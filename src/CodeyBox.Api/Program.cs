@@ -904,6 +904,11 @@ builder.Services.AddHttpClient("agent-quota", client =>
     client.Timeout = TimeSpan.FromSeconds(10);
 }).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
 
+builder.Services.AddHttpClient("check-completion", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(60);
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
+
 // Named client for credential smoke probes. Authorization is added per-request
 // from the credential bundle; the header is never logged. Timeout is generous
 // (15 s) since the probe runs at most once per credential fingerprint per TTL.
@@ -2132,6 +2137,20 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IAuditProgressStore>()));
 
+builder.Services.AddSingleton(sp =>
+{
+    var options = new CheckAndActCompletionOptions();
+    sp.GetRequiredService<IConfiguration>()
+        .GetSection("CodeyBox:CheckAndActCompletion")
+        .Bind(options);
+    return options;
+});
+builder.Services.AddSingleton<ICheckAndActCompletionRunner>(sp =>
+    new DefaultCheckAndActCompletionRunner(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<CheckAndActCompletionOptions>(),
+        sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>()));
+
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -2183,7 +2202,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     dispatchAvailability: sp.GetService<IAgentDispatchAvailability>(),
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
-    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>()));
+    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
+    checkCompletionRunner: sp.GetService<ICheckAndActCompletionRunner>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

@@ -557,6 +557,104 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task CompletionMode_UsesCompletionRunner_NoSandboxAgentCheckInvocation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new RecordingInVmSmokeGate();
+        var completion = new ScriptedCompletionRunner();
+        completion.Results.Enqueue(BuildCompletionResult(true, "README.md shows seed content", cacheHit: false));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            inVmSmokeGate: gate,
+            checkCompletionRunner: completion);
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Completion check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-completion",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Mode = CheckAndActModes.Completion,
+                Question = "Does README mention seed content?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix README", Prompt = "update docs" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(final.Verdict!.Answer);
+        Assert.Empty(tp.Agent.CheckInvocations);
+        Assert.Empty(gate.Targets);
+
+        var request = Assert.Single(completion.Requests);
+        Assert.Equal("check", request.Phase);
+        Assert.Null(request.Iteration);
+        Assert.Contains("[1: fixed generic system prompt]", request.Blocks.Render());
+        Assert.Contains("[2: the code/diff under review]", request.Blocks.Render());
+        Assert.Contains("[3: the specific check question]", request.Blocks.Render());
+        Assert.Contains("README.md", request.Blocks.ReviewBlock);
+        Assert.Contains(check.Check!.Question, request.Blocks.QuestionBlock);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+    }
+
+    [Fact]
+    public async Task CompletionMode_NoSafeProviderFallsBackToAgenticCheckPath()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new RecordingInVmSmokeGate();
+        var completion = new ScriptedCompletionRunner();
+        completion.Results.Enqueue(null);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            inVmSmokeGate: gate,
+            checkCompletionRunner: completion);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "agentic fallback inspected the repo", "high"));
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Completion fallback check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-completion-fallback",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Mode = CheckAndActModes.Completion,
+                Question = "Is remediation required?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.False(final.Verdict!.Answer);
+        Assert.Single(completion.Requests);
+        Assert.Single(tp.Agent.CheckInvocations);
+        Assert.Single(gate.Targets);
+    }
+
+    [Fact]
     public async Task YesVerdict_FollowupInheritsBoundaryPriorityAndMinModelScore()
     {
         // EnqueueOnYesFollowupAsync clamps priority to [-1000, 1000] and
@@ -1166,6 +1264,37 @@ public sealed class CheckAndActPipelineTests : IDisposable
         var ans = answer ? "true" : "false";
         var confSegment = confidence is null ? "" : $", \"confidence\": \"{confidence}\"";
         return $"some preamble\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\"{confSegment}}}\n{CheckAndActPipeline.EndSentinel}\n";
+    }
+
+    private static CheckAndActCompletionResult BuildCompletionResult(
+        bool answer,
+        string evidence,
+        bool cacheHit)
+    {
+        var ans = answer ? "true" : "false";
+        return new CheckAndActCompletionResult(
+            CheckAndActCompletionProviders.GeminiOAuth,
+            AgentKind.Gemini,
+            "gemini-2.5-pro",
+            $"completion output\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\", \"confidence\": \"high\"}}\n{CheckAndActPipeline.EndSentinel}\n",
+            new CheckAndActCompletionUsage(20, cacheHit ? 100 : 0, 4, cacheHit));
+    }
+
+    private sealed class ScriptedCompletionRunner : ICheckAndActCompletionRunner
+    {
+        public Queue<CheckAndActCompletionResult?> Results { get; } = new();
+        public List<CheckAndActCompletionRequest> Requests { get; } = [];
+
+        public Task<CheckAndActCompletionResult?> TryCompleteAsync(
+            CheckAndActCompletionRequest request,
+            CancellationToken ct = default)
+        {
+            _ = ct;
+            Requests.Add(request);
+            if (Results.Count == 0)
+                throw new InvalidOperationException("ScriptedCompletionRunner: ran out of completion results");
+            return Task.FromResult(Results.Dequeue());
+        }
     }
 
     private sealed class RacingFollowupCreateStore : IWorkItemStore

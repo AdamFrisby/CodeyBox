@@ -286,6 +286,8 @@ internal sealed class WorkItemCreationService
                 return Error("check.question is required");
             if (check.Question.Length > 64 * 1024)
                 return Error("check.question must be <= 64KB");
+            if (!CheckAndActModes.TryNormalise(check.Mode, out var checkMode))
+                return Error("check.mode must be 'agentic' or 'completion'");
             if (check.OnYes is null)
                 return Error("check.onYes is required when check is provided");
             var onYes = check.OnYes;
@@ -324,6 +326,7 @@ internal sealed class WorkItemCreationService
             checkSpec = new CheckAndActSpec
             {
                 Question = check.Question,
+                Mode = checkMode,
                 ActionableAnswer = check.ActionableAnswer ?? true,
                 OnYes = new OnYesActionSpec
                 {

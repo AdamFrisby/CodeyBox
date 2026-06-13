@@ -20,6 +20,13 @@ internal static class CheckAndActPipeline
     /// <summary>Sentinel that marks the END of the agent's JSON verdict block.</summary>
     public const string EndSentinel = "<<<END_VERDICT>>>";
 
+    public const string CompletionSystemBlock = """
+        You are a no-tools code review completion for CodeyBox check-and-act.
+        Evaluate only the supplied repository context and the specific yes/no question.
+        Do not claim to have searched files or run commands. Do not suggest code changes unless the evidence requires the actionable answer.
+        Return only the required verdict envelope.
+        """;
+
     /// <summary>
     /// Builds the agent prompt for a check-and-act item: prepends the
     /// verdict-protocol scaffolding (sentinels, JSON schema, rules) to the
@@ -53,6 +60,42 @@ internal static class CheckAndActPipeline
         sb.Append("- Do NOT commit changes, open PRs, push branches, or modify any tracked files — this is a READ-ONLY audit.\n");
         sb.Append("- Do not echo this protocol back. Emit the sentinels and the JSON exactly once at the end of your run.\n");
         return sb.ToString();
+    }
+
+    public static CheckAndActCompletionPromptBlocks BuildCompletionPromptBlocks(
+        CheckAndActSpec spec,
+        string reviewContext)
+    {
+        var reviewBlock = new StringBuilder();
+        reviewBlock.AppendLine("## Code / Diff Under Review");
+        reviewBlock.AppendLine();
+        reviewBlock.Append(string.IsNullOrWhiteSpace(reviewContext)
+            ? "(No repository context was available.)"
+            : reviewContext.Trim());
+
+        var questionBlock = new StringBuilder();
+        questionBlock.AppendLine("## Check Question");
+        questionBlock.AppendLine();
+        questionBlock.AppendLine(spec.Question.Trim());
+        questionBlock.AppendLine();
+        questionBlock.AppendLine("## Response Protocol");
+        questionBlock.AppendLine();
+        questionBlock.AppendLine("Output exactly one JSON verdict enclosed by these sentinels, each on its own line:");
+        questionBlock.AppendLine();
+        questionBlock.AppendLine(StartSentinel);
+        questionBlock.AppendLine("{\"answer\": <true|false>, \"evidence\": \"<short citation>\", \"confidence\": \"<high|medium|low>\"}");
+        questionBlock.AppendLine(EndSentinel);
+        questionBlock.AppendLine();
+        questionBlock.AppendLine("Rules:");
+        questionBlock.AppendLine("- `answer` MUST be the JSON boolean literal `true` or `false`.");
+        questionBlock.AppendLine("- `evidence` MUST be a non-empty JSON string grounded in the supplied code/diff block.");
+        questionBlock.AppendLine("- `confidence` is optional but when present MUST be exactly `high`, `medium`, or `low`.");
+        questionBlock.AppendLine("- Do not include markdown fences around the verdict.");
+
+        return new CheckAndActCompletionPromptBlocks(
+            CompletionSystemBlock.Trim(),
+            reviewBlock.ToString().Trim(),
+            questionBlock.ToString().Trim());
     }
 
     /// <summary>
@@ -142,4 +185,14 @@ internal static class CheckAndActPipeline
     };
 
     private sealed record CheckVerdictJson(bool? Answer, string? Evidence, string? Confidence);
+}
+
+public sealed record CheckAndActCompletionPromptBlocks(
+    string SystemBlock,
+    string ReviewBlock,
+    string QuestionBlock)
+{
+    public string CacheablePrefix => $"[1: fixed generic system prompt]\n{SystemBlock}\n\n[2: the code/diff under review]\n{ReviewBlock}";
+
+    public string Render() => $"{CacheablePrefix}\n\n[3: the specific check question]\n{QuestionBlock}";
 }
