@@ -480,6 +480,35 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task StopAndPreserve_ReleasesAdmission_AndResumeAdoptsItBack()
+    {
+        var inner = new CountingSandboxProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
+
+        var worker = await provider.CreateAsync(Spec(), CancellationToken.None);
+        var preemptible = Assert.IsAssignableFrom<IPreemptibleSandbox>(worker);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+
+        await preemptible.StopAndPreserveAsync(CancellationToken.None);
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+
+        await using (var audit = await provider.CreateAsync(Spec(), CancellationToken.None).WaitAsync(TestDeadline))
+        {
+            Assert.NotEqual(worker.Id, audit.Id);
+            Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        }
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+
+        await suspending.ResumeSandboxAsync(worker.Id, CancellationToken.None).WaitAsync(TestDeadline);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+
+        await worker.DisposeAsync();
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
     public async Task LeakManagementCalls_AreDelegatedThroughWrapper()
     {
         var createdAt = DateTimeOffset.UtcNow.AddMinutes(-10);

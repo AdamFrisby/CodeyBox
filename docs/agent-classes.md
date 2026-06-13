@@ -101,6 +101,30 @@ For simple single-credential deployments, omit `InstanceId` and
 `AgentInstances`; the route key remains the bare kind (`claude`, `codex`, …)
 and behavior is unchanged.
 
+### Claude session opt-in
+
+Class-routed Claude work items use the resumable session worker only when the
+global `CodeyBox:ClaudeSession:Enabled` flag, the project
+`ClaudeSession.Enabled` flag, and the selected class/member opt-in are all
+enabled. Set `ClaudeSession.Enabled` on the class to opt in all Claude members
+in that class, or set it on an individual member to override the class:
+
+```json
+{
+  "Id": "frontier-coding",
+  "ClaudeSession": { "Enabled": true },
+  "Members": [
+    { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100 },
+    { "Agent": "claude", "Billing": "PayPerApi", "ModelId": "claude-opus-4-7", "QualityScore": 99, "ClaudeSession": { "Enabled": false } },
+    { "Agent": "codex", "Billing": "Subscription", "ModelId": "gpt-5.5", "QualityScore": 100 }
+  ]
+}
+```
+
+The member key used for
+`CodeyBox:ClaudeSession:TransportOverridesByAgentClassMember:<member>` is the
+member route key, such as `claude` or `claude/acct-a`.
+
 ### Migrating pre-pooling configs
 
 Multi-subscription pooling (#226 / #227) tightened config validation so two

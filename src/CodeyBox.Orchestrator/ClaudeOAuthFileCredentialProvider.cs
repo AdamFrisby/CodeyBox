@@ -26,7 +26,7 @@ namespace CodeyBox.Orchestrator;
 ///   <item><description><c>CODEYBOX_CLAUDE_OAUTH_JSON</c> carrying a
 ///   <em>sanitised</em> bundle (access_token + expires_at only — the
 ///   refresh_token is stripped) so that
-///   <see cref="CodeyBox.Agents.Claude.ClaudeAgentRunner"/> can materialise
+///   the Claude runner can materialise
 ///   <c>~/.claude/.credentials.json</c> inside the sandbox.</description></item>
 /// </list>
 ///
@@ -39,7 +39,7 @@ namespace CodeyBox.Orchestrator;
 /// refresh, so two parallel refresh attempts cannot collide. A VM iteration
 /// that outlives the access_token's expiry will fail with a 401 (handled as a
 /// transient/auth failure rather than as a quota-exhaustion signal — see
-/// <see cref="CodeyBox.Agents.Claude.ClaudeQuotaFailureDetector"/>); a fresh
+/// Claude quota failure detection); a fresh
 /// iteration then picks up the host's currently-fresh token via the normal
 /// credential pipeline.</para>
 ///

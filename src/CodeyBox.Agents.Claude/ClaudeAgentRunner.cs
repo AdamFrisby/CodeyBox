@@ -200,6 +200,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         var write = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["bash", "-c", script],
+            ExtraEnvironment = credential.EnvironmentVariables,
         }, ct).ConfigureAwait(false);
         if (!write.Success)
         {
@@ -534,6 +535,10 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
         var invocation = BuildClaudeSessionInvocation(
             prompt, modelId, reasoningMode, cliResumeSessionId, captureStructuredStream);
+        invocation = invocation with
+        {
+            ExtraEnvironment = MergeCredentialEnvironment(invocation.ExtraEnvironment, credential),
+        };
 
         var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
             .ConfigureAwait(false);

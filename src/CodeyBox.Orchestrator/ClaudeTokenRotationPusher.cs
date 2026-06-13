@@ -18,7 +18,7 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <list type="number">
 ///   <item><description>Tracking active Claude-running sandboxes via
-///   <see cref="RegisterActiveSandbox"/>; <see cref="CodeyBox.Agents.Claude.ClaudeAgentRunner"/>
+///   <see cref="RegisterActiveSandbox"/>; the Claude runner
 ///   registers each sandbox for the duration of <c>RunAsync</c> /
 ///   <c>RunResumedAsync</c>.</description></item>
 ///   <item><description>Subscribing to
@@ -42,7 +42,7 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDisposable
 {
-    // The same bash hook ClaudeAgentRunner.PrepareSandboxAsync uses to
+    // The same bash hook the Claude runner's prepare path uses to
     // materialise the credentials file on sandbox launch — but reads the
     // bundle from stdin rather than from an env var, so the token never lands
     // on the multipass exec argv during a runtime push.

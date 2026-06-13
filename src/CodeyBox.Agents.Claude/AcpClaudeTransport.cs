@@ -115,10 +115,10 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         }
     }
 
-    internal sealed class AcpSession : IClaudeTransportSession
+    internal sealed class AcpSession : ICredentialRefreshableClaudeTransportSession
     {
         private readonly AcpClaudeTransport _transport;
-        private readonly ClaudeTransportOpenRequest _open;
+        private ClaudeTransportOpenRequest _open;
         private int _turnIndex;
         private bool _disposed;
 
@@ -281,6 +281,9 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             _disposed = true;
             return ValueTask.CompletedTask;
         }
+
+        public void RefreshCredential(AgentCredential? credential) =>
+            _open = _open with { Credential = credential };
 
         private string BuildStdin(
             string prompt,

@@ -151,6 +151,26 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly OrchestratorOptions _orchestratorOptions;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly string _disabledHostHooksPath;
+    // Resumable Claude session worker. Null when not registered in DI (the
+    // default for tests / minimal compositions). Composed with the global
+    // CodeyBox:ClaudeSession:Enabled flag and per-project opt-in
+    // (Project.ClaudeSession.Enabled) by ShouldEnterClaudeSessionMode — items
+    // that opt out of all three keep the legacy independent-phase pipeline.
+    //
+    // Stored as ISessionAgentRunner (not the concrete worker) so tests can
+    // inject a fake without spinning up the real Claude CLI machinery. The
+    // production DI path supplies a provider session runner whose snapshot
+    // delegate flows through _claudeHandleSnapshot for restart recovery.
+    private readonly ISessionAgentRunner? _claudeSessionWorker;
+    private readonly Func<AgentSessionHandle, AgentSessionHandle>? _claudeHandleSnapshot;
+    private readonly AgentSessionDispatchOptions _claudeSessionOptions;
+    // AsyncLocal flows through the deep work/audit/rework call chain without
+    // having to thread an explicit parameter through every helper. Scoped at
+    // the top of RunAsync (set when session-mode applies) and read by
+    // RunAgentPhaseAsync to swap in the persistent worker VM + worker turn.
+    // Per-pipeline-execution by construction, so two concurrent work items
+    // never see each other's lifecycle.
+    private readonly AsyncLocal<ClaudeSessionLifecycle?> _ambientSessionLifecycle = new();
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
     // CancellationTokenSource timers use a uint millisecond due-time internally;
@@ -226,7 +246,28 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentPauseController? agentPauseController = null,
         AgentPromptPreprocessorChain? promptPreprocessors = null,
         ICheckAndActCompletionRunner? checkCompletionRunner = null,
-        IAgentSupervisionService? agentSupervision = null)
+        IAgentSupervisionService? agentSupervision = null,
+        // Resumable session runner — accepted as an abstraction so the
+        // orchestration boundary doesn't take a hard dependency on any
+        // provider-specific concrete type. The composition root (Program.cs)
+        // hands in the per-provider concrete session runner
+        // implementing ISessionAgentRunner; tests substitute fakes through
+        // the same parameter. Null disables session-mode dispatch entirely
+        // (every item takes the legacy independent-phase path).
+        ISessionAgentRunner? sessionAgentRunner = null,
+        // Orchestrator-owned dispatch gate. Carries only the master switch
+        // PipelineRunner needs to decide whether to consider session mode
+        // for a given item; per-provider knobs (transport, metrics,
+        // overrides) live on the provider's own options shape and stay
+        // confined to the composition root.
+        AgentSessionDispatchOptions? sessionDispatchOptions = null,
+        // Optional persistence snapshot hook the session runner provides
+        // when its handle metadata evolves over time (e.g. captured CLI
+        // session ids stamped after the first turn). Production composition
+        // root wires this to the concrete runner's snapshot method; null
+        // when no snapshotting is needed (or in tests that don't assert on
+        // the persisted shape).
+        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -327,6 +368,14 @@ public sealed class PipelineRunner : IPipelineRunner
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
+        // The session-runner abstraction is the single seam: production
+        // hands in the per-provider concrete session runner
+        // implementing ISessionAgentRunner; tests substitute a fake
+        // through the same parameter. The snapshot hook is forwarded
+        // verbatim — the composition root chooses whether to wire it.
+        _claudeSessionWorker = sessionAgentRunner;
+        _claudeHandleSnapshot = sessionHandleSnapshot;
+        _claudeSessionOptions = sessionDispatchOptions ?? new AgentSessionDispatchOptions();
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
             _opts.RequiredBuildVerificationTimeout,
@@ -334,6 +383,150 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private readonly RequiredBuildGate _requiredBuildGate;
+
+    /// <summary>
+    /// Whether the resumable Claude session worker should drive the work +
+    /// every rework iteration for this item. All three conditions must hold:
+    /// <list type="bullet">
+    ///   <item>The worker is registered in DI (<see cref="_claudeSessionWorker"/> non-null).</item>
+    ///   <item>The global flag <c>CodeyBox:ClaudeSession:Enabled</c> is true.</item>
+    ///   <item>The per-project flag <c>Project.ClaudeSession.Enabled</c> is true.</item>
+    ///   <item>The work item's effective agent is Claude (the worker is Claude-only).</item>
+    ///   <item>For class-routed items, the selected class/member opts in to Claude sessions.</item>
+    /// </list>
+    /// <para>Items that fail any one of these conditions take the legacy
+    /// independent-phase pipeline (fresh sandbox per work / rework call,
+    /// no <c>--resume</c>, no shared VM across phases) unchanged. The brief
+    /// is non-negotiable here: a session-shared auditor would self-review.</para>
+    /// </summary>
+    internal bool ShouldEnterClaudeSessionMode(WorkItem item, Project project, IAgentRunner runner)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        ArgumentNullException.ThrowIfNull(project);
+        ArgumentNullException.ThrowIfNull(runner);
+        if (_claudeSessionWorker is null) return false;
+        if (!_claudeSessionOptions.Enabled) return false;
+        if (!project.ClaudeSession.Enabled) return false;
+        if (runner.Kind != AgentKind.Claude) return false;
+        // CheckAndAct is a read-only single-shot probe; it doesn't have a
+        // rework loop, so the session-share benefit doesn't apply.
+        if (item.JobType == JobType.CheckAndAct) return false;
+        if (item.JobType == JobType.AgentControl) return false;
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)) return false;
+        var classId = item.AgentClassId ?? project.DefaultAgentClass;
+        if (!string.IsNullOrWhiteSpace(classId))
+        {
+            if (_classRouter is null)
+                return false;
+            var selectedMember = _classRouter.FindMember(classId, runner.Kind, item.ModelId, item.AgentInstanceId);
+            if (selectedMember is null || !_classRouter.IsClaudeSessionEnabled(classId, selectedMember))
+                return false;
+        }
+        // The session worker opens ONE VM with the work-phase sandbox target
+        // and reuses it across every rework turn. When the operator
+        // configured Work and Rework with different network profiles (e.g.
+        // broader egress during initial work, restricted rework after
+        // auditor-controlled findings are fed back), keeping the work-phase
+        // policy on the rework turns silently weakens the operator's
+        // containment boundary. Refuse session mode in that configuration —
+        // the legacy fresh-sandbox path applies the correct per-phase
+        // policy and is the safe default.
+        if (!string.Equals(
+                project.NetworkProfiles.Work ?? string.Empty,
+                project.NetworkProfiles.Rework ?? string.Empty,
+                StringComparison.Ordinal))
+        {
+            _log.LogInformation(
+                "Claude session-mode disabled for work item {WorkItemId}: project {ProjectId} configures distinct Work ({WorkProfile}) and Rework ({ReworkProfile}) network profiles; using the legacy per-phase sandbox path to preserve the rework containment boundary.",
+                item.Id, project.Id, project.NetworkProfiles.Work ?? "(default)", project.NetworkProfiles.Rework ?? "(default)");
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Opens a fresh <see cref="ClaudeSessionLifecycle"/> against a newly
+    /// provisioned worker sandbox. Returns the lifecycle so the caller
+    /// (<see cref="RunAsync"/>) can publish it on
+    /// <see cref="_ambientSessionLifecycle"/> in its own ExecutionContext and
+    /// keep a handle for the outer-finally disposal. The caller must assign
+    /// the AsyncLocal — assigning here would be invisible to the parent
+    /// because AsyncLocal values set inside an awaited child method do NOT
+    /// flow back to the caller's ExecutionContext.
+    /// </summary>
+    private async Task<ClaudeSessionLifecycle?> TryOpenClaudeSessionLifecycleAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        CancellationToken ct)
+    {
+        if (!ShouldEnterClaudeSessionMode(item, project, runner))
+            return null;
+        if (_claudeSessionWorker is null)
+            return null;
+
+        // Use the work-phase sandbox target for the worker VM. Subsequent
+        // rework turns reuse the same VM via session resume, so the network
+        // profile / flavor / baseline pin established here applies to every
+        // worker turn for this item.
+        var access = _gitHost.GetSandboxAccess(repoId);
+        var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
+        var selectedMember = TryResolveSelectedMember(runner.Kind, project, item);
+        var openedRouteKey = selectedMember?.RouteKey ?? CanonicalAgentRouteKey(runner.Kind, item.AgentInstanceId);
+        var openedModelId = selectedMember?.ModelId ?? item.ModelId;
+        var openedReasoningMode = selectedMember?.ReasoningMode ?? item.ReasoningMode;
+        var credential = selectedMember is not null
+            ? await ResolveAgentCredentialAsync(selectedMember, project, ct).ConfigureAwait(false)
+            : await ResolveAgentCredentialAsync(runner.Kind, project, item, ct).ConfigureAwait(false);
+        var spec = BuildSandboxSpec(
+            access,
+            includeAgentCredential: credential,
+            allowAgentNetwork: true,
+            hostNetworkProfile: sandboxTarget.NetworkProfile,
+            timingWorkItemId: item.Id,
+            timingPhase: "work",
+            flavor: sandboxTarget.Flavor,
+            extraEnvironment: null,
+            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                project,
+                new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
+                item.BaselineImageRef));
+
+        var sandbox = await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
+        try
+        {
+            if (credential is not null && credential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
+
+            var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
+                _claudeSessionWorker,
+                _claudeHandleSnapshot,
+                sandbox,
+                SandboxConventions.WorkDir,
+                credential,
+                openedModelId,
+                openedReasoningMode,
+                openedRouteKey,
+                project.Id.Value,
+                selectedMember?.RouteKey,
+                ct).ConfigureAwait(false);
+            // sandbox ownership transferred to the lifecycle. The AsyncLocal
+            // is published by the caller (RunAsync) on the returned value, in
+            // its own ExecutionContext — assigning here would be a no-op for
+            // the parent frame.
+            sandbox = null!;
+            return lifecycle;
+        }
+        catch
+        {
+            // OpenAsync didn't adopt the sandbox; ensure we don't leak the VM.
+            if (sandbox is not null)
+                await sandbox.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
 
     private Task<string> ProcessAgentPromptAsync(
         WorkItemId itemId,
@@ -750,6 +943,7 @@ public sealed class PipelineRunner : IPipelineRunner
             return;
         }
 
+        ClaudeSessionLifecycle? claudeSessionLifecycle = null;
         try
         {
             await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
@@ -761,6 +955,26 @@ public sealed class PipelineRunner : IPipelineRunner
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
                 throw new InvalidOperationException(
                     $"workBranch must differ from baseBranch (both '{baseBranch}'); refusing to bypass merge-phase containment");
+
+            // Session-mode dispatch: when the work item, its project, and the
+            // global flag all opt in for the Claude resumable worker, open one
+            // worker session+VM up-front. The lifecycle is published via the
+            // AsyncLocal so the work / rework agent-phase path picks it up
+            // without any explicit threading; the outer try/finally closes it
+            // (disposes the VM) on every exit path. Items that don't opt in
+            // see no behaviour change: claudeSessionLifecycle stays null and
+            // RunAgentPhaseAsync takes the legacy independent-phase branch.
+            if (!skipWork && !skipAudit)
+            {
+                claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(item, project, agentRunner, repoId, ct);
+                // Publish the lifecycle on the AsyncLocal in RunAsync's own
+                // frame. AsyncLocal values set inside an awaited child method
+                // do NOT propagate back to the caller's ExecutionContext, so
+                // any assignment inside TryOpen would be invisible to the
+                // RunAgentPhaseAsync read below — assign here in the parent
+                // frame so the value flows down to the work / rework calls.
+                _ambientSessionLifecycle.Value = claudeSessionLifecycle;
+            }
             if (!string.Equals(item.WorkBranch, workBranch, StringComparison.Ordinal))
             {
                 item = item with { WorkBranch = workBranch };
@@ -1358,6 +1572,38 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         finally
         {
+            // Tear down the resumable Claude worker VM on every exit path
+            // (success, terminal failure, host shutdown). The lifecycle's
+            // CloseSessionAsync disposes the VM regardless of suspend state,
+            // so a session that completed cleanly + got suspended after the
+            // last rework turn still has its VM destroyed here — no idle VMs
+            // leak past terminal transitions.
+            if (claudeSessionLifecycle is not null)
+            {
+                try
+                {
+                    await CloseAmbientClaudeSessionAsync(
+                        claudeSessionLifecycle,
+                        item,
+                        project,
+                        "pipeline terminal cleanup");
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "Claude session terminal cleanup failed for work item {Id}; marking the item failed and rethrowing so cleanup can be retried",
+                        item.Id);
+                    await TransitionFailed(
+                        item,
+                        $"Claude session terminal cleanup failed: {ex.Message}",
+                        CancellationToken.None,
+                        project,
+                        failureKind: "infrastructure");
+                    throw;
+                }
+                _ambientSessionLifecycle.Value = null;
+            }
+
             if (_stdoutBroadcaster is not null)
             {
                 try { await _stdoutBroadcaster.CompleteAsync(item.Id); }
@@ -2621,6 +2867,15 @@ public sealed class PipelineRunner : IPipelineRunner
         int? iteration = null)
     {
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
+        var selectedMemberForSession = TryResolveSelectedMember(runner.Kind, project, item);
+        var sessionTurnItem = selectedMemberForSession is null
+            ? item
+            : item with
+            {
+                AgentInstanceId = selectedMemberForSession.RouteKey,
+                ModelId = selectedMemberForSession.ModelId,
+                ReasoningMode = selectedMemberForSession.ReasoningMode,
+            };
         var access = _gitHost.GetSandboxAccess(repoId);
         var agentPhase = isInitial ? "work" : "rework";
 
@@ -2643,137 +2898,230 @@ public sealed class PipelineRunner : IPipelineRunner
                 new SandboxTarget(networkProfile, sandboxFlavor),
                 item.BaselineImageRef));
 
-        var sandboxStartSw = Stopwatch.StartNew();
-        await using var sandbox = WorkSandboxContext.Current != null
-            ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
-            : await _sandboxes.CreateAsync(spec, ct);
-        sandboxStartSw.Stop();
-        CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+        // Session-mode (Claude resumable worker) reuses ONE sandbox across the
+        // work phase + every rework iteration: the VM is stopped during each
+        // (long) audit and resumed for the next worker turn. The lifecycle
+        // owns disposal (it disposes the VM via CloseSessionAsync at the end
+        // of RunAsync), so this method must NOT dispose the sandbox in the
+        // session branch — suspending it after a successful turn is what
+        // preserves the prompt cache + transcript across the upcoming audit.
+        var sessionLifecycle = _ambientSessionLifecycle.Value;
+        var useClaudeSession = sessionLifecycle is not null
+            && !sessionLifecycle.IsClosed
+            && runner.Kind == AgentKind.Claude
+            && sessionLifecycle.CanRunTurn(runner, sessionTurnItem)
+            && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
-        if (credential is not null && credential.Files.Count > 0)
-            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
-
-        TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
-            activitySource: CodeyBoxActivities.Sandbox, log: _log);
-        await using (cloneScope)
+        ISandbox sandbox;
+        bool sandboxOwnedByPhase;
+        bool skipClone;
+        if (useClaudeSession)
         {
-            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            // GetSandboxAsync resumes the VM via the worker's resume hook
+            // (multipass start) when the lifecycle is currently suspended;
+            // on the very first call it is already running.
+            try
+            {
+                sandbox = await sessionLifecycle!.GetSandboxAsync(ct);
+                sandboxOwnedByPhase = false;
+                // On subsequent worker turns (rework) the previous turn already
+                // cloned into /work; re-cloning would fail and would also throw
+                // away the agent's mid-tree scratch state. We refresh against
+                // origin via fetch + checkout below instead of cloning.
+                skipClone = sessionLifecycle.FirstTurnComplete;
+            }
+            catch (AgentSessionDegradedException ex)
+            {
+                _log.LogWarning(ex,
+                    "Claude session lifecycle degraded before phase '{Phase}' for work item {Id}; using the legacy fresh-sandbox path for this turn",
+                    agentPhase, item.Id);
+                _ambientSessionLifecycle.Value = null;
+                sessionLifecycle = null;
+                useClaudeSession = false;
+                var sandboxStartSw = Stopwatch.StartNew();
+                sandbox = await _sandboxes.CreateAsync(spec, ct);
+                sandboxStartSw.Stop();
+                CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+                sandboxOwnedByPhase = true;
+                skipClone = false;
+            }
         }
-        CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
+        else
+        {
+            // Legacy independent-phase path. WorkSandboxContext, when present
+            // on the ambient AsyncLocal, lets the orchestrator reuse a warm
+            // sandbox across the work + audit phases of the same item; the
+            // wrapper it returns has a cheap DisposeAsync so the
+            // sandboxOwnedByPhase finally below stays safe.
+            if (sessionLifecycle is not null
+                && !sessionLifecycle.IsClosed
+                && runner.Kind == AgentKind.Claude
+                && string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+                && !sessionLifecycle.CanRunTurn(runner, sessionTurnItem))
+            {
+                await CloseAmbientClaudeSessionAsync(
+                    sessionLifecycle,
+                    item,
+                    project,
+                    "selected Claude fallback member does not match the opened session");
+                _ambientSessionLifecycle.Value = null;
+                sessionLifecycle = null;
+            }
+            var sandboxStartSw = Stopwatch.StartNew();
+            sandbox = WorkSandboxContext.Current != null
+                ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
+                : await _sandboxes.CreateAsync(spec, ct);
+            sandboxStartSw.Stop();
+            CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+            sandboxOwnedByPhase = true;
+            skipClone = false;
+        }
+
         var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
-        var checkedOutExistingBranch = false;
-        if (resumingPreempt)
+        var phaseSucceeded = false;
+        try
         {
-            var preemptCheckpoint = item.PreemptCheckpoint!;
-            var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
-            checkedOutExistingBranch = true;
-            prompt = BuildResumePrompt(prompt, preemptCheckpoint);
-        }
-        else if (isInitial)
-        {
-            if (await OriginBranchExistsAsync(sandbox, branch, ct))
+
+            if (credential is not null && credential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            if (useClaudeSession && !resumingPreempt)
+                await sessionLifecycle!.RefreshCredentialAsync(credential, ct);
+
+            if (!skipClone)
+            {
+                TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
+                    activitySource: CodeyBoxActivities.Sandbox, log: _log);
+                await using (cloneScope)
+                {
+                    await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                }
+                CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
+            }
+            else
+            {
+                // Session-mode rework turn: the clone from the prior turn is
+                // still on disk. Refresh against origin so any incremental
+                // rebase that ran between iterations lands in the work tree
+                // before the agent looks at it.
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
+            }
+            var checkedOutExistingBranch = false;
+            if (resumingPreempt)
+            {
+                var preemptCheckpoint = item.PreemptCheckpoint!;
+                var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
+                checkedOutExistingBranch = true;
+                prompt = BuildResumePrompt(prompt, preemptCheckpoint);
+            }
+            else if (isInitial)
+            {
+                if (await OriginBranchExistsAsync(sandbox, branch, ct))
+                {
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+                    checkedOutExistingBranch = true;
+                }
+                else
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
+            }
+            else
             {
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
                 checkedOutExistingBranch = true;
             }
-            else
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
-        }
-        else
-        {
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
-            checkedOutExistingBranch = true;
-        }
-        var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
-        await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
 
-        // Capture HEAD before the agent runs. The rework prompt explicitly
-        // asks the agent to make new commits, so the agent may move HEAD
-        // itself. We compare before/after to distinguish "agent committed"
-        // from "agent did nothing" — both end with a clean working tree
-        // but only the former is success.
-        var beforeHead = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
-        }, ct);
-        if (!beforeHead.Success)
-            throw new InvalidOperationException($"Failed to read HEAD before agent: {beforeHead.Stderr}");
-        var shaBefore = beforeHead.Stdout.Trim();
-
-        AuditLog.AgentStarted(runner.Kind, sandbox.Id, agentPhase);
-        var agentSw = Stopwatch.StartNew();
-
-        var agentExecScope = await TimingScope.BeginAsync(
-            _timings, item.Id, agentPhase, "agent.exec",
-            metadata: new Dictionary<string, object>
+            // Capture HEAD before the agent runs. The rework prompt explicitly
+            // asks the agent to make new commits, so the agent may move HEAD
+            // itself. We compare before/after to distinguish "agent committed"
+            // from "agent did nothing" — both end with a clean working tree
+            // but only the former is success.
+            var beforeHead = await sandbox.ExecAsync(new SandboxExec
             {
-                ["agent"] = runner.Kind.Value,
-                ["resuming_preempt"] = resumingPreempt,
-            },
-            log: _log,
-            activitySource: CodeyBoxActivities.Pipeline);
-        var canCaptureStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, agentPhase, ct);
-        var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
-            ? await BeginAgentStreamCaptureAsync(item.Id, agentPhase, iteration ?? 1, ct)
-            : null;
-        var stdoutCallback = BuildStdoutCallback(item.Id, agentPhase, streamCapture);
-        prompt = await ProcessAgentPromptAsync(
-            item.Id,
-            runner.Kind,
-            isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
-            iteration ?? 1,
-            project,
-            sandbox,
-            prompt,
-            ct);
-        // The runner's CLI-native session resume capability is independent of
-        // optional stream persistence: a transient agent crash should still be
-        // recoverable in the same sandbox even when AgentStreams is disabled.
-        // Force-enable the id-bearing output mode only when the runner's public
-        // resume contract says its session-id extractor needs structured output.
-        var needsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
-        var captureStructuredStream = canCaptureStructuredStream || needsStreamForResume;
-        var supervision = await StartAgentSupervisionSessionAsync(
-            item.Id,
-            project,
-            agentPhase,
-            iteration ?? 1,
-            runner,
-            item.AgentInstanceId,
-            item.ModelId,
-            item.ReasoningMode,
-            sandbox,
-            SandboxConventions.WorkDir,
-            source: "pipeline",
-            ct);
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+            }, ct);
+            if (!beforeHead.Success)
+                throw new InvalidOperationException($"Failed to read HEAD before agent: {beforeHead.Stderr}");
+            var shaBefore = beforeHead.Stdout.Trim();
 
-        AgentResult agentResult;
-        using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var preemptRequested = false;
-        var supervisionHandledRun = supervision is not null && !resumingPreempt;
-        try
-        {
-            await using (agentExecScope)
-            {
-                if (supervisionHandledRun)
+            AuditLog.AgentStarted(runner.Kind, sandbox.Id, agentPhase);
+            var agentSw = Stopwatch.StartNew();
+
+            var agentExecScope = await TimingScope.BeginAsync(
+                _timings, item.Id, agentPhase, "agent.exec",
+                metadata: new Dictionary<string, object>
                 {
-                    var phaseForPreprocessor = isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework;
-                    var iterationForPreprocessor = iteration ?? 1;
-                    var runTask = AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
-                        runner,
-                        sandbox,
-                        SandboxConventions.WorkDir,
-                        prompt,
-                        credential,
-                        item.ModelId,
-                        item.ReasoningMode,
-                        supervision!,
-                        stdoutCallback,
-                        captureStructuredStream,
-                        promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                    ["agent"] = runner.Kind.Value,
+                    ["resuming_preempt"] = resumingPreempt,
+                },
+                log: _log,
+                activitySource: CodeyBoxActivities.Pipeline);
+            var canCaptureStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, agentPhase, ct);
+            var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
+                ? await BeginAgentStreamCaptureAsync(item.Id, agentPhase, iteration ?? 1, ct)
+                : null;
+            var stdoutCallback = BuildStdoutCallback(item.Id, agentPhase, streamCapture);
+            prompt = await ProcessAgentPromptAsync(
+                item.Id,
+                runner.Kind,
+                isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
+                iteration ?? 1,
+                project,
+                sandbox,
+                prompt,
+                ct);
+            // The runner's CLI-native session resume capability is independent of
+            // optional stream persistence: a transient agent crash should still be
+            // recoverable in the same sandbox even when AgentStreams is disabled.
+            // Force-enable the id-bearing output mode only when the runner's public
+            // resume contract says its session-id extractor needs structured output.
+            var needsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
+            var captureStructuredStream = canCaptureStructuredStream || needsStreamForResume;
+
+            // Session-mode worker VMs are opened once and reused across the
+            // work + every rework iteration; the per-iteration extraEnv we
+            // build above is applied to the legacy fresh-sandbox spec only,
+            // so the session VM's environment does not carry the current
+            // iteration's CODEYBOX_PROMPT_REVISION. The work/rework prompts
+            // instruct the agent to copy the env var verbatim into the
+            // CodeyBox-Prompt-Revision commit trailer — without the var,
+            // the agent has an impossible instruction and the orchestrator
+            // stamp would be papering over a noisy commit. Inline the
+            // resolved literal so the session-mode agent writes the right
+            // trailer regardless of env-var visibility inside the VM.
+            if (useClaudeSession && !resumingPreempt)
+                prompt = AppendSessionPromptRevisionDirective(prompt, promptRevisionAtDispatch);
+
+            var supervision = await StartAgentSupervisionSessionAsync(
+                item.Id,
+                project,
+                agentPhase,
+                iteration ?? 1,
+                runner,
+                item.AgentInstanceId,
+                item.ModelId,
+                item.ReasoningMode,
+                sandbox,
+                SandboxConventions.WorkDir,
+                source: "pipeline",
+                ct);
+
+            AgentResult agentResult;
+            using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var preemptRequested = false;
+            var supervisionHandledRun = supervision is not null && !resumingPreempt;
+            try
+            {
+                await using (agentExecScope)
+                {
+                    if (supervisionHandledRun)
+                    {
+                        var phaseForPreprocessor = isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework;
+                        var iterationForPreprocessor = iteration ?? 1;
+                        Func<string, CancellationToken, Task<string>> promptPreprocessor = (raw, pct) => ProcessAgentPromptAsync(
                             item.Id,
                             runner.Kind,
                             phaseForPreprocessor,
@@ -2781,213 +3129,258 @@ public sealed class PipelineRunner : IPipelineRunner
                             project,
                             sandbox,
                             raw,
-                            pct),
-                        runnerCts.Token);
-                    var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
-                    if (completed != runTask)
-                    {
-                        preemptRequested = true;
-                        await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
-                        completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                            pct);
+                        var runTask = useClaudeSession
+                            ? RunClaudeSessionSupervisedTurnsAsync(
+                                sessionLifecycle!,
+                                supervision!,
+                                prompt,
+                                stdoutCallback,
+                                promptPreprocessor,
+                                runnerCts.Token)
+                            : AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                                runner,
+                                sandbox,
+                                SandboxConventions.WorkDir,
+                                prompt,
+                                credential,
+                                item.ModelId,
+                                item.ReasoningMode,
+                                supervision!,
+                                stdoutCallback,
+                                captureStructuredStream,
+                                promptPreprocessor,
+                                runnerCts.Token);
+                        var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                         if (completed != runTask)
-                            await runnerCts.CancelAsync();
-                    }
+                        {
+                            preemptRequested = true;
+                            await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                            completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                            if (completed != runTask)
+                                await runnerCts.CancelAsync();
+                        }
 
-                    agentResult = await runTask;
-                    if (preemptRequested)
-                        throw new OperationCanceledException(hostShutdownToken);
+                        agentResult = await runTask;
+                        if (preemptRequested)
+                            throw new OperationCanceledException(hostShutdownToken);
+                    }
+                    else
+                    {
+                        stdoutCallback = WrapSupervisionStdout(supervision, stdoutCallback);
+                        if (supervision is not null)
+                            await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, runnerCts.Token);
+
+                        // Session-mode work / rework turn: route the agent invocation
+                        // through the lifecycle so the captured CLI session id flows
+                        // across turns (--resume on turn 2+) and the per-turn cache_read
+                        // metrics get emitted. The lifecycle forces stream-json on so
+                        // the worker can observe the session id; the captureStructuredStream
+                        // value we pass into RunAsync is irrelevant when useClaudeSession.
+                        var runTask = useClaudeSession && !resumingPreempt
+                            ? sessionLifecycle!.SendTurnAsync(prompt, runnerCts.Token, stdoutCallback)
+                            : (resumingPreempt && runner is IResumableAgentRunner resumable
+                                ? resumable.RunResumedAsync(
+                                    sandbox, SandboxConventions.WorkDir, prompt, credential,
+                                    new AgentResumeContext(item.PreemptCheckpoint!),
+                                    item.ModelId, item.ReasoningMode, runnerCts.Token,
+                                    stdoutChunkCallback: stdoutCallback)
+                                : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                                    stdoutChunkCallback: stdoutCallback,
+                                    captureStructuredStream: captureStructuredStream));
+                        var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
+                        if (completed != runTask)
+                        {
+                            preemptRequested = true;
+                            await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                            completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                            if (completed != runTask)
+                                await runnerCts.CancelAsync();
+                        }
+
+                        agentResult = await runTask;
+                        if (preemptRequested)
+                            throw new OperationCanceledException(hostShutdownToken);
+
+                        if (supervision is not null)
+                        {
+                            var dispatcher = new SupervisedTurnDispatcher(
+                                runner, sandbox, SandboxConventions.WorkDir, credential,
+                                item.ModelId, item.ReasoningMode, stdoutCallback,
+                                captureStructuredStream: captureStructuredStream,
+                                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                                    item.Id, runner.Kind,
+                                    isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
+                                    iteration ?? 1, project, sandbox, raw, pct));
+                            agentResult = await supervision.RunPendingInjectionsAsync(
+                                agentResult, dispatcher.RunInjectionTurnAsync, runnerCts.Token);
+                        }
+                    }
                 }
-                else
+            }
+            catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
+            {
+                if (streamCapture is not null)
+                    await streamCapture.DisposeAsync();
+
+                // R8-core: if SandboxShutdownTeardownService already took ownership
+                // of this VM during IHostedLifecycleService.StoppingAsync (which runs
+                // and completes BEFORE BackgroundService cancellation flows down as
+                // hostShutdownToken), either Suspend is preserving the frozen VM for
+                // SandboxResumeOnStartupService or Dispose is destroying the VM. The
+                // preempt-checkpoint flow would block on a frozen VM or fault against
+                // a deleted VM. Skip both the checkpoint and StopAndPreserveAsync in
+                // those lifecycle-owned cases.
+                //
+                // The signal is "did the shutdown teardown handler take ownership
+                // of this VM", NOT just ISuspendableSandbox.IsSuspended: the handler
+                // persists SuspendedVmName BEFORE awaiting multipass suspend, and on
+                // a per-VM suspend timeout it returns with the mapping still
+                // persisted while IsSuspended is left false (multipassd is still
+                // writing the RAM snapshot). Gating only on IsSuspended would let
+                // the legacy git-checkpoint + multipass-stop path race that
+                // in-flight suspend. Dispose mode sets the ownership flag before
+                // destroying the VM because in-VM checkpoint commands would fault
+                // after lifecycle teardown. Stop mode sets the flag only after a
+                // successful stop/preserve, and only for items whose state can
+                // recover without PipelineRunner creating a new preempt checkpoint.
+                // We re-read the store under CancellationToken.None (ct is already
+                // cancelled by host shutdown): on the per-VM suspend-timeout path the handler has
+                // persisted SuspendedVmName and returned while multipassd is still
+                // writing the snapshot and IsSuspended / IsOwnedByShutdownHandler may
+                // still be false on the sandbox instance, so the persisted mapping is
+                // the authoritative late signal.
+                var lifecycleHandled = sandbox is IShutdownTeardownSandbox teardownSandbox
+                    && teardownSandbox.IsOwnedByShutdownHandler;
+                if (!lifecycleHandled)
                 {
-                    stdoutCallback = WrapSupervisionStdout(supervision, stdoutCallback);
-                    if (supervision is not null)
-                        await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, runnerCts.Token);
-
-                    var runTask = resumingPreempt
-                    && runner is IResumableAgentRunner resumable
-                    ? resumable.RunResumedAsync(
-                        sandbox, SandboxConventions.WorkDir, prompt, credential,
-                        new AgentResumeContext(item.PreemptCheckpoint!),
-                        item.ModelId, item.ReasoningMode, runnerCts.Token,
-                        stdoutChunkCallback: stdoutCallback)
-                    : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
-                        stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: captureStructuredStream);
-                    var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
-                    if (completed != runTask)
-                    {
-                        preemptRequested = true;
-                        await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
-                        completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
-                        if (completed != runTask)
-                            await runnerCts.CancelAsync();
-                    }
-
-                    agentResult = await runTask;
-                    if (preemptRequested)
-                        throw new OperationCanceledException(hostShutdownToken);
-
-                    if (supervision is not null)
-                    {
-                        var dispatcher = new SupervisedTurnDispatcher(
-                            runner, sandbox, SandboxConventions.WorkDir, credential,
-                            item.ModelId, item.ReasoningMode, stdoutCallback,
-                            captureStructuredStream: captureStructuredStream,
-                            promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
-                                item.Id, runner.Kind,
-                                isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
-                                iteration ?? 1, project, sandbox, raw, pct));
-                        agentResult = await supervision.RunPendingInjectionsAsync(
-                            agentResult, dispatcher.RunInjectionTurnAsync, runnerCts.Token);
-                    }
+                    var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
+                    lifecycleHandled = !string.IsNullOrEmpty(persisted?.SuspendedVmName);
                 }
-            }
-        }
-        catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
-        {
-            if (streamCapture is not null)
-                await streamCapture.DisposeAsync();
+                if (lifecycleHandled)
+                {
+                    _log.LogInformation(
+                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxShutdownTeardownService; skipping preempt-checkpoint and preserve to avoid racing the frozen, stopped, or disposed VM",
+                        item.Id, sandbox.Id);
+                    throw;
+                }
 
-            // R8-core: if SandboxShutdownTeardownService already took ownership
-            // of this VM during IHostedLifecycleService.StoppingAsync (which runs
-            // and completes BEFORE BackgroundService cancellation flows down as
-            // hostShutdownToken), either Suspend is preserving the frozen VM for
-            // SandboxResumeOnStartupService or Dispose is destroying the VM. The
-            // preempt-checkpoint flow would block on a frozen VM or fault against
-            // a deleted VM. Skip both the checkpoint and StopAndPreserveAsync in
-            // those lifecycle-owned cases.
-            //
-            // The signal is "did the shutdown teardown handler take ownership
-            // of this VM", NOT just ISuspendableSandbox.IsSuspended: the handler
-            // persists SuspendedVmName BEFORE awaiting multipass suspend, and on
-            // a per-VM suspend timeout it returns with the mapping still
-            // persisted while IsSuspended is left false (multipassd is still
-            // writing the RAM snapshot). Gating only on IsSuspended would let
-            // the legacy git-checkpoint + multipass-stop path race that
-            // in-flight suspend. Dispose mode sets the ownership flag before
-            // destroying the VM because in-VM checkpoint commands would fault
-            // after lifecycle teardown. Stop mode sets the flag only after a
-            // successful stop/preserve, and only for items whose state can
-            // recover without PipelineRunner creating a new preempt checkpoint.
-            // We re-read the store under CancellationToken.None (ct is already
-            // cancelled by host shutdown): on the per-VM suspend-timeout path the handler has
-            // persisted SuspendedVmName and returned while multipassd is still
-            // writing the snapshot and IsSuspended / IsOwnedByShutdownHandler may
-            // still be false on the sandbox instance, so the persisted mapping is
-            // the authoritative late signal.
-            var lifecycleHandled = sandbox is IShutdownTeardownSandbox teardownSandbox
-                && teardownSandbox.IsOwnedByShutdownHandler;
-            if (!lifecycleHandled)
-            {
-                var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
-                lifecycleHandled = !string.IsNullOrEmpty(persisted?.SuspendedVmName);
-            }
-            if (lifecycleHandled)
-            {
-                _log.LogInformation(
-                    "Work item {Id}: sandbox {SandboxId} was taken over by SandboxShutdownTeardownService; skipping preempt-checkpoint and preserve to avoid racing the frozen, stopped, or disposed VM",
-                    item.Id, sandbox.Id);
-                throw;
-            }
-
-            Exception? checkpointFailure = null;
-            try
-            {
-                using var checkpointCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                checkpointCts.CancelAfter(_opts.PreemptCheckpointDrain);
-                await CheckpointPreemptAsync(
-                    item,
-                    sandbox,
-                    branch,
-                    runner.Kind,
-                    ResolveObservedModelId(runner, item.ModelId),
-                    checkpointCts.Token);
-            }
-            catch (Exception ex)
-            {
-                checkpointFailure = ex;
-                _log.LogError(ex, "Preempt checkpoint failed for work item {Id}; preserving sandbox for operator recovery", item.Id);
-            }
-
-            Exception? preserveFailure = null;
-            if (sandbox is IPreemptibleSandbox preemptible)
-            {
-                using var preserveCts = new CancellationTokenSource(_opts.SandboxPreserveDrain);
+                Exception? checkpointFailure = null;
                 try
                 {
-                    await preemptible.StopAndPreserveAsync(preserveCts.Token);
-                }
-                catch (OperationCanceledException ex)
-                {
-                    preserveFailure = ex;
-                    _log.LogWarning(
-                        "Timed out preserving sandbox {SandboxId} for work item {Id} after {Timeout}",
-                        sandbox.Id, item.Id, _opts.SandboxPreserveDrain);
+                    using var checkpointCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    checkpointCts.CancelAfter(_opts.PreemptCheckpointDrain);
+                    await CheckpointPreemptAsync(
+                        item,
+                        sandbox,
+                        branch,
+                        runner.Kind,
+                        ResolveObservedModelId(runner, item.ModelId),
+                        checkpointCts.Token);
                 }
                 catch (Exception ex)
                 {
-                    preserveFailure = ex;
-                    _log.LogWarning(ex,
-                        "Failed preserving sandbox {SandboxId} for work item {Id} during host shutdown; leaving the checkpointed item recoverable and the VM for operator cleanup",
-                        sandbox.Id, item.Id);
+                    checkpointFailure = ex;
+                    _log.LogError(ex, "Preempt checkpoint failed for work item {Id}; preserving sandbox for operator recovery", item.Id);
                 }
+
+                Exception? preserveFailure = null;
+                if (sandbox is IPreemptibleSandbox preemptible)
+                {
+                    using var preserveCts = new CancellationTokenSource(_opts.SandboxPreserveDrain);
+                    try
+                    {
+                        await preemptible.StopAndPreserveAsync(preserveCts.Token);
+                    }
+                    catch (OperationCanceledException ex)
+                    {
+                        preserveFailure = ex;
+                        _log.LogWarning(
+                            "Timed out preserving sandbox {SandboxId} for work item {Id} after {Timeout}",
+                            sandbox.Id, item.Id, _opts.SandboxPreserveDrain);
+                    }
+                    catch (Exception ex)
+                    {
+                        preserveFailure = ex;
+                        _log.LogWarning(ex,
+                            "Failed preserving sandbox {SandboxId} for work item {Id} during host shutdown; leaving the checkpointed item recoverable and the VM for operator cleanup",
+                            sandbox.Id, item.Id);
+                    }
+                }
+
+                if (checkpointFailure is not null)
+                    throw new OperationCanceledException("Host shutdown interrupted work, but the preempt checkpoint could not be created.", checkpointFailure, hostShutdownToken);
+                if (preserveFailure is not null)
+                    throw new OperationCanceledException("Host shutdown interrupted work and created a preempt checkpoint, but preserving the sandbox failed.", preserveFailure, hostShutdownToken);
+
+                throw;
             }
-
-            if (checkpointFailure is not null)
-                throw new OperationCanceledException("Host shutdown interrupted work, but the preempt checkpoint could not be created.", checkpointFailure, hostShutdownToken);
-            if (preserveFailure is not null)
-                throw new OperationCanceledException("Host shutdown interrupted work and created a preempt checkpoint, but preserving the sandbox failed.", preserveFailure, hostShutdownToken);
-
-            throw;
-        }
-        finally
-        {
-            if (streamCapture is not null && !preemptRequested)
-                await streamCapture.DisposeAsync();
-            if (supervision is not null)
-                await supervision.DisposeAsync();
-        }
-        CodeyBoxMeters.AgentDuration.Record(agentExecScope.ElapsedMs,
-            new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
-            new KeyValuePair<string, object?>("phase", agentPhase));
-
-        var agentEndedAt = DateTimeOffset.UtcNow;
-        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
-        var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
-        if (!canCaptureStructuredStream)
-            await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
-        await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-            runner.Kind, item.AgentInstanceId, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
-        agentSw.Stop();
-        if (_availability is { } regOnFinish)
-        {
-            await RecordAvailabilityOutcomeAsync(
-                regOnFinish,
-                runner,
-                agentResult,
-                agentSw.Elapsed,
-                item,
-                project,
-                sandbox.Id,
-                agentPhase);
-        }
-        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed,
-            stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
-        // Always log a truncated tail of agent output, regardless of
-        // success. This is critical when an agent finishes "successfully"
-        // but produces no useful diff — without this log, we have no
-        // visibility into what the agent reasoned.
-        LogAgentOutput(_log, runner.Kind, agentResult);
-        if (!agentResult.Success)
-        {
-            // Per-provider detector (registered as IQuotaFailureClassifier) inspects
-            // stderr/stdout and structured stream events. Per-CLI classification +
-            // reset-window parsing now live in the per-provider library.
-            _quotaAuditEmitter.EmitAdvisoryAuditEvents(
-                runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
-            var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
-            if (detection is not null)
+            finally
             {
+                if (streamCapture is not null && !preemptRequested)
+                    await streamCapture.DisposeAsync();
+                if (supervision is not null)
+                    await supervision.DisposeAsync();
+            }
+            CodeyBoxMeters.AgentDuration.Record(agentExecScope.ElapsedMs,
+                new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+                new KeyValuePair<string, object?>("phase", agentPhase));
+
+            var agentEndedAt = DateTimeOffset.UtcNow;
+            var observedModelId = ResolveObservedModelId(runner, item.ModelId);
+            var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
+            if (!canCaptureStructuredStream)
+                await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
+            await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
+                runner.Kind, item.AgentInstanceId, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
+            agentSw.Stop();
+            if (_availability is { } regOnFinish)
+            {
+                await RecordAvailabilityOutcomeAsync(
+                    regOnFinish,
+                    runner,
+                    agentResult,
+                    agentSw.Elapsed,
+                    item,
+                    project,
+                    sandbox.Id,
+                    agentPhase);
+            }
+            AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed,
+                stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
+            // Always log a truncated tail of agent output, regardless of
+            // success. This is critical when an agent finishes "successfully"
+            // but produces no useful diff — without this log, we have no
+            // visibility into what the agent reasoned.
+            LogAgentOutput(_log, runner.Kind, agentResult);
+            if (!agentResult.Success)
+            {
+                // Per-provider detector (registered as IQuotaFailureClassifier) inspects
+                // stderr/stdout and structured stream events. Per-CLI classification +
+                // reset-window parsing now live in the per-provider library.
+                _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                    runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
+                var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
+                if (detection is not null)
+                {
+                    await _quotaClassifier.RecordIfQuotaFailureAsync(
+                        _quotaFailures,
+                        runner.Kind,
+                        observedModelId,
+                        agentResult.Summary,
+                        agentResult.Stderr,
+                        agentEndedAt,
+                        _auditQuotaOptions.ObservedFailureRetention,
+                        ct,
+                        projectId: item.ProjectId,
+                        stdout: agentResult.Stdout);
+
+                    var quotaKind = detection?.Kind ?? QuotaFailureKind.RateLimitExceeded;
+                    throw new TerminalQuotaError(quotaKind,
+                        $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}",
+                        detection?.ResetAt);
+                }
+
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     runner.Kind,
@@ -3000,153 +3393,290 @@ public sealed class PipelineRunner : IPipelineRunner
                     projectId: item.ProjectId,
                     stdout: agentResult.Stdout);
 
-                var quotaKind = detection?.Kind ?? QuotaFailureKind.RateLimitExceeded;
-                throw new TerminalQuotaError(quotaKind,
-                    $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}",
-                    detection?.ResetAt);
+                // Redact and truncate agent-controlled output before it reaches
+                // LastError, audit persistence, webhooks, or API responses via the
+                // exception message chain.
+                var detail = string.Join("\n",
+                    new[] {
+                        $"Agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                        !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
+                        !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
+                    }.Where(s => s is not null));
+                throw new InvalidOperationException(detail);
             }
 
-            await _quotaClassifier.RecordIfQuotaFailureAsync(
-                _quotaFailures,
-                runner.Kind,
-                observedModelId,
-                agentResult.Summary,
-                agentResult.Stderr,
-                agentEndedAt,
-                _auditQuotaOptions.ObservedFailureRetention,
-                ct,
-                projectId: item.ProjectId,
-                stdout: agentResult.Stdout);
-
-            // Redact and truncate agent-controlled output before it reaches
-            // LastError, audit persistence, webhooks, or API responses via the
-            // exception message chain.
-            var detail = string.Join("\n",
-                new[] {
-                    $"Agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
-                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
-                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
-                }.Where(s => s is not null));
-            throw new InvalidOperationException(detail);
-        }
-
-        if (resumingPreempt)
-        {
-            await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv =
-                [
-                    "sh", "-c",
-                    "rm -f .codeybox/preempt-scratchpad.tgz .codeybox/preempt-scratchpad.md"
-                ],
-                WorkingDirectory = SandboxConventions.WorkDir,
-            }, ct);
-        }
-
-        // Stage anything the agent left dirty in the working tree. If the
-        // agent already committed (per the rework prompt's instruction
-        // to make new commits), `git add -A` is a no-op.
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
-
-        // Read the suggestions file BEFORE stripping it from the staged tree
-        // so we capture it even when the agent staged it alongside real changes.
-        // Only the work phase (isInitial) emits suggestions; rework does not.
-        string? suggestionsJson = null;
-        if (isInitial)
-            suggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
-
-        // Strip suggestions.json from the staged tree so it is never committed
-        // to the work branch, regardless of whether the agent staged it.
-        // Use separate argv so ProcessSandbox translates the -C path correctly.
-        // Ignore the exit code: git rm --cached exits 128 when the file is not tracked.
-        await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
-                ".codeybox/suggestions.json"],
-        }, ct);
-
-        var staged = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
-        }, ct);
-        // diff --cached --quiet exits 0 on no-diff, 1 on diff.
-        var hasStagedDiff = staged.ExitCode != 0;
-
-        if (hasStagedDiff)
-        {
-            var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct,
-                promptRevisionAtDispatch: promptRevisionAtDispatch);
-            var commitMessage = isInitial
-                ? $"codeybox: {item.Title}\n\n{trailerBlock}"
-                : $"codeybox rework: address audit findings\n\n{trailerBlock}";
-            await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit",
-                activitySource: CodeyBoxActivities.Sandbox, log: _log))
-            {
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
-            }
-        }
-
-        // Did HEAD advance — either via the agent committing itself or
-        // via our just-now commit?
-        var afterHead = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
-        }, ct);
-        if (!afterHead.Success)
-            throw new InvalidOperationException($"Failed to read HEAD after agent: {afterHead.Stderr}");
-        var shaAfter = afterHead.Stdout.Trim();
-        if (string.Equals(shaBefore, shaAfter, StringComparison.Ordinal))
-        {
             if (resumingPreempt)
             {
-                await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",
-                    activitySource: CodeyBoxActivities.Sandbox, log: _log))
+                await sandbox.ExecAsync(new SandboxExec
                 {
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
-                }
-
-                if (isInitial && suggestionsJson is not null)
-                    await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
-
-                await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
-                return agentResult.Stdout;
+                    Argv =
+                    [
+                        "sh", "-c",
+                    "rm -f .codeybox/preempt-scratchpad.tgz .codeybox/preempt-scratchpad.md"
+                    ],
+                    WorkingDirectory = SandboxConventions.WorkDir,
+                }, ct);
             }
 
-            if (checkedOutExistingBranch)
-                await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+            // Stage anything the agent left dirty in the working tree. If the
+            // agent already committed (per the rework prompt's instruction
+            // to make new commits), `git add -A` is a no-op.
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
 
-            var msg = isInitial
-                ? "Agent produced no changes to commit"
-                : "Rework agent produced no changes; cannot resolve audit findings";
-            throw new InvalidOperationException(msg);
+            // Read the suggestions file BEFORE stripping it from the staged tree
+            // so we capture it even when the agent staged it alongside real changes.
+            // Only the work phase (isInitial) emits suggestions; rework does not.
+            string? suggestionsJson = null;
+            if (isInitial)
+                suggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
+
+            // Strip suggestions.json from the staged tree so it is never committed
+            // to the work branch, regardless of whether the agent staged it.
+            // Use separate argv so ProcessSandbox translates the -C path correctly.
+            // Ignore the exit code: git rm --cached exits 128 when the file is not tracked.
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
+                ".codeybox/suggestions.json"],
+            }, ct);
+
+            var staged = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
+            }, ct);
+            // diff --cached --quiet exits 0 on no-diff, 1 on diff.
+            var hasStagedDiff = staged.ExitCode != 0;
+
+            if (hasStagedDiff)
+            {
+                var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct,
+                    promptRevisionAtDispatch: promptRevisionAtDispatch);
+                var commitMessage = isInitial
+                    ? $"codeybox: {item.Title}\n\n{trailerBlock}"
+                    : $"codeybox rework: address audit findings\n\n{trailerBlock}";
+                await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit",
+                    activitySource: CodeyBoxActivities.Sandbox, log: _log))
+                {
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+                }
+            }
+
+            // Did HEAD advance — either via the agent committing itself or
+            // via our just-now commit?
+            var afterHead = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+            }, ct);
+            if (!afterHead.Success)
+                throw new InvalidOperationException($"Failed to read HEAD after agent: {afterHead.Stderr}");
+            var shaAfter = afterHead.Stdout.Trim();
+            if (string.Equals(shaBefore, shaAfter, StringComparison.Ordinal))
+            {
+                if (resumingPreempt)
+                {
+                    await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",
+                        activitySource: CodeyBoxActivities.Sandbox, log: _log))
+                    {
+                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
+                    }
+
+                    if (isInitial && suggestionsJson is not null)
+                        await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+
+                    await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+                    return agentResult.Stdout;
+                }
+
+                if (checkedOutExistingBranch)
+                    await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+
+                var msg = isInitial
+                    ? "Agent produced no changes to commit"
+                    : "Rework agent produced no changes; cannot resolve audit findings";
+                throw new InvalidOperationException(msg);
+            }
+
+            // Stamp the CodeyBox trailers on HEAD if the agent forgot to emit them.
+            // The dispatch revision is orchestrator-owned state — delegating it to
+            // the agent's commit-hygiene is unreliable in practice, and a missing
+            // trailer would block the post-work audit on a purely mechanical
+            // triviality. Skipped when the operator updated the prompt
+            // mid-iteration so the auditor still surfaces the stale-prompt signal.
+            await EnsureHeadCarriesPromptRevisionTrailerAsync(
+                sandbox, item, runner.Kind, observedModelId,
+                promptRevisionAtDispatch, agentPhase, ct);
+
+            await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log))
+            {
+                await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
+            }
+
+            // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
+            if (isInitial && suggestionsJson is not null)
+                await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+
+            await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+
+            phaseSucceeded = true;
+            return agentResult.Stdout;
         }
-
-        // Stamp the CodeyBox trailers on HEAD if the agent forgot to emit them.
-        // The dispatch revision is orchestrator-owned state — delegating it to
-        // the agent's commit-hygiene is unreliable in practice, and a missing
-        // trailer would block the post-work audit on a purely mechanical
-        // triviality. Skipped when the operator updated the prompt
-        // mid-iteration so the auditor still surfaces the stale-prompt signal.
-        await EnsureHeadCarriesPromptRevisionTrailerAsync(
-            sandbox, item, runner.Kind, observedModelId,
-            promptRevisionAtDispatch, agentPhase, ct);
-
-        await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo",
-            activitySource: CodeyBoxActivities.Sandbox, log: _log))
+        finally
         {
-            await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
+            if (sandboxOwnedByPhase)
+            {
+                // Legacy independent-phase pipeline: the sandbox is per-phase,
+                // dispose it now (matches the original `await using var sandbox`
+                // behaviour).
+                try
+                {
+                    await sandbox.DisposeAsync();
+                }
+                catch
+                {
+                    // Best-effort disposal — the outer exception (if any) is
+                    // the meaningful failure.
+                }
+            }
+            else if (useClaudeSession)
+            {
+                if (phaseSucceeded)
+                {
+                    // Session-mode success path: suspend the worker VM so the
+                    // (long) audit phase doesn't burn host resources holding an
+                    // idle worker, while preserving the in-VM transcript and the
+                    // server-side prompt cache (within its TTL) for the next
+                    // rework turn. On failure we MUST NOT silently swallow: a
+                    // failed multipass stop/resume boundary is exactly the
+                    // session-mode acceptance criterion the brief lists as
+                    // non-negotiable. Surface the failure to operators via the
+                    // audit log and a webhook, then close the lifecycle so:
+                    //   (a) the worker VM is torn down before the long audit
+                    //       (no idle VM holding host resources), and
+                    //   (b) the next rework turn falls back to the legacy
+                    //       fresh-sandbox path (RunAgentPhaseAsync checks
+                    //       IsClosed to opt out of the session branch).
+                    try
+                    {
+                        await sessionLifecycle!.SuspendAsync(CancellationToken.None);
+                    }
+                    catch (Exception suspendEx)
+                    {
+                        var sessionIdForLog = sessionLifecycle!.Handle.SessionId;
+                        AuditLog.ClaudeSessionSuspendFailed(item.Id, sessionIdForLog, suspendEx.Message);
+                        _log.LogWarning(suspendEx,
+                            "ClaudeSessionLifecycle.SuspendAsync failed for work item {Id} session {SessionId}; closing the session and degrading to legacy fresh-sandbox rework",
+                            item.Id, sessionIdForLog);
+                        try
+                        {
+                            await _webhooks.PublishAsync(new WebhookEvent
+                            {
+                                Event = "agent.claude_session_suspend_failed",
+                                WorkItem = item,
+                                Project = project,
+                                Details = new
+                                {
+                                    workItemId = item.Id.ToString(),
+                                    sessionId = sessionIdForLog,
+                                    reason = suspendEx.Message,
+                                },
+                            }, CancellationToken.None);
+                        }
+                        catch
+                        {
+                            // Webhook delivery is best-effort; the audit log is
+                            // the durable surface.
+                        }
+                        await CloseAmbientClaudeSessionAsync(
+                            sessionLifecycle!,
+                            item,
+                            project,
+                            "suspend failed before audit");
+                        _ambientSessionLifecycle.Value = null;
+                    }
+                }
+                else
+                {
+                    await CloseAmbientClaudeSessionAsync(
+                        sessionLifecycle!,
+                        item,
+                        project,
+                        "session-backed attempt failed before phase success");
+                    _ambientSessionLifecycle.Value = null;
+                }
+            }
         }
+    }
 
-        // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
-        if (isInitial && suggestionsJson is not null)
-            await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+    private static async Task<AgentResult> RunClaudeSessionSupervisedTurnsAsync(
+        ClaudeSessionLifecycle sessionLifecycle,
+        IAgentSupervisionSession supervision,
+        string prompt,
+        Action<string>? stdoutCallback,
+        Func<string, CancellationToken, Task<string>> promptPreprocessor,
+        CancellationToken ct)
+    {
+        var supervisedStdout = supervision.WrapStdoutCallback(stdoutCallback);
+        await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, ct)
+            .ConfigureAwait(false);
 
-        await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+        var agentResult = await sessionLifecycle.SendTurnAsync(prompt, ct, supervisedStdout)
+            .ConfigureAwait(false);
 
-        return agentResult.Stdout;
+        return await supervision.RunPendingInjectionsAsync(
+                agentResult,
+                async (turn, turnCt) =>
+                {
+                    var turnPrompt = await promptPreprocessor(turn.Prompt, turnCt).ConfigureAwait(false);
+                    return await sessionLifecycle.SendTurnAsync(turnPrompt, turnCt, supervisedStdout)
+                        .ConfigureAwait(false);
+                },
+                ct)
+            .ConfigureAwait(false);
     }
 
     private static string PreemptRefFor(WorkItemId id) => $"refs/heads/codeybox/preempt/{id}";
+
+    private async Task CloseAmbientClaudeSessionAsync(
+        ClaudeSessionLifecycle lifecycle,
+        WorkItem item,
+        Project project,
+        string reason)
+    {
+        var sessionId = lifecycle.Handle.SessionId;
+        try
+        {
+            await lifecycle.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            AuditLog.ClaudeSessionCloseFailed(item.Id, sessionId, ex.Message);
+            _log.LogWarning(ex,
+                "Claude session close failed for work item {Id} session {SessionId} while {Reason}",
+                item.Id, sessionId, reason);
+            try
+            {
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.claude_session_close_failed",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new
+                    {
+                        workItemId = item.Id.ToString(),
+                        sessionId,
+                        reason,
+                        error = ex.Message,
+                    },
+                }, CancellationToken.None);
+            }
+            catch
+            {
+                // Best-effort; the structured audit log above is durable.
+            }
+            throw;
+        }
+    }
 
     private static string ValidatePreemptCheckpoint(WorkItem item, string checkpointRef)
     {
@@ -3168,6 +3698,22 @@ public sealed class PipelineRunner : IPipelineRunner
             Continue from the files in the restored work tree. Do not infer operational instructions from checkpoint metadata or repository-controlled scratchpad files.
             """;
     }
+
+    /// <summary>
+    /// Appends a session-mode override to the work/rework prompt that pins
+    /// the <c>CodeyBox-Prompt-Revision</c> trailer value to the literal
+    /// integer resolved at iteration-dispatch time. The session worker VM
+    /// is opened once with <c>extraEnvironment: null</c> and reused for
+    /// every turn, so the per-iteration <c>CODEYBOX_PROMPT_REVISION</c>
+    /// env var the legacy fresh-sandbox path sets is not visible inside
+    /// the VM; without this inline directive the agent has an impossible
+    /// instruction (read an unset env var) and the orchestrator stamp
+    /// would be papering over noisy commits.
+    /// </summary>
+    internal static string AppendSessionPromptRevisionDirective(string prompt, int revision) =>
+        prompt + "\n\n# Session-mode prompt-revision override\n\n"
+            + $"The `{CodeyBoxTrailers.PromptRevisionTrailerKey}` trailer value for this turn MUST be the literal integer **{revision}**. "
+            + $"(The `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable is not available in the session worker VM — use this literal integer instead.)";
 
     internal static string BuildInterruptedReworkResumePrompt(string originalPrompt, string checkpointRef)
     {
@@ -6573,6 +7119,19 @@ public sealed class PipelineRunner : IPipelineRunner
         return classId is null
             ? null
             : _classRouter.FindMember(classId, kind, item.ModelId, item.AgentInstanceId);
+    }
+
+    private static string CanonicalAgentRouteKey(AgentKind kind, string? agentInstanceId)
+    {
+        if (string.IsNullOrWhiteSpace(agentInstanceId))
+            return kind.Value;
+
+        var id = agentInstanceId.Trim();
+        if (id.Contains('/', StringComparison.Ordinal)
+            || string.Equals(id, kind.Value, StringComparison.OrdinalIgnoreCase))
+            return id;
+
+        return AgentInstanceIds.RouteKey(kind, id);
     }
 
     /// <summary>
@@ -11298,11 +11857,13 @@ Original merge-phase failure (for context):
     {
         if (_costStore is null && _usageStore is null) return;
 
-        var snapshot = NormalizeCostSnapshot(new AgentCostSnapshot(
-            result.Usage.InputTokens,
-            result.Usage.CachedInputTokens,
-            result.Usage.OutputTokens,
-            result.ModelId), result.ModelId);
+        var snapshot = NormalizeCostSnapshot(
+            new AgentCostSnapshot(
+                result.Usage.InputTokens,
+                result.Usage.CachedInputTokens,
+                result.Usage.OutputTokens,
+                result.ModelId),
+            result.ModelId);
 
         var usd = 0m;
         if (_costCalculator is not null)

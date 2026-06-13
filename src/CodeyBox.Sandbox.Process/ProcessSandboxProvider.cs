@@ -138,7 +138,7 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
     internal static string MapToHostPathInternal(string root, string sandboxPath) => MapToHostPath(root, sandboxPath);
 }
 
-internal sealed class ProcessSandbox : IPreemptibleSandbox
+internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox
 {
     private readonly string _root;
     private readonly SandboxSpec _spec;
@@ -394,6 +394,8 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
         _preserved = true;
         return Task.CompletedTask;
     }
+
+    public void DisablePreserveOnDispose() => _preserved = false;
 
     private static void RemoveTreeSafely(string path)
     {

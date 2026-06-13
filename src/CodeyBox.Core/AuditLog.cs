@@ -1157,8 +1157,8 @@ public static class AuditLog
                 summary, stderr ?? "none");
 
     /// <summary>
-    /// Emitted by <c>CodeyBox.Agents.Claude.ClaudeSessionWorker</c> when it
-    /// degrades the active transport for a session from ACP to print at
+    /// Emitted by the Claude session runner when it degrades the active
+    /// transport for a session from ACP to print at
     /// runtime — either because the ACP transport could not open at session
     /// start or because a turn surfaced an
     /// <c>AcpTransportUnavailableException</c>. The work item is NOT
@@ -1185,6 +1185,28 @@ public static class AuditLog
             .Warning(
                 "Session-resume liveness probe failed unexpectedly for {Agent}: {ExceptionType}: {Message}",
                 agent.Value, exceptionType, message);
+
+    /// <summary>
+    /// Emitted by <c>PipelineRunner</c> when <c>ClaudeSessionLifecycle.SuspendAsync</c>
+    /// throws between a worker turn and the audit phase. The session is then
+    /// closed so the long audit does not run with an idle worker VM still
+    /// holding host resources, and the next rework turn degrades to the
+    /// legacy fresh-sandbox path. Surfacing this is a session-mode acceptance
+    /// criterion: a silent swallow would hide the multipass stop/resume
+    /// boundary failure from operators.
+    /// </summary>
+    public static void ClaudeSessionSuspendFailed(WorkItemId itemId, string sessionId, string reason) =>
+        Audit("agent.claude_session_suspend_failed")
+            .Warning(
+                "Claude session suspend failed for work item {WorkItemId} session {SessionId}: {Reason}. " +
+                "Closing the session and degrading to the legacy fresh-sandbox rework path.",
+                itemId, sessionId, reason);
+
+    public static void ClaudeSessionCloseFailed(WorkItemId itemId, string sessionId, string reason) =>
+        Audit("agent.claude_session_close_failed")
+            .Warning(
+                "Claude session close failed for work item {WorkItemId} session {SessionId}: {Reason}",
+                itemId, sessionId, reason);
 
     // ── Live agent supervision ───────────────────────────────────────────────
 

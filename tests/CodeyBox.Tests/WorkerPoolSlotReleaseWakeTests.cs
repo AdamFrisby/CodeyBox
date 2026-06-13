@@ -162,7 +162,15 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
         using var registry = new CancellationRegistry(CancellationToken.None);
-        var capRetryDelay = TimeSpan.FromMilliseconds(750);
+        // Use a long cap-retry window so the deferral timer cannot fire during
+        // the quiet-window assertion below even when the CI host is heavily
+        // loaded. A short window (e.g. 750ms) races against test setup +
+        // polling overhead: ScheduleDeferredRequeue removes the id from
+        // _deferredItems BEFORE the re-enqueue, so a timer that fires within
+        // the assertion window can make IsDeferredForTest read false while
+        // EnqueueCount is briefly still 1 (audit observed this exact race at
+        // ~806ms, right at the prior 750ms boundary).
+        var capRetryDelay = TimeSpan.FromSeconds(5);
         var concurrency = new AgentConcurrencyOptions
         {
             Members = { ["codex"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } },
@@ -199,7 +207,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         Assert.True(svc.IsDeferredForTest(item.Id));
 
         Assert.True(
-            await WaitUntilAsync(() => queue.EnqueueCount(item.Id) > 1, TimeSpan.FromSeconds(2)),
+            await WaitUntilAsync(() => queue.EnqueueCount(item.Id) > 1, capRetryDelay + TimeSpan.FromSeconds(2)),
             "The item-specific retry should occur only when the configured cap deferral interval fires.");
 
         svc.ReleaseAgentSlotForTest(AgentKind.Codex);

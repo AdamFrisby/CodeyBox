@@ -45,7 +45,7 @@ namespace CodeyBox.Agents.Claude;
 /// global <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>) regardless
 /// of which transport is in use.</para>
 /// </summary>
-public sealed class ClaudeSessionWorker : ISessionAgentRunner
+public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredentialRefreshableSessionAgentRunner
 {
     /// <summary>
     /// Metadata key under <see cref="AgentSessionHandle.Metadata"/> carrying
@@ -204,6 +204,23 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
         => OpenSessionAsync(sandbox, workingDirectory, credential, modelId, reasoningMode,
             projectId: null, agentClassMember: null, ct: ct);
 
+    /// <inheritdoc/>
+    public Task<AgentSessionHandle> OpenSessionAsync(
+        AgentSessionOpenRequest request,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return OpenSessionAsync(
+            request.Sandbox,
+            request.WorkingDirectory,
+            request.Credential,
+            request.ModelId,
+            request.ReasoningMode,
+            request.ProjectId,
+            request.AgentClassMember,
+            ct);
+    }
+
     /// <summary>
     /// Override for callers that know the dispatch context. <paramref name="projectId"/> and
     /// <paramref name="agentClassMember"/> are matched against
@@ -346,6 +363,37 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
     }
 
     /// <inheritdoc/>
+    public async Task RefreshSessionCredentialAsync(
+        AgentSessionHandle sessionHandle,
+        AgentCredential? credential,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(sessionHandle);
+        EnsureKind(sessionHandle);
+        ct.ThrowIfCancellationRequested();
+
+        if (credential is not null && credential.Agent != Kind)
+        {
+            throw new InvalidOperationException(
+                $"Credential refresh supplied credentials for '{credential.Agent}', not '{Kind}'.");
+        }
+
+        var state = await ResolveStateAsync(sessionHandle, ct).ConfigureAwait(false);
+        await state.Gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ThrowIfClosed(state);
+            state.Credential = credential;
+            if (state.TransportSession is ICredentialRefreshableClaudeTransportSession refreshable)
+                refreshable.RefreshCredential(credential);
+        }
+        finally
+        {
+            state.Gate.Release();
+        }
+    }
+
+    /// <inheritdoc/>
     public async Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(sessionHandle);
@@ -439,6 +487,8 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             try { await state.TransportSession.DisposeAsync().ConfigureAwait(false); }
             catch (OperationCanceledException) { throw; }
             catch { /* Transport teardown must not strand */ }
+            if (state.Sandbox is IPreserveOnDisposeSandbox preserveOnDispose)
+                preserveOnDispose.DisablePreserveOnDispose();
             await state.Sandbox.DisposeAsync().ConfigureAwait(false);
             state.Closed = true;
             _closedSessions[sessionHandle.SessionId] = 0;
@@ -474,9 +524,15 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             metadata.Remove(CliSessionIdMetadataKey);
 
         if (state.FallbackToFresh)
+        {
             metadata[FallbackMetadataKey] = "true";
+            metadata[AgentSessionMetadataKeys.FallbackToOneShot] = "true";
+        }
         else
+        {
             metadata.Remove(FallbackMetadataKey);
+            metadata.Remove(AgentSessionMetadataKeys.FallbackToOneShot);
+        }
 
         if (state.DegradedFromAcp)
             metadata[AcpFallbackToPrintMetadataKey] = "true";
@@ -787,7 +843,7 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
 
         public SemaphoreSlim Gate { get; } = new(1, 1);
         public ISandbox Sandbox { get; }
-        public AgentCredential? Credential { get; }
+        public AgentCredential? Credential { get; set; }
         public IClaudeTransport ActiveTransport { get; set; }
         public IClaudeTransportSession TransportSession { get; set; }
         public string? CapturedSessionId { get; set; }

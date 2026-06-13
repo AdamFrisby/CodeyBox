@@ -47,6 +47,26 @@ public sealed class ProjectConfig
     public int? MaxPriority { get; set; }
 
     public bool? GraphicalSandbox { get; set; }
+
+    /// <summary>
+    /// Per-project Claude resumable-session worker opt-in. Maps to
+    /// <see cref="CodeyBox.Core.Project.ClaudeSession"/>. Null = the project
+    /// keeps the legacy per-phase fresh-sandbox pipeline.
+    /// </summary>
+    public ProjectClaudeSessionConfigOptions? ClaudeSession { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for <see cref="CodeyBox.Core.ProjectClaudeSessionConfig"/>.
+/// Lives under <c>CodeyBox:Projects:&lt;id&gt;:ClaudeSession</c>.
+/// </summary>
+public sealed class ProjectClaudeSessionConfigOptions
+{
+    /// <summary>
+    /// Per-project opt-in for the resumable Claude session worker. Composes
+    /// with the global <c>CodeyBox:ClaudeSession:Enabled</c> flag. Null = false.
+    /// </summary>
+    public bool? Enabled { get; set; }
 }
 
 /// <summary>

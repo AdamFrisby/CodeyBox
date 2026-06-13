@@ -4522,7 +4522,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5098,6 +5098,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
 
         await WaitForStoppedAfterPreserveAsync(ct);
     }
+
+    public void DisablePreserveOnDispose() => _preserveOnDispose = false;
 
     private async Task TryWritePreemptMarkerAsync(CancellationToken ct)
     {
