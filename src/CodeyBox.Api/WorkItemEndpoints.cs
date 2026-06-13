@@ -2144,7 +2144,8 @@ public sealed record CreateWorkItemRequest(
 public sealed record CheckAndActRequest(
     string Question,
     OnYesActionRequest OnYes,
-    bool? ActionableAnswer = null);
+    bool? ActionableAnswer = null,
+    string? Mode = null);
 
 /// <summary>
 /// Request payload for the follow-up work item the orchestrator should

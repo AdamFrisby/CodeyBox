@@ -147,7 +147,8 @@ internal static class TaskTemplateEndpoints
                     Agent: onYes.Agent,
                     AgentClassId: onYes.AgentClassId,
                     DependsOn: onYes.DependsOn),
-                ActionableAnswer: entry.ActionableAnswer));
+                ActionableAnswer: entry.ActionableAnswer,
+                Mode: entry.Mode));
     }
 
     private static string BuildGeneratedTitle(int entryIndex, string question)

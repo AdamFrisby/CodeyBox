@@ -25,6 +25,7 @@ internal sealed record TaskTemplateCheck(
     string Question,
     TaskTemplateOnYesAction OnYes,
     bool? ActionableAnswer = null,
+    string? Mode = null,
     string? Title = null,
     string? Prompt = null);
 
@@ -249,6 +250,8 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
             throw new TaskTemplateLoadException($"{prefix}.question is required");
         if (check.Question.Length > 64 * 1024)
             throw new TaskTemplateLoadException($"{prefix}.question must be <= 64KB");
+        if (!CheckAndActModes.TryNormalise(check.Mode, out var mode))
+            throw new TaskTemplateLoadException($"{prefix}.mode must be 'agentic' or 'completion'");
         if (check.OnYes is null)
             throw new TaskTemplateLoadException($"{prefix}.onYes is required");
 
@@ -284,6 +287,7 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
         return check with
         {
             Question = check.Question.Trim(),
+            Mode = mode,
             Title = string.IsNullOrWhiteSpace(check.Title) ? null : check.Title.Trim(),
             Prompt = string.IsNullOrWhiteSpace(check.Prompt) ? null : check.Prompt,
             OnYes = onYes with

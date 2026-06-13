@@ -27,6 +27,39 @@ public sealed class CheckAndActParserTests
     }
 
     [Fact]
+    public void BuildCompletionPromptBlocks_UsesStableCacheableSystemAndReviewPrefix()
+    {
+        var reviewContext = """
+            Base branch: main
+
+            ### File: src/Foo.cs
+
+            var sql = $"select * from users where id = {id}";
+            """;
+        var first = CheckAndActPipeline.BuildCompletionPromptBlocks(new CheckAndActSpec
+        {
+            Question = "Is user input interpolated into SQL?",
+            OnYes = new OnYesActionSpec { Title = "Fix SQL", Prompt = "Use parameters." },
+        }, reviewContext);
+        var second = CheckAndActPipeline.BuildCompletionPromptBlocks(new CheckAndActSpec
+        {
+            Question = "Does this diff introduce poorly named variables?",
+            OnYes = new OnYesActionSpec { Title = "Rename", Prompt = "Improve names." },
+        }, reviewContext);
+
+        Assert.Equal(first.CacheablePrefix, second.CacheablePrefix);
+        Assert.DoesNotContain("poorly named variables", first.CacheablePrefix);
+        Assert.Contains("[1: fixed generic system prompt]", first.Render());
+        Assert.Contains("[2: the code/diff under review]", first.Render());
+        Assert.Contains("[3: the specific check question]", first.Render());
+        Assert.Contains(reviewContext.Trim(), first.ReviewBlock);
+        Assert.Contains("Is user input interpolated into SQL?", first.QuestionBlock);
+        Assert.Contains(CheckAndActPipeline.StartSentinel, first.QuestionBlock);
+        Assert.Contains(CheckAndActPipeline.EndSentinel, first.QuestionBlock);
+        Assert.Contains("no-tools", first.SystemBlock);
+    }
+
+    [Fact]
     public void TryParse_HappyPath_ParsesAnswerEvidenceConfidence()
     {
         var stdout = $$"""

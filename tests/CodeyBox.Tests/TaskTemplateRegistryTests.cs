@@ -21,6 +21,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
               "checks": [
                 {
                   "question": "Is user input interpolated into SQL?",
+                  "mode": "completion",
                   "onYes": {
                     "title": "Fix SQL injection",
                     "prompt": "Replace unsafe SQL construction with parameters."
@@ -44,6 +45,8 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         Assert.Equal("security", loaded.Name);
         Assert.Equal(2, loaded.Checks.Count);
         Assert.Equal("Is user input interpolated into SQL?", loaded.Checks[0].Question);
+        Assert.Equal("completion", loaded.Checks[0].Mode);
+        Assert.Equal("agentic", loaded.Checks[1].Mode);
         Assert.False(loaded.Checks[1].ActionableAnswer);
 
         await File.WriteAllTextAsync(path, """
@@ -196,6 +199,8 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         yield return Case("""{"checks":{}}""", "checks must be an array");
         yield return Case("""{"checks":[]}""", "at least one");
         yield return Case("""{"checks":[{"question":"q"}]}""", ".onYes is required");
+        yield return Case("""{"checks":[{"question":"q","mode":"tools","onYes":{"title":"Fix","prompt":"Prompt"}}]}""",
+            ".mode must be 'agentic' or 'completion'");
         yield return Case("""{"checks":[{"question":"q","onYes":{"prompt":"Prompt"}}]}""",
             ".onYes.title is required");
         yield return Case(TemplateWithCheck(

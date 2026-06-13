@@ -15,6 +15,14 @@ public sealed record CheckAndActSpec
     public required string Question { get; init; }
 
     /// <summary>
+    /// Execution mode for the check phase. <c>agentic</c> preserves the existing
+    /// coding-agent-in-sandbox path; <c>completion</c> uses a single no-tools LLM
+    /// completion and falls back to <c>agentic</c> when no account-safe completion
+    /// provider is configured.
+    /// </summary>
+    public string Mode { get; init; } = CheckAndActModes.Agentic;
+
+    /// <summary>
     /// Which boolean answer triggers the on-yes action. Defaults to <c>true</c>
     /// — the common "if vulnerable, fix" / "if missing, add" shape. Set to
     /// <c>false</c> to act on a "no" answer (e.g. "no tests cover X → write tests").
@@ -26,6 +34,33 @@ public sealed record CheckAndActSpec
     /// <see cref="ActionableAnswer"/>. Required when the check item is created.
     /// </summary>
     public required OnYesActionSpec OnYes { get; init; }
+}
+
+public static class CheckAndActModes
+{
+    public const string Agentic = "agentic";
+    public const string Completion = "completion";
+
+    public static bool TryNormalise(string? raw, out string mode)
+    {
+        mode = Agentic;
+        if (string.IsNullOrWhiteSpace(raw))
+            return true;
+
+        var trimmed = raw.Trim();
+        if (string.Equals(trimmed, Agentic, StringComparison.OrdinalIgnoreCase))
+        {
+            mode = Agentic;
+            return true;
+        }
+        if (string.Equals(trimmed, Completion, StringComparison.OrdinalIgnoreCase))
+        {
+            mode = Completion;
+            return true;
+        }
+
+        return false;
+    }
 }
 
 /// <summary>

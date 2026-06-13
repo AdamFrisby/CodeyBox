@@ -462,6 +462,59 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     }
 
     [Fact]
+    public async Task CompletionModeCheckPhase_WritesCompletionCostAndUsageRows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        var completion = new ScriptedCompletionRunner(new CheckAndActCompletionResult(
+            CheckAndActCompletionProviders.GeminiOAuth,
+            AgentKind.Gemini,
+            "gemini-2.5-pro",
+            BuildVerdictStdout(false, "completion inspected README.md"),
+            new CheckAndActCompletionUsage(
+                InputTokens: 17,
+                CachedInputTokens: 83,
+                OutputTokens: 5,
+                CacheHit: true)));
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            checkCompletionRunner: completion);
+
+        var baseCheck = NewCheckAndActItem("feature/check-completion-cost");
+        var check = baseCheck with
+        {
+            Check = baseCheck.Check! with { Mode = CheckAndActModes.Completion },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var checkRow = Assert.Single(costStore.Recorded, r => r.Phase == "check");
+        Assert.Equal("gemini", checkRow.AgentKind);
+        Assert.Equal("gemini-2.5-pro", checkRow.ModelId);
+        Assert.Equal(17, checkRow.InputTokens);
+        Assert.Equal(83, checkRow.CachedInputTokens);
+        Assert.Equal(5, checkRow.OutputTokens);
+        Assert.True(checkRow.HasExtractedTokenUsage);
+        Assert.Contains("check_and_act_completion", checkRow.RawMetadataJson);
+        Assert.Contains("\"cacheHit\":true", checkRow.RawMetadataJson);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.Phase == "check");
+        Assert.Equal(check.Id.ToString(), usage.WorkItemId);
+        Assert.Equal("gemini", usage.AgentKind);
+        Assert.Equal("gemini-2.5-pro", usage.ModelId);
+        Assert.Equal(17, usage.InputTokens);
+        Assert.Equal(83, usage.CachedInputTokens);
+        Assert.Equal(5, usage.OutputTokens);
+        Assert.Single(completion.Requests);
+        Assert.Empty(tp.Agent.CheckInvocations);
+    }
+
+    [Fact]
     public async Task PostActReCheckPhase_WritesElapsedFallbackCostAndUsageRows()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -829,7 +882,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         bool extractorThrows = false,
         AgentCostSnapshot? extractorSnapshot = null,
         AgentPricingOptions? pricingOptions = null,
-        bool calculatorDefaultPricingThrows = false)
+        bool calculatorDefaultPricingThrows = false,
+        ICheckAndActCompletionRunner? checkCompletionRunner = null)
     {
         var resolvedAgentKind = agentKind ?? AgentKind.Claude;
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -887,7 +941,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             costExtractors: extractors,
             costCalculator: calculator,
             usageStore: usageStore,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            checkCompletionRunner: checkCompletionRunner);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }
@@ -1021,6 +1076,27 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             => Task.FromResult(new AgentUsageWindowAggregate(0, null, 0));
 
         public Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default) => Task.FromResult(0);
+    }
+
+    private sealed class ScriptedCompletionRunner : ICheckAndActCompletionRunner
+    {
+        private readonly Queue<CheckAndActCompletionResult?> _results;
+
+        public ScriptedCompletionRunner(params CheckAndActCompletionResult?[] results)
+            => _results = new Queue<CheckAndActCompletionResult?>(results);
+
+        public List<CheckAndActCompletionRequest> Requests { get; } = [];
+
+        public Task<CheckAndActCompletionResult?> TryCompleteAsync(
+            CheckAndActCompletionRequest request,
+            CancellationToken ct = default)
+        {
+            _ = ct;
+            Requests.Add(request);
+            if (_results.Count == 0)
+                throw new InvalidOperationException("ScriptedCompletionRunner: ran out of results");
+            return Task.FromResult(_results.Dequeue());
+        }
     }
 
     // ── Fake LLM auditor (needsCreds=true path) ───────────────────────────────

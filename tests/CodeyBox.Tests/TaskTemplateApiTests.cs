@@ -34,6 +34,7 @@ public sealed class TaskTemplateApiTests : IDisposable
               "checks": [
                 {
                   "question": "Is user input interpolated into SQL?",
+                  "mode": "completion",
                   "prompt": "Inspect SQL construction only.",
                   "onYes": {
                     "title": "Fix SQL injection",
@@ -104,6 +105,7 @@ public sealed class TaskTemplateApiTests : IDisposable
         Assert.Equal(1, byIndex[1].TemplateEntryIndex);
         Assert.Equal("Inspect SQL construction only.", byIndex[0].Prompt);
         Assert.Equal("Is user input interpolated into SQL?", byIndex[0].Check!.Question);
+        Assert.Equal("completion", byIndex[0].Check!.Mode);
         Assert.StartsWith("Check template entry 1:", byIndex[0].Title);
         Assert.True(byIndex[0].Check!.ActionableAnswer);
         Assert.Equal("Fix SQL injection", byIndex[0].Check!.OnYes.Title);
@@ -116,6 +118,7 @@ public sealed class TaskTemplateApiTests : IDisposable
             ["ticket:SEC-1", "550e8400-e29b-41d4-a716-446655440000"],
             byIndex[0].Check!.OnYes.DependsOn);
         Assert.Equal("Check cookie attributes", byIndex[1].Title);
+        Assert.Equal("agentic", byIndex[1].Check!.Mode);
         Assert.False(byIndex[1].Check!.ActionableAnswer);
         Assert.NotEqual(byIndex[0].Id, byIndex[1].Id);
 

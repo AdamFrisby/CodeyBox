@@ -47,6 +47,7 @@ public sealed class CheckAndActApiTests : IDisposable
                     minModelScore = 50,
                     priority = 100,
                 },
+                mode = "completion",
             },
         });
 
@@ -56,6 +57,7 @@ public sealed class CheckAndActApiTests : IDisposable
         var check = doc.GetProperty("check");
         Assert.Contains("SQL", check.GetProperty("question").GetString());
         Assert.True(check.GetProperty("actionableAnswer").GetBoolean());
+        Assert.Equal("completion", check.GetProperty("mode").GetString());
         Assert.Equal("Fix all SQL injection vulnerabilities and verify none remain",
             check.GetProperty("onYes").GetProperty("title").GetString());
 
@@ -66,8 +68,44 @@ public sealed class CheckAndActApiTests : IDisposable
         Assert.Equal(JobType.CheckAndAct, stored!.JobType);
         Assert.NotNull(stored.Check);
         Assert.True(stored.Check!.ActionableAnswer);
+        Assert.Equal(CheckAndActModes.Completion, stored.Check.Mode);
         Assert.Equal(100, stored.Check.OnYes.Priority);
         Assert.Equal(50, stored.Check.OnYes.MinModelScore);
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckBlock_ModeDefaultsAgentic_AndRejectsUnknownMode()
+    {
+        var defaultResponse = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "default-mode check",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new { title = "fix", prompt = "go" },
+            },
+        });
+        Assert.Equal(HttpStatusCode.Created, defaultResponse.StatusCode);
+        var created = await defaultResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("agentic", created.GetProperty("check").GetProperty("mode").GetString());
+
+        var badResponse = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad mode",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                mode = "raw-llm",
+                onYes = new { title = "fix", prompt = "go" },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, badResponse.StatusCode);
+        var err = await badResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("check.mode", err.GetProperty("error").GetString());
     }
 
     [Fact]

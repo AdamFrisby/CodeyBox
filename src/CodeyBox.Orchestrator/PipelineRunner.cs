@@ -40,6 +40,9 @@ public sealed class PipelineRunner : IPipelineRunner
     private const int AuditEscalationFindingsPerIterationLimit = 20;
     private const int AuditEscalationFindingDescriptionLimit = 2000;
     private const string ElapsedFallbackMetadataSource = "elapsed_fallback";
+    private const int CompletionReviewContextMaxChars = 64 * 1024;
+    private const int CompletionReviewFileMaxChars = 8 * 1024;
+    private const int CompletionReviewMaxFiles = 80;
 
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
@@ -80,6 +83,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentPauseController? _agentPauses;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     private readonly IRequiredBuildVerifier _requiredBuildVerifier;
+    private readonly ICheckAndActCompletionRunner? _checkCompletionRunner;
     // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
     // hang in store.UpdateAsync (sqlite write contention) or
     // webhooks.PublishAsync (slow remote sink) fails the item within bounded
@@ -219,7 +223,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentDispatchAvailability? dispatchAvailability = null,
         IAuditProgressStore? auditProgress = null,
         IAgentPauseController? agentPauseController = null,
-        AgentPromptPreprocessorChain? promptPreprocessors = null)
+        AgentPromptPreprocessorChain? promptPreprocessors = null,
+        ICheckAndActCompletionRunner? checkCompletionRunner = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -304,6 +309,7 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? throw new ArgumentNullException(
                 nameof(requiredBuildVerifier),
                 "PipelineRunner requires an IRequiredBuildVerifier supplied by the composition root.");
+        _checkCompletionRunner = checkCompletionRunner;
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         // Wire the credential-file materialiser into the default resolver so
@@ -680,8 +686,11 @@ public sealed class PipelineRunner : IPipelineRunner
         // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
         // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
         // gate is a free pass-through for them regardless of this flag.
+        var completionModeCheck = item.JobType == JobType.CheckAndAct
+            && item.Check is not null
+            && string.Equals(item.Check.Mode, CheckAndActModes.Completion, StringComparison.OrdinalIgnoreCase);
         var initialSmokePhase = item.JobType == JobType.CheckAndAct
-            ? "check"
+            ? completionModeCheck ? null : "check"
             : skipWork
                 ? null
                 : "work";
@@ -3060,8 +3069,32 @@ public sealed class PipelineRunner : IPipelineRunner
 
             await Transition(item, WorkItemState.Working, ct, project);
 
-            var prompt = CheckAndActPipeline.BuildPrompt(checkSpec);
-            var stdout = await RunCheckAndActAgentAsync(item, project, agentRunner, repoId, baseBranch, prompt, ct);
+            string? stdout = null;
+            if (string.Equals(checkSpec.Mode, CheckAndActModes.Completion, StringComparison.OrdinalIgnoreCase))
+            {
+                stdout = await TryRunCheckAndActCompletionAsync(
+                    item,
+                    project,
+                    checkSpec,
+                    repoId,
+                    baseBranch,
+                    targetBranch: baseBranch,
+                    phase: "check",
+                    iteration: null,
+                    ct);
+            }
+
+            if (stdout is null)
+            {
+                if (string.Equals(checkSpec.Mode, CheckAndActModes.Completion, StringComparison.OrdinalIgnoreCase)
+                    && !await EnsureCheckAgenticFallbackAvailableAsync(item, project, agentRunner.Kind, ct))
+                {
+                    return;
+                }
+
+                var prompt = CheckAndActPipeline.BuildPrompt(checkSpec);
+                stdout = await RunCheckAndActAgentAsync(item, project, agentRunner, repoId, baseBranch, prompt, ct);
+            }
 
             if (!CheckAndActPipeline.TryParseVerdict(stdout, out var verdict, out var parseError))
             {
@@ -3107,6 +3140,255 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogError(ex, "Work item {Id} check-and-act failed", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "other");
         }
+    }
+
+    private async Task<string?> TryRunCheckAndActCompletionAsync(
+        WorkItem item,
+        Project project,
+        CheckAndActSpec checkSpec,
+        string repoId,
+        string baseBranch,
+        string targetBranch,
+        string phase,
+        int? iteration,
+        CancellationToken ct)
+    {
+        if (_checkCompletionRunner is null)
+            return null;
+
+        var startedAt = DateTimeOffset.UtcNow;
+        var reviewContext = await BuildCompletionReviewContextAsync(repoId, baseBranch, targetBranch, ct);
+        var blocks = CheckAndActPipeline.BuildCompletionPromptBlocks(checkSpec, reviewContext);
+        var credentials = new CheckAndActCompletionCredentials(
+            Gemini: await ResolveAgentCredentialAsync(AgentKind.Gemini, project, item, ct),
+            Codex: await ResolveAgentCredentialAsync(AgentKind.Codex, project, item, ct),
+            Claude: await ResolveAgentCredentialAsync(AgentKind.Claude, project, item, ct));
+
+        var result = await _checkCompletionRunner.TryCompleteAsync(
+            new CheckAndActCompletionRequest(
+                item.Id,
+                phase,
+                iteration,
+                blocks,
+                credentials,
+                ModelId: item.ModelId),
+            ct);
+        if (result is null)
+        {
+            _log.LogInformation(
+                "Work item {Id} requested check-and-act completion mode for phase {Phase}, but no account-safe completion provider is configured; falling back to agentic mode",
+                item.Id,
+                phase);
+            return null;
+        }
+
+        var endedAt = DateTimeOffset.UtcNow;
+        _stdoutBroadcaster?.BroadcastChunk(item.Id, phase, result.Output);
+        await TryRecordCompletionCostAsync(result, item, phase, iteration, startedAt, endedAt);
+        _log.LogInformation(
+            "Work item {Id} check-and-act completion used {Provider} cacheHit={CacheHit} input={Input} cached={Cached} output={Output}",
+            item.Id,
+            result.Provider,
+            result.Usage.CacheHit,
+            result.Usage.InputTokens,
+            result.Usage.CachedInputTokens,
+            result.Usage.OutputTokens);
+        return result.Output;
+    }
+
+    private async Task<string> BuildCompletionReviewContextAsync(
+        string repoId,
+        string baseBranch,
+        string targetBranch,
+        CancellationToken ct)
+    {
+        var sb = new StringBuilder();
+        sb.Append("Base branch: ").AppendLine(baseBranch);
+        sb.Append("Target branch: ").AppendLine(targetBranch);
+
+        string? targetCommit = null;
+        try
+        {
+            targetCommit = await _gitHost.ResolveCommitAsync(repoId, targetBranch, ct);
+            sb.Append("Target commit: ").AppendLine(targetCommit);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Could not resolve target branch {TargetBranch} for completion check context", targetBranch);
+        }
+
+        var includeDiff = !string.Equals(baseBranch, targetBranch, StringComparison.Ordinal);
+        if (includeDiff)
+        {
+            var (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, targetBranch, ct);
+            AppendSection(sb, "Diff stat", string.IsNullOrWhiteSpace(diffStat) ? "(empty)" : diffStat);
+            AppendSectionCapped(sb, "Unified diff", string.IsNullOrWhiteSpace(fullDiff) ? "(empty)" : fullDiff);
+        }
+        else
+        {
+            AppendSection(sb, "Diff", "(initial check against the target branch; no work-branch diff exists)");
+        }
+
+        IReadOnlyList<string> files;
+        try
+        {
+            files = await _gitHost.ListFilesAsync(repoId, targetBranch, pathPrefix: null, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Could not list files for completion check context");
+            AppendSection(sb, "File listing", "(unavailable)");
+            return Truncate(sb.ToString(), CompletionReviewContextMaxChars);
+        }
+
+        var ordered = files.OrderBy(static f => f, StringComparer.Ordinal).ToList();
+        AppendSection(
+            sb,
+            $"File listing ({ordered.Count} total)",
+            string.Join('\n', ordered.Take(CompletionReviewMaxFiles)));
+        if (ordered.Count > CompletionReviewMaxFiles)
+            sb.AppendLine($"(listing truncated after {CompletionReviewMaxFiles} files)");
+
+        var selectedFiles = SelectCompletionContextFiles(ordered, includeDiff, repoId, baseBranch, targetBranch, ct);
+        await foreach (var (path, content) in selectedFiles)
+        {
+            if (sb.Length >= CompletionReviewContextMaxChars)
+                break;
+            AppendSectionCapped(sb, $"File: {path}", content);
+        }
+
+        return Truncate(sb.ToString(), CompletionReviewContextMaxChars);
+    }
+
+    private async IAsyncEnumerable<(string Path, string Content)> SelectCompletionContextFiles(
+        IReadOnlyList<string> orderedFiles,
+        bool includeDiff,
+        string repoId,
+        string baseBranch,
+        string targetBranch,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
+        IEnumerable<string> candidates = orderedFiles;
+        if (includeDiff)
+        {
+            try
+            {
+                var changed = await _gitHost.GetChangedPathsAsync(repoId, baseBranch, targetBranch, ct);
+                var changedPaths = changed
+                    .Select(static c => c.Path)
+                    .Where(static p => !string.IsNullOrWhiteSpace(p))
+                    .OrderBy(static p => p, StringComparer.Ordinal)
+                    .ToList();
+                if (changedPaths.Count > 0)
+                    candidates = changedPaths;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Could not list changed files for completion check context; falling back to tree order");
+            }
+        }
+
+        var selected = 0;
+        foreach (var file in candidates)
+        {
+            if (selected >= CompletionReviewMaxFiles)
+                yield break;
+            if (!LooksLikeUsefulTextFile(file))
+                continue;
+            string content;
+            try
+            {
+                content = await _gitHost.ReadTextFileAsync(repoId, targetBranch, file, ct);
+            }
+            catch
+            {
+                continue;
+            }
+            if (content.IndexOf('\0', StringComparison.Ordinal) >= 0)
+                continue;
+            selected++;
+            yield return (file, Truncate(content, CompletionReviewFileMaxChars));
+        }
+    }
+
+    private async Task<bool> EnsureCheckAgenticFallbackAvailableAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agentKind,
+        CancellationToken ct)
+    {
+        var smokeTarget = ResolvePhaseSmokeTarget(project, "check", item.BaselineImageRef);
+        var availability = await EnsureAgentSmokeAvailableAsync(agentKind, smokeTarget, ct);
+        if (availability.Available)
+            return true;
+
+        var reason = availability.Reason ?? "in-VM smoke gate excluded agent";
+        if (IsOperatorPaused(availability))
+        {
+            await TransitionWaitingForAgentResumeAsync(item, reason, project, agentKind);
+            return false;
+        }
+
+        AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero, SmokeFailureCategory.Unknown);
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "agent.smoke_failed",
+            WorkItem = item,
+            Project = project,
+            Details = new AgentSmokeFailedDetails
+            {
+                AgentKind = agentKind.Value,
+                Reason = reason,
+            },
+        }, CancellationToken.None);
+        await TransitionFailed(
+            item,
+            $"in-VM smoke gate: {reason}",
+            CancellationToken.None,
+            project,
+            failureKind: "infrastructure");
+        return false;
+    }
+
+    private static void AppendSection(StringBuilder sb, string title, string body)
+    {
+        sb.AppendLine();
+        sb.Append("### ").AppendLine(title);
+        sb.AppendLine();
+        sb.AppendLine(body.TrimEnd());
+    }
+
+    private static void AppendSectionCapped(StringBuilder sb, string title, string body)
+    {
+        var remaining = CompletionReviewContextMaxChars - sb.Length;
+        if (remaining <= 0)
+            return;
+        var content = body.Length > remaining ? body[..Math.Max(0, remaining - 64)] + "\n...(truncated)" : body;
+        AppendSection(sb, title, content);
+    }
+
+    private static string Truncate(string value, int maxChars)
+        => value.Length <= maxChars ? value : value[..Math.Max(0, maxChars - 15)] + "\n...(truncated)";
+
+    private static bool LooksLikeUsefulTextFile(string path)
+    {
+        var name = Path.GetFileName(path);
+        if (string.Equals(name, "package-lock.json", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "pnpm-lock.yaml", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "yarn.lock", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var ext = Path.GetExtension(path);
+        return ext is ".cs" or ".fs" or ".vb" or ".js" or ".jsx" or ".ts" or ".tsx"
+            or ".py" or ".go" or ".rs" or ".java" or ".kt" or ".kts"
+            or ".rb" or ".php" or ".c" or ".h" or ".cc" or ".cpp" or ".hpp"
+            or ".sql" or ".html" or ".css" or ".scss" or ".json" or ".yaml"
+            or ".yml" or ".xml" or ".md" or ".sh" or ".ps1" or ".toml"
+            or ".gradle" or ".tf"
+            || string.Equals(name, "Dockerfile", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "Makefile", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -3384,25 +3666,43 @@ public sealed class PipelineRunner : IPipelineRunner
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
 
-            var prompt = CheckAndActPipeline.BuildPrompt(checkSpec);
-            var recheckSmokeTarget = SandboxTargetResolver.ToInVmSmokeTarget(
-                project,
-                new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
-                item.BaselineImageRef);
-            var stdout = await InvokeAgentWithQuotaFallbackAsync(
-                item,
-                project,
-                "post-act-recheck",
-                iteration,
-                (runner, trialItem, attemptCt) => RunPostActReCheckAgentAsync(
-                    trialItem, project, runner, repoId, workBranch, prompt, iteration, attemptCt),
-                ct,
-                initialRunnerOverride: agentRunner,
-                initialMemberOverride: _classRouter?.FindMember(
-                    item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
-                    agentRunner.Kind,
-                    item.ModelId),
-                smokeTarget: recheckSmokeTarget);
+            string? stdout = null;
+            if (string.Equals(checkSpec.Mode, CheckAndActModes.Completion, StringComparison.OrdinalIgnoreCase))
+            {
+                stdout = await TryRunCheckAndActCompletionAsync(
+                    item,
+                    project,
+                    checkSpec,
+                    repoId,
+                    baseBranch,
+                    targetBranch: workBranch,
+                    phase: "post-act-recheck",
+                    iteration,
+                    ct);
+            }
+
+            if (stdout is null)
+            {
+                var prompt = CheckAndActPipeline.BuildPrompt(checkSpec);
+                var recheckSmokeTarget = SandboxTargetResolver.ToInVmSmokeTarget(
+                    project,
+                    new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
+                    item.BaselineImageRef);
+                stdout = await InvokeAgentWithQuotaFallbackAsync(
+                    item,
+                    project,
+                    "post-act-recheck",
+                    iteration,
+                    (runner, trialItem, attemptCt) => RunPostActReCheckAgentAsync(
+                        trialItem, project, runner, repoId, workBranch, prompt, iteration, attemptCt),
+                    ct,
+                    initialRunnerOverride: agentRunner,
+                    initialMemberOverride: _classRouter?.FindMember(
+                        item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
+                        agentRunner.Kind,
+                        item.ModelId),
+                    smokeTarget: recheckSmokeTarget);
+            }
 
             if (!CheckAndActPipeline.TryParseVerdict(stdout, out var verdict, out var parseError))
             {
@@ -10463,6 +10763,98 @@ Original merge-phase failure (for context):
     };
 
     // ── Cost capture ────────────────────────────────────────────────────────
+
+    private async Task TryRecordCompletionCostAsync(
+        CheckAndActCompletionResult result,
+        WorkItem item,
+        string phase,
+        int? iteration,
+        DateTimeOffset startedAt,
+        DateTimeOffset endedAt)
+    {
+        if (_costStore is null && _usageStore is null) return;
+
+        var snapshot = ClampCostSnapshot(new AgentCostSnapshot(
+            result.Usage.InputTokens,
+            result.Usage.CachedInputTokens,
+            result.Usage.OutputTokens,
+            result.ModelId));
+
+        var usd = 0m;
+        if (_costCalculator is not null)
+        {
+            try { usd = _costCalculator.Calculate(snapshot, result.AgentKind); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Cost: calculator threw for check-and-act completion provider '{Provider}' phase '{Phase}'; recording tokens with zero estimated cost",
+                    result.Provider, phase);
+            }
+        }
+        usd = Math.Max(0m, usd);
+
+        if (_costStore is not null)
+        {
+            try
+            {
+                await _costStore.RecordAsync(new WorkItemCost
+                {
+                    Id = Guid.NewGuid().ToString(),
+                    WorkItemId = item.Id.ToString(),
+                    Phase = phase,
+                    Iteration = iteration,
+                    AgentKind = result.AgentKind.Value,
+                    AgentInstanceId = item.AgentInstanceId,
+                    ModelId = snapshot.ModelId,
+                    InputTokens = snapshot.InputTokens,
+                    CachedInputTokens = snapshot.CachedInputTokens,
+                    OutputTokens = snapshot.OutputTokens,
+                    EstimatedUsd = (double)usd,
+                    StartedAt = startedAt,
+                    EndedAt = endedAt,
+                    RawMetadataJson = JsonSerializer.Serialize(new
+                    {
+                        source = "check_and_act_completion",
+                        provider = result.Provider,
+                        cacheHit = result.Usage.CacheHit,
+                    }),
+                    HasExtractedTokenUsage = true,
+                }, CancellationToken.None);
+
+                var model = snapshot.ModelId ?? "(default)";
+                var agentTag = new KeyValuePair<string, object?>("agent.kind", result.AgentKind.Value);
+                var agentInstanceTag = new KeyValuePair<string, object?>("agent.instance", item.AgentInstanceId ?? result.AgentKind.Value);
+                var modelTag = new KeyValuePair<string, object?>("model", model);
+                CodeyBoxMeters.AgentTokens.Add(snapshot.InputTokens, agentTag, agentInstanceTag, modelTag,
+                    new KeyValuePair<string, object?>("token_type", "input"));
+                CodeyBoxMeters.AgentTokens.Add(snapshot.CachedInputTokens, agentTag, agentInstanceTag, modelTag,
+                    new KeyValuePair<string, object?>("token_type", "cached_input"));
+                CodeyBoxMeters.AgentTokens.Add(snapshot.OutputTokens, agentTag, agentInstanceTag, modelTag,
+                    new KeyValuePair<string, object?>("token_type", "output"));
+                CodeyBoxMeters.AgentCostUsd.Add((double)usd, agentTag, agentInstanceTag, modelTag);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Cost: failed to persist completion row for work item {Id} phase '{Phase}'",
+                    item.Id, phase);
+            }
+        }
+
+        if (_usageStore is not null)
+        {
+            try
+            {
+                await _usageStore.RecordAsync(
+                    BuildUsageEvent(result.AgentKind, item.AgentInstanceId, result.ModelId, snapshot, usd, item.Id, endedAt, phase, startedAt),
+                    CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Usage: failed to persist completion event for work item {Id} phase '{Phase}'",
+                    item.Id, phase);
+            }
+        }
+    }
 
     /// <summary>
     /// Best-effort cost capture: extracts token counts from agent output, calculates
