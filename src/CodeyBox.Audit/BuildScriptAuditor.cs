@@ -32,6 +32,8 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
     public string Kind => "shell";
     public AuditCapabilities Required => AuditCapabilities.None;
     public bool RequiresFreshSandbox => true;
+    public string? SelfReviewGuidance => "run build (warnings-as-errors) + formatter before committing";
+
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
