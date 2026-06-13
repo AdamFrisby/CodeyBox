@@ -15,6 +15,13 @@ public interface ISandboxProvider
     string Name { get; }
 
     /// <summary>
+    /// Agent-output data plane this provider can offer for long-running CLI
+    /// invocations. Providers that do not override this keep stdout/stderr on
+    /// the normal <see cref="ISandbox.ExecAsync"/> pipe.
+    /// </summary>
+    SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
+
+    /// <summary>
     /// Provisions a sandbox according to the given spec. The returned handle
     /// holds the running sandbox until disposed; disposal must tear it down
     /// regardless of state.
@@ -92,6 +99,13 @@ public sealed record ManagedSandboxInfo(
 public interface ISandbox : IAsyncDisposable
 {
     string Id { get; }
+
+    /// <summary>
+    /// Agent-output data plane this concrete sandbox can offer. The default is
+    /// the historical exec pipe; providers may advertise a richer transport and
+    /// still fall back per invocation when setup is unavailable.
+    /// </summary>
+    SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
 
     /// <summary>
     /// Executes a command inside the sandbox. The command is run with
@@ -930,6 +944,8 @@ public sealed record SandboxExec
     public int? MaxStdoutBytes { get; init; }
     public int? MaxStderrBytes { get; init; }
     public bool KillOnOutputLimit { get; init; } = true;
+    public SandboxAgentOutputTransportPreference AgentOutputTransport { get; init; } =
+        SandboxAgentOutputTransportPreference.ExecPipe;
 
     /// <summary>
     /// Optional callback invoked per stdout chunk as the process emits it.
@@ -939,6 +955,18 @@ public sealed record SandboxExec
     /// </summary>
     public Action<string>? StdoutChunkCallback { get; init; }
     public Action<string>? StderrChunkCallback { get; init; }
+}
+
+public enum SandboxAgentOutputTransportPreference
+{
+    ExecPipe = 0,
+    PreferHttpIngest = 1,
+}
+
+public enum SandboxAgentOutputTransportKind
+{
+    ExecPipe = 0,
+    HttpIngest = 1,
 }
 
 public sealed record SandboxExecResult(

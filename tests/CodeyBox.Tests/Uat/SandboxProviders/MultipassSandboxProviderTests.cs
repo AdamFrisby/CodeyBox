@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -508,6 +509,221 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var call = Assert.Single(runner.Calls);
         Assert.Equal(256, call.MaxStdoutBytes);
         Assert.Equal(128, call.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task ExecAsync_PreferHttpIngestRoutesOutputThroughPerRunEndpoint()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        string? transferredEnvContent = null;
+        string? observedToken = null;
+        var runner = new RecordingMultipassRunner(async (argv, _, ct) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", "/home/ubuntu/.codeybox-exec-env"])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "transfer", var hostPath, _])
+            {
+                transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv is [_, "exec", _, "--", "chmod", "0600", _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return new ProcessRunResult(0, "", "");
+            if (IsCodeyboxExecArgv(argv))
+            {
+                Assert.NotNull(transferredEnvContent);
+                var url = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
+                var token = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
+                var runId = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
+                observedToken = token;
+                using var client = new HttpClient();
+                await PostAgentOutputAsync(client, url, runId, "ready", 0, token, "", ct);
+                await PostAgentOutputAsync(client, url, runId, "stdout", 0, token, "hello over http\n", ct);
+                await PostAgentOutputAsync(client, url, runId, "stderr", 0, token, "warn over http\n", ct);
+                return new ProcessRunResult(0, "wrapper stdout\n", "wrapper stderr\n");
+            }
+
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+        var stdoutChunks = new List<string>();
+        var stderrChunks = new List<string>();
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo ignored-by-fake-runner"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            StdoutChunkCallback = stdoutChunks.Add,
+            StderrChunkCallback = stderrChunks.Add,
+        });
+
+        Assert.True(result.Success);
+        Assert.Equal("hello over http\nwrapper stdout\n", result.Stdout);
+        Assert.Equal("warn over http\nwrapper stderr\n", result.Stderr);
+        Assert.Equal(["hello over http\n"], stdoutChunks);
+        Assert.Equal(["warn over http\n"], stderrChunks);
+        Assert.NotNull(observedToken);
+        foreach (var call in runner.Calls)
+            Assert.DoesNotContain(observedToken!, string.Join("\0", call.Argv), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ExecAsync_HttpSetupFailureBeforeLaunchFallsBackToExecPipe()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        string? transferredEnvContent = null;
+        var execCalls = 0;
+        var runner = new RecordingMultipassRunner(async (argv, _, ct) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", "/home/ubuntu/.codeybox-exec-env"])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "transfer", var hostPath, _])
+            {
+                transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv is [_, "exec", _, "--", "chmod", "0600", _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return new ProcessRunResult(0, "", "");
+            if (IsCodeyboxExecArgv(argv))
+            {
+                execCalls++;
+                return execCalls == 1
+                    ? new ProcessRunResult(
+                        MultipassSandbox.AgentOutputHttpSetupFailedExitCode,
+                        "",
+                        MultipassSandbox.AgentOutputHttpSetupFailureMarker + "\n")
+                    : new ProcessRunResult(0, "pipe stdout\n", "pipe stderr\n");
+            }
+
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+        var stdoutChunks = new List<string>();
+        var stderrChunks = new List<string>();
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            StdoutChunkCallback = stdoutChunks.Add,
+            StderrChunkCallback = stderrChunks.Add,
+        });
+
+        Assert.True(result.Success);
+        Assert.NotNull(transferredEnvContent);
+        Assert.Equal("pipe stdout\n", result.Stdout);
+        Assert.Equal("pipe stderr\n", result.Stderr);
+        Assert.Equal(2, execCalls);
+
+        var wrapperCalls = runner.Calls.Where(IsCodeyboxExecCall).ToArray();
+        Assert.Equal(2, wrapperCalls.Length);
+        Assert.Contains("--env-file", wrapperCalls[0].Argv);
+        Assert.False(wrapperCalls[0].HasStdoutChunkCallback);
+        Assert.False(wrapperCalls[0].HasStderrChunkCallback);
+        Assert.DoesNotContain("--env-file", wrapperCalls[1].Argv);
+        Assert.True(wrapperCalls[1].HasStdoutChunkCallback);
+        Assert.True(wrapperCalls[1].HasStderrChunkCallback);
+        Assert.Empty(stdoutChunks);
+        Assert.Empty(stderrChunks);
+    }
+
+    [Fact]
+    public async Task ExecAsync_EnvFileTransferFailureFallsBackToExecPipeAndRestoresCallbacks()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var transferCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", "/home/ubuntu/.codeybox-exec-env"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+            {
+                transferCalls++;
+                return Task.FromResult(new ProcessRunResult(1, "", "transfer denied"));
+            }
+            if (IsCodeyboxExecArgv(argv))
+                return Task.FromResult(new ProcessRunResult(0, "pipe stdout\n", "pipe stderr\n"));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+        var stdoutChunks = new List<string>();
+        var stderrChunks = new List<string>();
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            StdoutChunkCallback = stdoutChunks.Add,
+            StderrChunkCallback = stderrChunks.Add,
+        });
+
+        Assert.True(result.Success);
+        Assert.Equal(1, transferCalls);
+        Assert.Equal("pipe stdout\n", result.Stdout);
+        Assert.Equal("pipe stderr\n", result.Stderr);
+
+        var wrapperCall = Assert.Single(runner.Calls, IsCodeyboxExecCall);
+        Assert.DoesNotContain("--env-file", wrapperCall.Argv);
+        Assert.True(wrapperCall.HasStdoutChunkCallback);
+        Assert.True(wrapperCall.HasStderrChunkCallback);
+        Assert.Empty(stdoutChunks);
+        Assert.Empty(stderrChunks);
+    }
+
+    [Theory]
+    [InlineData(false, null, null)]
+    [InlineData(true, 256, null)]
+    [InlineData(true, null, 128)]
+    public async Task ExecAsync_UsesExecPipeUnlessHttpIngestIsPreferredAndOutputIsUnbounded(
+        bool preferHttpIngest,
+        int? maxStdoutBytes,
+        int? maxStderrBytes)
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (IsCodeyboxExecArgv(argv))
+                return Task.FromResult(new ProcessRunResult(0, "pipe stdout\n", "pipe stderr\n"));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = preferHttpIngest
+                ? SandboxAgentOutputTransportPreference.PreferHttpIngest
+                : SandboxAgentOutputTransportPreference.ExecPipe,
+            MaxStdoutBytes = maxStdoutBytes,
+            MaxStderrBytes = maxStderrBytes,
+            StdoutChunkCallback = _ => { },
+            StderrChunkCallback = _ => { },
+        });
+
+        Assert.True(result.Success);
+        Assert.Equal("pipe stdout\n", result.Stdout);
+        Assert.Equal("pipe stderr\n", result.Stderr);
+        Assert.DoesNotContain(runner.Calls, call => call.Argv.Count > 1 && call.Argv[1] == "transfer");
+
+        var wrapperCall = Assert.Single(runner.Calls, IsCodeyboxExecCall);
+        Assert.DoesNotContain("--env-file", wrapperCall.Argv);
+        Assert.True(wrapperCall.HasStdoutChunkCallback);
+        Assert.True(wrapperCall.HasStderrChunkCallback);
+        Assert.Equal(maxStdoutBytes, wrapperCall.MaxStdoutBytes);
+        Assert.Equal(maxStderrBytes, wrapperCall.MaxStderrBytes);
     }
 
     [Fact]
@@ -2548,6 +2764,61 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         return argv.Skip(envIndex).ToArray();
     }
 
+    private static string ExtractShellEnvValue(string envFileContent, string key)
+    {
+        var prefix = key + "=";
+        var line = envFileContent
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Single(l => l.StartsWith(prefix, StringComparison.Ordinal));
+        var value = line[prefix.Length..];
+        Assert.StartsWith("'", value, StringComparison.Ordinal);
+        Assert.EndsWith("'", value, StringComparison.Ordinal);
+        return value[1..^1].Replace("'\"'\"'", "'", StringComparison.Ordinal);
+    }
+
+    private static async Task PostAgentOutputAsync(
+        HttpClient client,
+        string baseUrl,
+        string runId,
+        string stream,
+        long seq,
+        string token,
+        string body,
+        CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"{baseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{seq}");
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        request.Content = new ByteArrayContent(System.Text.Encoding.UTF8.GetBytes(body));
+        using var response = await client.SendAsync(request, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
+    private MultipassSandbox NewLoopbackHttpIngestSandbox(RecordingMultipassRunner runner)
+        => new(
+            "codeybox-test",
+            _workspace,
+            new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Flavor = SandboxProfileFlavor.Headless,
+                WorkingDirectory = "/work",
+                Network = new SandboxNetworkPolicy { ProfileName = "loopback" },
+            },
+            new MultipassSandboxOptions
+            {
+                MultipassBinary = "/bin/true",
+                NetworkProfiles = new Dictionary<string, string> { ["loopback"] = "lo" },
+            },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: runner);
+
+    private static bool IsCodeyboxExecCall(MultipassCall call) => IsCodeyboxExecArgv(call.Argv);
+
+    private static bool IsCodeyboxExecArgv(IReadOnlyList<string> argv)
+        => argv.Contains("/usr/local/bin/codeybox-exec", StringComparer.Ordinal);
+
     private static void AssertPngSignature(byte[] bytes)
     {
         byte[] signature = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -4042,6 +4313,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // Defence-in-depth: the existing stdin-close behaviour stays intact
         // when the agent log path is set.
         Assert.Contains("\"$@\" </dev/null 2>&1 | tee -a", MultipassSandboxProvider.ExecWrapperScript);
+    }
+
+    [Fact]
+    public void ExecWrapper_HttpOutputTransportPreflightsAndUnsetsTokenBeforeAgentLaunch()
+    {
+        Assert.Contains("CODEYBOX_AGENT_OUTPUT_URL", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains("CODEYBOX_AGENT_OUTPUT_TOKEN", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains("codeybox_http_ready", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains("agent output HTTP ingest unavailable before launch", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains(
+            "unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID",
+            MultipassSandboxProvider.ExecWrapperScript);
     }
 
     /// <summary>
