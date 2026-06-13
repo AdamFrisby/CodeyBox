@@ -508,6 +508,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
         };
 
         SandboxExecResult result;

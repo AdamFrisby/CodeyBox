@@ -197,6 +197,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     }
 
     public string Name => "multipass";
+    public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
 
     private void MarkTrackedActive(string name)
     {
@@ -3117,6 +3118,177 @@ test "$work" = present && test "$exec_wrapper" = present
             shift 2
         fi
         rm -f "$codeybox_err_file"
+        # Optional agent-output HTTP transport. The host injects these
+        # variables only for agent CLI invocations that opted into the
+        # transport. Copy them into shell locals and remove them from the
+        # exported environment before launching the agent; the streamer
+        # subprocesses receive the token out-of-band, but the agent process
+        # does not inherit it.
+        codeybox_output_url="${CODEYBOX_AGENT_OUTPUT_URL:-}"
+        codeybox_output_token="${CODEYBOX_AGENT_OUTPUT_TOKEN:-}"
+        codeybox_output_run_id="${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}"
+        unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID
+        codeybox_http_post() {
+            local codeybox_stream_name="$1"
+            local codeybox_stream_seq="$2"
+            CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
+            CODEYBOX_AGENT_OUTPUT_TOKEN="$codeybox_output_token" \
+            CODEYBOX_AGENT_OUTPUT_RUN_ID="$codeybox_output_run_id" \
+            python3 -c '
+        import os, sys, time, urllib.error, urllib.parse, urllib.request
+        base = os.environ["CODEYBOX_AGENT_OUTPUT_URL"].rstrip("/")
+        run_id = os.environ["CODEYBOX_AGENT_OUTPUT_RUN_ID"]
+        token = os.environ["CODEYBOX_AGENT_OUTPUT_TOKEN"]
+        stream = sys.argv[1]
+        seq = sys.argv[2]
+        data = sys.stdin.buffer.read()
+        url = base + "/" + urllib.parse.quote(run_id, safe="") + "/" + urllib.parse.quote(stream, safe="") + "/" + str(seq)
+        deadline = time.monotonic() + 300.0
+        attempt = 0
+        while True:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                method="POST",
+                headers={"Authorization": "Bearer " + token, "Content-Type": "application/octet-stream"})
+            try:
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    code = resp.getcode()
+                    if 200 <= code < 300:
+                        sys.exit(0)
+                    if code in (401, 403, 409, 413):
+                        sys.exit(70)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403, 409, 413):
+                    sys.exit(70)
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                sys.exit(75)
+            time.sleep(min(5.0, 0.1 * (2 ** min(attempt, 5))))
+            attempt += 1
+        ' "$codeybox_stream_name" "$codeybox_stream_seq"
+        }
+        codeybox_http_stream() {
+            local codeybox_stream_name="$1"
+            CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
+            CODEYBOX_AGENT_OUTPUT_TOKEN="$codeybox_output_token" \
+            CODEYBOX_AGENT_OUTPUT_RUN_ID="$codeybox_output_run_id" \
+            python3 -c '
+        import os, sys, time, urllib.error, urllib.parse, urllib.request
+        base = os.environ["CODEYBOX_AGENT_OUTPUT_URL"].rstrip("/")
+        run_id = os.environ["CODEYBOX_AGENT_OUTPUT_RUN_ID"]
+        token = os.environ["CODEYBOX_AGENT_OUTPUT_TOKEN"]
+        stream = sys.argv[1]
+        seq = 0
+        max_chunk = 65536
+        deadline_seconds = 300.0
+        buf = bytearray()
+
+        def post(data):
+            global seq
+            url = base + "/" + urllib.parse.quote(run_id, safe="") + "/" + urllib.parse.quote(stream, safe="") + "/" + str(seq)
+            deadline = time.monotonic() + deadline_seconds
+            attempt = 0
+            payload = bytes(data)
+            while True:
+                req = urllib.request.Request(
+                    url,
+                    data=payload,
+                    method="POST",
+                    headers={"Authorization": "Bearer " + token, "Content-Type": "application/octet-stream"})
+                try:
+                    with urllib.request.urlopen(req, timeout=10.0) as resp:
+                        code = resp.getcode()
+                        if 200 <= code < 300:
+                            seq += 1
+                            return
+                        if code in (401, 403, 409, 413):
+                            sys.exit(70)
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403, 409, 413):
+                        sys.exit(70)
+                except Exception:
+                    pass
+                if time.monotonic() >= deadline:
+                    sys.exit(75)
+                time.sleep(min(5.0, 0.1 * (2 ** min(attempt, 5))))
+                attempt += 1
+
+        while True:
+            piece = sys.stdin.buffer.readline(max(1, max_chunk - len(buf)))
+            if not piece:
+                if buf:
+                    post(buf)
+                sys.exit(0)
+            buf.extend(piece)
+            if piece.endswith(b"\n") or len(buf) >= max_chunk:
+                post(buf)
+                buf.clear()
+        ' "$codeybox_stream_name"
+        }
+        codeybox_http_ready() {
+            codeybox_http_post ready 0 </dev/null
+        }
+        if [ -n "$codeybox_output_url$codeybox_output_token$codeybox_output_run_id" ]; then
+            if [ -z "$codeybox_output_url" ] || [ -z "$codeybox_output_token" ] || [ -z "$codeybox_output_run_id" ]; then
+                echo "codeybox-exec: agent output HTTP ingest unavailable before launch" >&2
+                exit 86
+            fi
+            if ! codeybox_http_ready; then
+                echo "codeybox-exec: agent output HTTP ingest unavailable before launch" >&2
+                exit 86
+            fi
+
+            if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
+                codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
+                mkdir -p "$codeybox_log_dir" 2>/dev/null || true
+                codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
+                rm -f "$codeybox_exit_file" 2>/dev/null || true
+                if [ "$keep_stdin" = "1" ]; then
+                    "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE" | codeybox_http_stream stdout
+                    codeybox_status=("${PIPESTATUS[@]}")
+                else
+                    "$@" </dev/null 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE" | codeybox_http_stream stdout
+                    codeybox_status=("${PIPESTATUS[@]}")
+                fi
+                codeybox_user_rc=${codeybox_status[0]}
+                codeybox_stream_rc=${codeybox_status[2]}
+                printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
+                if [ "$codeybox_stream_rc" -ne 0 ]; then
+                    echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
+                    exit 87
+                fi
+                exit "$codeybox_user_rc"
+            fi
+
+            codeybox_out_fifo=$(mktemp -u "${TMPDIR:-/tmp}/codeybox-stdout.XXXXXX")
+            codeybox_err_fifo=$(mktemp -u "${TMPDIR:-/tmp}/codeybox-stderr.XXXXXX")
+            if ! mkfifo "$codeybox_out_fifo" "$codeybox_err_fifo"; then
+                echo "codeybox-exec: agent output HTTP ingest unavailable before launch" >&2
+                exit 86
+            fi
+            codeybox_cleanup_fifos() { rm -f "$codeybox_out_fifo" "$codeybox_err_fifo"; }
+            trap codeybox_cleanup_fifos EXIT
+            codeybox_http_stream stdout < "$codeybox_out_fifo" &
+            codeybox_out_stream_pid=$!
+            codeybox_http_stream stderr < "$codeybox_err_fifo" &
+            codeybox_err_stream_pid=$!
+            if [ "$keep_stdin" = "1" ]; then
+                "$@" > "$codeybox_out_fifo" 2> "$codeybox_err_fifo"
+                codeybox_user_rc=$?
+            else
+                "$@" </dev/null > "$codeybox_out_fifo" 2> "$codeybox_err_fifo"
+                codeybox_user_rc=$?
+            fi
+            wait "$codeybox_out_stream_pid"; codeybox_out_stream_rc=$?
+            wait "$codeybox_err_stream_pid"; codeybox_err_stream_rc=$?
+            if [ "$codeybox_out_stream_rc" -ne 0 ] || [ "$codeybox_err_stream_rc" -ne 0 ]; then
+                echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
+                exit 87
+            fi
+            exit "$codeybox_user_rc"
+        fi
         # Tee path is opt-in via CODEYBOX_AGENT_LOG_FILE. When set, both
         # stdout and stderr stream live to the host AND get tee'd into the
         # log file so a suspend/resume cycle can recover output the host
@@ -4528,6 +4700,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
+    private const int AgentOutputHttpSetupFailedExitCode = 86;
+    private const string AgentOutputHttpSetupFailureMarker =
+        "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
 
     private readonly string _name;
@@ -4623,6 +4798,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     }
 
     public string Id { get; }
+    public SandboxAgentOutputTransportKind AgentOutputTransportKind =>
+        TryResolveAgentOutputBindAddress() is null
+            ? SandboxAgentOutputTransportKind.ExecPipe
+            : SandboxAgentOutputTransportKind.HttpIngest;
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
@@ -4650,11 +4829,66 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         if (exec.Argv.Count == 0) throw new ArgumentException("Argv must be non-empty", nameof(exec));
 
         var transferredVmPaths = new List<string>();
+        MultipassAgentOutputHttpIngestSession? agentOutputIngest = null;
+        var stdoutChunkCallback = exec.StdoutChunkCallback;
+        var stderrChunkCallback = exec.StderrChunkCallback;
+        var forceEnvironmentFile = false;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
-        var wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null);
-        var argv = BuildMultipassExecArgv(wrapped);
+        var pipeEnvironment = effectiveEnvironment;
+        if (ShouldUseAgentOutputHttpIngest(exec, maxStdoutBytes, maxStderrBytes)
+            && TryResolveAgentOutputBindAddress() is { } bindAddress)
+        {
+            agentOutputIngest = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+                bindAddress,
+                Guid.NewGuid().ToString("N"),
+                _log,
+                exec.StdoutChunkCallback,
+                exec.StderrChunkCallback,
+                ct).ConfigureAwait(false);
+            if (agentOutputIngest is not null)
+            {
+                effectiveEnvironment = MergeExecEnvironment(effectiveEnvironment, agentOutputIngest.BuildEnvironment());
+                stdoutChunkCallback = null;
+                stderrChunkCallback = null;
+                forceEnvironmentFile = true;
+            }
+        }
+
+        List<string> wrapped;
+        List<string> argv;
+        if (forceEnvironmentFile && effectiveEnvironment is { Count: > 0 })
+        {
+            try
+            {
+                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
+                transferredVmPaths.Add(envFile);
+                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile);
+                argv = BuildMultipassExecArgv(wrapped);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogWarning(ex,
+                    "Agent output HTTP ingest setup failed before launch for {Name}; falling back to multipass exec pipe",
+                    _name);
+                if (agentOutputIngest is not null)
+                    await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+                agentOutputIngest = null;
+                stdoutChunkCallback = exec.StdoutChunkCallback;
+                stderrChunkCallback = exec.StderrChunkCallback;
+                effectiveEnvironment = pipeEnvironment;
+                forceEnvironmentFile = false;
+                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null);
+                argv = BuildMultipassExecArgv(wrapped);
+            }
+        }
+        else
+        {
+            wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null);
+            argv = BuildMultipassExecArgv(wrapped);
+        }
+
         var argvBytes = EstimateArgvBytes(argv);
-        if (argvBytes > ArgvBytesWarningThreshold)
+        if (!forceEnvironmentFile && argvBytes > ArgvBytesWarningThreshold)
         {
             _log.LogWarning(
                 "Multipass exec argv for {Name} is {Bytes} bytes; routing through transferred files to avoid ARG_MAX",
@@ -4667,13 +4901,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile);
                 argv = BuildMultipassExecArgv(wrapped);
             }
+        }
 
-            if (EstimateArgvBytes(argv) > ArgvBytesWarningThreshold)
-            {
-                var script = await TransferExecScriptAsync(wrapped, ct);
-                transferredVmPaths.Add(script);
-                argv = [_opts.MultipassBinary, "exec", _name, "--", "/bin/sh", script];
-            }
+        if (EstimateArgvBytes(argv) > ArgvBytesWarningThreshold)
+        {
+            var script = await TransferExecScriptAsync(wrapped, ct);
+            transferredVmPaths.Add(script);
+            argv = [_opts.MultipassBinary, "exec", _name, "--", "/bin/sh", script];
         }
 
         var isFirstExec = Interlocked.CompareExchange(ref _firstExecEmitted, 1, 0) == 0;
@@ -4682,22 +4916,50 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             : null;
         try
         {
-            return await MultipassRetry.RunWithRetryAsync(
+            var result = await MultipassRetry.RunWithRetryAsync(
                 action: innerCt => RunMultipassAsync(
                     argv,
                     exec.Stdin,
                     innerCt,
-                    exec.StdoutChunkCallback,
-                    exec.StderrChunkCallback,
+                    stdoutChunkCallback,
+                    stderrChunkCallback,
                     maxStdoutBytes,
                     maxStderrBytes,
                     exec.KillOnOutputLimit),
                 log: _log,
                 description: $"exec on {_name}",
-                ct: ct);
+                ct: ct).ConfigureAwait(false);
+
+            if (agentOutputIngest is null)
+                return result;
+
+            if (IsAgentOutputHttpSetupFailure(result, agentOutputIngest))
+            {
+                _log.LogWarning(
+                    "Agent output HTTP ingest was unreachable from sandbox {Name}; falling back to multipass exec pipe",
+                    _name);
+                await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+                agentOutputIngest = null;
+                return await ExecRunAsync(
+                    exec with { AgentOutputTransport = SandboxAgentOutputTransportPreference.ExecPipe },
+                    ct,
+                    maxStdoutBytes,
+                    maxStderrBytes).ConfigureAwait(false);
+            }
+
+            await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+            var ingested = agentOutputIngest;
+            agentOutputIngest = null;
+            return result with
+            {
+                Stdout = ingested.Stdout + result.Stdout,
+                Stderr = ingested.Stderr + result.Stderr,
+            };
         }
         finally
         {
+            if (agentOutputIngest is not null)
+                await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
             if (transferredVmPaths.Count > 0)
                 await TryRemoveTransferredFilesAsync(transferredVmPaths);
             if (firstExecScope is not null)
@@ -4844,6 +5106,42 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         };
         return merged;
     }
+
+    private bool ShouldUseAgentOutputHttpIngest(
+        SandboxExec exec,
+        int? maxStdoutBytes,
+        int? maxStderrBytes)
+        => exec.AgentOutputTransport == SandboxAgentOutputTransportPreference.PreferHttpIngest
+            && maxStdoutBytes is null
+            && maxStderrBytes is null;
+
+    private System.Net.IPAddress? TryResolveAgentOutputBindAddress()
+    {
+        if (string.IsNullOrWhiteSpace(_spec.Network.ProfileName))
+            return null;
+        if (!_opts.NetworkProfiles.TryGetValue(_spec.Network.ProfileName, out var bridge))
+            return null;
+        return MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress(bridge);
+    }
+
+    private static IReadOnlyDictionary<string, string> MergeExecEnvironment(
+        IReadOnlyDictionary<string, string>? environment,
+        IReadOnlyDictionary<string, string> additional)
+    {
+        var merged = environment is null
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(environment, StringComparer.Ordinal);
+        foreach (var (key, value) in additional)
+            merged[key] = value;
+        return merged;
+    }
+
+    private static bool IsAgentOutputHttpSetupFailure(
+        ProcessRunResult result,
+        MultipassAgentOutputHttpIngestSession ingest)
+        => result.ExitCode == AgentOutputHttpSetupFailedExitCode
+            && !ingest.ReceivedAgentBytes
+            && result.Stderr.Contains(AgentOutputHttpSetupFailureMarker, StringComparison.Ordinal);
 
     private List<string> BuildWrappedInvocation(
         SandboxExec exec,

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -508,6 +509,76 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var call = Assert.Single(runner.Calls);
         Assert.Equal(256, call.MaxStdoutBytes);
         Assert.Equal(128, call.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task ExecAsync_PreferHttpIngestRoutesOutputThroughPerRunEndpoint()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        string? transferredEnvContent = null;
+        string? observedToken = null;
+        var runner = new RecordingMultipassRunner(async (argv, _, ct) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", "/home/ubuntu/.codeybox-exec-env"])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "transfer", var hostPath, _])
+            {
+                transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv is [_, "exec", _, "--", "chmod", "0600", _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return new ProcessRunResult(0, "", "");
+            if (argv.Contains("/usr/local/bin/codeybox-exec", StringComparer.Ordinal))
+            {
+                Assert.NotNull(transferredEnvContent);
+                var url = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
+                var token = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
+                var runId = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
+                observedToken = token;
+                using var client = new HttpClient();
+                await PostAgentOutputAsync(client, url, runId, "ready", 0, token, "", ct);
+                await PostAgentOutputAsync(client, url, runId, "stdout", 0, token, "hello over http\n", ct);
+                return new ProcessRunResult(0, "", "");
+            }
+
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+        });
+        var sandbox = new MultipassSandbox(
+            "codeybox-test",
+            _workspace,
+            new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Flavor = SandboxProfileFlavor.Headless,
+                WorkingDirectory = "/work",
+                Network = new SandboxNetworkPolicy { ProfileName = "loopback" },
+            },
+            new MultipassSandboxOptions
+            {
+                MultipassBinary = "/bin/true",
+                NetworkProfiles = new Dictionary<string, string> { ["loopback"] = "lo" },
+            },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: runner);
+        var chunks = new List<string>();
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo ignored-by-fake-runner"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            StdoutChunkCallback = chunks.Add,
+        });
+
+        Assert.True(result.Success);
+        Assert.Equal("hello over http\n", result.Stdout);
+        Assert.Equal(["hello over http\n"], chunks);
+        Assert.NotNull(observedToken);
+        foreach (var call in runner.Calls)
+            Assert.DoesNotContain(observedToken!, string.Join("\0", call.Argv), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2548,6 +2619,37 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         return argv.Skip(envIndex).ToArray();
     }
 
+    private static string ExtractShellEnvValue(string envFileContent, string key)
+    {
+        var prefix = key + "=";
+        var line = envFileContent
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Single(l => l.StartsWith(prefix, StringComparison.Ordinal));
+        var value = line[prefix.Length..];
+        Assert.StartsWith("'", value, StringComparison.Ordinal);
+        Assert.EndsWith("'", value, StringComparison.Ordinal);
+        return value[1..^1].Replace("'\"'\"'", "'", StringComparison.Ordinal);
+    }
+
+    private static async Task PostAgentOutputAsync(
+        HttpClient client,
+        string baseUrl,
+        string runId,
+        string stream,
+        long seq,
+        string token,
+        string body,
+        CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"{baseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{seq}");
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        request.Content = new ByteArrayContent(System.Text.Encoding.UTF8.GetBytes(body));
+        using var response = await client.SendAsync(request, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
     private static void AssertPngSignature(byte[] bytes)
     {
         byte[] signature = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -4042,6 +4144,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // Defence-in-depth: the existing stdin-close behaviour stays intact
         // when the agent log path is set.
         Assert.Contains("\"$@\" </dev/null 2>&1 | tee -a", MultipassSandboxProvider.ExecWrapperScript);
+    }
+
+    [Fact]
+    public void ExecWrapper_HttpOutputTransportPreflightsAndUnsetsTokenBeforeAgentLaunch()
+    {
+        Assert.Contains("CODEYBOX_AGENT_OUTPUT_URL", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains("CODEYBOX_AGENT_OUTPUT_TOKEN", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains("codeybox_http_ready", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains("agent output HTTP ingest unavailable before launch", MultipassSandboxProvider.ExecWrapperScript);
+        Assert.Contains(
+            "unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID",
+            MultipassSandboxProvider.ExecWrapperScript);
     }
 
     /// <summary>
