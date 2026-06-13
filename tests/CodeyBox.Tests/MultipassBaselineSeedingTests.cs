@@ -46,8 +46,8 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             }
         };
 
-        var hash1 = MultipassSandboxProvider.ComputeBaselineHash(opts1, "isolated", SandboxProfileFlavor.Default);
-        var hash2 = MultipassSandboxProvider.ComputeBaselineHash(opts2, "isolated", SandboxProfileFlavor.Default);
+        var hash1 = MultipassSandboxProvider.ComputeBaselineHash(opts1, "isolated", SandboxProfileFlavor.Headless);
+        var hash2 = MultipassSandboxProvider.ComputeBaselineHash(opts2, "isolated", SandboxProfileFlavor.Headless);
 
         Assert.NotEqual(hash1, hash2);
     }
@@ -116,7 +116,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
 
         var provider = new MultipassSandboxProvider(opts, NullLogger<MultipassSandboxProvider>.Instance, null, runner);
 
-        var baselineName = await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync("claude", SandboxProfileFlavor.Default, null, CancellationToken.None);
+        var baselineName = await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync("claude", SandboxProfileFlavor.Headless, null, CancellationToken.None);
 
         Assert.NotNull(baselineName);
 
