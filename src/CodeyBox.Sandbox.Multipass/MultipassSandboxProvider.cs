@@ -281,7 +281,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
         // Pre-create host directories for tmpfs-equivalent mounts so we can
         // bind-mount them into the VM after launch.
-        var bindMounts = new List<(string Host, string Sandbox)>();
+        var bindMounts = new List<BindMount>();
         foreach (var m in spec.Mounts)
         {
             if (m.Tmpfs)
@@ -289,11 +289,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 var hostPath = Path.Combine(sandboxRoot, "fs" + m.SandboxPath.Replace('/', '-'));
                 Directory.CreateDirectory(hostPath);
                 TryChmod0700(hostPath);
-                bindMounts.Add((hostPath, m.SandboxPath));
+                bindMounts.Add(new BindMount(hostPath, m.SandboxPath, ReadOnly: false));
             }
             else if (m.HostPath is not null)
             {
-                bindMounts.Add((m.HostPath, m.SandboxPath));
+                bindMounts.Add(new BindMount(m.HostPath, m.SandboxPath, m.ReadOnly));
             }
         }
 
@@ -386,7 +386,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             await using (var readinessScope = await TimingScope.BeginAsync(
                 timingStore, timingItemId, timingPhase, "vm.mount-readiness", log: _log))
             {
-                await WaitForMountsVisibleAsync(opts, name, bindMounts, workItemId, ct);
+                await WaitForMountsVisibleAsync(opts, name, bindMounts.ConvertAll(b => (b.Host, b.Sandbox)), workItemId, ct);
+            }
+
+            await using (var readOnlyMountScope = await TimingScope.BeginAsync(
+                timingStore, timingItemId, timingPhase, "vm.mount.readonly", log: _log))
+            {
+                await ApplyReadOnlyMountsAsync(opts, name, bindMounts, workItemId, ct);
             }
 
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
@@ -2435,15 +2441,48 @@ test "$work" = present && test "$exec_wrapper" = present
     private async Task ApplyMountsAsync(
         MultipassSandboxOptions opts,
         string name,
-        List<(string Host, string Sandbox)> binds,
+        List<BindMount> binds,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
         if (binds.Count == 0) return;
         await WaitForStoppedAsync(opts, name, workItemId, ct);
-        foreach (var (host, sandbox) in binds)
-            await MountSingleBindWithRetryAsync(opts, name, host, sandbox, workItemId, ct);
+        foreach (var bind in binds)
+        {
+            await MountSingleBindWithRetryAsync(opts, name, bind.Host, bind.Sandbox, workItemId, ct);
+        }
     }
+
+    private async Task ApplyReadOnlyMountsAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        List<BindMount> binds,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        foreach (var bind in binds)
+        {
+            if (!bind.ReadOnly)
+            {
+                continue;
+            }
+
+            var remount = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "exec", name, "--", "sudo", "mount", "-o", "remount,ro", bind.Sandbox],
+                stdin: null,
+                ct: ct,
+                workItemId: workItemId);
+            if (remount.ExitCode != 0)
+            {
+                ThrowIfProvisioningRetryExhausted("mount-readonly", remount);
+                throw new InvalidOperationException(
+                    $"multipass readonly remount {name}:{bind.Sandbox} failed: {remount.Stderr.Trim()}");
+            }
+        }
+    }
+
+    private readonly record struct BindMount(string Host, string Sandbox, bool ReadOnly);
 
     /// <summary>
     /// Mounts one host directory into the VM. Stats the source path before

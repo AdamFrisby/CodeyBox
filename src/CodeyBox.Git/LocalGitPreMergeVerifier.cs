@@ -121,6 +121,8 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
         var worktreeAdded = false;
         try
         {
+            _gitHost.PrepareRepositoryForHostGitOperations(request.RepositoryId);
+
             // --detach keeps the worktree HEAD on the merge sha without
             // claiming a branch ref, so we don't compete with other parts of
             // the pipeline that may also want a worktree on this repo.

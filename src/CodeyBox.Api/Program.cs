@@ -498,7 +498,12 @@ builder.Services.AddSingleton<LocalGitHost>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new LocalGitHost(
-        new LocalGitHostOptions { RootDirectory = opts.GitRootDirectory },
+        new LocalGitHostOptions
+        {
+            RootDirectory = opts.GitRootDirectory,
+            EnableSharedUpstreamMirror = opts.EnableSharedUpstreamMirror,
+            SharedUpstreamMirrorDirectory = opts.SharedUpstreamMirrorDirectory
+        },
         sp.GetRequiredService<ILogger<LocalGitHost>>());
 });
 builder.Services.AddSingleton<IGitHost>(sp => sp.GetRequiredService<LocalGitHost>());
@@ -3107,7 +3112,10 @@ namespace CodeyBox.Api
     /// <item><b>Startup-only and rejected</b> on reload by
     ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
     ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
-    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>. The retaining
+    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>,
+    ///   <c>WorkerPool.MaxConcurrentSandboxes</c>,
+    ///   <c>EnableSharedUpstreamMirror</c>, and
+    ///   <c>SharedUpstreamMirrorDirectory</c>. The retaining
     ///   options-monitor cache keeps the startup value visible to consumers
     ///   after a rejected reload.</item>
     /// <item><b>Startup-only by capture</b> — bound into a downstream
@@ -3123,6 +3131,8 @@ namespace CodeyBox.Api
     public sealed class CodeyBoxOptions
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
+        public bool EnableSharedUpstreamMirror { get; set; } = false;
+        public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string TemplateDirectory { get; set; } = "templates";
         public const int DefaultMaxTemplateChecks = 100;

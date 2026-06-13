@@ -3889,6 +3889,47 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_RemountsReadOnlyHostMountsInsideVm()
+    {
+        var readOnlySource = Path.Combine(_workspace, "readonly-source");
+        var writableSource = Path.Combine(_workspace, "writable-source");
+        Directory.CreateDirectory(readOnlySource);
+        Directory.CreateDirectory(writableSource);
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = BuildSuccessfulCreateRunner(states);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-readonly-mount"),
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount { HostPath = readOnlySource, SandboxPath = "/mirror", ReadOnly = true },
+                new SandboxMount { HostPath = writableSource, SandboxPath = "/repo", ReadOnly = false },
+                new SandboxMount { SandboxPath = "/work", Tmpfs = true },
+            ],
+        });
+
+        try
+        {
+            var remount = Assert.Single(runner.Calls, call =>
+                call.Argv is [_, "exec", _, "--", "sudo", "mount", "-o", "remount,ro", _]);
+            Assert.Equal("/mirror", remount.Argv[^1]);
+            Assert.DoesNotContain(runner.Calls, call =>
+                call.Argv is [_, "exec", _, "--", "sudo", "mount", "-o", "remount,ro", "/repo"]);
+            Assert.DoesNotContain(runner.Calls, call =>
+                call.Argv is [_, "exec", _, "--", "sudo", "mount", "-o", "remount,ro", "/work"]);
+        }
+        finally
+        {
+            await sandbox.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task DisposeLeakedAsync_ForTrackedActiveVm_ClearsOwnerSnapshot()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -3957,16 +3998,22 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "test", "-e", _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
+            if (argv is [_, "mount", "--type=native", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
+            if (argv is [_, "exec", _, "--", "sudo", "mount", "-o", "remount,ro", _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
