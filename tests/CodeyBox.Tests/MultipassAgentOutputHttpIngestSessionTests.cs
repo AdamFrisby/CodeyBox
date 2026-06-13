@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http;
+using System.Reflection;
 using System.Text;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Sandbox.Multipass;
@@ -77,6 +78,30 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         Assert.Empty(chunks);
     }
 
+    [Fact]
+    public async Task Post_ReturnsTooManyRequestsWhenRateLimitExceededAndResetsWindow()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+
+        SetRateWindow(
+            session,
+            DateTimeOffset.UtcNow + TimeSpan.FromMinutes(1),
+            MultipassAgentOutputHttpIngestSession.MaxRequestsPerSecond);
+        var throttled = await PostAsync(client, session, "run-x", "ready", 0, session.Token, "");
+
+        SetRateWindow(
+            session,
+            DateTimeOffset.UtcNow - TimeSpan.FromSeconds(2),
+            MultipassAgentOutputHttpIngestSession.MaxRequestsPerSecond);
+        var afterReset = await PostAsync(client, session, "run-x", "ready", 0, session.Token, "");
+
+        Assert.Equal((HttpStatusCode)429, throttled);
+        Assert.Equal(HttpStatusCode.NoContent, afterReset);
+        Assert.Empty(chunks);
+    }
+
     private static async Task<MultipassAgentOutputHttpIngestSession> StartAsync(Action<string>? stdout)
         => await MultipassAgentOutputHttpIngestSession.TryStartAsync(
             IPAddress.Loopback,
@@ -103,5 +128,19 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         request.Content = new ByteArrayContent(Encoding.UTF8.GetBytes(body));
         using var response = await client.SendAsync(request);
         return response.StatusCode;
+    }
+
+    private static void SetRateWindow(
+        MultipassAgentOutputHttpIngestSession session,
+        DateTimeOffset windowStart,
+        int count)
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        typeof(MultipassAgentOutputHttpIngestSession)
+            .GetField("_rateWindowStart", flags)!
+            .SetValue(session, windowStart);
+        typeof(MultipassAgentOutputHttpIngestSession)
+            .GetField("_rateWindowCount", flags)!
+            .SetValue(session, count);
     }
 }

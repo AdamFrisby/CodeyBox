@@ -4700,8 +4700,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
-    private const int AgentOutputHttpSetupFailedExitCode = 86;
-    private const string AgentOutputHttpSetupFailureMarker =
+    internal const int AgentOutputHttpSetupFailedExitCode = 86;
+    internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
 

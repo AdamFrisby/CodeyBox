@@ -72,7 +72,10 @@ internal sealed class RecordingMultipassRunner : IProcessRunner
             stdin,
             maxStdoutBytes,
             maxStderrBytes,
-            environment is null ? null : new Dictionary<string, string>(environment, StringComparer.Ordinal)));
+            environment is null ? null : new Dictionary<string, string>(environment, StringComparer.Ordinal),
+            stdoutChunkCallback is not null,
+            stderrChunkCallback is not null,
+            killOnOutputLimit));
         return await _handler(argv, stdin, ct);
     }
 }
@@ -82,7 +85,10 @@ internal sealed record MultipassCall(
     string? Stdin,
     int? MaxStdoutBytes = null,
     int? MaxStderrBytes = null,
-    IReadOnlyDictionary<string, string>? Environment = null);
+    IReadOnlyDictionary<string, string>? Environment = null,
+    bool HasStdoutChunkCallback = false,
+    bool HasStderrChunkCallback = false,
+    bool KillOnOutputLimit = true);
 
 internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
 {
