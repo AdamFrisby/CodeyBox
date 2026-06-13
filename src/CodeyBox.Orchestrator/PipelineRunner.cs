@@ -11838,11 +11838,13 @@ Original merge-phase failure (for context):
     {
         if (_costStore is null && _usageStore is null) return;
 
-        var snapshot = NormalizeCostSnapshot(new AgentCostSnapshot(
-            result.Usage.InputTokens,
-            result.Usage.CachedInputTokens,
-            result.Usage.OutputTokens,
-            result.ModelId), result.ModelId);
+        var snapshot = NormalizeCostSnapshot(
+            new AgentCostSnapshot(
+                result.Usage.InputTokens,
+                result.Usage.CachedInputTokens,
+                result.Usage.OutputTokens,
+                result.ModelId),
+            result.ModelId);
 
         var usd = 0m;
         if (_costCalculator is not null)
