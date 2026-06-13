@@ -234,6 +234,34 @@ In all cases the work item moves to `Failed`. An operator can inspect
 the work branch in the host bare repo, decide what to do, and either
 re-queue the work item with a clearer prompt or merge by hand.
 
+## Rework non-compile loop-back
+
+When the required-build gate (see `RequiredBuildGate`) discovers a build
+failure during the **audit** phase it surfaces a blocking finding so the
+loop performs another rework — this has always been recoverable. When the
+**same** failure is produced by a rework (the agent's commit broke the
+build), the gate also defers rather than terminal-failing the work item:
+the next audit iteration's build check picks it up as a blocking finding
+through the same `RunForAuditAsync` path, giving the loop another chance
+to converge within the existing `MaxIterations` budget.
+
+This loop-back is scoped to required-build failures from audit-driven
+rework, including the case where the rework leaves an already
+non-compiling branch unchanged. Only when the iteration budget is
+exhausted does the audit ceiling take over — parking the item at
+`NeedsOperatorInput` if convergence signals are visible (the blocking
+findings, fingerprints, or work-branch tip changed across iterations) or
+finishing at `AuditFailed` if no progress is detectable.
+
+**Scope.** The loop-back applies to the rework path only — an initial
+work phase that leaves the branch non-compiling still terminal-fails
+with `failureKind=build`, because no audit/rework loop sits behind the
+initial work to converge on a fix.
+
+**Sibling brittleness.** The rework no-changes guard above (empty
+commit) is still terminal today; the same loop-back-not-terminal
+unification is in flight for that case.
+
 ## Configuration
 
 `appsettings.json`:
