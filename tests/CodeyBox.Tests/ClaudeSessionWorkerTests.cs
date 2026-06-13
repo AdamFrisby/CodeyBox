@@ -236,6 +236,25 @@ public sealed class ClaudeSessionWorkerTests
         Assert.True(result.Success);
     }
 
+    [Fact]
+    public async Task RefreshSessionCredential_UsesLatestCredentialOnNextTurn()
+    {
+        var sandbox = new ScriptedSandbox(
+            StreamJsonFirstTurn("cli-refresh"),
+            StreamJsonSecondTurn("cli-refresh"));
+        var worker = new ClaudeSessionWorker(BuildRunner());
+        var initial = ClaudeApiCredential("old-token");
+        var refreshed = ClaudeApiCredential("new-token");
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", initial);
+        await worker.SendTurnAsync(handle, "first");
+        await worker.RefreshSessionCredentialAsync(handle, refreshed);
+        await worker.SendTurnAsync(handle, "second");
+
+        Assert.Equal("old-token", sandbox.AllAgentExecs[0].ExtraEnvironment!["ANTHROPIC_API_KEY"]);
+        Assert.Equal("new-token", sandbox.AllAgentExecs[1].ExtraEnvironment!["ANTHROPIC_API_KEY"]);
+    }
+
     // ── Sanitiser & 400 thinking-block recovery ───────────────────────────────
 
     [Fact]
@@ -518,7 +537,32 @@ public sealed class ClaudeSessionWorkerTests
         Assert.Equal(2, sandbox.AllAgentExecs.Count);
     }
 
+    [Fact]
+    public async Task CloseSession_AfterStopPreserve_DisablesPreserveBeforeDisposing()
+    {
+        var sandbox = new PreserveOnDisposeScriptedSandbox(StreamJsonFirstTurn("cli-preserve-close"));
+        var worker = new ClaudeSessionWorker(BuildRunner());
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        await worker.SendTurnAsync(handle, "first");
+        await worker.SuspendSessionAsync(handle);
+        await worker.CloseSessionAsync(handle);
+
+        Assert.Equal(1, sandbox.StopCallCount);
+        Assert.True(sandbox.DisablePreserveCalled);
+        Assert.True(sandbox.Destroyed);
+    }
+
     // ── Test doubles ──────────────────────────────────────────────────────────
+
+    private static AgentCredential ClaudeApiCredential(string token) =>
+        new(
+            AgentKind.Claude,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["ANTHROPIC_API_KEY"] = token,
+            },
+            new Dictionary<string, string>(StringComparer.Ordinal));
 
     /// <summary>
     /// Sandbox that returns a scripted stdout for each successive `claude` exec
@@ -576,6 +620,39 @@ public sealed class ClaudeSessionWorkerTests
         {
             StopCallCount++;
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class PreserveOnDisposeScriptedSandbox :
+        ScriptedSandbox,
+        IPreemptibleSandbox,
+        IPreserveOnDisposeSandbox
+    {
+        private bool _preserveOnDispose;
+        public int StopCallCount { get; private set; }
+        public bool DisablePreserveCalled { get; private set; }
+        public bool Destroyed { get; private set; }
+
+        public PreserveOnDisposeScriptedSandbox(params string[] agentStdouts) : base(agentStdouts) { }
+
+        public Task StopAndPreserveAsync(CancellationToken ct = default)
+        {
+            StopCallCount++;
+            _preserveOnDispose = true;
+            return Task.CompletedTask;
+        }
+
+        public void DisablePreserveOnDispose()
+        {
+            DisablePreserveCalled = true;
+            _preserveOnDispose = false;
+        }
+
+        public override ValueTask DisposeAsync()
+        {
+            if (!_preserveOnDispose)
+                Destroyed = true;
+            return ValueTask.CompletedTask;
         }
     }
 

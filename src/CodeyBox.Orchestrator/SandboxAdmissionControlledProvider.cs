@@ -26,6 +26,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     private readonly NamedAdmissionTracker? _resumeAdmissions;
     private readonly NamedAdmissionTracker _disposedSandboxAdmissions = new();
     private readonly NamedAdmissionTracker _disposedBaselineAdmissions = new();
+    private readonly ConcurrentDictionary<string, AdmissionControlledSandbox> _preservedLiveSandboxes = new(StringComparer.Ordinal);
     private readonly ISuspendingSandboxProvider? _suspendingProvider;
     private readonly IDiskGuardedSandboxProvider? _diskGuardedProvider;
     private readonly IBaselineImageResolver? _baselineResolver;
@@ -140,14 +141,17 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
         var managed = await _inner.ListAllManagedAsync(ct).ConfigureAwait(false);
-        _resumeAdmissions?.ReleaseMissing(managed.Select(static info => info.Name));
-        _disposedSandboxAdmissions.ReleaseMissing(managed.Select(static info => info.Name));
+        var managedNames = managed.Select(static info => info.Name).ToArray();
+        _resumeAdmissions?.ReleaseMissing(managedNames);
+        _disposedSandboxAdmissions.ReleaseMissing(managedNames);
+        ReleaseMissingPreservedLiveSandboxes(managedNames);
         return managed;
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
         await _inner.DisposeLeakedAsync(name, ct).ConfigureAwait(false);
+        _preservedLiveSandboxes.TryRemove(name, out _);
         _resumeAdmissions?.Release(name);
         _disposedSandboxAdmissions.Release(name);
     }
@@ -172,7 +176,10 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         {
             lease = await _gate.AcquireAsync(ct).ConfigureAwait(false);
             await suspendingProvider.ResumeSandboxAsync(name, ct).ConfigureAwait(false);
-            resumeAdmissions.Retain(name, lease);
+            if (TryAdoptResumeAdmission(name, lease))
+                resumeAdmissions.CancelPending(name);
+            else
+                resumeAdmissions.Retain(name, lease);
             retained = true;
         }
         finally
@@ -298,24 +305,30 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
         return capabilities switch
         {
-            SandboxCapabilities.None => new AdmissionControlledSandbox(sandbox, lease, OnSandboxDisposedAsync, _log),
-            SandboxCapabilities.Preemptible => new AdmissionControlledPreemptibleSandbox(sandbox, preemptible!, lease, OnSandboxDisposedAsync, _log),
-            SandboxCapabilities.Suspendable => new AdmissionControlledSuspendableSandbox(sandbox, suspendable!, lease, OnSandboxDisposedAsync, _log),
-            SandboxCapabilities.Shutdown => new AdmissionControlledShutdownSandbox(sandbox, shutdown!, lease, OnSandboxDisposedAsync, _log),
-            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable => new AdmissionControlledPreemptibleSuspendableSandbox(sandbox, preemptible!, suspendable!, lease, OnSandboxDisposedAsync, _log),
-            SandboxCapabilities.Preemptible | SandboxCapabilities.Shutdown => new AdmissionControlledPreemptibleShutdownSandbox(sandbox, preemptible!, shutdown!, lease, OnSandboxDisposedAsync, _log),
-            SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledSuspendableShutdownSandbox(sandbox, suspendable!, shutdown!, lease, OnSandboxDisposedAsync, _log),
-            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledFullSandbox(sandbox, preemptible!, suspendable!, shutdown!, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.None => new AdmissionControlledSandbox(sandbox, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
+            SandboxCapabilities.Preemptible => new AdmissionControlledPreemptibleSandbox(sandbox, preemptible!, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
+            SandboxCapabilities.Suspendable => new AdmissionControlledSuspendableSandbox(sandbox, suspendable!, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
+            SandboxCapabilities.Shutdown => new AdmissionControlledShutdownSandbox(sandbox, shutdown!, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
+            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable => new AdmissionControlledPreemptibleSuspendableSandbox(sandbox, preemptible!, suspendable!, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
+            SandboxCapabilities.Preemptible | SandboxCapabilities.Shutdown => new AdmissionControlledPreemptibleShutdownSandbox(sandbox, preemptible!, shutdown!, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
+            SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledSuspendableShutdownSandbox(sandbox, suspendable!, shutdown!, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
+            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledFullSandbox(sandbox, preemptible!, suspendable!, shutdown!, lease, OnSandboxDisposedAsync, OnSandboxPreserved, _log),
             _ => throw new InvalidOperationException($"Unhandled sandbox capability set: {capabilities}"),
         };
     }
 
     private async ValueTask OnSandboxDisposedAsync(
-        ISandbox sandbox,
+        AdmissionControlledSandbox sandbox,
         SandboxAdmissionLease lease,
-        bool innerDisposeSucceeded)
+        bool innerDisposeSucceeded,
+        bool admissionHeld)
     {
         _active?.Remove(sandbox);
+        _preservedLiveSandboxes.TryRemove(sandbox.Id, out _);
+        _resumeAdmissions?.Release(sandbox.Id);
+        if (!admissionHeld)
+            return;
+
         var releaseAdmission = false;
         if (innerDisposeSucceeded)
             releaseAdmission = !await IsManagedSandboxStillPresentAsync(sandbox.Id).ConfigureAwait(false);
@@ -332,6 +345,33 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             }
             _disposedSandboxAdmissions.Retain(sandbox.Id, lease);
         }
+    }
+
+    private void OnSandboxPreserved(AdmissionControlledSandbox sandbox)
+    {
+        _preservedLiveSandboxes[sandbox.Id] = sandbox;
+        _resumeAdmissions?.Release(sandbox.Id);
+    }
+
+    private void ReleaseMissingPreservedLiveSandboxes(IReadOnlyCollection<string> managedNames)
+    {
+        if (_preservedLiveSandboxes.IsEmpty)
+            return;
+
+        var present = new HashSet<string>(managedNames, StringComparer.Ordinal);
+        foreach (var name in _preservedLiveSandboxes.Keys)
+        {
+            if (!present.Contains(name))
+                _preservedLiveSandboxes.TryRemove(name, out _);
+        }
+    }
+
+    private bool TryAdoptResumeAdmission(string name, SandboxAdmissionLease lease)
+    {
+        if (!_preservedLiveSandboxes.TryRemove(name, out var sandbox))
+            return false;
+
+        return sandbox.TryAdoptAdmissionLease(lease);
     }
 
     private async Task<bool> IsManagedSandboxStillPresentAsync(string name)
@@ -750,25 +790,31 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
 {
     private readonly ISandbox _inner;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
-    private readonly SandboxAdmissionLease _lease;
-    private readonly Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> _onDisposed;
+    private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> _onDisposed;
+    private readonly Action<AdmissionControlledSandbox> _onPreserved;
     private readonly ILogger _log;
+    private readonly object _admissionSync = new();
+    private SandboxAdmissionLease _lease;
+    private bool _admissionReleasedForPreserve;
     private int _disposed;
 
     public AdmissionControlledSandbox(
         ISandbox inner,
         SandboxAdmissionLease lease,
-        Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
+        Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+        Action<AdmissionControlledSandbox> onPreserved,
         ILogger log)
     {
         ArgumentNullException.ThrowIfNull(inner);
         ArgumentNullException.ThrowIfNull(lease);
         ArgumentNullException.ThrowIfNull(onDisposed);
+        ArgumentNullException.ThrowIfNull(onPreserved);
         ArgumentNullException.ThrowIfNull(log);
         _inner = inner;
         _preserveOnDispose = inner as IPreserveOnDisposeSandbox;
         _lease = lease;
         _onDisposed = onDisposed;
+        _onPreserved = onPreserved;
         _log = log;
     }
 
@@ -814,7 +860,8 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
         {
             try
             {
-                await _onDisposed(this, _lease, innerDisposeSucceeded).ConfigureAwait(false);
+                var (lease, admissionHeld) = SnapshotAdmissionForDispose();
+                await _onDisposed(this, lease, innerDisposeSucceeded, admissionHeld).ConfigureAwait(false);
             }
             catch (Exception releaseEx)
             {
@@ -829,25 +876,74 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
     }
 
     public void DisablePreserveOnDispose() => _preserveOnDispose?.DisablePreserveOnDispose();
+
+    internal bool TryAdoptAdmissionLease(SandboxAdmissionLease lease)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        lock (_admissionSync)
+        {
+            if (_disposed != 0 || !_admissionReleasedForPreserve)
+                return false;
+
+            _lease = lease;
+            _admissionReleasedForPreserve = false;
+            return true;
+        }
+    }
+
+    protected async Task StopAndReleaseAdmissionAsync(
+        IPreemptibleSandbox preemptible,
+        CancellationToken ct)
+    {
+        await preemptible.StopAndPreserveAsync(ct).ConfigureAwait(false);
+        ReleaseAdmissionAfterPreserve();
+    }
+
+    private void ReleaseAdmissionAfterPreserve()
+    {
+        SandboxAdmissionLease? release = null;
+        var notify = false;
+        lock (_admissionSync)
+        {
+            if (!_admissionReleasedForPreserve)
+            {
+                _admissionReleasedForPreserve = true;
+                release = _lease;
+                notify = true;
+            }
+        }
+
+        release?.Dispose();
+        if (notify)
+            _onPreserved(this);
+    }
+
+    private (SandboxAdmissionLease Lease, bool AdmissionHeld) SnapshotAdmissionForDispose()
+    {
+        lock (_admissionSync)
+            return (_lease, !_admissionReleasedForPreserve);
+    }
 }
 
 internal sealed class AdmissionControlledPreemptibleSandbox(
     ISandbox inner,
     IPreemptibleSandbox preemptible,
     SandboxAdmissionLease lease,
-    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
-    ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, log), IPreemptibleSandbox
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Action<AdmissionControlledSandbox> onPreserved,
+    ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log), IPreemptibleSandbox
 {
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
-        preemptible.StopAndPreserveAsync(ct);
+        StopAndReleaseAdmissionAsync(preemptible, ct);
 }
 
 internal sealed class AdmissionControlledShutdownSandbox(
     ISandbox inner,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
-    ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, log), IShutdownTeardownSandbox
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Action<AdmissionControlledSandbox> onPreserved,
+    ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log), IShutdownTeardownSandbox
 {
     public bool IsOwnedByShutdownHandler => shutdown.IsOwnedByShutdownHandler;
 
@@ -858,8 +954,9 @@ internal sealed class AdmissionControlledSuspendableSandbox(
     ISandbox inner,
     ISuspendableSandbox suspendable,
     SandboxAdmissionLease lease,
-    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
-    ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, log), ISuspendableSandbox
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Action<AdmissionControlledSandbox> onPreserved,
+    ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log), ISuspendableSandbox
 {
     public bool IsSuspended => suspendable.IsSuspended;
 
@@ -874,9 +971,10 @@ internal sealed class AdmissionControlledPreemptibleSuspendableSandbox(
     IPreemptibleSandbox preemptible,
     ISuspendableSandbox suspendable,
     SandboxAdmissionLease lease,
-    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
-    : AdmissionControlledSandbox(inner, lease, onDisposed, log),
+    : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),
         IPreemptibleSandbox,
         ISuspendableSandbox
 {
@@ -885,7 +983,7 @@ internal sealed class AdmissionControlledPreemptibleSuspendableSandbox(
     public long? MemoryBytes => suspendable.MemoryBytes;
 
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
-        preemptible.StopAndPreserveAsync(ct);
+        StopAndReleaseAdmissionAsync(preemptible, ct);
 
     public Task SuspendAsync(CancellationToken ct = default) =>
         suspendable.SuspendAsync(ct);
@@ -896,16 +994,17 @@ internal sealed class AdmissionControlledPreemptibleShutdownSandbox(
     IPreemptibleSandbox preemptible,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
-    : AdmissionControlledSandbox(inner, lease, onDisposed, log),
+    : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),
         IPreemptibleSandbox,
         IShutdownTeardownSandbox
 {
     public bool IsOwnedByShutdownHandler => shutdown.IsOwnedByShutdownHandler;
 
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
-        preemptible.StopAndPreserveAsync(ct);
+        StopAndReleaseAdmissionAsync(preemptible, ct);
 
     public void MarkOwnedByShutdownHandler() => shutdown.MarkOwnedByShutdownHandler();
 }
@@ -915,9 +1014,10 @@ internal sealed class AdmissionControlledSuspendableShutdownSandbox(
     ISuspendableSandbox suspendable,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
-    : AdmissionControlledSandbox(inner, lease, onDisposed, log),
+    : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),
         ISuspendableSandbox,
         IShutdownTeardownSandbox
 {
@@ -939,9 +1039,10 @@ internal sealed class AdmissionControlledFullSandbox(
     ISuspendableSandbox suspendable,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
-    : AdmissionControlledSandbox(inner, lease, onDisposed, log),
+    : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),
         IPreemptibleSandbox,
         ISuspendableSandbox,
         IShutdownTeardownSandbox
@@ -953,7 +1054,7 @@ internal sealed class AdmissionControlledFullSandbox(
     public long? MemoryBytes => suspendable.MemoryBytes;
 
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
-        preemptible.StopAndPreserveAsync(ct);
+        StopAndReleaseAdmissionAsync(preemptible, ct);
 
     public Task SuspendAsync(CancellationToken ct = default) =>
         suspendable.SuspendAsync(ct);

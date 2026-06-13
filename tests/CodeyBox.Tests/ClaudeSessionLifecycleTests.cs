@@ -316,7 +316,49 @@ public sealed class ClaudeSessionLifecycleTests
         Assert.Equal(2, worker.CloseCalls);
     }
 
+    [Fact]
+    public async Task CanRunTurn_RejectsLiveSessionMemberModelAndReasoningMismatches()
+    {
+        var worker = new FakeSessionRunner();
+        var sandbox = new RecordingSandbox("worker-vm-mismatch");
+        var runner = new StubAgentRunner(AgentKind.Claude);
+
+        await using var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
+            worker,
+            handleSnapshot: null,
+            sandbox,
+            "/work",
+            credential: null,
+            modelId: "model-a",
+            reasoningMode: "high",
+            openedAgentRouteKey: "claude/account-a",
+            projectId: null,
+            agentClassMember: null,
+            ct: CancellationToken.None);
+
+        var matching = NewItem() with
+        {
+            AgentInstanceId = "claude/account-a",
+            ModelId = "model-a",
+            ReasoningMode = "high",
+        };
+
+        Assert.True(lifecycle.CanRunTurn(runner, matching));
+        Assert.False(lifecycle.CanRunTurn(runner, matching with { AgentInstanceId = "claude/account-b" }));
+        Assert.False(lifecycle.CanRunTurn(runner, matching with { ModelId = "model-b" }));
+        Assert.False(lifecycle.CanRunTurn(runner, matching with { ReasoningMode = "max" }));
+    }
+
     // ─── test doubles ─────────────────────────────────────────────────────
+
+    private static WorkItem NewItem() => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test-project"),
+        Title = "session lifecycle test",
+        Prompt = "do thing",
+        Agent = AgentKind.Claude,
+    };
 
     /// <summary>
     /// Programmable <see cref="ISessionAgentRunner"/> that records every
@@ -427,5 +469,25 @@ public sealed class ClaudeSessionLifecycleTests
             => Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
 
         public ValueTask DisposeAsync() { Disposed = true; return ValueTask.CompletedTask; }
+    }
+
+    private sealed class StubAgentRunner(AgentKind kind) : IAgentRunner
+    {
+        public AgentKind Kind { get; } = kind;
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+            => Task.FromResult(new AgentResult(true, "ok", null, null));
+
+        public AgentFailureClassification ClassifyFailure(AgentResult result)
+            => new(AgentFailureKind.Normal);
     }
 }

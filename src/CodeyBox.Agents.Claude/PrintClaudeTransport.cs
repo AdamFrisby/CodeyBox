@@ -39,10 +39,10 @@ public sealed class PrintClaudeTransport : IClaudeTransport
         return Task.FromResult<IClaudeTransportSession>(new PrintSession(_runner, request));
     }
 
-    private sealed class PrintSession : IClaudeTransportSession
+    private sealed class PrintSession : ICredentialRefreshableClaudeTransportSession
     {
         private readonly ClaudeAgentRunner _runner;
-        private readonly ClaudeTransportOpenRequest _open;
+        private ClaudeTransportOpenRequest _open;
 
         public PrintSession(ClaudeAgentRunner runner, ClaudeTransportOpenRequest open)
         {
@@ -86,6 +86,9 @@ public sealed class PrintClaudeTransport : IClaudeTransport
 
             return new ClaudeTransportTurnResult(result, combinedStdout, captured);
         }
+
+        public void RefreshCredential(AgentCredential? credential) =>
+            _open = _open with { Credential = credential };
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }

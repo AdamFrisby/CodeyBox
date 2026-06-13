@@ -79,6 +79,15 @@ public interface IClaudeTransportSession : IAsyncDisposable
 }
 
 /// <summary>
+/// Optional transport-session capability used when a long-lived logical
+/// session receives a freshly resolved credential before a later turn.
+/// </summary>
+public interface ICredentialRefreshableClaudeTransportSession : IClaudeTransportSession
+{
+    void RefreshCredential(AgentCredential? credential);
+}
+
+/// <summary>
 /// Inputs the worker hands a transport when opening a session. Carries only
 /// what the transport actually needs.
 /// </summary>

@@ -274,6 +274,29 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
     }
 
     /// <summary>
+    /// Updates runner-local credentials for the already-open session before a
+    /// later turn. Runners that do not advertise refresh support keep their
+    /// original open-time credential.
+    /// </summary>
+    public async Task RefreshCredentialAsync(AgentCredential? credential, CancellationToken ct)
+    {
+        if (_worker is not ICredentialRefreshableSessionAgentRunner refreshable)
+            return;
+
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ThrowIfClosed();
+            await refreshable.RefreshSessionCredentialAsync(Handle, credential, ct)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
     /// Stops the worker VM via
     /// <see cref="ISessionAgentRunner.SuspendSessionAsync"/>. Called by
     /// PipelineRunner after each worker turn completes its post-agent git

@@ -412,6 +412,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // rework loop, so the session-share benefit doesn't apply.
         if (item.JobType == JobType.CheckAndAct) return false;
         if (item.JobType == JobType.AgentControl) return false;
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)) return false;
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         if (!string.IsNullOrWhiteSpace(classId))
         {
@@ -1590,8 +1591,15 @@ public sealed class PipelineRunner : IPipelineRunner
                 catch (Exception ex)
                 {
                     _log.LogWarning(ex,
-                        "Claude session terminal cleanup failed for work item {Id}; continuing after surfacing the cleanup failure",
+                        "Claude session terminal cleanup failed for work item {Id}; marking the item failed and rethrowing so cleanup can be retried",
                         item.Id);
+                    await TransitionFailed(
+                        item,
+                        $"Claude session terminal cleanup failed: {ex.Message}",
+                        CancellationToken.None,
+                        project,
+                        failureKind: "infrastructure");
+                    throw;
                 }
                 _ambientSessionLifecycle.Value = null;
             }
@@ -2859,6 +2867,15 @@ public sealed class PipelineRunner : IPipelineRunner
         int? iteration = null)
     {
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
+        var selectedMemberForSession = TryResolveSelectedMember(runner.Kind, project, item);
+        var sessionTurnItem = selectedMemberForSession is null
+            ? item
+            : item with
+            {
+                AgentInstanceId = selectedMemberForSession.RouteKey,
+                ModelId = selectedMemberForSession.ModelId,
+                ReasoningMode = selectedMemberForSession.ReasoningMode,
+            };
         var access = _gitHost.GetSandboxAccess(repoId);
         var agentPhase = isInitial ? "work" : "rework";
 
@@ -2892,7 +2909,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var useClaudeSession = sessionLifecycle is not null
             && !sessionLifecycle.IsClosed
             && runner.Kind == AgentKind.Claude
-            && sessionLifecycle.CanRunTurn(runner, item)
+            && sessionLifecycle.CanRunTurn(runner, sessionTurnItem)
             && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
         ISandbox sandbox;
@@ -2940,7 +2957,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 && !sessionLifecycle.IsClosed
                 && runner.Kind == AgentKind.Claude
                 && string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
-                && !sessionLifecycle.CanRunTurn(runner, item))
+                && !sessionLifecycle.CanRunTurn(runner, sessionTurnItem))
             {
                 await CloseAmbientClaudeSessionAsync(
                     sessionLifecycle,
@@ -2960,12 +2977,15 @@ public sealed class PipelineRunner : IPipelineRunner
             skipClone = false;
         }
 
+        var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
         var phaseSucceeded = false;
         try
         {
 
             if (credential is not null && credential.Files.Count > 0)
                 await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            if (useClaudeSession && !resumingPreempt)
+                await sessionLifecycle!.RefreshCredentialAsync(credential, ct);
 
             if (!skipClone)
             {
@@ -2985,7 +3005,6 @@ public sealed class PipelineRunner : IPipelineRunner
                 // before the agent looks at it.
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
             }
-            var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
             var checkedOutExistingBranch = false;
             if (resumingPreempt)
             {

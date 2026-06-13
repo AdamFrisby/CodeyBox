@@ -258,6 +258,12 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         var codexItem = NewItem() with { Agent = AgentKind.Codex };
         var checkItem = NewItem() with { Agent = AgentKind.Claude, JobType = JobType.CheckAndAct };
         var controlItem = NewItem() with { Agent = AgentKind.Claude, JobType = JobType.AgentControl };
+        var preemptItem = NewItem() with
+        {
+            Agent = AgentKind.Claude,
+            State = WorkItemState.Working,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{WorkItemId.New()}",
+        };
 
         // Helper to spin up a PipelineRunner with the given knobs and ask it.
         bool Gate(ClaudeSessionWorker? worker, ClaudeSessionWorkerOptions options, Project project, WorkItem item, AgentKind runnerKind)
@@ -290,6 +296,9 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         // the session-share benefit doesn't apply and dropping this bypass
         // would route them through the worker VM unnecessarily.
         Assert.False(Gate(workerRegistered, enabledOptions, optedInProject, controlItem, AgentKind.Claude));
+        // Gate OFF for preempt recovery. Restarted Working/Reworking items with
+        // a checkpoint intentionally degrade to the legacy one-shot resume path.
+        Assert.False(Gate(workerRegistered, enabledOptions, optedInProject, preemptItem, AgentKind.Claude));
     }
 
     [Fact]
@@ -644,6 +653,59 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task SessionMode_ResumeDegradeFallback_ContinuesReworkInLegacySandbox()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+        ])
+        {
+            MarkFallbackOnResume = true,
+        };
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "needs fix", "x")]),
+            new AuditOutcome(true, []),
+        ]);
+
+        AgentSessionHandle Snapshot(AgentSessionHandle handle)
+        {
+            if (!sessionRunner.FallbackMarked)
+                return handle;
+
+            var metadata = handle.Metadata is null
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : new Dictionary<string, string>(handle.Metadata, StringComparer.Ordinal);
+            metadata[AgentSessionMetadataKeys.FallbackToOneShot] = "true";
+            return handle with { Metadata = metadata };
+        }
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
+            sessionAgentRunnerOverride: sessionRunner,
+            sessionHandleSnapshotOverride: Snapshot);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-legacy-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, sessionRunner.SendTurns);
+        Assert.Equal(1, sessionRunner.SuspendCalls);
+        Assert.Equal(1, sessionRunner.ResumeCalls);
+        Assert.Equal(1, sessionRunner.CloseCalls);
+        Assert.Empty(tp.Agent.WorkPlan);
+    }
+
+    [Fact]
     public async Task SessionMode_QuotaFailureClosesSessionBeforeSameKindFallback()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -745,6 +807,38 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task SessionMode_TerminalCleanupFailure_MarksItemFailedAndRethrows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+        ])
+        {
+            CloseFailuresRemaining = 1,
+        };
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        Assert.Contains("close failed", ex.Message, StringComparison.Ordinal);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Claude session terminal cleanup failed", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task SessionMode_OptedOutProject_DoesNotOpenSession()
     {
         // The non-session default path must be unchanged when a project does
@@ -814,6 +908,9 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         public string? OpenedModelId;
         public string? OpenedReasoningMode;
         public bool FailNextSuspend { get; set; }
+        public int CloseFailuresRemaining { get; set; }
+        public bool MarkFallbackOnResume { get; set; }
+        public bool FallbackMarked { get; private set; }
         public ConcurrentQueue<string> HandleIdsObserved { get; } = new();
         public ConcurrentQueue<string> SandboxIdsObservedOnTurns { get; } = new();
         public ConcurrentQueue<string> PromptsSent { get; } = new();
@@ -911,12 +1008,19 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         public Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
         {
             Interlocked.Increment(ref ResumeCalls);
+            if (MarkFallbackOnResume)
+                FallbackMarked = true;
             return Task.CompletedTask;
         }
 
         public async Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
         {
             Interlocked.Increment(ref CloseCalls);
+            if (CloseFailuresRemaining > 0)
+            {
+                CloseFailuresRemaining--;
+                throw new InvalidOperationException("close failed");
+            }
             if (_capturedSandbox is not null)
                 await _capturedSandbox.DisposeAsync();
         }

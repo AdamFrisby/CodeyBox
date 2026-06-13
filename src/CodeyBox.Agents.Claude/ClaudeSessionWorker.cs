@@ -45,7 +45,7 @@ namespace CodeyBox.Agents.Claude;
 /// global <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>) regardless
 /// of which transport is in use.</para>
 /// </summary>
-public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner
+public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredentialRefreshableSessionAgentRunner
 {
     /// <summary>
     /// Metadata key under <see cref="AgentSessionHandle.Metadata"/> carrying
@@ -355,6 +355,37 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner
 
             state.TurnsCompleted++;
             return turn.Result;
+        }
+        finally
+        {
+            state.Gate.Release();
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task RefreshSessionCredentialAsync(
+        AgentSessionHandle sessionHandle,
+        AgentCredential? credential,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(sessionHandle);
+        EnsureKind(sessionHandle);
+        ct.ThrowIfCancellationRequested();
+
+        if (credential is not null && credential.Agent != Kind)
+        {
+            throw new InvalidOperationException(
+                $"Credential refresh supplied credentials for '{credential.Agent}', not '{Kind}'.");
+        }
+
+        var state = await ResolveStateAsync(sessionHandle, ct).ConfigureAwait(false);
+        await state.Gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ThrowIfClosed(state);
+            state.Credential = credential;
+            if (state.TransportSession is ICredentialRefreshableClaudeTransportSession refreshable)
+                refreshable.RefreshCredential(credential);
         }
         finally
         {
@@ -812,7 +843,7 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner
 
         public SemaphoreSlim Gate { get; } = new(1, 1);
         public ISandbox Sandbox { get; }
-        public AgentCredential? Credential { get; }
+        public AgentCredential? Credential { get; set; }
         public IClaudeTransport ActiveTransport { get; set; }
         public IClaudeTransportSession TransportSession { get; set; }
         public string? CapturedSessionId { get; set; }

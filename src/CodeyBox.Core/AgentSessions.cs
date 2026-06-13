@@ -96,6 +96,19 @@ public interface ISessionAgentRunner : IAgentRunner
 }
 
 /// <summary>
+/// Optional session-runner capability for callers that resolve fresh
+/// credentials before each turn. The session handle still carries no secret
+/// material; this only updates runner-local state for an already-open session.
+/// </summary>
+public interface ICredentialRefreshableSessionAgentRunner : ISessionAgentRunner
+{
+    Task RefreshSessionCredentialAsync(
+        AgentSessionHandle sessionHandle,
+        AgentCredential? credential,
+        CancellationToken ct = default);
+}
+
+/// <summary>
 /// Optional extension for session runners that can use project/member context
 /// when opening a session. The base <see cref="ISessionAgentRunner"/> contract
 /// stays context-free for providers that do not need scoped dispatch hints.
