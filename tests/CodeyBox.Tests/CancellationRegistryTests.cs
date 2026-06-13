@@ -14,6 +14,20 @@ public sealed class CancellationRegistryTests
         Assert.False(registration.Token.IsCancellationRequested);
         Assert.True(reg.Cancel(id));
         Assert.True(registration.Token.IsCancellationRequested);
+        Assert.Equal(CancellationRequestKind.Operator, reg.GetRequestKind(id));
+    }
+
+    [Fact]
+    public void CancelForRecovery_SignalsTokenWithRecoveryKind()
+    {
+        using var reg = new CancellationRegistry(CancellationToken.None);
+        var id = WorkItemId.New();
+        using var registration = reg.Register(id);
+
+        Assert.True(reg.CancelForRecovery(id));
+
+        Assert.True(registration.Token.IsCancellationRequested);
+        Assert.Equal(CancellationRequestKind.Recovery, reg.GetRequestKind(id));
     }
 
     [Fact]
@@ -52,5 +66,6 @@ public sealed class CancellationRegistryTests
         Assert.True(reg.IsActive(id));
         registration.Dispose();
         Assert.False(reg.IsActive(id));
+        Assert.Null(reg.GetRequestKind(id));
     }
 }

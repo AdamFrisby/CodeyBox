@@ -32,6 +32,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
         group.MapPost("/{id}/uncancel", UncancelAsync);
         group.MapPost("/{id}/resume", ResumeAsync);
+        group.MapPost("/{id}/recover", RecoverAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -874,6 +875,57 @@ internal static class WorkItemEndpoints
             from = requestedFrom,
             state = resumed.State.ToString(),
         });
+    }
+
+    /// <summary>
+    /// POST /workitems/{id}/recover — one-call operator recovery for a single
+    /// stuck in-flight item. Same recovery path the
+    /// <see cref="ItemStaleProgressWatchdog"/> uses: claim the bound worker
+    /// row (if any), release its pool slot, requeue PRESERVING the work
+    /// branch (so the next pickup re-rebases existing commits onto current
+    /// upstream main rather than starting over), and increment
+    /// <see cref="WorkItem.RecoveryAttempts"/>. Bounded by
+    /// <c>CodeyBox:WorkerProgressWatchdog:ItemStaleMaxRecoveryAttempts</c>;
+    /// once exceeded the item escalates to
+    /// <see cref="WorkItemState.NeedsOperatorInput"/> instead of looping.
+    ///
+    /// <para>
+    /// Refuses anything that is not in an active in-flight state (Working /
+    /// Reworking / Auditing / Merging / ReworkingForConflict /
+    /// UpstreamPushing). Use POST /workitems/{id}/retry for terminal-failed
+    /// or operator-parked items; use POST /workitems/{id}/resume for the
+    /// operator-cancel resume path.
+    /// </para>
+    /// </summary>
+    private static async Task<IResult> RecoverAsync(
+        string id,
+        IWorkItemStore store,
+        ItemStaleProgressWatchdog watchdog,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        // The watchdog refuses non-active states with a structured error; no
+        // need to duplicate the state check here.
+        var result = await watchdog.RecoverItemAsync(
+            item!,
+            reason: $"operator-triggered recovery via POST /workitems/{item!.Id}/recover",
+            ct);
+
+        if (!result.Recovered)
+            return Results.Conflict(new { error = result.Error ?? "recovery did not transition the work item" });
+
+        return Results.Accepted(
+            $"/workitems/{item.Id}",
+            new
+            {
+                id = item.Id.ToString(),
+                fromState = result.FromState?.ToString(),
+                state = result.NewState?.ToString(),
+                recoveryAttempt = result.Attempt,
+                branchPreserved = result.BranchPreserved,
+            });
     }
 
     /// <summary>

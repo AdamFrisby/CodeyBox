@@ -1,4 +1,6 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
@@ -171,6 +173,136 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         Assert.Equal(preservedTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
         Assert.Equal("preserved work\n", await ShowAsync(barePath, $"{item.WorkBranch}:preserved.txt"));
         Assert.Equal("continued work\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
+    public async Task ItemStaleRecovery_RecoveredItem_PreservedCommitsRideThroughPickup_AndMergeAdvancesOntoCurrentMain()
+    {
+        // Acceptance criterion (c): recovery preserves the work branch and
+        // the next pickup carries the preserved commits forward; the merge
+        // phase then folds them onto current upstream main so the merge
+        // commit advances past the new main tip rather than starting over
+        // from scratch.
+        //
+        // Without this end-to-end check, a regression where recovery sets
+        // PreserveWorkBranchOnQueuedPickup but the next pickup wipes the
+        // branch (or skips the merge-time rebase that lands the preserved
+        // commits onto current main) would pass the per-watchdog unit tests.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        // Item is currently Working with two prior work-branch commits the
+        // pipeline produced on top of the original main tip.
+        var item = NewItem() with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-100),
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-100),
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var originalMain = await RevParseAsync(barePath, "main");
+        await CommitTwoWorkBranchCommitsAsync(barePath, item.WorkBranch!);
+        var preRecoveryWorkTip = await RevParseAsync(barePath, item.WorkBranch!);
+        await tp.Store.CreateAsync(item);
+
+        // Recover via ItemStaleProgressWatchdog — same surface the operator
+        // endpoint and periodic sweep use.
+        var watchdogOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(60),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            ItemStaleTimeout = TimeSpan.FromMinutes(90),
+            ItemStaleCheckInterval = TimeSpan.FromMinutes(5),
+            ItemStaleMaxRecoveryAttempts = 3,
+        };
+        watchdogOpts.Validate();
+        using var registryDb = new SqliteWorkerRegistry(Path.Combine(_workspace, "registry.db"));
+        var watchdog = new ItemStaleProgressWatchdog(
+            tp.Store, new InMemoryTaskQueue(), registryDb,
+            watchdogOpts, NullLogger<ItemStaleProgressWatchdog>.Instance);
+        var result = await watchdog.RecoverItemAsync(
+            (await tp.Store.GetAsync(item.Id))!,
+            "test: simulated stale-updatedAt recovery",
+            CancellationToken.None);
+        Assert.True(result.Recovered);
+        Assert.Equal(WorkItemState.Queued, result.NewState);
+        Assert.True(result.BranchPreserved);
+
+        // Advance upstream main AFTER recovery, then run the pipeline on
+        // the recovered Queued item. The work branch carries forward into
+        // pickup, the agent appends a new commit, the merge phase folds
+        // the result onto the advanced main, and the final state is Done.
+        await CommitToSeedAsync(seed, "main.txt", "main advanced after recovery\n", "main advanced after recovery");
+        var advancedMain = await RevParseAsync(seed, "main");
+        Assert.NotEqual(originalMain, advancedMain);
+
+        string? pickupHead = null;
+        string? pickupOriginMain = null;
+        bool pickupOriginMainIsAncestor = false;
+        string? pickupB = null;
+        string? pickupC = null;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var head = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "rev-parse", "HEAD"],
+            }, ct);
+            pickupHead = head.Stdout.Trim();
+
+            var originMain = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "rev-parse", "origin/main"],
+            }, ct);
+            pickupOriginMain = originMain.Stdout.Trim();
+
+            var ancestor = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "merge-base", "--is-ancestor", "origin/main", "HEAD"],
+            }, ct);
+            pickupOriginMainIsAncestor = ancestor.Success;
+
+            pickupB = (await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{workingDirectory}/b.txt"],
+            }, ct)).Stdout;
+            pickupC = (await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{workingDirectory}/c.txt"],
+            }, ct)).Stdout;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "post-recovery work\n"));
+        var recovered = await tp.Store.GetAsync(item.Id);
+        await tp.Pipeline.RunAsync(recovered!, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        // Preserved work commits and the new post-recovery commit must all
+        // be reachable on the work branch — the pickup did not discard them.
+        Assert.NotEqual(preRecoveryWorkTip, pickupHead);
+        Assert.Equal(advancedMain, pickupOriginMain);
+        Assert.True(pickupOriginMainIsAncestor,
+            "recovered work phase must start after pickup-time rebase, with origin/main already an ancestor of HEAD");
+        Assert.Equal("work B\n", pickupB);
+        Assert.Equal("work C\n", pickupC);
+        Assert.Equal("work B\n", await ShowAsync(barePath, $"{item.WorkBranch}:b.txt"));
+        Assert.Equal("work C\n", await ShowAsync(barePath, $"{item.WorkBranch}:c.txt"));
+        Assert.Equal("post-recovery work\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+
+        // Main was advanced and folded in: the merge commit's ancestry
+        // reaches the advanced-main tip (recovery did not restart from the
+        // pre-advance base).
+        Assert.Equal("main advanced after recovery\n", await ShowAsync(barePath, $"main:main.txt"));
+        var advancedMainReachable = await IsAncestorAsync(barePath, advancedMain, "main");
+        Assert.True(advancedMainReachable,
+            "merge must fold the preserved branch onto current main; advanced main tip is unreachable from final main");
+    }
+
+    private static async Task<bool> IsAncestorAsync(string repoPath, string ancestor, string descendant)
+    {
+        var result = await TestSupport.RunGitNoThrow(repoPath, "merge-base", "--is-ancestor", ancestor, descendant);
+        return result.code == 0;
     }
 
     [Fact]

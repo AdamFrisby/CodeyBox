@@ -117,6 +117,29 @@ public interface IWorkItemStore
     Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default);
 
     /// <summary>
+    /// Updates persisted work-item fields only when the persisted state and
+    /// <c>updated_at</c> stamp still match the snapshot the caller inspected.
+    /// Used by recovery paths that must not overwrite a worker's concurrent
+    /// completion or progress update.
+    /// </summary>
+    async Task<bool> TryUpdateIfStateAndUpdatedAtAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+    {
+        var current = await GetAsync(item.Id, ct).ConfigureAwait(false);
+        if (current is null
+            || current.State != onlyIfState
+            || current.UpdatedAt != onlyIfUpdatedAt)
+        {
+            return false;
+        }
+
+        return await TryUpdateIfStateAsync(item, onlyIfState, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Partial UPDATE that touches only the <c>priority</c> and <c>updated_at</c>
     /// columns for the row identified by <paramref name="id"/>. Avoids the TOCTOU
     /// race that a full-row <see cref="UpdateAsync"/> introduces when a concurrent

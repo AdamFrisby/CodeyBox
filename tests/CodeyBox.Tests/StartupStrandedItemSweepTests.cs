@@ -69,9 +69,15 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     };
 
     [Fact]
-    public async Task Sweep_WorkingItem_NoWorker_NoCheckpoint_MarksFailed()
+    public async Task Sweep_WorkingItem_NoWorker_NoCheckpoint_ReclaimsPreservingBranch()
     {
-        var item = MakeItem(WorkItemState.Working);
+        // Spec change 2026-06-12: orphaned Working items with no live worker
+        // are reclaimed (requeued preserving the work branch) instead of
+        // marked Failed — the bare repo holds the work branch across the
+        // restart, so the next pickup re-rebases existing commits onto
+        // current upstream main rather than discarding partial progress.
+        const string workBranch = "codeybox/auto/work-orphan";
+        var item = MakeItem(WorkItemState.Working) with { WorkBranch = workBranch };
         await _store.CreateAsync(item);
 
         // No worker row in the registry — the orchestrator crashed before the
@@ -80,11 +86,17 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         var after = await _store.GetAsync(item.Id);
         Assert.NotNull(after);
-        Assert.Equal(WorkItemState.Failed, after.State);
+        Assert.Equal(WorkItemState.Queued, after.State);
         Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(workBranch, after.WorkBranch);
+        Assert.True(after.PreserveWorkBranchOnQueuedPickup);
+        Assert.Null(after.StartedAt);
+        Assert.Null(after.PreemptCheckpoint);
         Assert.Contains("orchestrator restarted while work was in progress", after.LastError);
-        // No re-enqueue for the Failed terminal path.
-        Assert.Equal(0, _queue.Count);
+        Assert.Equal(1, _queue.Count);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
     }
 
     [Fact]
@@ -180,20 +192,24 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_WorkingItem_AtRecoveryCap_NoCheckpoint_StillMarksFailed()
+    public async Task Sweep_WorkingItem_AtRecoveryCap_NoCheckpoint_EscalatesToNeedsOperatorInput()
     {
-        // Working-without-preempt always transitions to Failed regardless of
-        // RecoveryAttempts — the work branch is gone, so there's nothing to
-        // resume from. This mirrors the AbandonedAfterRecoveryAttempts surface
-        // for resumable states.
+        // Spec change 2026-06-12: Working-without-preempt orphans are reclaimed
+        // (preserve-branch requeue) until MaxRecoveryAttempts is exceeded;
+        // beyond the cap they escalate to NeedsOperatorInput for triage, not
+        // Failed. NeedsOperatorInput surfaces an explicit park so the operator
+        // sees that the reclaim path was tried-and-bounded; Failed would
+        // suggest a one-shot pipeline failure.
         var item = MakeItem(WorkItemState.Working, recoveryAttempts: _opts.MaxRecoveryAttempts);
         await _store.CreateAsync(item);
 
         await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, after!.State);
         Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Contains("MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(0, _queue.Count);
     }
 
     [Theory]
@@ -355,12 +371,16 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
 
-        Assert.Equal(WorkItemState.Failed, (await _store.GetAsync(working.Id))!.State);
+        // Spec change 2026-06-12: Working-without-checkpoint orphans are
+        // reclaimed (requeued preserving the work branch) rather than failed.
+        // Reworking still maps to WorkComplete (resumable state with intact
+        // work-phase commits — no work-branch preservation needed there).
+        Assert.Equal(WorkItemState.Queued, (await _store.GetAsync(working.Id))!.State);
         Assert.Equal(WorkItemState.WorkComplete, (await _store.GetAsync(reworking.Id))!.State);
         Assert.Equal(WorkItemState.WorkComplete, (await _store.GetAsync(auditing.Id))!.State);
         Assert.Equal(WorkItemState.AuditPassed, (await _store.GetAsync(merging.Id))!.State);
-        // Three enqueues: reworking, auditing, merging. Working→Failed is terminal.
-        Assert.Equal(3, _queue.Count);
+        // Four enqueues now: Working→Queued, Reworking→WorkComplete, Auditing→WorkComplete, Merging→AuditPassed.
+        Assert.Equal(4, _queue.Count);
     }
 
     [Fact]
@@ -419,12 +439,17 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     public async Task OrchestratorStartup_RunsSweepBeforeDispatch_StrandedItemNeverRacedByFreshPickup()
     {
         // End-to-end: a Working item with no worker row sits stranded. When
-        // the orchestrator starts, the startup sweep must transition it to
-        // Failed (worker died without a preempt checkpoint) BEFORE the worker
-        // pool begins picking from the queue. If the sweep ran too late, the
-        // item could be picked up in its mid-flight state and executed against
-        // a half-broken pipeline state.
-        var item = MakeItem(WorkItemState.Working);
+        // the orchestrator starts, the startup sweep must reclaim it BEFORE
+        // the worker pool begins picking from the queue. If the sweep ran too
+        // late, the item could be picked up in its mid-flight Working state
+        // and executed against a half-broken pipeline state.
+        //
+        // Spec change 2026-06-12: the sweep now reclaims orphaned Working
+        // items by requeueing them to Queued (work branch preserved), so the
+        // observable race-free signal is the transition to Queued (or Done
+        // once the pipeline picks the requeued item up). The transition out
+        // of Working is what we verify here.
+        var item = MakeItem(WorkItemState.Working) with { WorkBranch = "codeybox/auto/work-orphan-startup" };
         await _store.CreateAsync(item);
 
         var pipeline = new ImmediateDonePipeline(_store);
@@ -442,29 +467,31 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         // BackgroundService.ExecuteAsync runs on the thread pool; under heavy
         // CPU contention (parallel audit suites) the startup-sweep chain can
-        // take several seconds to flush before the item flips to Failed.
+        // take several seconds to flush before the item leaves Working.
         var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
         WorkItem? final = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
             final = await _store.GetAsync(item.Id);
-            if (final?.State == WorkItemState.Failed) break;
+            if (final is not null && final.State != WorkItemState.Working) break;
             await Task.Delay(30);
         }
 
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Failed, final.State);
-        Assert.Contains("orchestrator restarted while work was in progress", final.LastError);
-        // Pipeline must NOT have executed the stranded item.
-        Assert.DoesNotContain(item.Id, pipeline.Executed);
+        Assert.NotEqual(WorkItemState.Working, final.State);
+        Assert.Equal(1, final.RecoveryAttempts);
+        if (pipeline.EntryStates.TryGetValue(item.Id, out var entryState))
+            Assert.Equal(WorkItemState.Queued, entryState);
+        // The recovery attempt count and observed pipeline entry state prove
+        // the orphaned mid-flight Working state was reclaimed before dispatch.
     }
 
     [Fact]
     public async Task OrchestratorStartup_WaitsForRecoveryInputBeforeStartupReaperAndReplay()
     {
-        var item = MakeItem(WorkItemState.Working);
+        var item = MakeItem(WorkItemState.Working) with { WorkBranch = "codeybox/auto/work-orphan-barrier" };
         await _store.CreateAsync(item);
 
         var barrier = new TestStartupRecoveryBarrier();
@@ -491,14 +518,15 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         barrier.MarkRecoveryInputReady();
 
-        // Wider deadline mirrors the parallel-suite contention budget used in
-        // the sibling test; the local-loop case still resolves in milliseconds.
+        // Spec change 2026-06-12: the orphan is reclaimed (requeued) instead
+        // of failed; the immediate-Done pipeline then advances the requeued
+        // item to Done. Wait for any post-Working state.
         var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
         WorkItem? final = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
             final = await _store.GetAsync(item.Id);
-            if (final?.State == WorkItemState.Failed) break;
+            if (final is not null && final.State != WorkItemState.Working) break;
             await Task.Delay(30);
         }
 
@@ -506,8 +534,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Failed, final.State);
-        Assert.DoesNotContain(item.Id, pipeline.Executed);
+        Assert.NotEqual(WorkItemState.Working, final.State);
         Assert.Equal(1, barrier.InitialRecoveryCompletedSignals);
     }
 

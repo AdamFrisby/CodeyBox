@@ -149,6 +149,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
+    private readonly CancellationRegistry? _cancellations;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the
@@ -267,7 +268,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // root wires this to the concrete runner's snapshot method; null
         // when no snapshotting is needed (or in tests that don't assert on
         // the persisted shape).
-        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null)
+        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null,
+        CancellationRegistry? cancellationRegistry = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -335,6 +337,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _questionStore = questionStore;
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
+        _cancellations = cancellationRegistry;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
         _dispatchAvailability = dispatchAvailability;
@@ -1021,7 +1024,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
                     if (preserveExistingWorkBranch)
                     {
-                        if (!item.PreserveWorkBranchOnQueuedPickup)
+                        if (item.PreserveWorkBranchOnQueuedPickup)
+                        {
+                            await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
+                        }
+                        else
                         {
                             await _requiredBuildGate.EnforceBeforePickupResetAsync(
                                 item, project, _gitHost, repoId, baseBranch, workBranch, ct);
@@ -1380,6 +1387,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 operatorRequested: true,
                 hostShutdown: false,
                 exception: pex);
+            if (IsRecoveryCancellation(item.Id))
+            {
+                _log.LogInformation(
+                    "Work item {Id} was aborted by recovery in phase '{Phase}'; leaving recovered durable state intact",
+                    item.Id, pex.Phase);
+                throw;
+            }
+
             await HandleOperatorCancelAsync(item, project);
             throw;
         }
@@ -1427,6 +1442,14 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             else
             {
+                if (IsRecoveryCancellation(item.Id))
+                {
+                    _log.LogInformation(
+                        "Work item {Id} was aborted by recovery (legacy OCE path); leaving recovered durable state intact",
+                        item.Id);
+                    throw;
+                }
+
                 await HandleOperatorCancelAsync(item, project);
             }
             throw;
@@ -11566,7 +11589,10 @@ Original merge-phase failure (for context):
         var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
             WorkItemCancellationReason.OperatorRequested,
             cancellationSource: CancellationSources.Operator);
-        await _store.UpdateAsync(cancelled, CancellationToken.None);
+        var wrote = await _store.TryUpdateIfStateAsync(cancelled, current.State, CancellationToken.None);
+        if (!wrote)
+            return;
+
         AuditLog.WorkItemCancelled(item.Id);
         var effectiveProject = project ?? new Project
         {
@@ -11585,6 +11611,9 @@ Original merge-phase failure (for context):
             RevisionMatches = cancelledRevision?.RevisionMatches,
         }, CancellationToken.None);
     }
+
+    private bool IsRecoveryCancellation(WorkItemId itemId) =>
+        _cancellations?.GetRequestKind(itemId) == CancellationRequestKind.Recovery;
 
     /// <summary>
     /// Handles a <see cref="PhaseCancellationException"/> whose source could

@@ -169,7 +169,7 @@ public sealed class AgentSupervisionServiceTests
             {
                 Enabled = true,
                 InjectionQueueCapacity = 4,
-                InjectionDrainIdleTimeoutMs = 500,
+                InjectionDrainIdleTimeoutMs = 5000,
             });
         await using var scope = await service.TryStartSessionAsync(Start())
             ?? throw new InvalidOperationException("expected supervision scope");

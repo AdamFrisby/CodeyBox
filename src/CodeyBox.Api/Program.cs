@@ -1982,6 +1982,31 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         activitySource: sp.GetRequiredService<IWorkerProgressActivitySource>());
 });
 
+// --- Per-item stale-updatedAt watchdog --------------------------------------
+// Item-centric counterpart to WorkerProgressWatchdog: walks items by state
+// (not by the worker registry) and uses only item.UpdatedAt as the progress
+// signal, ignoring worker heartbeat / CPU / sandbox activity. Catches the
+// reconnect-loop wedge (worker still alive, CPU active, item frozen) and the
+// orphan-after-restart wedge (item Working but no live worker) that the
+// per-worker watchdog cannot see. Also powers POST /workitems/{id}/recover.
+builder.Services.AddSingleton<ItemStaleProgressWatchdog>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    sp.GetRequiredService<WorkerProgressWatchdogOptions>();
+    return new ItemStaleProgressWatchdog(
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetRequiredService<ITaskQueue>(),
+        sp.GetRequiredService<IWorkerRegistry>(),
+        () => monitor.CurrentValue.WorkerProgressWatchdog,
+        sp.GetRequiredService<ILogger<ItemStaleProgressWatchdog>>(),
+        sp.GetService<IWebhookDispatcher>(),
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
+        // Recovery cancels the running pipeline's CT so its finally blocks
+        // tear down the active sandbox / VM. Without this the wedged worker
+        // can keep running on a row that has been requeued to a fresh slot.
+        cancellations: sp.GetRequiredService<CancellationRegistry>());
+});
+
 // --- Worker pool health watchdog --------------------------------------------
 // Dispatcher-level watchdog for a pool that is under-filled while runnable work
 // and an available agent exist. Complements WorkerProgressWatchdog, which owns
@@ -2248,7 +2273,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sessionDispatchOptions: sp.GetService<CodeyBox.Orchestrator.AgentSessionDispatchOptions>(),
     sessionHandleSnapshot: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>() is { } worker
         ? worker.SnapshotPersistedHandle
-        : null));
+        : null,
+    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2392,6 +2418,12 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>(
 builder.Services.AddHostedService(sp =>
 {
     var watchdog = sp.GetRequiredService<WorkerProgressWatchdog>();
+    watchdog.AttachWorkerPoolSlotReleaser(sp.GetRequiredService<OrchestratorService>());
+    return watchdog;
+});
+builder.Services.AddHostedService(sp =>
+{
+    var watchdog = sp.GetRequiredService<ItemStaleProgressWatchdog>();
     watchdog.AttachWorkerPoolSlotReleaser(sp.GetRequiredService<OrchestratorService>());
     return watchdog;
 });
