@@ -187,6 +187,12 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 | `StopOnFirstFailure` | bool | `false` | Stop running auditors as soon as one returns a blocking finding — useful when cheap linters precede expensive LLM auditors |
 | `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors one item may try to run concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time, subject to the process-wide `CodeyBox:WorkerPool:MaxConcurrentSandboxes` ceiling. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
 
+Declared short-circuit gates are controlled globally with
+`CodeyBox:PipelineTuning:AuditShortCircuitEnabled` (default `true`,
+hot-reloadable). The built-in `csharp:build-WaE` and `csharp:test-pass`
+auditors run before LLM reviewers and skip the remaining auditors when they
+produce a blocking result.
+
 The built-in `uat` profile is intended for UAT/test-generation work. It keeps
 C# format/build/test checks, gitleaks, semgrep, security LLM review, and the
 deterministic cheating patterns, while omitting the completeness and cheating

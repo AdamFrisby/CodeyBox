@@ -28,6 +28,14 @@ public interface IAuditor
     AuditCapabilities Required { get; }
 
     /// <summary>
+    /// Declares that a blocking result from this auditor can skip the
+    /// remaining auditors in the same audit iteration. Cheap mechanical gates
+    /// can opt in so failures that already require rework avoid spending
+    /// model quota on later advisory auditors.
+    /// </summary>
+    bool CanShortCircuitOnBlockingFinding => false;
+
+    /// <summary>
     /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
     /// </summary>
     Task<AuditResult> RunAsync(

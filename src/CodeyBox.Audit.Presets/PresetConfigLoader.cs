@@ -147,6 +147,7 @@ internal sealed class PresetConfigLoader
                     Script = a.Script,
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                    CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                 }).ToList(),
             };
             ValidateLanguage($"Audit.Languages.Overrides[{id}]", definition, allowPartial: languages.ContainsKey(id), isTrusted: true);
@@ -168,6 +169,7 @@ internal sealed class PresetConfigLoader
                     Script = a.Script,
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                    CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                 }).ToList(),
                 Patterns = ov.Patterns.Select(p => new DiffPatternDefinition
                 {
@@ -553,6 +555,7 @@ internal sealed class PresetConfigLoader
                     markerDescription,
                     markerScript,
                     a.Name,
+                    a.CanShortCircuitOnBlockingFinding,
                     [.. a.Argv])
                 : LanguagePresetHelpers.ShellScript(
                     definition.Id,
@@ -561,7 +564,8 @@ internal sealed class PresetConfigLoader
                     a.Name,
                     a.Script,
                     a.ToolName ?? a.Name,
-                    a.TreatExit127AsMissingTool)).ToList();
+                    a.TreatExit127AsMissingTool,
+                    a.CanShortCircuitOnBlockingFinding)).ToList();
     }
 
     private static string BuildMarkerScript(IReadOnlyList<string> globs)
@@ -629,6 +633,7 @@ internal sealed class AuditorDefinition
     public string? Script { get; set; }
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
+    public bool CanShortCircuitOnBlockingFinding { get; set; }
 }
 
 internal sealed class AuditTypePresetDefinition

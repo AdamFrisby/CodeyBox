@@ -29,6 +29,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     public string Name => _opts.Name;
     public string Kind => "shell";
     public AuditCapabilities Required => AuditCapabilities.None;
+    public bool CanShortCircuitOnBlockingFinding => _opts.CanShortCircuitOnBlockingFinding;
 
     /// <summary>
     /// The argv this auditor invokes. Exposed so the work-phase prompt builder
@@ -136,4 +137,5 @@ public sealed record ShellCommandAuditorOptions
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
     public IShellCommandResultClassifier? ResultClassifier { get; init; }
+    public bool CanShortCircuitOnBlockingFinding { get; init; }
 }

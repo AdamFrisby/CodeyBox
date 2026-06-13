@@ -35,6 +35,29 @@ file sealed class FakeLlmAuditor : IAuditor
         => _body(sandbox, context, ct);
 }
 
+file sealed class FakeToolAuditor : IAuditor
+{
+    private readonly Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> _body;
+
+    public FakeToolAuditor(
+        string name,
+        Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> body,
+        bool canShortCircuitOnBlockingFinding = false)
+    {
+        Name = name;
+        _body = body;
+        CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding;
+    }
+
+    public string Name { get; }
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public bool CanShortCircuitOnBlockingFinding { get; }
+
+    public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        => _body(sandbox, context, ct);
+}
+
 file sealed class FixedQuotaProbe : IAgentQuotaProbe
 {
     private readonly DateTimeOffset _resetAt;
@@ -277,6 +300,192 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
+    }
+}
+
+// ── Test: declared short-circuit gates ───────────────────────────────────────
+
+public sealed class AuditorShortCircuitTests : IDisposable
+{
+    private readonly string _workspace;
+    public AuditorShortCircuitTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-short-circuit-").FullName;
+    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+
+    [Fact]
+    public async Task BlockingShortCircuitGate_SkipsSubsequentAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var gateCalls = 0;
+        var laterToolCalls = 0;
+        var llmCalls = 0;
+        var gate = new FakeToolAuditor("gate:build", (_, _, _) =>
+        {
+            gateCalls++;
+            return Task.FromResult(new AuditResult(false, [new AuditFinding(
+                "gate:build",
+                AuditSeverity.Warning,
+                "build failed",
+                "reported as failed through AuditResult.Passed")]));
+        }, canShortCircuitOnBlockingFinding: true);
+        var laterTool = new FakeToolAuditor("tool:later", (_, _, _) =>
+        {
+            laterToolCalls++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var llm = new FakeLlmAuditor("llm:review", (_, _, _) =>
+        {
+            llmCalls++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [laterTool, llm, gate],
+            maxAuditIterations: 1,
+            auditReportStore: reports);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(1, gateCalls);
+        Assert.Equal(0, laterToolCalls);
+        Assert.Equal(0, llmCalls);
+        Assert.Equal(["gate:build"], reports.Reports.Select(r => r.AuditorName).ToArray());
+    }
+
+    [Fact]
+    public async Task ErrorFindingFromPassingShortCircuitGate_SkipsSubsequentAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var gateCalls = 0;
+        var laterToolCalls = 0;
+        var llmCalls = 0;
+        var gate = new FakeToolAuditor("gate:build", (_, _, _) =>
+        {
+            gateCalls++;
+            return Task.FromResult(new AuditResult(true, [new AuditFinding(
+                "gate:build-error",
+                AuditSeverity.Error,
+                "build failed",
+                "reported as blocking through an Error finding")]));
+        }, canShortCircuitOnBlockingFinding: true);
+        var laterTool = new FakeToolAuditor("tool:later", (_, _, _) =>
+        {
+            laterToolCalls++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var llm = new FakeLlmAuditor("llm:review", (_, _, _) =>
+        {
+            llmCalls++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [laterTool, llm, gate],
+            maxAuditIterations: 1,
+            auditReportStore: reports);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(1, gateCalls);
+        Assert.Equal(0, laterToolCalls);
+        Assert.Equal(0, llmCalls);
+        var report = Assert.Single(reports.Reports);
+        Assert.Equal("gate:build", report.AuditorName);
+        var finding = Assert.Single(report.Findings);
+        Assert.Equal("Error", finding.Severity);
+        Assert.Equal("build failed", finding.Title);
+    }
+
+    [Fact]
+    public async Task PassingShortCircuitGate_RunsAllAuditorsWithGateFirst()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var gate = new FakeToolAuditor(
+            "gate:build",
+            (_, _, _) => Task.FromResult(new AuditResult(true, [])),
+            canShortCircuitOnBlockingFinding: true);
+        var laterTool = new FakeToolAuditor(
+            "tool:later",
+            (_, _, _) => Task.FromResult(new AuditResult(true, [])));
+        var llm = new FakeLlmAuditor(
+            "llm:review",
+            (_, _, _) => Task.FromResult(new AuditResult(true, [])));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [laterTool, llm, gate],
+            maxAuditIterations: 1,
+            auditReportStore: reports);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(["gate:build", "tool:later", "llm:review"],
+            reports.Reports.Select(r => r.AuditorName).ToArray());
+    }
+
+    [Fact]
+    public async Task DisabledShortCircuit_RunsRemainingAuditorsAfterBlockingGate()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var gate = new FakeToolAuditor(
+            "gate:build",
+            (_, _, _) => Task.FromResult(new AuditResult(false, [new AuditFinding(
+                "gate:build",
+                AuditSeverity.Error,
+                "build failed",
+                "compile error")])),
+            canShortCircuitOnBlockingFinding: true);
+        var laterTool = new FakeToolAuditor(
+            "tool:later",
+            (_, _, _) => Task.FromResult(new AuditResult(true, [])));
+        var llm = new FakeLlmAuditor(
+            "llm:review",
+            (_, _, _) => Task.FromResult(new AuditResult(true, [])));
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditShortCircuitEnabled = false,
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [laterTool, gate, llm],
+            maxAuditIterations: 1,
+            auditReportStore: reports,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(["tool:later", "gate:build", "llm:review"],
+            reports.Reports.Select(r => r.AuditorName).ToArray());
     }
 }
 

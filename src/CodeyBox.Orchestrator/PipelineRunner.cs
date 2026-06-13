@@ -4039,7 +4039,9 @@ public sealed class PipelineRunner : IPipelineRunner
             // (return) and exhausted (throw) paths.
             using var auditPhaseScope = BeginPhaseScope(item, "audit");
 
-            await PublishAuditStartedAsync(item, project, iteration, auditors, ct);
+            var auditShortCircuitEnabled = _pipelineTuning.Current.AuditShortCircuitEnabled;
+            var scheduledAuditors = OrderAuditorsForShortCircuit(auditors, auditShortCircuitEnabled);
+            await PublishAuditStartedAsync(item, project, iteration, scheduledAuditors, ct);
             var auditPhaseStart = DateTimeOffset.UtcNow;
             await Transition(item, WorkItemState.Auditing, ct, project);
             using var auditPhase = new PhaseCancellation("audit", ct, _opts.TimeProvider);
@@ -4048,6 +4050,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             IReadOnlyList<AuditFinding> findings;
             AgentKind? activeAuditAgentKind;
+            bool declaredShortCircuitBlocking;
             AuditFinding? requiredBuildFinding;
             try
             {
@@ -4057,7 +4060,15 @@ public sealed class PipelineRunner : IPipelineRunner
                     PromptRevisionAtDispatch: revisionForCtx,
                     BuildScriptRequired: project.Audit.BuildScriptRequired,
                     ProjectId: project.Id.Value);
-                var collectTask = CollectFindingsAsync(item, project, runner, auditors, repoId, ctx, auditPhase.Token);
+                var collectTask = CollectFindingsAsync(
+                    item,
+                    project,
+                    runner,
+                    scheduledAuditors,
+                    repoId,
+                    ctx,
+                    auditShortCircuitEnabled,
+                    auditPhase.Token);
                 var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completedAuditTask != collectTask)
                 {
@@ -4070,7 +4081,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
 
-                (findings, activeAuditAgentKind) = await collectTask;
+                (findings, activeAuditAgentKind, declaredShortCircuitBlocking) = await collectTask;
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
 
@@ -4091,6 +4102,19 @@ public sealed class PipelineRunner : IPipelineRunner
                 AuditLog.CrossReviewActive(runner.Kind, activeAuditAgentKind.Value);
 
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
+            if (declaredShortCircuitBlocking && blocking.Count == 0)
+            {
+                if (findings.Count == 0)
+                {
+                    findings = [new AuditFinding(
+                        "audit:short-circuit",
+                        AuditSeverity.Error,
+                        "short-circuit gate failed without findings",
+                        "A short-circuit-capable auditor returned a failing AuditResult without any findings.")];
+                }
+
+                blocking = findings.ToList();
+            }
             var nonBlocking = findings.Count - blocking.Count;
             var workBranchTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
             var progressSnapshot = BuildAuditProgressSnapshot(
@@ -4641,17 +4665,115 @@ public sealed class PipelineRunner : IPipelineRunner
         return signals;
     }
 
-    private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
+    private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind, bool DeclaredShortCircuitBlocking)> CollectFindingsAsync(
         WorkItem item,
         Project project,
         IAgentRunner workRunner,
         IReadOnlyList<IAuditor> auditors,
         string repoId,
         AuditContext ctx,
+        bool auditShortCircuitEnabled,
+        CancellationToken ct)
+    {
+        if (!auditShortCircuitEnabled)
+        {
+            var all = await CollectFindingsBatchAsync(
+                item,
+                project,
+                workRunner,
+                auditors,
+                repoId,
+                ctx,
+                detectDeclaredShortCircuit: false,
+                ct);
+            return (all.Findings, all.ActiveAuditAgentKind, false);
+        }
+
+        var gateAuditors = auditors
+            .Where(a => a.CanShortCircuitOnBlockingFinding)
+            .ToList();
+        if (gateAuditors.Count == 0)
+        {
+            var all = await CollectFindingsBatchAsync(
+                item,
+                project,
+                workRunner,
+                auditors,
+                repoId,
+                ctx,
+                detectDeclaredShortCircuit: false,
+                ct);
+            return (all.Findings, all.ActiveAuditAgentKind, false);
+        }
+
+        var gate = await CollectFindingsBatchAsync(
+            item,
+            project,
+            workRunner,
+            gateAuditors,
+            repoId,
+            ctx,
+            detectDeclaredShortCircuit: true,
+            ct);
+        if (gate.DeclaredShortCircuitBlocking)
+            return (gate.Findings, gate.ActiveAuditAgentKind, true);
+
+        var remainingAuditors = auditors
+            .Where(a => !a.CanShortCircuitOnBlockingFinding)
+            .ToList();
+        if (remainingAuditors.Count == 0)
+            return (gate.Findings, gate.ActiveAuditAgentKind, false);
+
+        var remaining = await CollectFindingsBatchAsync(
+            item,
+            project,
+            workRunner,
+            remainingAuditors,
+            repoId,
+            ctx,
+            detectDeclaredShortCircuit: false,
+            ct);
+
+        return (
+            [.. gate.Findings, .. remaining.Findings],
+            gate.ActiveAuditAgentKind ?? remaining.ActiveAuditAgentKind,
+            false);
+    }
+
+    private static IReadOnlyList<IAuditor> OrderAuditorsForShortCircuit(
+        IReadOnlyList<IAuditor> auditors,
+        bool auditShortCircuitEnabled)
+    {
+        if (!auditShortCircuitEnabled || auditors.Count <= 1)
+            return auditors;
+
+        return auditors
+            .Select((auditor, index) => new { Auditor = auditor, Index = index })
+            .OrderBy(x => x.Auditor.CanShortCircuitOnBlockingFinding ? 0 : 1)
+            .ThenBy(x => x.Index)
+            .Select(x => x.Auditor)
+            .ToList();
+    }
+
+    private static bool HasAuditBlockingFinding(AuditResult result, Project project)
+        => result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity);
+
+    private static bool IsDeclaredShortCircuitBlockingResult(AuditResult result)
+        => !result.Passed || result.Findings.Any(f => f.Severity == AuditSeverity.Error);
+
+    private async Task<AuditorBatchResult> CollectFindingsBatchAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner workRunner,
+        IReadOnlyList<IAuditor> auditors,
+        string repoId,
+        AuditContext ctx,
+        bool detectDeclaredShortCircuit,
         CancellationToken ct)
     {
         var findings = new List<AuditFinding>();
         AgentKind? activeAuditAgentKind = null;
+        var declaredShortCircuitBlocking = false;
 
         // Resolve the audit agent runner per LLM auditor (once, before grouping).
         // Tool auditors don't carry a runner — they stay with workRunner as a
@@ -4814,8 +4936,14 @@ public sealed class PipelineRunner : IPipelineRunner
                         if (needsCreds && runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= runner.Kind;
                         findings.AddRange(run.Result.Findings);
-                        if (project.Audit.StopOnFirstFailure && run.Result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
-                            return (findings, activeAuditAgentKind);
+                        if (detectDeclaredShortCircuit
+                            && auditor.CanShortCircuitOnBlockingFinding
+                            && IsDeclaredShortCircuitBlockingResult(run.Result))
+                        {
+                            declaredShortCircuitBlocking = true;
+                        }
+                        if (project.Audit.StopOnFirstFailure && HasAuditBlockingFinding(run.Result, project))
+                            return new AuditorBatchResult(findings, activeAuditAgentKind, declaredShortCircuitBlocking);
                     }
                 }
                 finally
@@ -4975,13 +5103,19 @@ public sealed class PipelineRunner : IPipelineRunner
                     if (needsCreds && run.Runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= run.Runner.Kind;
                     findings.AddRange(run.Result.Findings);
+                    if (detectDeclaredShortCircuit
+                        && run.Auditor.CanShortCircuitOnBlockingFinding
+                        && IsDeclaredShortCircuitBlockingResult(run.Result))
+                    {
+                        declaredShortCircuitBlocking = true;
+                    }
                 }
                 if (project.Audit.StopOnFirstFailure && findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
-                    return (findings, activeAuditAgentKind);
+                    return new AuditorBatchResult(findings, activeAuditAgentKind, declaredShortCircuitBlocking);
             }
         }
 
-        return (findings, activeAuditAgentKind);
+        return new AuditorBatchResult(findings, activeAuditAgentKind, declaredShortCircuitBlocking);
     }
 
     /// <summary>
@@ -5192,6 +5326,11 @@ public sealed class PipelineRunner : IPipelineRunner
         TimeSpan Elapsed,
         long ScopeElapsedMs,
         bool CapturedStructuredStream);
+
+    private sealed record AuditorBatchResult(
+        IReadOnlyList<AuditFinding> Findings,
+        AgentKind? ActiveAuditAgentKind,
+        bool DeclaredShortCircuitBlocking);
 
     private async Task PersistAuditReportAsync(
         AuditContext ctx,

@@ -4,18 +4,17 @@ namespace CodeyBox.Audit;
 
 /// <summary>
 /// Default IAuditorRegistry — wraps the DI-injected list of auditors and
-/// keeps them in registration order so deterministic auditors run before
-/// LLM-based ones (failing-fast on cheap checks before paying for tokens).
+/// keeps deterministic gates before later advisory auditors.
 /// </summary>
 public sealed class AuditorRegistry : IAuditorRegistry
 {
     public AuditorRegistry(IEnumerable<IAuditor> auditors)
     {
-        // Stable order: tool-only first, LLM/network ones after. This lets
-        // cheap deterministic checks short-circuit expensive LLM reviews on
-        // each iteration if AuditOptions.StopOnFirstFailingAuditor is set.
+        // Stable order: declared short-circuit gates first, then tool-only,
+        // then LLM/network auditors.
         All = auditors
-            .OrderBy(a => a.Required.HasFlag(AuditCapabilities.AgentCredentials) ? 1 : 0)
+            .OrderBy(a => a.CanShortCircuitOnBlockingFinding ? 0 : 1)
+            .ThenBy(a => a.Required.HasFlag(AuditCapabilities.AgentCredentials) ? 1 : 0)
             .ToList();
     }
 

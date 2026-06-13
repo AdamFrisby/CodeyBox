@@ -49,6 +49,9 @@
           },
           "treatExit127AsMissingTool": {
             "type": "boolean"
+          },
+          "canShortCircuitOnBlockingFinding": {
+            "type": "boolean"
           }
         }
       }

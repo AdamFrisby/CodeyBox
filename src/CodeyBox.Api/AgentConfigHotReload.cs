@@ -944,6 +944,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MaxSandboxReuses,
                 MaxSandboxLifetimeSeconds = opts.MaxSandboxLifetime.TotalSeconds,
                 opts.SandboxPressureThreshold,
+                opts.AuditShortCircuitEnabled,
             },
             JsonOpts);
 

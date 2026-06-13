@@ -90,11 +90,20 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public TimeSpan MaxSandboxLifetime { get; set; } = TimeSpan.FromHours(1);
 
+    /// <summary>
     /// Utilization threshold (CurrentAdmittedSandboxes / MaxConcurrentSandboxes) above which
     /// a reused sandbox is disposed to free capacity for other runs.
     /// Default 0.85 (85%).
     /// </summary>
     public double SandboxPressureThreshold { get; set; } = 0.85;
+
+    /// <summary>
+    /// When true, auditors declaring
+    /// <see cref="CodeyBox.Core.IAuditor.CanShortCircuitOnBlockingFinding"/> run before
+    /// the remaining auditors and a blocking gate result skips the rest of the
+    /// audit iteration. Default true.
+    /// </summary>
+    public bool AuditShortCircuitEnabled { get; set; } = true;
 
     public void Validate()
     {
