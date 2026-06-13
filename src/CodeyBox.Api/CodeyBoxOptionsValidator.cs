@@ -127,6 +127,22 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add(ex.Message);
         }
 
+        if (options.PipelineTuning.MaxSandboxReuses < 1)
+        {
+            failures.Add("CodeyBox:PipelineTuning:MaxSandboxReuses must be >= 1");
+        }
+        if (options.PipelineTuning.MaxSandboxLifetime <= TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:MaxSandboxLifetime must be a positive TimeSpan");
+        }
+        if (double.IsNaN(options.PipelineTuning.SandboxPressureThreshold)
+            || double.IsInfinity(options.PipelineTuning.SandboxPressureThreshold)
+            || options.PipelineTuning.SandboxPressureThreshold < 0.0
+            || options.PipelineTuning.SandboxPressureThreshold > 1.0)
+        {
+            failures.Add("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive");
+        }
+
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
         return failures.Count == 0

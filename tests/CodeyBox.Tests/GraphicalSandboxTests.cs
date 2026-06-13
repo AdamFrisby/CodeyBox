@@ -558,7 +558,8 @@ public sealed class GraphicalSandboxTests
                 credentials: new ConstantCredentialProvider(new AgentCredential(
                     AgentKind.Claude,
                     new Dictionary<string, string> { ["WORK_TOKEN"] = "secret" },
-                    new Dictionary<string, string>())));
+                    new Dictionary<string, string>())),
+                pipelineTuning: new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = false }));
             tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
             tp.Agent.WorkPlan.Enqueue(new FileWrite("rework.txt", "rework\n"));
             var item = new WorkItem
@@ -745,7 +746,8 @@ public sealed class GraphicalSandboxTests
                 projectAudit: audit,
                 sandboxProvider: sandboxes,
                 graphicalSandbox: false,
-                networkProfiles: profiles);
+                networkProfiles: profiles,
+                pipelineTuning: new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = false }));
             tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
             tp.Agent.WorkPlan.Enqueue(new FileWrite("rework.txt", "rework\n"));
             var item = new WorkItem

@@ -71,6 +71,49 @@ public sealed class PipelineTuningOptions
     /// cost. Default 3 (separate from and narrower than <c>UpstreamPushMaxAttempts</c>).
     /// </summary>
     public int AutoMergeRaceRecoveryMaxAttempts { get; set; } = 3;
+
+    /// <summary>
+    /// Whether to keep the same warm VM/sandbox alive across work<->rework cycles.
+    /// Default true.
+    /// </summary>
+    public bool EnableSandboxReuse { get; set; } = true;
+
+    /// <summary>
+    /// Maximum reuse cycles (invocations) for a single work sandbox before it is recreated.
+    /// Default 3.
+    /// </summary>
+    public int MaxSandboxReuses { get; set; } = 3;
+
+    /// <summary>
+    /// Maximum lifetime of a reused work sandbox before it is recreated.
+    /// Default 1 hour.
+    /// </summary>
+    public TimeSpan MaxSandboxLifetime { get; set; } = TimeSpan.FromHours(1);
+
+    /// Utilization threshold (CurrentAdmittedSandboxes / MaxConcurrentSandboxes) above which
+    /// a reused sandbox is disposed to free capacity for other runs.
+    /// Default 0.85 (85%).
+    /// </summary>
+    public double SandboxPressureThreshold { get; set; } = 0.85;
+
+    public void Validate()
+    {
+        if (MaxSandboxReuses < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(MaxSandboxReuses), "MaxSandboxReuses must be >= 1");
+        }
+        if (MaxSandboxLifetime <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(MaxSandboxLifetime), "MaxSandboxLifetime must be positive");
+        }
+        if (double.IsNaN(SandboxPressureThreshold)
+            || double.IsInfinity(SandboxPressureThreshold)
+            || SandboxPressureThreshold < 0.0
+            || SandboxPressureThreshold > 1.0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(SandboxPressureThreshold), "SandboxPressureThreshold must be between 0.0 and 1.0 inclusive");
+        }
+    }
 }
 
 /// <summary>
@@ -86,6 +129,7 @@ public sealed class PipelineTuningSnapshot
     public PipelineTuningSnapshot(PipelineTuningOptions initial)
     {
         ArgumentNullException.ThrowIfNull(initial);
+        initial.Validate();
         _current = initial;
     }
 
@@ -104,6 +148,7 @@ public sealed class PipelineTuningSnapshot
     public void Replace(PipelineTuningOptions next)
     {
         ArgumentNullException.ThrowIfNull(next);
+        next.Validate();
         Volatile.Write(ref _current, next);
     }
 }

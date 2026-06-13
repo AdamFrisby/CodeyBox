@@ -739,6 +739,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
+            await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
             var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
             var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
@@ -2565,7 +2566,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 item.BaselineImageRef));
 
         var sandboxStartSw = Stopwatch.StartNew();
-        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        await using var sandbox = WorkSandboxContext.Current != null
+            ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
+            : await _sandboxes.CreateAsync(spec, ct);
         sandboxStartSw.Stop();
         CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
