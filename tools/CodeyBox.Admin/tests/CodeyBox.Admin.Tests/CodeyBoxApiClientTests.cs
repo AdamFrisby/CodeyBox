@@ -90,6 +90,41 @@ public sealed class CodeyBoxApiClientTests
     }
 
     [Fact]
+    public async Task GetAgentSupervisionSessionsAsync_CallsCorrectEndpoint()
+    {
+        var (client, handler) = Build("""{"enabled":true,"sessions":[]}""");
+
+        var result = await client.GetAgentSupervisionSessionsAsync();
+
+        Assert.Equal(HttpMethod.Get, handler.LastMethod);
+        Assert.Equal("/agent-supervision/sessions", handler.LastPath);
+        Assert.NotNull(result);
+        Assert.True(result!.Enabled);
+    }
+
+    [Fact]
+    public async Task InjectAgentSupervisionAsync_PostsCorrectBody()
+    {
+        var (client, handler) = Build("""{"accepted":true,"status":"accepted","injectionId":"agi-1"}""", HttpStatusCode.Accepted);
+
+        var result = await client.InjectAgentSupervisionAsync(
+            "ags-1",
+            new AgentSupervisionInjectionRequestDto
+            {
+                Message = "inspect",
+                Actor = "admin",
+            });
+
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        Assert.Equal("/agent-supervision/sessions/ags-1/injections", handler.LastPath);
+        var body = JsonSerializer.Deserialize<JsonElement>(handler.LastBody ?? "{}");
+        Assert.Equal("inspect", body.GetProperty("message").GetString());
+        Assert.Equal("admin", body.GetProperty("actor").GetString());
+        Assert.NotNull(result);
+        Assert.True(result!.Accepted);
+    }
+
+    [Fact]
     public async Task CreateWorkItemAsync_PostsToCorrectEndpoint()
     {
         var respJson = """

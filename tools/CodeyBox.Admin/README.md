@@ -43,6 +43,7 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 |-------|-------------|
 | `/` | Queue overview — all work items, auto-refreshes every 5 s |
 | `/fleet` | Fleet view — one row per project: status dot, current phase, queued/in-flight counts, last-5 outcomes, 30-day spend. Auto-refreshes every 5 s. |
+| `/supervision` | Live multi-session agent supervision and injection. Requires `CodeyBox:AgentSupervision:Enabled=true`. |
 | `/work-items/new` | Create a new work item |
 | `/work-items/{id}` | Detail view: full prompt (collapsible), state, error, deps; live stdout panel for in-flight items |
 | `/work-items/{id}/edit` | Edit title/prompt/agent — Queued items only |

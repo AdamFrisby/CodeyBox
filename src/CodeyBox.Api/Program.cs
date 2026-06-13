@@ -1800,6 +1800,12 @@ builder.Services.AddSignalR();
 builder.Services.AddSingleton<AgentStdoutBroadcastService>();
 builder.Services.AddSingleton<IStdoutBroadcaster>(sp =>
     sp.GetRequiredService<AgentStdoutBroadcastService>());
+builder.Services.AddSingleton<IAgentSupervisionNotifier>(sp =>
+    sp.GetRequiredService<AgentStdoutBroadcastService>());
+builder.Services.AddSingleton<IAgentSupervisionService>(sp => new AgentSupervisionService(
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AgentSupervision,
+    sp.GetRequiredService<IAgentSupervisionNotifier>(),
+    sp.GetRequiredService<ILogger<AgentSupervisionService>>()));
 
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>
@@ -2211,7 +2217,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
-    checkCompletionRunner: sp.GetService<ICheckAndActCompletionRunner>()));
+    checkCompletionRunner: sp.GetService<ICheckAndActCompletionRunner>(),
+    agentSupervision: sp.GetService<IAgentSupervisionService>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2615,6 +2622,7 @@ ChangelogEndpoints.Map(app);
 FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
+AgentSupervisionEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 BaselineEndpoints.Map(app);
 QuotaRetryStatusEndpoints.Map(app);
@@ -3365,6 +3373,9 @@ namespace CodeyBox.Api
 
         /// <summary>Structured agent stdout stream capture configuration.</summary>
         public AgentStreamsOptions AgentStreams { get; set; } = new();
+
+        /// <summary>Config-gated live human supervision and injection channel.</summary>
+        public AgentSupervisionOptions AgentSupervision { get; set; } = new();
 
         /// <summary>Read-only analytics parser configuration for captured agent streams.</summary>
         public AgentStreamParserOptions AgentStreamAnalysis { get; set; } = new();

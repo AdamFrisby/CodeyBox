@@ -605,6 +605,26 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult<string?>(StdoutTailOverride.TryGetValue(workItemId, out var t) ? t : null);
 
+    public AgentSupervisionSessionsResponse? AgentSupervisionSessionsOverride { get; set; }
+    public List<(string SessionId, AgentSupervisionInjectionRequestDto Request)> AgentSupervisionInjections { get; } = [];
+
+    public Task<AgentSupervisionSessionsResponse?> GetAgentSupervisionSessionsAsync(CancellationToken ct = default)
+        => Task.FromResult(AgentSupervisionSessionsOverride);
+
+    public Task<AgentSupervisionInjectionReceiptDto?> InjectAgentSupervisionAsync(
+        string sessionId,
+        AgentSupervisionInjectionRequestDto request,
+        CancellationToken ct = default)
+    {
+        AgentSupervisionInjections.Add((sessionId, request));
+        return Task.FromResult<AgentSupervisionInjectionReceiptDto?>(new AgentSupervisionInjectionReceiptDto
+        {
+            Accepted = true,
+            Status = "accepted",
+            InjectionId = "agi-fake",
+        });
+    }
+
     public List<ReleaseDto> ReleasesOverride { get; set; } = [];
     public ReleaseDto? ReleaseOverride { get; set; }
     public List<object> ReleaseWorkItemsOverride { get; set; } = [];

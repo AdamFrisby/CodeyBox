@@ -104,6 +104,11 @@ h1 {
     font-size: 0.75rem;
 }
 
+.btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
 /* ── Queue table ────────────────────────────────────────────────────────────── */
 
 .queue-table {
@@ -201,6 +206,71 @@ h1 {
     color: #c0392b;
     font-family: monospace;
     font-size: 0.85rem;
+}
+
+/* ── Supervision ───────────────────────────────────────────────────────────── */
+
+.supervision-layout {
+    display: grid;
+    grid-template-columns: minmax(24rem, 34rem) minmax(0, 1fr);
+    gap: 1rem;
+    align-items: start;
+}
+
+.supervision-toolbar,
+.supervision-detail-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.supervision-detail-head span {
+    margin-left: 0.5rem;
+    color: #666;
+}
+
+.supervision-table tr {
+    cursor: pointer;
+}
+
+.supervision-table .selected-row td {
+    background: #eaf2ff;
+}
+
+.supervision-output {
+    min-height: 28rem;
+    max-height: 58vh;
+    overflow: auto;
+}
+
+.supervision-inject {
+    margin-top: 0.75rem;
+}
+
+.supervision-inject textarea {
+    width: 100%;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 0.5rem;
+}
+
+.supervision-inject div {
+    margin-top: 0.5rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.supervision-inject input {
+    min-width: 12rem;
+    padding: 0.25rem 0.4rem;
+}
+
+@media (max-width: 900px) {
+    .supervision-layout {
+        grid-template-columns: 1fr;
+    }
 }
 
 /* ── Prompt collapsible ──────────────────────────────────────────────────────── */

@@ -25,10 +25,12 @@ Start here if you're new:
 12. [`webhooks.md`](webhooks.md) — outbound webhook events, payload shape, HMAC signing, and configuration.
 13. [`audit-logging.md`](audit-logging.md) — structured audit log: location, format, all event names and
     properties. Start here when writing SIEM rules or log-query dashboards.
+14. [`agent-supervision.md`](agent-supervision.md) — config-gated human live
+    supervision, streaming, and injection across concurrent agent sessions.
 
 ## Plugin SDK
 
-14. [`plugins.md`](plugins.md) — plugin author guide. Covers project setup,
+15. [`plugins.md`](plugins.md) — plugin author guide. Covers project setup,
     `[CodeyBoxPlugin]` attribute, allowlist configuration, configuration
     scoping, the API-version contract, threat model, and NuGet publishing
     pattern. Start here if you want to ship a custom auditor, upstream remote,

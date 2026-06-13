@@ -86,6 +86,28 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadAsStringAsync(ct);
     }
 
+    public async Task<AgentSupervisionSessionsResponse?> GetAgentSupervisionSessionsAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync("/agent-supervision/sessions", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<AgentSupervisionSessionsResponse>(JsonOptions, ct);
+    }
+
+    public async Task<AgentSupervisionInjectionReceiptDto?> InjectAgentSupervisionAsync(
+        string sessionId,
+        AgentSupervisionInjectionRequestDto request,
+        CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/agent-supervision/sessions/{Uri.EscapeDataString(sessionId)}/injections",
+            request,
+            JsonOptions,
+            ct);
+        if (!resp.IsSuccessStatusCode)
+            return await resp.Content.ReadFromJsonAsync<AgentSupervisionInjectionReceiptDto>(JsonOptions, ct);
+        return await resp.Content.ReadFromJsonAsync<AgentSupervisionInjectionReceiptDto>(JsonOptions, ct);
+    }
+
     public async Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
     {
         var resp = await _http.GetAsync("/queue/status", ct);

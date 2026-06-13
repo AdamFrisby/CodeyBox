@@ -515,6 +515,51 @@ with precomputed summaries. `n` is clamped to 1-500. Fleet aggregates keep
 `invocations` empty but include `slowestToolCalls` for the operator dashboard
 leaderboard.
 
+### Agent Supervision
+
+Live human supervision is disabled unless
+`CodeyBox:AgentSupervision:Enabled=true`. The primary realtime protocol is
+SignalR on `/hubs/agent-stdout`; see
+[`agent-supervision.md`](agent-supervision.md).
+
+#### `GET /agent-supervision/sessions`
+
+Lists active and recently completed supervision sessions across all workers and
+auditors.
+
+```json
+{
+  "enabled": true,
+  "sessions": [
+    {
+      "sessionId": "ags-...",
+      "workItemId": "abc123...",
+      "phase": "work",
+      "agent": "claude",
+      "acceptingInjections": true,
+      "pendingInjections": 0
+    }
+  ]
+}
+```
+
+When disabled, returns `enabled:false` and an empty session list.
+
+#### `POST /agent-supervision/sessions/{sessionId}/injections`
+
+Queues a human follow-up instruction for one live session.
+
+```json
+{
+  "actor": "alice",
+  "message": "Add the parser regression test before committing."
+}
+```
+
+Returns `202 Accepted` when queued, `403` when supervision is disabled, `404`
+for an unknown session, `409` when the session is no longer accepting
+injections, and `429` when that session's injection queue is full.
+
 ### `GET /workitems/{id}/costs`
 
 Returns token usage and estimated cost data for a single work item, aggregated

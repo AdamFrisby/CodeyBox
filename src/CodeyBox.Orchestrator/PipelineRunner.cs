@@ -81,6 +81,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentPauseController? _agentPauses;
+    private readonly IAgentSupervisionService? _agentSupervision;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     private readonly IRequiredBuildVerifier _requiredBuildVerifier;
     private readonly ICheckAndActCompletionRunner? _checkCompletionRunner;
@@ -224,7 +225,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IAuditProgressStore? auditProgress = null,
         IAgentPauseController? agentPauseController = null,
         AgentPromptPreprocessorChain? promptPreprocessors = null,
-        ICheckAndActCompletionRunner? checkCompletionRunner = null)
+        ICheckAndActCompletionRunner? checkCompletionRunner = null,
+        IAgentSupervisionService? agentSupervision = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -296,6 +298,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _availability = availability;
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
+        _agentSupervision = agentSupervision;
         _agentRunningCounters = agentRunningCounters;
         // Prefer the shared snapshot when DI supplies it (production path —
         // OrchestratorService holds the same instance, so hot-reload swaps
@@ -319,7 +322,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // tests and for callers that wire their own hook.
         _agenticConflictResolver = agenticConflictResolver
             ?? new AgenticConflictResolver(
-                credentialFileMaterialiser: MaterialiseCredentialFilesAsync);
+                credentialFileMaterialiser: MaterialiseCredentialFilesAsync,
+                agentSupervision: _agentSupervision);
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
@@ -2060,7 +2064,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     sandbox,
                     SandboxConventions.WorkDir,
                     item.Id,
-                    new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Rebase),
+                    new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Rebase)
+                    {
+                        ProjectId = project.Id,
+                    },
                     candidates,
                     ct);
 
@@ -2729,15 +2736,74 @@ public sealed class PipelineRunner : IPipelineRunner
         // resume contract says its session-id extractor needs structured output.
         var needsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
         var captureStructuredStream = canCaptureStructuredStream || needsStreamForResume;
+        var supervision = await StartAgentSupervisionSessionAsync(
+            item.Id,
+            project,
+            agentPhase,
+            iteration ?? 1,
+            runner,
+            item.AgentInstanceId,
+            item.ModelId,
+            item.ReasoningMode,
+            sandbox,
+            SandboxConventions.WorkDir,
+            source: "pipeline",
+            ct);
 
         AgentResult agentResult;
         using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var preemptRequested = false;
+        var supervisionHandledRun = supervision is not null && !resumingPreempt;
         try
         {
             await using (agentExecScope)
             {
-                var runTask = resumingPreempt
+                if (supervisionHandledRun)
+                {
+                    var phaseForPreprocessor = isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework;
+                    var iterationForPreprocessor = iteration ?? 1;
+                    var runTask = AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                        runner,
+                        sandbox,
+                        SandboxConventions.WorkDir,
+                        prompt,
+                        credential,
+                        item.ModelId,
+                        item.ReasoningMode,
+                        supervision!,
+                        stdoutCallback,
+                        captureStructuredStream,
+                        promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                            item.Id,
+                            runner.Kind,
+                            phaseForPreprocessor,
+                            iterationForPreprocessor,
+                            project,
+                            sandbox,
+                            raw,
+                            pct),
+                        runnerCts.Token);
+                    var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
+                    if (completed != runTask)
+                    {
+                        preemptRequested = true;
+                        await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                        completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                        if (completed != runTask)
+                            await runnerCts.CancelAsync();
+                    }
+
+                    agentResult = await runTask;
+                    if (preemptRequested)
+                        throw new OperationCanceledException(hostShutdownToken);
+                }
+                else
+                {
+                    stdoutCallback = WrapSupervisionStdout(supervision, stdoutCallback);
+                    if (supervision is not null)
+                        await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, runnerCts.Token);
+
+                    var runTask = resumingPreempt
                     && runner is IResumableAgentRunner resumable
                     ? resumable.RunResumedAsync(
                         sandbox, SandboxConventions.WorkDir, prompt, credential,
@@ -2747,19 +2813,34 @@ public sealed class PipelineRunner : IPipelineRunner
                     : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                         stdoutChunkCallback: stdoutCallback,
                         captureStructuredStream: captureStructuredStream);
-                var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
-                if (completed != runTask)
-                {
-                    preemptRequested = true;
-                    await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
-                    completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                    var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                     if (completed != runTask)
-                        await runnerCts.CancelAsync();
-                }
+                    {
+                        preemptRequested = true;
+                        await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                        completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                        if (completed != runTask)
+                            await runnerCts.CancelAsync();
+                    }
 
-                agentResult = await runTask;
-                if (preemptRequested)
-                    throw new OperationCanceledException(hostShutdownToken);
+                    agentResult = await runTask;
+                    if (preemptRequested)
+                        throw new OperationCanceledException(hostShutdownToken);
+
+                    if (supervision is not null)
+                    {
+                        var dispatcher = new SupervisedTurnDispatcher(
+                            runner, sandbox, SandboxConventions.WorkDir, credential,
+                            item.ModelId, item.ReasoningMode, stdoutCallback,
+                            captureStructuredStream: captureStructuredStream,
+                            promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                                item.Id, runner.Kind,
+                                isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
+                                iteration ?? 1, project, sandbox, raw, pct));
+                        agentResult = await supervision.RunPendingInjectionsAsync(
+                            agentResult, dispatcher.RunInjectionTurnAsync, runnerCts.Token);
+                    }
+                }
             }
         }
         catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
@@ -2863,6 +2944,8 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             if (streamCapture is not null && !preemptRequested)
                 await streamCapture.DisposeAsync();
+            if (supervision is not null)
+                await supervision.DisposeAsync();
         }
         CodeyBoxMeters.AgentDuration.Record(agentExecScope.ElapsedMs,
             new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
@@ -3495,11 +3578,11 @@ public sealed class PipelineRunner : IPipelineRunner
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
 
         var aggregator = new System.Text.StringBuilder();
-        var chunkCallback = (Action<string>)(chunk =>
+        Action<string>? chunkCallback = chunk =>
         {
             aggregator.Append(chunk);
             _stdoutBroadcaster?.BroadcastChunk(item.Id, "check", chunk);
-        });
+        };
 
         AuditLog.AgentStarted(agentRunner.Kind, sandbox.Id, "check");
         prompt = await ProcessAgentPromptAsync(
@@ -3511,12 +3594,41 @@ public sealed class PipelineRunner : IPipelineRunner
             sandbox,
             prompt,
             ct);
+        await using var supervision = await StartAgentSupervisionSessionAsync(
+            item.Id,
+            project,
+            "check",
+            1,
+            agentRunner,
+            item.AgentInstanceId,
+            item.ModelId,
+            item.ReasoningMode,
+            sandbox,
+            SandboxConventions.WorkDir,
+            source: "check-and-act",
+            ct);
         var startedAt = DateTimeOffset.UtcNow;
-        var result = await agentRunner.RunAsync(
-            sandbox, SandboxConventions.WorkDir, prompt, credential,
-            item.ModelId, item.ReasoningMode, ct,
-            stdoutChunkCallback: chunkCallback,
-            captureStructuredStream: false);
+        var result = supervision is null
+            ? await agentRunner.RunAsync(
+                sandbox, SandboxConventions.WorkDir, prompt, credential,
+                item.ModelId, item.ReasoningMode, ct,
+                stdoutChunkCallback: chunkCallback,
+                captureStructuredStream: false)
+            : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                agentRunner,
+                sandbox,
+                SandboxConventions.WorkDir,
+                prompt,
+                credential,
+                item.ModelId,
+                item.ReasoningMode,
+                supervision,
+                chunkCallback,
+                captureStructuredStream: false,
+                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                    item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
+                    1, project, sandbox, raw, pct),
+                ct);
         var endedAt = DateTimeOffset.UtcNow;
 
         var aggregatedStdout = aggregator.ToString();
@@ -3900,11 +4012,11 @@ public sealed class PipelineRunner : IPipelineRunner
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
 
         var aggregator = new System.Text.StringBuilder();
-        var chunkCallback = (Action<string>)(chunk =>
+        Action<string>? chunkCallback = chunk =>
         {
             aggregator.Append(chunk);
             _stdoutBroadcaster?.BroadcastChunk(item.Id, "post-act-recheck", chunk);
-        });
+        };
 
         AuditLog.AgentStarted(agentRunner.Kind, sandbox.Id, "post-act-recheck");
         prompt = await ProcessAgentPromptAsync(
@@ -3916,12 +4028,41 @@ public sealed class PipelineRunner : IPipelineRunner
             sandbox,
             prompt,
             ct);
+        await using var supervision = await StartAgentSupervisionSessionAsync(
+            item.Id,
+            project,
+            "post-act-recheck",
+            iteration,
+            agentRunner,
+            item.AgentInstanceId,
+            item.ModelId,
+            item.ReasoningMode,
+            sandbox,
+            SandboxConventions.WorkDir,
+            source: "check-and-act",
+            ct);
         var startedAt = DateTimeOffset.UtcNow;
-        var result = await agentRunner.RunAsync(
-            sandbox, SandboxConventions.WorkDir, prompt, credential,
-            item.ModelId, item.ReasoningMode, ct,
-            stdoutChunkCallback: chunkCallback,
-            captureStructuredStream: false);
+        var result = supervision is null
+            ? await agentRunner.RunAsync(
+                sandbox, SandboxConventions.WorkDir, prompt, credential,
+                item.ModelId, item.ReasoningMode, ct,
+                stdoutChunkCallback: chunkCallback,
+                captureStructuredStream: false)
+            : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                agentRunner,
+                sandbox,
+                SandboxConventions.WorkDir,
+                prompt,
+                credential,
+                item.ModelId,
+                item.ReasoningMode,
+                supervision,
+                chunkCallback,
+                captureStructuredStream: false,
+                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                    item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
+                    1, project, sandbox, raw, pct),
+                ct);
         var endedAt = DateTimeOffset.UtcNow;
 
         var aggregatedStdout = aggregator.ToString();
@@ -4296,6 +4437,88 @@ public sealed class PipelineRunner : IPipelineRunner
             _stdoutBroadcaster?.BroadcastChunk(workItemId, phase, chunk);
             streamCapture?.WriteChunk(chunk);
         };
+    }
+
+    private Task<IAgentSupervisionSession?> StartAgentSupervisionSessionAsync(
+        WorkItemId workItemId,
+        Project project,
+        string phase,
+        int iteration,
+        IAgentRunner runner,
+        string? agentInstanceId,
+        string? modelId,
+        string? reasoningMode,
+        ISandbox sandbox,
+        string workingDirectory,
+        string source,
+        CancellationToken ct)
+    {
+        if (_agentSupervision is null || !_agentSupervision.Enabled)
+            return Task.FromResult<IAgentSupervisionSession?>(null);
+
+        return _agentSupervision.TryStartSessionAsync(
+            new AgentSupervisionSessionStart(
+                workItemId,
+                project.Id.Value,
+                phase,
+                iteration,
+                runner.Kind,
+                agentInstanceId,
+                modelId,
+                reasoningMode,
+                sandbox.Id,
+                workingDirectory,
+                source),
+            ct);
+    }
+
+    private static Action<string>? WrapSupervisionStdout(
+        IAgentSupervisionSession? supervision,
+        Action<string>? stdoutCallback) =>
+        supervision is null ? stdoutCallback : supervision.WrapStdoutCallback(stdoutCallback);
+
+    private sealed class SupervisedAgentRunner : IAgentRunner
+    {
+        private readonly IAgentRunner _inner;
+        private readonly IAgentSupervisionSession _supervision;
+
+        public SupervisedAgentRunner(IAgentRunner inner, IAgentSupervisionSession supervision)
+        {
+            _inner = inner;
+            _supervision = supervision;
+        }
+
+        public AgentKind Kind => _inner.Kind;
+
+        public async Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            return await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                    _inner,
+                    sandbox,
+                    workingDirectory,
+                    prompt,
+                    credential,
+                    modelId,
+                    reasoningMode,
+                    _supervision,
+                    stdoutChunkCallback,
+                    captureStructuredStream,
+                    promptPreprocessor: null,
+                    ct)
+                .ConfigureAwait(false);
+        }
+
+        public AgentFailureClassification ClassifyFailure(AgentResult result) =>
+            _inner.ClassifyFailure(result);
     }
 
     private async Task<bool> RunAuditLoopAsync(
@@ -5463,10 +5686,29 @@ public sealed class PipelineRunner : IPipelineRunner
         // ReasoningMode uses the universal low/medium/high vocabulary and is
         // safe to forward across kinds.
         var crossKind = runner.Kind != workRunner.Kind;
+        var auditModelId = crossKind ? null : ctx.ModelId;
+        await using var supervision = auditor.Kind == "llm"
+            ? await StartAgentSupervisionSessionAsync(
+                ctx.WorkItemId,
+                project,
+                auditPhase,
+                ctx.Iteration,
+                runner,
+                agentInstanceId,
+                auditModelId,
+                ctx.ReasoningMode,
+                sandbox,
+                SandboxConventions.WorkDir,
+                source: "audit",
+                ct)
+            : null;
         // Thread the resolved runner into the context so LlmReviewAuditor
         // can use the cross-review agent instead of its baked-in default.
-        var promptRunner = WrapPromptPreprocessedRunner(
-            runner,
+        IAgentRunner supervisedRunner = supervision is null
+            ? runner
+            : new SupervisedAgentRunner(runner, supervision);
+        IAgentRunner promptRunner = WrapPromptPreprocessedRunner(
+            supervisedRunner,
             ctx.WorkItemId,
             AgentPromptPhase.Audit,
             ctx.Iteration,
@@ -5477,7 +5719,7 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditCredential = credential,
             StdoutChunkCallback = stdoutCallback,
             CaptureStructuredStream = canCaptureStructuredStream || auditNeedsStreamForResume,
-            ModelId = crossKind ? null : ctx.ModelId,
+            ModelId = auditModelId,
             ReasoningMode = ctx.ReasoningMode,
         };
         var timingScope = await TimingScope.BeginAsync(
@@ -7431,7 +7673,10 @@ public sealed class PipelineRunner : IPipelineRunner
                         sandbox,
                         SandboxConventions.WorkDir,
                         item.Id,
-                        new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Merge),
+                        new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Merge)
+                        {
+                            ProjectId = project.Id,
+                        },
                         candidates,
                         ct);
                     agentResult = new AgentResult(
@@ -7481,14 +7726,44 @@ public sealed class PipelineRunner : IPipelineRunner
                 // Decouple from AgentStreams when the runner's session-id
                 // extractor needs structured output (see work-phase comment).
                 var mergeNeedsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
+                var supervision = await StartAgentSupervisionSessionAsync(
+                    item.Id,
+                    project,
+                    "merge",
+                    1,
+                    runner,
+                    item.AgentInstanceId,
+                    item.ModelId,
+                    item.ReasoningMode,
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    source: "pipeline",
+                    ct);
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 try
                 {
                     await using (mergeExecScope)
                     {
-                        var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, mergePrompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
-                            stdoutChunkCallback: mergeStdoutCallback,
-                            captureStructuredStream: canCaptureMergeStructuredStream || mergeNeedsStreamForResume);
+                        var captureMergeStream = canCaptureMergeStructuredStream || mergeNeedsStreamForResume;
+                        var runTask = supervision is null
+                            ? runner.RunAsync(sandbox, SandboxConventions.WorkDir, mergePrompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                                stdoutChunkCallback: mergeStdoutCallback,
+                                captureStructuredStream: captureMergeStream)
+                            : AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                                runner,
+                                sandbox,
+                                SandboxConventions.WorkDir,
+                                mergePrompt,
+                                mergeCredential,
+                                item.ModelId,
+                                item.ReasoningMode,
+                                supervision,
+                                mergeStdoutCallback,
+                                captureMergeStream,
+                                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                                    item.Id, runner.Kind, AgentPromptPhase.Merge,
+                                    1, project, sandbox, raw, pct),
+                                runnerCts.Token);
                         var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                         if (completed != runTask)
                         {
@@ -7507,6 +7782,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     if (mergeStreamCapture is not null)
                         await mergeStreamCapture.DisposeAsync();
+                    if (supervision is not null)
+                        await supervision.DisposeAsync();
                 }
                 mergeExecElapsedMs = mergeExecScope.ElapsedMs;
                 mergeEndedAt = DateTimeOffset.UtcNow;
@@ -9243,12 +9520,44 @@ public sealed class PipelineRunner : IPipelineRunner
             // leave no audit-trail entry and break operator attribution.
             var conflictInvolvementId = await RecordInvolvementStartAsync(
                 item.Id, runner.Kind, item.AgentInstanceId, item.ModelId, ConflictReworkPhaseKey, iteration: null);
+            var supervision = await StartAgentSupervisionSessionAsync(
+                item.Id,
+                project,
+                ConflictReworkPhaseKey,
+                Math.Max(1, item.ConflictReworkAttempts),
+                runner,
+                item.AgentInstanceId,
+                item.ModelId,
+                item.ReasoningMode,
+                sandbox,
+                SandboxConventions.WorkDir,
+                source: "pipeline",
+                ct);
+            Action<string>? stdoutCallback = null;
+            var captureStructuredStream = NeedsStructuredStreamForSessionResume(runner);
             try
             {
-                agentResult = await runner.RunAsync(
-                    sandbox, SandboxConventions.WorkDir, prompt, credential,
-                    item.ModelId, item.ReasoningMode, phase.Token,
-                    captureStructuredStream: NeedsStructuredStreamForSessionResume(runner));
+                agentResult = supervision is null
+                    ? await runner.RunAsync(
+                        sandbox, SandboxConventions.WorkDir, prompt, credential,
+                        item.ModelId, item.ReasoningMode, phase.Token,
+                        stdoutChunkCallback: stdoutCallback,
+                        captureStructuredStream: captureStructuredStream)
+                    : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                        runner,
+                        sandbox,
+                        SandboxConventions.WorkDir,
+                        prompt,
+                        credential,
+                        item.ModelId,
+                        item.ReasoningMode,
+                        supervision,
+                        stdoutCallback,
+                        captureStructuredStream,
+                        promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                            item.Id, runner.Kind, AgentPromptPhase.Rework,
+                            item.ConflictReworkAttempts, project, sandbox, raw, pct),
+                        phase.Token);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
@@ -9266,6 +9575,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 // else to failure:agent.
                 await FinalizeInvolvementAsync(conflictInvolvementId, OutcomeForFailure(ex));
                 throw;
+            }
+            finally
+            {
+                if (supervision is not null)
+                    await supervision.DisposeAsync();
             }
             stopwatch.Stop();
             var endedAt = DateTimeOffset.UtcNow;
@@ -10984,11 +11298,11 @@ Original merge-phase failure (for context):
     {
         if (_costStore is null && _usageStore is null) return;
 
-        var snapshot = ClampCostSnapshot(new AgentCostSnapshot(
+        var snapshot = NormalizeCostSnapshot(new AgentCostSnapshot(
             result.Usage.InputTokens,
             result.Usage.CachedInputTokens,
             result.Usage.OutputTokens,
-            result.ModelId));
+            result.ModelId), result.ModelId);
 
         var usd = 0m;
         if (_costCalculator is not null)

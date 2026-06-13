@@ -497,6 +497,42 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive", result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData("MaxPromptChars")]
+    [InlineData("MaxOutputBufferChars")]
+    [InlineData("MaxInjectionChars")]
+    [InlineData("InjectionQueueCapacity")]
+    [InlineData("CompletedSessionRetentionSeconds")]
+    [InlineData("MaxSessions")]
+    [InlineData("RetainedCommandsPerSession")]
+    [InlineData("DefaultListPageSize")]
+    [InlineData("MaxListPageSize")]
+    public void Validate_PropagatesAgentSupervisionFailures(string scenario)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentSupervision = new AgentSupervisionOptions();
+        switch (scenario)
+        {
+            case "MaxPromptChars": options.AgentSupervision.MaxPromptChars = 0; break;
+            case "MaxOutputBufferChars": options.AgentSupervision.MaxOutputBufferChars = 0; break;
+            case "MaxInjectionChars": options.AgentSupervision.MaxInjectionChars = 0; break;
+            case "InjectionQueueCapacity": options.AgentSupervision.InjectionQueueCapacity = 0; break;
+            case "CompletedSessionRetentionSeconds": options.AgentSupervision.CompletedSessionRetentionSeconds = -1; break;
+            case "MaxSessions": options.AgentSupervision.MaxSessions = 0; break;
+            case "RetainedCommandsPerSession": options.AgentSupervision.RetainedCommandsPerSession = -1; break;
+            case "DefaultListPageSize": options.AgentSupervision.DefaultListPageSize = 0; break;
+            case "MaxListPageSize":
+                options.AgentSupervision.DefaultListPageSize = 64;
+                options.AgentSupervision.MaxListPageSize = 16;
+                break;
+        }
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(scenario, result.FailureMessage);
+    }
+
     private static CodeyBoxOptions ValidCodeyBoxOptions()
         => new() { AuditLog = ValidAuditLogOptions() };
 

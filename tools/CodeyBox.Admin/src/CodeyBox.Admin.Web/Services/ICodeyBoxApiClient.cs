@@ -38,6 +38,13 @@ public interface ICodeyBoxApiClient
     Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default);
     // ── Live stdout tail ──────────────────────────────────────────────────────
     Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default);
+    Task<AgentSupervisionSessionsResponse?> GetAgentSupervisionSessionsAsync(CancellationToken ct = default)
+        => Task.FromResult<AgentSupervisionSessionsResponse?>(null);
+    Task<AgentSupervisionInjectionReceiptDto?> InjectAgentSupervisionAsync(
+        string sessionId,
+        AgentSupervisionInjectionRequestDto request,
+        CancellationToken ct = default)
+        => Task.FromResult<AgentSupervisionInjectionReceiptDto?>(null);
 
     // ── Audit timeline ────────────────────────────────────────────────────────
     Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(

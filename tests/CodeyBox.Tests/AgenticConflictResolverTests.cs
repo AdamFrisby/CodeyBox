@@ -69,6 +69,41 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_WithSupervision_ReusesSessionHandleForQueuedInjection()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var notifier = new AutoQueueConflictInjectionNotifier();
+        var supervision = new AgentSupervisionService(
+            () => new AgentSupervisionOptions { Enabled = true, InjectionQueueCapacity = 4 },
+            notifier);
+        notifier.Service = supervision;
+        var runner = new RecordingConflictSessionRunner();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            agentSupervision: supervision);
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase)
+            {
+                ProjectId = new ProjectId("project"),
+            },
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Single(runner.OpenedSessionIds);
+        Assert.Equal(2, runner.SendTurnSessionIds.Count);
+        Assert.All(runner.SendTurnSessionIds, id => Assert.Equal(runner.OpenedSessionIds[0], id));
+        Assert.Contains(notifier.Commands, c => c.Kind == "autonomous" && c.Phase == "conflict-rebase");
+        Assert.Contains(notifier.Commands, c => c.Kind == "human-injection" && c.Phase == "conflict-rebase");
+        Assert.Single(notifier.CompletedInjections);
+    }
+
+    [Fact]
     public async Task ResolveAsync_WrappedResumableRunner_ForcesStructuredCapture()
     {
         var sandbox = new ConflictSandbox();
@@ -912,6 +947,104 @@ public sealed class AgenticConflictResolverTests
 
             public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
                 => null;
+        }
+    }
+
+    private sealed class RecordingConflictSessionRunner : ISessionAgentRunner
+    {
+        public AgentKind Kind { get; } = new("session-conflict-test");
+        public List<string> OpenedSessionIds { get; } = [];
+        public List<string> SendTurnSessionIds { get; } = [];
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false) =>
+            throw new InvalidOperationException("resolver should use the session path when supervision is enabled");
+
+        public Task<AgentSessionHandle> OpenSessionAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default)
+        {
+            var sessionId = "resolver-session-" + Guid.NewGuid().ToString("N");
+            OpenedSessionIds.Add(sessionId);
+            return Task.FromResult(new AgentSessionHandle(
+                Kind,
+                sessionId,
+                new AgentSessionSandboxRef(sandbox.Id),
+                workingDirectory,
+                modelId,
+                reasoningMode));
+        }
+
+        public Task<AgentResult> SendTurnAsync(
+            AgentSessionHandle sessionHandle,
+            string prompt,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            SendTurnSessionIds.Add(sessionHandle.SessionId);
+            stdoutChunkCallback?.Invoke($"turn:{SendTurnSessionIds.Count}\n");
+            return Task.FromResult(new AgentResult(true, "ok", $"turn:{SendTurnSessionIds.Count}", null));
+        }
+
+        public Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class AutoQueueConflictInjectionNotifier : IAgentSupervisionNotifier
+    {
+        private bool _queued;
+        public AgentSupervisionService? Service { get; set; }
+        public List<AgentSupervisionCommandEvent> Commands { get; } = [];
+        public List<AgentSupervisionInjectionCompletedEvent> CompletedInjections { get; } = [];
+
+        public async Task SessionStartedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default)
+        {
+            if (_queued || Service is null)
+                return;
+            _queued = true;
+            var receipt = await Service.EnqueueInjectionAsync(
+                session.SessionId,
+                new AgentSupervisionInjectionRequest("operator conflict hint", "resolver-test"),
+                ct);
+            Assert.True(receipt.Accepted, receipt.Error);
+        }
+
+        public Task SessionUpdatedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task SessionCompletedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task CodeyBoxCommandAsync(AgentSupervisionCommandEvent command, CancellationToken ct = default)
+        {
+            Commands.Add(command);
+            return Task.CompletedTask;
+        }
+        public Task StdoutChunkAsync(AgentSupervisionStdoutEvent chunk, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task InjectionQueuedAsync(AgentSupervisionInjectionEvent injection, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task InjectionStartedAsync(AgentSupervisionInjectionEvent injection, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task InjectionCompletedAsync(AgentSupervisionInjectionCompletedEvent injection, CancellationToken ct = default)
+        {
+            CompletedInjections.Add(injection);
+            return Task.CompletedTask;
         }
     }
 
