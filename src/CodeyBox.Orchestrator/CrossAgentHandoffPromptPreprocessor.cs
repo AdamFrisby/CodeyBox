@@ -71,7 +71,7 @@ public sealed class CrossAgentHandoffPromptPreprocessor : IAgentPromptPreprocess
         }
 
         var priorAgent = ResolvePriorAgentKind(history, ctx);
-        if (priorAgent is null)
+        if (priorAgent is null || priorAgent == ctx.AgentKind)
             return prompt;
 
         string? brief;

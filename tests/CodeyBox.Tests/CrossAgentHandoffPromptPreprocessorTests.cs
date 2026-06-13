@@ -41,7 +41,10 @@ public sealed class CrossAgentHandoffPromptPreprocessorTests
     public async Task NoOp_WhenPriorEntryIsSameAgentKind()
     {
         var workItemId = WorkItemId.New();
-        var history = new StubFallbackHistoryStore([]);
+        var history = new StubFallbackHistoryStore(
+        [
+            FallbackRecord(workItemId, AgentKind.Codex, AgentKind.Codex, "rework", 2)
+        ]);
         var builder = new RecordingBriefBuilder("should not be requested");
         var preprocessor = new CrossAgentHandoffPromptPreprocessor(
             NullLogger<CrossAgentHandoffPromptPreprocessor>.Instance,
