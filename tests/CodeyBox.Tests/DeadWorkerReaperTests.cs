@@ -140,6 +140,49 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_WorkingWithPreemptCheckpoint_RequeuesAndCountsRecoveryAttempt()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/reaper",
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Equal(item.PreemptCheckpoint, after.PreemptCheckpoint);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Reaper_WorkingWithPreemptCheckpoint_AtRecoveryCap_Abandons()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            RecoveryAttempts = _opts.MaxRecoveryAttempts,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/reaper",
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
     public async Task Reaper_SuspendedItem_SkipsRecovery()
     {
         var item = MakeItem(WorkItemState.Working) with
@@ -310,13 +353,13 @@ public sealed class DeadWorkerReaperTests : IDisposable
     [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.Merged)]
-    public async Task Reaper_RedispatchesDurablePhaseBoundaryStates_WithoutIncrementingRecoveryAttempts(
+    public async Task Reaper_RedispatchesDurablePhaseBoundaryStates_AndCountsRecoveryAttempts(
         WorkItemState state)
     {
         var item = MakeItem(state) with
         {
             LastError = "stale worker died",
-            RecoveryAttempts = 3,
+            RecoveryAttempts = 1,
         };
         await _store.CreateAsync(item);
         await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
@@ -326,10 +369,47 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.NotNull(after);
         Assert.Equal(state, after.State);
-        Assert.Equal(3, after.RecoveryAttempts);
-        Assert.Equal("stale worker died", after.LastError);
+        Assert.Equal(2, after.RecoveryAttempts);
+        Assert.Null(after.LastError);
         Assert.Equal(1, _queue.Count);
-        Assert.Empty(_webhooks.Events);
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(state, evt.WorkItem!.State);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged)]
+    public async Task Reaper_PhaseBoundaryRedispatchAtRecoveryCap_Abandons(
+        WorkItemState state)
+    {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
+        var item = MakeItem(state) with
+        {
+            RecoveryAttempts = _opts.MaxRecoveryAttempts,
+        };
+        var workerId = Guid.NewGuid().ToString();
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(workerId, item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        var release = Assert.Single(slotReleaser.Releases);
+        Assert.Equal(workerId, release.WorkerId);
+        Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]
@@ -368,14 +448,19 @@ public sealed class DeadWorkerReaperTests : IDisposable
         await _reaper.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]
-    public async Task Reaper_CheckAndActAtRecoveryCap_MarksFailedAndReleasesWorkerSlot()
+    public async Task Reaper_CheckAndActAtRecoveryCap_AbandonsAndReleasesWorkerSlot()
     {
         var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
         _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
@@ -400,7 +485,7 @@ public sealed class DeadWorkerReaperTests : IDisposable
         await _reaper.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
         Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
         Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
         Assert.Null(after.StartedAt);
@@ -410,6 +495,11 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]
@@ -450,7 +540,7 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
-    public async Task Reaper_AgentControlAtRecoveryCap_MarksFailedAndReleasesWorkerSlot()
+    public async Task Reaper_AgentControlAtRecoveryCap_AbandonsAndReleasesWorkerSlot()
     {
         var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
         _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
@@ -473,7 +563,7 @@ public sealed class DeadWorkerReaperTests : IDisposable
         await _reaper.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
         Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
         Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
         Assert.Null(after.StartedAt);
@@ -482,6 +572,11 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]

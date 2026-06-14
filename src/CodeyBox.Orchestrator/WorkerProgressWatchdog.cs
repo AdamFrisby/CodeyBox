@@ -334,29 +334,24 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         // matching the dead-worker reaper's ceiling. Watchdog interventions
         // count against the same budget — they represent genuine recovery
         // work even if the heartbeat path didn't fire.
-        var attempts = item.RecoveryAttempts + 1;
+        var attempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
         var fromState = item.State;
         var opts = _opts;
         // MaxRecoveryAttempts <= 0 means unlimited. Only enforce when > 0.
         // Mirrors the DeadWorkerReaper / OrchestratorService budget check so
-        // an item that wedges on every pickup eventually Fails rather than
-        // looping Working → Queued → Working forever and burning a slot per
-        // iteration. The preempt-checkpoint branch is exempt: that's a clean
-        // resume from a captured ref, not a counted recovery transition.
-        if (opts.MaxRecoveryAttempts > 0
-            && attempts > opts.MaxRecoveryAttempts
-            && !(target == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)))
+        // an item that wedges on every pickup is eventually abandoned rather than
+        // looping through recovery forever and burning a slot per iteration.
+        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts))
         {
-            var failed = item with
+            var failed = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
-                State = WorkItemState.Failed,
+                State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}); was {fromState} with no progress for {sinceProgressSeconds}s",
-                RecoveryAttempts = attempts,
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            }, attempts, item.State);
             await _store.UpdateAsync(failed, ct);
             _recoveredWorkers[worker.WorkerId] = 0;
             if (_slotReleaser is not null)
@@ -367,9 +362,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                     ct);
             }
 
-            AuditLog.WorkItemWatchdogRecovered(item.Id, worker.WorkerId, fromState, WorkItemState.Failed, dependentsRestored: 0);
+            AuditLog.WorkItemWatchdogRecovered(item.Id, worker.WorkerId, fromState, WorkItemState.AbandonedAfterRecoveryAttempts, dependentsRestored: 0);
             _log.LogWarning(
-                "Watchdog: work item {ItemId} (worker {WorkerId}) exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                "Watchdog: work item {ItemId} (worker {WorkerId}) exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
                 item.Id, worker.WorkerId, opts.MaxRecoveryAttempts);
 
             if (_webhooks is not null)
@@ -398,16 +393,15 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         WorkItem updated;
         if (target == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
         {
-            updated = item with
+            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
                 StartedAt = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
-                RecoveryAttempts = attempts,
-            };
+            }, attempts, item.State);
         }
         else
         {
-            updated = item with
+            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
                 State = target,
                 LastError = $"watchdog: worker made no progress for {sinceProgressSeconds}s in state {fromState}",
@@ -422,9 +416,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                     : item.PreserveWorkBranchOnQueuedPickup,
                 PreemptedAt = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptedAt : null,
                 PreemptCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptCheckpoint : null,
-                RecoveryAttempts = attempts,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            }, attempts, item.State);
         }
 
         await _store.UpdateAsync(updated, ct);

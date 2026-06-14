@@ -1027,18 +1027,27 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return;
         }
 
+        if (recovered.State == WorkItemState.AbandonedAfterRecoveryAttempts)
+        {
+            _log.LogWarning(
+                "Shutdown recovery abandoned {Id}: {FromState} exceeded MaxRecoveryAttempts ({Max})",
+                id, item.State, _opts.MaxRecoveryAttempts);
+            return;
+        }
+
         await _queue.EnqueueAsync(id, ct).ConfigureAwait(false);
         _log.LogWarning(
             "Shutdown recovery re-queued {Id}: {FromState} -> {ToState} ({Reason})",
             id, item.State, recovered.State, recoveryReason);
     }
 
-    private static WorkItem? BuildGracefulShutdownRecoveryState(
+    private WorkItem? BuildGracefulShutdownRecoveryState(
         WorkItem item,
         string recoveryReason = "graceful shutdown drain timed out")
         => WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             item,
             DateTimeOffset.UtcNow,
+            _opts.MaxRecoveryAttempts,
             recoveryReason);
 
     /// <summary>
@@ -1192,8 +1201,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// <see cref="WorkItem.RecoveryAttempts"/>. Items that exceed
     /// <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> are transitioned to
     /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> instead.
-    /// Durable phase-boundary pass-throughs are re-enqueued without consuming a
-    /// recovery attempt.
+    /// Durable phase-boundary pass-throughs also consume a recovery attempt:
+    /// being redispatched from the same boundary is still an automatic recovery
+    /// handoff, and the pipeline clears the counter when a later phase actually
+    /// completes.
     /// </summary>
     private async Task ReplayPendingAsync(CancellationToken ct)
     {
@@ -1338,28 +1349,28 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
-            return item with
-            {
-                StartedAt = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            return WorkItemRecoveryPolicy.BuildPreemptCheckpointRecovery(
+                item,
+                WorkItemRecoveryPolicy.NextRecoveryAttempt(item),
+                _opts.MaxRecoveryAttempts,
+                DateTimeOffset.UtcNow,
+                $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}");
         }
 
         if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
         {
-            var checkAttempts = item.RecoveryAttempts + 1;
-            if (_opts.MaxRecoveryAttempts > 0 && checkAttempts > _opts.MaxRecoveryAttempts)
+            var checkAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(checkAttempts, _opts.MaxRecoveryAttempts))
             {
-                return item with
+                return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
                 {
                     State = WorkItemState.AbandonedAfterRecoveryAttempts,
                     LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
-                    RecoveryAttempts = checkAttempts,
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
-                };
+                }, checkAttempts, item.State);
             }
 
             return WorkItemRecoveryPolicy.BuildCheckAndActRerun(item, checkAttempts);
@@ -1367,19 +1378,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
         {
-            var controlAttempts = item.RecoveryAttempts + 1;
-            if (_opts.MaxRecoveryAttempts > 0 && controlAttempts > _opts.MaxRecoveryAttempts)
+            var controlAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(controlAttempts, _opts.MaxRecoveryAttempts))
             {
-                return item with
+                return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
                 {
                     State = WorkItemState.AbandonedAfterRecoveryAttempts,
                     LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
-                    RecoveryAttempts = controlAttempts,
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
-                };
+                }, controlAttempts, item.State);
             }
 
             return WorkItemRecoveryPolicy.BuildAgentControlRerun(item, controlAttempts);
@@ -1387,16 +1397,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (item.State == WorkItemState.Working)
         {
-            return item with
+            return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
                 State = WorkItemState.Failed,
                 LastError = "worker died while work phase was running without a preempt checkpoint",
-                RecoveryAttempts = item.RecoveryAttempts + 1,
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
 
         // WaitingForQuotaReset is owned by QuotaRetryScheduler; the periodic
@@ -1410,26 +1419,31 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (targetState is null) return null;
 
-        // Only backward-reset transitions (Auditing→WorkComplete, etc.) and
-        // UpstreamPushing→Merged represent genuinely interrupted in-flight work and count
-        // against the recovery cap. Passthrough re-enqueues (WorkComplete/AuditPassed/Merged
-        // left as-is) are natural resting points — a routine rolling restart should not burn
-        // a recovery credit for items waiting between pipeline phases.
-        bool isInterruptedWork = targetState.Value != item.State;
-        var newAttempts = isInterruptedWork ? item.RecoveryAttempts + 1 : item.RecoveryAttempts;
+        // Every automatic recovery handoff counts against the same budget,
+        // including same-state redispatches from durable phase-boundary states.
+        // Otherwise a WorkComplete -> Auditing -> WorkComplete livelock can reset
+        // itself forever without reaching the cap. The production pipeline clears
+        // RecoveryAttempts only when a phase actually completes.
+        var newAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
 
         // MaxRecoveryAttempts <= 0 means unlimited (no cap). Only enforce when > 0.
-        if (isInterruptedWork && _opts.MaxRecoveryAttempts > 0 && newAttempts > _opts.MaxRecoveryAttempts)
+        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(newAttempts, _opts.MaxRecoveryAttempts))
         {
-            return item with
+            return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
                 State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            }, newAttempts, item.State);
         }
 
-        return item.With(targetState.Value) with { RecoveryAttempts = newAttempts };
+        return WorkItemRecoveryPolicy.WithRecoveryAttempt(
+            item.With(targetState.Value),
+            newAttempts,
+            item.State);
     }
 
     private async Task RunItemAsync(int workerIndex, WorkItemId id, WorkerSlotLease slotLease, CancellationToken ct)

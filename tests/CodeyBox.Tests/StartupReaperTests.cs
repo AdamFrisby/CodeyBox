@@ -376,7 +376,7 @@ internal sealed class ImmediateDonePipeline : IPipelineRunner
     {
         _executed.Add(item.Id);
         _entryStates[item.Id] = item.State;
-        await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+        await _store.UpdateAsync(item.With(WorkItemState.Done) with { RecoveryAttempts = 0 }, ct);
     }
 }
 

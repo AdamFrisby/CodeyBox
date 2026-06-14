@@ -68,6 +68,115 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Same(item.AgentControl, recovered.AgentControl);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged)]
+    [InlineData(WorkItemState.Done)]
+    public void ResetRecoveryAttemptsAfterRealProgress_ClearsCompletionStates(WorkItemState state)
+    {
+        var item = MakeItem(state) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(item, state);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.Merging)]
+    [InlineData(WorkItemState.UpstreamPushing)]
+    public void ResetRecoveryAttemptsAfterRealProgress_PreservesInFlightStates(WorkItemState state)
+    {
+        var item = MakeItem(state) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(item, state);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgress_PreservesDirectAuditingToReworkingTransition()
+    {
+        var item = MakeItem(WorkItemState.Auditing) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            item.With(WorkItemState.Reworking),
+            fromState: WorkItemState.Auditing,
+            toState: WorkItemState.Reworking);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgressEvent_ClearsAfterCompletedRework()
+    {
+        var item = MakeItem(WorkItemState.Reworking) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = WorkItemState.Reworking,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(
+            item,
+            RecoveryProgressEvent.AuditReworkCompleted);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+        Assert.Null(reset.RecoveryAttemptSourceState);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgressEvent_PreservesReworkRecoveryOnAuditVerdict()
+    {
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = WorkItemState.Reworking,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(
+            item,
+            RecoveryProgressEvent.AuditVerdictProduced);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Reworking, reset.RecoveryAttemptSourceState);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.Auditing)]
+    public void ResetRecoveryAttemptsAfterRealProgressEvent_ClearsAuditRecoveryOnAuditVerdict(
+        WorkItemState sourceState)
+    {
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = sourceState,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(
+            item,
+            RecoveryProgressEvent.AuditVerdictProduced);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+        Assert.Null(reset.RecoveryAttemptSourceState);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgress_PreservesAuditStartTransition()
+    {
+        var item = MakeItem(WorkItemState.WorkComplete) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            item.With(WorkItemState.Auditing),
+            fromState: WorkItemState.WorkComplete,
+            toState: WorkItemState.Auditing);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+    }
+
     [Fact]
     public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_Requeues()
     {
@@ -102,6 +211,45 @@ public sealed class WorkItemRecoveryPolicyTests
         }
     }
 
+    [Fact]
+    public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_AtCapAbandons()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-recovery-cap-{Guid.NewGuid():N}.db");
+        using var store = new SqliteWorkItemStore(dbPath);
+        try
+        {
+            var svc = new OrchestratorService(
+                new InMemoryTaskQueue(),
+                store,
+                new FakePipelineRunner(store),
+                new CancellationRegistry(CancellationToken.None),
+                new OrchestratorOptions { MaxRecoveryAttempts = 3 },
+                NullLogger<OrchestratorService>.Instance);
+            var item = MakeAgentControlItem(WorkItemState.Working) with
+            {
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+                PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-4),
+                PreemptCheckpoint = null,
+                RecoveryAttempts = 3,
+            };
+
+            var recovered = svc.TryBuildRecoveredStateForTest(item);
+
+            Assert.NotNull(recovered);
+            Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+            Assert.Equal(4, recovered.RecoveryAttempts);
+            Assert.Null(recovered.StartedAt);
+            Assert.Null(recovered.PreemptedAt);
+            Assert.Null(recovered.PreemptCheckpoint);
+            Assert.Same(item.AgentControl, recovered.AgentControl);
+            Assert.Contains("3 recovery attempts", recovered.LastError);
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { }
+        }
+    }
+
     [Theory]
     [InlineData(WorkItemState.Working, WorkItemState.Queued, true)]
     [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete, false)]
@@ -120,11 +268,13 @@ public sealed class WorkItemRecoveryPolicyTests
         var startedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
         var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             MakeItem(from) with { StartedAt = startedAt },
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
 
         Assert.NotNull(recovered);
         Assert.Equal(to, recovered!.State);
         Assert.Equal(clearsStartedAt ? null : startedAt, recovered.StartedAt);
+        Assert.Equal(1, recovered.RecoveryAttempts);
     }
 
     [Fact]
@@ -138,12 +288,52 @@ public sealed class WorkItemRecoveryPolicyTests
 
         var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             item,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
 
         Assert.NotNull(recovered);
         Assert.Equal(WorkItemState.Working, recovered!.State);
         Assert.Null(recovered.StartedAt);
+        Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Reworking)]
+    public void GracefulShutdownRecovery_WithPreemptCheckpoint_AtCapAbandons(WorkItemState state)
+    {
+        var item = MakeItem(state) with
+        {
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/test",
+            RecoveryAttempts = 3,
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            item,
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Equal(4, recovered.RecoveryAttempts);
+        Assert.Null(recovered.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public void GracefulShutdownRecovery_NormalRecoverableState_AtCapAbandons()
+    {
+        var item = MakeItem(WorkItemState.Auditing) with { RecoveryAttempts = 3 };
+
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            item,
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Equal(4, recovered.RecoveryAttempts);
+        Assert.Contains("MaxRecoveryAttempts", recovered.LastError);
     }
 
     [Theory]
@@ -205,7 +395,8 @@ public sealed class WorkItemRecoveryPolicyTests
 
         var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             item,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
 
         Assert.Null(recovered);
     }

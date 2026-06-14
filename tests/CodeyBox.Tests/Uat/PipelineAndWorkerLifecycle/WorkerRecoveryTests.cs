@@ -41,10 +41,7 @@ public sealed class WorkerRecoveryTests : IDisposable
 
         Assert.NotNull(recovered);
         Assert.Equal(expectedState, recovered!.State);
-        if (entryState == expectedState)
-            Assert.Equal(item.RecoveryAttempts, recovered.RecoveryAttempts);
-        else
-            Assert.Equal(item.RecoveryAttempts + 1, recovered.RecoveryAttempts);
+        Assert.Equal(item.RecoveryAttempts + 1, recovered.RecoveryAttempts);
     }
 
     [Fact]
@@ -66,6 +63,7 @@ public sealed class WorkerRecoveryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, failed!.State);
         Assert.Contains("without a preempt checkpoint", failed.LastError);
         Assert.Equal(WorkItemState.Working, resumable!.State);
+        Assert.Equal(1, resumable.RecoveryAttempts);
         Assert.Null(resumable.StartedAt);
         Assert.Equal(checkpointed.PreemptCheckpoint, resumable.PreemptCheckpoint);
     }

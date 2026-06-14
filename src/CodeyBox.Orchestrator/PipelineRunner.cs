@@ -4572,6 +4572,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // re-check against the new work-branch tip. Refresh so the next
             // re-check sees any state mutations made by the rework path
             // (e.g. concurrent prompt edit captured by RunAgentPhaseAsync).
+            await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+                item.Id,
+                RecoveryProgressEvent.PostActReworkCompleted,
+                "post-act-rework-completed",
+                ct);
             item = await _store.GetAsync(item.Id, ct) ?? item;
         }
     }
@@ -5311,6 +5316,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var auditVerdict = blocking.Count == 0 ? AuditVerdict.Pass : AuditVerdict.Fail;
             await PublishAuditCompletedAsync(item, project, iteration, auditVerdict, auditPhaseStart, ct);
+            await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+                item.Id,
+                RecoveryProgressEvent.AuditVerdictProduced,
+                "audit-verdict-produced",
+                ct);
 
             if (blocking.Count == 0)
             {
@@ -5506,6 +5516,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
         await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
             repoId, workBranch, reworkStart, ct);
+        await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+            item.Id,
+            RecoveryProgressEvent.AuditReworkCompleted,
+            "audit-rework-completed",
+            ct);
         if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
         {
             var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
@@ -10046,6 +10061,12 @@ public sealed class PipelineRunner : IPipelineRunner
             return new ConflictReworkResult(false, parkMsg);
         }
 
+        await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+            item.Id,
+            RecoveryProgressEvent.ConflictReworkBranchAdvanced,
+            "conflict-rework-branch-advanced",
+            ct);
+
         _ = startedAt; // currently unused; future: emit conflict_rework duration metric.
 
         await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
@@ -11490,7 +11511,10 @@ Original merge-phase failure (for context):
         await RunBoundedPostAgentAsync(item.Id, $"transition-to-{state}", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
-            var next = current.With(state);
+            var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                current.With(state),
+                current.State,
+                state);
             await _store.UpdateAsync(next, transitionCt);
             _log.LogInformation("Work item {Id} → {State}", item.Id, state);
             AuditLog.WorkItemTransitioned(item.Id, state.ToString());
@@ -11511,6 +11535,29 @@ Original merge-phase failure (for context):
                     RevisionMatches = revision?.RevisionMatches,
                 }, CancellationToken.None);
             }
+        });
+    }
+
+    private async Task ResetRecoveryAttemptsAfterRealProgressEventAsync(
+        WorkItemId itemId,
+        RecoveryProgressEvent progressEvent,
+        string progressLabel,
+        CancellationToken ct)
+    {
+        await RunBoundedPostAgentAsync(itemId, $"reset-recovery-attempts-{progressLabel}", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(itemId, transitionCt);
+            if (current is null || current.RecoveryAttempts == 0)
+                return;
+
+            var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(current, progressEvent);
+            if (next.RecoveryAttempts == current.RecoveryAttempts
+                && next.RecoveryAttemptSourceState == current.RecoveryAttemptSourceState)
+            {
+                return;
+            }
+
+            await _store.UpdateAsync(next, transitionCt);
         });
     }
 
@@ -11729,6 +11776,7 @@ Original merge-phase failure (for context):
             // run of transient retries doesn't burn the host-crash recovery
             // budget on top of the transient-cancel budget.
             RecoveryAttempts = 0,
+            RecoveryAttemptSourceState = null,
         };
         var updated = await _store.TryUpdateIfStateAsync(resumed, current.State, CancellationToken.None);
         if (!updated)

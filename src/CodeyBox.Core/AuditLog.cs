@@ -877,7 +877,7 @@ public static class AuditLog
 
     public static void DeadWorkerFailedTerminal(WorkItemId itemId, string workerId, int attempt) =>
         Audit("work_item.worker_dead_failed_terminal")
-            .Warning("Dead worker {WorkerId}: work item {WorkItemId} exceeded MaxRecoveryAttempts at attempt {Attempt}; transitioned to Failed",
+            .Warning("Dead worker {WorkerId}: work item {WorkItemId} exceeded MaxRecoveryAttempts at attempt {Attempt}; transitioned to AbandonedAfterRecoveryAttempts",
                 workerId, itemId.ToString(), attempt);
 
     /// <summary>

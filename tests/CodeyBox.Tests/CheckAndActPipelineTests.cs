@@ -1142,6 +1142,63 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PostActReValidation_PostActReworkCompleted_ResetsRecoveryAttemptsBeforeNextRecheckFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, maxAuditIterations: 3);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "initial yes", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-recovery-reset",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Vulnerable?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        var seededRecoveryAttempts = false;
+        tp.Agent.BeforeWorkAsync = async (_, _, ct) =>
+        {
+            var current = await tp.Store.GetAsync(followup.Id, ct);
+            if (!seededRecoveryAttempts && current?.State == WorkItemState.Reworking)
+            {
+                await tp.Store.UpdateAsync(current with { RecoveryAttempts = 2 }, ct);
+                seededRecoveryAttempts = true;
+            }
+        };
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.cs", "v1"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "still vulnerable", "high"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.cs", "v2"));
+        tp.Agent.CheckPlan.Enqueue("not a parseable check verdict");
+
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var finalFollowup = await tp.Store.GetAsync(followup.Id);
+        Assert.True(seededRecoveryAttempts);
+        Assert.Equal(WorkItemState.Failed, finalFollowup!.State);
+        Assert.Contains("post-act re-check verdict parse failure", finalFollowup.LastError);
+        Assert.Equal(0, finalFollowup.RecoveryAttempts);
+        Assert.Single(finalFollowup.ReCheckVerdicts);
+    }
+
+    [Fact]
     public async Task PostActReValidation_PostActReworkBreaksRequiredBuild_FailsBuildBeforeNextRecheck()
     {
         // Post-act rework is followed by another check verdict, not by the

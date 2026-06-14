@@ -22,7 +22,8 @@ public sealed class DeadWorkerOptions
 
     /// <summary>
     /// Maximum number of automatic recovery transitions for a single work item
-    /// before the reaper gives up and transitions it to Failed. Default 10.
+    /// before the reaper gives up and transitions it to
+    /// <c>AbandonedAfterRecoveryAttempts</c>. Default 10.
     /// Pairs with <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> (the
     /// startup-replay counterpart) — both default to 10 so a healthy work item
     /// survives routine operator activity (config tweaks, restarts) without

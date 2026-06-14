@@ -180,7 +180,7 @@ Distinct from `/uncancel` (operator cancels are refused there by design — the 
 
 ### AbandonedAfterRecoveryAttempts
 
-When the recovery loop has retried an item more than `CodeyBox:WorkerPool:MaxRecoveryAttempts` times (default 3) without it ever reaching a terminal state, the item is transitioned to `AbandonedAfterRecoveryAttempts` with a descriptive `lastError`. Use `POST /workitems/{id}/retry` to resume manually after investigating the root cause.
+When the recovery loop has retried an item more than `CodeyBox:DeadWorker:MaxRecoveryAttempts` times (default 10) without it ever completing the recovered phase, the item is transitioned to `AbandonedAfterRecoveryAttempts` with a descriptive `lastError`. Use `POST /workitems/{id}/retry` to resume manually after investigating the root cause.
 
 ### Cancellation source attribution
 

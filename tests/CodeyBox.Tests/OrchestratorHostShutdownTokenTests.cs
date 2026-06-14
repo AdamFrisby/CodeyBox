@@ -95,6 +95,48 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
     }
 
     [Fact]
+    public async Task ServiceStop_HostShutdownCancellation_AtRecoveryCapAbandonsInsteadOfRequeueing()
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+            RecoveryAttempts = 2,
+        };
+        await _store.CreateAsync(item);
+
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new HostCancellationWorkingPipeline(_store);
+        var service = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                MaxRecoveryAttempts = 2,
+                ShutdownDrainTimeout = TimeSpan.FromSeconds(10),
+            },
+            NullLogger<OrchestratorService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+        await pipeline.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token);
+
+        var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after.State);
+        Assert.Equal(3, after.RecoveryAttempts);
+        Assert.Contains("MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(0, queue.Count);
+        service.Dispose();
+    }
+
+    [Fact]
     public async Task ServiceStop_DrainTimeout_DoesNotRequeueWhileWorkerStillRunning()
     {
         var item = new WorkItem

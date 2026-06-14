@@ -120,7 +120,7 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// than discarding partial progress. Bounded by
     /// <see cref="DeadWorkerOptions.MaxRecoveryAttempts"/>; once exceeded
     /// the item escalates to
-    /// <see cref="WorkItemState.NeedsOperatorInput"/> so it does not loop
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> so it does not loop
     /// burning a slot per restart. Distinct from the periodic / heartbeat-
     /// stale path, which still uses
     /// <see cref="WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure"/>
@@ -236,11 +236,10 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// <para>
     /// When <paramref name="preserveWorkBranchForOrphan"/> is true (startup
     /// stranded sweep), Working items without a preempt checkpoint are
-    /// reclaimed via
-    /// <see cref="WorkItemRecoveryPolicy.BuildStaleItemRecovery"/>: requeued
-    /// preserving the work branch, with bounded recovery attempts escalating
-    /// to <see cref="WorkItemState.NeedsOperatorInput"/>. When false (periodic
-    /// dead-worker reaper), the same items are marked
+    /// reclaimed preserving the work branch until the shared recovery cap is
+    /// exceeded; cap exhaustion transitions to
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>. When false
+    /// (periodic dead-worker reaper), the same items are marked
     /// <see cref="WorkItemState.Failed"/> via
     /// <see cref="WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure"/>
     /// because a dead worker mid-flight is a different signal — the worker
@@ -269,13 +268,50 @@ public sealed class DeadWorkerReaper : BackgroundService
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
-            var preempted = item with { StartedAt = null, UpdatedAt = DateTimeOffset.UtcNow };
+            var preemptAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            var preempted = WorkItemRecoveryPolicy.BuildPreemptCheckpointRecovery(
+                item,
+                preemptAttempt,
+                _opts.MaxRecoveryAttempts,
+                DateTimeOffset.UtcNow,
+                "exceeded MaxRecoveryAttempts");
             await _store.UpdateAsync(preempted, ct);
-            await _queue.EnqueueAsync(itemId, ct);
             MarkRecoveredItem(itemId);
-            _log.LogInformation(
-                "Recovery ({WorkerId}): work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume",
-                workerIdContext, itemId, item.PreemptCheckpoint);
+
+            if (preempted.State == WorkItemState.AbandonedAfterRecoveryAttempts)
+            {
+                _log.LogWarning(
+                    "Recovery ({WorkerId}): preempt-checkpointed work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
+                    workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, preemptAttempt);
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "checkpoint recovery exceeded MaxRecoveryAttempts; abandoned permanently", ct);
+            }
+            else
+            {
+                await _queue.EnqueueAsync(itemId, ct);
+                _log.LogInformation(
+                    "Recovery ({WorkerId}): work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume (attempt {Attempt}/{Max})",
+                    workerIdContext, itemId, item.PreemptCheckpoint, preemptAttempt, _opts.MaxRecoveryAttempts);
+            }
+
+            if (_webhooks is not null)
+            {
+                _ = _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.recovered",
+                    WorkItem = preempted,
+                    Details = new
+                    {
+                        workItemId = itemId.ToString(),
+                        projectId = item.ProjectId.Value,
+                        fromState = item.State.ToString(),
+                        toState = preempted.State.ToString(),
+                        reason = webhookReason,
+                        recoveryAttempt = preemptAttempt,
+                        maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                    },
+                }, CancellationToken.None);
+            }
             return;
         }
 
@@ -314,27 +350,44 @@ public sealed class DeadWorkerReaper : BackgroundService
                 return;
             }
 
-            var checkAttempt = item.RecoveryAttempts + 1;
+            var checkAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
             WorkItem recovered;
-            if (_opts.MaxRecoveryAttempts > 0 && checkAttempt > _opts.MaxRecoveryAttempts)
+            if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(checkAttempt, _opts.MaxRecoveryAttempts))
             {
-                recovered = item with
+                recovered = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
                 {
-                    State = WorkItemState.Failed,
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
                     LastError = "exceeded MaxRecoveryAttempts",
-                    RecoveryAttempts = checkAttempt,
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
-                };
+                }, checkAttempt, item.State);
                 _log.LogWarning(
-                    "Recovery ({WorkerId}): check-and-act item {ItemId} exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                    "Recovery ({WorkerId}): check-and-act item {ItemId} exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
                     workerIdContext, itemId, _opts.MaxRecoveryAttempts);
                 AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, checkAttempt);
                 await _store.UpdateAsync(recovered, ct);
                 MarkRecoveredItem(itemId);
-                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery failed interrupted check-and-act item permanently without re-dispatch", ct);
+                if (_webhooks is not null)
+                {
+                    _ = _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.recovered",
+                        WorkItem = recovered,
+                        Details = new
+                        {
+                            workItemId = itemId.ToString(),
+                            projectId = item.ProjectId.Value,
+                            fromState = item.State.ToString(),
+                            toState = recovered.State.ToString(),
+                            reason = webhookReason,
+                            recoveryAttempt = checkAttempt,
+                            maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                        },
+                    }, CancellationToken.None);
+                }
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery abandoned interrupted check-and-act item permanently without re-dispatch", ct);
                 return;
             }
 
@@ -368,27 +421,44 @@ public sealed class DeadWorkerReaper : BackgroundService
 
         if (WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
         {
-            var controlAttempt = item.RecoveryAttempts + 1;
+            var controlAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
             WorkItem recovered;
-            if (_opts.MaxRecoveryAttempts > 0 && controlAttempt > _opts.MaxRecoveryAttempts)
+            if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(controlAttempt, _opts.MaxRecoveryAttempts))
             {
-                recovered = item with
+                recovered = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
                 {
-                    State = WorkItemState.Failed,
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
                     LastError = "exceeded MaxRecoveryAttempts",
-                    RecoveryAttempts = controlAttempt,
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
-                };
+                }, controlAttempt, item.State);
                 _log.LogWarning(
-                    "Recovery ({WorkerId}): agent-control item {ItemId} exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                    "Recovery ({WorkerId}): agent-control item {ItemId} exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
                     workerIdContext, itemId, _opts.MaxRecoveryAttempts);
                 AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, controlAttempt);
                 await _store.UpdateAsync(recovered, ct);
                 MarkRecoveredItem(itemId);
-                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery failed interrupted agent-control item permanently without re-dispatch", ct);
+                if (_webhooks is not null)
+                {
+                    _ = _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.recovered",
+                        WorkItem = recovered,
+                        Details = new
+                        {
+                            workItemId = itemId.ToString(),
+                            projectId = item.ProjectId.Value,
+                            fromState = item.State.ToString(),
+                            toState = recovered.State.ToString(),
+                            reason = webhookReason,
+                            recoveryAttempt = controlAttempt,
+                            maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                        },
+                    }, CancellationToken.None);
+                }
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery abandoned interrupted agent-control item permanently without re-dispatch", ct);
                 return;
             }
 
@@ -426,13 +496,24 @@ public sealed class DeadWorkerReaper : BackgroundService
             && !WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item)
             && !WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
         {
-            var orphanAttempt = item.RecoveryAttempts + 1;
-            var orphanRecovered = WorkItemRecoveryPolicy.BuildStaleItemRecovery(
-                item,
-                orphanAttempt,
-                _opts.MaxRecoveryAttempts,
-                noPreemptFailedReason,
-                DateTimeOffset.UtcNow);
+            var orphanAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            var orphanNow = DateTimeOffset.UtcNow;
+            var orphanRecovered = WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(orphanAttempt, _opts.MaxRecoveryAttempts)
+                ? WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = "exceeded MaxRecoveryAttempts",
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    UpdatedAt = orphanNow,
+                }, orphanAttempt, item.State)
+                : WorkItemRecoveryPolicy.BuildStaleItemRecovery(
+                    item,
+                    orphanAttempt,
+                    _opts.MaxRecoveryAttempts,
+                    noPreemptFailedReason,
+                    orphanNow);
             if (orphanRecovered is not null)
             {
                 var orphanFromState = item.State;
@@ -445,7 +526,15 @@ public sealed class DeadWorkerReaper : BackgroundService
                 await _store.UpdateAsync(orphanRecovered, ct);
                 MarkRecoveredItem(itemId);
 
-                if (orphanToState == WorkItemState.NeedsOperatorInput)
+                if (orphanToState == WorkItemState.AbandonedAfterRecoveryAttempts)
+                {
+                    _log.LogWarning(
+                        "Recovery ({WorkerId}): orphaned Working/Reworking work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
+                        workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                    AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, orphanAttempt);
+                    await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "orphan recovery exceeded MaxRecoveryAttempts; abandoned permanently", ct);
+                }
+                else if (orphanToState == WorkItemState.NeedsOperatorInput)
                 {
                     _log.LogWarning(
                         "Recovery ({WorkerId}): orphaned Working work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); parked at NeedsOperatorInput for triage",
@@ -482,7 +571,8 @@ public sealed class DeadWorkerReaper : BackgroundService
                     }, CancellationToken.None);
                 }
 
-                if (orphanToState != WorkItemState.NeedsOperatorInput
+                if (orphanToState != WorkItemState.AbandonedAfterRecoveryAttempts
+                    && orphanToState != WorkItemState.NeedsOperatorInput
                     && orphanToState != WorkItemState.Failed)
                 {
                     await _queue.EnqueueAsync(itemId, ct);
@@ -514,35 +604,35 @@ public sealed class DeadWorkerReaper : BackgroundService
         }
 
         var fromState = item.State;
-        var isInterruptedWork = recoveryTarget.Value != fromState;
-        var attempt = isInterruptedWork ? item.RecoveryAttempts + 1 : item.RecoveryAttempts;
+        var attempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
         WorkItem updated;
 
-        if (isInterruptedWork && attempt > _opts.MaxRecoveryAttempts)
+        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempt, _opts.MaxRecoveryAttempts))
         {
-            updated = item with
+            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
-                State = WorkItemState.Failed,
+                State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = "exceeded MaxRecoveryAttempts",
-                RecoveryAttempts = attempt,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            }, attempt, item.State);
             _log.LogWarning(
-                "Recovery ({WorkerId}): work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                "Recovery ({WorkerId}): work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
                 workerIdContext, itemId, _opts.MaxRecoveryAttempts);
             AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, attempt);
         }
         else
         {
-            updated = item with
+            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
                 State = recoveryTarget.Value,
-                LastError = isInterruptedWork ? null : item.LastError,
-                RecoveryAttempts = attempt,
+                LastError = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
                 // Re-queued items must not appear in-flight to CountInFlightAsync.
                 StartedAt = recoveryTarget == WorkItemState.Queued ? null : item.StartedAt,
-            };
+            }, attempt, item.State);
             _log.LogInformation(
                 "Recovery ({WorkerId}): recovering work item {ItemId} from {From} → {To} (attempt {Attempt}/{Max})",
                 workerIdContext, itemId, fromState, recoveryTarget, attempt, _opts.MaxRecoveryAttempts);
@@ -551,7 +641,7 @@ public sealed class DeadWorkerReaper : BackgroundService
 
         await _store.UpdateAsync(updated, ct);
 
-        if (_webhooks is not null && isInterruptedWork)
+        if (_webhooks is not null)
         {
             _ = _webhooks.PublishAsync(new WebhookEvent
             {
@@ -570,7 +660,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             }, CancellationToken.None);
         }
 
-        if (updated.State != WorkItemState.Failed)
+        if (updated.State != WorkItemState.AbandonedAfterRecoveryAttempts)
         {
             await _queue.EnqueueAsync(itemId, ct);
             MarkRecoveredItem(itemId);
@@ -578,7 +668,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         else
         {
             MarkRecoveredItem(itemId);
-            await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery failed item permanently without re-dispatch", ct);
+            await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery abandoned item permanently without re-dispatch", ct);
         }
     }
 
@@ -608,8 +698,8 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// Maps a state for which a stale worker row could exist to the state the
     /// reaper should recover or redispatch it into. Mid-flight states map back
     /// to durable resume points and consume a recovery attempt; phase-boundary
-    /// resting states map to themselves and are only re-dispatched. Returns
-    /// null for terminal, parked, or otherwise dispatcher-owned states.
+    /// resting states map to themselves and also consume a recovery attempt.
+    /// Returns null for terminal, parked, or otherwise dispatcher-owned states.
     /// </summary>
     internal static WorkItemState? MapToRecoveryState(WorkItemState state)
         => WorkItemRecoveryPolicy.MapToRecoveryState(state);

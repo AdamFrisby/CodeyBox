@@ -160,6 +160,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // Additive migration: how many times the recovery loop / dead-worker reaper
             // has reset this item. Default 0 = never recovered. Capped at MaxRecoveryAttempts.
             RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempt_source_state INTEGER;");
 
             // Additive migration: link work items to a release. NULL = legacy / merge-to-main behaviour.
             RunMigration("ALTER TABLE work_items ADD COLUMN release_id TEXT;");
@@ -400,7 +401,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
-                        min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
+                        min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
@@ -411,7 +412,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         preserve_work_branch_on_queued_pickup)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
-                        $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
+                        $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
@@ -517,6 +518,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
+                    recovery_attempt_source_state = $recovery_attempt_source_state,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
                     preempt_checkpoint = $preempt_checkpoint,
@@ -582,6 +584,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
+                    recovery_attempt_source_state = $recovery_attempt_source_state,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
                     preempt_checkpoint = $preempt_checkpoint,
@@ -652,6 +655,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
+                    recovery_attempt_source_state = $recovery_attempt_source_state,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
                     preempt_checkpoint = $preempt_checkpoint,
@@ -1809,6 +1813,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$cancellation_reason",
             item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
         cmd.Parameters.AddWithValue("$recovery_attempts", item.RecoveryAttempts);
+        cmd.Parameters.AddWithValue("$recovery_attempt_source_state",
+            item.RecoveryAttemptSourceState.HasValue ? (object)(int)item.RecoveryAttemptSourceState.Value : DBNull.Value);
         cmd.Parameters.AddWithValue("$release_id", (object?)item.ReleaseId?.ToString() ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preempted_at", (object?)item.PreemptedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preempt_checkpoint", (object?)item.PreemptCheckpoint ?? DBNull.Value);
@@ -1882,6 +1888,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         MinModelScore = ReadInt32OrDefault(r, "min_model_score", defaultValue: 95),
         CancellationReason = ReadCancellationReason(r),
         RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
+        RecoveryAttemptSourceState = ReadNullableWorkItemState(r, "recovery_attempt_source_state"),
         ReleaseId = ReadNullableReleaseId(r, "release_id"),
         PreemptedAt = ReadNullableDateTimeOffset(r, "preempted_at"),
         PreemptCheckpoint = r.IsDBNull(r.GetOrdinal("preempt_checkpoint")) ? null : r.GetString(r.GetOrdinal("preempt_checkpoint")),
@@ -2033,6 +2040,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     {
         var raw = ReadNullableString(r, column);
         return string.IsNullOrWhiteSpace(raw) ? null : new AgentKind(raw);
+    }
+
+    private static WorkItemState? ReadNullableWorkItemState(SqliteDataReader r, string column)
+    {
+        var ord = r.GetOrdinal(column);
+        if (r.IsDBNull(ord)) return null;
+        var value = r.GetInt32(ord);
+        return Enum.IsDefined(typeof(WorkItemState), value) ? (WorkItemState)value : null;
     }
 
     private static DateTimeOffset? ReadNullableDateTimeOffset(SqliteDataReader r, string column)

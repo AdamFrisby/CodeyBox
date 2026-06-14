@@ -183,7 +183,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task PreemptedWorking_ReenqueuesWithoutRecoveryReset()
+    public async Task PreemptedWorking_ReenqueuesAndCountsRecoveryAttempt()
     {
         var item = Item(WorkItemState.Working) with
         {
@@ -197,9 +197,30 @@ public sealed class WorkItemRecoveryTests : IDisposable
 
         var recovered = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, recovered!.State);
-        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Null(recovered.StartedAt);
         Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public async Task PreemptedWorking_AtRecoveryCap_TransitionsToAbandoned()
+    {
+        var item = Item(WorkItemState.Working, recoveryAttempts: 2) with
+        {
+            PreemptedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{Guid.NewGuid()}",
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator(maxRecovery: 2);
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Contains("2 recovery attempts", recovered.LastError);
+        Assert.Equal(3, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
     }
 
     [Fact]
@@ -356,18 +377,18 @@ public sealed class WorkItemRecoveryTests : IDisposable
         Assert.Equal(1, queue.Count);
     }
 
-    // ── WorkComplete / AuditPassed / Merged: re-enqueued as-is ───────────────
+    // ── WorkComplete / AuditPassed / Merged: re-enqueued as recovery handoffs ─
 
     [Theory]
     [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.Merged)]
-    public async Task MidFlightPassThroughStates_ReenqueuedWithoutIncrementingAttempts(WorkItemState state)
+    public async Task MidFlightPassThroughStates_ReenqueuedAndIncrementAttempts(WorkItemState state)
     {
-        // WorkComplete / AuditPassed / Merged are natural resting points between pipeline
-        // phases, not indicators of interrupted in-flight work. A routine orchestrator
-        // restart while an item sits in one of these states must not burn a recovery credit.
-        var item = Item(state);
+        // Same-state redispatches still consume the recovery budget. Without this,
+        // a WorkComplete -> Auditing -> WorkComplete livelock can repeatedly return
+        // to a durable boundary and never reach MaxRecoveryAttempts.
+        var item = Item(state, recoveryAttempts: 1);
         await _store.CreateAsync(item);
 
         var queue = new InMemoryTaskQueue();
@@ -380,7 +401,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
 
         var recovered = await _store.GetAsync(item.Id);
         Assert.Equal(state, recovered!.State);
-        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Equal(2, recovered.RecoveryAttempts);
         Assert.Equal(1, queue.Count);
     }
 

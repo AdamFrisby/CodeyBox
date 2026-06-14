@@ -477,12 +477,12 @@ See [`budget-alerts.md`](budget-alerts.md) for configuration and edge-trigger se
 | `workItemId` | string | UUID of the recovered work item |
 | `projectId` | string | Project the item belongs to |
 | `fromState` | string | State the item was in when the worker was declared dead |
-| `toState` | string | State the item was transitioned to; `"Failed"` if `MaxRecoveryAttempts` was exceeded |
+| `toState` | string | State the item was transitioned to; `"AbandonedAfterRecoveryAttempts"` if `MaxRecoveryAttempts` was exceeded |
 | `reason` | string | Always `"dead worker detected"` |
 | `recoveryAttempt` | int | Which recovery attempt this is (1-based) |
-| `maxRecoveryAttempts` | int | The configured cap before the item is failed permanently |
+| `maxRecoveryAttempts` | int | The configured cap before the item is abandoned for operator triage |
 
-`work_item.recovered` fires even when `toState` is `"Failed"` (i.e. the cap was exceeded). Phase-boundary re-dispatches such as `AuditPassed` → `AuditPassed` do not emit this webhook because no recovery transition occurred. Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
+`work_item.recovered` fires even when `toState` is `"AbandonedAfterRecoveryAttempts"` (i.e. the cap was exceeded). Phase-boundary re-dispatches such as `AuditPassed` → `AuditPassed` also emit this webhook and consume a recovery attempt. Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
 
 ### `agent_smoke_failed` details
 

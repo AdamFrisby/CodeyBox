@@ -19,10 +19,10 @@ public sealed class RestartRecoveryUatTests : IDisposable
     [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete, 1)]
     [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed, 1)]
     [InlineData(WorkItemState.UpstreamPushing, WorkItemState.Merged, 1)]
-    [InlineData(WorkItemState.WorkComplete, WorkItemState.WorkComplete, 0)]
-    [InlineData(WorkItemState.AuditPassed, WorkItemState.AuditPassed, 0)]
-    [InlineData(WorkItemState.Merged, WorkItemState.Merged, 0)]
-    public void RecoveryMapping_ResetsInterruptedPhasesAndLeavesDurableBoundariesInPlace(
+    [InlineData(WorkItemState.WorkComplete, WorkItemState.WorkComplete, 1)]
+    [InlineData(WorkItemState.AuditPassed, WorkItemState.AuditPassed, 1)]
+    [InlineData(WorkItemState.Merged, WorkItemState.Merged, 1)]
+    public void RecoveryMapping_ResetsInterruptedPhasesAndCountsDurableBoundaryRedispatches(
         WorkItemState entryState,
         WorkItemState expectedState,
         int expectedAttemptIncrement)
@@ -62,13 +62,13 @@ public sealed class RestartRecoveryUatTests : IDisposable
         Assert.Null(failed.PreemptCheckpoint);
         Assert.Contains("without a preempt checkpoint", failed.LastError);
         Assert.Equal(WorkItemState.Working, resumable!.State);
-        Assert.Equal(0, resumable.RecoveryAttempts);
+        Assert.Equal(1, resumable.RecoveryAttempts);
         Assert.Null(resumable.StartedAt);
         Assert.Equal(preemptedWork.PreemptCheckpoint, resumable.PreemptCheckpoint);
     }
 
     [Fact]
-    public void RecoveryCap_AbandonsOnlyInterruptedRecoveryBeyondLimit()
+    public void RecoveryCap_AbandonsInterruptedAndDurableBoundaryRecoveryBeyondLimit()
     {
         using var store = new SqliteWorkItemStore(_workspace.NewDatabasePath());
         var queue = new InMemoryTaskQueue();
@@ -77,12 +77,12 @@ public sealed class RestartRecoveryUatTests : IDisposable
         var durableBoundary = PersistenceAndRecoveryHelpers.Item(WorkItemState.Merged, recoveryAttempts: 2);
 
         var abandoned = service.TryBuildRecoveredStateForTest(interrupted);
-        var stillRunnable = service.TryBuildRecoveredStateForTest(durableBoundary);
+        var boundaryAbandoned = service.TryBuildRecoveredStateForTest(durableBoundary);
 
         Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, abandoned!.State);
         Assert.Contains("abandoned after 2 recovery attempts", abandoned.LastError);
-        Assert.Equal(WorkItemState.Merged, stillRunnable!.State);
-        Assert.Equal(2, stillRunnable.RecoveryAttempts);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, boundaryAbandoned!.State);
+        Assert.Contains("abandoned after 2 recovery attempts", boundaryAbandoned.LastError);
     }
 
     [Fact]
@@ -115,7 +115,7 @@ public sealed class RestartRecoveryUatTests : IDisposable
         Assert.Equal(WorkItemState.WorkComplete, (await store.GetAsync(interruptedAudit.Id))!.State);
         Assert.Equal(1, (await store.GetAsync(interruptedAudit.Id))!.RecoveryAttempts);
         Assert.Equal(WorkItemState.Merged, (await store.GetAsync(durableMerged.Id))!.State);
-        Assert.Equal(0, (await store.GetAsync(durableMerged.Id))!.RecoveryAttempts);
+        Assert.Equal(1, (await store.GetAsync(durableMerged.Id))!.RecoveryAttempts);
         Assert.Equal(WorkItemState.Done, (await store.GetAsync(terminal.Id))!.State);
     }
 

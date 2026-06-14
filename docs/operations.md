@@ -66,7 +66,7 @@ to a safe restart point:
 | `WorkComplete` / `AuditPassed` / `Merged` | (unchanged) | Pipeline resumes at the correct phase |
 
 Each recovery increments the item's `recoveryAttempts` counter. After
-`CodeyBox:WorkerPool:MaxRecoveryAttempts` consecutive recoveries (default **3**)
+`CodeyBox:DeadWorker:MaxRecoveryAttempts` consecutive recoveries (default **10**)
 without reaching a terminal state, the item is transitioned to
 `AbandonedAfterRecoveryAttempts` and requires operator action:
 
