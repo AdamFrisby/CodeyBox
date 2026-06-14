@@ -1,8 +1,11 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using Microsoft.Extensions.Logging;
@@ -159,21 +162,37 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         // the merge call.
         int prNumber;
         string? prHtmlUrl;
+        var prTitle = BuildPrTitle(request.Title, request.WorkBranch);
+        PrDescriptionResult? prDescription = null;
         if (request.ExistingPullRequestNumber is { } existingPr)
         {
             prNumber = existingPr;
             prHtmlUrl = $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{existingPr}";
+            if (IsSquashMerge(_opts.MergeMethod))
+            {
+                var existing = await TryFetchPullRequestAsync(existingPr, ct);
+                if (existing is not null)
+                {
+                    if (!string.IsNullOrWhiteSpace(existing.HtmlUrl))
+                        prHtmlUrl = existing.HtmlUrl;
+                    if (!string.IsNullOrWhiteSpace(existing.Title))
+                        prTitle = existing.Title;
+                    if (!string.IsNullOrWhiteSpace(existing.Body))
+                        prDescription = new PrDescriptionResult(
+                            existing.Body,
+                            Generated: ShouldReuseExistingPrBodyAsGenerated(existing.Body, request));
+                }
+            }
         }
         else
         {
-            var description = await BuildDescriptionAsync(request, ct);
-            var prTitle = BuildPrTitle(request.Title, request.WorkBranch);
+            prDescription = await BuildDescriptionAsync(request, ct);
             GitHubPrResponse? pr;
             await using (var createPrScope = await TimingScope.BeginAsync(
                 _timings, request.WorkItemId, "upstream_push", "upstream.api_create_pr",
                 log: _log))
             {
-                pr = await CreatePullRequestAsync(request, prTitle, description, ct);
+                pr = await CreatePullRequestAsync(request, prTitle, prDescription.Body, ct);
             }
 
             if (pr is null)
@@ -215,7 +234,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _timings, request.WorkItemId, "upstream_push", "upstream.api_merge_pr",
             log: _log))
         {
-            (mergedSha, mergeNotes, autoMergeRaced) = await MergePullRequestAsync(prNumber, ct);
+            (mergedSha, mergeNotes, autoMergeRaced) = await MergePullRequestAsync(
+                prNumber, prTitle, prDescription, request, ct);
         }
 
         if (mergedSha is not null)
@@ -412,12 +432,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     /// Appends the standard CodeyBox footer to whichever body is used.
     /// Never throws — generator failures are warnings, not errors.
     /// </summary>
-    private async Task<string> BuildDescriptionAsync(UpstreamCompletionRequest request, CancellationToken ct)
+    private async Task<PrDescriptionResult> BuildDescriptionAsync(UpstreamCompletionRequest request, CancellationToken ct)
     {
         var staticBody = request.Description ?? string.Empty;
 
         if (_descriptionGenerator is null || !_opts.PrDescription.Enabled)
-            return staticBody + PrFooter;
+            return new PrDescriptionResult(staticBody + PrFooter, Generated: false);
 
         try
         {
@@ -451,7 +471,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             // Redact the generated body — the LLM may echo secrets from the diff.
             generated = RawOutputRedactor.Redact(generated);
             _log.LogInformation("LLM-generated PR description produced ({Chars} chars)", generated.Length);
-            return generated + PrFooter;
+            return new PrDescriptionResult(generated + PrFooter, Generated: true);
         }
         catch (TimeoutException)
         {
@@ -472,7 +492,44 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _log.LogWarning("PR description generation failed ({Message}); using static template", ex.Message);
         }
 
-        return staticBody + PrFooter;
+        return new PrDescriptionResult(staticBody + PrFooter, Generated: false);
+    }
+
+    private sealed record PrDescriptionResult(string Body, bool Generated);
+
+    private bool ShouldReuseExistingPrBodyAsGenerated(string body, UpstreamCompletionRequest request)
+    {
+        if (!_opts.PrDescription.Enabled)
+            return false;
+
+        return !LooksLikeStaticFallbackPrBody(body, request.Description);
+    }
+
+    private static bool LooksLikeStaticFallbackPrBody(string body, string? staticDescription)
+    {
+        var strippedBody = StripPrFooter(body);
+        if (strippedBody.Length == 0)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(staticDescription) &&
+            string.Equals(strippedBody, StripPrFooter(staticDescription), StringComparison.Ordinal))
+            return true;
+
+        return strippedBody.StartsWith("Automated via CodeyBox", StringComparison.Ordinal) ||
+            strippedBody.Contains("Untrusted agent output", StringComparison.Ordinal);
+    }
+
+    private static string StripPrFooter(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        var normalized = text.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var footerIndex = normalized.IndexOf("\n\n---\n*Co-Authored-By:", StringComparison.Ordinal);
+        if (footerIndex >= 0)
+            normalized = normalized[..footerIndex];
+
+        return normalized.Trim();
     }
 
     /// <summary>Returns the last 2 KB of <paramref name="text"/> (raw agent stdout or fallback).</summary>
@@ -487,6 +544,70 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     // The Co-Authored-By trailer identifies CodeyBox as a co-author on the
     // forge side; the 🤖 line links back to the platform for operators.
     private const string PrFooter = "\n\n---\n*Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*  \n🤖 Generated with [CodeyBox](https://codeybox.invalid)";
+
+    private static readonly Regex CollapseWhitespace = new(@"\s+", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex PullRequestNumberOnly = new(@"^\(#\d+\)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex PromptRevisionTrailer = new(
+        @"(?im)^\s*\*?CodeyBox-Prompt-Revision\s*:\s*(\d+)\s*\*?\s*$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex KnownTrailerLine = new(
+        @"^\*?(?:CodeyBox-[A-Za-z0-9-]+|Co-Authored-By)\s*:",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex ChecklistPrefix = new(
+        @"^\s*[-*+]\s+\[[ xX]\]\s+",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex BulletPrefix = new(
+        @"^\s*[-*+]\s+",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex NumberedListPrefix = new(
+        @"^\s*\d+[.)]\s+",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex MarkdownLink = new(
+        @"\[([^\]]+)\]\([^)]+\)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex ConventionalSubjectPrefix = new(
+        @"^(?:feat|fix|chore|docs|test|refactor|perf|build|ci|style|revert)(?:\([^)]+\))?!?:\s+",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex PureReworkOrAuditSubject = new(
+        @"^(?:fix|address|resolve|rework)\s+(?:audit|auditor|review|reviewer|findings?|feedback)\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex CiSkipDirective = new(
+        @"\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex SkipChecksTrailerLine = new(
+        @"^\s*\*?skip-checks\s*:",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex ExcessBlankLines = new(
+        @"\n{3,}",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly (string Prefix, string Replacement)[] ImperativePrefixes =
+    [
+        ("This pull request adds ", "Add "),
+        ("This pull request updates ", "Update "),
+        ("This pull request changes ", "Change "),
+        ("This pull request fixes ", "Fix "),
+        ("This pull request removes ", "Remove "),
+        ("This PR adds ", "Add "),
+        ("This PR updates ", "Update "),
+        ("This PR changes ", "Change "),
+        ("This PR fixes ", "Fix "),
+        ("This PR removes ", "Remove "),
+        ("This change adds ", "Add "),
+        ("This change updates ", "Update "),
+        ("This change changes ", "Change "),
+        ("This change fixes ", "Fix "),
+        ("This change removes ", "Remove "),
+        ("Adds ", "Add "),
+        ("Updates ", "Update "),
+        ("Changes ", "Change "),
+        ("Fixes ", "Fix "),
+        ("Removes ", "Remove "),
+        ("Introduces ", "Introduce "),
+        ("Implements ", "Implement "),
+        ("Refactors ", "Refactor "),
+        ("Ships ", "Ship "),
+    ];
 
     // -------------------------------------------------------------------------
     // GitHub API helpers
@@ -526,10 +647,53 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 $"GitHub POST /pulls returned success but response body could not be deserialised (head={request.WorkBranch})");
     }
 
-    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced)> MergePullRequestAsync(int prNumber, CancellationToken ct)
+    private async Task<GitHubPrResponse?> TryFetchPullRequestAsync(int prNumber, CancellationToken ct)
+    {
+        try
+        {
+            var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}";
+            using var req = BuildRequest(HttpMethod.Get, url);
+
+            var getPrSw = Stopwatch.StartNew();
+            using var response = await SendAsync(req, ct);
+            getPrSw.Stop();
+            CodeyBoxMeters.UpstreamApiCallDuration.Record(getPrSw.ElapsedMilliseconds,
+                new KeyValuePair<string, object?>("endpoint", "GET /pulls"),
+                new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _log.LogWarning(
+                    "GitHub GET /pulls/{N} returned {Status}; using local request data for squash commit message",
+                    prNumber, (int)response.StatusCode);
+                AuditLog.UpstreamApiCallFailed("GET /pulls", (int)response.StatusCode, _opts.Owner, _opts.Repository);
+                return null;
+            }
+
+            return await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                "Could not read PR #{N} while composing squash commit message ({Message}); using local request data fallback",
+                prNumber, ex.Message);
+            return null;
+        }
+    }
+
+    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced)> MergePullRequestAsync(
+        int prNumber,
+        string prTitle,
+        PrDescriptionResult? prDescription,
+        UpstreamCompletionRequest completionRequest,
+        CancellationToken ct)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}/merge";
-        var body = new GitHubMergeRequest(_opts.MergeMethod);
+        var body = await BuildMergeRequestAsync(prNumber, prTitle, prDescription, completionRequest, ct);
 
         using var req = BuildRequest(HttpMethod.Put, url);
         req.Content = JsonContent.Create(body);
@@ -565,6 +729,429 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         var result = await response.Content.ReadFromJsonAsync<GitHubMergeResponse>(ct);
         return (result?.Sha, null, false);
     }
+
+    private async Task<GitHubMergeRequest> BuildMergeRequestAsync(
+        int prNumber,
+        string prTitle,
+        PrDescriptionResult? prDescription,
+        UpstreamCompletionRequest completionRequest,
+        CancellationToken ct)
+    {
+        if (!IsSquashMerge(_opts.MergeMethod))
+            return new GitHubMergeRequest(_opts.MergeMethod);
+
+        IReadOnlyList<string> commitMessages = [];
+        try
+        {
+            commitMessages = await FetchPullRequestCommitMessagesAsync(prNumber, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                "Could not read commits for PR #{N} while composing squash commit message ({Message}); using available PR description fallback",
+                prNumber, ex.Message);
+        }
+
+        var commitTitle = StripCiSkipControlsFromTitle(BuildSquashCommitTitle(prTitle, prNumber));
+        if (string.IsNullOrWhiteSpace(commitTitle) || PullRequestNumberOnly.IsMatch(commitTitle))
+            commitTitle = BuildSquashCommitTitle("chore: merge CodeyBox pull request", prNumber);
+
+        var commitMessage = StripCiSkipControlsFromBody(
+            BuildSquashCommitMessage(prDescription, commitMessages, completionRequest));
+        return new GitHubMergeRequest(_opts.MergeMethod, commitTitle, commitMessage);
+    }
+
+    private async Task<IReadOnlyList<string>> FetchPullRequestCommitMessagesAsync(int prNumber, CancellationToken ct)
+    {
+        const int perPage = 100;
+        const int maxPages = 10;
+        const int maxCommitMessageBytes = 8192;
+        const int maxTotalCommitMessageBytes = 65536;
+        var messages = new List<string>();
+        var retainedBytes = 0;
+
+        for (var page = 1; page <= maxPages; page++)
+        {
+            var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}/commits" +
+                $"?per_page={perPage}&page={page}";
+            using var req = BuildRequest(HttpMethod.Get, url);
+            using var response = await SendAsync(req, ct);
+            if (!response.IsSuccessStatusCode)
+            {
+                _log.LogWarning(
+                    "GitHub GET /pulls/{N}/commits returned {Status}; using PR description fallback for squash commit message",
+                    prNumber, (int)response.StatusCode);
+                AuditLog.UpstreamApiCallFailed("GET /pulls/commits", (int)response.StatusCode, _opts.Owner, _opts.Repository);
+                return messages;
+            }
+
+            var commits = await response.Content.ReadFromJsonAsync<GitHubPullRequestCommitResponse[]>(ct);
+            if (commits is null || commits.Length == 0)
+                break;
+
+            foreach (var commit in commits)
+            {
+                var message = commit.Commit?.Message;
+                if (string.IsNullOrWhiteSpace(message))
+                    continue;
+
+                var remainingBytes = maxTotalCommitMessageBytes - retainedBytes;
+                if (remainingBytes < 64)
+                    return messages;
+
+                var truncated = TruncateCommitMessageForSquashFallback(
+                    message,
+                    Math.Min(maxCommitMessageBytes, remainingBytes));
+                messages.Add(truncated);
+                retainedBytes += Encoding.UTF8.GetByteCount(truncated);
+            }
+
+            if (commits.Length < perPage)
+                break;
+        }
+
+        return messages;
+    }
+
+    private static string BuildSquashCommitTitle(string prTitle, int prNumber)
+    {
+        var title = CollapseWhitespace.Replace(prTitle, " ").Trim();
+        if (string.IsNullOrWhiteSpace(title))
+            title = "chore: merge CodeyBox pull request";
+
+        var expectedSuffix = string.Create(CultureInfo.InvariantCulture, $" (#{prNumber})");
+        return title.EndsWith(expectedSuffix, StringComparison.Ordinal)
+            ? title
+            : title + expectedSuffix;
+    }
+
+    private static string BuildSquashCommitMessage(
+        PrDescriptionResult? prDescription,
+        IReadOnlyList<string> commitMessages,
+        UpstreamCompletionRequest completionRequest)
+    {
+        var promptRevision =
+            ExtractLastPromptRevision(commitMessages) ??
+            completionRequest.PromptRevision ??
+            ExtractLastPromptRevision(prDescription?.Body);
+
+        var body = prDescription?.Generated == true
+            ? CleanProseForCommitMessage(prDescription.Body)
+            : string.Empty;
+
+        if (string.IsNullOrWhiteSpace(body))
+            body = CleanCommitMessagesForFallback(commitMessages);
+
+        if (string.IsNullOrWhiteSpace(body))
+            body = CleanProseForCommitMessage(prDescription?.Body ?? completionRequest.Description);
+
+        if (string.IsNullOrWhiteSpace(body))
+            body = "Apply the CodeyBox work item changes.";
+
+        return $"{body.Trim()}\n\n{BuildSquashTrailerBlock(promptRevision)}";
+    }
+
+    private static string CleanCommitMessagesForFallback(IReadOnlyList<string> commitMessages)
+    {
+        var paragraphs = new List<string>();
+        foreach (var message in commitMessages)
+            paragraphs.AddRange(ExtractCommitMessageParagraphs(message));
+
+        return FormatCommitBody(paragraphs);
+    }
+
+    private static IEnumerable<string> ExtractCommitMessageParagraphs(string message)
+    {
+        foreach (var paragraph in ExtractCleanParagraphs(message, stopAtPrFooter: false))
+        {
+            if (!IsPureIterationNoise(paragraph))
+                yield return paragraph;
+        }
+    }
+
+    private static string CleanProseForCommitMessage(string? text)
+        => FormatCommitBody(ExtractCleanParagraphs(text, stopAtPrFooter: true));
+
+    private static IEnumerable<string> ExtractCleanParagraphs(string? text, bool stopAtPrFooter)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            yield break;
+
+        var current = new StringBuilder();
+        var inFence = false;
+
+        foreach (var rawLine in text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
+        {
+            var trimmedRaw = rawLine.Trim();
+            if (stopAtPrFooter && trimmedRaw == "---")
+                break;
+
+            if (trimmedRaw.StartsWith("```", StringComparison.Ordinal))
+            {
+                if (current.Length > 0)
+                {
+                    yield return ToImperativeSentence(current.ToString());
+                    current.Clear();
+                }
+
+                inFence = !inFence;
+                continue;
+            }
+
+            if (inFence)
+                continue;
+
+            if (IsSkippableCommitMessageLine(trimmedRaw))
+            {
+                if (current.Length > 0)
+                {
+                    yield return ToImperativeSentence(current.ToString());
+                    current.Clear();
+                }
+
+                continue;
+            }
+
+            var line = CleanMarkdownLine(trimmedRaw);
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                if (current.Length > 0)
+                {
+                    yield return ToImperativeSentence(current.ToString());
+                    current.Clear();
+                }
+
+                continue;
+            }
+
+            if (IsPureIterationNoise(line))
+                continue;
+
+            if (current.Length > 0)
+                current.Append(' ');
+            current.Append(line);
+        }
+
+        if (current.Length > 0)
+            yield return ToImperativeSentence(current.ToString());
+    }
+
+    private static bool IsSkippableCommitMessageLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        if (line.StartsWith("#", StringComparison.Ordinal)) return true;
+        if (line.StartsWith(">", StringComparison.Ordinal)) return true;
+        if (line.StartsWith("```", StringComparison.Ordinal)) return true;
+        if (line.Contains("Generated with [CodeyBox]", StringComparison.Ordinal)) return true;
+        if (line.Contains(CodeyBoxTrailers.CoAuthoredBy, StringComparison.Ordinal)) return true;
+        if (KnownTrailerLine.IsMatch(line)) return true;
+        if (SkipChecksTrailerLine.IsMatch(line)) return true;
+        if (ChecklistPrefix.IsMatch(line)) return true;
+        return false;
+    }
+
+    private static string CleanMarkdownLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return string.Empty;
+        line = ChecklistPrefix.Replace(line, string.Empty);
+        line = BulletPrefix.Replace(line, string.Empty);
+        line = NumberedListPrefix.Replace(line, string.Empty);
+        line = MarkdownLink.Replace(line, "$1");
+        line = ConventionalSubjectPrefix.Replace(line, string.Empty);
+        line = line.Replace("`", string.Empty, StringComparison.Ordinal);
+        line = line.Trim(' ', '\t', '*', '_');
+        return CollapseWhitespace.Replace(line, " ").Trim();
+    }
+
+    private static string FormatCommitBody(IEnumerable<string> paragraphs)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var cleaned = new List<string>();
+
+        foreach (var paragraph in paragraphs)
+        {
+            var normalized = CollapseWhitespace.Replace(paragraph, " ").Trim();
+            if (string.IsNullOrWhiteSpace(normalized)) continue;
+            normalized = EnsureSentence(normalized);
+            if (!seen.Add(normalized)) continue;
+            cleaned.Add(WrapParagraph(normalized, 72));
+            if (cleaned.Count >= 8) break;
+        }
+
+        return string.Join("\n\n", cleaned).Trim();
+    }
+
+    private static string WrapParagraph(string paragraph, int width)
+    {
+        var words = CollapseWhitespace.Split(paragraph.Trim());
+        var sb = new StringBuilder();
+        var lineLength = 0;
+
+        foreach (var word in words)
+        {
+            if (word.Length == 0) continue;
+
+            if (lineLength == 0)
+            {
+                sb.Append(word);
+                lineLength = word.Length;
+                continue;
+            }
+
+            if (lineLength + 1 + word.Length > width)
+            {
+                sb.Append('\n').Append(word);
+                lineLength = word.Length;
+            }
+            else
+            {
+                sb.Append(' ').Append(word);
+                lineLength += 1 + word.Length;
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private static string ToImperativeSentence(string text)
+    {
+        var cleaned = CollapseWhitespace.Replace(text, " ").Trim();
+        if (cleaned.Length == 0) return cleaned;
+
+        foreach (var (prefix, replacement) in ImperativePrefixes)
+        {
+            if (cleaned.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return replacement + cleaned[prefix.Length..];
+        }
+
+        return char.ToUpperInvariant(cleaned[0]) + cleaned[1..];
+    }
+
+    private static string EnsureSentence(string text)
+    {
+        text = text.Trim();
+        if (text.Length == 0) return text;
+        var last = text[^1];
+        return last is '.' or '!' or '?' ? text : text + ".";
+    }
+
+    private static bool IsPureIterationNoise(string line)
+    {
+        var normalized = CollapseWhitespace.Replace(line, " ").Trim().TrimEnd('.');
+        if (normalized.Length == 0) return true;
+        var lower = normalized.ToLowerInvariant();
+
+        if (lower.StartsWith("codeybox: merge ", StringComparison.Ordinal)) return true;
+        if (lower.StartsWith("codeybox:", StringComparison.Ordinal))
+            return IsPureIterationNoise(lower["codeybox:".Length..]);
+        if (lower.StartsWith("codeybox rework:", StringComparison.Ordinal))
+            return IsPureIterationNoise(lower["codeybox rework:".Length..]);
+        if ((lower.StartsWith("stamp ", StringComparison.Ordinal) ||
+             lower.StartsWith("restamp ", StringComparison.Ordinal)) &&
+            (lower.Contains("prompt-revision trailer", StringComparison.Ordinal) ||
+             lower.Contains("prompt revision trailer", StringComparison.Ordinal)))
+            return true;
+        if (lower.StartsWith("merge branch ", StringComparison.Ordinal)) return true;
+        if (lower.StartsWith("merge main", StringComparison.Ordinal)) return true;
+        if (lower.Contains("merge conflict", StringComparison.Ordinal) &&
+            (lower.StartsWith("chore:", StringComparison.Ordinal) ||
+             lower.StartsWith("fix:", StringComparison.Ordinal) ||
+             lower.StartsWith("resolve", StringComparison.Ordinal)))
+            return true;
+        if (lower is "rework" or "audit fix" or "fix audit" or "address audit feedback")
+            return true;
+
+        return PureReworkOrAuditSubject.IsMatch(lower);
+    }
+
+    private static string BuildSquashTrailerBlock(int? promptRevision)
+    {
+        if (promptRevision is null)
+            return CodeyBoxTrailers.CoAuthoredBy;
+
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"{CodeyBoxTrailers.PromptRevisionTrailerKey}: {promptRevision}\n{CodeyBoxTrailers.CoAuthoredBy}");
+    }
+
+    private static string StripCiSkipControlsFromTitle(string title)
+        => CollapseWhitespace.Replace(CiSkipDirective.Replace(title, string.Empty), " ").Trim();
+
+    private static string StripCiSkipControlsFromBody(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return body;
+
+        var normalized = body.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var cleaned = new StringBuilder(normalized.Length);
+        foreach (var rawLine in normalized.Split('\n'))
+        {
+            if (SkipChecksTrailerLine.IsMatch(rawLine.Trim()))
+                continue;
+
+            cleaned.Append(CiSkipDirective.Replace(rawLine, string.Empty).TrimEnd()).Append('\n');
+        }
+
+        return ExcessBlankLines.Replace(cleaned.ToString().Trim(), "\n\n");
+    }
+
+    private static string TruncateCommitMessageForSquashFallback(string message, int maxBytes)
+    {
+        if (ExtractLastPromptRevision(message) is not { } promptRevision)
+            return RawOutputRedactor.TruncateToBytes(message, maxBytes);
+
+        var promptRevisionTrailer = string.Create(
+            CultureInfo.InvariantCulture,
+            $"\n\n{CodeyBoxTrailers.PromptRevisionTrailerKey}: {promptRevision}");
+        var trailerBytes = Encoding.UTF8.GetByteCount(promptRevisionTrailer);
+        if (maxBytes <= trailerBytes + 64)
+            return promptRevisionTrailer.Trim();
+
+        var truncated = RawOutputRedactor.TruncateToBytes(message, maxBytes - trailerBytes);
+        if (ExtractLastPromptRevision(truncated) is not null)
+            return truncated;
+
+        return truncated.TrimEnd() + promptRevisionTrailer;
+    }
+
+    private static int? ExtractLastPromptRevision(IReadOnlyList<string> commitMessages)
+    {
+        int? result = null;
+        foreach (var message in commitMessages)
+        {
+            var revisions = ExtractPromptRevisions(message);
+            if (revisions.Count > 1)
+                return null;
+            if (revisions.Count == 1)
+                result = revisions[0];
+        }
+        return result;
+    }
+
+    private static int? ExtractLastPromptRevision(string? text)
+    {
+        var revisions = ExtractPromptRevisions(text);
+        return revisions.Count == 0 ? null : revisions[^1];
+    }
+
+    private static IReadOnlyList<int> ExtractPromptRevisions(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return [];
+
+        var revisions = new List<int>();
+        foreach (Match match in PromptRevisionTrailer.Matches(text))
+            if (int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var rev))
+                revisions.Add(rev);
+        return revisions;
+    }
+
+    private static bool IsSquashMerge(string mergeMethod)
+        => mergeMethod.Equals("squash", StringComparison.OrdinalIgnoreCase);
 
     private HttpRequestMessage BuildRequest(HttpMethod method, string url)
     {
@@ -630,14 +1217,28 @@ internal sealed record GitHubCreatePrRequest(
     [property: JsonPropertyName("base")] string Base);
 
 internal sealed record GitHubMergeRequest(
-    [property: JsonPropertyName("merge_method")] string MergeMethod);
+    [property: JsonPropertyName("merge_method")] string MergeMethod,
+    [property: JsonPropertyName("commit_title")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? CommitTitle = null,
+    [property: JsonPropertyName("commit_message")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? CommitMessage = null);
 
 internal sealed record GitHubPrResponse(
     [property: JsonPropertyName("number")] int Number,
-    [property: JsonPropertyName("html_url")] string? HtmlUrl);
+    [property: JsonPropertyName("html_url")] string? HtmlUrl,
+    [property: JsonPropertyName("title")] string? Title = null,
+    [property: JsonPropertyName("body")] string? Body = null);
 
 internal sealed record GitHubMergeResponse(
     [property: JsonPropertyName("sha")] string? Sha);
+
+internal sealed record GitHubPullRequestCommitResponse(
+    [property: JsonPropertyName("commit")] GitHubPullRequestCommitDetail? Commit);
+
+internal sealed record GitHubPullRequestCommitDetail(
+    [property: JsonPropertyName("message")] string? Message);
 
 internal sealed record GitHubMergesRequest(
     [property: JsonPropertyName("base")] string Base,

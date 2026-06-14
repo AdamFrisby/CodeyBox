@@ -1,0 +1,38 @@
+[
+  {
+    "sha": "1111111111111111111111111111111111111111",
+    "commit": {
+      "message": "feat: add squash merge message composition\n\nBuild an explicit squash body from the generated PR description.\n\nCodeyBox-Prompt-Revision: 12\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  },
+  {
+    "sha": "2222222222222222222222222222222222222222",
+    "commit": {
+      "message": "codeybox: stamp prompt-revision trailer\n\nCodeyBox-Prompt-Revision: 12\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  },
+  {
+    "sha": "2323232323232323232323232323232323232323",
+    "commit": {
+      "message": "chore: restamp prompt revision trailer\n\nCodeyBox-Prompt-Revision: 13\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  },
+  {
+    "sha": "3333333333333333333333333333333333333333",
+    "commit": {
+      "message": "codeybox rework: address audit findings\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  },
+  {
+    "sha": "3434343434343434343434343434343434343434",
+    "commit": {
+      "message": "chore: resolve merge conflict\n\nAddress auditor feedback.\n\nCodeyBox-Prompt-Revision: 12\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  },
+  {
+    "sha": "4444444444444444444444444444444444444444",
+    "commit": {
+      "message": "test: cover squash merge fallback\n\nBuild a captured multi-commit shape for the no-LLM fallback path.\n\nCodeyBox-Prompt-Revision: 13\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  }
+]

@@ -209,7 +209,7 @@ public sealed class ObservableMetricsTests : IDisposable
             refreshInterval: TimeSpan.FromMinutes(10));
         await svc.StartAsync(CancellationToken.None);
 
-        var observed = new List<(double Value, string? Agent, string? Model)>();
+        var observed = new List<(double Value, string? Agent, string? Instance, string? Model)>();
         using var listener = new MeterListener();
         listener.InstrumentPublished = (instrument, l) =>
         {
@@ -218,13 +218,14 @@ public sealed class ObservableMetricsTests : IDisposable
         };
         listener.SetMeasurementEventCallback<double>((_, value, tags, _) =>
         {
-            string? agent = null, model = null;
+            string? agent = null, instance = null, model = null;
             for (var i = 0; i < tags.Length; i++)
             {
                 if (tags[i].Key == "agent.kind") agent = tags[i].Value?.ToString();
+                if (tags[i].Key == "agent.instance") instance = tags[i].Value?.ToString();
                 if (tags[i].Key == "model") model = tags[i].Value?.ToString();
             }
-            lock (observed) observed.Add((value, agent, model));
+            lock (observed) observed.Add((value, agent, instance, model));
         });
         listener.Start();
         for (var i = 0; i < 3; i++)
@@ -234,10 +235,76 @@ public sealed class ObservableMetricsTests : IDisposable
         }
         GC.KeepAlive(svc);
 
-        Assert.Contains(observed, m => m.Agent == "claude" && m.Model == "claude-opus-4-8" && Math.Abs(m.Value - 72.5) < 1e-9);
-        Assert.Contains(observed, m => m.Agent == "codex" && m.Model == "(default)" && m.Value == -1);
+        Assert.Contains(observed, m => m.Agent == "claude" && m.Instance == "claude" && m.Model == "claude-opus-4-8" && Math.Abs(m.Value - 72.5) < 1e-9);
+        Assert.Contains(observed, m => m.Agent == "codex" && m.Instance == "codex" && m.Model == "(default)" && m.Value == -1);
 
         await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task ObservableCallbacks_ReturnNoMeasurements_AfterDispose()
+    {
+        var store = new FlakyFleetCountsStore(
+        [
+            ("proj", (int)WorkItemState.Queued, 7, "2026-01-01T00:00:00Z"),
+        ]);
+        var workerPool = new FakeWorkerPool(113);
+        var quotaSnapshot = new FakeQuotaSnapshot(
+        [
+            (new AgentKind("disposed-agent"), "disposed-model", 61.5),
+        ]);
+        var svc = new CodeyBoxObservableMetrics(
+            store,
+            new NamedActiveProvider("disposed-provider", 17),
+            new OrchestratorOptions { MaxConcurrentWorkers = 114, MaxConcurrentSandboxes = 115 },
+            NullLogger<CodeyBoxObservableMetrics>.Instance,
+            workerPool: workerPool,
+            quotaSnapshot: quotaSnapshot,
+            refreshInterval: TimeSpan.FromMinutes(10));
+
+        await svc.StartAsync(CancellationToken.None);
+        Assert.Equal(1, store.Calls);
+        svc.Dispose();
+
+        var observedLong = CollectLong(svc, "provider",
+            "codeybox.work_item.active",
+            "codeybox.workers.in_use",
+            "codeybox.workers.max",
+            "codeybox.sandbox.active",
+            "codeybox.sandbox.max");
+        var observedQuota = CollectQuotaMeasurements("disposed-agent");
+
+        Assert.DoesNotContain(observedLong, m => m.Instrument == "codeybox.work_item.active" && m.Value == 7);
+        Assert.DoesNotContain(observedLong, m => m.Instrument == "codeybox.workers.in_use" && m.Value == 113);
+        Assert.DoesNotContain(observedLong, m => m.Instrument == "codeybox.workers.max" && m.Value == 114);
+        Assert.DoesNotContain(observedLong, m => m.Instrument == "codeybox.sandbox.active" && m.Tag == "disposed-provider");
+        Assert.DoesNotContain(observedLong, m => m.Instrument == "codeybox.sandbox.max" && m.Value == 115);
+        Assert.Empty(observedQuota);
+
+        var refresh = typeof(CodeyBoxObservableMetrics).GetMethod(
+            "RefreshWorkItemStateCountsAsync",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(refresh);
+        await (Task)refresh!.Invoke(svc, null)!;
+        Assert.Equal(1, store.Calls);
+    }
+
+    [Fact]
+    public async Task ObservableCallbacks_TreatDisposedDependenciesAsNoMeasurements()
+    {
+        using var svc = new CodeyBoxObservableMetrics(
+            new SqliteWorkItemStore(_dbPath),
+            new ThrowingActiveProvider(),
+            new OrchestratorOptions { MaxConcurrentWorkers = 4, MaxConcurrentSandboxes = 6 },
+            NullLogger<CodeyBoxObservableMetrics>.Instance,
+            workerPool: new ThrowingWorkerPool(),
+            quotaSnapshot: new ThrowingQuotaSnapshot(),
+            refreshInterval: TimeSpan.FromMinutes(10));
+        await svc.StartAsync(CancellationToken.None);
+
+        Assert.Empty(InvokeLongObservable(svc, "ObserveWorkersInUse"));
+        Assert.Empty(InvokeLongObservable(svc, "ObserveActiveSandboxes"));
+        Assert.Empty(InvokeDoubleObservable(svc, "ObserveQuotaAvailability"));
     }
 
     [Fact]
@@ -282,11 +349,22 @@ public sealed class ObservableMetricsTests : IDisposable
         public int CurrentlyRunningTotal => total;
     }
 
+    private sealed class ThrowingWorkerPool : IWorkerPoolOccupancy
+    {
+        public int CurrentlyRunningTotal => throw new ObjectDisposedException("worker-pool");
+    }
+
     private sealed class FakeQuotaSnapshot(IReadOnlyList<(AgentKind, string?, double)> rows)
         : IAgentQuotaAvailabilitySnapshot
     {
         public IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability()
             => rows.Select(r => (r.Item1, r.Item2, r.Item3)).ToList();
+    }
+
+    private sealed class ThrowingQuotaSnapshot : IAgentQuotaAvailabilitySnapshot
+    {
+        public IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability() =>
+            throw new ObjectDisposedException("throwing-agent");
     }
 
     private sealed class InertSandboxProvider : ISandboxProvider
@@ -312,6 +390,34 @@ public sealed class ObservableMetricsTests : IDisposable
             Enumerable.Range(0, active)
                 .Select(_ => (new WorkItemId(Guid.NewGuid()), (IShutdownTeardownSandbox)new FakeActiveSandbox()))
                 .ToList();
+    }
+
+    private sealed class NamedActiveProvider(string name, int active) : ISandboxProvider, IActiveSandboxProvider
+    {
+        public string Name => name;
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
+            Enumerable.Range(0, active)
+                .Select(_ => (new WorkItemId(Guid.NewGuid()), (IShutdownTeardownSandbox)new FakeActiveSandbox()))
+                .ToList();
+    }
+
+    private sealed class ThrowingActiveProvider : ISandboxProvider, IActiveSandboxProvider
+    {
+        public string Name => "throwing-provider";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
+            throw new ObjectDisposedException("throwing-provider");
     }
 
     private sealed class FakeActiveSandbox : IShutdownTeardownSandbox
@@ -383,6 +489,60 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotSupportedException();
         public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) => throw new NotSupportedException();
+    }
+
+    private static List<(double Value, string? Agent, string? Instance, string? Model)> CollectQuotaMeasurements(
+        string agentFilter)
+    {
+        var observed = new List<(double Value, string? Agent, string? Instance, string? Model)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Pipeline" && instrument.Name == "codeybox.agent.quota.available_pct")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<double>((_, value, tags, _) =>
+        {
+            string? agent = null, instance = null, model = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "agent.kind") agent = tags[i].Value?.ToString();
+                if (tags[i].Key == "agent.instance") instance = tags[i].Value?.ToString();
+                if (tags[i].Key == "model") model = tags[i].Value?.ToString();
+            }
+
+            if (agent == agentFilter)
+                lock (observed) observed.Add((value, agent, instance, model));
+        });
+        listener.Start();
+        for (var i = 0; i < 3; i++)
+        {
+            listener.RecordObservableInstruments();
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+
+        return observed;
+    }
+
+    private static IReadOnlyList<Measurement<long>> InvokeLongObservable(
+        CodeyBoxObservableMetrics svc,
+        string methodName)
+        => InvokeObservable<long>(svc, methodName);
+
+    private static IReadOnlyList<Measurement<double>> InvokeDoubleObservable(
+        CodeyBoxObservableMetrics svc,
+        string methodName)
+        => InvokeObservable<double>(svc, methodName);
+
+    private static IReadOnlyList<Measurement<T>> InvokeObservable<T>(
+        CodeyBoxObservableMetrics svc,
+        string methodName) where T : struct
+    {
+        var method = typeof(CodeyBoxObservableMetrics).GetMethod(
+            methodName,
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return ((IEnumerable<Measurement<T>>)method!.Invoke(svc, null)!).ToList();
     }
 }
 
