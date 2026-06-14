@@ -6302,14 +6302,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 }).ToList();
 
                 // Wait for ALL tasks to settle (success OR failure) before
-                // inspecting outcomes. A bare `await Task.WhenAll(tasks)`
-                // throws the first faulted task's exception immediately, which
-                // can mask a sibling task's AgentClassExhaustedException and
-                // route the work item to the generic infrastructure-failure
-                // path even though a configured auditor was quota-blocked and
-                // should have parked the item in WaitingForQuotaReset. The
-                // continuation form below never throws — exceptions stay on
-                // each Task and we walk them in stable order.
+                // inspecting outcomes. Task.WhenAll itself does wait for every
+                // supplied task to complete, but `await Task.WhenAll(tasks)`
+                // surfaces only ONE of the faulted exceptions (typically the
+                // first observed by the awaiter), which can mask a sibling
+                // task's AgentClassExhaustedException behind an unrelated
+                // failure and route the work item to the generic
+                // infrastructure-failure path even though a configured
+                // auditor was quota-blocked and should have parked the item
+                // in WaitingForQuotaReset. The continuation form below never
+                // throws — exceptions stay on each Task and we walk them in
+                // stable order so exhaustion wins over sibling faults.
                 await Task.WhenAll(llmTasks).ContinueWith(
                     _ => { },
                     CancellationToken.None,
@@ -7151,11 +7154,25 @@ public sealed class PipelineRunner : IPipelineRunner
         if (quotaRejectedCount == 0
             && await TryGetPausedAuditPoolMemberAsync(project, classId, ct) is { } paused)
             throw new AgentPausedException("audit", paused.Agent, paused.Reason);
-        if (quotaRejectedCount > 0)
+
+        // OrderedFallbackCandidatesAsync filters out members already marked
+        // exhausted in the router's in-process cache before returning, so when
+        // every audit-capable member of the class is cached-exhausted the loop
+        // sees zero candidates and quotaRejectedCount stays at 0. That state
+        // is still quota exhaustion — surfacing it as AuditUnavailableException
+        // would route the item to failureKind="infrastructure" instead of
+        // parking in WaitingForQuotaReset and re-introduce a silent-skip path
+        // (the hard invariant being defended is: a Pass verdict must never
+        // emerge while a configured auditor's spill-to-peer pool was entirely
+        // quota-blocked). Reclassify here as exhausted so the existing park
+        // path runs.
+        var cachedExhaustedCount = CountCachedExhaustedAuditCapableMembers(classId);
+        var totalExhausted = quotaRejectedCount + cachedExhaustedCount;
+        if (totalExhausted > 0)
         {
             var parkMessage =
-                $"LLM auditor '{auditorName}' cannot run: no audit-capable member of class '{classId}' is available ({quotaRejectedCount} quota-rejected)";
-            AuditLog.LlmAuditorParkedQuota(item.Id, auditorName, quotaRejectedCount);
+                $"LLM auditor '{auditorName}' cannot run: no audit-capable member of class '{classId}' is available ({totalExhausted} quota-rejected)";
+            AuditLog.LlmAuditorParkedQuota(item.Id, auditorName, totalExhausted);
             _log.LogWarning(parkMessage);
             // Park the work item rather than silently skipping the auditor:
             // a Pass verdict must never emerge while a configured auditor
@@ -7164,7 +7181,7 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new AgentClassExhaustedException(
                 classId,
                 phase: "audit",
-                memberCount: quotaRejectedCount,
+                memberCount: totalExhausted,
                 earliestResetAt: null,
                 message: parkMessage);
         }
@@ -7183,6 +7200,32 @@ public sealed class PipelineRunner : IPipelineRunner
             $"(missing runner={missingRunnerCount}, missing credentials={missingCredentialsCount})";
         _log.LogWarning(infraMessage);
         throw new AuditUnavailableException(infraMessage);
+    }
+
+    /// <summary>
+    /// Returns the count of audit-capable members of <paramref name="classId"/>
+    /// currently marked exhausted in the router's in-process cache. Used to
+    /// disambiguate "empty audit pool" (misconfiguration) from "every
+    /// audit-capable member is in-cache exhausted" (quota crunch) when
+    /// <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/> returns
+    /// zero candidates — the helper applies the same exhaustion filter the
+    /// router does, but at the configured-membership level instead of the
+    /// post-filter survivor list. Returns 0 when no router is configured.
+    /// </summary>
+    private int CountCachedExhaustedAuditCapableMembers(string classId)
+    {
+        if (_classRouter is null)
+            return 0;
+        var nowUtc = _opts.TimeProvider.GetUtcNow();
+        var count = 0;
+        foreach (var member in _classRouter.GetClassMembers(classId))
+        {
+            if (!_classRouter.MemberHasCapability(classId, member, WellKnownCapabilities.Audit))
+                continue;
+            if (_classRouter.IsExhausted(member, nowUtc))
+                count++;
+        }
+        return count;
     }
 
     private async Task<(AgentKind Agent, string Reason)?> TryGetPausedAuditPoolMemberAsync(

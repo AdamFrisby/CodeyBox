@@ -218,7 +218,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             quotas: new()
             {
                 [AgentKind.Claude] = 1.0,    // exhausted (work runner)
-                [AgentKind.Codex]  = 80.0,   // healthy peer
+                [AgentKind.Codex] = 80.0,   // healthy peer
             },
             // No AuditAgent configured — forces the "no preferred kind"
             // branch of ResolveAuditAgentRunnerAsync, which is the path
@@ -239,6 +239,84 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         // the healthy audit-capable peer. Asserting the exact pick (rather
         // than "anything but Claude") catches a future regression where the
         // shortcut returns Claude again and the auditor happens to succeed.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: a smoke-benched audit-capable work runner must NOT
+    // be selected for auditing. The no-preferred-audit-agent shortcut in
+    // ResolveAuditAgentRunnerAsync (PipelineRunner.cs:~6802) now routes the
+    // work runner through EnsureAgentSmokeAvailableAsync before trusting it,
+    // and on smoke rejection falls through to SelectFromAuditCapablePoolAsync
+    // for a healthy peer. Without this gate, a work runner whose CLI is
+    // benched (exit-127 / auth drift) could still be dispatched as auditor,
+    // and a happens-to-return-cleanly run would silently produce a Pass
+    // verdict on an agent the production smoke gate had already rejected.
+    //
+    // The sibling quota-exhausted shortcut is covered by
+    // NoPreferredAuditAgent_WorkAgentAuditCapableButQuotaExhausted_SpillsToPeer
+    // above; this test pins the smoke-gate branch explicitly so a regression
+    // that ignores the smoke verdict cannot pass both tests.
+    [Fact]
+    public async Task NoPreferredAuditAgent_WorkAgentAuditCapableButSmokeRejected_SpillsToPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Both Claude (the work runner) and Codex are audit-capable AND both
+        // have healthy quota. The only thing wrong with Claude is that the
+        // in-VM smoke gate benches it FOR THE AUDIT-PHASE sandbox target —
+        // exactly the shape a real CLI outage produces against the audit
+        // profile while the work profile is fine. With no AuditAgent
+        // configured, the resolver enters the no-preferred-kind branch; the
+        // work runner's audit-capable shortcut MUST gate on the smoke
+        // verdict and fall through to the audit pool walk, which then picks
+        // Codex.
+        //
+        // The work-phase smoke target uses NetworkProfiles.Work, and the
+        // audit-phase target uses NetworkProfiles.AuditAgent — distinct
+        // strings let the gate bench only the audit-phase view of Claude
+        // without breaking the work phase. The same pattern keeps the
+        // OrderedFallbackCandidatesAsync pool walk (also targeting the audit
+        // profile) from surfacing Claude.
+        const string workProfile = "work";
+        const string auditProfile = "audit";
+        var smokeGate = new BenchKindByNetworkProfileSmokeGate(AgentKind.Claude, auditProfile);
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                // Both healthy on quota — only the smoke gate excludes Claude.
+                // If quota were the lever, this test would collapse into the
+                // sibling quota-exhaustion test above; keeping both healthy is
+                // what isolates the smoke-gate branch.
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Codex] = 80.0,
+            },
+            preferredAuditAgent: null,
+            defaultAgent: AgentKind.Claude,
+            inVmSmokeGate: smokeGate,
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                Work = workProfile,
+                AuditAgent = auditProfile,
+            });
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Auditor must NOT run on the smoke-benched work runner; it must
+        // spill to the healthy audit-capable peer. Asserting the exact pick
+        // (not "anything but Claude") catches a regression where the
+        // shortcut skips the smoke gate and dispatches the auditor on the
+        // benched Claude runner.
         Assert.Equal([AgentKind.Codex], auditor.Invocations);
         Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
     }
@@ -607,7 +685,9 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         IReadOnlyList<(AgentKind Agent, bool IsAuditCapable, int QualityScore)> members,
         Dictionary<AgentKind, double> quotas,
         AgentKind? preferredAuditAgent,
-        AgentKind? defaultAgent = null)
+        AgentKind? defaultAgent = null,
+        IInVmSmokeGate? inVmSmokeGate = null,
+        ProjectNetworkProfiles? networkProfiles = null)
         => BuildFixture(
             seedRepoUrl,
             auditors: [auditor],
@@ -616,7 +696,9 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             preferredAuditAgent,
             defaultAgent: defaultAgent,
             perAuditorAgent: null,
-            maxLlmAuditorParallelism: 1);
+            maxLlmAuditorParallelism: 1,
+            inVmSmokeGate: inVmSmokeGate,
+            networkProfiles: networkProfiles);
 
     private RoutingFixture BuildFixture(
         string seedRepoUrl,
@@ -626,7 +708,9 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         AgentKind? preferredAuditAgent,
         AgentKind? defaultAgent = null,
         IReadOnlyDictionary<string, AgentKind>? perAuditorAgent = null,
-        int maxLlmAuditorParallelism = 1)
+        int maxLlmAuditorParallelism = 1,
+        IInVmSmokeGate? inVmSmokeGate = null,
+        ProjectNetworkProfiles? networkProfiles = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -666,11 +750,22 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                 quotas.GetValueOrDefault(m.Agent, 80.0)))
             .ToList();
 
+        // Wire the smoke gate into both the router (so OrderedFallbackCandidatesAsync
+        // filters smoke-rejected members from its candidate list) AND the pipeline
+        // (so EnsureAgentSmokeAvailableAsync gates the work-runner-audit-capable
+        // shortcut). Without both, the pool walk and the shortcut would drift in
+        // smoke verdicts and the test would not exercise the real production
+        // wiring.
+        var dispatchAvailability = inVmSmokeGate is null
+            ? null
+            : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate);
+
         var router = new AgentClassRouter(
             [frontier],
             probes,
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance);
+            NullLogger<AgentClassRouter>.Instance,
+            dispatchAvailability: dispatchAvailability);
 
         var project = new Project
         {
@@ -680,6 +775,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             DefaultBaseBranch = "main",
             DefaultAgent = defaultAgent ?? AgentKind.Codex,
             DefaultAgentClass = "frontier",
+            NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Audit = new ProjectAudit
             {
                 MaxIterations = 1,
@@ -718,7 +814,8 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
             ]),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: dispatchAvailability);
 
         return new RoutingFixture(pipeline, store, webhooks, codex, gemini, claude);
     }
@@ -807,5 +904,49 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         ScriptableAgent? Claude) : IDisposable
     {
         public void Dispose() => Store.Dispose();
+    }
+
+    /// <summary>
+    /// In-VM smoke gate stub that benches a single agent kind ONLY when the
+    /// probe target's <see cref="InVmSmokeSandboxTarget.NetworkProfile"/>
+    /// matches the configured "bench" profile string. Used by the smoke-
+    /// rejected work-runner shortcut test to simulate a CLI outage that
+    /// affects the audit-phase sandbox profile but leaves the work-phase
+    /// profile healthy — without this distinction the work phase would fail
+    /// on smoke before the audit phase ever ran. Production wiring runs the
+    /// gate inside both the router (which filters smoke-rejected members
+    /// from its candidate list) and the pipeline (which gates the audit-
+    /// capable work-runner shortcut), so the test wires it into both via
+    /// <see cref="AgentDispatchAvailability"/>.
+    /// </summary>
+    private sealed class BenchKindByNetworkProfileSmokeGate : IInVmSmokeGate
+    {
+        private readonly AgentKind _kind;
+        private readonly string _benchProfile;
+
+        public BenchKindByNetworkProfileSmokeGate(AgentKind kind, string benchProfile)
+        {
+            _kind = kind;
+            _benchProfile = benchProfile;
+        }
+
+        public bool Enabled => true;
+
+        private bool ShouldBench(AgentKind kind, InVmSmokeSandboxTarget target) =>
+            kind == _kind
+            && string.Equals(target.NetworkProfile, _benchProfile, StringComparison.Ordinal);
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+            => Task.FromResult(ShouldBench(kind, target)
+                ? new AgentAvailability(false, "in-VM smoke: bench (test)", null, AgentAvailabilityCause.SmokeGate)
+                : new AgentAvailability(true, null, null));
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+            => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
     }
 }
