@@ -2353,6 +2353,29 @@ builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetr
     sp.GetRequiredService<IAgentPauseSignal>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentPauseRetryScheduler>());
 
+// --- Failure-class recovery -------------------------------------------------
+// Pure deterministic classifier in front of the hosted recovery service.
+// Operators wire alternate classifiers (e.g. LLM-precision layer) by replacing
+// the singleton registration; the service treats the interface as authoritative.
+builder.Services.AddSingleton<ITerminalFailureClassifier, DefaultTerminalFailureClassifier>();
+builder.Services.AddSingleton<TerminalFailureRecoveryService>(sp => new TerminalFailureRecoveryService(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    sp.GetRequiredService<ITerminalFailureClassifier>(),
+    () =>
+    {
+        var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.TerminalFailureRecovery;
+        return OrchestratorOptionsFactory.BuildTerminalFailureRecoveryOptions(
+            live.Enabled,
+            live.PeriodicCheckInterval,
+            live.BaseBackoff,
+            live.MaxBackoff,
+            live.JitterFraction,
+            live.MaxAutoRetriesPerWorkItem);
+    },
+    sp.GetRequiredService<ILogger<TerminalFailureRecoveryService>>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<TerminalFailureRecoveryService>());
+
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2367,6 +2390,13 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         startupLog) with
     {
         ShutdownDrainTimeout = Program.ComputeOrchestratorShutdownDrainTimeout(cbOpts.Shutdown.GraceSeconds),
+        TerminalFailureRecovery = OrchestratorOptionsFactory.BuildTerminalFailureRecoveryOptions(
+            cbOpts.TerminalFailureRecovery.Enabled,
+            cbOpts.TerminalFailureRecovery.PeriodicCheckInterval,
+            cbOpts.TerminalFailureRecovery.BaseBackoff,
+            cbOpts.TerminalFailureRecovery.MaxBackoff,
+            cbOpts.TerminalFailureRecovery.JitterFraction,
+            cbOpts.TerminalFailureRecovery.MaxAutoRetriesPerWorkItem),
     };
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
@@ -3585,6 +3615,14 @@ namespace CodeyBox.Api
         /// <summary>Automatic retry for quota-failed items.</summary>
         public AutoRetryOnQuotaFailureConfig AutoRetryOnQuotaFailure { get; set; } = new();
 
+        /// <summary>
+        /// Failure-class recovery policy. Classifies every terminal failure
+        /// (Failed, AuditFailed, MergeConflictResolutionFailed) and routes by
+        /// class — see <see cref="TerminalFailureRecoveryConfig"/>. Replaces the
+        /// external operator chaperone's blunt requeue reflex.
+        /// </summary>
+        public TerminalFailureRecoveryConfig TerminalFailureRecovery { get; set; } = new();
+
         /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
@@ -3774,6 +3812,22 @@ namespace CodeyBox.Api
         public bool Enabled { get; set; } = false;
         public string PeriodicCheckInterval { get; set; } = "00:05:00";
         public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
+        public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+    }
+
+    /// <summary>
+    /// Bound from <c>CodeyBox:TerminalFailureRecovery</c>. Hot-reloadable.
+    /// All TimeSpan-shaped values use the standard <c>HH:MM:SS</c> format.
+    /// See <see cref="CodeyBox.Orchestrator.TerminalFailureRecoveryOptions"/>
+    /// for runtime semantics.
+    /// </summary>
+    public sealed class TerminalFailureRecoveryConfig
+    {
+        public bool Enabled { get; set; } = false;
+        public string PeriodicCheckInterval { get; set; } = "00:05:00";
+        public string BaseBackoff { get; set; } = "00:01:00";
+        public string MaxBackoff { get; set; } = "00:30:00";
+        public double JitterFraction { get; set; } = 0.2;
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
     }
 

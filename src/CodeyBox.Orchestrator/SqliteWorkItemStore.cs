@@ -275,6 +275,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // Default 0 preserves existing retry/fresh-work reset behaviour.
             RunMigration("ALTER TABLE work_items ADD COLUMN preserve_work_branch_on_queued_pickup INTEGER NOT NULL DEFAULT 0;");
 
+            // Failure-class recovery counters (TerminalFailureRecoveryService).
+            // terminal_retry_attempts: number of auto-retries the recovery
+            // service has executed for this work item after classifying a
+            // transient terminal failure. next_terminal_retry_at: scheduled
+            // wakeup for the next attempt so the periodic sweep can re-arm
+            // backoff across orchestrator restarts. Defaults preserve
+            // pre-recovery behaviour for legacy rows.
+            RunMigration("ALTER TABLE work_items ADD COLUMN terminal_retry_attempts INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN next_terminal_retry_at TEXT;");
+
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
             // restart-recovery for the same iteration) overwrites the row via
@@ -409,7 +419,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         required_capabilities_json,
                         job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
-                        preserve_work_branch_on_queued_pickup)
+                        preserve_work_branch_on_queued_pickup,
+                        terminal_retry_attempts, next_terminal_retry_at)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
@@ -420,7 +431,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $required_capabilities,
                         $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
-                        $preserve_work_branch_on_queued_pickup);
+                        $preserve_work_branch_on_queued_pickup,
+                        $terminal_retry_attempts, $next_terminal_retry_at);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -546,7 +558,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     re_check_verdicts_json = $re_check_verdicts,
                     template_name = $template_name,
                     template_entry_index = $template_entry_index,
-                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup
+                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
+                    terminal_retry_attempts = $terminal_retry_attempts,
+                    next_terminal_retry_at = $next_terminal_retry_at
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -612,7 +626,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     re_check_verdicts_json = $re_check_verdicts,
                     template_name = $template_name,
                     template_entry_index = $template_entry_index,
-                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup
+                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
+                    terminal_retry_attempts = $terminal_retry_attempts,
+                    next_terminal_retry_at = $next_terminal_retry_at
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -683,7 +699,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     re_check_verdicts_json = $re_check_verdicts,
                     template_name = $template_name,
                     template_entry_index = $template_entry_index,
-                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup
+                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
+                    terminal_retry_attempts = $terminal_retry_attempts,
+                    next_terminal_retry_at = $next_terminal_retry_at
                 WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
                 """;
             Bind(cmd, item);
@@ -1853,6 +1871,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$template_name", (object?)item.TemplateName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$template_entry_index", (object?)item.TemplateEntryIndex ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preserve_work_branch_on_queued_pickup", item.PreserveWorkBranchOnQueuedPickup ? 1 : 0);
+        cmd.Parameters.AddWithValue("$terminal_retry_attempts", item.TerminalRetryAttempts);
+        cmd.Parameters.AddWithValue("$next_terminal_retry_at", (object?)item.NextTerminalRetryAt?.ToString("O") ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -1921,6 +1941,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         TemplateName = ReadNullableString(r, "template_name"),
         TemplateEntryIndex = ReadNullableInt32(r, "template_entry_index"),
         PreserveWorkBranchOnQueuedPickup = ReadInt32OrDefault(r, "preserve_work_branch_on_queued_pickup", defaultValue: 0) != 0,
+        TerminalRetryAttempts = ReadInt32OrDefault(r, "terminal_retry_attempts", defaultValue: 0),
+        NextTerminalRetryAt = ReadNullableDateTimeOffset(r, "next_terminal_retry_at"),
     };
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)
