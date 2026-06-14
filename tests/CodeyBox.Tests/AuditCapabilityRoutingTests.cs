@@ -413,6 +413,142 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         Assert.DoesNotContain(AgentKind.Codex, auditor.Invocations);
     }
 
+    // ── HARD INVARIANT: a ModelId-pinned cached-exhausted preferred audit
+    // member must NOT be selected for auditing. The sibling
+    // PreferredAuditAgent_CachedExhausted_SpillsToHealthyPeer pins the
+    // unpinned-member shape, but the production class for our largest
+    // operator runs ModelId-pinned members (each model id is its own quota
+    // bucket on the gateway side). The legacy FindMember(modelId:null)
+    // lookup only matched members with ModelId null/empty, so a class
+    // configured with a real ModelId-pinned audit member fell through to
+    // a synthetic AgentMembership against the runner's default model id —
+    // and the router-cache check ran against a bucket no probe / cache
+    // entry actually tracks. With the synthetic check returning "not
+    // cached-exhausted" while the configured member sat in the
+    // MarkExhausted cache, a Pass verdict could emerge against an
+    // exhausted pool. FindPreferredAuditMember walks every class member
+    // of preferredKind regardless of ModelId, so the cache check runs
+    // against the real bucket; this test pins that wiring.
+    [Fact]
+    public async Task PreferredAuditAgent_ModelIdPinned_CachedExhausted_SpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Single Codex member, ModelId-pinned (the production shape). The
+        // peer is an unpinned Claude member so the spill target is
+        // unambiguous. Codex is the preferred audit agent; the work item
+        // runs on Claude so the work phase is independent of the audit
+        // exhaustion and the audit-phase logic is what the test exercises.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,    // healthy live probe — only the cache marks it out
+                [AgentKind.Claude] = 80.0,   // healthy peer
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            defaultAgent: AgentKind.Claude,
+            modelIds: new Dictionary<AgentKind, string>
+            {
+                [AgentKind.Codex] = "gpt-5.5",
+            });
+        fix.MarkExhausted(AgentKind.Codex);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST spill past the cached-exhausted ModelId-pinned Codex
+        // member onto the healthy peer. Reverting FindPreferredAuditMember
+        // to the legacy FindMember(modelId:null) lookup would return null
+        // for the pinned member, the synthetic bucket check would not
+        // catch the exhaustion, the live probe (80%) would say healthy,
+        // and the auditor would dispatch on Codex — exactly the silent
+        // Pass-against-exhausted-bucket regression this test pins.
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Codex, auditor.Invocations);
+    }
+
+    // ── Companion to the ModelId-pinned test above: the production class
+    // also runs members that are BOTH ModelId-pinned AND InstanceId-named
+    // (one subscription per gateway model). FindPreferredAuditMember
+    // scores +2 on InstanceId match and +1 on ModelId match (most-specific
+    // wins). The work item carries item.AgentInstanceId, the resolver
+    // threads it through, and the +2 bonus picks the correct instance.
+    // This test pins the InstanceId scoring path alongside the ModelId
+    // pinning — a regression that drops the InstanceId match from
+    // FindPreferredAuditMember would still pass the ModelId-only test,
+    // since both scoring branches arrive at the same single member when
+    // there is only one Codex member to pick. We keep a single Codex
+    // member here for AgentRegistry simplicity but cover the matching
+    // logic so MEMBER selection (instance + model) is what survives a
+    // future routing refactor.
+    [Fact]
+    public async Task PreferredAuditAgent_InstanceIdAndModelIdPinned_CachedExhausted_SpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Item.Agent=Codex with both ModelId and AgentInstanceId set so
+        // FindPreferredAuditMember receives both hints (preferredKind ==
+        // item.Agent gates the hint threading at the call site). The
+        // router cache marks Codex out so the audit phase MUST spill to
+        // Claude; the work-phase initial dispatch on Codex still runs
+        // (the router cache only gates fallback / audit selection, not
+        // the initial pick), so work is enqueued on the Codex
+        // ScriptableAgent to keep the work phase succeeding while the
+        // audit phase is what we exercise.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,
+                [AgentKind.Claude] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            defaultAgent: AgentKind.Codex,
+            modelIds: new Dictionary<AgentKind, string>
+            {
+                [AgentKind.Codex] = "gpt-5.5",
+            },
+            instanceIds: new Dictionary<AgentKind, string>
+            {
+                [AgentKind.Codex] = "codex-acct-a",
+            });
+        fix.MarkExhausted(AgentKind.Codex);
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(
+            AgentKind.Codex,
+            modelId: "gpt-5.5",
+            agentInstanceId: "codex-acct-a");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST spill onto Claude — neither the ModelId nor the
+        // InstanceId pinning is allowed to leak the cached-exhausted
+        // Codex member back into the dispatch pool. Reverting
+        // FindPreferredAuditMember to the legacy FindMember(modelId:null,
+        // instanceId:item.AgentInstanceId) chain would return null for
+        // this ModelId+InstanceId-pinned member, the synthetic check
+        // would miss the exhaustion, and Codex would be dispatched —
+        // producing a Pass against the very bucket the spill avoided.
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Codex, auditor.Invocations);
+    }
+
     // ── HARD INVARIANT: when the preferred audit agent is registered but
     // has NO credentials, the fallback MUST gate the work runner through
     // the same smoke + quota checks the no-preferred branch applies — NOT
@@ -931,7 +1067,9 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         AgentKind? defaultAgent = null,
         IInVmSmokeGate? inVmSmokeGate = null,
         ProjectNetworkProfiles? networkProfiles = null,
-        ICredentialProvider? credentials = null)
+        ICredentialProvider? credentials = null,
+        IReadOnlyDictionary<AgentKind, string>? modelIds = null,
+        IReadOnlyDictionary<AgentKind, string>? instanceIds = null)
         => BuildFixture(
             seedRepoUrl,
             auditors: [auditor],
@@ -943,7 +1081,9 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             maxLlmAuditorParallelism: 1,
             inVmSmokeGate: inVmSmokeGate,
             networkProfiles: networkProfiles,
-            credentials: credentials);
+            credentials: credentials,
+            modelIds: modelIds,
+            instanceIds: instanceIds);
 
     private RoutingFixture BuildFixture(
         string seedRepoUrl,
@@ -956,7 +1096,9 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         int maxLlmAuditorParallelism = 1,
         IInVmSmokeGate? inVmSmokeGate = null,
         ProjectNetworkProfiles? networkProfiles = null,
-        ICredentialProvider? credentials = null)
+        ICredentialProvider? credentials = null,
+        IReadOnlyDictionary<AgentKind, string>? modelIds = null,
+        IReadOnlyDictionary<AgentKind, string>? instanceIds = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -986,6 +1128,16 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                     Billing = AgentBilling.Subscription,
                     QualityScore = m.QualityScore,
                     Capabilities = m.IsAuditCapable ? [WellKnownCapabilities.Audit] : [],
+                    ModelId = modelIds is not null
+                        && modelIds.TryGetValue(m.Agent, out var pinnedModel)
+                        && !string.IsNullOrWhiteSpace(pinnedModel)
+                            ? pinnedModel
+                            : null,
+                    InstanceId = instanceIds is not null
+                        && instanceIds.TryGetValue(m.Agent, out var pinnedInstance)
+                        && !string.IsNullOrWhiteSpace(pinnedInstance)
+                            ? pinnedInstance
+                            : null,
                 })
                 .ToList(),
         };
@@ -1066,7 +1218,10 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         return new RoutingFixture(pipeline, store, webhooks, codex, gemini, claude, router, frontier);
     }
 
-    private static WorkItem NewItem(AgentKind agent) => new()
+    private static WorkItem NewItem(
+        AgentKind agent,
+        string? modelId = null,
+        string? agentInstanceId = null) => new()
     {
         Id = WorkItemId.New(),
         ProjectId = new ProjectId("test-project"),
@@ -1075,6 +1230,8 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         BaseBranch = "main",
         Agent = agent,
         AgentClassId = "frontier",
+        ModelId = modelId,
+        AgentInstanceId = agentInstanceId,
         PushUpstream = false,
     };
 
