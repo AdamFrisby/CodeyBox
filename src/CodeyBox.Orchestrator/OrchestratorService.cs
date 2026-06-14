@@ -2372,6 +2372,15 @@ public sealed record OrchestratorOptions
     public AutoRetryOnQuotaFailureOptions AutoRetryOnQuotaFailure { get; init; } = new();
 
     /// <summary>
+    /// Failure-class recovery policy: classifies every terminal failure
+    /// (Failed, AuditFailed, MergeConflictResolutionFailed) and routes by
+    /// class — TRANSIENT failures get bounded auto-retry with backoff;
+    /// DETERMINISTIC failures park for operator triage. Replaces the
+    /// external operator chaperone's blunt requeue reflex. Off by default.
+    /// </summary>
+    public TerminalFailureRecoveryOptions TerminalFailureRecovery { get; init; } = new();
+
+    /// <summary>
     /// Called by the dispatch loop immediately after the spawn timestamp is
     /// written, before <see cref="Task.Run"/>. Used by tests to capture the
     /// true spawn time rather than the thread-pool scheduling time.
