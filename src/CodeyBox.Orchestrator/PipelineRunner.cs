@@ -6844,12 +6844,8 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Audit agent '{AuditKind}' is not registered for auditor '{Auditor}'; falling back to work agent '{WorkKind}'",
                 preferredKind.Value.Value, auditorName, workRunner.Kind.Value);
-            // Capability gate: when the pool is active and the work agent is
-            // not in it, falling back to workRunner would breach the AC. Walk
-            // the audit-capable pool for a tagged substitute instead.
-            if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
-                return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
-            return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
+            return await FallbackToWorkRunnerOrSpillToAuditPoolAsync(
+                item, project, workRunner, auditorName, classId, auditPool, auditSmokeTarget, ct);
         }
 
         var preferredMember = classId is not null
@@ -6868,10 +6864,8 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "No credentials found for audit agent '{AuditKind}' (auditor '{Auditor}'); falling back to work agent '{WorkKind}'",
                 preferredKind.Value.Value, auditorName, workRunner.Kind.Value);
-            // Same capability gate as the unregistered-preferred branch above.
-            if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
-                return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
-            return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
+            return await FallbackToWorkRunnerOrSpillToAuditPoolAsync(
+                item, project, workRunner, auditorName, classId, auditPool, auditSmokeTarget, ct);
         }
 
         var preferredProbeMember = preferredMember ?? new AgentMembership
@@ -7070,6 +7064,79 @@ public sealed class PipelineRunner : IPipelineRunner
             workRunner.Kind.Value,
             pauseReason);
         throw new AgentPausedException("audit", workRunner.Kind, pauseReason);
+    }
+
+    /// <summary>
+    /// Fallback used when a configured preferred audit agent is unregistered or
+    /// has no credentials. Applies the SAME pause + smoke + quota gates the
+    /// no-preferred-audit-agent branch applies to the work runner before
+    /// trusting it, then spills to the gated audit pool walk on any rejection
+    /// — which either picks a healthy audit-capable peer or surfaces the
+    /// proper park (AgentClassExhaustedException → WaitingForQuotaReset) /
+    /// infrastructure (AuditUnavailableException) exception. Without these
+    /// gates an audit-capable work runner that is already smoke-rejected or
+    /// quota-exhausted could be dispatched against an effectively-skipped
+    /// review and a Pass verdict could emerge with one fewer auditor than
+    /// configured — the silent-skip hole this resolver exists to defend.
+    /// When no audit pool / class chain is configured, preserves the legacy
+    /// pause-only fall-through (the operator hasn't opted into class-aware
+    /// audit routing so the work runner is the only configured candidate).
+    /// </summary>
+    private async Task<AuditAgentSelection> FallbackToWorkRunnerOrSpillToAuditPoolAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner workRunner,
+        string auditorName,
+        string? classId,
+        IReadOnlySet<AgentKind>? auditPool,
+        InVmSmokeSandboxTarget auditSmokeTarget,
+        CancellationToken ct)
+    {
+        // No audit pool / class chain wired: legacy pause-only fallback — the
+        // work runner is the operator's only configured audit candidate.
+        if (auditPool is null || classId is null || _classRouter is null)
+            return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
+
+        // Capability gate: when the pool is active and the work agent isn't
+        // in it, the work agent must NEVER audit. Walk the audit-capable pool
+        // for a tagged substitute (fully gated).
+        if (!auditPool.Contains(workRunner.Kind))
+            return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId, ct);
+
+        // Work runner is in the audit pool. Mirror the no-preferred branch's
+        // pause + smoke + quota gating before trusting it; on any rejection
+        // spill to SelectFromAuditCapablePoolAsync (which either picks a
+        // healthy peer or throws the proper park / infrastructure exception).
+        var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
+        if (GetAgentPausedReason(workRunner.Kind) is null)
+        {
+            var workProbeMember = workMember ?? new AgentMembership
+            {
+                Agent = workRunner.Kind,
+                Billing = AgentBilling.Subscription,
+                ModelId = ResolveObservedModelId(workRunner, modelId: null),
+                QualityScore = 100,
+            };
+            var workAvailability = await EnsureAgentSmokeAvailableAsync(
+                workRunner.Kind, auditSmokeTarget, ct);
+            if (workAvailability.Available && !IsOperatorPaused(workAvailability))
+            {
+                var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
+                    workRunner.Kind, workProbeMember, ct);
+                if (workOk)
+                    return new AuditAgentSelection(workRunner, workMember);
+                _log.LogInformation(
+                    "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                    workRunner.Kind.Value, workReason, auditorName);
+            }
+            else
+            {
+                _log.LogInformation(
+                    "Audit-capable work agent '{WorkKind}' rejected (smoke gate: {Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                    workRunner.Kind.Value, workAvailability.Reason ?? "unavailable", auditorName);
+            }
+        }
+        return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId, ct);
     }
 
     private string? GetAgentPausedReason(AgentKind agent)

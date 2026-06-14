@@ -321,6 +321,101 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
     }
 
+    // ── HARD INVARIANT: when the operator NAMED a preferred audit agent
+    // that isn't registered, the fallback MUST gate the work runner through
+    // the same smoke + quota checks the no-preferred branch applies — NOT
+    // hand the auditor straight to the work runner with only a pause check.
+    // Before the fix at PipelineRunner.cs:~6827 the unregistered-preferred
+    // branch routed to WorkRunnerForAuditUnlessPaused (operator-pause only)
+    // even when the work runner was already smoke-rejected or quota-
+    // exhausted, so the auditor could dispatch against an unroutable bucket
+    // and produce a Pass against an effectively skipped review. The same
+    // shape applies to the missing-credentials-preferred branch (~line 6851),
+    // which now shares the same gated fallback helper. Below pins the
+    // quota-exhausted case for the unregistered-preferred branch; an
+    // analogous regression in the missing-credentials path would also have
+    // to bypass the helper.
+    [Fact]
+    public async Task PreferredAuditAgent_NotRegistered_FallbackGatesWorkRunner_AndSpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 1.0,    // exhausted (work runner)
+                [AgentKind.Codex] = 80.0,    // healthy peer
+            },
+            // Cursor is not present in members → not in the registry →
+            // ResolveAuditAgentRunnerAsync hits the unregistered-preferred
+            // branch and (pre-fix) returned the work runner unchecked.
+            // With the fix it must gate the work runner on smoke + quota
+            // and spill to the audit pool on rejection.
+            preferredAuditAgent: AgentKind.Cursor,
+            defaultAgent: AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST run on the healthy peer (Codex), NEVER on the quota-
+        // exhausted work runner (Claude). Asserting the exact pick catches
+        // a regression that drops the gating helper and lets the work
+        // runner audit against an exhausted bucket.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    // Sibling pin to PreferredAuditAgent_NotRegistered_…: when the work
+    // runner itself is quota-exhausted AND the whole spill pool is also
+    // exhausted, the unregistered-preferred fallback must PARK the item
+    // for quota reset rather than silently dispatching against the
+    // exhausted work runner (pre-fix behaviour) — the hard invariant being
+    // defended is that a Pass verdict never emerges while a configured
+    // auditor's spill-to-peer pool was entirely quota-blocked.
+    [Fact]
+    public async Task PreferredAuditAgent_NotRegistered_AllAuditPoolExhausted_ParksForQuotaReset()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 1.0,    // exhausted (work runner)
+                [AgentKind.Codex] = 1.0,     // exhausted peer
+            },
+            preferredAuditAgent: AgentKind.Cursor,
+            defaultAgent: AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        // Whole pool exhausted → park for quota reset; the auditor must
+        // NEVER have run. A regression that bypasses the gate would
+        // instead dispatch the auditor against the quota-exhausted work
+        // runner — either silently passing (the 094bb05 hole this fix
+        // descends from) or terminally failing with the wrong shape.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.Empty(auditor.Invocations);
+    }
+
     // ── HARD INVARIANT: a sibling auditor's non-quota exception must NOT
     // mask another auditor's mid-iteration AgentClassExhaustedException.
     // The settling logic in CollectFindingsAsync (PipelineRunner.cs:~6320)

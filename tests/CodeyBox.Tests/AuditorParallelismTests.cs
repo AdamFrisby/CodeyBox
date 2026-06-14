@@ -1108,6 +1108,206 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Equal(0, auditorCalls);
     }
+
+    // Audit-pool QUOTA exhaustion via the router's in-process MarkExhausted
+    // cache — distinct from the probe-floor / mid-iteration-failure paths.
+    // AgentClassRouter.OrderedFallbackCandidatesAsync filters cached-
+    // exhausted members BEFORE running probes, so when every audit-capable
+    // member of the class is in the exhaustion cache the pool walk returns
+    // zero candidates and quotaRejectedCount inside
+    // SelectFromAuditCapablePoolAsync stays at 0. The dedicated cached-
+    // exhausted helper (CountCachedExhaustedAuditCapableMembers) must
+    // reclassify that empty-loop state as quota exhaustion and throw
+    // AgentClassExhaustedException so the item parks for quota reset.
+    // Without that helper the resolver would fall through to
+    // AuditUnavailableException → failureKind="infrastructure" — a
+    // misclassification that would strand items even though a normal quota
+    // reset would unblock them.
+    [Fact]
+    public async Task AuditPool_AllAuditCapableMembersCachedExhausted_ParksForQuotaReset()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Class: Claude (work, NOT audit-tagged) + Codex (audit-tagged).
+        // The audit pool has exactly one member; pre-seeding the router
+        // marks Codex exhausted-in-cache, so OrderedFallbackCandidatesAsync
+        // returns no audit-capable candidates and the cached-exhausted
+        // helper is the only thing standing between this item and an
+        // incorrect infrastructure-failure verdict.
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Codex,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 90,
+                    Capabilities = [WellKnownCapabilities.Audit],
+                },
+            ],
+        };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        // Healthy probe deliberately wired alongside the exhaustion cache:
+        // if a regression dropped the in-cache filter inside
+        // OrderedFallbackCandidatesAsync, the probe would surface Codex
+        // as available and the test would silently pass against a broken
+        // production path. With the probe healthy, the ONLY thing that
+        // can park this item is the cached-exhausted helper.
+        var router = new AgentClassRouter(
+            [frontier],
+            [new FakeProbe(AgentKind.Codex, 80.0)],
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance);
+        router.MarkExhausted(
+            frontier.Members[1],
+            TimeSpan.FromHours(1),
+            resetAt: DateTimeOffset.UtcNow.AddHours(1));
+
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor(
+            "cached-exhausted-review",
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref auditorCalls);
+                return Task.FromResult(new AuditResult(true, []));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            classRouter: router,
+            auditQuotaOptions: quotaOptions,
+            extraAgentRunners: [new PoolPassthroughRunner(AgentKind.Codex)]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // The single audit-capable member is cached-exhausted: the resolver
+        // MUST classify this as quota (park for quota reset), NOT
+        // infrastructure (terminal failure that strands the item until
+        // operator intervention) and NOT Done (silent-skip Pass with zero
+        // review).
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+        Assert.NotEqual("infrastructure", final.FailureKind);
+        // The auditor body must never have run — resolution short-circuited
+        // before any dispatch into a sandbox.
+        Assert.Equal(0, auditorCalls);
+    }
+
+    // Sibling pin to AllAuditCapableMembersCachedExhausted: a NON-audit
+    // member sitting in the exhaustion cache must NOT contribute to the
+    // helper's count. The audit-capability filter inside
+    // CountCachedExhaustedAuditCapableMembers is what stops the resolver
+    // from misclassifying a misconfiguration (missing runner / missing
+    // credentials on the only audit-capable member) as a quota crunch
+    // just because some unrelated non-audit member happens to be cache-
+    // exhausted. Without that filter, the helper would reclassify the
+    // infrastructure failure as quota and the item would park behind
+    // QuotaRetryScheduler — even though quota returning would never make
+    // the missing runner / credential appear.
+    [Fact]
+    public async Task AuditPool_NonAuditMemberCachedExhausted_AuditCapableMisconfigured_FailsInfrastructure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Class layout:
+        //   - Claude (work runner, NOT audit-tagged, NOT exhausted) —
+        //     keeps the work phase healthy so the item reaches audit.
+        //   - Codex  (audit-tagged) with NO registered runner — the
+        //     audit pool walk hits the missing-runner branch, leaving
+        //     quotaRejectedCount=0 and triggering the cached-exhausted
+        //     reclassification helper.
+        //   - Gemini (NOT audit-tagged) pre-seeded exhausted — the
+        //     non-audit cache entry that must NOT be counted by the
+        //     helper.
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Codex,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 90,
+                    Capabilities = [WellKnownCapabilities.Audit],
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Gemini,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 80,
+                },
+            ],
+        };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var router = new AgentClassRouter(
+            [frontier],
+            [],
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance);
+        router.MarkExhausted(
+            frontier.Members[2],
+            TimeSpan.FromHours(1),
+            resetAt: DateTimeOffset.UtcNow.AddHours(1));
+
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor(
+            "non-audit-exhausted-review",
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref auditorCalls);
+                return Task.FromResult(new AuditResult(true, []));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            classRouter: router,
+            auditQuotaOptions: quotaOptions);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // The audit pool's only audit-capable member has no runner →
+        // infrastructure misconfig. Cache-exhausted Gemini is NOT audit-
+        // capable so it MUST NOT inflate totalExhausted; without that
+        // filter the resolver would mistakenly park for quota reset.
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.Equal(0, auditorCalls);
+    }
 }
 
 // Minimal registered runner whose only job is to be in the AgentRegistry so
