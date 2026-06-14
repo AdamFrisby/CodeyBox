@@ -334,7 +334,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
         var requiredCapabilityPoolActive = !string.IsNullOrWhiteSpace(requiredCapability)
-            && agentClass.Members.Any(member => member.HasCapability(requiredCapability!));
+            && agentClass.Members.Any(member => MemberHasCapability(
+                member,
+                requiredCapability!,
+                effectiveCapabilities));
 
         // Step 1: filter by eligibility — both the legacy QualityScore floor and
         // the new capability gate must pass during the transition window.
@@ -346,7 +349,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 x.Member,
                 item.RequiredCapabilities,
                 effectiveCapabilities))
-            .Where(x => !requiredCapabilityPoolActive || x.Member.HasCapability(requiredCapability!))
+            .Where(x => !requiredCapabilityPoolActive || MemberHasCapability(
+                x.Member,
+                requiredCapability!,
+                effectiveCapabilities))
             .ToList();
 
         if (eligible.Count == 0)
@@ -1036,8 +1042,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return member.HasCapability(capability);
 
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
-        return EffectiveCapabilities(member, effectiveCapabilities)
-            .Any(tag => string.Equals(tag, capability, StringComparison.OrdinalIgnoreCase));
+        return MemberHasCapability(member, capability, effectiveCapabilities);
     }
 
     public IReadOnlyList<(string ClassId, string DisplayName, AgentMembership Member)> SnapshotConfiguredMembers()
@@ -1330,7 +1335,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (!MemberCoversRequiredCapabilities(
                     member, item.RequiredCapabilities, effectiveCapabilities))
                 continue;
-            if (capability is not null && !member.HasCapability(capability))
+            if (capability is not null
+                && !MemberHasCapability(member, capability, effectiveCapabilities))
                 continue;
             if (IsExhausted(member, nowUtc))
                 count++;
@@ -1656,7 +1662,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var nowUtc = _time.GetUtcNow();
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
         var requiredCapabilityPoolActive = !string.IsNullOrWhiteSpace(requiredCapability)
-            && agentClass.Members.Any(member => member.HasCapability(requiredCapability!));
+            && agentClass.Members.Any(member => MemberHasCapability(
+                member,
+                requiredCapability!,
+                effectiveCapabilities));
         DateTimeOffset? earliest = null;
         foreach (var member in agentClass.Members)
         {
@@ -1670,7 +1679,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     member,
                     item.RequiredCapabilities,
                     effectiveCapabilities)) continue;
-            if (requiredCapabilityPoolActive && !member.HasCapability(requiredCapability!))
+            if (requiredCapabilityPoolActive
+                && !MemberHasCapability(member, requiredCapability!, effectiveCapabilities))
                 continue;
             var availability = _dispatchAvailability?.GetAvailability(member);
             if (IsOperatorPaused(availability))
@@ -2120,6 +2130,18 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return member.Capabilities.Count == 0
             ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             : new HashSet<string>(member.Capabilities, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool MemberHasCapability(
+        AgentMembership member,
+        string capability,
+        IReadOnlyDictionary<AgentKind, IReadOnlySet<string>>? effectiveCapabilities)
+    {
+        if (string.IsNullOrWhiteSpace(capability))
+            return false;
+
+        return EffectiveCapabilities(member, effectiveCapabilities)
+            .Any(tag => string.Equals(tag, capability, StringComparison.OrdinalIgnoreCase));
     }
 
     private static IReadOnlyDictionary<AgentKind, IReadOnlySet<string>> BuildEffectiveCapabilities(AgentClass agentClass)

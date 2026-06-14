@@ -414,6 +414,75 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task PreferredAuditAgent_CachedExhausted_SpillsToInheritedSameKindPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true,  QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: false, QualityScore: 99),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 98),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Gemini] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Claude,
+            defaultAgent: AgentKind.Claude,
+            memberModelIds: ["audit-model", "peer-model", "gemini-model"]);
+        fix.MarkExhausted(AgentKind.Claude, modelId: "audit-model");
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude, modelId: "audit-model");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.Equal(["peer-model"], auditor.ModelInvocations);
+        Assert.DoesNotContain("gemini-model", auditor.ModelInvocations);
+    }
+
+    [Fact]
+    public async Task MidIterationSpill_UsesInheritedSameKindAuditPeerBeforeParking()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var calls = 0;
+        var auditor = new RecordingLlmAuditor("cheating:llm-review", _ =>
+            ++calls == 1 ? QuotaAuditResult() : new AuditResult(true, []));
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true,  QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: false, QualityScore: 99),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 98),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Gemini] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Claude,
+            defaultAgent: AgentKind.Claude,
+            memberModelIds: ["audit-model", "peer-model", "gemini-model"]);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude, modelId: "audit-model");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Claude, AgentKind.Claude], auditor.Invocations);
+        Assert.Equal(["audit-model", "peer-model"], auditor.ModelInvocations);
+        Assert.DoesNotContain("gemini-model", auditor.ModelInvocations);
+    }
+
+    [Fact]
     public async Task PreferredAuditAgent_CachedExhausted_NoPeer_ParksForQuotaReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -699,10 +768,15 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     }
 
     [Fact]
-    public async Task PreferredAuditAgent_NotRegistered_WorkKindInAuditPoolButWorkMemberUntagged_SpillsToTaggedMember()
+    public async Task PreferredAuditAgent_NotRegistered_WorkKindInAuditPoolViaSameKindSibling_UsesWorkMember()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("security:llm-review");
+        // The Codex work member does not directly carry "audit", but a same-kind
+        // Codex sibling does. The router contract treats that capability as
+        // effective across same-kind members, so the healthy work member is a
+        // valid audit candidate after the unregistered preferred agent is
+        // demoted.
         using var fix = BuildFixture(seed, auditor,
             members: [
                 (AgentKind.Cursor, IsAuditCapable: true,  QualityScore: 100),
@@ -728,7 +802,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal([AgentKind.Codex], auditor.Invocations);
-        Assert.Equal(["audit-model"], auditor.ModelInvocations);
+        Assert.Equal(["work-model"], auditor.ModelInvocations);
     }
 
     // Sibling pin to PreferredAuditAgent_NotRegistered_…: when the work
@@ -1380,13 +1454,22 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     private sealed class ConfigurableProbe : IAgentQuotaProbe
     {
         private double _pct;
+        private readonly HashSet<(string RouteKey, string ModelId)> _exhaustedMembers = [];
+
         public ConfigurableProbe(AgentKind kind, double initialPct) { Kind = kind; _pct = initialPct; }
         public AgentKind Kind { get; }
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _pct });
+        {
+            var key = (member.RouteKey, member.ModelId ?? string.Empty);
+            return Task.FromResult(new AgentQuotaSnapshot
+            {
+                AvailablePct = _exhaustedMembers.Contains(key) ? 0.0 : _pct,
+            });
+        }
+
         public Task MarkExhaustedAsync(AgentMembership member, TimeSpan ttl, DateTimeOffset? resetAt = null, CancellationToken ct = default)
         {
-            _pct = 0.0;
+            _exhaustedMembers.Add((member.RouteKey, member.ModelId ?? string.Empty));
             return Task.CompletedTask;
         }
     }

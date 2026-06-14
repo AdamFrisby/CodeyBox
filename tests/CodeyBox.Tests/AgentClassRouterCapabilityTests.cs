@@ -142,6 +142,35 @@ public sealed class AgentClassRouterCapabilityTests
     }
 
     [Fact]
+    public async Task ResolveQuotaRetry_RequiredCapabilityInheritsAcrossSameKindInstances()
+    {
+        var tagged = Member(Claude, 100, "audit") with { InstanceId = "acct-a" };
+        var sibling = Member(Claude, 99) with { InstanceId = "acct-b" };
+        var cls = Class(
+            tagged,
+            sibling,
+            Member(Codex, 98));
+        var router = BuildRouter([cls],
+        [
+            new InstanceRouteProbe(Claude, new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            {
+                [tagged.RouteKey] = 0.0,
+                [sibling.RouteKey] = 50.0,
+            }),
+            new FakeProbe(Codex, 50.0),
+        ]);
+
+        var retryDecision = await router.ResolveQuotaRetryAsync(
+            Item(),
+            project: null,
+            CancellationToken.None,
+            requiredCapability: "audit");
+
+        Assert.False(retryDecision.ShouldWait);
+        Assert.False(retryDecision.NoEligibleMembers);
+    }
+
+    [Fact]
     public async Task RequiredCapability_MemberMustCoverEveryTag()
     {
         // Claude declares "sensitive" only; item requires both — Claude rejected.
@@ -283,6 +312,37 @@ public sealed class AgentClassRouterCapabilityTests
         Assert.Equal(codexReset, earliest);
     }
 
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_RequiredCapabilityUsesInheritedSameKindPool()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var nonAuditReset = now.AddHours(1);
+        var auditReset = now.AddHours(5);
+        var taggedBelowFloor = Member(Claude, 50, "audit") with { InstanceId = "acct-a" };
+        var inheritedAuditSibling = Member(Claude, 100) with { InstanceId = "acct-b" };
+        var cls = Class(
+            taggedBelowFloor,
+            inheritedAuditSibling,
+            Member(Codex, 100));
+        var router = BuildRouter([cls],
+        [
+            new InstanceSnapshotProbe(Claude, new Dictionary<string, AgentQuotaSnapshot>(StringComparer.OrdinalIgnoreCase)
+            {
+                [taggedBelowFloor.RouteKey] = new() { AvailablePct = 0, ResetAt = now.AddHours(10) },
+                [inheritedAuditSibling.RouteKey] = new() { AvailablePct = 0, ResetAt = auditReset },
+            }),
+            new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = nonAuditReset }),
+        ]);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            Item(minScore: 90),
+            project: null,
+            CancellationToken.None,
+            requiredCapability: "audit");
+
+        Assert.Equal(auditReset, earliest);
+    }
+
     // ── CountEligibleExhaustedClassMembersWithCapability honours eligibility ─
 
     [Fact]
@@ -344,6 +404,23 @@ public sealed class AgentClassRouterCapabilityTests
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_InheritsAcrossSameKindInstances()
+    {
+        var taggedBelowFloor = Member(Claude, 50, "audit") with { InstanceId = "acct-a" };
+        var inheritedAuditSibling = Member(Claude, 100) with { InstanceId = "acct-b" };
+        var codex = Member(Codex, 100);
+        var cls = Class(taggedBelowFloor, inheritedAuditSibling, codex);
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(inheritedAuditSibling, TimeSpan.FromHours(1));
+        router.MarkExhausted(codex, TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(minScore: 90), project: null, capability: "audit");
 
         Assert.Equal(1, count);
     }
@@ -454,5 +531,25 @@ public sealed class AgentClassRouterCapabilityTests
             Item(minScore: 90), null, CancellationToken.None);
 
         Assert.Equal(claudeReset, earliest);
+    }
+
+    private sealed class InstanceSnapshotProbe : IAgentQuotaProbe
+    {
+        private readonly IReadOnlyDictionary<string, AgentQuotaSnapshot> _snapshotsByRoute;
+
+        public InstanceSnapshotProbe(
+            AgentKind kind,
+            IReadOnlyDictionary<string, AgentQuotaSnapshot> snapshotsByRoute)
+        {
+            Kind = kind;
+            _snapshotsByRoute = snapshotsByRoute;
+        }
+
+        public AgentKind Kind { get; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
+            Task.FromResult(_snapshotsByRoute.TryGetValue(member.RouteKey, out var snapshot)
+                ? snapshot
+                : new AgentQuotaSnapshot { AvailablePct = 100.0 });
     }
 }

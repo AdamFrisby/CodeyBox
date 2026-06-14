@@ -6758,12 +6758,12 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <para>
     /// Capability gate (<see cref="WellKnownCapabilities.Audit"/>): when AT
     /// LEAST ONE member of the routed class declares the <c>audit</c> tag, the
-    /// audit phase is restricted to those members — a non-tagged member is
-    /// NEVER picked for auditing even if it is the only one with quota. This
+    /// audit phase is restricted to the router's effective audit-capable
+    /// members, including same-kind siblings that inherit the capability. This
     /// is what fixes the audit-throughput collapse: with both Claude AND
-    /// Codex tagged audit-capable, an exhausted Codex spills to Claude (and
-    /// vice-versa) while Gemini stays out of the audit pool entirely. When NO
-    /// member carries the tag, audit routing falls back to the legacy
+    /// Codex audit-capable, an exhausted Codex spills to Claude (and vice-versa)
+    /// while Gemini stays out of the audit pool entirely. When NO member
+    /// carries the tag, audit routing falls back to the legacy
     /// "any class member is eligible" behaviour for backward compatibility.
     /// </para>
     /// </summary>
@@ -6814,10 +6814,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
             // Class chain wired. Two shapes:
             //   * auditPool != null — audit-capability pool active; work
-            //     agent is only safe if it carries the audit tag itself,
-            //     otherwise we MUST walk the tagged subset (falling back
-            //     to workRunner would breach the AC: "a non-audit-capable
-            //     agent must NEVER be selected for auditing").
+            //     agent is only safe if the router says its class member is
+            //     effectively audit-capable, otherwise we MUST walk that
+            //     subset (falling back to workRunner would breach the AC:
+            //     "a non-audit-capable agent must NEVER be selected for
+            //     auditing").
             //   * auditPool == null — legacy no-tag class; every class
             //     member is audit-eligible. The work agent is in that pool
             //     (the work-phase router picked it from the same chain),
@@ -6832,7 +6833,8 @@ public sealed class PipelineRunner : IPipelineRunner
             //     / infrastructure (AuditUnavailableException) exception.
             var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
             var workIsAuditCapable = auditPool is null
-                || workMember?.HasCapability(WellKnownCapabilities.Audit) == true;
+                || (workMember is not null
+                    && MemberHasClassCapability(classId!, workMember, WellKnownCapabilities.Audit));
             if (workIsAuditCapable && GetAgentPausedReason(workRunner.Kind) is null)
             {
                 // Hard invariant: an audit-capable work member must clear
@@ -7039,14 +7041,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 && SameMemberBucket(member, preferredMember))
                 continue;   // already counted above
             // Audit-capability gate: when the pool is active, restrict the
-            // walk to tagged members so a non-audit-capable member is NEVER
-            // picked for auditing — even when it is the only one with quota.
+            // walk to effectively audit-capable members so a non-audit-capable
+            // member is NEVER picked for auditing — even when it is the only
+            // one with quota.
             // Mid-iteration fallback in InvokeAgentWithQuotaFallbackAsync
             // enforces the same gate via requireAuditCapability.
-            if (auditPool is not null && !member.HasCapability(WellKnownCapabilities.Audit))
+            if (auditPool is not null
+                && !MemberHasClassCapability(classId!, member, WellKnownCapabilities.Audit))
             {
                 _log.LogDebug(
-                    "Class '{ClassId}' member '{Member}' not tagged 'audit'; skipping for auditor '{Auditor}'",
+                    "Class '{ClassId}' member '{Member}' is not audit-capable; skipping for auditor '{Auditor}'",
                     classId, member.Agent.Value, auditorName);
                 continue;
             }
@@ -7186,16 +7190,19 @@ public sealed class PipelineRunner : IPipelineRunner
             return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
 
         // Audit-capability pool active and the work agent isn't in it: the
-        // work agent must NEVER audit. Walk the tagged subset (fully gated).
+        // work agent must NEVER audit. Walk the effective audit-capable subset
+        // (fully gated).
         var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
         var workIsAuditCapable = auditPool is null
-            || workMember?.HasCapability(WellKnownCapabilities.Audit) == true;
+            || (workMember is not null
+                && MemberHasClassCapability(classId, workMember, WellKnownCapabilities.Audit));
         if (!workIsAuditCapable)
             return await SelectFromAuditCapablePoolAsync(
                 item, project, auditorName, classId, auditSmokeTarget, ct);
 
-        // Either the concrete work member carries the audit tag, or no pool is
-        // active (legacy no-tag class — every class member is audit-eligible).
+        // Either the concrete work member is effectively audit-capable, or no
+        // pool is active (legacy no-tag class — every class member is
+        // audit-eligible).
         // Mirror the no-preferred branch's pause + smoke + quota + router-cache
         // gating before trusting the work runner; on any rejection spill to the
         // class-chain walk (which either picks a healthy peer or throws the
@@ -7255,6 +7262,18 @@ public sealed class PipelineRunner : IPipelineRunner
             : null;
     }
 
+    private string? GetAgentPausedReason(AgentMembership member)
+    {
+        var availability = _dispatchAvailability?.GetAvailability(member);
+        return IsOperatorPaused(availability)
+            ? availability!.Reason ?? AgentDispatchAvailability.PausedReasonPrefix
+            : null;
+    }
+
+    private bool MemberHasClassCapability(string classId, AgentMembership member, string capability) =>
+        _classRouter?.MemberHasCapability(classId, member, capability)
+        ?? member.HasCapability(capability);
+
     /// <summary>
     /// Walks the routed class chain looking for the first eligible member that
     /// is registered, credentialed, and quota OK. Smoke availability is handled
@@ -7268,9 +7287,10 @@ public sealed class PipelineRunner : IPipelineRunner
     /// rejected it (the "unrunnable auditor must not be a Pass" invariant).
     /// <para>
     /// When <paramref name="requireAuditCapability"/> is true, only members
-    /// tagged <see cref="WellKnownCapabilities.Audit"/> are considered — the
-    /// audit-capability pool path. When false, every class member is eligible
-    /// — the legacy no-tag-class path where the entire class is the audit
+    /// with effective <see cref="WellKnownCapabilities.Audit"/> capability are
+    /// considered — the audit-capability pool path. When false, every class
+    /// member is eligible — the legacy no-tag-class path where the entire class
+    /// is the audit
     /// pool. Either way, falling back to the work agent here would breach the
     /// hard invariant ("a non-audit-capable agent must NEVER be selected for
     /// auditing" / "the gate must apply to every class audit pool").
@@ -7314,7 +7334,8 @@ public sealed class PipelineRunner : IPipelineRunner
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
             item, project, ct, smokeTarget: auditSmokeTarget, requireQuota: false))
         {
-            if (requireAuditCapability && !member.HasCapability(WellKnownCapabilities.Audit))
+            if (requireAuditCapability
+                && !MemberHasClassCapability(classId, member, WellKnownCapabilities.Audit))
                 continue;
             if (!_agents.TryGet(member.Agent, out var memberRunner))
             {
@@ -7353,8 +7374,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // is misconfiguration, not a quota crunch; surfacing it as quota would
         // misdirect operators investigating the skip.
         if (quotaRejectedCount == 0
-            && requireAuditCapability
-            && await TryGetPausedAuditPoolMemberAsync(project, classId, ct) is { } paused)
+            && await TryGetPausedAuditPoolMemberAsync(project, classId, requireAuditCapability, ct) is { } paused)
             throw new AgentPausedException("audit", paused.Agent, paused.Reason);
 
         // OrderedFallbackCandidatesAsync filters out members already marked
@@ -7450,8 +7470,8 @@ public sealed class PipelineRunner : IPipelineRunner
     /// path against. Walks every member of <paramref name="preferredKind"/> in
     /// <paramref name="classId"/>, scoring instance-id and model-id matches
     /// (most-specific wins) and — when <paramref name="requireAuditCapability"/>
-    /// is true — restricting to members tagged
-    /// <see cref="WellKnownCapabilities.Audit"/>. Unlike
+    /// is true — restricting to members with effective
+    /// <see cref="WellKnownCapabilities.Audit"/> capability. Unlike
     /// <see cref="AgentClassRouter.FindMember"/>, this never demands an exact
     /// model-id equality, so a class configured with a ModelId-pinned member
     /// still resolves to the real member instead of falling through to a
@@ -7477,7 +7497,8 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             if (member.Agent != preferredKind)
                 continue;
-            if (requireAuditCapability && !member.HasCapability(WellKnownCapabilities.Audit))
+            if (requireAuditCapability
+                && !MemberHasClassCapability(classId, member, WellKnownCapabilities.Audit))
                 continue;
 
             var score = 0;
@@ -7499,26 +7520,31 @@ public sealed class PipelineRunner : IPipelineRunner
     private async Task<(AgentKind Agent, string Reason)?> TryGetPausedAuditPoolMemberAsync(
         Project project,
         string classId,
+        bool requireAuditCapability,
         CancellationToken ct)
     {
-        var auditPool = _classRouter?.GetCapabilityPool(classId, WellKnownCapabilities.Audit);
-        if (auditPool is null || auditPool.Count == 0)
+        var members = _classRouter?.GetClassMembers(classId);
+        if (members is null || members.Count == 0)
             return null;
 
-        foreach (var agent in auditPool)
+        foreach (var member in members)
         {
-            if (!_agents.TryGet(agent, out _))
+            if (requireAuditCapability
+                && !MemberHasClassCapability(classId, member, WellKnownCapabilities.Audit))
                 continue;
 
-            var cred = await ResolveAgentCredentialAsync(agent, project, ct);
+            if (!_agents.TryGet(member.Agent, out _))
+                continue;
+
+            var cred = await ResolveAgentCredentialAsync(member, project, ct);
             if (cred is null)
                 continue;
 
-            var reason = GetAgentPausedReason(agent);
+            var reason = GetAgentPausedReason(member);
             if (reason is null)
                 continue;
 
-            return (agent, reason);
+            return (member.Agent, reason);
         }
 
         return null;
@@ -8028,9 +8054,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass!;
         // Capability-pool filter for mid-iteration spill: when the caller
-        // requires a capability tag (e.g. "audit") and the routed class has
-        // at least one tagged member, mid-iteration fallback must stay
-        // inside the tagged pool — otherwise a Claude audit that quota-fails
+        // requires a capability (e.g. "audit") and the routed class has
+        // at least one effectively capable member, mid-iteration fallback must
+        // stay inside that pool — otherwise a Claude audit that quota-fails
         // could spill to a Gemini member which the operator never authorised
         // for auditing. Null pool = no opt-in for this class → legacy
         // unfiltered fallback (matches ResolveAuditAgentRunnerAsync gating).
@@ -8118,7 +8144,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 // matches the resolve-time gate in ResolveAuditAgentRunnerAsync
                 // so the work item never ends up on an agent the operator did
                 // not tag for this phase.
-                if (requiredCapabilityPoolActive && !candidate.HasCapability(requireCapability!))
+                if (requiredCapabilityPoolActive
+                    && !MemberHasClassCapability(classId, candidate, requireCapability!))
                 {
                     _log.LogDebug(
                         "Class '{ClassId}' member '{Agent}' not in '{Capability}' pool; skipping for fallback (work item {WorkItemId})",

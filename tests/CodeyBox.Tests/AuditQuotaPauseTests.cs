@@ -297,6 +297,49 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditRouting_LegacyNoTagPausedAuditPool_ParksForAgentResume()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseDb = Path.Combine(_workspace, $"audit-pauses-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            pauseDb,
+            NullLogger<SqliteAgentPauseController>.Instance);
+        await pauses.PauseAsync(AgentKind.Gemini, "audit subscription reserved", "test");
+
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(true, []));
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini],
+            pauses: pauses);
+
+        var itemId = WorkItemId.New();
+        var item = NewItem(AgentKind.Gemini) with
+        {
+            Id = itemId,
+            State = WorkItemState.WorkComplete,
+            WorkBranch = $"codeybox/{itemId.ToString()[..8]}",
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            fix.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "work.txt",
+            "work complete\n",
+            "work commit");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
+        Assert.Equal(AgentKind.Gemini, final.AgentPauseTarget);
+        Assert.Equal("audit", final.AgentPauseRetryFrom);
+        Assert.Null(final.QuotaRetryFrom);
+        Assert.Empty(auditor.Invocations);
+    }
+
+    [Fact]
     public async Task AuditPass_RequiresEveryConfiguredAuditorToHaveRun_WholePoolExhaustedDoesNotPass()
     {
         // Hard invariant: a Pass verdict must NEVER emerge while one or more
@@ -628,7 +671,18 @@ public sealed class AuditQuotaPauseTests : IDisposable
             dispatchAvailability: dispatchAvailability,
             agentPauseController: pauses);
 
-        return new AuditQuotaFixture(pipeline, scheduler, retrier, store, queue, webhooks, fallbackHistory, time, gemini, codex);
+        return new AuditQuotaFixture(
+            pipeline,
+            scheduler,
+            retrier,
+            store,
+            queue,
+            webhooks,
+            fallbackHistory,
+            time,
+            gemini,
+            codex,
+            gitHost);
     }
 
     private static WorkItem NewItem(AgentKind agent) => new()
@@ -659,6 +713,24 @@ public sealed class AuditQuotaPauseTests : IDisposable
             await Task.Delay(25, cts.Token);
         }
         throw new TimeoutException("condition was not met");
+    }
+
+    private async Task CommitToBareBranchAsync(
+        string barePath,
+        string branch,
+        string fileName,
+        string contents,
+        string subject)
+    {
+        var clone = Path.Combine(_workspace, "audit-pause-clone-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", branch, "origin/main");
+        await File.WriteAllTextAsync(Path.Combine(clone, fileName), contents);
+        await TestSupport.RunGit(clone, "add", fileName);
+        await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
     }
 
     private sealed class RoutingLlmAuditor : IAuditor
@@ -698,7 +770,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
         InMemoryAgentFallbackHistoryStore FallbackHistory,
         ManualClock Time,
         ScriptableAgent Gemini,
-        ScriptableAgent Codex) : IDisposable
+        ScriptableAgent Codex,
+        LocalGitHost GitHost) : IDisposable
     {
         public void Dispose()
         {
