@@ -398,6 +398,116 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
+    public async Task CompleteAsync_ExistingPrNumberWithSquash_PrFetchNonSuccessUsesLocalFallback()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(JsonResponse(HttpStatusCode.InternalServerError, """{"message":"backend unavailable"}"""));
+        handler.Enqueue(PullRequestCommitsResponse("[]"));
+        handler.Enqueue(MergeOkResponse("merged-after-pr-fetch-500"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            });
+        var request = SampleRequest with
+        {
+            ExistingPullRequestNumber = 42,
+            PromptRevision = 44,
+            Description = "Updates existing PR retry fallback after PR fetch returns an error.",
+        };
+
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
+
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Get, handler.Requests[0].Method);
+        Assert.Equal("/repos/myorg/myrepo/pulls/42", handler.Requests[0].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Get, handler.Requests[1].Method);
+        Assert.Contains("/pulls/42/commits", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Put, handler.Requests[2].Method);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("Add feature X (#42)", mergeBody.RootElement.GetProperty("commit_title").GetString());
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Update existing PR retry fallback after PR fetch returns an error.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 44", message);
+        Assert.Equal("merged-after-pr-fetch-500", outcome.MergedSha);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/42", outcome.PullRequestUrl);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ExistingPrNumberWithSquash_PrFetchExceptionUsesLocalFallback()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.EnqueueException(new HttpRequestException("connection reset"));
+        handler.Enqueue(PullRequestCommitsResponse("[]"));
+        handler.Enqueue(MergeOkResponse("merged-after-pr-fetch-exception"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            });
+        var request = SampleRequest with
+        {
+            ExistingPullRequestNumber = 43,
+            PromptRevision = 45,
+            Description = "Updates existing PR retry fallback after PR fetch throws.",
+        };
+
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
+
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Get, handler.Requests[0].Method);
+        Assert.Equal("/repos/myorg/myrepo/pulls/43", handler.Requests[0].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Get, handler.Requests[1].Method);
+        Assert.Contains("/pulls/43/commits", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Put, handler.Requests[2].Method);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("Add feature X (#43)", mergeBody.RootElement.GetProperty("commit_title").GetString());
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Update existing PR retry fallback after PR fetch throws.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 45", message);
+        Assert.Equal("merged-after-pr-fetch-exception", outcome.MergedSha);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/43", outcome.PullRequestUrl);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ExistingPrNumberWithSquash_PrFetchCancellationRethrows()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.EnqueueException(new OperationCanceledException("cancelled"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            });
+        var request = SampleRequest with { ExistingPullRequestNumber = 44 };
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            remote.CompleteAsync(request, cts.Token));
+    }
+
+    [Fact]
     public async Task CompleteAsync_PullsReturns422_ReturnsGracefulOutcomeWithoutThrow()
     {
         var gitHost = new FakeGitHost();
@@ -687,11 +797,12 @@ internal sealed class FakeGitHost : IGitHost
 
 internal sealed class FakeHttpMessageHandler : HttpMessageHandler
 {
-    private readonly Queue<HttpResponseMessage> _queue = new();
+    private readonly Queue<object> _queue = new();
     public List<HttpRequestMessage> Requests { get; } = new();
     public List<string> RequestBodies { get; } = new();
 
     public void Enqueue(HttpResponseMessage response) => _queue.Enqueue(response);
+    public void EnqueueException(Exception exception) => _queue.Enqueue(exception);
 
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken)
@@ -701,9 +812,14 @@ internal sealed class FakeHttpMessageHandler : HttpMessageHandler
             ? await request.Content.ReadAsStringAsync(cancellationToken)
             : string.Empty;
         RequestBodies.Add(body);
-        return _queue.Count > 0
-            ? _queue.Dequeue()
-            : new HttpResponseMessage(HttpStatusCode.OK);
+        if (_queue.Count == 0)
+            return new HttpResponseMessage(HttpStatusCode.OK);
+
+        var next = _queue.Dequeue();
+        if (next is Exception exception)
+            throw exception;
+
+        return (HttpResponseMessage)next;
     }
 }
 
