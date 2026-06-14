@@ -423,6 +423,63 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task RecoveredWorkComplete_AuditStartTransitionPreservesRecoveryAttempts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            webhookDispatcher: webhooks);
+
+        var item = NewItem() with { RecoveryAttempts = 2 };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var auditing = Assert.Single(webhooks.Events, e => e.Event == "work_item.auditing");
+        var auditingItem = Assert.IsType<WorkItem>(auditing.WorkItem);
+        Assert.Equal(WorkItemState.Auditing, auditingItem.State);
+        Assert.Equal(2, auditingItem.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Done, (await tp.Store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task RecoveredWorkComplete_AuditFailureVerdictClearsRecoveryAttempts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "still broken", "x")]),
+        ], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1);
+
+        var item = NewItem() with { RecoveryAttempts = 2 };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(0, final.RecoveryAttempts);
+        Assert.Equal([1], auditor.SeenIterations);
+    }
+
+    [Fact]
     public async Task StopOnFirstPersistedAuditReports_AdvanceRecoveredIteration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

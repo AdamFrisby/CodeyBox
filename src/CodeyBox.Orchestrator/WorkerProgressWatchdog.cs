@@ -340,11 +340,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         // MaxRecoveryAttempts <= 0 means unlimited. Only enforce when > 0.
         // Mirrors the DeadWorkerReaper / OrchestratorService budget check so
         // an item that wedges on every pickup is eventually abandoned rather than
-        // looping Working → Queued → Working forever and burning a slot per
-        // iteration. The preempt-checkpoint branch is exempt: that's a clean
-        // resume from a captured ref, not a counted recovery transition.
-        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts)
-            && !(target == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)))
+        // looping through recovery forever and burning a slot per iteration.
+        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts))
         {
             var failed = item with
             {

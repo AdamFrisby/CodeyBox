@@ -1298,6 +1298,40 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task Watchdog_StuckWorkingWithPreemptCheckpoint_AtCapTransitionsToAbandoned()
+    {
+        var lowCeilingOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            MaxRecoveryAttempts = 2,
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, lowCeilingOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var item = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45))
+            with
+        {
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/test",
+            RecoveryAttempts = 2,
+        };
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
+        Assert.Equal(3, after.RecoveryAttempts);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Single(_slotReleaser.Releases);
+        Assert.Empty(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
     public async Task Watchdog_MaxRecoveryAttemptsZero_TreatsAsUnlimited()
     {
         var unlimitedOpts = new WorkerProgressWatchdogOptions

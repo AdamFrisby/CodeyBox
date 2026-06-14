@@ -1027,18 +1027,27 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return;
         }
 
+        if (recovered.State == WorkItemState.AbandonedAfterRecoveryAttempts)
+        {
+            _log.LogWarning(
+                "Shutdown recovery abandoned {Id}: {FromState} exceeded MaxRecoveryAttempts ({Max})",
+                id, item.State, _opts.MaxRecoveryAttempts);
+            return;
+        }
+
         await _queue.EnqueueAsync(id, ct).ConfigureAwait(false);
         _log.LogWarning(
             "Shutdown recovery re-queued {Id}: {FromState} -> {ToState} ({Reason})",
             id, item.State, recovered.State, recoveryReason);
     }
 
-    private static WorkItem? BuildGracefulShutdownRecoveryState(
+    private WorkItem? BuildGracefulShutdownRecoveryState(
         WorkItem item,
         string recoveryReason = "graceful shutdown drain timed out")
         => WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             item,
             DateTimeOffset.UtcNow,
+            _opts.MaxRecoveryAttempts,
             recoveryReason);
 
     /// <summary>

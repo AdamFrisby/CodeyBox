@@ -135,6 +135,7 @@ internal static class WorkItemRecoveryPolicy
     public static WorkItem? BuildGracefulShutdownRecoveryState(
         WorkItem item,
         DateTimeOffset now,
+        int maxRecoveryAttempts,
         string recoveryReason = "graceful shutdown drain timed out")
     {
         if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
@@ -146,7 +147,7 @@ internal static class WorkItemRecoveryPolicy
             return BuildPreemptCheckpointRecovery(
                 item,
                 NextRecoveryAttempt(item),
-                maxRecoveryAttempts: 0,
+                maxRecoveryAttempts,
                 now,
                 "exceeded MaxRecoveryAttempts");
         }
@@ -158,12 +159,28 @@ internal static class WorkItemRecoveryPolicy
         if (target is null)
             return null;
 
+        var attempts = NextRecoveryAttempt(item);
+        if (ExceedsRecoveryAttempts(attempts, maxRecoveryAttempts))
+        {
+            return item with
+            {
+                State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                LastError = $"exceeded MaxRecoveryAttempts ({maxRecoveryAttempts}) during {recoveryReason}",
+                RecoveryAttempts = attempts,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                UpdatedAt = now,
+            };
+        }
+
         var error = target == WorkItemState.Queued
             ? $"{recoveryReason} while item was {item.State}; re-queued for a fresh run"
             : null;
 
         return item.With(target.Value, error) with
         {
+            RecoveryAttempts = attempts,
             StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
             UpdatedAt = now,
         };

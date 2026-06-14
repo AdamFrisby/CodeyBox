@@ -175,11 +175,13 @@ public sealed class WorkItemRecoveryPolicyTests
         var startedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
         var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             MakeItem(from) with { StartedAt = startedAt },
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
 
         Assert.NotNull(recovered);
         Assert.Equal(to, recovered!.State);
         Assert.Equal(clearsStartedAt ? null : startedAt, recovered.StartedAt);
+        Assert.Equal(1, recovered.RecoveryAttempts);
     }
 
     [Fact]
@@ -193,13 +195,52 @@ public sealed class WorkItemRecoveryPolicyTests
 
         var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             item,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
 
         Assert.NotNull(recovered);
         Assert.Equal(WorkItemState.Working, recovered!.State);
         Assert.Null(recovered.StartedAt);
         Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Reworking)]
+    public void GracefulShutdownRecovery_WithPreemptCheckpoint_AtCapAbandons(WorkItemState state)
+    {
+        var item = MakeItem(state) with
+        {
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/test",
+            RecoveryAttempts = 3,
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            item,
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Equal(4, recovered.RecoveryAttempts);
+        Assert.Null(recovered.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public void GracefulShutdownRecovery_NormalRecoverableState_AtCapAbandons()
+    {
+        var item = MakeItem(WorkItemState.Auditing) with { RecoveryAttempts = 3 };
+
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            item,
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Equal(4, recovered.RecoveryAttempts);
+        Assert.Contains("MaxRecoveryAttempts", recovered.LastError);
     }
 
     [Theory]
@@ -261,7 +302,8 @@ public sealed class WorkItemRecoveryPolicyTests
 
         var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             item,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
 
         Assert.Null(recovered);
     }
