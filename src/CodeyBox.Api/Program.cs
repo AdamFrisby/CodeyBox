@@ -551,8 +551,10 @@ builder.Services.AddSingleton<IAgentPromptPreprocessor, ProjectRulesPromptPrepro
 // until IWorkItemAttachmentSource is wired by the attachments foundation.
 builder.Services.AddSingleton<IAgentPromptPreprocessor, AttachmentManifestPromptPreprocessor>();
 // Cross-agent handoff brief injection: fires only when the involvement store
-// shows a prior phase ran under a different AgentKind. No-op until both
-// IAgentInvolvementStore and ICrossAgentHandoffBriefBuilder are wired.
+// shows a prior phase ran under a different AgentKind. Gated end-to-end by
+// CodeyBox:PipelineTuning:EnableHandoffSeeding (default off) — the builder
+// returns null when the flag is unset so the preprocessor stays a no-op.
+builder.Services.AddSingleton<ICrossAgentHandoffBriefBuilder, AgentStreamBriefBuilder>();
 builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptPreprocessor>();
 builder.Services.AddSingleton<AgentPromptPreprocessorChain>();
 
@@ -2274,8 +2276,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sessionHandleSnapshot: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>() is { } worker
         ? worker.SnapshotPersistedHandle
         : null,
-    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>(),
-    streamParsers: sp.GetServices<IAgentStreamParser>()));
+    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
