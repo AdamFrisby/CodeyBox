@@ -289,7 +289,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     public async Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
         WorkItem item,
         Project? project,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? requiredCapability = null)
     {
         var decision = await ResolveCoreAsync(
             item,
@@ -298,7 +299,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             slotGate: null,
             bypassRecentFailurePrecheck: true,
             bypassInProcessExhaustion: true,
-            commitDispatchSideEffects: true);
+            commitDispatchSideEffects: true,
+            requiredCapability: requiredCapability);
         if (decision.Chosen is { } chosen)
             RecordQuotaRetryAdmission(item, chosen);
 
@@ -314,7 +316,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         IAgentSlotGate? slotGate,
         bool bypassRecentFailurePrecheck,
         bool bypassInProcessExhaustion,
-        bool commitDispatchSideEffects = true)
+        bool commitDispatchSideEffects = true,
+        string? requiredCapability = null)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -330,6 +333,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return new AgentRoutingDecision { Reason = $"unknown agent class '{classId}'" };
         }
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
+        var requiredCapabilityPoolActive = !string.IsNullOrWhiteSpace(requiredCapability)
+            && agentClass.Members.Any(member => member.HasCapability(requiredCapability!));
 
         // Step 1: filter by eligibility — both the legacy QualityScore floor and
         // the new capability gate must pass during the transition window.
@@ -341,6 +346,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 x.Member,
                 item.RequiredCapabilities,
                 effectiveCapabilities))
+            .Where(x => !requiredCapabilityPoolActive || x.Member.HasCapability(requiredCapability!))
             .ToList();
 
         if (eligible.Count == 0)
@@ -1281,9 +1287,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// would have considered for <paramref name="item"/> — i.e. they pass the
     /// <see cref="WorkItem.MinModelScore"/> floor AND cover the work item's
     /// <see cref="WorkItem.RequiredCapabilities"/> AND (when
-    /// <paramref name="capability"/> is non-null) declare
-    /// <paramref name="capability"/> — and are currently marked exhausted in
-    /// this process's in-cache state. Used by the audit resolver to
+    /// <paramref name="capability"/> is non-null) directly declare
+    /// <paramref name="capability"/> on that member — and are currently marked
+    /// exhausted in this process's in-cache state. Used by the audit resolver to
     /// disambiguate "no candidate was eligible for non-quota reasons"
     /// (infrastructure) from "every eligible audit-capable member is cached
     /// exhausted" (quota — park for reset) when the fallback walk returns
@@ -1324,9 +1330,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (!MemberCoversRequiredCapabilities(
                     member, item.RequiredCapabilities, effectiveCapabilities))
                 continue;
-            if (capability is not null
-                && !EffectiveCapabilities(member, effectiveCapabilities)
-                    .Any(tag => string.Equals(tag, capability, StringComparison.OrdinalIgnoreCase)))
+            if (capability is not null && !member.HasCapability(capability))
                 continue;
             if (IsExhausted(member, nowUtc))
                 count++;
@@ -1639,7 +1643,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// available).
     /// </returns>
     public async Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
-        WorkItem item, Project? project, CancellationToken ct)
+        WorkItem item,
+        Project? project,
+        CancellationToken ct,
+        string? requiredCapability = null)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -1648,6 +1655,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var nowUtc = _time.GetUtcNow();
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
+        var requiredCapabilityPoolActive = !string.IsNullOrWhiteSpace(requiredCapability)
+            && agentClass.Members.Any(member => member.HasCapability(requiredCapability!));
         DateTimeOffset? earliest = null;
         foreach (var member in agentClass.Members)
         {
@@ -1661,6 +1670,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     member,
                     item.RequiredCapabilities,
                     effectiveCapabilities)) continue;
+            if (requiredCapabilityPoolActive && !member.HasCapability(requiredCapability!))
+                continue;
             var availability = _dispatchAvailability?.GetAvailability(member);
             if (IsOperatorPaused(availability))
                 continue;

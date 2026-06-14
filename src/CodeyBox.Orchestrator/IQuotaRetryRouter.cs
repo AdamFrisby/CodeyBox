@@ -12,12 +12,14 @@ public interface IQuotaRetryRouter
     Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
         WorkItem item,
         Project? project,
-        CancellationToken ct);
+        CancellationToken ct,
+        string? requiredCapability = null);
 
     Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
         WorkItem item,
         Project? project,
-        CancellationToken ct);
+        CancellationToken ct,
+        string? requiredCapability = null);
 }
 
 public sealed record QuotaRetryRoutingDecision(

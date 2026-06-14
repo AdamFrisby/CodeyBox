@@ -45,6 +45,55 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         AssertQuotaAttempt(waiting, "periodic", "skipped:quota-still-gated", "WaitingForQuotaReset");
     }
 
+    [Fact]
+    public async Task PeriodicSweep_AuditParkedItem_RechecksOnlyAuditCapablePool()
+    {
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "frontier",
+                    DisplayName = "Frontier",
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Codex,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 100,
+                            Capabilities = [WellKnownCapabilities.Audit],
+                        },
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Gemini,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 95,
+                        },
+                    ],
+                },
+            ],
+            [
+                new KindedStaticQuotaProbe(AgentKind.Codex, availablePct: 0),
+                new KindedStaticQuotaProbe(AgentKind.Gemini, availablePct: 100),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var fixture = BuildScheduler(router, BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            QuotaRetryFrom = "audit",
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stored!.State);
+        Assert.Equal(0, stored.QuotaRetryAttempts);
+        AssertQuotaAttempt(item, "periodic", "skipped:quota-still-gated", "WaitingForQuotaReset");
+    }
+
     [Theory]
     [MemberData(nameof(AuditOutcomeCases))]
     public async Task TryRetry_AuditLogsOutcomeForSkippedAndFailedBranches(
@@ -530,6 +579,20 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
     }
 
+    private sealed class KindedStaticQuotaProbe : IAgentQuotaProbe
+    {
+        private readonly double _availablePct;
+        public KindedStaticQuotaProbe(AgentKind kind, double availablePct)
+        {
+            Kind = kind;
+            _availablePct = availablePct;
+        }
+
+        public AgentKind Kind { get; }
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
+    }
+
     private sealed class MutableQuotaProbe : IAgentQuotaProbe
     {
         public MutableQuotaProbe(double availablePct) => AvailablePct = availablePct;
@@ -847,7 +910,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         public Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
             WorkItem item,
             Project? project,
-            CancellationToken ct)
+            CancellationToken ct,
+            string? requiredCapability = null)
         {
             if (item.Id == _throwFor)
                 throw new InvalidOperationException("startup router failed");
@@ -861,7 +925,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         public Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
             WorkItem item,
             Project? project,
-            CancellationToken ct)
+            CancellationToken ct,
+            string? requiredCapability = null)
             => Task.FromResult<DateTimeOffset?>(null);
     }
 
