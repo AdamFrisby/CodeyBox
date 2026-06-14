@@ -236,11 +236,10 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// <para>
     /// When <paramref name="preserveWorkBranchForOrphan"/> is true (startup
     /// stranded sweep), Working items without a preempt checkpoint are
-    /// reclaimed via
-    /// <see cref="WorkItemRecoveryPolicy.BuildStaleItemRecovery"/>: requeued
-    /// preserving the work branch, with bounded recovery attempts escalating
-    /// to <see cref="WorkItemState.NeedsOperatorInput"/>. When false (periodic
-    /// dead-worker reaper), the same items are marked
+    /// reclaimed preserving the work branch until the shared recovery cap is
+    /// exceeded; cap exhaustion transitions to
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>. When false
+    /// (periodic dead-worker reaper), the same items are marked
     /// <see cref="WorkItemState.Failed"/> via
     /// <see cref="WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure"/>
     /// because a dead worker mid-flight is a different signal — the worker
@@ -464,12 +463,24 @@ public sealed class DeadWorkerReaper : BackgroundService
             && !WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
         {
             var orphanAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
-            var orphanRecovered = WorkItemRecoveryPolicy.BuildStaleItemRecovery(
-                item,
-                orphanAttempt,
-                _opts.MaxRecoveryAttempts,
-                noPreemptFailedReason,
-                DateTimeOffset.UtcNow);
+            var orphanNow = DateTimeOffset.UtcNow;
+            var orphanRecovered = WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(orphanAttempt, _opts.MaxRecoveryAttempts)
+                ? item with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = "exceeded MaxRecoveryAttempts",
+                    RecoveryAttempts = orphanAttempt,
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    UpdatedAt = orphanNow,
+                }
+                : WorkItemRecoveryPolicy.BuildStaleItemRecovery(
+                    item,
+                    orphanAttempt,
+                    _opts.MaxRecoveryAttempts,
+                    noPreemptFailedReason,
+                    orphanNow);
             if (orphanRecovered is not null)
             {
                 var orphanFromState = item.State;
@@ -482,7 +493,15 @@ public sealed class DeadWorkerReaper : BackgroundService
                 await _store.UpdateAsync(orphanRecovered, ct);
                 MarkRecoveredItem(itemId);
 
-                if (orphanToState == WorkItemState.NeedsOperatorInput)
+                if (orphanToState == WorkItemState.AbandonedAfterRecoveryAttempts)
+                {
+                    _log.LogWarning(
+                        "Recovery ({WorkerId}): orphaned Working/Reworking work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
+                        workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                    AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, orphanAttempt);
+                    await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "orphan recovery exceeded MaxRecoveryAttempts; abandoned permanently", ct);
+                }
+                else if (orphanToState == WorkItemState.NeedsOperatorInput)
                 {
                     _log.LogWarning(
                         "Recovery ({WorkerId}): orphaned Working work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); parked at NeedsOperatorInput for triage",
@@ -519,7 +538,8 @@ public sealed class DeadWorkerReaper : BackgroundService
                     }, CancellationToken.None);
                 }
 
-                if (orphanToState != WorkItemState.NeedsOperatorInput
+                if (orphanToState != WorkItemState.AbandonedAfterRecoveryAttempts
+                    && orphanToState != WorkItemState.NeedsOperatorInput
                     && orphanToState != WorkItemState.Failed)
                 {
                     await _queue.EnqueueAsync(itemId, ct);

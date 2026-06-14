@@ -10049,6 +10049,11 @@ public sealed class PipelineRunner : IPipelineRunner
             return new ConflictReworkResult(false, parkMsg);
         }
 
+        await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+            item.Id,
+            "conflict-rework-branch-advanced",
+            ct);
+
         _ = startedAt; // currently unused; future: emit conflict_rework duration metric.
 
         await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,

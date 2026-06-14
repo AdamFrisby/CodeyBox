@@ -213,24 +213,25 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         Assert.Equal(0, _queue.Count);
     }
 
-    [Fact]
-    public async Task Sweep_WorkingItem_AtRecoveryCap_NoCheckpoint_EscalatesToNeedsOperatorInput()
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Reworking)]
+    public async Task Sweep_WorkingOrReworkingItem_AtRecoveryCap_NoCheckpoint_Abandons(
+        WorkItemState state)
     {
-        // Spec change 2026-06-12: Working-without-preempt orphans are reclaimed
-        // (preserve-branch requeue) until MaxRecoveryAttempts is exceeded;
-        // beyond the cap they escalate to NeedsOperatorInput for triage, not
-        // Failed. NeedsOperatorInput surfaces an explicit park so the operator
-        // sees that the reclaim path was tried-and-bounded; Failed would
-        // suggest a one-shot pipeline failure.
-        var item = MakeItem(WorkItemState.Working, recoveryAttempts: _opts.MaxRecoveryAttempts);
+        // Startup dead-worker recovery shares the dead-letter budget with the
+        // periodic reaper. Once the cap is exceeded, it must reach the permanent
+        // abandoned state operators monitor rather than parking in the stale-item
+        // watchdog's NeedsOperatorInput triage state.
+        var item = MakeItem(state, recoveryAttempts: _opts.MaxRecoveryAttempts);
         await _store.CreateAsync(item);
 
         await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.NeedsOperatorInput, after!.State);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
         Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
-        Assert.Contains("MaxRecoveryAttempts", after.LastError);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
         Assert.Equal(0, _queue.Count);
     }
 
