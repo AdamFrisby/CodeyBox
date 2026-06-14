@@ -6885,6 +6885,7 @@ public sealed class PipelineRunner : IPipelineRunner
             return await SelectFromAuditClassChainAsync(
                 item, project, auditorName, classId!,
                 requireAuditCapability: auditPool is not null,
+                auditSmokeTarget,
                 ct);
         }
 
@@ -6897,13 +6898,25 @@ public sealed class PipelineRunner : IPipelineRunner
                 item, project, workRunner, auditorName, classId, auditPool, auditSmokeTarget, ct);
         }
 
+        // Resolve the configured class member to gate the preferred audit
+        // fast path against. The legacy FindMember(modelId:null) lookup only
+        // matched members whose ModelId was explicitly null/empty, so a
+        // class configured with a real ModelId-pinned member fell through
+        // to a synthetic AgentMembership below. The router-cache and quota
+        // gates then ran against a (kind, runner-default model) bucket
+        // that no probe / cache entry actually tracks — so an exhausted
+        // real member could still slip through and reach a Pass verdict.
+        // FindPreferredAuditMember walks every member of preferredKind in
+        // the class, prefers an instance/model match, and (when the audit
+        // pool is active) restricts to audit-capable members so the gates
+        // run against the real bucket the spill / park logic depends on.
         var preferredMember = classId is not null
-            ? _classRouter?.FindMember(
-                  classId,
-                  preferredKind.Value,
-                  modelId: null,
-                  instanceId: preferredKind.Value == item.Agent ? item.AgentInstanceId : null)
-              ?? _classRouter?.FindMember(classId, preferredKind.Value, modelId: null)
+            ? FindPreferredAuditMember(
+                classId,
+                preferredKind.Value,
+                preferredModelId: preferredKind.Value == item.Agent ? item.ModelId : null,
+                instanceId: preferredKind.Value == item.Agent ? item.AgentInstanceId : null,
+                requireAuditCapability: auditPool is not null)
             : null;
         var preferredCred = preferredMember is not null
             ? await ResolveAgentCredentialAsync(preferredMember, project, ct)
@@ -7172,7 +7185,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // Audit-capability pool active and the work agent isn't in it: the
         // work agent must NEVER audit. Walk the tagged subset (fully gated).
         if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
-            return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId, ct);
+            return await SelectFromAuditCapablePoolAsync(
+                item, project, auditorName, classId, auditSmokeTarget, ct);
 
         // Either the work agent is in the audit-capability pool, or no pool
         // is active (legacy no-tag class — every class member is audit-
@@ -7224,6 +7238,7 @@ public sealed class PipelineRunner : IPipelineRunner
         return await SelectFromAuditClassChainAsync(
             item, project, auditorName, classId,
             requireAuditCapability: auditPool is not null,
+            auditSmokeTarget,
             ct);
     }
 
@@ -7240,7 +7255,12 @@ public sealed class PipelineRunner : IPipelineRunner
     /// is registered, credentialed, and quota OK. Smoke availability is handled
     /// upstream by <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/>,
     /// which yields smoke-checked members for this path; this method applies
-    /// the audit quota policy itself.
+    /// the audit quota policy itself. <paramref name="auditSmokeTarget"/> is
+    /// threaded into that smoke gate so candidates are checked against the
+    /// audit sandbox profile, not the work profile — without this, a member
+    /// benched only for the audit profile could pass the work-profile smoke
+    /// check and be re-selected after the audit dispatch gate already
+    /// rejected it (the "unrunnable auditor must not be a Pass" invariant).
     /// <para>
     /// When <paramref name="requireAuditCapability"/> is true, only members
     /// tagged <see cref="WellKnownCapabilities.Audit"/> are considered — the
@@ -7268,6 +7288,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string auditorName,
         string classId,
         bool requireAuditCapability,
+        InVmSmokeSandboxTarget auditSmokeTarget,
         CancellationToken ct)
     {
         if (_classRouter is null)
@@ -7277,8 +7298,16 @@ public sealed class PipelineRunner : IPipelineRunner
         var quotaRejectedCount = 0;
         var missingRunnerCount = 0;
         var missingCredentialsCount = 0;
+        // Thread the resolved audit smoke target through the router so its
+        // in-VM smoke gate runs against the audit sandbox profile, not the
+        // work profile. Without this, a member benched only for the audit
+        // sandbox profile could pass the work-profile smoke check and be
+        // re-selected after the audit dispatch gate already rejected it —
+        // contradicting the "unrunnable auditor must not be treated as a
+        // valid audit verdict" invariant. Matches the preferred-agent
+        // fallback path's gating.
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
-            item, project, ct, requireQuota: false))
+            item, project, ct, smokeTarget: auditSmokeTarget, requireQuota: false))
         {
             if (requireAuditCapability
                 && _classRouter?.MemberHasCapability(classId, member, WellKnownCapabilities.Audit) != true)
@@ -7377,8 +7406,15 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private Task<AuditAgentSelection> SelectFromAuditCapablePoolAsync(
-        WorkItem item, Project project, string auditorName, string classId, CancellationToken ct)
-        => SelectFromAuditClassChainAsync(item, project, auditorName, classId, requireAuditCapability: true, ct);
+        WorkItem item,
+        Project project,
+        string auditorName,
+        string classId,
+        InVmSmokeSandboxTarget auditSmokeTarget,
+        CancellationToken ct)
+        => SelectFromAuditClassChainAsync(
+            item, project, auditorName, classId,
+            requireAuditCapability: true, auditSmokeTarget, ct);
 
     /// <summary>
     /// Returns true when the router's in-process exhaustion cache says
@@ -7399,6 +7435,58 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_classRouter is null || member is null)
             return false;
         return _classRouter.IsExhausted(member, _opts.TimeProvider.GetUtcNow());
+    }
+
+    /// <summary>
+    /// Resolves the configured class member to gate the preferred audit fast
+    /// path against. Walks every member of <paramref name="preferredKind"/> in
+    /// <paramref name="classId"/>, scoring instance-id and model-id matches
+    /// (most-specific wins) and — when <paramref name="requireAuditCapability"/>
+    /// is true — restricting to members tagged
+    /// <see cref="WellKnownCapabilities.Audit"/>. Unlike
+    /// <see cref="AgentClassRouter.FindMember"/>, this never demands an exact
+    /// model-id equality, so a class configured with a ModelId-pinned member
+    /// still resolves to the real member instead of falling through to a
+    /// synthetic <see cref="AgentMembership"/> whose (kind, runner-default
+    /// model) bucket no probe / cache entry tracks. Returns null only when
+    /// no class member of <paramref name="preferredKind"/> qualifies — the
+    /// caller then spills to the class-chain walk rather than dispatching
+    /// against an ungated raw runner.
+    /// </summary>
+    private AgentMembership? FindPreferredAuditMember(
+        string classId,
+        AgentKind preferredKind,
+        string? preferredModelId,
+        string? instanceId,
+        bool requireAuditCapability)
+    {
+        if (_classRouter is null)
+            return null;
+        var members = _classRouter.GetClassMembers(classId);
+        AgentMembership? best = null;
+        var bestScore = -1;
+        foreach (var member in members)
+        {
+            if (member.Agent != preferredKind)
+                continue;
+            if (requireAuditCapability
+                && _classRouter.MemberHasCapability(classId, member, WellKnownCapabilities.Audit) != true)
+                continue;
+
+            var score = 0;
+            if (!string.IsNullOrWhiteSpace(instanceId)
+                && AgentInstanceIds.Matches(member, instanceId))
+                score += 2;
+            if (preferredModelId is not null
+                && string.Equals(member.ModelId ?? string.Empty, preferredModelId, StringComparison.Ordinal))
+                score += 1;
+            if (score > bestScore)
+            {
+                best = member;
+                bestScore = score;
+            }
+        }
+        return best;
     }
 
     private async Task<(AgentKind Agent, string Reason)?> TryGetPausedAuditPoolMemberAsync(
