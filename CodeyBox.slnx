@@ -31,6 +31,10 @@
     <Project Path="src/CodeyBox.Webhooks/CodeyBox.Webhooks.csproj" />
     <Project Path="src/CodeyBox.Notifications/CodeyBox.Notifications.csproj" />
   </Folder>
+  <Folder Name="/plugins/">
+    <Project Path="plugins/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <Project Path="plugins/CodeyBox.StatisticsPlugin/CodeyBox.StatisticsPlugin.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
     <Project Path="tests/CodeyBox.PluginSdk.SampleTests/CodeyBox.PluginSdk.SampleTests.csproj" />

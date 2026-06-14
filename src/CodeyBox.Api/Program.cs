@@ -2584,6 +2584,15 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<PeriodicSmokeProbe
 // Expose the host-side on-demand probe through the core port so the admin
 // /smoke endpoint depends on the abstraction, not the background-service type.
 builder.Services.AddSingleton<IHostSmokeProbeRunner>(sp => sp.GetRequiredService<PeriodicSmokeProbeService>());
+
+// Periodic metric samplers. The host runs each IMetricSampler on its own loop,
+// re-reading the sampler's Enabled / Interval each cycle so plugin-side
+// hot-reload takes effect without a host restart. The first sampler shipping
+// against this extension point is the statistics plugin's quota sampler — but
+// the host is sampler-agnostic; further plugins (throughput, audit pass rate,
+// cost-over-time) can register additional IMetricSampler implementations.
+// See docs/plugins.md (IMetricSampler) and docs/statistics-plugin.md.
+builder.Services.AddHostedService<MetricSamplerHost>();
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<ICredentialProvider>(),
@@ -2751,6 +2760,7 @@ AgentSupervisionEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 BaselineEndpoints.Map(app);
 QuotaRetryStatusEndpoints.Map(app);
+QuotaHistoryEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 AgentPauseEndpoints.Map(app);
 

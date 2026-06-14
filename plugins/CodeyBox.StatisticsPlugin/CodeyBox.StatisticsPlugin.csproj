@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.7" />
+  </ItemGroup>
+
+</Project>
