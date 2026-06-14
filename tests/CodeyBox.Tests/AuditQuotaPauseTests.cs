@@ -593,6 +593,70 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditPass_QuotaRetryAdmissionBypassesRecentObservedFailureForEveryResolvedAuditor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var dbPath = Path.Combine(_workspace, $"quota-failures-{Guid.NewGuid():N}.db");
+        using var quotaFailures = new SqliteQuotaFailureStore(dbPath);
+        var firstAuditor = new RoutingLlmAuditor("bugs:llm-review", inv =>
+            inv.CallNumber == 1 ? QuotaResult() : new AuditResult(true, []));
+        var secondAuditor = new RoutingLlmAuditor("security:llm-review", _ => new AuditResult(true, []));
+
+        using var fix = BuildFixture(
+            seed,
+            [firstAuditor, secondAuditor],
+            [AgentKind.Gemini],
+            quotaFailures: quotaFailures);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+
+        await quotaFailures.RecordAsync(
+            AgentKind.Gemini,
+            modelId: null,
+            QuotaFailureKind.LimitReached,
+            DateTimeOffset.UtcNow,
+            CancellationToken.None);
+        Assert.True(await quotaFailures.HasRecentAsync(
+            AgentKind.Gemini,
+            modelId: null,
+            TimeSpan.FromHours(1),
+            DateTimeOffset.UtcNow,
+            CancellationToken.None));
+
+        var retryDecision = await fix.Router.ResolveQuotaRetryAsync(
+            parked,
+            project: null,
+            CancellationToken.None,
+            WellKnownCapabilities.Audit);
+        Assert.False(retryDecision.ShouldWait, retryDecision.Reason);
+        Assert.False(retryDecision.NoEligibleMembers, retryDecision.Reason);
+
+        var (retrySuccess, retryError, _, _, _) = await fix.Retrier.RetryAsync(
+            parked, from: "audit", trigger: "test-quota-return", CancellationToken.None);
+        Assert.True(retrySuccess, retryError);
+
+        var resumed = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+
+        await fix.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini, AgentKind.Gemini], firstAuditor.Invocations);
+        Assert.Equal([AgentKind.Gemini, AgentKind.Gemini], secondAuditor.Invocations);
+    }
+
+    [Fact]
     public async Task AuditPass_PartialAuditorPoolExhaustion_ParksRatherThanCountingAsBlockingFinding()
     {
         // Regression cover for the 1aa5a13f swing: an auditor that cannot

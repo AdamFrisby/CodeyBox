@@ -7605,12 +7605,12 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentMembership member,
         CancellationToken ct)
     {
-        var consumedQuotaRetryAdmission = _classRouter?.TryConsumeQuotaRetryAdmission(
+        var hasQuotaRetryAdmission = _classRouter?.HasQuotaRetryAdmission(
             itemId,
             member,
             _opts.TimeProvider.GetUtcNow()) == true;
         if (_quotaFailures is not null
-            && !consumedQuotaRetryAdmission
+            && !hasQuotaRetryAdmission
             && await _quotaFailures.HasRecentAsync(
                 kind, member.ModelId,
                 _auditQuotaOptions.ObservedFailureWindow,

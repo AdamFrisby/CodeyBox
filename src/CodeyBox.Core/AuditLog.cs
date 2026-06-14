@@ -505,8 +505,9 @@ public static class AuditLog
 
     /// <summary>
     /// Emitted when the configured audit agent had insufficient quota and the
-    /// pipeline fell through to the work agent. The correlation-breaking
-    /// benefit of cross-review was lost for this auditor invocation.
+    /// pipeline routed the auditor to a fallback agent. When the fallback is the
+    /// work agent, the correlation-breaking benefit of cross-review was lost for
+    /// this auditor invocation.
     /// </summary>
     public static void QuotaAuditFallthrough(AgentKind exhaustedAgent, AgentKind fallbackAgent, string auditorName) =>
         Audit("quota_router.audit_fallthrough")

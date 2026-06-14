@@ -605,7 +605,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
         try
         {
-            var adoptionExitCode = await adoptionTask.WaitAsync(timeoutCts.Token);
+            await WaitForTaskOrTimeoutAsync(adoptionTask, adoptionDeadline, ct);
+            var adoptionExitCode = await adoptionTask;
             if (adoptionExitCode is null)
             {
                 _log.LogWarning(

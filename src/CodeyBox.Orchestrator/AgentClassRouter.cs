@@ -1507,6 +1507,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return true;
     }
 
+    internal bool HasQuotaRetryAdmission(
+        WorkItemId itemId,
+        AgentMembership member,
+        DateTimeOffset nowUtc)
+    {
+        PruneExpiredQuotaRetryAdmissions(nowUtc);
+        return QuotaRetryAdmissionMatches(GetQuotaRetryAdmission(itemId, nowUtc), member);
+    }
+
     private void ConsumeQuotaRetryAdmission(WorkItemId itemId, QuotaRetryAdmission? admission)
     {
         if (admission is null)
