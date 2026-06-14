@@ -105,6 +105,20 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public bool AuditShortCircuitEnabled { get; set; } = true;
 
+    /// <summary>
+    /// Whether to build and seed a cross-agent handoff brief on the next
+    /// invocation after the orchestrator falls back from one
+    /// <c>AgentKind</c> to another mid-iteration. The brief itself is built
+    /// by the wired <c>ICrossAgentHandoffBriefBuilder</c> (currently
+    /// <c>AgentStreamBriefBuilder</c>) and injected by the
+    /// <c>CrossAgentHandoffPromptPreprocessor</c> as a fenced
+    /// <c>[UNTRUSTED DATA SECTION]</c> block. Default <c>false</c>: the
+    /// brief is sourced from attacker-influenceable inputs (prior agent
+    /// stream + branch state), so the feature is opt-in until an operator
+    /// has confidence in the upstream defences for their workload.
+    /// </summary>
+    public bool EnableHandoffSeeding { get; set; }
+
     public void Validate()
     {
         if (MaxSandboxReuses < 1)

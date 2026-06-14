@@ -7704,6 +7704,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
             // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
             // consumers that read WorkItem.Agent see the agent actually being run.
+            // The handoff brief (when EnableHandoffSeeding is on) is injected by the
+            // CrossAgentHandoffPromptPreprocessor on the next agent invocation; it
+            // reads the fallback history record we write below and asks the wired
+            // ICrossAgentHandoffBriefBuilder for a fenced + sanitised brief. Keep
+            // the prompt unchanged here.
             var trialItem = item with
             {
                 Agent = nextMember.Agent,
