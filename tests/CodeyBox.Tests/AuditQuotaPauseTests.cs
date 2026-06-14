@@ -297,6 +297,60 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditRouting_PausedAuditMemberIgnoredWhenItemEligibilityRejectsIt()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseDb = Path.Combine(_workspace, $"audit-pauses-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            pauseDb,
+            NullLogger<SqliteAgentPauseController>.Instance);
+        await pauses.PauseAsync(AgentKind.Claude, "paused but not eligible for this item", "test");
+
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(true, []));
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Codex, AgentKind.Claude],
+            pauses: pauses,
+            capabilities: new Dictionary<AgentKind, IReadOnlyList<string>>
+            {
+                [AgentKind.Codex] = [WellKnownCapabilities.Audit, "sensitive"],
+                [AgentKind.Claude] = [WellKnownCapabilities.Audit],
+            });
+
+        var codexMember = fix.Router
+            .GetClassMembers("frontier")
+            .Single(m => m.Agent == AgentKind.Codex);
+        fix.Router.MarkExhausted(codexMember, TimeSpan.FromHours(1));
+
+        var itemId = WorkItemId.New();
+        var item = NewItem(AgentKind.Gemini) with
+        {
+            Id = itemId,
+            State = WorkItemState.WorkComplete,
+            WorkBranch = $"codeybox/{itemId.ToString()[..8]}",
+            RequiredCapabilities = ["sensitive"],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            fix.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "work.txt",
+            "work complete\n",
+            "work commit");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForAgentResume, final.State);
+        Assert.Null(final.AgentPauseTarget);
+        Assert.Equal("audit", final.QuotaRetryFrom);
+        Assert.Empty(auditor.Invocations);
+    }
+
+    [Fact]
     public async Task AuditRouting_LegacyNoTagPausedAuditPool_ParksForAgentResume()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -474,6 +528,68 @@ public sealed class AuditQuotaPauseTests : IDisposable
         Assert.True(
             securityAuditor.CallCount >= 2,
             $"security auditor must run on the resumed iteration before Pass; CallCount={securityAuditor.CallCount}");
+    }
+
+    [Fact]
+    public async Task AuditPass_QuotaRetryAdmissionBypassesRecentObservedFailureBeforePass()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var dbPath = Path.Combine(_workspace, $"quota-failures-{Guid.NewGuid():N}.db");
+        using var quotaFailures = new SqliteQuotaFailureStore(dbPath);
+        var auditor = new RoutingLlmAuditor("bugs:llm-review", inv =>
+            inv.CallNumber == 1 ? QuotaResult() : new AuditResult(true, []));
+
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini],
+            quotaFailures: quotaFailures);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+
+        await quotaFailures.RecordAsync(
+            AgentKind.Gemini,
+            modelId: null,
+            QuotaFailureKind.LimitReached,
+            DateTimeOffset.UtcNow,
+            CancellationToken.None);
+        Assert.True(await quotaFailures.HasRecentAsync(
+            AgentKind.Gemini,
+            modelId: null,
+            TimeSpan.FromHours(1),
+            DateTimeOffset.UtcNow,
+            CancellationToken.None));
+
+        var retryDecision = await fix.Router.ResolveQuotaRetryAsync(
+            parked,
+            project: null,
+            CancellationToken.None,
+            WellKnownCapabilities.Audit);
+        Assert.False(retryDecision.ShouldWait, retryDecision.Reason);
+        Assert.False(retryDecision.NoEligibleMembers, retryDecision.Reason);
+
+        var (retrySuccess, retryError, _, _, _) = await fix.Retrier.RetryAsync(
+            parked, from: "audit", trigger: "test-quota-return", CancellationToken.None);
+        Assert.True(retrySuccess, retryError);
+
+        var resumed = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+
+        await fix.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini, AgentKind.Gemini], auditor.Invocations);
     }
 
     [Fact]
@@ -680,6 +796,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             webhooks,
             fallbackHistory,
             time,
+            router,
             gemini,
             codex,
             gitHost);
@@ -769,6 +886,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
         CapturingWebhookDispatcher Webhooks,
         InMemoryAgentFallbackHistoryStore FallbackHistory,
         ManualClock Time,
+        AgentClassRouter Router,
         ScriptableAgent Gemini,
         ScriptableAgent Codex,
         LocalGitHost GitHost) : IDisposable

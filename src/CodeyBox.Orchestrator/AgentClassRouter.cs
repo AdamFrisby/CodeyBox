@@ -1288,30 +1288,44 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     }
 
     /// <summary>
+    /// Returns true when <paramref name="member"/> is a member of the effective
+    /// class for <paramref name="item"/> and passes the same item-specific
+    /// eligibility filters <see cref="OrderedFallbackCandidatesAsync"/> applies:
+    /// the <see cref="WorkItem.MinModelScore"/> floor, the work item's
+    /// <see cref="WorkItem.RequiredCapabilities"/>, and (when
+    /// <paramref name="capability"/> is non-null) the effective class capability
+    /// map for that member. Exhaustion, smoke, quota, and pause state are not
+    /// part of this predicate.
+    /// </summary>
+    public bool IsEligibleClassMemberWithCapability(
+        WorkItem item,
+        Project? project,
+        AgentMembership member,
+        string? capability)
+    {
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (string.IsNullOrEmpty(classId))
+            return false;
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
+            return false;
+
+        if (!agentClass.Members.Any(candidate => SameMemberBucket(candidate, member)))
+            return false;
+
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
+        return IsEligibleMemberForItem(member, item, effectiveCapabilities, capability);
+    }
+
+    /// <summary>
     /// Counts class members that <see cref="OrderedFallbackCandidatesAsync"/>
     /// would have considered for <paramref name="item"/> — i.e. they pass the
-    /// <see cref="WorkItem.MinModelScore"/> floor AND cover the work item's
-    /// <see cref="WorkItem.RequiredCapabilities"/> AND (when
-    /// <paramref name="capability"/> is non-null) directly declare
-    /// <paramref name="capability"/> on that member — and are currently marked
-    /// exhausted in this process's in-cache state. Used by the audit resolver to
+    /// item-specific eligibility filters — and are currently marked exhausted
+    /// in this process's in-cache state. Used by the audit resolver to
     /// disambiguate "no candidate was eligible for non-quota reasons"
     /// (infrastructure) from "every eligible audit-capable member is cached
     /// exhausted" (quota — park for reset) when the fallback walk returns
     /// zero candidates.
-    /// <para>
-    /// When <paramref name="capability"/> is null the capability filter is
-    /// dropped and every class member that meets the score / required-
-    /// capability filters is counted — used by the legacy no-audit-tag
-    /// resolver path where the entire class is the audit pool.
-    /// </para>
-    /// <para>
-    /// The eligibility filter MUST mirror the filter
-    /// <see cref="OrderedFallbackCandidatesAsync"/> applies; otherwise a
-    /// member that could never have been picked for this work item (below
-    /// score floor / missing required capability) can inflate the count and
-    /// park an item that should have surfaced as infrastructure.
-    /// </para>
     /// </summary>
     public int CountEligibleExhaustedClassMembersWithCapability(
         WorkItem item,
@@ -1330,18 +1344,33 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var count = 0;
         foreach (var member in agentClass.Members)
         {
-            if (member.QualityScore < item.MinModelScore)
-                continue;
-            if (!MemberCoversRequiredCapabilities(
-                    member, item.RequiredCapabilities, effectiveCapabilities))
-                continue;
-            if (capability is not null
-                && !MemberHasCapability(member, capability, effectiveCapabilities))
+            if (!IsEligibleMemberForItem(member, item, effectiveCapabilities, capability))
                 continue;
             if (IsExhausted(member, nowUtc))
                 count++;
         }
         return count;
+    }
+
+    private static bool SameMemberBucket(AgentMembership left, AgentMembership right) =>
+        string.Equals(left.RouteKey, right.RouteKey, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left.ModelId ?? string.Empty, right.ModelId ?? string.Empty, StringComparison.Ordinal);
+
+    private static bool IsEligibleMemberForItem(
+        AgentMembership member,
+        WorkItem item,
+        IReadOnlyDictionary<AgentKind, IReadOnlySet<string>> effectiveCapabilities,
+        string? capability)
+    {
+        if (member.QualityScore < item.MinModelScore)
+            return false;
+        if (!MemberCoversRequiredCapabilities(
+                member, item.RequiredCapabilities, effectiveCapabilities))
+            return false;
+        if (capability is not null
+            && !MemberHasCapability(member, capability, effectiveCapabilities))
+            return false;
+        return true;
     }
 
     private static MemberQuotaKey ExhaustionKey(AgentMembership member) =>
@@ -1463,6 +1492,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         => admission is not null
            && string.Equals(admission.RouteKey, member.RouteKey, StringComparison.OrdinalIgnoreCase)
            && string.Equals(admission.ModelId, member.ModelId ?? string.Empty, StringComparison.Ordinal);
+
+    public bool TryConsumeQuotaRetryAdmission(
+        WorkItemId itemId,
+        AgentMembership member,
+        DateTimeOffset nowUtc)
+    {
+        PruneExpiredQuotaRetryAdmissions(nowUtc);
+        var admission = GetQuotaRetryAdmission(itemId, nowUtc);
+        if (!QuotaRetryAdmissionMatches(admission, member))
+            return false;
+
+        ConsumeQuotaRetryAdmission(itemId, admission);
+        return true;
+    }
 
     private void ConsumeQuotaRetryAdmission(WorkItemId itemId, QuotaRetryAdmission? admission)
     {

@@ -2615,7 +2615,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 return reason;
             }
 
-            var (quotaOk, quotaReason) = await EvaluateAuditCandidateQuotaAsync(candidate.Kind, quotaMember, token);
+            var (quotaOk, quotaReason) = await EvaluateAuditCandidateQuotaAsync(item.Id, candidate.Kind, quotaMember, token);
             if (!quotaOk)
             {
                 var reason = $"{candidate.Kind.Value}: {quotaReason}";
@@ -6867,7 +6867,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     if (workAvailability.Available && !IsOperatorPaused(workAvailability))
                     {
                         var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
-                            workRunner.Kind, workProbeMember, ct);
+                            item.Id, workRunner.Kind, workProbeMember, ct);
                         if (workOk)
                             return new AuditAgentSelection(workRunner, workMember);
                         _log.LogInformation(
@@ -6980,7 +6980,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 preferredAvailable = preferredAvailability.Available;
 
                 (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
-                    preferredKind.Value, preferredProbeMember, ct);
+                    item.Id, preferredKind.Value, preferredProbeMember, ct);
             }
         }
         if (!preferredCachedExhausted && preferredPauseReason is null && preferredAvailable && preferredOk)
@@ -7071,7 +7071,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 missingCredentialsCount++;
                 continue;
             }
-            var (memberOk, memberReason) = await EvaluateAuditCandidateQuotaAsync(member.Agent, member, ct);
+            var (memberOk, memberReason) = await EvaluateAuditCandidateQuotaAsync(item.Id, member.Agent, member, ct);
             if (!memberOk)
             {
                 _log.LogInformation(
@@ -7232,7 +7232,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (workAvailability.Available && !IsOperatorPaused(workAvailability))
                 {
                     var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
-                        workRunner.Kind, workProbeMember, ct);
+                        item.Id, workRunner.Kind, workProbeMember, ct);
                     if (workOk)
                         return new AuditAgentSelection(workRunner, workMember);
                     _log.LogInformation(
@@ -7354,7 +7354,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 missingCredentialsCount++;
                 continue;
             }
-            var (memberOk, memberReason) = await EvaluateAuditCandidateQuotaAsync(member.Agent, member, ct);
+            var (memberOk, memberReason) = await EvaluateAuditCandidateQuotaAsync(item.Id, member.Agent, member, ct);
             if (!memberOk)
             {
                 _log.LogInformation(
@@ -7374,7 +7374,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // is misconfiguration, not a quota crunch; surfacing it as quota would
         // misdirect operators investigating the skip.
         if (quotaRejectedCount == 0
-            && await TryGetPausedAuditPoolMemberAsync(project, classId, requireAuditCapability, ct) is { } paused)
+            && await TryGetPausedAuditPoolMemberAsync(item, project, classId, requireAuditCapability, ct) is { } paused)
             throw new AgentPausedException("audit", paused.Agent, paused.Reason);
 
         // OrderedFallbackCandidatesAsync filters out members already marked
@@ -7518,6 +7518,7 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private async Task<(AgentKind Agent, string Reason)?> TryGetPausedAuditPoolMemberAsync(
+        WorkItem item,
         Project project,
         string classId,
         bool requireAuditCapability,
@@ -7529,6 +7530,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
         foreach (var member in members)
         {
+            if (_classRouter is not null
+                && !_classRouter.IsEligibleClassMemberWithCapability(
+                    item,
+                    project,
+                    member,
+                    requireAuditCapability ? WellKnownCapabilities.Audit : null))
+                continue;
+
             if (requireAuditCapability
                 && !MemberHasClassCapability(classId, member, WellKnownCapabilities.Audit))
                 continue;
@@ -7591,9 +7600,17 @@ public sealed class PipelineRunner : IPipelineRunner
     /// on what counts as "available".
     /// </summary>
     private async Task<(bool Allowed, string Reason)> EvaluateAuditCandidateQuotaAsync(
-        AgentKind kind, AgentMembership member, CancellationToken ct)
+        WorkItemId itemId,
+        AgentKind kind,
+        AgentMembership member,
+        CancellationToken ct)
     {
+        var consumedQuotaRetryAdmission = _classRouter?.TryConsumeQuotaRetryAdmission(
+            itemId,
+            member,
+            _opts.TimeProvider.GetUtcNow()) == true;
         if (_quotaFailures is not null
+            && !consumedQuotaRetryAdmission
             && await _quotaFailures.HasRecentAsync(
                 kind, member.ModelId,
                 _auditQuotaOptions.ObservedFailureWindow,
