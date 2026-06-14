@@ -296,6 +296,32 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Contains("CodeyBox-Prompt-Revision: 7", message);
     }
 
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_AppendsCurrentPrNumberWhenTitleEndsWithIssueReference()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(11, "https://github.com/myorg/myrepo/pull/11"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                "fix: handle timeout\n\nHandle timeout failures.\n\nCodeyBox-Prompt-Revision: 7\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            ]));
+        handler.Enqueue(MergeOkResponse("exact-pr-suffix-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with { AutoMerge = true, MergeMethod = "squash" });
+
+        await remote.CompleteAsync(
+            SampleRequest with { Title = "fix: handle timeout (#123)" },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("fix: handle timeout (#123) (#11)",
+            mergeBody.RootElement.GetProperty("commit_title").GetString());
+    }
+
     [Theory]
     [InlineData("[skip ci]")]
     [InlineData("   ")]
@@ -482,6 +508,95 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Contains("CodeyBox-Prompt-Revision: 21", message);
         Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
         Assert.Equal(1, CountOccurrences(message, "Co-Authored-By: CodeyBox"));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_CommitsEmptyUsesRequestRevisionBeforeStaticPrBodyTrailer()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(20, "https://github.com/myorg/myrepo/pull/20"));
+        handler.Enqueue(PullRequestCommitsResponse("[]"));
+        handler.Enqueue(MergeOkResponse("request-revision-before-pr-body-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(
+            SampleRequest with
+            {
+                PromptRevision = 21,
+                Description =
+                    """
+                    This static fallback includes a stale trailer in agent output.
+
+                    ```
+                    CodeyBox-Prompt-Revision: 99
+                    Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+                    ```
+                    """,
+            },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("This static fallback includes a stale trailer in agent output.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 21", message);
+        Assert.DoesNotContain("CodeyBox-Prompt-Revision: 99", message);
+        Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_DuplicateCommitPromptTrailersUseRequestRevision()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(21, "https://github.com/myorg/myrepo/pull/21"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                """
+                feat: avoid ambiguous prompt trailer
+
+                Preserve the request revision when a commit message has
+                duplicate prompt trailers.
+
+                CodeyBox-Prompt-Revision: 22
+                CodeyBox-Prompt-Revision: 99
+                Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+                """,
+            ]));
+        handler.Enqueue(MergeOkResponse("duplicate-prompt-trailer-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(
+            SampleRequest with
+            {
+                PromptRevision = 22,
+                Description = "Fallback description should not decide the trailer.",
+            },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("CodeyBox-Prompt-Revision: 22", message);
+        Assert.DoesNotContain("CodeyBox-Prompt-Revision: 99", message);
+        Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
     }
 
     [Fact]
@@ -761,6 +876,55 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.DoesNotContain("stdout that should not become the squash body", message);
         Assert.Contains("CodeyBox-Prompt-Revision: 8", message);
         Assert.Equal("merged-static-retry", outcome.MergedSha);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ExistingPrNumberWithSquash_PrDescriptionDisabledUsesCommitFallback()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PullRequestResponse(
+            44,
+            "https://github.com/myorg/myrepo/pull/44",
+            "feat: retry with generated body (#44)",
+            """
+            This PR adds generated retry body that should not be reused.
+
+            ## Changes
+            - Updates from the existing PR body.
+
+            CodeyBox-Prompt-Revision: 99
+
+            ---
+            *Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*
+            """));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                "feat: preserve disabled fallback\n\nCompose the squash body from commit messages when PR description generation is disabled.\n\nCodeyBox-Prompt-Revision: 10\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            ]));
+        handler.Enqueue(MergeOkResponse("merged-disabled-existing-pr-retry"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+        var request = SampleRequest with { ExistingPullRequestNumber = 44, PromptRevision = 45 };
+
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Compose the squash body from commit messages", message);
+        Assert.DoesNotContain("generated retry body", message);
+        Assert.DoesNotContain("Updates from the existing PR body", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 10", message);
+        Assert.DoesNotContain("CodeyBox-Prompt-Revision: 99", message);
+        Assert.Equal("merged-disabled-existing-pr-retry", outcome.MergedSha);
     }
 
     [Fact]

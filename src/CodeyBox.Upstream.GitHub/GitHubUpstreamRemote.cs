@@ -546,7 +546,6 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private const string PrFooter = "\n\n---\n*Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*  \n🤖 Generated with [CodeyBox](https://codeybox.invalid)";
 
     private static readonly Regex CollapseWhitespace = new(@"\s+", RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex PullRequestNumberSuffix = new(@"\s\(#\d+\)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex PullRequestNumberOnly = new(@"^\(#\d+\)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex PromptRevisionTrailer = new(
         @"(?im)^\s*\*?CodeyBox-Prompt-Revision\s*:\s*(\d+)\s*\*?\s*$",
@@ -824,9 +823,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         if (string.IsNullOrWhiteSpace(title))
             title = "chore: merge CodeyBox pull request";
 
-        return PullRequestNumberSuffix.IsMatch(title)
+        var expectedSuffix = string.Create(CultureInfo.InvariantCulture, $" (#{prNumber})");
+        return title.EndsWith(expectedSuffix, StringComparison.Ordinal)
             ? title
-            : $"{title} (#{prNumber})";
+            : title + expectedSuffix;
     }
 
     private static string BuildSquashCommitMessage(
@@ -836,8 +836,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     {
         var promptRevision =
             ExtractLastPromptRevision(commitMessages) ??
-            ExtractLastPromptRevision(prDescription?.Body) ??
-            completionRequest.PromptRevision;
+            completionRequest.PromptRevision ??
+            ExtractLastPromptRevision(prDescription?.Body);
 
         var body = prDescription?.Generated == true
             ? CleanProseForCommitMessage(prDescription.Body)
@@ -1122,21 +1122,32 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     {
         int? result = null;
         foreach (var message in commitMessages)
-            if (ExtractLastPromptRevision(message) is { } rev)
-                result = rev;
+        {
+            var revisions = ExtractPromptRevisions(message);
+            if (revisions.Count > 1)
+                return null;
+            if (revisions.Count == 1)
+                result = revisions[0];
+        }
         return result;
     }
 
     private static int? ExtractLastPromptRevision(string? text)
     {
-        if (string.IsNullOrWhiteSpace(text))
-            return null;
+        var revisions = ExtractPromptRevisions(text);
+        return revisions.Count == 0 ? null : revisions[^1];
+    }
 
-        int? result = null;
+    private static IReadOnlyList<int> ExtractPromptRevisions(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return [];
+
+        var revisions = new List<int>();
         foreach (Match match in PromptRevisionTrailer.Matches(text))
             if (int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var rev))
-                result = rev;
-        return result;
+                revisions.Add(rev);
+        return revisions;
     }
 
     private static bool IsSquashMerge(string mergeMethod)
