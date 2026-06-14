@@ -5967,21 +5967,25 @@ public sealed class PipelineRunner : IPipelineRunner
         // Tool auditors don't carry a runner — they stay with workRunner as a
         // harmless sentinel that only affects grouping.
         //
-        // Quota exhaustion in the resolver throws AgentClassExhaustedException
-        // (the resolver walks the spill-to-peer chain internally first and only
-        // raises when every candidate is exhausted). The exception propagates
-        // out of CollectFindingsAsync and the audit loop, parking the item in
-        // WaitingForQuotaReset so the QuotaRetryScheduler resumes the same
-        // audit iteration once quota returns — a silently-skipped auditor
-        // would let a Pass verdict emerge with an incomplete review set.
+        // HARD INVARIANT: every configured auditor must produce a verdict, or
+        // the audit phase must surface a transient-execution failure (park /
+        // infra fail) rather than silently dropping the auditor. The resolver
+        // never returns null — it returns a selection, throws
+        // AgentClassExhaustedException for quota exhaustion (parks the item in
+        // WaitingForQuotaReset; QuotaRetryScheduler resumes the same
+        // iteration once quota returns), AgentPausedException for operator
+        // pauses, or AuditUnavailableException for configuration-shaped
+        // absence (no audit-capable members at all, all candidates missing
+        // runners or credentials) — that last one surfaces via the existing
+        // RunAsync catch as failureKind="infrastructure", not a code-quality
+        // finding. A silently-skipped auditor would let a Pass verdict emerge
+        // with an incomplete review set.
         var resolved = new List<(IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member)>(auditors.Count);
         foreach (var a in auditors)
         {
             if (a.Required.HasFlag(AuditCapabilities.AgentCredentials))
             {
                 var selection = await ResolveAuditAgentRunnerAsync(item, project, a.Name, a.Required, workRunner, ct);
-                if (selection is null)
-                    continue;
                 resolved.Add((a, selection.Runner, selection.Member));
             }
             else
@@ -6677,7 +6681,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// </summary>
     private sealed record AuditAgentSelection(IAgentRunner Runner, AgentMembership? Member);
 
-    private async Task<AuditAgentSelection?> ResolveAuditAgentRunnerAsync(
+    private async Task<AuditAgentSelection> ResolveAuditAgentRunnerAsync(
         WorkItem item,
         Project project,
         string auditorName,
@@ -6914,7 +6918,7 @@ public sealed class PipelineRunner : IPipelineRunner
             message: parkMessage);
     }
 
-    private AuditAgentSelection? WorkRunnerForAuditUnlessPaused(
+    private AuditAgentSelection WorkRunnerForAuditUnlessPaused(
         WorkItem item,
         Project project,
         IAgentRunner workRunner,
@@ -6952,15 +6956,24 @@ public sealed class PipelineRunner : IPipelineRunner
     /// Throws <see cref="AgentClassExhaustedException"/> when at least one
     /// audit-capable candidate was quota-rejected (the work item then parks
     /// in WaitingForQuotaReset rather than passing audit with an incomplete
-    /// review set). Returns null only on configuration-shaped absence (no
-    /// audit-capable members at all), surfacing the misconfig to the
-    /// caller's existing AuditUnavailableException path.
+    /// review set). Throws <see cref="AuditUnavailableException"/> on
+    /// configuration-shaped absence (no audit-capable members at all, every
+    /// candidate missing a registered runner or credentials) — surfacing the
+    /// misconfig as a transient-execution failure that the caller routes via
+    /// the existing RunAsync catch to failureKind="infrastructure". Never
+    /// returns a null selection: a configured auditor that has no usable
+    /// candidate must surface as an explicit failure, not a silent skip
+    /// against which a Pass verdict could still be computed.
     /// </summary>
-    private async Task<AuditAgentSelection?> SelectFromAuditCapablePoolAsync(
+    private async Task<AuditAgentSelection> SelectFromAuditCapablePoolAsync(
         WorkItem item, Project project, string auditorName, string classId, CancellationToken ct)
     {
-        if (_classRouter is null) return null;
+        if (_classRouter is null)
+            throw new AuditUnavailableException(
+                $"LLM auditor '{auditorName}' cannot run: no class router is configured but class '{classId}' is required for audit routing");
         var quotaRejectedCount = 0;
+        var missingRunnerCount = 0;
+        var missingCredentialsCount = 0;
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
             item, project, ct, requireQuota: false))
         {
@@ -6971,6 +6984,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogWarning(
                     "Class '{ClassId}' member '{Member}' has no registered runner for auditor '{Auditor}'; skipping",
                     classId, member.Agent.Value, auditorName);
+                missingRunnerCount++;
                 continue;
             }
             var memberCred = await ResolveAgentCredentialAsync(member, project, ct);
@@ -6979,6 +6993,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogWarning(
                     "Class '{ClassId}' member '{Member}' has no credentials for auditor '{Auditor}'; skipping",
                     classId, member.Agent.Value, auditorName);
+                missingCredentialsCount++;
                 continue;
             }
             var (memberOk, memberReason) = await EvaluateAuditCandidateQuotaAsync(member.Agent, member, ct);
@@ -7021,10 +7036,20 @@ public sealed class PipelineRunner : IPipelineRunner
                 message: parkMessage);
         }
 
-        _log.LogWarning(
-            "LLM auditor '{Auditor}' skipped: no audit-capable member of class '{ClassId}' is available ({Rejected} quota-rejected)",
-            auditorName, classId, quotaRejectedCount);
-        return null;
+        // No usable candidate at all: every member of the audit-capable pool
+        // is missing a registered runner, missing credentials, or the pool is
+        // empty. This is a configuration / operator-environment failure, not
+        // a quota crunch — surface it as a transient infrastructure failure
+        // (AuditUnavailableException) so the audit phase cannot resolve to a
+        // Pass verdict with an incomplete review set. The RunAsync catch
+        // (line 1542) routes it to failureKind="infrastructure" rather than
+        // a code-quality finding (would re-introduce the 1aa5a13f false-
+        // AuditFailed regression) or a silent skip (the bug this fix targets).
+        var infraMessage =
+            $"LLM auditor '{auditorName}' cannot run: no audit-capable member of class '{classId}' is dispatchable " +
+            $"(missing runner={missingRunnerCount}, missing credentials={missingCredentialsCount})";
+        _log.LogWarning(infraMessage);
+        throw new AuditUnavailableException(infraMessage);
     }
 
     private async Task<(AgentKind Agent, string Reason)?> TryGetPausedAuditPoolMemberAsync(

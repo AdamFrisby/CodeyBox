@@ -342,6 +342,89 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditPass_QuotaReturnViaRetryResumesAndAllAuditorsRunBeforePass()
+    {
+        // Hard invariant: after the entire spill-to-peer pool exhausts and
+        // parks the work item in WaitingForQuotaReset, the retry path
+        // (QuotaRetryScheduler / WorkItemRetrier) must re-dispatch the item
+        // and the resumed audit iteration must drive EVERY configured auditor
+        // to a verdict before any Pass verdict is emitted. The first audit
+        // iteration parked because every auditor's class-pool was exhausted;
+        // the resumed iteration must not inherit a stale skipped-auditor
+        // entry that would let the iteration pass with only the previously
+        // successful sibling auditor having run.
+        //
+        // The auditor handler returns QuotaResult on its FIRST call (parking
+        // attempt) and Pass on every subsequent call (post-quota-return).
+        // Driving the same item through resume must therefore observe BOTH
+        // auditors being invoked at least once more before Done.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var bugsAuditor = new RoutingLlmAuditor("bugs:llm-review", inv =>
+            inv.CallNumber == 1 ? QuotaResult() : new AuditResult(true, []));
+        var securityAuditor = new RoutingLlmAuditor("security:llm-review", inv =>
+            inv.CallNumber == 1 ? QuotaResult() : new AuditResult(true, []));
+
+        using var fix = BuildFixture(
+            seed,
+            [bugsAuditor, securityAuditor],
+            [AgentKind.Gemini]);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        // First pass: the single-member class is exhausted for the parking
+        // auditor → audit phase raises AgentClassExhaustedException → item
+        // parks in WaitingForQuotaReset BEFORE any Pass verdict is emitted.
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.DoesNotContain(
+            fix.Webhooks.Events,
+            e => e.Event == "audit.completed"
+                 && e.Details is AuditCompletedDetails details
+                 && string.Equals(details.Verdict, "pass", StringComparison.OrdinalIgnoreCase));
+
+        // Quota returns. Drive the retry path the same way QuotaRetryScheduler
+        // does on the usable-threshold wakeup: WorkItemRetrier.RetryAsync
+        // transitions the parked item back to WorkComplete (from=audit) and
+        // re-enqueues it for pickup. This is the exact code path the
+        // scheduler invokes on quota return.
+        var (retrySuccess, retryError, _, _, _) = await fix.Retrier.RetryAsync(
+            parked, from: "audit", trigger: "test-quota-return", CancellationToken.None);
+        Assert.True(retrySuccess, retryError);
+
+        var resumed = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+
+        // Second pickup: the worker pool would call pipeline.RunAsync on the
+        // dequeued item — mirror that here. The audit phase must now run BOTH
+        // auditors before Pass: a stale skipped-auditor entry surviving the
+        // park would let the iteration pass with only the previously
+        // successful sibling having run, which is exactly the regression
+        // shape this fix forbids.
+        await fix.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        // Every configured auditor must have produced a verdict on the
+        // resumed iteration. The first call to each auditor was the
+        // parking-attempt quota result; the resume must have driven each
+        // auditor to a SECOND invocation (Pass) before the Done verdict.
+        Assert.True(
+            bugsAuditor.CallCount >= 2,
+            $"bugs auditor must run on the resumed iteration before Pass; CallCount={bugsAuditor.CallCount}");
+        Assert.True(
+            securityAuditor.CallCount >= 2,
+            $"security auditor must run on the resumed iteration before Pass; CallCount={securityAuditor.CallCount}");
+    }
+
+    [Fact]
     public async Task AuditPass_PartialAuditorPoolExhaustion_ParksRatherThanCountingAsBlockingFinding()
     {
         // Regression cover for the 1aa5a13f swing: an auditor that cannot
@@ -536,7 +619,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             dispatchAvailability: dispatchAvailability,
             agentPauseController: pauses);
 
-        return new AuditQuotaFixture(pipeline, scheduler, store, queue, webhooks, fallbackHistory, time, gemini, codex);
+        return new AuditQuotaFixture(pipeline, scheduler, retrier, store, queue, webhooks, fallbackHistory, time, gemini, codex);
     }
 
     private static WorkItem NewItem(AgentKind agent) => new()
@@ -599,6 +682,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
     private sealed record AuditQuotaFixture(
         PipelineRunner Pipeline,
         QuotaRetryScheduler Scheduler,
+        WorkItemRetrier Retrier,
         SqliteWorkItemStore Store,
         InMemoryTaskQueue Queue,
         CapturingWebhookDispatcher Webhooks,
