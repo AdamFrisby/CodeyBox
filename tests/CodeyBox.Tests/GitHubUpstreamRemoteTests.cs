@@ -297,6 +297,111 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
+    public async Task CompleteAsync_SquashMerge_GeneratorTimeoutUsesCommitFallbackForCommitMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(22, "https://github.com/myorg/myrepo/pull/22"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                """
+                feat: preserve timeout fallback
+
+                Compose the squash body from commit messages after description generation times out.
+
+                CodeyBox-Prompt-Revision: 51
+                Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+                """,
+            ]));
+        handler.Enqueue(MergeOkResponse("timeout-squash-fallback-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions
+                {
+                    Enabled = true,
+                    Timeout = TimeSpan.FromMilliseconds(50),
+                },
+            },
+            new HangingDescriptionGenerator());
+
+        await remote.CompleteAsync(
+                SampleRequest with
+                {
+                    Description = "This static timeout fallback body should only be used for the PR page.",
+                },
+                CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(30));
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("Add feature X (#22)", mergeBody.RootElement.GetProperty("commit_title").GetString());
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        var normalizedMessage = message.Replace("\n", " ", StringComparison.Ordinal);
+        Assert.Contains(
+            "Compose the squash body from commit messages after description generation times out.",
+            normalizedMessage);
+        Assert.DoesNotContain("static timeout fallback", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("CodeyBox-Prompt-Revision: 51", message);
+        Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
+        Assert.Equal(1, CountOccurrences(message, "Co-Authored-By: CodeyBox"));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_GeneratorExceptionUsesCommitFallbackForCommitMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(23, "https://github.com/myorg/myrepo/pull/23"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                """
+                feat: preserve exception fallback
+
+                Compose the squash body from commit messages after description generation throws.
+
+                CodeyBox-Prompt-Revision: 52
+                Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+                """,
+            ]));
+        handler.Enqueue(MergeOkResponse("exception-squash-fallback-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            },
+            new ThrowingDescriptionGenerator());
+
+        await remote.CompleteAsync(
+            SampleRequest with
+            {
+                Description = "This static exception fallback body should only be used for the PR page.",
+            },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("Add feature X (#23)", mergeBody.RootElement.GetProperty("commit_title").GetString());
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        var normalizedMessage = message.Replace("\n", " ", StringComparison.Ordinal);
+        Assert.Contains(
+            "Compose the squash body from commit messages after description generation throws.",
+            normalizedMessage);
+        Assert.DoesNotContain("static exception fallback", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("CodeyBox-Prompt-Revision: 52", message);
+        Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
+        Assert.Equal(1, CountOccurrences(message, "Co-Authored-By: CodeyBox"));
+    }
+
+    [Fact]
     public async Task CompleteAsync_SquashMerge_AppendsCurrentPrNumberWhenTitleEndsWithIssueReference()
     {
         var gitHost = new FakeGitHost();
