@@ -255,9 +255,11 @@ public sealed class CapacityCalculatorTests : IDisposable
 
     /// <summary>
     /// When no usage events back the time-series (probe runs, usage store is
-    /// empty), the entry reports SampleIntervals=0 (no qualifying drops) and
-    /// no estimate — the calculator must not divide by zero or extrapolate
-    /// from a single zero-token interval.
+    /// empty), the calculator must NOT produce a "zero capacity" estimate —
+    /// a provider-side drain with no captured local usage is an attribution
+    /// gap, not real zero-token burn. The interval is still surfaced in the
+    /// returned series for visibility, but it is excluded from the burn-rate
+    /// denominator and a caveat is added to Notes.
     /// </summary>
     [Fact]
     public async Task ComputeAsync_NoUsageEvents_NoEstimateProduced()
@@ -279,12 +281,18 @@ public sealed class CapacityCalculatorTests : IDisposable
         }, default);
 
         var entry = Assert.Single(report.Entries);
-        // The drop survived MinDeltaPct, so the interval IS counted — but the
-        // computed tokens-per-percent is 0 because no usage events fall in
-        // [t0, t1). That zero is informational, not pathological.
-        Assert.Equal(1, entry.SampleIntervals);
-        Assert.Equal(0d, entry.InputTokensPerPercent!.Value, 0);
-        Assert.Equal(0d, entry.EstimatedFullWindowInputTokens!.Value, 0);
+        // The drop survived MinDeltaPct but no usage events were captured —
+        // the interval is excluded from the burn-rate denominator and no
+        // capacity estimate is produced. The interval still appears in the
+        // returned series so the dashboard can show "drained, no attribution"
+        // visibility, and Notes flags the attribution gap to the operator.
+        Assert.Equal(0, entry.SampleIntervals);
+        Assert.Null(entry.InputTokensPerPercent);
+        Assert.Null(entry.EstimatedFullWindowInputTokens);
+        Assert.Equal(CapacityConfidence.None, entry.Confidence);
+        Assert.Single(entry.Intervals);
+        Assert.Contains(entry.Notes, n => n.Contains("no matching", StringComparison.OrdinalIgnoreCase)
+            || n.Contains("no local consumption", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
@@ -321,6 +329,96 @@ public sealed class CapacityCalculatorTests : IDisposable
         Assert.Equal(100_000d, codexEntry.InputTokensPerPercent!.Value, 0); // 400k / 4%
     }
 
+    /// <summary>
+    /// IncludeIntervals=false suppresses the per-interval series in the
+    /// response but MUST still return the aggregate totals AND the exhaustion
+    /// projection. The auditor flagged that EstimatedExhaustionAt previously
+    /// only fired when intervals were carried back — verify that the
+    /// projection now works regardless of the IncludeIntervals payload knob.
+    /// </summary>
+    [Fact]
+    public async Task ComputeAsync_IncludeIntervalsFalse_OmitsSeries_PreservesTotalsAndExhaustion()
+    {
+        var clock = new FakeClock(DateTimeOffset.Parse("2026-06-14T15:00:00Z"));
+        var probe = new StubProbe(AgentKind.Claude, MakeSnapshot(pct: 100, sevenDayPct: 100));
+        var usage = new FakeUsageStore();
+        await using var plugin = await BuildPluginAsync([probe], usage, clock);
+
+        // 4 ticks at 1h spacing, dropping 5% each tick with usage events.
+        probe.Next = MakeSnapshot(pct: 100, sevenDayPct: 100);
+        await plugin.SampleOnceAsync(default);
+        for (int i = 0; i < 3; i++)
+        {
+            AddEvents(usage, "claude", clock.GetUtcNow(), 1, inputPerEvent: 500_000, outputPerEvent: 100_000, count: 4);
+            clock.Advance(TimeSpan.FromHours(1));
+            probe.Next = MakeSnapshot(pct: 95 - i * 5, sevenDayPct: 95 - i * 5);
+            await plugin.SampleOnceAsync(default);
+        }
+
+        var report = await plugin.ComputeAsync(new CapacityFilter
+        {
+            Agent = "claude",
+            WindowName = "seven_day",
+            IncludeIntervals = false,
+        }, default);
+
+        var entry = Assert.Single(report.Entries);
+        Assert.Empty(entry.Intervals); // series suppressed
+        Assert.Equal(3, entry.SampleIntervals);
+        Assert.Equal(15d, entry.TotalDeltaPct, 3);
+        Assert.NotNull(entry.InputTokensPerPercent);
+        Assert.NotNull(entry.EstimatedFullWindowInputTokens);
+
+        // Latest sample is pct=85 at t=3h; recent burn rate is 5% / hour,
+        // so projected exhaustion ~17h from now.
+        Assert.NotNull(entry.EstimatedExhaustionAt);
+        var hours = (entry.EstimatedExhaustionAt!.Value - clock.GetUtcNow()).TotalHours;
+        Assert.InRange(hours, 15, 20);
+    }
+
+    /// <summary>
+    /// Model-scoped capacity: the calculator and SQL both narrow to the
+    /// requested model_id. A model filter routes to the per-model probe rows
+    /// AND to the per-model usage aggregate. A regression that mismatched the
+    /// model id between the two sides — e.g. passing null to the usage store
+    /// — would surface a wildly wrong tokens-per-percent here.
+    /// </summary>
+    [Fact]
+    public async Task ComputeAsync_ModelFilter_NarrowsBothQuotaAndUsage()
+    {
+        var clock = new FakeClock(DateTimeOffset.Parse("2026-06-14T15:00:00Z"));
+        var probe = new StubProbe(AgentKind.Claude, MakeSnapshotForModel("opus", pct: 100, sevenDayPct: 100));
+        var usage = new FakeUsageStore();
+        await using var plugin = await BuildPluginAsync([probe], usage, clock);
+
+        // Cross-model events should NOT count when the filter narrows to opus.
+        probe.Next = MakeSnapshotForModel("opus", pct: 100, sevenDayPct: 100);
+        await plugin.SampleOnceAsync(default);
+
+        // 2M opus tokens between snapshots; 500k haiku tokens at the same
+        // timestamps must be excluded by the modelId filter.
+        AddEvents(usage, "claude", clock.GetUtcNow(), 1, inputPerEvent: 500_000, outputPerEvent: 100_000, count: 4, model: "opus");
+        AddEvents(usage, "claude", clock.GetUtcNow(), 1, inputPerEvent: 250_000, outputPerEvent: 50_000, count: 2, model: "haiku");
+
+        clock.Advance(TimeSpan.FromHours(1));
+        probe.Next = MakeSnapshotForModel("opus", pct: 98, sevenDayPct: 98);
+        await plugin.SampleOnceAsync(default);
+
+        var report = await plugin.ComputeAsync(new CapacityFilter
+        {
+            Agent = "claude",
+            ModelId = "opus",
+            WindowName = "seven_day",
+        }, default);
+
+        var entry = Assert.Single(report.Entries);
+        Assert.Equal("opus", entry.ModelId);
+        // Only the 2M opus tokens count (haiku is filtered out by ModelId).
+        Assert.Equal(2_000_000, entry.TotalInputTokens);
+        Assert.Equal(1_000_000d, entry.InputTokensPerPercent!.Value, 0); // 2M / 2%
+        Assert.Equal(100_000_000d, entry.EstimatedFullWindowInputTokens!.Value, 0);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────
 
     private static AgentQuotaSnapshot MakeSnapshot(double pct, double sevenDayPct, double? fiveHourPct = null)
@@ -338,6 +436,31 @@ public sealed class CapacityCalculatorTests : IDisposable
         };
     }
 
+    /// <summary>Snapshot carrying per-model quota detail — drives the
+    /// model-scoped time-series rows so model-filtered queries can pick them
+    /// up. The probe still has an overall AvailablePct; the per-model bucket
+    /// is what the calculator narrows to when ModelId is set on the filter.</summary>
+    private static AgentQuotaSnapshot MakeSnapshotForModel(string modelId, double pct, double sevenDayPct)
+        => new()
+        {
+            AvailablePct = pct,
+            Windows = new List<WindowQuota>
+            {
+                new() { Name = "seven_day", AvailablePct = sevenDayPct },
+            },
+            PerModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+            {
+                [modelId] = new ModelQuota
+                {
+                    AvailablePct = pct,
+                    Windows = new List<WindowQuota>
+                    {
+                        new() { Name = "seven_day", AvailablePct = sevenDayPct },
+                    },
+                },
+            },
+        };
+
     private static void AddEvents(
         FakeUsageStore usage,
         string agent,
@@ -345,7 +468,8 @@ public sealed class CapacityCalculatorTests : IDisposable
         int totalHoursToFill,
         int inputPerEvent,
         int outputPerEvent,
-        int count)
+        int count,
+        string? model = null)
     {
         // Spread `count` events evenly across the interval.
         if (count <= 0) return;
@@ -357,6 +481,7 @@ public sealed class CapacityCalculatorTests : IDisposable
                 Id = Guid.NewGuid().ToString("n"),
                 TimeUtc = baseTime + dt * i + TimeSpan.FromSeconds(1),
                 AgentKind = agent,
+                ModelId = model,
                 InputTokens = inputPerEvent,
                 OutputTokens = outputPerEvent,
                 CostMicroCents = 0,

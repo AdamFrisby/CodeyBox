@@ -29,5 +29,19 @@ public sealed class DeferredWorkerPoolOccupancy : IWorkerPoolOccupancy
 
     public DeferredWorkerPoolOccupancy(Func<IWorkerPoolOccupancy> resolve) => _resolve = resolve;
 
-    public int CurrentlyRunningTotal => _resolve().CurrentlyRunningTotal;
+    public int CurrentlyRunningTotal
+    {
+        get
+        {
+            // The OTel SDK retains observable instruments via a weak reference,
+            // so a CodeyBoxObservableMetrics built against a Host that was later
+            // torn down can outlive its DI container until GC reclaims it. When
+            // another MeterListener triggers RecordObservableInstruments in that
+            // window the delegate resolves against a disposed ServiceProvider —
+            // surface that as zero rather than propagating an ObjectDisposedException
+            // through every concurrent listener.
+            try { return _resolve().CurrentlyRunningTotal; }
+            catch (ObjectDisposedException) { return 0; }
+        }
+    }
 }

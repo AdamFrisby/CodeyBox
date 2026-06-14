@@ -45,6 +45,17 @@ public sealed class CapacityCalculator : ICapacityCalculator
     private const int MaxIntervalsReturned = 5000;
     private const int MaxHorizonHours = 24 * 60; // 60 days — beyond this, query plan loses value.
 
+    // Hard upper bound on the number of SumTokensWindowAsync queries any one
+    // (agent, window, model) group can issue from a single /stats/capacity
+    // call. Keeps an authenticated caller — or an accidentally-broad horizon
+    // crossed with a high-frequency sampler — from spinning the SQLite query
+    // engine for tens of thousands of consecutive aggregate reads. At 5,000
+    // intervals this still covers ~14 days at 4-min sampling cadence (or
+    // ~83 hours at 1-min cadence), so the burn-rate signal stays meaningful;
+    // when the cap fires the entry surfaces a caveat note so the operator
+    // sees the truncation rather than silently reading a partial average.
+    private const int MaxIntervalsProcessedPerGroup = 5000;
+
     private readonly IQuotaTimeSeriesStore _timeSeries;
     private readonly IAgentUsageStore _usage;
     private readonly TimeProvider _clock;
@@ -166,9 +177,25 @@ public sealed class CapacityCalculator : ICapacityCalculator
         CancellationToken ct)
     {
         var intervals = new List<CapacityInterval>(capacity: samples.Count - 1);
+        // Recent counted intervals retained for the exhaustion projection even
+        // when filter.IncludeIntervals is false. Bounded to the projection
+        // window (last 3) so the bookkeeping is O(1).
+        var recentCounted = new List<CapacityInterval>(capacity: 3);
         long sumInput = 0, sumCached = 0, sumOutput = 0, sumRequests = 0, sumCost = 0;
         double sumDelta = 0;
         int countedIntervals = 0;
+        int unattributedIntervals = 0;
+
+        // Per-group DoS guard. Process at most MaxIntervalsProcessedPerGroup
+        // intervals; when the cap fires we keep the MOST RECENT slice so the
+        // exhaustion projection still reflects current burn rate, and surface
+        // the truncation as a caveat note. Each interval costs one
+        // SumTokensWindowAsync round-trip to SQLite, so an unbounded loop
+        // here is the documented DoS vector — at 5,000 we still cover ~14
+        // days at 4-minute sampling cadence.
+        var totalIntervals = samples.Count - 1;
+        var processingTruncated = totalIntervals > MaxIntervalsProcessedPerGroup;
+        var startIdx = processingTruncated ? totalIntervals - MaxIntervalsProcessedPerGroup : 0;
 
         // We bucket consecutive samples. For each pair compute deltaPct =
         // prevPct - nextPct. Positive means consumption; negative means the
@@ -178,7 +205,7 @@ public sealed class CapacityCalculator : ICapacityCalculator
         // are nonetheless attributed to that interval (so dashboards can
         // show a spike); the IsWindowReset flag tells the caller to skip
         // them when computing burn rates.
-        for (int i = 0; i < samples.Count - 1; i++)
+        for (int i = startIdx; i < samples.Count - 1; i++)
         {
             ct.ThrowIfCancellationRequested();
 
@@ -194,22 +221,34 @@ public sealed class CapacityCalculator : ICapacityCalculator
             var tokens = await _usage.SumTokensWindowAsync(
                 agent, modelId, prev.SampledAt, next.SampledAt, ct);
 
+            var interval = new CapacityInterval(
+                FromUtc: prev.SampledAt,
+                ToUtc: next.SampledAt,
+                DeltaPct: delta,
+                InputTokens: tokens.InputTokens,
+                CachedInputTokens: tokens.CachedInputTokens,
+                OutputTokens: tokens.OutputTokens,
+                Requests: tokens.Count,
+                CostMicroCents: tokens.SumMicroCents,
+                IsWindowReset: isReset);
+
             if (filter.IncludeIntervals && intervals.Count < MaxIntervalsReturned)
-            {
-                intervals.Add(new CapacityInterval(
-                    FromUtc: prev.SampledAt,
-                    ToUtc: next.SampledAt,
-                    DeltaPct: delta,
-                    InputTokens: tokens.InputTokens,
-                    CachedInputTokens: tokens.CachedInputTokens,
-                    OutputTokens: tokens.OutputTokens,
-                    Requests: tokens.Count,
-                    CostMicroCents: tokens.SumMicroCents,
-                    IsWindowReset: isReset));
-            }
+                intervals.Add(interval);
 
             if (isReset || delta < filter.MinDeltaPct)
                 continue;
+
+            // Provider-side quota drained but no usage events were captured
+            // locally for the matching span. Folding this into the denominator
+            // would imply "zero tokens per percent" — an impossible capacity
+            // signal that would pull the weighted average to absurd values.
+            // Record the gap as a caveat, surface the interval in the series
+            // for visibility, and skip it from the burn-rate sums.
+            if (tokens.Count == 0)
+            {
+                unattributedIntervals++;
+                continue;
+            }
 
             sumDelta += delta;
             sumInput += tokens.InputTokens;
@@ -218,6 +257,12 @@ public sealed class CapacityCalculator : ICapacityCalculator
             sumRequests += tokens.Count;
             sumCost += tokens.SumMicroCents;
             countedIntervals++;
+
+            // Sliding window of the last 3 counted intervals — used by the
+            // exhaustion projection so it works regardless of whether the
+            // caller asked for the full Intervals payload.
+            if (recentCounted.Count == 3) recentCounted.RemoveAt(0);
+            recentCounted.Add(interval);
         }
 
         // Most recent sample drives the current pct + reset + projection.
@@ -239,18 +284,16 @@ public sealed class CapacityCalculator : ICapacityCalculator
             estFullRequests = requestsPerPct * 100.0;
         }
 
-        // Recent burn rate for projection. We use the median over the LAST
-        // up-to-3 counted intervals so a single spike doesn't dominate the
-        // estimated-exhaustion time. Tokens are billable input — the bucket
-        // most directly billed against the subscription's 5h / weekly limit.
+        // Recent burn rate for projection. We use the LAST up-to-3 counted
+        // intervals (collected during the bucketing loop so the projection
+        // works even when filter.IncludeIntervals is false) so a single spike
+        // doesn't dominate the estimated-exhaustion time. Tokens are billable
+        // input — the bucket most directly billed against the subscription's
+        // 5h / weekly limit.
         DateTimeOffset? exhaustionAt = null;
-        if (currentPct is > 0 && intervals.Count > 0)
+        if (currentPct is > 0 && recentCounted.Count > 0)
         {
-            var recent = intervals
-                .Where(iv => !iv.IsWindowReset && iv.DeltaPct >= filter.MinDeltaPct)
-                .TakeLast(3)
-                .ToList();
-            if (recent.Count > 0)
+            var recent = recentCounted;
             {
                 var recentDelta = recent.Sum(iv => iv.DeltaPct);
                 var recentSpan = (recent[^1].ToUtc - recent[0].FromUtc).TotalSeconds;
@@ -275,7 +318,8 @@ public sealed class CapacityCalculator : ICapacityCalculator
             _ => CapacityConfidence.High,
         };
 
-        var notes = BuildNotes(window, countedIntervals, sumCached);
+        var notes = BuildNotes(window, countedIntervals, sumCached, unattributedIntervals,
+            processingTruncated ? totalIntervals - MaxIntervalsProcessedPerGroup : 0);
 
         return new CapacityEntry
         {
@@ -334,12 +378,14 @@ public sealed class CapacityCalculator : ICapacityCalculator
         };
     }
 
-    private static IReadOnlyList<string> BuildNotes(string window, int countedIntervals, long sumCached)
+    private static IReadOnlyList<string> BuildNotes(string window, int countedIntervals, long sumCached, int unattributedIntervals, int droppedOldIntervals)
     {
         var notes = new List<string>();
         if (countedIntervals == 0)
         {
-            notes.Add("No intervals survived noise-floor filtering. Either no usage was recorded or every interval's pct-delta was below the threshold.");
+            notes.Add(unattributedIntervals > 0
+                ? $"No intervals could be attributed to local usage events ({unattributedIntervals} quota-drop interval(s) had no matching agent_usage_events rows). The provider drained quota but no local consumption was captured for the matching span — capacity cannot be estimated."
+                : "No intervals survived noise-floor filtering. Either no usage was recorded or every interval's pct-delta was below the threshold.");
             return notes;
         }
 
@@ -351,6 +397,12 @@ public sealed class CapacityCalculator : ICapacityCalculator
 
         if (sumCached > 0)
             notes.Add("Cached input tokens are billed at a different rate than fresh input — both buckets are reported separately so totals stay meaningful.");
+
+        if (unattributedIntervals > 0)
+            notes.Add($"{unattributedIntervals} quota-drop interval(s) had no matching usage events and were excluded from the burn-rate average — the provider drained quota without local attribution.");
+
+        if (droppedOldIntervals > 0)
+            notes.Add($"Sample volume exceeded the per-group processing cap; oldest {droppedOldIntervals} interval(s) were dropped to keep the burn-rate read O(cap). Narrow the time range to widen coverage.");
 
         return notes;
     }

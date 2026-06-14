@@ -219,11 +219,12 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
         readConn.Open();
 
         using var cmd = readConn.CreateCommand();
-        // Same model-null branch as SumWindowAsync — null modelId aggregates only
-        // null-model events; non-null narrows to that specific model. The capacity
-        // calculator passes null at the agent-window level (cross-model sum is the
-        // probe-side denominator) and a specific id when an operator drills into a
-        // single model bucket.
+        // Null modelId aggregates EVERY model_id row for the agent (cross-model
+        // sum — the capacity calculator's agent-window denominator); non-null
+        // narrows to that specific model. This is the intentionally-opposite
+        // semantics to SumWindowAsync above (which gates on model_id IS NULL on
+        // the null-model branch); the capacity path needs every billable token
+        // attributed to the agent regardless of model bucket.
         cmd.CommandText = """
             SELECT
                 COALESCE(SUM(input_tokens), 0),

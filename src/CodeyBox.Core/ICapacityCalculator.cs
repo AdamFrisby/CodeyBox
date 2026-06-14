@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -179,7 +181,11 @@ public sealed record CapacityInterval(
     long CostMicroCents,
     bool IsWindowReset);
 
-/// <summary>Confidence band on a capacity estimate.</summary>
+/// <summary>Confidence band on a capacity estimate.
+/// Serialized as a string so the wire contract is human-readable and stable
+/// independent of the API's JSON-converter list — admin DTOs and operator
+/// scripts can switch on "Low" / "Medium" / "High" / "None" directly.</summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum CapacityConfidence
 {
     /// <summary>Fewer than 3 counted intervals — the estimate is a hint, not a number.</summary>
