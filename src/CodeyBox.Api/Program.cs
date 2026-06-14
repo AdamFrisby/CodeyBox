@@ -1467,6 +1467,7 @@ builder.Services.AddSingleton<AvailabilityOptions>(sp =>
     {
         FastFailThresholdSeconds = a.FastFailThresholdSeconds,
         MaxConsecutiveFastFails = a.MaxConsecutiveFastFails,
+        MaxConsecutiveNoChanges = a.MaxConsecutiveNoChanges,
         PeriodicSweepInterval = TimeSpan.FromSeconds(Math.Max(0, a.PeriodicSweepIntervalSeconds)),
     };
 });
@@ -2963,9 +2964,11 @@ app.MapGet("/concurrency", async (
             excluded = s.Excluded,
             reason = s.Reason,
             consecutiveFastFails = s.ConsecutiveFastFails,
+            consecutiveNoChanges = s.ConsecutiveNoChanges,
             lastSmokePassedAt = s.LastSmokePassedAt,
             lastSmokeFailedAt = s.LastSmokeFailedAt,
             lastFastFailAt = s.LastFastFailAt,
+            lastNoChangesAt = s.LastNoChangesAt,
         }),
     });
 });
@@ -3066,9 +3069,11 @@ app.MapGet("/admin/agents/availability", (IAgentAvailabilityRegistry registry) =
             excluded = s.Excluded,
             reason = s.Reason,
             consecutiveFastFails = s.ConsecutiveFastFails,
+            consecutiveNoChanges = s.ConsecutiveNoChanges,
             lastSmokePassedAt = s.LastSmokePassedAt,
             lastSmokeFailedAt = s.LastSmokeFailedAt,
             lastFastFailAt = s.LastFastFailAt,
+            lastNoChangesAt = s.LastNoChangesAt,
         }),
     });
 });
@@ -4014,6 +4019,13 @@ namespace CodeyBox.Api
 
         /// <summary>Consecutive sub-threshold non-zero exits before excluding. Default 3.</summary>
         public int MaxConsecutiveFastFails { get; set; } = 3;
+
+        /// <summary>
+        /// Consecutive DISTINCT work items that the agent leaves empty-diff
+        /// (clean exit, no commit) before the no-changes circuit breaker
+        /// excludes the agent. Default 3. Set 0 (or negative) to disable.
+        /// </summary>
+        public int MaxConsecutiveNoChanges { get; set; } = 3;
 
         /// <summary>Background sweep interval in seconds. Default 300 (5 min); set 0 to disable.</summary>
         public int PeriodicSweepIntervalSeconds { get; set; } = 300;

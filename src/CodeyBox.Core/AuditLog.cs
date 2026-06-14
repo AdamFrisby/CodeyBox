@@ -660,6 +660,21 @@ public static class AuditLog
     public static void AgentSmokeFailed(AgentKind agent, string? reason, TimeSpan duration) =>
         AgentSmokeFailed(agent, reason, duration, SmokeFailureCategory.Unknown);
 
+    /// <summary>
+    /// Emitted when the no-changes circuit breaker excludes an agent because
+    /// <paramref name="consecutiveDistinctItems"/> distinct work items in a
+    /// row produced no changes. Operator-actionable: the agent is silently
+    /// broken (auth collapse, capability collapse, or a failure mode we don't
+    /// recognise yet) and needs investigation. Recovery is operator-only via
+    /// <c>POST /admin/agent/{name}/reset</c>.
+    /// </summary>
+    public static void AgentNoChangesBreakerTripped(
+        AgentKind agent, int consecutiveDistinctItems, string? reason) =>
+        Audit("agent.smoke_failed")
+            .Warning(
+                "Agent {Agent} excluded by no-changes circuit breaker after {Count} consecutive distinct work items produced no changes — silent-failure signature; operator action required (diagnose then reset via /admin/agent/{Agent}/reset): {Reason}",
+                agent.Value, consecutiveDistinctItems, agent.Value, reason);
+
     public static void AgentSmokeFailed(
         AgentKind agent, string? reason, TimeSpan duration, SmokeFailureCategory category)
     {

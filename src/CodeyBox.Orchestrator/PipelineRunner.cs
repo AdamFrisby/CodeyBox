@@ -3526,11 +3526,25 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (buildOutcome == RequiredBuildWorkPhaseOutcome.DeferredFailure)
                     return agentResult.Stdout;
 
+                // Feed the no-changes circuit breaker: a clean-exit-but-no-diff
+                // outcome is the silent-failure signature an agent exhibits when
+                // it's broken in a way the fast-fail breaker (non-zero exit only)
+                // cannot see — auth collapse, capability collapse, or a failure
+                // mode whose signature isn't recognised yet. After N consecutive
+                // DISTINCT work items the agent is excluded; the same item
+                // retried doesn't advance the counter.
+                await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
+
                 var msg = isInitial
                     ? "Agent produced no changes to commit"
                     : "Rework agent produced no changes; cannot resolve audit findings";
                 throw new InvalidOperationException(msg);
             }
+
+            // HEAD advanced: this run produced real changes. Clear the
+            // no-changes streak so an isolated empty-diff before this success
+            // is forgotten — only CONSECUTIVE no-changes signal a broken agent.
+            _availability?.RecordChangesProduced(runner.Kind);
 
             // Stamp the CodeyBox trailers on HEAD if the agent forgot to emit them.
             // The dispatch revision is orchestrator-owned state — delegating it to
@@ -4936,6 +4950,48 @@ public sealed class PipelineRunner : IPipelineRunner
                     // construction: the binary launched, exited non-zero fast,
                     // and did so repeatedly. A retry without operator
                     // intervention will produce the same outcome.
+                    Category = SmokeFailureCategory.Persistent,
+                },
+            }, CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// Feeds a "clean exit, working tree unchanged" outcome into the no-changes
+    /// circuit breaker and fires an operator alert when the breaker newly
+    /// excludes the agent. The exception that surfaces the no-changes outcome
+    /// to the caller is thrown by the caller AFTER this method runs, so the
+    /// alert is dispatched even on the trip-and-throw path.
+    /// </summary>
+    private async Task RecordNoChangesOutcomeAsync(
+        AgentKind kind,
+        WorkItem item,
+        Project project)
+    {
+        if (_availability is not { } registry) return;
+        var transition = registry.RecordNoChangesOutcome(kind, item.Id);
+        if (!transition.PreviouslyExcluded && transition.NowExcluded)
+        {
+            AuditLog.AgentNoChangesBreakerTripped(
+                kind,
+                consecutiveDistinctItems: registry
+                    .Snapshot()
+                    .FirstOrDefault(s => s.Agent == kind)?.ConsecutiveNoChanges ?? 0,
+                reason: transition.Reason);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.smoke_failed",
+                WorkItem = item,
+                Project = project,
+                Details = new AgentSmokeFailedDetails
+                {
+                    AgentKind = kind.Value,
+                    Reason = transition.Reason,
+                    // Silent-failure exclusions are persistent by construction:
+                    // an agent that produced N empty diffs in a row needs
+                    // operator diagnosis (auth, capability collapse, or a new
+                    // failure shape) — retrying without intervention will
+                    // produce the same outcome.
                     Category = SmokeFailureCategory.Persistent,
                 },
             }, CancellationToken.None);

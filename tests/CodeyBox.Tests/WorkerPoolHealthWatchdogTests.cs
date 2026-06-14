@@ -829,6 +829,11 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         public AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration) =>
             new(false, !_available, _available ? null : "unavailable");
 
+        public AvailabilityTransition RecordNoChangesOutcome(AgentKind kind, WorkItemId itemId) =>
+            new(false, !_available, _available ? null : "unavailable");
+
+        public void RecordChangesProduced(AgentKind kind) { }
+
         public IReadOnlyList<AgentAvailabilitySnapshot> Snapshot() => [];
     }
 

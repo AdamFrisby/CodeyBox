@@ -5,7 +5,7 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Per-process availability tracker for each registered agent. Two signals
+/// Per-process availability tracker for each registered agent. Three signals
 /// feed it:
 /// <list type="number">
 ///   <item>
@@ -23,6 +23,21 @@ namespace CodeyBox.Orchestrator;
 ///     <see cref="AvailabilityOptions.MaxConsecutiveFastFails"/> consecutive
 ///     fast-fails the agent is excluded. A successful run (or a normal-length
 ///     failure) resets the counter.
+///   </item>
+///   <item>
+///     <b>No-changes circuit breaker</b> — clean-exit runs that leave the
+///     working tree unchanged ("Agent produced no changes to commit"). The
+///     fast-fail breaker only counts non-zero exits, so a silently-broken
+///     agent (auth collapse, capability collapse, or an unknown failure mode
+///     that still exits 0) is never excluded by that path and keeps consuming
+///     the backlog. After
+///     <see cref="AvailabilityOptions.MaxConsecutiveNoChanges"/> CONSECUTIVE
+///     DISTINCT work items produce no changes the agent is excluded. The same
+///     work item retried does not advance the counter, so a single hard item
+///     can't trip the breaker on its own. Recovery is operator-only via the
+///     existing reset path; a real "produced changes" run between no-changes
+///     outcomes clears the streak so an isolated no-change does not trip
+///     either.
 ///   </item>
 /// </list>
 ///
@@ -221,6 +236,69 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     }
 
     /// <summary>
+    /// Feeds a "clean exit, working tree unchanged" outcome into the no-changes
+    /// circuit breaker. Increments only when <paramref name="itemId"/> is
+    /// distinct from items already counted in the current streak, so a single
+    /// hard item retried multiple times can't trip the breaker on its own.
+    /// Excludes the agent under <see cref="SmokeExclusionSource.NoChangesBreaker"/>
+    /// once the count reaches <see cref="AvailabilityOptions.MaxConsecutiveNoChanges"/>;
+    /// the exclusion is cleared only by operator <see cref="Reset"/>.
+    /// </summary>
+    public AvailabilityTransition RecordNoChangesOutcome(AgentKind kind, WorkItemId itemId)
+    {
+        var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
+        var now = _time.GetUtcNow();
+
+        lock (entry.Sync)
+        {
+            var wasExcluded = entry.IsExcluded;
+            // Disabled when MaxConsecutiveNoChanges <= 0: the operator opted out
+            // of the breaker but still wants the rest of the registry behavior.
+            if (_opts.MaxConsecutiveNoChanges <= 0)
+                return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
+
+            // Dedup: a retry of the same item must not advance the streak —
+            // otherwise one legitimately-empty task could trip the breaker.
+            if (!entry.NoChangesItems.Add(itemId))
+                return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
+
+            entry.ConsecutiveNoChanges = entry.NoChangesItems.Count;
+            entry.LastNoChangesAt = now;
+
+            if (entry.ConsecutiveNoChanges >= _opts.MaxConsecutiveNoChanges
+                && !entry.Exclusions.ContainsKey(SmokeExclusionSource.NoChangesBreaker))
+            {
+                entry.Exclusions[SmokeExclusionSource.NoChangesBreaker] =
+                    $"no-changes circuit breaker: {entry.ConsecutiveNoChanges} consecutive distinct work items produced no changes (silent-failure signature)";
+                _log.LogWarning(
+                    "Agent {Agent} excluded by no-changes circuit breaker after {Count} consecutive distinct work items produced no changes — operator action required (reset via /admin/agent/{Agent}/reset after diagnosing)",
+                    kind.Value, entry.ConsecutiveNoChanges, kind.Value);
+                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+            }
+
+            return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
+        }
+    }
+
+    /// <summary>
+    /// Resets the no-changes streak for <paramref name="kind"/> — called when
+    /// the agent successfully produces real changes on a work item. Does NOT
+    /// lift an existing no-changes exclusion (the breaker recovers only via
+    /// <see cref="Reset"/>); in practice an excluded agent is never dispatched
+    /// and so never reaches this signal anyway.
+    /// </summary>
+    public void RecordChangesProduced(AgentKind kind)
+    {
+        if (!_entries.TryGetValue(kind, out var entry)) return;
+        lock (entry.Sync)
+        {
+            if (entry.NoChangesItems.Count == 0) return;
+            entry.NoChangesItems.Clear();
+            entry.ConsecutiveNoChanges = 0;
+        }
+    }
+
+    /// <summary>
     /// Benches <paramref name="kind"/> because it is named in an
     /// <c>AgentClass</c> but has no registered in-VM smoke probe, so its
     /// in-sandbox CLI can never be verified. Called once at startup by the
@@ -263,6 +341,9 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             entry.LastFastFailDuration = null;
             entry.LastSmokePassedAt = null;
             entry.LastSmokeFailedAt = null;
+            entry.NoChangesItems.Clear();
+            entry.ConsecutiveNoChanges = 0;
+            entry.LastNoChangesAt = null;
         }
         _log.LogInformation("Agent {Agent} availability reset by operator", kind.Value);
     }
@@ -287,7 +368,9 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                     ConsecutiveFastFails: entry.ConsecutiveFastFails,
                     LastSmokePassedAt: entry.LastSmokePassedAt,
                     LastSmokeFailedAt: entry.LastSmokeFailedAt,
-                    LastFastFailAt: entry.LastFastFailAt));
+                    LastFastFailAt: entry.LastFastFailAt,
+                    ConsecutiveNoChanges: entry.ConsecutiveNoChanges,
+                    LastNoChangesAt: entry.LastNoChangesAt));
             }
         }
         return results;
@@ -301,6 +384,17 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         public DateTimeOffset? LastSmokeFailedAt;
         public DateTimeOffset? LastFastFailAt;
         public TimeSpan? LastFastFailDuration;
+
+        /// <summary>
+        /// Distinct work-item IDs in the current no-changes streak. The
+        /// no-changes breaker counts distinct items so a single hard task
+        /// retried in place can't trip it. Cleared by a real "produced changes"
+        /// run or by operator reset.
+        /// </summary>
+        public readonly HashSet<WorkItemId> NoChangesItems = new();
+
+        public int ConsecutiveNoChanges;
+        public DateTimeOffset? LastNoChangesAt;
 
         /// <summary>
         /// Active exclusions keyed by the signal that raised them. The agent is
@@ -362,6 +456,16 @@ public enum SmokeExclusionSource
     /// coverage validator; cleared only by operator <see cref="AgentAvailabilityRegistry.Reset"/>.
     /// </summary>
     MissingProbe,
+
+    /// <summary>
+    /// No-changes circuit breaker over real run outcomes. Catches the
+    /// silent-failure signature where an agent exits 0 but leaves the working
+    /// tree unchanged; the fast-fail breaker only counts non-zero exits and
+    /// so misses this pattern (auth collapse, capability collapse, or a
+    /// failure mode whose signature isn't recognised yet). Cleared only by
+    /// operator <see cref="AgentAvailabilityRegistry.Reset"/>.
+    /// </summary>
+    NoChangesBreaker,
 }
 
 /// <summary>
@@ -433,6 +537,14 @@ public sealed record AvailabilityOptions
     /// circuit breaker. Default 3.
     /// </summary>
     public int MaxConsecutiveFastFails { get; init; } = 3;
+
+    /// <summary>
+    /// Number of consecutive DISTINCT work items that produce no changes
+    /// before the no-changes circuit breaker excludes the agent. Default 3.
+    /// Catches the silent-failure signature (clean exit, empty diff) the
+    /// fast-fail breaker doesn't see because it only counts non-zero exits.
+    /// </summary>
+    public int MaxConsecutiveNoChanges { get; init; } = 3;
 
     /// <summary>
     /// Interval between periodic background smoke probe sweeps. Default 5
