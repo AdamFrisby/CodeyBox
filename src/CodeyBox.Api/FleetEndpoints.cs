@@ -9,6 +9,43 @@ internal static class FleetEndpoints
     public static void Map(WebApplication app)
     {
         app.MapGet("/fleet/summary", GetFleetSummaryAsync);
+        app.MapGet("/fleet/transition-health", GetTransitionHealthAsync);
+    }
+
+    private static async Task<IResult> GetTransitionHealthAsync(
+        TransitionHealthService service,
+        CancellationToken ct)
+    {
+        if (!service.Enabled)
+            return Results.NotFound(new { error = "transition-health is disabled" });
+
+        var report = await service.ComputeAsync(ct);
+        return Results.Ok(new
+        {
+            score = report.Score,
+            infraFailureRate = report.InfraFailureRate,
+            window = new
+            {
+                start = report.WindowStart,
+                end = report.WindowEnd,
+                durationSeconds = report.WindowDuration.TotalSeconds,
+                maxTransitions = report.MaxTransitions,
+            },
+            totalTransitions = report.TotalTransitions,
+            legitimateTransitions = report.LegitimateTransitions,
+            infraFailureTransitions = report.InfraFailureTransitions,
+            worstStage = report.WorstStage,
+            stages = report.Stages.Select(s => new
+            {
+                stage = s.Stage,
+                score = s.Score,
+                total = s.Total,
+                legitimate = s.Legitimate,
+                infraFailure = s.InfraFailure,
+                infraByKind = s.InfraByKind,
+            }),
+            infraByKind = report.InfraByKind,
+        });
     }
 
     private static async Task<IResult> GetFleetSummaryAsync(
