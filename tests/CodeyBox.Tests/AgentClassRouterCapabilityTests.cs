@@ -348,6 +348,90 @@ public sealed class AgentClassRouterCapabilityTests
         Assert.Equal(1, count);
     }
 
+    // ── capability == null branch: legacy no-audit-tag class path ─────────────
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_CountsEveryEligibleExhaustedMember()
+    {
+        // Legacy no-audit-tag class path: no member of the class declares the
+        // audit capability tag, so SelectFromAuditClassChainAsync is invoked
+        // with requireAuditCapability=false and the helper is called with
+        // capability=null. Every score-eligible member that is cached-exhausted
+        // must be counted; otherwise the resolver would surface the all-pool-
+        // exhausted state as an infrastructure failure rather than parking the
+        // item in WaitingForQuotaReset (the silent-skip regression this fix
+        // targets).
+        var cls = Class(
+            Member(Claude, 100),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(), project: null, capability: null);
+
+        Assert.Equal(2, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_StillRespectsMinModelScore()
+    {
+        // capability filter dropped, but the score floor still applies — the
+        // helper must mirror OrderedFallbackCandidatesAsync exactly, or the
+        // legacy no-tag path would inflate the exhausted count with members
+        // that could never have been picked for this work item.
+        var cls = Class(
+            Member(Claude, 100),
+            Member(Codex, 70));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(minScore: 90), project: null, capability: null);
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_StillRespectsRequiredCapabilities()
+    {
+        // The legacy no-audit-tag path drops the audit-tag filter, but the
+        // work item's RequiredCapabilities filter remains: a member missing a
+        // required tag could never have been picked, so the exhausted count
+        // must skip it.
+        var cls = Class(
+            Member(Claude, 100, "sensitive"),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(required: "sensitive"), project: null, capability: null);
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_NotExhausted_ReturnsZero()
+    {
+        // capability=null branch: nothing in the class is exhausted, so the
+        // count must be 0 — the resolver falls through to the
+        // configuration-infrastructure error path rather than parking for
+        // quota reset.
+        var cls = Class(
+            Member(Claude, 100),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(), project: null, capability: null);
+
+        Assert.Equal(0, count);
+    }
+
     [Fact]
     public async Task ComputeEarliestExhaustedReset_SkipsMembersBelowMinModelScore()
     {

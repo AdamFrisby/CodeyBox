@@ -126,6 +126,91 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.DoesNotContain("agent exited 1", final.LastError ?? string.Empty);
     }
 
+    // ── Resume after quota return: every auditor runs before a Pass verdict ─
+
+    [Fact]
+    public async Task AllClassMembersExhausted_AtResolveTime_AfterQuotaReturn_RetryDrivesAuditorToCompletion()
+    {
+        // Hard invariant on the audit-tag pool: a Pass verdict must NEVER
+        // emerge while a configured auditor's spill-to-peer pool was entirely
+        // quota-blocked. The companion to
+        // AllClassMembersExhausted_AtResolveTime_ParksWorkItemForQuotaReset
+        // proves the park; this test proves the OTHER half of the invariant:
+        // when quota returns, the retry path actually drives the SAME audit
+        // iteration to a completed verdict (auditor invoked, Done) rather
+        // than carrying a stale skipped-auditor entry that would let the
+        // iteration short-circuit to Pass without the auditor running.
+        // The original AllClassMembersExhausted... test stops at the park;
+        // a regression that parks correctly but then resumes to Done with no
+        // auditor invocation would slip past it.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Claude, AgentKind.Codex],
+            quotas: new()
+            {
+                [AgentKind.Gemini] = 1.0,
+                [AgentKind.Claude] = 2.0,
+                [AgentKind.Codex] = 3.0,
+            },
+            wireRetrier: true);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        // First pass: all probes report below MinQuotaPct → resolver throws
+        // AgentClassExhaustedException → item parks in WaitingForQuotaReset
+        // BEFORE any auditor is dispatched.
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Empty(auditor.Invocations);
+
+        // Quota returns: flip every class member's probe back above MinQuotaPct.
+        // This mirrors the production "next quota probe reads fresh headroom"
+        // sequence that QuotaRetryScheduler observes before scheduling retry.
+        foreach (var probe in fix.Probes)
+            probe.SetAvailable(80.0);
+
+        // Drive the retry the same way QuotaRetryScheduler does on quota
+        // return: WorkItemRetrier.RetryAsync transitions the parked item
+        // back to a re-runnable pre-audit state and re-enqueues it for
+        // pickup.
+        Assert.NotNull(fix.Retrier);
+        var (retrySuccess, retryError, _, _, _) = await fix.Retrier!.RetryAsync(
+            parked, from: "audit", trigger: "test-quota-return", CancellationToken.None);
+        Assert.True(retrySuccess, retryError);
+
+        var resumed = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        // Resume target is the pre-audit state the worker pool re-picks up.
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+
+        // Second pickup: mirror what the worker pool does on dequeue.
+        // The audit phase must now actually run the configured auditor
+        // before any Pass verdict — a stale skipped-auditor entry surviving
+        // the park would let the iteration pass with zero auditor calls,
+        // which is exactly the silent-skip regression this fix forbids.
+        await fix.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Auditor MUST have run on the resumed iteration before the Pass
+        // verdict — exactly one invocation, on a member that passed the gate
+        // (gemini is preferred but at 1% on first pass; after the flip it's
+        // healthy and runs the auditor; if the preferred path were skipped
+        // the chain walk would still land on a class member). Either way
+        // the count must be exactly one and the invocation must be a real
+        // class member, not the empty list the park produced.
+        Assert.Single(auditor.Invocations);
+        Assert.Contains(auditor.Invocations[0],
+            new[] { AgentKind.Gemini, AgentKind.Claude, AgentKind.Codex });
+    }
+
     [Fact]
     public async Task PerAgentFloorOverride_AuditGateRejectsReservedPreferredAndAllowsBurnFallback()
     {
@@ -634,7 +719,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         QuotaRouterOptions? routerQuotaOptions = null,
         QuotaRouterOptions? auditQuotaOptions = null,
         DateTimeOffset? quotaResetAt = null,
-        Dictionary<AgentKind, IReadOnlyList<WindowQuota>>? quotaWindows = null)
+        Dictionary<AgentKind, IReadOnlyList<WindowQuota>>? quotaWindows = null,
+        bool wireRetrier = false)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -670,14 +756,15 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         var throwSet = throwingProbes is null
             ? new HashSet<AgentKind>()
             : new HashSet<AgentKind>(throwingProbes);
-        var probes = classMembers
-            .Select(kind => (IAgentQuotaProbe)new ConfigurableProbe(
+        var configurableProbes = classMembers
+            .Select(kind => new ConfigurableProbe(
                 kind,
                 quotas?.GetValueOrDefault(kind, 80.0) ?? 80.0,
                 quotaResetAt,
                 quotaWindows?.GetValueOrDefault(kind),
                 shouldThrow: throwSet.Contains(kind)))
             .ToList();
+        var probes = configurableProbes.Cast<IAgentQuotaProbe>().ToList();
         var effectiveRouterQuotaOptions = routerQuotaOptions ?? quotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 };
         var effectiveAuditQuotaOptions = auditQuotaOptions ?? quotaOptions ?? effectiveRouterQuotaOptions;
         effectiveRouterQuotaOptions.UnknownPolicy = unknownPolicy;
@@ -712,6 +799,11 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         var projects = new InMemoryProjectRepository(project);
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
 
+        var queue = wireRetrier ? new InMemoryTaskQueue() : null;
+        var retrier = wireRetrier
+            ? new WorkItemRetrier(store, queue!, gitHost, NullLogger<WorkItemRetrier>.Instance)
+            : null;
+
         var pipeline = new PipelineRunner(
             sandboxes,
             gitHost,
@@ -738,7 +830,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             budgetProvider: budgetProvider,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
-        return new RoutingFixture(pipeline, store, webhooks, codex);
+        return new RoutingFixture(pipeline, store, webhooks, codex, router, configurableProbes, retrier);
     }
 
     private static WorkItem NewItem(AgentKind agent) => new()
@@ -805,6 +897,10 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             _pct = 0.0;
             return Task.CompletedTask;
         }
+        // Lets the resume test flip the probe back to healthy after the initial
+        // park — mirrors the production "quota recovers, next probe sees fresh
+        // headroom" sequence.
+        public void SetAvailable(double pct) => _pct = pct;
     }
 
     private sealed class FakeBudgetProvider : IAgentBudgetProvider
@@ -853,7 +949,10 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         PipelineRunner Pipeline,
         SqliteWorkItemStore Store,
         CapturingWebhookDispatcher Webhooks,
-        ScriptableAgent? Codex) : IDisposable
+        ScriptableAgent? Codex,
+        AgentClassRouter Router,
+        IReadOnlyList<ConfigurableProbe> Probes,
+        WorkItemRetrier? Retrier) : IDisposable
     {
         public void Dispose() => Store.Dispose();
     }

@@ -388,9 +388,12 @@ public sealed class BudgetEnforcementTests : IDisposable
         // the first item 30 s, and the dispatch loop has to walk each
         // successor through enqueue → pickup → defer; a stingy 10 s window
         // has been observed to expire on heavily-loaded test hosts even
-        // though the consumer-side logic is healthy. Match the
-        // running-deadline budget to stay coherent with the slowest path.
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        // though the consumer-side logic is healthy. The full audit suite
+        // runs many integration tests in parallel, so the dispatch loop can
+        // be CPU-starved for longer than the first item's run window itself
+        // — give the second walk an independent 60 s budget to absorb that
+        // pressure without flaking.
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(60);
         while (!successors.All(svc.IsDeferredForTest)
                && DateTimeOffset.UtcNow < deferDeadline)
         {
