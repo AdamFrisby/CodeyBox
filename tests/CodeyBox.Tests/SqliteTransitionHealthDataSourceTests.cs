@@ -150,6 +150,62 @@ public sealed class SqliteTransitionHealthDataSourceTests : IDisposable
     }
 
     [Fact]
+    public async Task Terminal_failure_query_includes_failed_mcrf_and_abandoned_states()
+    {
+        // The terminal-failure SQL filter must follow the WorkItemState enum,
+        // not magic ints. Pins the three INFRA terminal states (Failed,
+        // MergeConflictResolutionFailed, AbandonedAfterRecoveryAttempts) as
+        // included, and Done / Cancelled / AuditFailed as excluded. If a
+        // future renumber of the enum decouples from the SQL, this test
+        // breaks instead of the metric silently bucketing the wrong items.
+        using var workItems = new SqliteWorkItemStore(_dbPath);
+        var now = DateTimeOffset.UtcNow;
+
+        async Task<WorkItemId> Insert(WorkItemState state, string? failureKind = null)
+        {
+            var id = WorkItemId.New();
+            await workItems.CreateAsync(new WorkItem
+            {
+                Id = id,
+                ProjectId = new ProjectId("project-a"),
+                Title = "t",
+                Prompt = "p",
+                Agent = new AgentKind("claude"),
+                State = state,
+                FailureKind = failureKind,
+                CreatedAt = now.AddHours(-2),
+                UpdatedAt = now.AddMinutes(-5),
+            });
+            return id;
+        }
+
+        var failed = await Insert(WorkItemState.Failed, failureKind: "infrastructure");
+        var mcrf = await Insert(WorkItemState.MergeConflictResolutionFailed);
+        var abandoned = await Insert(WorkItemState.AbandonedAfterRecoveryAttempts);
+        var done = await Insert(WorkItemState.Done);
+        var cancelled = await Insert(WorkItemState.Cancelled);
+        var auditFailed = await Insert(WorkItemState.AuditFailed);
+
+        var source = new SqliteTransitionHealthDataSource(_dbPath);
+        var snapshot = await source.LoadAsync(now.AddHours(-1), now, 1000);
+
+        var returnedStates = snapshot.TerminalFailures
+            .Select(r => r.State)
+            .OrderBy(s => s)
+            .ToArray();
+        Assert.Equal(
+            new[]
+            {
+                (int)WorkItemState.Failed,
+                (int)WorkItemState.AbandonedAfterRecoveryAttempts,
+                (int)WorkItemState.MergeConflictResolutionFailed,
+            }
+            .OrderBy(s => s)
+            .ToArray(),
+            returnedStates);
+    }
+
+    [Fact]
     public void ExtractFindingTitles_pulls_only_titles_and_tolerates_malformed_json()
     {
         var valid = JsonSerializer.Serialize(new[]

@@ -3943,6 +3943,31 @@ namespace CodeyBox.Api
     /// <summary>
     /// Credential smoke test options. Bound from <c>CodeyBox:Smoke</c>.
     /// </summary>
+    public sealed class SmokeConfig
+    {
+        /// <summary>Enable or disable the smoke gate. Default true.</summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>Result cache TTL in minutes. Default 15.</summary>
+        public int CacheTtlMinutes { get; set; } = 15;
+
+        /// <summary>Per-agent timeout for the startup probe in seconds. Default 10.</summary>
+        public int StartupTimeoutSeconds { get; set; } = 10;
+
+        /// <summary>
+        /// Tuning for the availability registry (fast-fail circuit breaker +
+        /// periodic smoke probe sweep). Bound from <c>CodeyBox:Smoke:Availability</c>.
+        /// </summary>
+        public AvailabilityConfig Availability { get; set; } = new();
+
+        /// <summary>
+        /// Tuning for the in-VM smoke prober (binary-presence + auth checks run
+        /// inside a sandbox cloned from the active baseline). Bound from
+        /// <c>CodeyBox:Smoke:InVm</c>.
+        /// </summary>
+        public InVmSmokeConfig InVm { get; set; } = new();
+    }
+
     /// <summary>
     /// Config binding for the transition-health metric. Bound from
     /// <c>CodeyBox:TransitionHealth</c>. All fields are hot-reloadable; see
@@ -3967,31 +3992,6 @@ namespace CodeyBox.Api
         /// happened. Floor 50, ceiling 100_000.
         /// </summary>
         public int? MaxTransitions { get; set; }
-    }
-
-    public sealed class SmokeConfig
-    {
-        /// <summary>Enable or disable the smoke gate. Default true.</summary>
-        public bool Enabled { get; set; } = true;
-
-        /// <summary>Result cache TTL in minutes. Default 15.</summary>
-        public int CacheTtlMinutes { get; set; } = 15;
-
-        /// <summary>Per-agent timeout for the startup probe in seconds. Default 10.</summary>
-        public int StartupTimeoutSeconds { get; set; } = 10;
-
-        /// <summary>
-        /// Tuning for the availability registry (fast-fail circuit breaker +
-        /// periodic smoke probe sweep). Bound from <c>CodeyBox:Smoke:Availability</c>.
-        /// </summary>
-        public AvailabilityConfig Availability { get; set; } = new();
-
-        /// <summary>
-        /// Tuning for the in-VM smoke prober (binary-presence + auth checks run
-        /// inside a sandbox cloned from the active baseline). Bound from
-        /// <c>CodeyBox:Smoke:InVm</c>.
-        /// </summary>
-        public InVmSmokeConfig InVm { get; set; } = new();
     }
 
     /// <summary>Config binding for the in-VM smoke prober.</summary>

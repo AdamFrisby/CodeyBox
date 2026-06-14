@@ -126,16 +126,37 @@ public sealed class TransitionHealthClassifierTests
     }
 
     [Fact]
-    public void Audit_required_build_verification_unavailable_is_infra_failure()
+    public void Audit_required_build_unavailable_is_infra_failure()
     {
+        // RequiredBuildGate.ToAuditResult emits findings whose title is
+        // "required build unavailable: {DisplayCommand}" when the build
+        // verifier itself could not run. Match by prefix so the command suffix
+        // does not break classification.
         var snapshot = Snapshot(audits: [AuditReport(
             endedAt: Now.AddMinutes(-1),
-            findingTitles: ["RequiredBuildVerificationUnavailable"])]);
+            findingTitles: ["required build unavailable: dotnet build"])]);
 
         var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());
 
         Assert.Equal(1, report.InfraFailureTransitions);
         Assert.Equal(1, report.InfraByKind["build_unavailable"]);
+    }
+
+    [Fact]
+    public void Audit_required_build_failed_is_legitimate_real_finding()
+    {
+        // "required build failed: {DisplayCommand}" represents a real, valid
+        // audit finding (the build genuinely broke). It MUST NOT be mapped to
+        // infra — the audit→rework loop is doing its job. Only the
+        // "unavailable" sibling means the auditor couldn't run.
+        var snapshot = Snapshot(audits: [AuditReport(
+            endedAt: Now.AddMinutes(-1),
+            findingTitles: ["required build failed: dotnet build"])]);
+
+        var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());
+
+        Assert.Equal(1, report.LegitimateTransitions);
+        Assert.Equal(0, report.InfraFailureTransitions);
     }
 
     [Fact]
@@ -257,6 +278,24 @@ public sealed class TransitionHealthClassifierTests
         Assert.Equal(1, report.TotalTransitions);
         Assert.Equal(1, report.InfraFailureTransitions);
         Assert.Equal(0, report.LegitimateTransitions);
+    }
+
+    [Fact]
+    public void Terminal_abandoned_after_recovery_attempts_is_infra()
+    {
+        // AbandonedAfterRecoveryAttempts is the recovery loop giving up after
+        // MaxRecoveryAttempts host-shutdown cycles — the canonical
+        // worker-died-without-preempt-checkpoint infra signature.
+        var snapshot = Snapshot(terminals: [TerminalFailure(
+            state: (int)WorkItemState.AbandonedAfterRecoveryAttempts,
+            failureKind: null,
+            updatedAt: Now.AddMinutes(-5))]);
+
+        var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());
+
+        Assert.Equal(1, report.InfraFailureTransitions);
+        Assert.Equal(1, report.InfraByKind["abandoned_after_recovery_attempts"]);
+        Assert.Equal(TransitionStage.Terminal, report.WorstStage);
     }
 
     [Fact]
@@ -440,14 +479,15 @@ public sealed class TransitionHealthClassifierTests
     [Fact]
     public void Merge_phase_uses_phase_string_contains_check_for_conflict_rework_variants()
     {
-        // PipelineRunner uses "merge" plus a "conflict-rework" variant when
-        // the merge-time conflict-resolution agent runs. Both belong in the
-        // Merge stage bucket so the operator sees one number for "merges
-        // dying".
+        // PipelineRunner uses "merge" plus a "conflict_rework" variant when
+        // the merge-time conflict-resolution agent runs (the literal stored in
+        // agent_involvement.phase is PipelineRunner.ConflictReworkPhaseKey =
+        // "conflict_rework"). Both belong in the Merge stage bucket so the
+        // operator sees one number for "merges dying".
         var snapshot = Snapshot(involvements:
         [
             Involvement("merge", "success", Now.AddMinutes(-30)),
-            Involvement("conflict-rework", "failure:agent", Now.AddMinutes(-20)),
+            Involvement("conflict_rework", "failure:agent", Now.AddMinutes(-20)),
         ]);
 
         var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());

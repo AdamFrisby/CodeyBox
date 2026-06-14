@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeyBox.Core;
 using Microsoft.Data.Sqlite;
 
 namespace CodeyBox.Orchestrator;
@@ -151,13 +152,21 @@ public sealed class SqliteTransitionHealthDataSource : ITransitionHealthDataSour
         int maxRows, CancellationToken ct)
     {
         using var cmd = conn.CreateCommand();
-        // 100 = Failed, 104 = MergeConflictResolutionFailed. The classifier
-        // also accepts these literals; the SQL filters down so we do not pull
-        // every terminal Done/Cancelled row across the window.
-        cmd.CommandText = """
+        // Terminal infra states the classifier scores:
+        //   100 = Failed, 103 = AbandonedAfterRecoveryAttempts,
+        //   104 = MergeConflictResolutionFailed.
+        // Done / Cancelled / AuditFailed are intentionally excluded — Done is
+        // throughput (not a health signal), Cancelled is operator intent, and
+        // AuditFailed (rework-cap hit) is a work-quality outcome whose
+        // preceding audit_report rows already contribute to the audit-stage
+        // score. See docs/transition-health.md.
+        var failedState = (int)WorkItemState.Failed;
+        var abandonedState = (int)WorkItemState.AbandonedAfterRecoveryAttempts;
+        var mcrfState = (int)WorkItemState.MergeConflictResolutionFailed;
+        cmd.CommandText = $"""
             SELECT id, state, failure_kind, updated_at
             FROM work_items
-            WHERE state IN (100, 104)
+            WHERE state IN ({failedState}, {abandonedState}, {mcrfState})
               AND updated_at >= $start
               AND updated_at <= $end
             ORDER BY updated_at DESC
@@ -180,8 +189,6 @@ public sealed class SqliteTransitionHealthDataSource : ITransitionHealthDataSour
         }
         return results;
     }
-
-    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
     /// <summary>
     /// Pulls just the <c>title</c> field out of each finding object in the

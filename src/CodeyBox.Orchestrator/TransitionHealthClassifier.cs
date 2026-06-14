@@ -45,7 +45,16 @@ public static class TransitionHealthClassifier
     };
 
     private const string DidNotWriteResultPrefix = "agent did not write";
-    private const string RequiredBuildVerificationUnavailable = "RequiredBuildVerificationUnavailable";
+
+    // RequiredBuildGate.ToAuditResult and RunForAuditAsync emit findings titled
+    // "required build unavailable: {DisplayCommand}" when the build verifier
+    // itself could not run (probe Unavailable, verifier missing, mount timeout,
+    // etc.) — that's the audit-stage infra signal we want to catch. The matching
+    // "required build failed: {DisplayCommand}" title represents a real,
+    // legitimate blocking finding (the build genuinely broke) and must NOT be
+    // mapped to infra. Match by prefix because the title carries the command
+    // string as a suffix.
+    private const string RequiredBuildUnavailablePrefix = "required build unavailable:";
 
     public static TransitionHealthReport Compute(
         TransitionDataSnapshot snapshot,
@@ -151,7 +160,7 @@ public static class TransitionHealthClassifier
                     TransitionClassification.InfraFailure,
                     "auditor_failed",
                     row.EndedAt);
-            if (string.Equals(title, RequiredBuildVerificationUnavailable, StringComparison.OrdinalIgnoreCase))
+            if (title.StartsWith(RequiredBuildUnavailablePrefix, StringComparison.OrdinalIgnoreCase))
                 return new TransitionRecord(
                     TransitionStage.Audit,
                     TransitionClassification.InfraFailure,
@@ -177,6 +186,19 @@ public static class TransitionHealthClassifier
                 TransitionStage.Terminal,
                 TransitionClassification.InfraFailure,
                 "merge_conflict_resolution_failed",
+                row.UpdatedAt);
+        }
+
+        if (row.State == (int)WorkItemState.AbandonedAfterRecoveryAttempts)
+        {
+            // The recovery loop exhausted MaxRecoveryAttempts after successive
+            // host shutdowns / worker-died-without-checkpoint events without
+            // the item ever completing. By the task taxonomy this is the
+            // "worker-died-without-preempt-checkpoint" infra signature.
+            return new TransitionRecord(
+                TransitionStage.Terminal,
+                TransitionClassification.InfraFailure,
+                "abandoned_after_recovery_attempts",
                 row.UpdatedAt);
         }
 
@@ -244,11 +266,10 @@ public static class TransitionHealthClassifier
             if (t.Classification == TransitionClassification.Skipped)
                 continue;
 
-            if (!perStage.TryGetValue(t.Stage, out var acc))
-            {
-                acc = new StageAccumulator();
-                perStage[t.Stage] = acc;
-            }
+            // perStage is pre-populated with every TransitionStage.AllOrdered
+            // constant above, and every classifier path emits one of those
+            // same constants. Indexer access is therefore safe.
+            var acc = perStage[t.Stage];
 
             if (t.Classification == TransitionClassification.Legitimate)
             {

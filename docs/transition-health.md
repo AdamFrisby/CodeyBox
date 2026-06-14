@@ -50,10 +50,17 @@ A stage transition is an **INFRA failure** when the plumbing — not the work
   titles — `review agent failed to run`, `agent did not write
   audit/result.json` (matched by prefix), `review agent produced invalid
   JSON`. Plus the build-verification gate's
-  `RequiredBuildVerificationUnavailable` finding.
+  `required build unavailable: <command>` finding (matched by prefix —
+  the trailing `<command>` is the display command). Note that the sibling
+  `required build failed: <command>` finding is a real, legitimate
+  blocking finding (the build genuinely broke); it counts as LEGITIMATE,
+  not INFRA.
 - Terminal `Failed` with `failure_kind` ∈ {`quota`, `timeout`, `agent`,
   `agent_unavailable`, `build`, `infrastructure`, `configuration`}.
 - Terminal `MergeConflictResolutionFailed` (always classified as infra).
+- Terminal `AbandonedAfterRecoveryAttempts` — the recovery loop gave up
+  after `MaxRecoveryAttempts` host-shutdown / worker-died cycles. This is
+  the canonical worker-died-without-preempt-checkpoint signature.
 
 A transition is **SKIPPED** (counted in neither numerator nor denominator)
 when it neither represents healthy progress nor an infra failure:
@@ -77,8 +84,11 @@ Transitions come from three persisted signals (no new tables):
 2. `audit_reports` rows for the Audit stage. The classifier inspects each
    row's findings to discriminate real blocking findings (LEGITIMATE) from
    the auditor failing to run (INFRA).
-3. `work_items` rows with `state ∈ {Failed, MergeConflictResolutionFailed}`
-   for terminal failures.
+3. `work_items` rows with `state ∈ {Failed, MergeConflictResolutionFailed,
+   AbandonedAfterRecoveryAttempts}` for terminal failures. `AuditFailed`
+   is intentionally excluded — it represents the rework cap being hit
+   (a work-quality outcome, not an infra failure), and the preceding
+   audit_report rows are already counted by signal #2.
 
 ## Endpoint
 
