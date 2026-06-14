@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -6269,8 +6270,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     await sem.WaitAsync(ct);
                     try
                     {
-                        AuditorRunRecord? run = null;
-                        AgentClassExhaustedException? exhaustion = null;
+                        AuditorRunRecord run;
                         try
                         {
                             run = await RunLlmPairAsync(pair);
@@ -6279,7 +6279,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         {
                             // Every class member exhausted mid-iteration while
                             // running THIS auditor. The whole spill-to-peer pool
-                            // is gone: capture so we can surface after sibling
+                            // is gone: capture and re-raise as the task's
+                            // exception so we can surface it after sibling
                             // tasks finish. The bug report's hard invariant —
                             // a Pass verdict requires every configured auditor
                             // to have produced a verdict — means we must park,
@@ -6293,34 +6294,79 @@ public sealed class PipelineRunner : IPipelineRunner
                             _log.LogWarning(
                                 "LLM auditor '{Auditor}' could not run mid-iteration: all {Members} class member(s) exhausted ({Reason}); parking work item",
                                 pair.Auditor.Name, ex.MemberCount, ex.Message);
-                            exhaustion = ex;
+                            throw;
                         }
-                        return (Run: run, Auditor: pair.Auditor, Exhaustion: exhaustion);
+                        return (Run: run, Auditor: pair.Auditor);
                     }
                     finally { sem.Release(); }
                 }).ToList();
 
-                var llmRuns = await Task.WhenAll(llmTasks);
+                // Wait for ALL tasks to settle (success OR failure) before
+                // inspecting outcomes. A bare `await Task.WhenAll(tasks)`
+                // throws the first faulted task's exception immediately, which
+                // can mask a sibling task's AgentClassExhaustedException and
+                // route the work item to the generic infrastructure-failure
+                // path even though a configured auditor was quota-blocked and
+                // should have parked the item in WaitingForQuotaReset. The
+                // continuation form below never throws — exceptions stay on
+                // each Task and we walk them in stable order.
+                await Task.WhenAll(llmTasks).ContinueWith(
+                    _ => { },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+
+                // Cancellation MUST be honoured before exhaustion / generic
+                // failures are inspected: a cancelled audit phase has to
+                // transition the work item to Cancelled, not Failed. Without
+                // this explicit re-throw, the loop below would skip the
+                // (cancelled, task.Exception=null) entries silently and the
+                // pipeline would mis-route an Operator-initiated cancel.
+                ct.ThrowIfCancellationRequested();
 
                 // HARD INVARIANT: a Pass verdict must never emerge while an
                 // auditor was unable to run because the entire spill-to-peer
-                // pool was quota-exhausted. Surface the exhaustion AFTER
-                // sibling auditors finish so any usable observability they
-                // emit still lands, then bubble out of the audit phase. The
-                // top-level RunAsync catch parks the item in
-                // WaitingForQuotaReset; QuotaRetryScheduler resumes it at the
-                // earliest reset and the same iteration number runs again.
-                var firstExhaustion = llmRuns
-                    .Select(r => r.Exhaustion)
-                    .FirstOrDefault(e => e is not null);
+                // pool was quota-exhausted. Surface exhaustion FIRST (in
+                // stable auditor order), before propagating any sibling
+                // execution exception, so the work item parks for quota
+                // reset instead of being routed to failureKind="other" or
+                // "infrastructure". QuotaRetryScheduler resumes the same
+                // iteration at the earliest reset.
+                AgentClassExhaustedException? firstExhaustion = null;
+                ExceptionDispatchInfo? firstOtherException = null;
+                foreach (var task in llmTasks)
+                {
+                    if (task.IsCompletedSuccessfully) continue;
+                    if (task.IsCanceled)
+                    {
+                        // A per-task cancellation that wasn't covered by the
+                        // outer ct check above (e.g. a phase timeout firing
+                        // on a child token). Surface as cancellation rather
+                        // than letting a downstream .Result re-wrap it as a
+                        // generic failure.
+                        throw new OperationCanceledException(ct);
+                    }
+                    var inner = task.Exception?.InnerException ?? task.Exception;
+                    if (inner is null) continue;
+                    if (firstExhaustion is null && inner is AgentClassExhaustedException exhaustion)
+                        firstExhaustion = exhaustion;
+                    else if (firstExhaustion is null && firstOtherException is null)
+                        firstOtherException = ExceptionDispatchInfo.Capture(inner);
+                }
                 if (firstExhaustion is not null)
                     throw firstExhaustion;
+                firstOtherException?.Throw();
+
+                // Every task succeeded — gather results in stable order.
+                var llmRuns = llmTasks.Select(t => t.Result).ToList();
 
                 // Post-process in stable auditor order (same as llmPairs).
+                // entry.Run is non-nullable here: the only path that could
+                // produce a null record was the silent-skip variant the patch
+                // removed, and exhaustion is now thrown above before we
+                // reach this loop.
                 foreach (var entry in llmRuns)
                 {
-                    if (entry.Run is null)
-                        continue;
                     var run = entry.Run;
                     await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                     if (needsCreds && run.Runner.Kind != workRunner.Kind)
@@ -6647,16 +6693,17 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Picks the agent runner for an LLM-driven auditor invocation. Returns
-    /// <c>null</c> only when the work item has a configured agent class AND
-    /// every audit-eligible member of that class is quota-exhausted — the
-    /// caller then skips the auditor for this iteration instead of parking
-    /// the whole work item.
+    /// Picks the agent runner for an LLM-driven auditor invocation. Always
+    /// returns a non-null <see cref="AuditAgentSelection"/> or throws — a
+    /// silent skip would let a Pass verdict emerge with one fewer review
+    /// than configured, which violates the per-auditor independent-gate
+    /// contract.
     ///
     /// <para>Resolution order:</para>
     /// <list type="number">
     ///   <item>Use the explicitly-configured per-auditor / default audit agent
-    ///         when registered, credentialed, audit-capable, and quota-available.</item>
+    ///         when registered, credentialed, audit-capable, smoke-available,
+    ///         and quota-available.</item>
     ///   <item>If the preferred agent is quota-exhausted AND the work item has
     ///         an agent class configured, walk the class chain (same order the
     ///         work-phase router would use) and pick the first member that is
@@ -6665,6 +6712,22 @@ public sealed class PipelineRunner : IPipelineRunner
     ///         legacy "audit reuses the work agent on misconfiguration" path
     ///         (unregistered audit agent, missing credentials, or quota-exhausted
     ///         agent with no class chain to walk).</item>
+    /// </list>
+    ///
+    /// <para>Failure modes (mutually exclusive, in order of precedence):</para>
+    /// <list type="bullet">
+    ///   <item><see cref="AgentPausedException"/> — operator-paused agent and
+    ///         no usable substitute. Routed to WaitingForAgentResume.</item>
+    ///   <item><see cref="AgentClassExhaustedException"/> — at least one
+    ///         candidate was quota-rejected and no usable substitute remained.
+    ///         Routed to WaitingForQuotaReset; QuotaRetryScheduler resumes the
+    ///         same iteration when quota returns.</item>
+    ///   <item><see cref="AuditUnavailableException"/> — configuration-shaped
+    ///         absence: no candidate was ever dispatchable (smoke-rejected,
+    ///         missing runner, or missing credentials). Routed to
+    ///         <c>failureKind="infrastructure"</c> — distinct from quota
+    ///         because quota returning will not make a smoke-benched CLI or
+    ///         a missing credential usable.</item>
     /// </list>
     ///
     /// <para>
@@ -6841,6 +6904,20 @@ public sealed class PipelineRunner : IPipelineRunner
         var quotaRejectedCount = preferredPauseReason is null && preferredAvailable && !preferredOk
             ? 1
             : 0;
+        // Track configuration-shaped rejections so the final throw can
+        // distinguish "quota exhausted" (park for reset) from "no candidate
+        // was ever dispatchable" (infrastructure failure). The preferred
+        // path's smoke-unavailable count starts at 1 when smoke rejected
+        // the named agent — without that the all-smoke-rejected pool would
+        // surface as a 0-candidate "quota exhausted" message, which both
+        // misleads operators and parks the item behind QuotaRetryScheduler
+        // even though quota returning will not make a smoke-benched CLI
+        // usable.
+        var smokeRejectedCount = preferredPauseReason is null && !preferredAvailable
+            ? 1
+            : 0;
+        var missingRunnerCount = 0;
+        var missingCredentialsCount = 0;
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
             item, project, ct, auditSmokeTarget, requireQuota: false))
         {
@@ -6865,6 +6942,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogWarning(
                     "Class '{ClassId}' member '{Member}' has no registered runner for auditor '{Auditor}'; skipping",
                     classId, member.Agent.Value, auditorName);
+                missingRunnerCount++;
                 continue;
             }
             var memberCred = await ResolveAgentCredentialAsync(member, project, ct);
@@ -6873,6 +6951,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogWarning(
                     "Class '{ClassId}' member '{Member}' has no credentials for auditor '{Auditor}'; skipping",
                     classId, member.Agent.Value, auditorName);
+                missingCredentialsCount++;
                 continue;
             }
             var (memberOk, memberReason) = await EvaluateAuditCandidateQuotaAsync(member.Agent, member, ct);
@@ -6906,16 +6985,36 @@ public sealed class PipelineRunner : IPipelineRunner
         if (preferredPauseReason is not null && quotaRejectedCount == 0)
             throw new AgentPausedException("audit", preferredKind.Value, preferredPauseReason);
 
-        var parkMessage =
-            $"LLM auditor '{auditorName}' cannot run: all {quotaRejectedCount} candidate agent(s) of class '{classId}' quota-exhausted";
-        AuditLog.LlmAuditorParkedQuota(item.Id, auditorName, quotaRejectedCount);
-        _log.LogWarning(parkMessage);
-        throw new AgentClassExhaustedException(
-            classId,
-            phase: "audit",
-            memberCount: quotaRejectedCount,
-            earliestResetAt: null,
-            message: parkMessage);
+        if (quotaRejectedCount > 0)
+        {
+            var parkMessage =
+                $"LLM auditor '{auditorName}' cannot run: all {quotaRejectedCount} candidate agent(s) of class '{classId}' quota-exhausted";
+            AuditLog.LlmAuditorParkedQuota(item.Id, auditorName, quotaRejectedCount);
+            _log.LogWarning(parkMessage);
+            throw new AgentClassExhaustedException(
+                classId,
+                phase: "audit",
+                memberCount: quotaRejectedCount,
+                earliestResetAt: null,
+                message: parkMessage);
+        }
+
+        // Zero quota rejections at this point means every candidate was
+        // filtered out for a non-quota reason: smoke gate, missing runner,
+        // or missing credentials. Reporting this as "quota exhausted" would
+        // both mislead operators investigating the skip AND park the item
+        // behind QuotaRetryScheduler even though quota returning will not
+        // make a smoke-benched CLI / unregistered runner / missing
+        // credential usable. Surface it as a transient infrastructure
+        // failure (AuditUnavailableException) so the RunAsync catch routes
+        // it to failureKind="infrastructure" — distinct from both
+        // "quota" (park-and-retry) and "code-quality finding"
+        // (false-AuditFailed regression from 1aa5a13f).
+        var infraMessage =
+            $"LLM auditor '{auditorName}' cannot run: no candidate agent of class '{classId}' is dispatchable " +
+            $"(smoke-rejected={smokeRejectedCount}, missing runner={missingRunnerCount}, missing credentials={missingCredentialsCount})";
+        _log.LogWarning(infraMessage);
+        throw new AuditUnavailableException(infraMessage);
     }
 
     private AuditAgentSelection WorkRunnerForAuditUnlessPaused(

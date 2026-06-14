@@ -640,6 +640,9 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
     public async Task LlmAgentQuotaFailure_AuditClassExhausted_ParksForQuotaReset_WithParsedReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Probe reports a 1-hour reset, but the parsed stderr tail wins:
+        // we assert the parked QuotaResetAt is the 13-minute parsed value,
+        // not the probe's 60-minute hint.
         var probe = new FixedQuotaProbe(AgentKind.Claude, DateTimeOffset.UtcNow.AddHours(1));
         var frontier = new AgentClass
         {
@@ -684,7 +687,9 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
 
         var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
         await tp.Store.CreateAsync(item);
+        var before = DateTimeOffset.UtcNow;
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        var after = DateTimeOffset.UtcNow;
 
         var final = await tp.Store.GetAsync(item.Id);
         // Single-member audit pool, quota-failing auditor → entire
@@ -692,13 +697,26 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         // silently passing audit.
         Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.NotEqual(WorkItemState.Done, final.State);
+        // Parsed reset MUST win: the 13-minute tail from the stderr
+        // overrides the probe's 60-minute hint. A wider tolerance would
+        // let the probe-reset variant pass silently if the parsed-reset
+        // wiring regressed.
+        Assert.NotNull(final.QuotaResetAt);
+        Assert.InRange(
+            final.QuotaResetAt!.Value,
+            before.AddMinutes(13),
+            after.AddMinutes(13));
+        Assert.Equal(final.QuotaResetAt, final.NextQuotaRetryAt);
     }
 
     [Fact]
     public async Task LlmAgentQuotaFailure_AuditClassExhausted_ParksForQuotaReset_WithProbeResetAvailable()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var resetAt = DateTimeOffset.UtcNow.AddMinutes(17);
+        // Probe reports a 17-minute reset; stderr has no parseable tail so
+        // the resolver falls back to the probe-supplied window. We assert
+        // QuotaResetAt is the probe value, not a default-pause window.
+        var probeResetAt = DateTimeOffset.UtcNow.AddMinutes(17);
         var frontier = new AgentClass
         {
             Id = "frontier",
@@ -716,7 +734,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
         var router = new AgentClassRouter(
             [frontier],
-            [new FixedQuotaProbe(AgentKind.Claude, resetAt)],
+            [new FixedQuotaProbe(AgentKind.Claude, probeResetAt)],
             quotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
@@ -749,6 +767,15 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         // QuotaResetAt so the retry scheduler wakes at the right moment.
         Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.NotNull(final.QuotaResetAt);
+        // Probe reset MUST be threaded through: a 2-second tolerance pins
+        // the exact probe value and would fail if the resolver substituted
+        // an arbitrary default-pause window.
+        var driftTolerance = TimeSpan.FromSeconds(2);
+        Assert.InRange(
+            final.QuotaResetAt!.Value,
+            probeResetAt - driftTolerance,
+            probeResetAt + driftTolerance);
+        Assert.Equal(final.QuotaResetAt, final.NextQuotaRetryAt);
     }
 
     [Fact]
@@ -799,12 +826,109 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
 
         var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
         await tp.Store.CreateAsync(item);
+        var before = DateTimeOffset.UtcNow;
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        var after = DateTimeOffset.UtcNow;
 
         var final = await tp.Store.GetAsync(item.Id);
         // No probe-supplied reset → still parks; the retry scheduler will
-        // use the default quota-failure-pause window.
+        // use the default quota-failure-pause window (5 minutes).
         Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotNull(final.QuotaResetAt);
+        // Default pause MUST be the 5-minute window from
+        // PipelineTuningOptions.DefaultQuotaFailurePause. Without an
+        // assertion that pins the window, an accidental change to an
+        // arbitrary retry interval (e.g. 30s or 24h) would silently pass.
+        Assert.InRange(
+            final.QuotaResetAt!.Value,
+            before.AddMinutes(5),
+            after.AddMinutes(5));
+        Assert.Equal(final.QuotaResetAt, final.NextQuotaRetryAt);
+    }
+
+    // Audit-pool misconfiguration — distinct from quota exhaustion. When the
+    // active audit-capability pool has at least one tagged member but every
+    // candidate is filtered out for a non-quota reason (missing registered
+    // runner, missing credentials, or smoke-rejected), the resolver MUST
+    // surface AuditUnavailableException → failureKind="infrastructure", NOT:
+    //   - park as WaitingForQuotaReset (quota returning would not make a
+    //     missing runner / missing credential appear);
+    //   - fall back to the work agent (would breach the audit-capability
+    //     gate and silently audit on an untagged agent);
+    //   - silently skip the auditor and emit a Pass with one fewer review
+    //     than configured (the 094bb05 hole this commit reverted).
+    [Fact]
+    public async Task AuditPoolMisconfigured_AllMembersLackRegisteredRunner_FailsWithInfrastructureKind()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Class: Claude (work, NOT audit-tagged) + Codex (audit-tagged, but
+        // no Codex runner is registered in the test pipeline so the
+        // candidate cannot be dispatched).
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Codex,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 90,
+                    Capabilities = [WellKnownCapabilities.Audit],
+                },
+            ],
+        };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var router = new AgentClassRouter(
+            [frontier],
+            [],     // no probes — no candidate gets that far
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance);
+
+        // The auditor body should never be invoked — resolution fails first.
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor(
+            "infra-review",
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref auditorCalls);
+                return Task.FromResult(new AuditResult(true, []));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            classRouter: router,
+            auditQuotaOptions: quotaOptions);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Item MUST land terminally failed with failureKind=infrastructure,
+        // NOT Done (silent-skip regression) and NOT WaitingForQuotaReset
+        // (quota-misclassification regression — the architecture finding).
+        Assert.NotEqual(WorkItemState.Done, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        Assert.Equal(WorkItemState.Failed, final.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        // Resolution short-circuited before the auditor body could run —
+        // there is no usable runner to dispatch into.
+        Assert.Equal(0, auditorCalls);
     }
 }
 
