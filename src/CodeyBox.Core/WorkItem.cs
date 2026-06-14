@@ -189,11 +189,12 @@ public sealed record WorkItem
     public int TransientCancelRetries { get; init; }
 
     /// <summary>
-    /// How many times the recovery loop has reset this item from a mid-flight
-    /// state back to a recoverable state after successive host shutdowns. When
-    /// this reaches <c>OrchestratorOptions.MaxRecoveryAttempts</c> the item is
-    /// transitioned to <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>
-    /// instead of being re-queued.
+    /// How many automatic recovery handoffs this item has accumulated since a
+    /// phase last completed successfully. Counts both mid-flight recovery
+    /// resets and same-state durable-boundary redispatches. When the configured
+    /// recovery cap is exceeded, the item is transitioned to
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> instead of
+    /// being re-queued.
     /// </summary>
     public int RecoveryAttempts { get; init; }
 

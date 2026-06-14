@@ -356,18 +356,18 @@ public sealed class WorkItemRecoveryTests : IDisposable
         Assert.Equal(1, queue.Count);
     }
 
-    // ── WorkComplete / AuditPassed / Merged: re-enqueued as-is ───────────────
+    // ── WorkComplete / AuditPassed / Merged: re-enqueued as recovery handoffs ─
 
     [Theory]
     [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.Merged)]
-    public async Task MidFlightPassThroughStates_ReenqueuedWithoutIncrementingAttempts(WorkItemState state)
+    public async Task MidFlightPassThroughStates_ReenqueuedAndIncrementAttempts(WorkItemState state)
     {
-        // WorkComplete / AuditPassed / Merged are natural resting points between pipeline
-        // phases, not indicators of interrupted in-flight work. A routine orchestrator
-        // restart while an item sits in one of these states must not burn a recovery credit.
-        var item = Item(state);
+        // Same-state redispatches still consume the recovery budget. Without this,
+        // a WorkComplete -> Auditing -> WorkComplete livelock can repeatedly return
+        // to a durable boundary and never reach MaxRecoveryAttempts.
+        var item = Item(state, recoveryAttempts: 1);
         await _store.CreateAsync(item);
 
         var queue = new InMemoryTaskQueue();
@@ -380,7 +380,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
 
         var recovered = await _store.GetAsync(item.Id);
         Assert.Equal(state, recovered!.State);
-        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Equal(2, recovered.RecoveryAttempts);
         Assert.Equal(1, queue.Count);
     }
 

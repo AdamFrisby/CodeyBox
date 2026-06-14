@@ -4,6 +4,28 @@ namespace CodeyBox.Orchestrator;
 
 internal static class WorkItemRecoveryPolicy
 {
+    public static int NextRecoveryAttempt(WorkItem item) => item.RecoveryAttempts + 1;
+
+    public static bool ExceedsRecoveryAttempts(int attempts, int maxAttempts)
+        => maxAttempts > 0 && attempts > maxAttempts;
+
+    public static WorkItem ResetRecoveryAttemptsAfterRealProgress(WorkItem item, WorkItemState completedState)
+    {
+        if (item.RecoveryAttempts == 0 || !IsRealProgressCompletionState(completedState))
+            return item;
+
+        return item with { RecoveryAttempts = 0 };
+    }
+
+    private static bool IsRealProgressCompletionState(WorkItemState state) => state switch
+    {
+        WorkItemState.WorkComplete => true,
+        WorkItemState.AuditPassed => true,
+        WorkItemState.Merged => true,
+        WorkItemState.Done => true,
+        _ => false,
+    };
+
     public static bool RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(WorkItem item) =>
         item.JobType is not JobType.CheckAndAct and not JobType.AgentControl
         && item.State is (WorkItemState.Working or WorkItemState.Reworking)
@@ -201,7 +223,7 @@ internal static class WorkItemRecoveryPolicy
         // forever by Build{CheckAndAct,AgentControl}Rerun and never hit the
         // bounded-then-escalate contract the rest of the recovery surface
         // honours.
-        if (maxAttempts > 0 && attempts > maxAttempts)
+        if (ExceedsRecoveryAttempts(attempts, maxAttempts))
         {
             return item with
             {

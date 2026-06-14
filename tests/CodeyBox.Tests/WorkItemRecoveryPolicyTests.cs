@@ -68,6 +68,35 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Same(item.AgentControl, recovered.AgentControl);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged)]
+    [InlineData(WorkItemState.Done)]
+    public void ResetRecoveryAttemptsAfterRealProgress_ClearsCompletionStates(WorkItemState state)
+    {
+        var item = MakeItem(state) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(item, state);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.Merging)]
+    [InlineData(WorkItemState.UpstreamPushing)]
+    public void ResetRecoveryAttemptsAfterRealProgress_PreservesInFlightStates(WorkItemState state)
+    {
+        var item = MakeItem(state) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(item, state);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+    }
+
     [Fact]
     public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_Requeues()
     {

@@ -296,7 +296,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                     $"work item advanced from {item.State}@{item.UpdatedAt:O} to {current.State}@{current.UpdatedAt:O}; recovery skipped");
         }
 
-        var attempts = current.RecoveryAttempts + 1;
+        var attempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(current);
         var now = _time.GetUtcNow();
         var recovered = WorkItemRecoveryPolicy.BuildStaleItemRecovery(
             current,

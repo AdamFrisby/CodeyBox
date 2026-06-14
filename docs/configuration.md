@@ -269,7 +269,7 @@ CPU signal, and active sandbox ownership signal are all stale for
 | `ProcessCpuProgressSignalEnabled` | `true` | Count item-owned host processes whose CPU ticks advance between observations as progress. Sandbox providers derive `CODEYBOX_WORK_ITEM_ID` from `TimingWorkItemId` so the probe is scoped to the work item. |
 | `ActiveSandboxProgressSignalEnabled` | `true` | Count provider-tracked active sandbox ownership as progress. This covers VM-backed providers whose guest CPU is not visible from host `/proc`; providers should omit sandboxes no longer actively owned by a work item. |
 | `PostAgentTransitionTimeout` | `00:10:00` | Bound the post-agent commit, push, and state-transition step. |
-| `MaxRecoveryAttempts` | `10` | Bounded automatic recoveries before transitioning the item to `Failed`; `0` means unlimited. |
+| `MaxRecoveryAttempts` | `10` | Bounded automatic recoveries before transitioning the item to `AbandonedAfterRecoveryAttempts`; `0` means unlimited. |
 
 ---
 

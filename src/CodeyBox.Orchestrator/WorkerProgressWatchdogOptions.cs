@@ -69,7 +69,8 @@ public sealed class WorkerProgressWatchdogOptions
 
     /// <summary>
     /// Maximum number of automatic recovery transitions before the watchdog
-    /// gives up and transitions an item to <c>Failed</c>. Mirrors
+    /// gives up and transitions an item to
+    /// <c>AbandonedAfterRecoveryAttempts</c>. Mirrors
     /// <see cref="DeadWorkerOptions.MaxRecoveryAttempts"/> so a chronically
     /// wedging item cannot loop Working → Queued → Working forever consuming
     /// a slot on every iteration. Watchdog recoveries share the same

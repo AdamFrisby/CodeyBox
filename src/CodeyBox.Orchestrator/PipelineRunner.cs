@@ -11490,7 +11490,9 @@ Original merge-phase failure (for context):
         await RunBoundedPostAgentAsync(item.Id, $"transition-to-{state}", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
-            var next = current.With(state);
+            var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                current.With(state),
+                state);
             await _store.UpdateAsync(next, transitionCt);
             _log.LogInformation("Work item {Id} → {State}", item.Id, state);
             AuditLog.WorkItemTransitioned(item.Id, state.ToString());

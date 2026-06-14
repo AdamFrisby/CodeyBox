@@ -261,25 +261,25 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_OverRecoveryCap_MarksFailedAsExceeded()
+    public async Task Sweep_OverRecoveryCap_AbandonsAsExceeded()
     {
-        // Item already at the cap; the next recovery transitions it to Failed
-        // with the "exceeded MaxRecoveryAttempts" reason (shared helper logic,
-        // verified for both reaper and sweep entry points).
+        // Item already at the cap; the next recovery transitions it to
+        // AbandonedAfterRecoveryAttempts with the shared MaxRecoveryAttempts
+        // reason verified for both reaper and sweep entry points.
         var item = MakeItem(WorkItemState.Auditing, recoveryAttempts: _opts.MaxRecoveryAttempts);
         await _store.CreateAsync(item);
 
         await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
         Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
         Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
         Assert.Equal(0, _queue.Count);
     }
 
     [Fact]
-    public async Task Sweep_PhaseBoundaryStates_NoWorker_RedispatchesWithoutRecoveryAttempt()
+    public async Task Sweep_PhaseBoundaryStates_NoWorker_RedispatchesAndCountsRecoveryAttempt()
     {
         var states = new[]
         {
@@ -290,7 +290,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         var ids = new List<WorkItemId>();
         foreach (var state in states)
         {
-            var item = MakeItem(state) with { LastError = "diagnostic" };
+            var item = MakeItem(state) with { LastError = "diagnostic", RecoveryAttempts = 1 };
             await _store.CreateAsync(item);
             ids.Add(item.Id);
         }
@@ -301,11 +301,30 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         {
             var after = await _store.GetAsync(ids[i]);
             Assert.Equal(states[i], after!.State);
-            Assert.Equal(0, after.RecoveryAttempts);
-            Assert.Equal("diagnostic", after.LastError);
+            Assert.Equal(2, after.RecoveryAttempts);
+            Assert.Null(after.LastError);
         }
         Assert.Equal(states.Length, _queue.Count);
-        Assert.Empty(_webhooks.Events);
+        Assert.Equal(states.Length, _webhooks.Events.Count);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged)]
+    public async Task Sweep_PhaseBoundaryStateAtRecoveryCap_Abandons(WorkItemState state)
+    {
+        var item = MakeItem(state, recoveryAttempts: _opts.MaxRecoveryAttempts);
+        await _store.CreateAsync(item);
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
     }
 
     [Fact]
@@ -473,19 +492,20 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         while (DateTimeOffset.UtcNow < deadline)
         {
             final = await _store.GetAsync(item.Id);
-            if (final is not null && final.State != WorkItemState.Working) break;
+            if (final?.State == WorkItemState.Done) break;
             await Task.Delay(30);
         }
 
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(final);
-        Assert.NotEqual(WorkItemState.Working, final.State);
-        Assert.Equal(1, final.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.Equal(0, final.RecoveryAttempts);
         if (pipeline.EntryStates.TryGetValue(item.Id, out var entryState))
             Assert.Equal(WorkItemState.Queued, entryState);
-        // The recovery attempt count and observed pipeline entry state prove
-        // the orphaned mid-flight Working state was reclaimed before dispatch.
+        // The observed pipeline entry state proves the orphaned mid-flight
+        // Working state was reclaimed before dispatch; successful completion
+        // then clears RecoveryAttempts as real progress.
     }
 
     [Fact]

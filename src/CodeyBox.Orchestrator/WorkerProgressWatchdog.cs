@@ -334,22 +334,21 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         // matching the dead-worker reaper's ceiling. Watchdog interventions
         // count against the same budget — they represent genuine recovery
         // work even if the heartbeat path didn't fire.
-        var attempts = item.RecoveryAttempts + 1;
+        var attempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
         var fromState = item.State;
         var opts = _opts;
         // MaxRecoveryAttempts <= 0 means unlimited. Only enforce when > 0.
         // Mirrors the DeadWorkerReaper / OrchestratorService budget check so
-        // an item that wedges on every pickup eventually Fails rather than
+        // an item that wedges on every pickup is eventually abandoned rather than
         // looping Working → Queued → Working forever and burning a slot per
         // iteration. The preempt-checkpoint branch is exempt: that's a clean
         // resume from a captured ref, not a counted recovery transition.
-        if (opts.MaxRecoveryAttempts > 0
-            && attempts > opts.MaxRecoveryAttempts
+        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts)
             && !(target == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)))
         {
             var failed = item with
             {
-                State = WorkItemState.Failed,
+                State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}); was {fromState} with no progress for {sinceProgressSeconds}s",
                 RecoveryAttempts = attempts,
                 StartedAt = null,
@@ -367,9 +366,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                     ct);
             }
 
-            AuditLog.WorkItemWatchdogRecovered(item.Id, worker.WorkerId, fromState, WorkItemState.Failed, dependentsRestored: 0);
+            AuditLog.WorkItemWatchdogRecovered(item.Id, worker.WorkerId, fromState, WorkItemState.AbandonedAfterRecoveryAttempts, dependentsRestored: 0);
             _log.LogWarning(
-                "Watchdog: work item {ItemId} (worker {WorkerId}) exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                "Watchdog: work item {ItemId} (worker {WorkerId}) exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
                 item.Id, worker.WorkerId, opts.MaxRecoveryAttempts);
 
             if (_webhooks is not null)

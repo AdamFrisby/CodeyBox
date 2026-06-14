@@ -1192,8 +1192,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// <see cref="WorkItem.RecoveryAttempts"/>. Items that exceed
     /// <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> are transitioned to
     /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> instead.
-    /// Durable phase-boundary pass-throughs are re-enqueued without consuming a
-    /// recovery attempt.
+    /// Durable phase-boundary pass-throughs also consume a recovery attempt:
+    /// being redispatched from the same boundary is still an automatic recovery
+    /// handoff, and the pipeline clears the counter when a later phase actually
+    /// completes.
     /// </summary>
     private async Task ReplayPendingAsync(CancellationToken ct)
     {
@@ -1347,8 +1349,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
         {
-            var checkAttempts = item.RecoveryAttempts + 1;
-            if (_opts.MaxRecoveryAttempts > 0 && checkAttempts > _opts.MaxRecoveryAttempts)
+            var checkAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(checkAttempts, _opts.MaxRecoveryAttempts))
             {
                 return item with
                 {
@@ -1367,8 +1369,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
         {
-            var controlAttempts = item.RecoveryAttempts + 1;
-            if (_opts.MaxRecoveryAttempts > 0 && controlAttempts > _opts.MaxRecoveryAttempts)
+            var controlAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(controlAttempts, _opts.MaxRecoveryAttempts))
             {
                 return item with
                 {
@@ -1391,7 +1393,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             {
                 State = WorkItemState.Failed,
                 LastError = "worker died while work phase was running without a preempt checkpoint",
-                RecoveryAttempts = item.RecoveryAttempts + 1,
+                RecoveryAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item),
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
@@ -1410,21 +1412,24 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (targetState is null) return null;
 
-        // Only backward-reset transitions (Auditing→WorkComplete, etc.) and
-        // UpstreamPushing→Merged represent genuinely interrupted in-flight work and count
-        // against the recovery cap. Passthrough re-enqueues (WorkComplete/AuditPassed/Merged
-        // left as-is) are natural resting points — a routine rolling restart should not burn
-        // a recovery credit for items waiting between pipeline phases.
-        bool isInterruptedWork = targetState.Value != item.State;
-        var newAttempts = isInterruptedWork ? item.RecoveryAttempts + 1 : item.RecoveryAttempts;
+        // Every automatic recovery handoff counts against the same budget,
+        // including same-state redispatches from durable phase-boundary states.
+        // Otherwise a WorkComplete -> Auditing -> WorkComplete livelock can reset
+        // itself forever without reaching the cap. The production pipeline clears
+        // RecoveryAttempts only when a phase actually completes.
+        var newAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
 
         // MaxRecoveryAttempts <= 0 means unlimited (no cap). Only enforce when > 0.
-        if (isInterruptedWork && _opts.MaxRecoveryAttempts > 0 && newAttempts > _opts.MaxRecoveryAttempts)
+        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(newAttempts, _opts.MaxRecoveryAttempts))
         {
             return item with
             {
                 State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
+                RecoveryAttempts = newAttempts,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
             };
         }

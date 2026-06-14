@@ -42,9 +42,9 @@ Each active worker fires an `UPDATE worker_registry SET last_heartbeat_at = $now
 3. For each deleted row whose `current_work_item_id IS NOT NULL`:
    - Look up the work item.
    - If it is in a recoverable worker-owned state (see table below), increment `RecoveryAttempts` and transition it.
-   - If it is in a durable phase-boundary state, re-dispatch it without changing state or consuming a recovery attempt.
-   - If `RecoveryAttempts` exceeds `MaxRecoveryAttempts` (default **2**): transition to `Failed` with `LastError = "exceeded MaxRecoveryAttempts"`.
-   - Fire a `work_item.recovered` webhook event for state-changing recovery transitions.
+   - If it is in a durable phase-boundary state, re-dispatch it without changing state, still consuming a recovery attempt.
+   - If `RecoveryAttempts` exceeds `MaxRecoveryAttempts` (default **10**): transition to `AbandonedAfterRecoveryAttempts` with `LastError = "exceeded MaxRecoveryAttempts"`.
+   - Fire a `work_item.recovered` webhook event for recovery handoffs, including same-state phase-boundary redispatches.
    - Re-enqueue the item for immediate pick-up.
 
 The reaper also runs **once synchronously at orchestrator startup** (before the worker pool begins pulling from the queue), ensuring that items orphaned by the _previous_ process crash are recovered before any new work starts.
@@ -55,11 +55,11 @@ The reaper also runs **once synchronously at orchestrator startup** (before the 
 |---|---|---|
 | `Working` | `Failed` | No committed work to preserve; explicit retry required unless a preempt checkpoint exists |
 | `Reworking` | `Queued` | Re-run the work phase from scratch |
-| `WorkComplete` | `WorkComplete` | Re-dispatch audit from the phase boundary without consuming a recovery attempt |
+| `WorkComplete` | `WorkComplete` | Re-dispatch audit from the phase boundary and count the recovery handoff |
 | `Auditing` | `WorkComplete` | Re-audit the same commit |
-| `AuditPassed` | `AuditPassed` | Re-dispatch merge from the phase boundary without consuming a recovery attempt |
+| `AuditPassed` | `AuditPassed` | Re-dispatch merge from the phase boundary and count the recovery handoff |
 | `Merging` | `AuditPassed` | Re-attempt the merge |
-| `Merged` | `Merged` | Re-dispatch upstream push/finalization from the phase boundary without consuming a recovery attempt |
+| `Merged` | `Merged` | Re-dispatch upstream push/finalization from the phase boundary and count the recovery handoff |
 | `UpstreamPushing` | `Merged` | Re-attempt the upstream push |
 | Any terminal state | — (no action) | Already finished |
 | `Queued` | — (no action) | Not worker-owned; safe without intervention |
@@ -75,7 +75,7 @@ All options live under `CodeyBox:DeadWorker`:
 | `HeartbeatInterval` | `00:00:15` | How often each worker updates its heartbeat row |
 | `DeadWorkerThreshold` | `00:01:30` | Workers not seen in this window are presumed dead |
 | `CheckInterval` | `00:01:00` | How often the reaper periodic sweep runs |
-| `MaxRecoveryAttempts` | `2` | Cap on automatic recovery transitions before the item is failed permanently |
+| `MaxRecoveryAttempts` | `10` | Cap on automatic recovery transitions before the item is abandoned for operator triage |
 
 **Constraint**: `DeadWorkerThreshold` must be ≥ 3 × `HeartbeatInterval`. Startup validation throws if the constraint is violated.
 
@@ -105,7 +105,7 @@ All options live under `CodeyBox:DeadWorker`:
 | `worker.registered` | Worker slot wrote its registry row |
 | `worker.deregistered` | Worker row deleted on clean exit |
 | `work_item.worker_dead_recovered` | Item recovered by the reaper (below cap) |
-| `work_item.worker_dead_failed_terminal` | Item hit `MaxRecoveryAttempts`; failed permanently |
+| `work_item.worker_dead_failed_terminal` | Item hit `MaxRecoveryAttempts`; abandoned for operator triage |
 
 ### Webhook events
 

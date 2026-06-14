@@ -41,10 +41,7 @@ public sealed class WorkerRecoveryTests : IDisposable
 
         Assert.NotNull(recovered);
         Assert.Equal(expectedState, recovered!.State);
-        if (entryState == expectedState)
-            Assert.Equal(item.RecoveryAttempts, recovered.RecoveryAttempts);
-        else
-            Assert.Equal(item.RecoveryAttempts + 1, recovered.RecoveryAttempts);
+        Assert.Equal(item.RecoveryAttempts + 1, recovered.RecoveryAttempts);
     }
 
     [Fact]
