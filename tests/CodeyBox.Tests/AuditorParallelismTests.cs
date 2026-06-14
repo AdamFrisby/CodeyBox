@@ -930,6 +930,250 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         // there is no usable runner to dispatch into.
         Assert.Equal(0, auditorCalls);
     }
+
+    // Sibling test to AllMembersLackRegisteredRunner: every audit-capable
+    // candidate is registered but the credential provider returns null for it.
+    // The resolver MUST classify this as configuration-shaped (infrastructure)
+    // rather than quota — a returning quota window will not make a missing
+    // credential file appear, so park-and-retry would leave the item spinning
+    // on the QuotaRetryScheduler instead of surfacing the misconfig.
+    [Fact]
+    public async Task AuditPoolMisconfigured_AllMembersLackCredentials_FailsWithInfrastructureKind()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Class: Claude (work, NOT audit-tagged) + Codex (audit-tagged) and
+        // Codex IS in the registry (extraAgentRunners) — so the missing-
+        // runner branch is NOT what filters Codex out. The credential
+        // provider returns null for every agent (StaticCredentialProvider),
+        // so the pool walk hits "no credentials" and increments the
+        // missing-credentials count instead.
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Codex,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 90,
+                    Capabilities = [WellKnownCapabilities.Audit],
+                },
+            ],
+        };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var router = new AgentClassRouter(
+            [frontier],
+            [],
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance);
+
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor(
+            "infra-review",
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref auditorCalls);
+                return Task.FromResult(new AuditResult(true, []));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            classRouter: router,
+            auditQuotaOptions: quotaOptions,
+            // StaticCredentialProvider returns null for every agent —
+            // so Codex (the registered audit-capable candidate) has no
+            // credentials and is filtered out for missing creds, not
+            // quota.
+            extraAgentRunners: [new PoolPassthroughRunner(AgentKind.Codex)]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Same terminal-failure expectation as the missing-runner sibling:
+        // configuration-shaped absence must surface as infrastructure, not
+        // quota-park (which would never resolve) and not silent-pass
+        // (which would breach the every-auditor-runs invariant).
+        Assert.NotEqual(WorkItemState.Done, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        Assert.Equal(WorkItemState.Failed, final.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(0, auditorCalls);
+    }
+
+    // Sibling test to AllMembersLackRegisteredRunner: every audit-capable
+    // candidate is registered + credentialed but the in-VM smoke gate
+    // benches them all. The resolver MUST again classify as
+    // configuration-shaped (infrastructure) — returning quota will not
+    // make a broken sandbox CLI start working, and the bench source must
+    // not be quietly absorbed into a Pass verdict either.
+    [Fact]
+    public async Task AuditPoolMisconfigured_AllMembersSmokeRejected_FailsWithInfrastructureKind()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                // Claude is the work agent, NOT audit-tagged — the work
+                // phase still completes against it. Tag it un-audit so the
+                // pool consists only of Codex; that way the entire audit
+                // pool is smoke-rejected when Codex is benched.
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Codex,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 90,
+                    Capabilities = [WellKnownCapabilities.Audit],
+                },
+            ],
+        };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        // Wire the same in-VM smoke gate into the router AND the pipeline:
+        // OrderedFallbackCandidatesAsync (router) filters smoke-rejected
+        // members from its candidate list, AND EnsureAgentSmokeAvailableAsync
+        // (pipeline) gates dispatch — without both, the pool walk would
+        // still surface Codex and the test would not exercise the
+        // "every audit-capable member smoke-rejected → throw
+        // AuditUnavailableException" branch of SelectFromAuditCapablePoolAsync.
+        var smokeGate = new BenchKindsSmokeGate(AgentKind.Codex);
+        var dispatchAvailability = new AgentDispatchAvailability(inVmSmokeGate: smokeGate);
+        var router = new AgentClassRouter(
+            [frontier],
+            [],
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            dispatchAvailability: dispatchAvailability);
+
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor(
+            "infra-review",
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref auditorCalls);
+                return Task.FromResult(new AuditResult(true, []));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            classRouter: router,
+            auditQuotaOptions: quotaOptions,
+            // Codex is registered and credentialed, but the smoke gate
+            // benches it on probe. OrderedFallbackCandidatesAsync then
+            // filters Codex out of the pool walk, leaving zero
+            // dispatchable audit-capable candidates.
+            extraAgentRunners: [new PoolPassthroughRunner(AgentKind.Codex)],
+            credentials: new GrantCredentialsForProvider(AgentKind.Codex),
+            inVmSmokeGate: smokeGate);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.Done, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        Assert.Equal(WorkItemState.Failed, final.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(0, auditorCalls);
+    }
+}
+
+// Minimal registered runner whose only job is to be in the AgentRegistry so
+// the audit pool walk does not short-circuit on "missing runner" before it
+// reaches the credential / smoke gates. Never actually invoked in these
+// tests — audit resolution fails first.
+file sealed class PoolPassthroughRunner : IAgentRunner
+{
+    public AgentKind Kind { get; }
+    public PoolPassthroughRunner(AgentKind kind) => Kind = kind;
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+        => Task.FromResult(new AgentResult(true, "pool-passthrough", null, null));
+}
+
+// Returns non-null credentials only for the configured kind. Used for the
+// smoke-rejected test where Codex must have credentials so the pool walk
+// reaches the smoke gate (not the missing-credentials gate).
+file sealed class GrantCredentialsForProvider : ICredentialProvider
+{
+    private readonly AgentKind _grantedKind;
+    public GrantCredentialsForProvider(AgentKind grantedKind) => _grantedKind = grantedKind;
+
+    public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        => Task.FromResult<AgentCredential?>(
+            agent == _grantedKind
+                ? new AgentCredential(agent, new Dictionary<string, string>(), new Dictionary<string, string>())
+                : null);
+}
+
+// Minimal in-VM smoke gate that returns Available=false (with a non-quota
+// reason) for every configured kind and Available=true otherwise. Pins the
+// "all audit-capable smoke-rejected" branch of SelectFromAuditCapablePoolAsync
+// — the pool walk's GetGatedAvailabilityAsync filter drops smoke-rejected
+// members, so the resolver throws AuditUnavailableException rather than
+// silently parking on quota.
+file sealed class BenchKindsSmokeGate : IInVmSmokeGate
+{
+    private readonly HashSet<AgentKind> _benched;
+    public BenchKindsSmokeGate(params AgentKind[] kinds) => _benched = [.. kinds];
+
+    public bool Enabled => true;
+
+    public Task<AgentAvailability> EnsureAvailableAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+        => Task.FromResult(_benched.Contains(kind)
+            ? new AgentAvailability(false, "in-VM smoke: bench (test)", null, AgentAvailabilityCause.SmokeGate)
+            : new AgentAvailability(true, null, null));
+
+    public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+    public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+        => Task.FromResult<AgentAvailability?>(_benched.Contains(kind)
+            ? new AgentAvailability(false, "in-VM smoke: bench (test)", null, AgentAvailabilityCause.SmokeGate)
+            : new AgentAvailability(true, null, null));
 }
 
 // ── Test: sandbox isolation ───────────────────────────────────────────────────

@@ -190,6 +190,121 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         Assert.DoesNotContain(AgentKind.Gemini, auditor.Invocations);
     }
 
+    // ── HARD INVARIANT: when no preferred audit agent is configured and the
+    // selected work runner is itself in the audit-capable pool, the resolver
+    // must still gate it on quota before returning. An already-exhausted
+    // work runner has to spill to another audit-capable peer (or park if
+    // the whole pool is exhausted), not be returned blindly. This is the
+    // resolve-time gate that audit:llm-review flagged: previously the
+    // shortcut at PipelineRunner.cs:~6780 trusted the work runner solely on
+    // the audit-capability tag + paused-state check, so an exhausted work
+    // agent could still dispatch the auditor and reach a Pass verdict if
+    // the CLI happened to return cleanly.
+    [Fact]
+    public async Task NoPreferredAuditAgent_WorkAgentAuditCapableButQuotaExhausted_SpillsToPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Both Claude (the work runner) and Codex are audit-capable; Claude
+        // is quota-exhausted at resolve time, Codex is healthy. With no
+        // explicit AuditAgent set, the resolver previously returned the
+        // work runner (Claude) directly without re-gating on quota — the
+        // bug fixed here. The resolver must now spill to Codex.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 1.0,    // exhausted (work runner)
+                [AgentKind.Codex]  = 80.0,   // healthy peer
+            },
+            // No AuditAgent configured — forces the "no preferred kind"
+            // branch of ResolveAuditAgentRunnerAsync, which is the path
+            // that previously bypassed the quota gate for an audit-capable
+            // work runner.
+            preferredAuditAgent: null,
+            defaultAgent: AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit must NOT run on the exhausted work runner; it must spill to
+        // the healthy audit-capable peer. Asserting the exact pick (rather
+        // than "anything but Claude") catches a future regression where the
+        // shortcut returns Claude again and the auditor happens to succeed.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: a sibling auditor's non-quota exception must NOT
+    // mask another auditor's mid-iteration AgentClassExhaustedException.
+    // The settling logic in CollectFindingsAsync (PipelineRunner.cs:~6320)
+    // waits for all parallel tasks to finish, then surfaces exhaustion
+    // FIRST so the work item parks in WaitingForQuotaReset for a quota-
+    // blocked audit; only when no auditor was exhaustion-blocked does a
+    // sibling generic exception propagate. Without this priority, a
+    // sibling InvalidOperationException would route the item to
+    // failureKind=other (or worse, infrastructure) and the
+    // QuotaRetryScheduler would never re-pick it up — the quota would
+    // return and the item would stay terminally Failed.
+    [Fact]
+    public async Task ParallelAuditors_ExhaustionPrioritisedOverSiblingNonQuotaException_ParksForQuotaReset()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Auditor A returns a Claude-shaped quota failure on dispatch; the
+        // single-member audit pool then exhausts in
+        // InvokeAgentWithQuotaFallbackAsync → AgentClassExhaustedException.
+        var quotaAuditor = new RecordingLlmAuditor(
+            "cheating:llm-review",
+            agent => agent == AgentKind.Claude ? QuotaAuditResult() : new AuditResult(true, []));
+        // Auditor B throws a generic (non-quota) exception from inside its
+        // RunAsync body — the same shape an unexpected fault would take.
+        var throwingAuditor = new RecordingLlmAuditor(
+            "security:llm-review",
+            agent => throw new InvalidOperationException(
+                "simulated non-quota auditor body fault (must NOT mask sibling exhaustion)"));
+
+        using var fix = BuildFixture(seed,
+            auditors: [quotaAuditor, throwingAuditor],
+            members: [
+                // Single-member audit pool. Both auditors land on Claude;
+                // the quota-failing auditor's spill therefore exhausts the
+                // whole pool, which is what raises AgentClassExhaustedException.
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Gemini] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Claude,
+            // Parallel dispatch is what makes the settling order matter —
+            // sequential settling would never see both exceptions land at
+            // once.
+            maxLlmAuditorParallelism: 2);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        // The hard invariant: AgentClassExhaustedException wins over a sibling
+        // non-quota exception, so the work item parks for quota reset rather
+        // than landing terminally Failed on the sibling fault.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+    }
+
     // ── AC: per-auditor routing dispatches across distinct audit-capable members ─
 
     [Fact]

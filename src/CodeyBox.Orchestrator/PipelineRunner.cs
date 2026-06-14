@@ -6792,12 +6792,46 @@ public sealed class PipelineRunner : IPipelineRunner
             // selected for auditing). The walk runs the full quota /
             // availability gate on each candidate.
             var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
-            if ((workMember is not null
-                    ? _classRouter?.MemberHasCapability(classId, workMember, WellKnownCapabilities.Audit) == true
-                    : auditPool.Contains(workRunner.Kind))
-                && GetAgentPausedReason(workRunner.Kind) is null)
+            var workIsAuditCapable = workMember is not null
+                ? _classRouter?.MemberHasCapability(classId, workMember, WellKnownCapabilities.Audit) == true
+                : auditPool.Contains(workRunner.Kind);
+            if (workIsAuditCapable && GetAgentPausedReason(workRunner.Kind) is null)
             {
-                return new AuditAgentSelection(workRunner, workMember);
+                // Hard invariant: an audit-capable work member must clear
+                // the SAME smoke + quota gates the preferred branch runs
+                // before it can audit. The earlier shortcut here let an
+                // already smoke-benched or quota-exhausted work runner be
+                // returned and dispatched against an exhausted bucket; the
+                // run could then return cleanly (cached output, partial
+                // success, …) and produce a Pass verdict even though the
+                // audit pool was meant to spill or park. Re-using the
+                // preferred branch's probe-member shape keeps the gate
+                // semantics in lockstep.
+                var workProbeMember = workMember ?? new AgentMembership
+                {
+                    Agent = workRunner.Kind,
+                    Billing = AgentBilling.Subscription,
+                    ModelId = ResolveObservedModelId(workRunner, modelId: null),
+                    QualityScore = 100,
+                };
+                var workAvailability = await EnsureAgentSmokeAvailableAsync(
+                    workRunner.Kind, auditSmokeTarget, ct);
+                if (workAvailability.Available && !IsOperatorPaused(workAvailability))
+                {
+                    var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
+                        workRunner.Kind, workProbeMember, ct);
+                    if (workOk)
+                        return new AuditAgentSelection(workRunner, workMember);
+                    _log.LogInformation(
+                        "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                        workRunner.Kind.Value, workReason, auditorName);
+                }
+                else
+                {
+                    _log.LogInformation(
+                        "Audit-capable work agent '{WorkKind}' rejected (smoke gate: {Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                        workRunner.Kind.Value, workAvailability.Reason ?? "unavailable", auditorName);
+                }
             }
             return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
         }
