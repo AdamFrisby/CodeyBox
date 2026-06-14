@@ -113,11 +113,55 @@ public sealed class WorkItemRecoveryPolicyTests
     [Fact]
     public void ResetRecoveryAttemptsAfterRealProgressEvent_ClearsAfterCompletedRework()
     {
-        var item = MakeItem(WorkItemState.Reworking) with { RecoveryAttempts = 2 };
+        var item = MakeItem(WorkItemState.Reworking) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = WorkItemState.Reworking,
+        };
 
-        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(item);
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(
+            item,
+            RecoveryProgressEvent.AuditReworkCompleted);
 
         Assert.Equal(0, reset.RecoveryAttempts);
+        Assert.Null(reset.RecoveryAttemptSourceState);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgressEvent_PreservesReworkRecoveryOnAuditVerdict()
+    {
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = WorkItemState.Reworking,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(
+            item,
+            RecoveryProgressEvent.AuditVerdictProduced);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Reworking, reset.RecoveryAttemptSourceState);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.Auditing)]
+    public void ResetRecoveryAttemptsAfterRealProgressEvent_ClearsAuditRecoveryOnAuditVerdict(
+        WorkItemState sourceState)
+    {
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = sourceState,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(
+            item,
+            RecoveryProgressEvent.AuditVerdictProduced);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+        Assert.Null(reset.RecoveryAttemptSourceState);
     }
 
     [Fact]

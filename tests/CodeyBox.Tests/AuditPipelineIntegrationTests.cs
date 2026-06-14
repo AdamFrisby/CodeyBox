@@ -514,6 +514,48 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task RecoveredRework_BlockingAuditVerdictDoesNotResetBeforeNextRework()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "needs rework", "x")]),
+            new AuditOutcome(true, []),
+        ], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            webhookDispatcher: webhooks);
+
+        var item = NewItem() with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = WorkItemState.Reworking,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "recovered rework\n", "rework commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "reworked again\n"));
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var reworking = Assert.Single(webhooks.Events, e => e.Event == "work_item.reworking");
+        var reworkingItem = Assert.IsType<WorkItem>(reworking.WorkItem);
+        Assert.Equal(2, reworkingItem.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Reworking, reworkingItem.RecoveryAttemptSourceState);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(0, final.RecoveryAttempts);
+        Assert.Null(final.RecoveryAttemptSourceState);
+        Assert.Equal([1, 2], auditor.SeenIterations);
+    }
+
+    [Fact]
     public async Task StopOnFirstPersistedAuditReports_AdvanceRecoveredIteration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

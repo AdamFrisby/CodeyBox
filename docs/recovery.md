@@ -54,7 +54,7 @@ The reaper also runs **once synchronously at orchestrator startup** (before the 
 | State when worker died | Recovered to | Why |
 |---|---|---|
 | `Working` | `Failed` | No committed work to preserve; explicit retry required unless a preempt checkpoint exists |
-| `Reworking` | `Queued` | Re-run the work phase from scratch |
+| `Reworking` | `WorkComplete` | Re-run audit against the preserved rework branch, then rework again if findings remain |
 | `WorkComplete` | `WorkComplete` | Re-dispatch audit from the phase boundary and count the recovery handoff |
 | `Auditing` | `WorkComplete` | Re-audit the same commit |
 | `AuditPassed` | `AuditPassed` | Re-dispatch merge from the phase boundary and count the recovery handoff |

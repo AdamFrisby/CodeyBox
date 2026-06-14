@@ -9,6 +9,16 @@ internal static class WorkItemRecoveryPolicy
     public static bool ExceedsRecoveryAttempts(int attempts, int maxAttempts)
         => maxAttempts > 0 && attempts > maxAttempts;
 
+    public static WorkItem WithRecoveryAttempt(
+        WorkItem item,
+        int recoveryAttempts,
+        WorkItemState sourceState)
+        => item with
+        {
+            RecoveryAttempts = recoveryAttempts,
+            RecoveryAttemptSourceState = recoveryAttempts > 0 ? sourceState : null,
+        };
+
     public static WorkItem ResetRecoveryAttemptsAfterRealProgress(WorkItem item, WorkItemState completedState)
         => ResetRecoveryAttemptsAfterRealProgress(item, item.State, completedState);
 
@@ -17,17 +27,75 @@ internal static class WorkItemRecoveryPolicy
         WorkItemState fromState,
         WorkItemState toState)
     {
-        if (item.RecoveryAttempts == 0 || !IsRealProgressTransition(fromState, toState))
+        if (item.RecoveryAttempts == 0 || !IsRealProgressTransition(fromState, toState, item.RecoveryAttemptSourceState))
             return item;
 
-        return item with { RecoveryAttempts = 0 };
+        return ClearRecoveryAttempts(item);
     }
 
-    public static WorkItem ResetRecoveryAttemptsAfterRealProgressEvent(WorkItem item)
-        => item.RecoveryAttempts == 0 ? item : item with { RecoveryAttempts = 0 };
+    public static WorkItem ResetRecoveryAttemptsAfterRealProgressEvent(
+        WorkItem item,
+        RecoveryProgressEvent progressEvent)
+    {
+        if (item.RecoveryAttempts == 0
+            || !IsRealProgressEventForRecoverySource(item.RecoveryAttemptSourceState, progressEvent))
+        {
+            return item;
+        }
 
-    private static bool IsRealProgressTransition(WorkItemState fromState, WorkItemState toState)
-        => IsRealProgressCompletionState(toState);
+        return ClearRecoveryAttempts(item);
+    }
+
+    private static WorkItem ClearRecoveryAttempts(WorkItem item) => item with
+    {
+        RecoveryAttempts = 0,
+        RecoveryAttemptSourceState = null,
+    };
+
+    private static bool IsRealProgressTransition(
+        WorkItemState fromState,
+        WorkItemState toState,
+        WorkItemState? recoverySourceState)
+    {
+        _ = fromState;
+
+        return recoverySourceState is null
+            ? IsRealProgressCompletionState(toState)
+            : toState switch
+            {
+                WorkItemState.WorkComplete => recoverySourceState is WorkItemState.Working or WorkItemState.Reworking,
+                WorkItemState.AuditPassed => recoverySourceState is
+                    WorkItemState.WorkComplete
+                    or WorkItemState.Auditing
+                    or WorkItemState.Reworking
+                    or WorkItemState.ReworkingForConflict,
+                WorkItemState.Merged => recoverySourceState is WorkItemState.AuditPassed or WorkItemState.Merging,
+                WorkItemState.Done => true,
+                _ => false,
+            };
+    }
+
+    private static bool IsRealProgressEventForRecoverySource(
+        WorkItemState? recoverySourceState,
+        RecoveryProgressEvent progressEvent)
+    {
+        if (recoverySourceState is null)
+            return true;
+
+        return progressEvent switch
+        {
+            RecoveryProgressEvent.AuditVerdictProduced => recoverySourceState is
+                WorkItemState.WorkComplete
+                or WorkItemState.Auditing,
+            RecoveryProgressEvent.AuditReworkCompleted => recoverySourceState == WorkItemState.Reworking,
+            RecoveryProgressEvent.PostActReworkCompleted => recoverySourceState == WorkItemState.Reworking,
+            RecoveryProgressEvent.ConflictReworkBranchAdvanced => recoverySourceState is
+                WorkItemState.AuditPassed
+                or WorkItemState.Merging
+                or WorkItemState.ReworkingForConflict,
+            _ => false,
+        };
+    }
 
     private static bool IsRealProgressCompletionState(WorkItemState state) => state switch
     {
@@ -47,24 +115,22 @@ internal static class WorkItemRecoveryPolicy
     {
         if (ExceedsRecoveryAttempts(recoveryAttempts, maxRecoveryAttempts))
         {
-            return item with
+            return WithRecoveryAttempt(item with
             {
                 State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = exceededMessage,
-                RecoveryAttempts = recoveryAttempts,
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = now,
-            };
+            }, recoveryAttempts, item.State);
         }
 
-        return item with
+        return WithRecoveryAttempt(item with
         {
-            RecoveryAttempts = recoveryAttempts,
             StartedAt = null,
             UpdatedAt = now,
-        };
+        }, recoveryAttempts, item.State);
     }
 
     public static bool RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(WorkItem item) =>
@@ -82,27 +148,27 @@ internal static class WorkItemRecoveryPolicy
         && item.State == WorkItemState.Working
         && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
-    public static WorkItem BuildCheckAndActRerun(WorkItem item, int recoveryAttempts) => item with
-    {
-        State = WorkItemState.Queued,
-        LastError = null,
-        RecoveryAttempts = recoveryAttempts,
-        StartedAt = null,
-        PreemptedAt = null,
-        PreemptCheckpoint = null,
-        UpdatedAt = DateTimeOffset.UtcNow,
-    };
+    public static WorkItem BuildCheckAndActRerun(WorkItem item, int recoveryAttempts) =>
+        WithRecoveryAttempt(item with
+        {
+            State = WorkItemState.Queued,
+            LastError = null,
+            StartedAt = null,
+            PreemptedAt = null,
+            PreemptCheckpoint = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        }, recoveryAttempts, item.State);
 
-    public static WorkItem BuildAgentControlRerun(WorkItem item, int recoveryAttempts) => item with
-    {
-        State = WorkItemState.Queued,
-        LastError = null,
-        RecoveryAttempts = recoveryAttempts,
-        StartedAt = null,
-        PreemptedAt = null,
-        PreemptCheckpoint = null,
-        UpdatedAt = DateTimeOffset.UtcNow,
-    };
+    public static WorkItem BuildAgentControlRerun(WorkItem item, int recoveryAttempts) =>
+        WithRecoveryAttempt(item with
+        {
+            State = WorkItemState.Queued,
+            LastError = null,
+            StartedAt = null,
+            PreemptedAt = null,
+            PreemptCheckpoint = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        }, recoveryAttempts, item.State);
 
     public static bool TryBuildWorkingWithoutPreemptFailure(
         WorkItem item,
@@ -118,16 +184,15 @@ internal static class WorkItemRecoveryPolicy
             return false;
         }
 
-        failed = item with
+        failed = WithRecoveryAttempt(item with
         {
             State = WorkItemState.Failed,
             LastError = lastError,
-            RecoveryAttempts = item.RecoveryAttempts + 1,
             StartedAt = null,
             PreemptedAt = null,
             PreemptCheckpoint = null,
             UpdatedAt = DateTimeOffset.UtcNow,
-        };
+        }, item.RecoveryAttempts + 1, item.State);
         return true;
     }
 
@@ -161,28 +226,26 @@ internal static class WorkItemRecoveryPolicy
         var attempts = NextRecoveryAttempt(item);
         if (ExceedsRecoveryAttempts(attempts, maxRecoveryAttempts))
         {
-            return item with
+            return WithRecoveryAttempt(item with
             {
                 State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = $"exceeded MaxRecoveryAttempts ({maxRecoveryAttempts}) during {recoveryReason}",
-                RecoveryAttempts = attempts,
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = now,
-            };
+            }, attempts, item.State);
         }
 
         var error = target == WorkItemState.Queued
             ? $"{recoveryReason} while item was {item.State}; re-queued for a fresh run"
             : null;
 
-        return item.With(target.Value, error) with
+        return WithRecoveryAttempt(item.With(target.Value, error) with
         {
-            RecoveryAttempts = attempts,
             StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
             UpdatedAt = now,
-        };
+        }, attempts, item.State);
     }
 
     public static WorkItem? BuildInfrastructureDeferredResumeState(WorkItem item, DateTimeOffset now)
@@ -284,17 +347,16 @@ internal static class WorkItemRecoveryPolicy
         // honours.
         if (ExceedsRecoveryAttempts(attempts, maxAttempts))
         {
-            return item with
+            return WithRecoveryAttempt(item with
             {
                 State = WorkItemState.NeedsOperatorInput,
                 LastError =
                     $"{reason}; exceeded MaxRecoveryAttempts ({maxAttempts}) — operator triage required",
-                RecoveryAttempts = attempts,
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = now,
-            };
+            }, attempts, item.State);
         }
 
         if (IsRerunnableCheckAndActWithoutPreempt(item))
@@ -312,13 +374,12 @@ internal static class WorkItemRecoveryPolicy
         if (item.State is WorkItemState.Working or WorkItemState.Reworking
             && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
         {
-            return item with
+            return WithRecoveryAttempt(item with
             {
                 LastError = reason,
                 StartedAt = null,
-                RecoveryAttempts = attempts,
                 UpdatedAt = now,
-            };
+            }, attempts, item.State);
         }
 
         if (item.State == WorkItemState.Working)
@@ -329,7 +390,7 @@ internal static class WorkItemRecoveryPolicy
             // from Reworking, which has WorkComplete as a durable resume
             // point and is handled by MapToRecoveryState below.
             var preserve = !string.IsNullOrWhiteSpace(item.WorkBranch);
-            return item with
+            return WithRecoveryAttempt(item with
             {
                 State = WorkItemState.Queued,
                 LastError = reason,
@@ -338,22 +399,20 @@ internal static class WorkItemRecoveryPolicy
                 PreserveWorkBranchOnQueuedPickup = preserve,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
-                RecoveryAttempts = attempts,
                 UpdatedAt = now,
-            };
+            }, attempts, item.State);
         }
 
         var target = MapToRecoveryState(item.State) ?? item.State;
-        return item with
+        return WithRecoveryAttempt(item with
         {
             State = target,
             LastError = reason,
             StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
             PreemptedAt = null,
             PreemptCheckpoint = null,
-            RecoveryAttempts = attempts,
             UpdatedAt = now,
-        };
+        }, attempts, item.State);
     }
 
     /// <summary>
@@ -386,4 +445,12 @@ internal static class WorkItemRecoveryPolicy
         CancellationSource = null,
         UpdatedAt = now,
     };
+}
+
+internal enum RecoveryProgressEvent
+{
+    AuditVerdictProduced,
+    AuditReworkCompleted,
+    PostActReworkCompleted,
+    ConflictReworkBranchAdvanced,
 }

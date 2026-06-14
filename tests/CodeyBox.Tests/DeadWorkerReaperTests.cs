@@ -405,6 +405,11 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]
@@ -447,6 +452,11 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]
@@ -485,6 +495,11 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]
@@ -557,6 +572,11 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Equal(item.Id, release.WorkItemId);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, evt.WorkItem.State);
     }
 
     [Fact]

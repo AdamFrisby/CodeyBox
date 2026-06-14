@@ -198,6 +198,14 @@ public sealed record WorkItem
     /// </summary>
     public int RecoveryAttempts { get; init; }
 
+    /// <summary>
+    /// State that consumed the current recovery-attempt budget. Used to clear
+    /// <see cref="RecoveryAttempts"/> only when the recovered phase actually
+    /// completes, rather than when an unrelated later phase makes progress.
+    /// Null means the row predates phase-scoped recovery accounting.
+    /// </summary>
+    public WorkItemState? RecoveryAttemptSourceState { get; init; }
+
     /// <summary>Number of attempts that have been made on the upstream-push phase.</summary>
     public int UpstreamPushAttempts { get; init; }
 

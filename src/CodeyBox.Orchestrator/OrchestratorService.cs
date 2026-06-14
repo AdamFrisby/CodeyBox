@@ -1362,16 +1362,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             var checkAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
             if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(checkAttempts, _opts.MaxRecoveryAttempts))
             {
-                return item with
+                return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
                 {
                     State = WorkItemState.AbandonedAfterRecoveryAttempts,
                     LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
-                    RecoveryAttempts = checkAttempts,
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
-                };
+                }, checkAttempts, item.State);
             }
 
             return WorkItemRecoveryPolicy.BuildCheckAndActRerun(item, checkAttempts);
@@ -1382,16 +1381,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             var controlAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
             if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(controlAttempts, _opts.MaxRecoveryAttempts))
             {
-                return item with
+                return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
                 {
                     State = WorkItemState.AbandonedAfterRecoveryAttempts,
                     LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
-                    RecoveryAttempts = controlAttempts,
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
-                };
+                }, controlAttempts, item.State);
             }
 
             return WorkItemRecoveryPolicy.BuildAgentControlRerun(item, controlAttempts);
@@ -1399,16 +1397,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (item.State == WorkItemState.Working)
         {
-            return item with
+            return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
                 State = WorkItemState.Failed,
                 LastError = "worker died while work phase was running without a preempt checkpoint",
-                RecoveryAttempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item),
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
 
         // WaitingForQuotaReset is owned by QuotaRetryScheduler; the periodic
@@ -1432,19 +1429,21 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // MaxRecoveryAttempts <= 0 means unlimited (no cap). Only enforce when > 0.
         if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(newAttempts, _opts.MaxRecoveryAttempts))
         {
-            return item with
+            return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
             {
                 State = WorkItemState.AbandonedAfterRecoveryAttempts,
                 LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
-                RecoveryAttempts = newAttempts,
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            }, newAttempts, item.State);
         }
 
-        return item.With(targetState.Value) with { RecoveryAttempts = newAttempts };
+        return WorkItemRecoveryPolicy.WithRecoveryAttempt(
+            item.With(targetState.Value),
+            newAttempts,
+            item.State);
     }
 
     private async Task RunItemAsync(int workerIndex, WorkItemId id, WorkerSlotLease slotLease, CancellationToken ct)

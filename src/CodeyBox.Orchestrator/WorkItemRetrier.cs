@@ -133,6 +133,7 @@ public sealed class WorkItemRetrier
         var resumed = item.With(resumeState.Value, error: null) with
         {
             RecoveryAttempts = 0,
+            RecoveryAttemptSourceState = null,
             QuotaRetryAttempts = trigger != "manual" ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts,
             StartedAt = null
         };
@@ -481,6 +482,7 @@ public sealed class WorkItemRetrier
             CancellationSource = null,
             FailureKind = null,
             RecoveryAttempts = 0,
+            RecoveryAttemptSourceState = null,
             StartedAt = null,
             PreserveWorkBranchOnQueuedPickup = resumeState.Value == WorkItemState.Queued,
         };
