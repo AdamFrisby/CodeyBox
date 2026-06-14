@@ -169,4 +169,45 @@ public sealed class RecoveryAttemptCapTests : IDisposable
         // After MaxAttempts+1 reaper runs the item should be abandoned.
         Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, item.State);
     }
+
+    [Fact]
+    public async Task ReworkRecoveryCycles_CountUntilReworkActuallyCompletes()
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Reworking,
+            RecoveryAttempts = 0,
+        };
+        await _store.CreateAsync(item);
+
+        for (int i = 0; i <= MaxAttempts; i++)
+        {
+            while (_queue.Count > 0) await _queue.DequeueAsync();
+
+            await PlantDeadWorkerAsync(item.Id.ToString());
+            await _reaper.RunOnceAsync(CancellationToken.None);
+            item = (await _store.GetAsync(item.Id))!;
+
+            if (item.State == WorkItemState.WorkComplete)
+            {
+                var auditStarted = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                    item with { State = WorkItemState.Auditing },
+                    fromState: WorkItemState.WorkComplete,
+                    toState: WorkItemState.Auditing);
+                var reworkStarted = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                    auditStarted with { State = WorkItemState.Reworking },
+                    fromState: WorkItemState.Auditing,
+                    toState: WorkItemState.Reworking);
+                Assert.Equal(item.RecoveryAttempts, reworkStarted.RecoveryAttempts);
+                await _store.UpdateAsync(reworkStarted);
+            }
+        }
+
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, item.State);
+        Assert.Equal(MaxAttempts + 1, item.RecoveryAttempts);
+    }
 }

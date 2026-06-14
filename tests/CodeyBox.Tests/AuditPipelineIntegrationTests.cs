@@ -451,7 +451,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task RecoveredWorkComplete_AuditFailureVerdictClearsRecoveryAttempts()
+    public async Task RecoveredWorkComplete_AuditFailureVerdictPreservesRecoveryAttempts()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new ScriptedAuditor(
@@ -475,7 +475,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Equal(0, final.RecoveryAttempts);
+        Assert.Equal(2, final.RecoveryAttempts);
         Assert.Equal([1], auditor.SeenIterations);
     }
 

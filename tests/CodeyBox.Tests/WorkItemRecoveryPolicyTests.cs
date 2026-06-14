@@ -98,7 +98,7 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
-    public void ResetRecoveryAttemptsAfterRealProgress_ClearsAuditFailureToRework()
+    public void ResetRecoveryAttemptsAfterRealProgress_PreservesAuditFailureToRework()
     {
         var item = MakeItem(WorkItemState.Auditing) with { RecoveryAttempts = 2 };
 
@@ -106,6 +106,16 @@ public sealed class WorkItemRecoveryPolicyTests
             item.With(WorkItemState.Reworking),
             fromState: WorkItemState.Auditing,
             toState: WorkItemState.Reworking);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgressEvent_ClearsAfterCompletedRework()
+    {
+        var item = MakeItem(WorkItemState.Reworking) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(item);
 
         Assert.Equal(0, reset.RecoveryAttempts);
     }
@@ -150,6 +160,45 @@ public sealed class WorkItemRecoveryPolicyTests
             Assert.Equal(2, recovered.RecoveryAttempts);
             Assert.Null(recovered.StartedAt);
             Assert.Same(item.AgentControl, recovered.AgentControl);
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_AtCapAbandons()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-recovery-cap-{Guid.NewGuid():N}.db");
+        using var store = new SqliteWorkItemStore(dbPath);
+        try
+        {
+            var svc = new OrchestratorService(
+                new InMemoryTaskQueue(),
+                store,
+                new FakePipelineRunner(store),
+                new CancellationRegistry(CancellationToken.None),
+                new OrchestratorOptions { MaxRecoveryAttempts = 3 },
+                NullLogger<OrchestratorService>.Instance);
+            var item = MakeAgentControlItem(WorkItemState.Working) with
+            {
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+                PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-4),
+                PreemptCheckpoint = null,
+                RecoveryAttempts = 3,
+            };
+
+            var recovered = svc.TryBuildRecoveredStateForTest(item);
+
+            Assert.NotNull(recovered);
+            Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+            Assert.Equal(4, recovered.RecoveryAttempts);
+            Assert.Null(recovered.StartedAt);
+            Assert.Null(recovered.PreemptedAt);
+            Assert.Null(recovered.PreemptCheckpoint);
+            Assert.Same(item.AgentControl, recovered.AgentControl);
+            Assert.Contains("3 recovery attempts", recovered.LastError);
         }
         finally
         {

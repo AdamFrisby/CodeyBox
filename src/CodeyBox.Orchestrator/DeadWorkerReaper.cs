@@ -120,7 +120,7 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// than discarding partial progress. Bounded by
     /// <see cref="DeadWorkerOptions.MaxRecoveryAttempts"/>; once exceeded
     /// the item escalates to
-    /// <see cref="WorkItemState.NeedsOperatorInput"/> so it does not loop
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> so it does not loop
     /// burning a slot per restart. Distinct from the periodic / heartbeat-
     /// stale path, which still uses
     /// <see cref="WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure"/>

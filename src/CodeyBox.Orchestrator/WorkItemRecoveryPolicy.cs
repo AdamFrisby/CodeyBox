@@ -27,8 +27,7 @@ internal static class WorkItemRecoveryPolicy
         => item.RecoveryAttempts == 0 ? item : item with { RecoveryAttempts = 0 };
 
     private static bool IsRealProgressTransition(WorkItemState fromState, WorkItemState toState)
-        => IsRealProgressCompletionState(toState)
-        || (toState == WorkItemState.Reworking && fromState != WorkItemState.Reworking);
+        => IsRealProgressCompletionState(toState);
 
     private static bool IsRealProgressCompletionState(WorkItemState state) => state switch
     {
