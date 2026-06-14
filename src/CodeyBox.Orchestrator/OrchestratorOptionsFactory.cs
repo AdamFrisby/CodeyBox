@@ -108,6 +108,57 @@ public static class OrchestratorOptionsFactory
         return options;
     }
 
+    public static TerminalFailureRecoveryOptions BuildTerminalFailureRecoveryOptions(
+        bool enabled,
+        string periodicCheckInterval,
+        string baseBackoff,
+        string maxBackoff,
+        double jitterFraction,
+        int maxAutoRetriesPerWorkItem)
+    {
+        if (!enabled)
+            return new TerminalFailureRecoveryOptions { Enabled = false };
+
+        if (!TimeSpan.TryParse(periodicCheckInterval, out TimeSpan periodic))
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:PeriodicCheckInterval must be a valid TimeSpan (e.g. '00:05:00')");
+        if (periodic <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:PeriodicCheckInterval must be positive");
+
+        if (!TimeSpan.TryParse(baseBackoff, out TimeSpan baseBack))
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:BaseBackoff must be a valid TimeSpan (e.g. '00:01:00')");
+        if (baseBack <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:BaseBackoff must be positive");
+
+        if (!TimeSpan.TryParse(maxBackoff, out TimeSpan maxBack))
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:MaxBackoff must be a valid TimeSpan (e.g. '00:30:00')");
+        if (maxBack < baseBack)
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:MaxBackoff must be >= BaseBackoff");
+
+        if (jitterFraction < 0 || jitterFraction > 1.0)
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:JitterFraction must be between 0 and 1");
+
+        if (maxAutoRetriesPerWorkItem < 0)
+            throw new InvalidOperationException(
+                "CodeyBox:TerminalFailureRecovery:MaxAutoRetriesPerWorkItem must be non-negative");
+
+        return new TerminalFailureRecoveryOptions
+        {
+            Enabled = true,
+            PeriodicCheckInterval = periodic,
+            BaseBackoff = baseBack,
+            MaxBackoff = maxBack,
+            JitterFraction = jitterFraction,
+            MaxAutoRetriesPerWorkItem = maxAutoRetriesPerWorkItem,
+        };
+    }
+
     public static AutoRetryOnQuotaFailureOptions BuildAutoRetryOptions(
         bool enabled,
         string periodicCheckInterval,
