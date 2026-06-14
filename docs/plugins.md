@@ -76,6 +76,18 @@ agent prompt is handed to a runner. The host applies them in three segments:
 built-in first, plugin preprocessors ordered by `Order`, then built-in last.
 Use a small `Order` value to run earlier within the plugin segment.
 
+Periodic telemetry samplers implement `IMetricSampler` (added in host API
+`1.2`). The host's `MetricSamplerHost` drives every registered sampler on
+its own loop and re-reads the sampler's `Enabled` / `Interval` each tick so
+the sampler can honour hot-reloaded configuration without a host restart.
+A sampler owns its own persistence — pick a SQLite file under the
+orchestrator dataroot, push to OTLP, write to an in-memory ring buffer,
+whatever fits the metric. See [`docs/statistics-plugin.md`](statistics-plugin.md)
+for the first shipping sampler (per-agent quota snapshots persisted to a
+dedicated SQLite file with a `GET /quota/history` query surface). The
+sampler-host contract guarantees that one sampler throwing does NOT block
+others: each loop catches and logs.
+
 ### 3. Decorate with `[CodeyBoxPlugin]`
 
 ```csharp

@@ -15,7 +15,7 @@ namespace CodeyBox.Core;
 public static class CodeyBoxApiVersion
 {
     /// <summary>Current orchestrator host API version.</summary>
-    public const string Current = "1.1";
+    public const string Current = "1.2";
 
     /// <summary>
     /// Returns true when this host satisfies the plugin's minimum version
