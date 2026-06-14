@@ -134,6 +134,15 @@ public static class TransitionHealthClassifier
                 // Operator-driven cancel: not an infra failure, not a
                 // legitimate forward step. Excluded from scoring.
                 return null;
+            case "failure:semantic-incompatible":
+                // The conflict-rework agent declared the upstream/downstream
+                // branches semantically irreconcilable (PipelineRunner emits
+                // this on conflict_rework involvements). The agent did its
+                // job — this is a real, intended disposition, not an infra
+                // failure. Excluded from scoring rather than counted as
+                // legitimate so a conflict-heavy fleet does not artificially
+                // inflate the Merge-stage success number.
+                return null;
             default:
                 // Includes "error" (transient default before a path-specific
                 // outcome was set) and any future label we have not classified
@@ -211,10 +220,17 @@ public static class TransitionHealthClassifier
             "timeout" => Infra("timeout"),
             "agent" => Infra("agent"),
             "agent_unavailable" => Infra("agent_unavailable"),
-            "build" => Infra("build"),
             "infrastructure" => Infra("infrastructure"),
             "configuration" => Infra("configuration"),
-            // "cancelled" and "other" are intentionally not scored:
+            // "build", "cancelled", and "other" are intentionally not scored:
+            //  - build is the RequiredBuildGate catching agent work-product
+            //    that left the branch non-compiling — a work-quality failure,
+            //    the gate working as designed. The infra-equivalent signal is
+            //    failureKind="infrastructure" (RequiredBuildVerificationUnavailable);
+            //    counting "build" as infra would conflate the two and contradict
+            //    the audit-stage taxonomy, which maps "required build failed:"
+            //    findings to LEGITIMATE and only "required build unavailable:"
+            //    findings to InfraFailure.
             //  - cancelled is operator intent, not infra health.
             //  - other is the catch-all label PipelineRunner uses for failures
             //    we have not yet classified; counting it as infra would

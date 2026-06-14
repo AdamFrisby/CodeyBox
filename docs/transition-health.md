@@ -56,7 +56,7 @@ A stage transition is an **INFRA failure** when the plumbing — not the work
   blocking finding (the build genuinely broke); it counts as LEGITIMATE,
   not INFRA.
 - Terminal `Failed` with `failure_kind` ∈ {`quota`, `timeout`, `agent`,
-  `agent_unavailable`, `build`, `infrastructure`, `configuration`}.
+  `agent_unavailable`, `infrastructure`, `configuration`}.
 - Terminal `MergeConflictResolutionFailed` (always classified as infra).
 - Terminal `AbandonedAfterRecoveryAttempts` — the recovery loop gave up
   after `MaxRecoveryAttempts` host-shutdown / worker-died cycles. This is
@@ -67,10 +67,17 @@ when it neither represents healthy progress nor an infra failure:
 
 - Operator-driven cancellation (`failure:cancelled` / `cancelled`).
 - An involvement row that is still in flight (`outcome` not yet finalised).
-- Terminal `Failed` with `failure_kind` ∈ {`cancelled`, `other`, null}. The
-  `other` kind is the catch-all PipelineRunner uses when it has not yet
-  classified a failure; counting it as infra would over-pessimise the score,
-  counting it as legitimate would under-pessimise. Documented and excluded.
+- Conflict-rework's `failure:semantic-incompatible` outcome (the agent
+  declared the upstream/downstream branches semantically irreconcilable —
+  a real, intended disposition, not infra failure).
+- Terminal `Failed` with `failure_kind` ∈ {`build`, `cancelled`, `other`,
+  null}. `build` comes from `RequiredBuildFailedException` — the agent's
+  work-product left the branch non-compiling, the gate working as designed
+  (a work-quality failure, **not** infra; the infra-equivalent is
+  `failure_kind="infrastructure"` from `RequiredBuildVerificationUnavailableException`).
+  The `other` kind is the catch-all PipelineRunner uses when it has not
+  yet classified a failure; counting it as infra would over-pessimise the
+  score, counting it as legitimate would under-pessimise.
 
 ## Source data
 

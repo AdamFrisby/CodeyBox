@@ -318,7 +318,6 @@ public sealed class TransitionHealthClassifierTests
     [InlineData("timeout")]
     [InlineData("agent")]
     [InlineData("agent_unavailable")]
-    [InlineData("build")]
     [InlineData("infrastructure")]
     [InlineData("configuration")]
     public void Terminal_failed_infra_kinds_count_as_infra_failure(string kind)
@@ -332,6 +331,49 @@ public sealed class TransitionHealthClassifierTests
 
         Assert.Equal(1, report.InfraFailureTransitions);
         Assert.Equal(1, report.InfraByKind[kind]);
+    }
+
+    [Fact]
+    public void Terminal_failed_build_is_not_counted_as_infra()
+    {
+        // failureKind="build" comes from RequiredBuildFailedException — the
+        // agent's work-product left the branch non-compiling. The gate caught
+        // it, which means the gate is working as designed (a work-quality
+        // failure, NOT an infra failure). The infra-equivalent signature is
+        // failureKind="infrastructure" (RequiredBuildVerificationUnavailable).
+        // Mirrors the audit-stage taxonomy, which classifies "required build
+        // failed:" findings as LEGITIMATE and only "required build unavailable:"
+        // findings as InfraFailure.
+        var snapshot = Snapshot(terminals: [TerminalFailure(
+            state: (int)WorkItemState.Failed,
+            failureKind: "build",
+            updatedAt: Now.AddMinutes(-1))]);
+
+        var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());
+
+        Assert.Equal(0, report.TotalTransitions);
+        Assert.Equal(0, report.InfraFailureTransitions);
+        Assert.False(report.InfraByKind.ContainsKey("build"));
+    }
+
+    [Fact]
+    public void Conflict_rework_semantic_incompatible_is_skipped_not_infra()
+    {
+        // PipelineRunner finalises the conflict-rework involvement with
+        // outcome="failure:semantic-incompatible" when the agent declares the
+        // upstream/downstream branches semantically irreconcilable. That's
+        // the agent doing its job — a real, intended disposition — not an
+        // infra failure. Must not pull the Merge-stage score down.
+        var snapshot = Snapshot(involvements:
+        [
+            Involvement("conflict_rework", "failure:semantic-incompatible", Now.AddMinutes(-10)),
+        ]);
+
+        var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());
+
+        Assert.Equal(0, report.TotalTransitions);
+        Assert.Equal(0, report.InfraFailureTransitions);
+        Assert.Equal(0, report.LegitimateTransitions);
     }
 
     [Theory]
