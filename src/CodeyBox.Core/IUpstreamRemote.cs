@@ -130,6 +130,12 @@ public sealed record UpstreamCompletionRequest
     /// <summary>Raw agent stdout. Used for AgentReasoningTail in LLM-generated descriptions. Null for legacy callers.</summary>
     public string? AgentStdout { get; init; }
     /// <summary>
+    /// Current work-item prompt revision at upstream time. Used only as a
+    /// fallback for generated squash-merge trailers when the branch commits
+    /// cannot be read from the forge.
+    /// </summary>
+    public int? PromptRevision { get; init; }
+    /// <summary>
     /// Name of the environment variable holding the upstream credential (from
     /// <c>Upstream.TokenEnvVar</c> in the project config). Null when not configured.
     /// Plugin implementations read: <c>Environment.GetEnvironmentVariable(TokenEnvVar)</c>.

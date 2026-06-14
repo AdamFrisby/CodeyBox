@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Upstream.GitHub;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -41,7 +42,8 @@ public sealed class GitHubUpstreamRemoteTests
     private static GitHubUpstreamRemote BuildRemote(
         IGitHost gitHost,
         FakeHttpMessageHandler handler,
-        GitHubUpstreamOptions? opts = null)
+        GitHubUpstreamOptions? opts = null,
+        IPullRequestDescriptionGenerator? descriptionGenerator = null)
     {
         opts ??= DefaultOpts;
         var factory = new FakeHttpClientFactory(handler, userAgent: "codeybox");
@@ -49,7 +51,8 @@ public sealed class GitHubUpstreamRemoteTests
             gitHost,
             factory,
             NullLogger<GitHubUpstreamRemote>.Instance,
-            opts);
+            opts,
+            descriptionGenerator: descriptionGenerator);
     }
 
     private static HttpResponseMessage JsonResponse(HttpStatusCode status, string json) =>
@@ -62,6 +65,22 @@ public sealed class GitHubUpstreamRemoteTests
     private static HttpResponseMessage MergeOkResponse(string sha) =>
         JsonResponse(HttpStatusCode.OK,
             $$"""{"sha":"{{sha}}","merged":true,"message":"Pull Request successfully merged"}""");
+
+    private static HttpResponseMessage PullRequestCommitsResponse(string json) =>
+        JsonResponse(HttpStatusCode.OK, json);
+
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+
+        return count;
+    }
 
     // -------------------------------------------------------------------------
     // Tests
@@ -99,25 +118,138 @@ public sealed class GitHubUpstreamRemoteTests
         var gitHost = new FakeGitHost();
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(PrCreatedResponse(7, "https://github.com/myorg/myrepo/pull/7"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            """
+            [
+              {
+                "commit": {
+                  "message": "feat: add feature X\n\nImplement feature X.\n\nCodeyBox-Prompt-Revision: 4\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+                }
+              }
+            ]
+            """));
         handler.Enqueue(MergeOkResponse("abc123sha"));
 
         var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "squash" });
         var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
 
-        // Two HTTP calls: POST /pulls then PUT /pulls/7/merge
-        Assert.Equal(2, handler.Requests.Count);
+        // Three HTTP calls: POST /pulls, GET /pulls/7/commits, then PUT /pulls/7/merge.
+        Assert.Equal(3, handler.Requests.Count);
         Assert.Contains("/pulls", handler.Requests[0].RequestUri!.PathAndQuery);
         Assert.Equal(HttpMethod.Post, handler.Requests[0].Method);
-        Assert.Contains("/pulls/7/merge", handler.Requests[1].RequestUri!.PathAndQuery);
-        Assert.Equal(HttpMethod.Put, handler.Requests[1].Method);
+        Assert.Contains("/pulls/7/commits", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Get, handler.Requests[1].Method);
+        Assert.Contains("/pulls/7/merge", handler.Requests[2].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Put, handler.Requests[2].Method);
 
-        // Merge body contains the configured method
-        Assert.Contains("squash", handler.RequestBodies[1]);
+        // Merge body contains the configured method plus explicit squash title/body.
+        using (var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]))
+        {
+            Assert.Equal("squash", mergeBody.RootElement.GetProperty("merge_method").GetString());
+            Assert.Equal("Add feature X (#7)", mergeBody.RootElement.GetProperty("commit_title").GetString());
+            var message = mergeBody.RootElement.GetProperty("commit_message").GetString();
+            Assert.Contains("Implement feature X.", message);
+            Assert.Contains("CodeyBox-Prompt-Revision: 4", message);
+            Assert.Equal(1, CountOccurrences(message!, "Co-Authored-By: CodeyBox"));
+        }
 
         Assert.True(outcome.BranchPushed);
         Assert.Equal("https://github.com/myorg/myrepo/pull/7", outcome.PullRequestUrl);
         Assert.Equal(7, outcome.PullRequestNumber);
         Assert.Equal("abc123sha", outcome.MergedSha);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_UsesGeneratedPrDescriptionForCommitMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(8, "https://github.com/myorg/myrepo/pull/8"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            """
+            [
+              {
+                "commit": {
+                  "message": "feat: merge description body\n\nCodeyBox-Prompt-Revision: 5\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+                }
+              }
+            ]
+            """));
+        handler.Enqueue(MergeOkResponse("generated-body-sha"));
+
+        var generator = new StaticDescriptionGenerator(
+            """
+            This PR adds explicit squash merge messages.
+
+            ## Changes
+            - Updates the GitHub merge payload.
+            - [ ] Run manual verification
+
+            CodeyBox-Prompt-Revision: 99
+            Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+            """);
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            },
+            generator);
+
+        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Add explicit squash merge messages.", message);
+        Assert.Contains("Update the GitHub merge payload.", message);
+        Assert.DoesNotContain("## Changes", message);
+        Assert.DoesNotContain("[ ]", message);
+        Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
+        Assert.Equal(1, CountOccurrences(message, "Co-Authored-By: CodeyBox"));
+        Assert.Contains("CodeyBox-Prompt-Revision: 5", message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMergeFallback_CleansCapturedMultiCommitShape()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(187, "https://github.com/myorg/myrepo/pull/187"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            File.ReadAllText("Fixtures/GitHub/pr-187-commits.redacted.json")));
+        handler.Enqueue(MergeOkResponse("fallback-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(SampleRequest with { PromptRevision = 12 }, CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString();
+        Assert.Equal(
+            """
+            Add squash merge message composition.
+
+            Build an explicit squash body from the generated PR description.
+
+            Cover squash merge fallback.
+
+            Build a captured multi-commit shape for the no-LLM fallback path.
+
+            CodeyBox-Prompt-Revision: 13
+            Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+            """,
+            message);
     }
 
     [Fact]
@@ -446,6 +578,16 @@ internal sealed class FakeHttpClientFactory : IHttpClientFactory
         Assert.Equal("github-upstream", name);
         return _client;
     }
+}
+
+internal sealed class StaticDescriptionGenerator : IPullRequestDescriptionGenerator
+{
+    private readonly string _body;
+
+    public StaticDescriptionGenerator(string body) => _body = body;
+
+    public Task<string> GenerateAsync(PullRequestDescriptionRequest request, CancellationToken ct)
+        => Task.FromResult(_body);
 }
 
 internal sealed class ThrowingFakeGitHost : IGitHost

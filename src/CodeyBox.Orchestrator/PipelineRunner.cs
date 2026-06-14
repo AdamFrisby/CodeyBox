@@ -9320,6 +9320,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 WorkItemPrompt = item.Prompt,
                 AddressedFindings = addressedFindings,
                 AgentStdout = agentStdout,
+                PromptRevision = item.PromptRevision,
                 TokenEnvVar = project.Upstream.TokenEnvVar,
                 AutoMerge = project.Upstream.AutoMerge,
                 MergeMethod = project.Upstream.MergeMethod,

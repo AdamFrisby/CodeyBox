@@ -79,6 +79,17 @@ public sealed class UpstreamRemotesAndPrCompletionUatTests : IDisposable
             """{"number":17,"html_url":"https://github.com/owner/repo/pull/17"}"""));
         handler.Enqueue(UpstreamWebhooksAndReleasesHelpers.Json(
             HttpStatusCode.OK,
+            """
+            [
+              {
+                "commit": {
+                  "message": "feat: complete UAT upstream change\n\nCodeyBox-Prompt-Revision: 2\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+                }
+              }
+            ]
+            """));
+        handler.Enqueue(UpstreamWebhooksAndReleasesHelpers.Json(
+            HttpStatusCode.OK,
             """{"sha":"remote-merge-sha","merged":true}"""));
         var remote = UpstreamWebhooksAndReleasesHelpers.GitHubRemote(
             gitHost,
@@ -97,11 +108,13 @@ public sealed class UpstreamRemotesAndPrCompletionUatTests : IDisposable
         Assert.Equal("https://github.com/owner/repo.git", push.UpstreamUrl);
         Assert.Contains(push.Environment, kv => kv.Key == "GIT_ASKPASS");
 
-        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal(3, handler.Requests.Count);
         Assert.Equal(HttpMethod.Post, handler.Requests[0].Method);
         Assert.Contains("/repos/owner/repo/pulls", handler.Requests[0].RequestUri!.PathAndQuery);
-        Assert.Equal(HttpMethod.Put, handler.Requests[1].Method);
-        Assert.Contains("/repos/owner/repo/pulls/17/merge", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Get, handler.Requests[1].Method);
+        Assert.Contains("/repos/owner/repo/pulls/17/commits", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Put, handler.Requests[2].Method);
+        Assert.Contains("/repos/owner/repo/pulls/17/merge", handler.Requests[2].RequestUri!.PathAndQuery);
 
         using var prBody = JsonDocument.Parse(handler.RequestBodies[0]);
         Assert.Equal("[codeybox] UAT upstream change (feature/uat-upstream)",
@@ -109,8 +122,12 @@ public sealed class UpstreamRemotesAndPrCompletionUatTests : IDisposable
         Assert.Equal("feature/uat-upstream", prBody.RootElement.GetProperty("head").GetString());
         Assert.Equal("main", prBody.RootElement.GetProperty("base").GetString());
 
-        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[1]);
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
         Assert.Equal("squash", mergeBody.RootElement.GetProperty("merge_method").GetString());
+        Assert.Equal("[codeybox] UAT upstream change (feature/uat-upstream) (#17)",
+            mergeBody.RootElement.GetProperty("commit_title").GetString());
+        Assert.Contains("CodeyBox-Prompt-Revision: 2",
+            mergeBody.RootElement.GetProperty("commit_message").GetString());
         Assert.Equal("https://github.com/owner/repo/pull/17", outcome.PullRequestUrl);
         Assert.Equal(17, outcome.PullRequestNumber);
         Assert.Equal("remote-merge-sha", outcome.MergedSha);
