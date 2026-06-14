@@ -396,6 +396,15 @@ public sealed class AuditQuotaPauseTests : IDisposable
             parked, from: "audit", trigger: "test-quota-return", CancellationToken.None);
         Assert.True(retrySuccess, retryError);
 
+        // Advance the manual clock past the router's in-process exhaustion
+        // TTL (default 1 h). Without this, the legacy no-tag class path's
+        // new gating (cached-exhausted member → spill / park, never dispatch
+        // on a cached-exhausted work runner) would correctly re-park the
+        // resumed iteration. Production quota return both expires the TTL
+        // AND clears the cache via a fresh probe write-back; here we just
+        // age the cache so the next pickup observes Gemini as eligible.
+        fix.Time.UtcNow = fix.Time.UtcNow.AddHours(2);
+
         var resumed = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(resumed);
         Assert.Equal(WorkItemState.WorkComplete, resumed!.State);

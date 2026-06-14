@@ -1280,13 +1280,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// Counts class members that <see cref="OrderedFallbackCandidatesAsync"/>
     /// would have considered for <paramref name="item"/> — i.e. they pass the
     /// <see cref="WorkItem.MinModelScore"/> floor AND cover the work item's
-    /// <see cref="WorkItem.RequiredCapabilities"/> AND declare
+    /// <see cref="WorkItem.RequiredCapabilities"/> AND (when
+    /// <paramref name="capability"/> is non-null) declare
     /// <paramref name="capability"/> — and are currently marked exhausted in
     /// this process's in-cache state. Used by the audit resolver to
     /// disambiguate "no candidate was eligible for non-quota reasons"
     /// (infrastructure) from "every eligible audit-capable member is cached
     /// exhausted" (quota — park for reset) when the fallback walk returns
     /// zero candidates.
+    /// <para>
+    /// When <paramref name="capability"/> is null the capability filter is
+    /// dropped and every class member that meets the score / required-
+    /// capability filters is counted — used by the legacy no-audit-tag
+    /// resolver path where the entire class is the audit pool.
+    /// </para>
     /// <para>
     /// The eligibility filter MUST mirror the filter
     /// <see cref="OrderedFallbackCandidatesAsync"/> applies; otherwise a
@@ -1298,10 +1305,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     public int CountEligibleExhaustedClassMembersWithCapability(
         WorkItem item,
         Project? project,
-        string capability)
+        string? capability)
     {
-        if (string.IsNullOrEmpty(capability))
-            return 0;
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (string.IsNullOrEmpty(classId))
             return 0;
@@ -1319,7 +1324,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (!MemberCoversRequiredCapabilities(
                     member, item.RequiredCapabilities, effectiveCapabilities))
                 continue;
-            if (!EffectiveCapabilities(member, effectiveCapabilities)
+            if (capability is not null
+                && !EffectiveCapabilities(member, effectiveCapabilities)
                     .Any(tag => string.Equals(tag, capability, StringComparison.OrdinalIgnoreCase)))
                 continue;
             if (IsExhausted(member, nowUtc))

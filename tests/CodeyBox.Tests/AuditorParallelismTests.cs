@@ -1484,4 +1484,72 @@ public sealed class AuditorParallelismCancellationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Cancelled, final!.State);
     }
+
+    // Defends the per-task IsCanceled branch in the audit settling loop.
+    // The outer audit ct stays NOT cancelled, but one auditor task ends in
+    // Canceled state via a child cancellation token (simulating a phase
+    // timeout or other inner CTS firing without the parent token going
+    // cancelled). Without the dedicated IsCanceled branch the loop would
+    // walk past the (cancelled, task.Exception=null) entry, drop the
+    // cancellation, and either (a) reach a Pass verdict with one fewer
+    // auditor than configured, or (b) misroute a phase-timeout-style cancel
+    // as a generic failure. The branch surfaces the OCE so the orchestrator's
+    // last-resort OCE catch routes it to the transient-cancellation path
+    // (HandleTransientCancellationAsync, source=Unknown), which moves the
+    // work item back to Queued and increments TransientCancelRetries.
+    [Fact]
+    public async Task ChildTokenCancelledAuditorTask_RoutesAsTransientCancellation_NotPassNorGenericFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor("inner-cancelled", (_, _, _) =>
+        {
+            Interlocked.Increment(ref auditorCalls);
+            // A pre-cancelled INNER CTS, distinct from the audit phase's
+            // outer ct. Task.FromCanceled<AuditResult> hands back a Canceled
+            // task tied to innerCts.Token (NOT the outer ct). The async
+            // settling lambda re-await of this cancelled Task propagates the
+            // OperationCanceledException up — and because the OCE's token is
+            // innerCts.Token (not outer ct), the task wrapping the auditor
+            // entry ends in Canceled state without the outer ct ever firing.
+            // That is exactly the shape the IsCanceled branch defends against.
+            var innerCts = new CancellationTokenSource();
+            innerCts.Cancel();
+            return Task.FromCanceled<AuditResult>(innerCts.Token);
+        });
+
+        using var tp = TestSupport.BuildPipeline(_workspace, seed,
+            auditors: [auditor], maxAuditIterations: 1);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        // Outer ct stays NOT cancelled. The only cancellation in flight is
+        // the per-task inner token — this is what the IsCanceled branch is
+        // there to handle.
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(1, auditorCalls);
+        // The IsCanceled branch threw OperationCanceledException(ct); the
+        // audit phase wraps it as PhaseCancellationException("audit", …)
+        // before it leaves the phase scope. RunAsync's unattributed-cancel
+        // catch routes it through HandleTransientCancellationAsync, and
+        // ResumeStateForTransientRetry maps phase="audit" back to
+        // WorkComplete while bumping the transient-cancel retry counter —
+        // exactly the rescue path the per-task IsCanceled branch was added
+        // to guarantee. Without that branch the cancelled child task would
+        // either (a) be silently dropped (Pass on a skipped review) or
+        // (b) misroute as a generic Failed/timeout.
+        Assert.Equal(WorkItemState.WorkComplete, final!.State);
+        Assert.Equal(1, final.TransientCancelRetries);
+        // Regression guards: the cancellation MUST NOT land as a code-quality
+        // verdict (Done / AuditPassed / AuditFailed) or as a generic Failed.
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        Assert.NotEqual(WorkItemState.AuditFailed, final.State);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+    }
 }

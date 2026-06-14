@@ -6234,6 +6234,28 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
 
                     await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
+
+                    // HARD INVARIANT: an auditor that could not RUN must surface as
+                    // a transient execution failure, never as a code-quality finding
+                    // or a Pass with a skipped review. The retry above is the one
+                    // chance to ride out a transient CLI/network/process flap; if
+                    // the retry's result still carries the
+                    // "review agent failed to run" sentinel and ThrowIfAuditorRunQuotaAsync
+                    // did NOT classify it as quota, this is non-quota infrastructure:
+                    // throw AuditUnavailableException so the RunAsync catch routes it
+                    // to failureKind="infrastructure" rather than letting the caller
+                    // post-process the Error finding into the audit findings list
+                    // (which would either (a) re-introduce the 1aa5a13f false-
+                    // AuditFailed regression by burning a rework iteration on an
+                    // infra-shaped failure, or (b) turn an unrunnable auditor into a
+                    // blocking source-code finding the work agent cannot fix).
+                    if (IsLlmAgentExecutionFailure(run.Result))
+                    {
+                        var summary = run.Result.AgentSummary ?? run.Result.AgentStderr ?? "agent execution failed";
+                        throw new AuditUnavailableException(
+                            $"LLM auditor '{run.Auditor.Name}' could not run: agent execution failed after one retry ({SingleLineSummary(summary)})");
+                    }
+
                     return run;
                 }
 
@@ -6785,19 +6807,34 @@ public sealed class PipelineRunner : IPipelineRunner
         if (preferredKind is null)
         {
             // No explicit override (or it was demoted by the capability gate).
-            // Legacy path: no audit pool active → use work agent.
-            if (auditPool is null)
+            // Legacy path: no class chain configured at all → work agent is
+            // the only audit candidate; gate it on pause only.
+            if (_classRouter is null || classId is null)
                 return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
-            // Audit pool active: the work agent is only safe if it carries
-            // the audit tag itself. Otherwise we must walk the class chain
-            // for a tagged substitute — falling back to workRunner here
-            // would breach the AC (a non-audit-capable agent must NEVER be
-            // selected for auditing). The walk runs the full quota /
-            // availability gate on each candidate.
+
+            // Class chain wired. Two shapes:
+            //   * auditPool != null — audit-capability pool active; work
+            //     agent is only safe if it carries the audit tag itself,
+            //     otherwise we MUST walk the tagged subset (falling back
+            //     to workRunner would breach the AC: "a non-audit-capable
+            //     agent must NEVER be selected for auditing").
+            //   * auditPool == null — legacy no-tag class; every class
+            //     member is audit-eligible. The work agent is in that pool
+            //     (the work-phase router picked it from the same chain),
+            //     so we apply the SAME smoke + quota + router-cache gates
+            //     before trusting it. Without these gates a class whose
+            //     audit-eligible pool is already known exhausted could
+            //     still dispatch on the work runner and reach a Pass
+            //     verdict if the invocation returned cleanly. Spill to
+            //     SelectFromAuditClassChainAsync on rejection so the entire
+            //     class is walked — which either picks a healthy peer or
+            //     surfaces the proper park (AgentClassExhaustedException)
+            //     / infrastructure (AuditUnavailableException) exception.
             var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
-            var workIsAuditCapable = workMember is not null
-                ? _classRouter?.MemberHasCapability(classId, workMember, WellKnownCapabilities.Audit) == true
-                : auditPool.Contains(workRunner.Kind);
+            var workIsAuditCapable = auditPool is null
+                || (workMember is not null
+                    ? _classRouter?.MemberHasCapability(classId, workMember, WellKnownCapabilities.Audit) == true
+                    : auditPool.Contains(workRunner.Kind));
             if (workIsAuditCapable && GetAgentPausedReason(workRunner.Kind) is null)
             {
                 // Hard invariant: an audit-capable work member must clear
@@ -6845,7 +6882,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
             }
-            return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
+            return await SelectFromAuditClassChainAsync(
+                item, project, auditorName, classId!,
+                requireAuditCapability: auditPool is not null,
+                ct);
         }
 
         if (!_agents.TryGet(preferredKind.Value, out var preferredRunner))
@@ -7124,22 +7164,25 @@ public sealed class PipelineRunner : IPipelineRunner
         InVmSmokeSandboxTarget auditSmokeTarget,
         CancellationToken ct)
     {
-        // No audit pool / class chain wired: legacy pause-only fallback — the
-        // work runner is the operator's only configured audit candidate.
-        if (auditPool is null || classId is null || _classRouter is null)
+        // No class chain wired: legacy pause-only fallback — the work runner
+        // is the operator's only configured audit candidate.
+        if (classId is null || _classRouter is null)
             return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
 
-        // Capability gate: when the pool is active and the work agent isn't
-        // in it, the work agent must NEVER audit. Walk the audit-capable pool
-        // for a tagged substitute (fully gated).
-        if (!auditPool.Contains(workRunner.Kind))
+        // Audit-capability pool active and the work agent isn't in it: the
+        // work agent must NEVER audit. Walk the tagged subset (fully gated).
+        if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
             return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId, ct);
 
-        // Work runner is in the audit pool. Mirror the no-preferred branch's
-        // pause + smoke + quota + router-cache gating before trusting it; on
-        // any rejection spill to SelectFromAuditCapablePoolAsync (which
-        // either picks a healthy peer or throws the proper park /
-        // infrastructure exception).
+        // Either the work agent is in the audit-capability pool, or no pool
+        // is active (legacy no-tag class — every class member is audit-
+        // eligible). Mirror the no-preferred branch's pause + smoke + quota +
+        // router-cache gating before trusting the work runner; on any
+        // rejection spill to the class-chain walk (which either picks a
+        // healthy peer or throws the proper park / infrastructure exception).
+        // The legacy no-tag class is intentionally gated identically — without
+        // it a class whose audit-eligible pool is already known exhausted
+        // could still slip a Pass verdict in on the work runner.
         var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
         if (GetAgentPausedReason(workRunner.Kind) is null)
         {
@@ -7178,7 +7221,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 }
             }
         }
-        return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId, ct);
+        return await SelectFromAuditClassChainAsync(
+            item, project, auditorName, classId,
+            requireAuditCapability: auditPool is not null,
+            ct);
     }
 
     private string? GetAgentPausedReason(AgentKind agent)
@@ -7190,19 +7236,25 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Walks the routed class chain looking for the first audit-capable member
-    /// that is registered, credentialed, and quota OK. Smoke availability is
-    /// handled upstream by <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/>,
-    /// which yields smoke-checked members for this path; this method applies the
-    /// audit quota policy itself. Used when the operator gave
-    /// no explicit audit preference AND the work agent itself is not tagged
-    /// audit-capable — falling back to the work agent would breach the AC
-    /// ("a non-audit-capable agent must NEVER be selected for auditing").
+    /// Walks the routed class chain looking for the first eligible member that
+    /// is registered, credentialed, and quota OK. Smoke availability is handled
+    /// upstream by <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/>,
+    /// which yields smoke-checked members for this path; this method applies
+    /// the audit quota policy itself.
+    /// <para>
+    /// When <paramref name="requireAuditCapability"/> is true, only members
+    /// tagged <see cref="WellKnownCapabilities.Audit"/> are considered — the
+    /// audit-capability pool path. When false, every class member is eligible
+    /// — the legacy no-tag-class path where the entire class is the audit
+    /// pool. Either way, falling back to the work agent here would breach the
+    /// hard invariant ("a non-audit-capable agent must NEVER be selected for
+    /// auditing" / "the gate must apply to every class audit pool").
+    /// </para>
     /// Throws <see cref="AgentClassExhaustedException"/> when at least one
-    /// audit-capable candidate was quota-rejected (the work item then parks
+    /// eligible candidate was quota-rejected (the work item then parks
     /// in WaitingForQuotaReset rather than passing audit with an incomplete
     /// review set). Throws <see cref="AuditUnavailableException"/> on
-    /// configuration-shaped absence (no audit-capable members at all, every
+    /// configuration-shaped absence (no eligible members at all, every
     /// candidate missing a registered runner or credentials) — surfacing the
     /// misconfig as a transient-execution failure that the caller routes via
     /// the existing RunAsync catch to failureKind="infrastructure". Never
@@ -7210,19 +7262,26 @@ public sealed class PipelineRunner : IPipelineRunner
     /// candidate must surface as an explicit failure, not a silent skip
     /// against which a Pass verdict could still be computed.
     /// </summary>
-    private async Task<AuditAgentSelection> SelectFromAuditCapablePoolAsync(
-        WorkItem item, Project project, string auditorName, string classId, CancellationToken ct)
+    private async Task<AuditAgentSelection> SelectFromAuditClassChainAsync(
+        WorkItem item,
+        Project project,
+        string auditorName,
+        string classId,
+        bool requireAuditCapability,
+        CancellationToken ct)
     {
         if (_classRouter is null)
             throw new AuditUnavailableException(
                 $"LLM auditor '{auditorName}' cannot run: no class router is configured but class '{classId}' is required for audit routing");
+        var poolDescriptor = requireAuditCapability ? "audit-capable member" : "member";
         var quotaRejectedCount = 0;
         var missingRunnerCount = 0;
         var missingCredentialsCount = 0;
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
             item, project, ct, requireQuota: false))
         {
-            if (_classRouter?.MemberHasCapability(classId, member, WellKnownCapabilities.Audit) != true)
+            if (requireAuditCapability
+                && _classRouter?.MemberHasCapability(classId, member, WellKnownCapabilities.Audit) != true)
                 continue;
             if (!_agents.TryGet(member.Agent, out var memberRunner))
             {
@@ -7251,7 +7310,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 continue;
             }
             _log.LogInformation(
-                "Routing auditor '{Auditor}' to audit-capable class member '{Member}'",
+                "Routing auditor '{Auditor}' to class member '{Member}'",
                 auditorName, member.Agent.Value);
             return new AuditAgentSelection(memberRunner, member);
         }
@@ -7261,12 +7320,13 @@ public sealed class PipelineRunner : IPipelineRunner
         // is misconfiguration, not a quota crunch; surfacing it as quota would
         // misdirect operators investigating the skip.
         if (quotaRejectedCount == 0
+            && requireAuditCapability
             && await TryGetPausedAuditPoolMemberAsync(project, classId, ct) is { } paused)
             throw new AgentPausedException("audit", paused.Agent, paused.Reason);
 
         // OrderedFallbackCandidatesAsync filters out members already marked
         // exhausted in the router's in-process cache before returning, so when
-        // every audit-capable member of the class is cached-exhausted the loop
+        // every eligible member of the class is cached-exhausted the loop
         // sees zero candidates and quotaRejectedCount stays at 0. That state
         // is still quota exhaustion — surfacing it as AuditUnavailableException
         // would route the item to failureKind="infrastructure" instead of
@@ -7280,12 +7340,12 @@ public sealed class PipelineRunner : IPipelineRunner
         // picked for this item cannot inflate the count and park work that
         // should have surfaced as infrastructure.
         var cachedExhaustedCount = _classRouter!.CountEligibleExhaustedClassMembersWithCapability(
-            item, project, WellKnownCapabilities.Audit);
+            item, project, requireAuditCapability ? WellKnownCapabilities.Audit : null);
         var totalExhausted = quotaRejectedCount + cachedExhaustedCount;
         if (totalExhausted > 0)
         {
             var parkMessage =
-                $"LLM auditor '{auditorName}' cannot run: no audit-capable member of class '{classId}' is available ({totalExhausted} quota-rejected)";
+                $"LLM auditor '{auditorName}' cannot run: no {poolDescriptor} of class '{classId}' is available ({totalExhausted} quota-rejected)";
             AuditLog.LlmAuditorParkedQuota(item.Id, auditorName, totalExhausted);
             _log.LogWarning(parkMessage);
             // Park the work item rather than silently skipping the auditor:
@@ -7300,7 +7360,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 message: parkMessage);
         }
 
-        // No usable candidate at all: every member of the audit-capable pool
+        // No usable candidate at all: every eligible member of the pool
         // is missing a registered runner, missing credentials, or the pool is
         // empty. This is a configuration / operator-environment failure, not
         // a quota crunch — surface it as a transient infrastructure failure
@@ -7310,11 +7370,15 @@ public sealed class PipelineRunner : IPipelineRunner
         // a code-quality finding (would re-introduce the 1aa5a13f false-
         // AuditFailed regression) or a silent skip (the bug this fix targets).
         var infraMessage =
-            $"LLM auditor '{auditorName}' cannot run: no audit-capable member of class '{classId}' is dispatchable " +
+            $"LLM auditor '{auditorName}' cannot run: no {poolDescriptor} of class '{classId}' is dispatchable " +
             $"(missing runner={missingRunnerCount}, missing credentials={missingCredentialsCount})";
         _log.LogWarning(infraMessage);
         throw new AuditUnavailableException(infraMessage);
     }
+
+    private Task<AuditAgentSelection> SelectFromAuditCapablePoolAsync(
+        WorkItem item, Project project, string auditorName, string classId, CancellationToken ct)
+        => SelectFromAuditClassChainAsync(item, project, auditorName, classId, requireAuditCapability: true, ct);
 
     /// <summary>
     /// Returns true when the router's in-process exhaustion cache says
