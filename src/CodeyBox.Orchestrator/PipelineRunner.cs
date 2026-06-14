@@ -6817,23 +6817,32 @@ public sealed class PipelineRunner : IPipelineRunner
                     ModelId = ResolveObservedModelId(workRunner, modelId: null),
                     QualityScore = 100,
                 };
-                var workAvailability = await EnsureAgentSmokeAvailableAsync(
-                    workRunner.Kind, auditSmokeTarget, ct);
-                if (workAvailability.Available && !IsOperatorPaused(workAvailability))
+                if (IsRouterCachedExhausted(workMember))
                 {
-                    var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
-                        workRunner.Kind, workProbeMember, ct);
-                    if (workOk)
-                        return new AuditAgentSelection(workRunner, workMember);
                     _log.LogInformation(
-                        "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
-                        workRunner.Kind.Value, workReason, auditorName);
+                        "Audit-capable work agent '{WorkKind}' rejected (router cache: exhausted) for auditor '{Auditor}'; spilling to audit pool",
+                        workRunner.Kind.Value, auditorName);
                 }
                 else
                 {
-                    _log.LogInformation(
-                        "Audit-capable work agent '{WorkKind}' rejected (smoke gate: {Reason}) for auditor '{Auditor}'; spilling to audit pool",
-                        workRunner.Kind.Value, workAvailability.Reason ?? "unavailable", auditorName);
+                    var workAvailability = await EnsureAgentSmokeAvailableAsync(
+                        workRunner.Kind, auditSmokeTarget, ct);
+                    if (workAvailability.Available && !IsOperatorPaused(workAvailability))
+                    {
+                        var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
+                            workRunner.Kind, workProbeMember, ct);
+                        if (workOk)
+                            return new AuditAgentSelection(workRunner, workMember);
+                        _log.LogInformation(
+                            "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                            workRunner.Kind.Value, workReason, auditorName);
+                    }
+                    else
+                    {
+                        _log.LogInformation(
+                            "Audit-capable work agent '{WorkKind}' rejected (smoke gate: {Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                            workRunner.Kind.Value, workAvailability.Reason ?? "unavailable", auditorName);
+                    }
                 }
             }
             return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
@@ -6876,39 +6885,55 @@ public sealed class PipelineRunner : IPipelineRunner
             QualityScore = 100,
         };
 
-        // Gate the preferred agent on in-VM smoke + availability exactly as the
-        // work-phase router (AgentClassRouter.ResolveAsync) does, BEFORE trusting
-        // it. An agent benched by in-VM smoke (exit 127 / auth drift) or by the
-        // fast-fail breaker must not run audit even when named explicitly — the
-        // class-chain walk below already gates its members via
-        // OrderedFallbackCandidatesAsync, so without this the preferred fast path
-        // was the one hole left open.
+        // Gate the preferred agent on router-cached exhaustion + in-VM smoke +
+        // availability exactly as the work-phase router
+        // (AgentClassRouter.ResolveAsync) does, BEFORE trusting it. An agent
+        // benched by in-VM smoke (exit 127 / auth drift), the fast-fail
+        // breaker, or the router's in-process exhaustion cache must not run
+        // audit even when named explicitly — the class-chain walk below
+        // already gates its members via OrderedFallbackCandidatesAsync, so
+        // without this the preferred fast path was the one hole left open.
+        // The cache check matters because the live smoke + quota probe can
+        // currently look healthy for a member that was just marked exhausted
+        // by a mid-iteration spill; returning it here would re-dispatch
+        // against the same bucket the spill was meant to avoid.
         AgentAvailability? preferredAvailability = null;
         var preferredAvailable = false;
         var preferredOk = false;
         string? preferredReason = null;
         string? preferredPauseReason = null;
+        var preferredCachedExhausted = IsRouterCachedExhausted(preferredMember);
 
-        preferredAvailability = await EnsureAgentSmokeAvailableAsync(
-            preferredKind.Value, auditSmokeTarget, ct);
-        if (IsOperatorPaused(preferredAvailability))
+        if (preferredCachedExhausted)
         {
-            preferredPauseReason = preferredAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
+            preferredReason = "router cache: exhausted";
             _log.LogInformation(
                 "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
-                preferredKind.Value.Value, preferredPauseReason, auditorName);
+                preferredKind.Value.Value, preferredReason, auditorName);
         }
         else
         {
-            preferredAvailable = preferredAvailability.Available;
+            preferredAvailability = await EnsureAgentSmokeAvailableAsync(
+                preferredKind.Value, auditSmokeTarget, ct);
+            if (IsOperatorPaused(preferredAvailability))
+            {
+                preferredPauseReason = preferredAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
+                _log.LogInformation(
+                    "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
+                    preferredKind.Value.Value, preferredPauseReason, auditorName);
+            }
+            else
+            {
+                preferredAvailable = preferredAvailability.Available;
 
-            (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
-                preferredKind.Value, preferredProbeMember, ct);
+                (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
+                    preferredKind.Value, preferredProbeMember, ct);
+            }
         }
-        if (preferredPauseReason is null && preferredAvailable && preferredOk)
+        if (!preferredCachedExhausted && preferredPauseReason is null && preferredAvailable && preferredOk)
             return new AuditAgentSelection(preferredRunner, preferredMember);
 
-        if (preferredPauseReason is null)
+        if (!preferredCachedExhausted && preferredPauseReason is null)
         {
             var rejectReason = preferredAvailable
                 ? preferredReason
@@ -6932,9 +6957,14 @@ public sealed class PipelineRunner : IPipelineRunner
         // (including the preferred agent above) — this is what the
         // LlmAuditorParkedQuota event reports. Candidates skipped for other
         // reasons (missing runner / credentials) are intentionally excluded.
-        var quotaRejectedCount = preferredPauseReason is null && preferredAvailable && !preferredOk
+        // A router-cache-exhausted preferred member is counted here because
+        // an exhaustion entry has the same eventual reset shape as a live
+        // probe rejection — quota returning is what clears it.
+        var quotaRejectedCount = preferredCachedExhausted
             ? 1
-            : 0;
+            : preferredPauseReason is null && preferredAvailable && !preferredOk
+                ? 1
+                : 0;
         // Track configuration-shaped rejections so the final throw can
         // distinguish "quota exhausted" (park for reset) from "no candidate
         // was ever dispatchable" (infrastructure failure). The preferred
@@ -6944,7 +6974,9 @@ public sealed class PipelineRunner : IPipelineRunner
         // misleads operators and parks the item behind QuotaRetryScheduler
         // even though quota returning will not make a smoke-benched CLI
         // usable.
-        var smokeRejectedCount = preferredPauseReason is null && !preferredAvailable
+        var smokeRejectedCount = !preferredCachedExhausted
+            && preferredPauseReason is null
+            && !preferredAvailable
             ? 1
             : 0;
         var missingRunnerCount = 0;
@@ -7104,9 +7136,10 @@ public sealed class PipelineRunner : IPipelineRunner
             return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId, ct);
 
         // Work runner is in the audit pool. Mirror the no-preferred branch's
-        // pause + smoke + quota gating before trusting it; on any rejection
-        // spill to SelectFromAuditCapablePoolAsync (which either picks a
-        // healthy peer or throws the proper park / infrastructure exception).
+        // pause + smoke + quota + router-cache gating before trusting it; on
+        // any rejection spill to SelectFromAuditCapablePoolAsync (which
+        // either picks a healthy peer or throws the proper park /
+        // infrastructure exception).
         var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
         if (GetAgentPausedReason(workRunner.Kind) is null)
         {
@@ -7117,23 +7150,32 @@ public sealed class PipelineRunner : IPipelineRunner
                 ModelId = ResolveObservedModelId(workRunner, modelId: null),
                 QualityScore = 100,
             };
-            var workAvailability = await EnsureAgentSmokeAvailableAsync(
-                workRunner.Kind, auditSmokeTarget, ct);
-            if (workAvailability.Available && !IsOperatorPaused(workAvailability))
+            if (IsRouterCachedExhausted(workMember))
             {
-                var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
-                    workRunner.Kind, workProbeMember, ct);
-                if (workOk)
-                    return new AuditAgentSelection(workRunner, workMember);
                 _log.LogInformation(
-                    "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
-                    workRunner.Kind.Value, workReason, auditorName);
+                    "Audit-capable work agent '{WorkKind}' rejected (router cache: exhausted) for auditor '{Auditor}'; spilling to audit pool",
+                    workRunner.Kind.Value, auditorName);
             }
             else
             {
-                _log.LogInformation(
-                    "Audit-capable work agent '{WorkKind}' rejected (smoke gate: {Reason}) for auditor '{Auditor}'; spilling to audit pool",
-                    workRunner.Kind.Value, workAvailability.Reason ?? "unavailable", auditorName);
+                var workAvailability = await EnsureAgentSmokeAvailableAsync(
+                    workRunner.Kind, auditSmokeTarget, ct);
+                if (workAvailability.Available && !IsOperatorPaused(workAvailability))
+                {
+                    var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
+                        workRunner.Kind, workProbeMember, ct);
+                    if (workOk)
+                        return new AuditAgentSelection(workRunner, workMember);
+                    _log.LogInformation(
+                        "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                        workRunner.Kind.Value, workReason, auditorName);
+                }
+                else
+                {
+                    _log.LogInformation(
+                        "Audit-capable work agent '{WorkKind}' rejected (smoke gate: {Reason}) for auditor '{Auditor}'; spilling to audit pool",
+                        workRunner.Kind.Value, workAvailability.Reason ?? "unavailable", auditorName);
+                }
             }
         }
         return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId, ct);
@@ -7232,8 +7274,13 @@ public sealed class PipelineRunner : IPipelineRunner
         // (the hard invariant being defended is: a Pass verdict must never
         // emerge while a configured auditor's spill-to-peer pool was entirely
         // quota-blocked). Reclassify here as exhausted so the existing park
-        // path runs.
-        var cachedExhaustedCount = CountCachedExhaustedAuditCapableMembers(classId);
+        // path runs. The router-owned helper applies the SAME item-specific
+        // eligibility filter OrderedFallbackCandidatesAsync did (MinModelScore
+        // + RequiredCapabilities) so a member that could never have been
+        // picked for this item cannot inflate the count and park work that
+        // should have surfaced as infrastructure.
+        var cachedExhaustedCount = _classRouter!.CountEligibleExhaustedClassMembersWithCapability(
+            item, project, WellKnownCapabilities.Audit);
         var totalExhausted = quotaRejectedCount + cachedExhaustedCount;
         if (totalExhausted > 0)
         {
@@ -7270,29 +7317,24 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Returns the count of audit-capable members of <paramref name="classId"/>
-    /// currently marked exhausted in the router's in-process cache. Used to
-    /// disambiguate "empty audit pool" (misconfiguration) from "every
-    /// audit-capable member is in-cache exhausted" (quota crunch) when
-    /// <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/> returns
-    /// zero candidates — the helper applies the same exhaustion filter the
-    /// router does, but at the configured-membership level instead of the
-    /// post-filter survivor list. Returns 0 when no router is configured.
+    /// Returns true when the router's in-process exhaustion cache says
+    /// <paramref name="member"/> is currently exhausted. The audit fast paths
+    /// (preferred-runner and audit-capable-work-runner) must consult this
+    /// before trusting a live smoke + quota probe — without it a member that
+    /// was marked exhausted via <see cref="AgentClassRouter.MarkExhausted"/>
+    /// (e.g. mid-iteration spill) could be re-selected immediately if the
+    /// live probe currently looks healthy, defeating the spill and reaching
+    /// a Pass verdict on the same exhausted bucket. Returns false when the
+    /// router is unwired or the member is synthetic (no cache entry to
+    /// consult); the audit-pool walk's
+    /// <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/> already
+    /// applies the same gate for its candidates.
     /// </summary>
-    private int CountCachedExhaustedAuditCapableMembers(string classId)
+    private bool IsRouterCachedExhausted(AgentMembership? member)
     {
-        if (_classRouter is null)
-            return 0;
-        var nowUtc = _opts.TimeProvider.GetUtcNow();
-        var count = 0;
-        foreach (var member in _classRouter.GetClassMembers(classId))
-        {
-            if (!_classRouter.MemberHasCapability(classId, member, WellKnownCapabilities.Audit))
-                continue;
-            if (_classRouter.IsExhausted(member, nowUtc))
-                count++;
-        }
-        return count;
+        if (_classRouter is null || member is null)
+            return false;
+        return _classRouter.IsExhausted(member, _opts.TimeProvider.GetUtcNow());
     }
 
     private async Task<(AgentKind Agent, string Reason)?> TryGetPausedAuditPoolMemberAsync(

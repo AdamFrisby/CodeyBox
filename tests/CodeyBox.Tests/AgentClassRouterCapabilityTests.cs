@@ -283,6 +283,71 @@ public sealed class AgentClassRouterCapabilityTests
         Assert.Equal(codexReset, earliest);
     }
 
+    // ── CountEligibleExhaustedClassMembersWithCapability honours eligibility ─
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_SkipsMembersBelowMinModelScore()
+    {
+        // Two members both declare "audit"; one is below the work item's
+        // MinModelScore floor. Both are marked exhausted. The helper must
+        // count ONLY the eligible one — otherwise the audit resolver would
+        // mistakenly park work for quota reset on the strength of an
+        // exhausted member that could never have been picked for this item.
+        var cls = Class(
+            Member(Claude, 100, "audit"),
+            Member(Codex, 70, "audit"));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(minScore: 90), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_SkipsMembersMissingRequiredCapabilities()
+    {
+        // The item requires "sensitive". One audit-capable member also
+        // declares "sensitive" (eligible); the other only declares "audit"
+        // (NOT eligible — missing the required capability). Both are
+        // exhausted. Only the eligible one must count, or the resolver
+        // would surface a member that could never have been picked.
+        var cls = Class(
+            Member(Claude, 100, "audit", "sensitive"),
+            Member(Codex, 90, "audit"));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(required: "sensitive"), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_SkipsMembersMissingCapabilityTag()
+    {
+        // Two eligible-by-score members are exhausted; only one declares
+        // the capability. The helper must not count the non-audit-tagged
+        // member — that mirrors the existing
+        // AuditPool_NonAuditMemberCachedExhausted_AuditCapableMisconfigured_FailsInfrastructure
+        // pin, but at the router-API level.
+        var cls = Class(
+            Member(Claude, 100, "audit"),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
     [Fact]
     public async Task ComputeEarliestExhaustedReset_SkipsMembersBelowMinModelScore()
     {
