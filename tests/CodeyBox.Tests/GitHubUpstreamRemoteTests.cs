@@ -62,6 +62,15 @@ public sealed class GitHubUpstreamRemoteTests
         JsonResponse(HttpStatusCode.Created,
             $$"""{"number":{{number}},"html_url":"{{htmlUrl}}"}""");
 
+    private static HttpResponseMessage PullRequestResponse(int number, string htmlUrl, string title, string body) =>
+        JsonResponse(HttpStatusCode.OK, JsonSerializer.Serialize(new
+        {
+            number,
+            html_url = htmlUrl,
+            title,
+            body,
+        }));
+
     private static HttpResponseMessage MergeOkResponse(string sha) =>
         JsonResponse(HttpStatusCode.OK,
             $$"""{"sha":"{{sha}}","merged":true,"message":"Pull Request successfully merged"}""");
@@ -250,6 +259,142 @@ public sealed class GitHubUpstreamRemoteTests
             Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
             """,
             message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_CommitsEndpointFailureStillSendsExplicitMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(12, "https://github.com/myorg/myrepo/pull/12"));
+        handler.Enqueue(JsonResponse(HttpStatusCode.InternalServerError, """{"message":"backend unavailable"}"""));
+        handler.Enqueue(MergeOkResponse("fallback-without-commits-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(
+            SampleRequest with
+            {
+                PromptRevision = 21,
+                Description = "Updates squash merge fallback when GitHub commit listing fails.",
+            },
+            CancellationToken.None);
+
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Get, handler.Requests[1].Method);
+        Assert.Contains("/pulls/12/commits", handler.Requests[1].RequestUri!.PathAndQuery);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("squash", mergeBody.RootElement.GetProperty("merge_method").GetString());
+        Assert.Equal("Add feature X (#12)", mergeBody.RootElement.GetProperty("commit_title").GetString());
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Update squash merge fallback when GitHub commit listing fails.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 21", message);
+        Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
+        Assert.Equal(1, CountOccurrences(message, "Co-Authored-By: CodeyBox"));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_UsesPromptRevisionWhenCommitsAreEmpty()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(13, "https://github.com/myorg/myrepo/pull/13"));
+        handler.Enqueue(PullRequestCommitsResponse("[]"));
+        handler.Enqueue(MergeOkResponse("prompt-revision-fallback-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(
+            SampleRequest with
+            {
+                PromptRevision = 34,
+                Description = "Ships a clean fallback trailer.",
+            },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Ship a clean fallback trailer.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 34", message);
+        Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ExistingPrNumberWithSquash_UsesExistingPrBodyForCommitMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PullRequestResponse(
+            42,
+            "https://github.com/myorg/myrepo/pull/42",
+            "feat: preserve generated squash summary (#42)",
+            """
+            This PR adds retry-safe squash commit composition.
+
+            ## Changes
+            - Updates retry merges to reuse the original PR description.
+
+            ---
+            *Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*
+            """));
+        handler.Enqueue(PullRequestCommitsResponse(
+            """
+            [
+              {
+                "commit": {
+                  "message": "codeybox rework: address audit findings\n\nCodeyBox-Prompt-Revision: 6\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+                }
+              }
+            ]
+            """));
+        handler.Enqueue(MergeOkResponse("merged-after-squash-retry"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            });
+        var request = SampleRequest with { ExistingPullRequestNumber = 42 };
+
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
+
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Get, handler.Requests[0].Method);
+        Assert.Equal("/repos/myorg/myrepo/pulls/42", handler.Requests[0].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Get, handler.Requests[1].Method);
+        Assert.Contains("/pulls/42/commits", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Equal(HttpMethod.Put, handler.Requests[2].Method);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("feat: preserve generated squash summary (#42)",
+            mergeBody.RootElement.GetProperty("commit_title").GetString());
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Add retry-safe squash commit composition.", message);
+        Assert.Contains("Update retry merges to reuse the original PR description.", message);
+        Assert.DoesNotContain("codeybox rework", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("CodeyBox-Prompt-Revision: 6", message);
+        Assert.Equal("merged-after-squash-retry", outcome.MergedSha);
     }
 
     [Fact]

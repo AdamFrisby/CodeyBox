@@ -8,7 +8,7 @@
   {
     "sha": "2222222222222222222222222222222222222222",
     "commit": {
-      "message": "fix audit feedback\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+      "message": "codeybox rework: address audit findings\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
     }
   },
   {

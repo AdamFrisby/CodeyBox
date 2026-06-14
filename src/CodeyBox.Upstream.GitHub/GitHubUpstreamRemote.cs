@@ -168,6 +168,19 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         {
             prNumber = existingPr;
             prHtmlUrl = $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{existingPr}";
+            if (IsSquashMerge(_opts.MergeMethod))
+            {
+                var existing = await TryFetchPullRequestAsync(existingPr, ct);
+                if (existing is not null)
+                {
+                    if (!string.IsNullOrWhiteSpace(existing.HtmlUrl))
+                        prHtmlUrl = existing.HtmlUrl;
+                    if (!string.IsNullOrWhiteSpace(existing.Title))
+                        prTitle = existing.Title;
+                    if (!string.IsNullOrWhiteSpace(existing.Body))
+                        prDescription = new PrDescriptionResult(existing.Body, Generated: _opts.PrDescription.Enabled);
+                }
+            }
         }
         else
         {
@@ -547,6 +560,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         ("Introduces ", "Introduce "),
         ("Implements ", "Implement "),
         ("Refactors ", "Refactor "),
+        ("Ships ", "Ship "),
     ];
 
     // -------------------------------------------------------------------------
@@ -585,6 +599,44 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct)
             ?? throw new InvalidOperationException(
                 $"GitHub POST /pulls returned success but response body could not be deserialised (head={request.WorkBranch})");
+    }
+
+    private async Task<GitHubPrResponse?> TryFetchPullRequestAsync(int prNumber, CancellationToken ct)
+    {
+        try
+        {
+            var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}";
+            using var req = BuildRequest(HttpMethod.Get, url);
+
+            var getPrSw = Stopwatch.StartNew();
+            using var response = await SendAsync(req, ct);
+            getPrSw.Stop();
+            CodeyBoxMeters.UpstreamApiCallDuration.Record(getPrSw.ElapsedMilliseconds,
+                new KeyValuePair<string, object?>("endpoint", "GET /pulls"),
+                new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _log.LogWarning(
+                    "GitHub GET /pulls/{N} returned {Status}; using local request data for squash commit message",
+                    prNumber, (int)response.StatusCode);
+                AuditLog.UpstreamApiCallFailed("GET /pulls", (int)response.StatusCode, _opts.Owner, _opts.Repository);
+                return null;
+            }
+
+            return await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                "Could not read PR #{N} while composing squash commit message ({Message}); using local request data fallback",
+                prNumber, ex.Message);
+            return null;
+        }
     }
 
     private async Task<(string? Sha, string? Notes, bool AutoMergeRaced)> MergePullRequestAsync(
@@ -910,6 +962,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         var lower = normalized.ToLowerInvariant();
 
         if (lower.StartsWith("codeybox: merge ", StringComparison.Ordinal)) return true;
+        if (lower.StartsWith("codeybox:", StringComparison.Ordinal))
+            return IsPureIterationNoise(lower["codeybox:".Length..]);
+        if (lower.StartsWith("codeybox rework:", StringComparison.Ordinal))
+            return IsPureIterationNoise(lower["codeybox rework:".Length..]);
         if (lower.StartsWith("merge branch ", StringComparison.Ordinal)) return true;
         if (lower.StartsWith("merge main", StringComparison.Ordinal)) return true;
         if (lower.Contains("merge conflict", StringComparison.Ordinal) &&
@@ -1031,7 +1087,9 @@ internal sealed record GitHubMergeRequest(
 
 internal sealed record GitHubPrResponse(
     [property: JsonPropertyName("number")] int Number,
-    [property: JsonPropertyName("html_url")] string? HtmlUrl);
+    [property: JsonPropertyName("html_url")] string? HtmlUrl,
+    [property: JsonPropertyName("title")] string? Title = null,
+    [property: JsonPropertyName("body")] string? Body = null);
 
 internal sealed record GitHubMergeResponse(
     [property: JsonPropertyName("sha")] string? Sha);

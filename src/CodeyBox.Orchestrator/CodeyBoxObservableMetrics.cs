@@ -38,6 +38,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
     // Refreshed off-thread; read by the work-item gauge callback.
     private volatile IReadOnlyList<Measurement<long>> _workItemStateCounts = [];
+    private volatile bool _disposed;
     private Timer? _refreshTimer;
 
     public CodeyBoxObservableMetrics(
@@ -60,19 +61,19 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
         _workItemsActive = CodeyBoxMeters.CreatePipelineObservableGauge<long>(
             "codeybox.work_item.active",
-            () => _workItemStateCounts,
+            ObserveWorkItemStateCounts,
             unit: "{work_item}",
             description: "Work items currently persisted in each state.");
 
         _workersInUse = CodeyBoxMeters.CreatePipelineObservableGauge<long>(
             "codeybox.workers.in_use",
-            () => [new Measurement<long>(CurrentWorkersInUse())],
+            ObserveWorkersInUse,
             unit: "{worker}",
             description: "Worker slots currently occupied by an in-flight pipeline run.");
 
         _workersMax = CodeyBoxMeters.CreatePipelineObservableGauge<long>(
             "codeybox.workers.max",
-            () => [new Measurement<long>(_maxWorkers)],
+            ObserveWorkersMax,
             unit: "{worker}",
             description: "Configured MaxConcurrentWorkers ceiling for the worker pool.");
 
@@ -84,7 +85,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
         _sandboxMax = CodeyBoxMeters.CreateSandboxObservableGauge<long>(
             "codeybox.sandbox.max",
-            () => [new Measurement<long>(_maxSandboxes)],
+            ObserveSandboxMax,
             unit: "{sandbox}",
             description: "Configured MaxConcurrentSandboxes admission ceiling.");
 
@@ -98,37 +99,76 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         }
     }
 
-    private long CurrentWorkersInUse() => _workerPool?.CurrentlyRunningTotal ?? 0;
+    private IEnumerable<Measurement<long>> ObserveWorkItemStateCounts()
+        => _disposed ? [] : _workItemStateCounts;
+
+    private IEnumerable<Measurement<long>> ObserveWorkersInUse()
+    {
+        if (_disposed) return [];
+
+        try
+        {
+            return [new Measurement<long>(_workerPool?.CurrentlyRunningTotal ?? 0)];
+        }
+        catch (ObjectDisposedException)
+        {
+            return [];
+        }
+    }
+
+    private IEnumerable<Measurement<long>> ObserveWorkersMax()
+        => _disposed ? [] : [new Measurement<long>(_maxWorkers)];
+
+    private IEnumerable<Measurement<long>> ObserveSandboxMax()
+        => _disposed ? [] : [new Measurement<long>(_maxSandboxes)];
 
     private IEnumerable<Measurement<long>> ObserveActiveSandboxes()
     {
+        if (_disposed) return [];
+
         // VM providers wrapped by SandboxAdmissionControlledProvider report the
         // admission gate directly. That includes queued/provisioning CreateAsync,
         // baseline warm-up, and startup resume leases that are not part of the
         // shutdown-owned active-sandbox snapshot.
-        var count = _sandboxes is ISandboxAdmissionSnapshot admission
-            ? admission.CurrentAdmittedSandboxes
-            : _sandboxes is IActiveSandboxProvider activeProvider
-            ? activeProvider.SnapshotActiveSandboxes().Count
-            : SandboxLiveCounter.Active;
-        return [new Measurement<long>(count, new KeyValuePair<string, object?>("provider", _sandboxes.Name))];
+        try
+        {
+            var count = _sandboxes is ISandboxAdmissionSnapshot admission
+                ? admission.CurrentAdmittedSandboxes
+                : _sandboxes is IActiveSandboxProvider activeProvider
+                ? activeProvider.SnapshotActiveSandboxes().Count
+                : SandboxLiveCounter.Active;
+            return [new Measurement<long>(count, new KeyValuePair<string, object?>("provider", _sandboxes.Name))];
+        }
+        catch (ObjectDisposedException)
+        {
+            return [];
+        }
     }
 
     private IEnumerable<Measurement<double>> ObserveQuotaAvailability()
     {
-        if (_quotaSnapshot is null) yield break;
-        foreach (var (instanceId, agent, model, pct) in _quotaSnapshot.SnapshotQuotaAvailabilityByInstance())
+        if (_disposed || _quotaSnapshot is null) return [];
+
+        try
         {
-            yield return new Measurement<double>(
-                pct,
-                new KeyValuePair<string, object?>("agent.kind", agent.Value),
-                new KeyValuePair<string, object?>("agent.instance", instanceId),
-                new KeyValuePair<string, object?>("model", model ?? "(default)"));
+            return _quotaSnapshot.SnapshotQuotaAvailabilityByInstance()
+                .Select(row => new Measurement<double>(
+                    row.AvailablePct,
+                    new KeyValuePair<string, object?>("agent.kind", row.Agent.Value),
+                    new KeyValuePair<string, object?>("agent.instance", row.InstanceId),
+                    new KeyValuePair<string, object?>("model", row.ModelId ?? "(default)")))
+                .ToArray();
+        }
+        catch (ObjectDisposedException)
+        {
+            return [];
         }
     }
 
     private async Task RefreshWorkItemStateCountsAsync()
     {
+        if (_disposed) return;
+
         try
         {
             var rows = await _store.GetFleetStateCountsAsync(CancellationToken.None);
@@ -173,6 +213,8 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
+        _refreshTimer?.Dispose();
         // ObservableGauge instances are owned by the Meter, not separately
         // disposable; only the refresh timer needs teardown here. The gauge
         // fields are retained for the process lifetime to keep the SDK's weak
@@ -183,6 +225,5 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         GC.KeepAlive(_sandboxActive);
         GC.KeepAlive(_sandboxMax);
         GC.KeepAlive(_quotaAvailable);
-        _refreshTimer?.Dispose();
     }
 }
