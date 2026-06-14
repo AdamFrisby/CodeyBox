@@ -48,8 +48,14 @@ internal static class ApiKeyAuth
         builder.Services.AddHostedService<ApiKeyAuthValidator>();
     }
 
-    public static IApplicationBuilder UseApiKeyAuth(this IApplicationBuilder app, string[] anonymousPrefixes)
+    public static IApplicationBuilder UseApiKeyAuth(
+        this IApplicationBuilder app,
+        string[] anonymousPrefixes,
+        string[]? anonymousExactPaths = null)
     {
+        // Materialise the exact-path list up-front so the middleware loop is
+        // a hot allocation-free path. Null is treated as empty.
+        var exactPaths = anonymousExactPaths ?? Array.Empty<string>();
         return app.Use(async (ctx, next) =>
         {
             var state = ctx.RequestServices.GetRequiredService<ApiKeyState>();
@@ -59,10 +65,25 @@ internal static class ApiKeyAuth
                 return;
             }
 
-            // Anonymous prefixes (e.g. "/healthz") are exempt.
+            // Anonymous prefixes (e.g. "/healthz") are exempt — covers the
+            // prefix itself AND any descendant routes (StartsWithSegments
+            // matches "/healthz", "/healthz/", "/healthz/anything").
             foreach (var prefix in anonymousPrefixes)
             {
                 if (ctx.Request.Path.StartsWithSegments(prefix, StringComparison.Ordinal))
+                {
+                    await next();
+                    return;
+                }
+            }
+
+            // Exact-path exemptions (e.g. "/metrics" for the Prometheus scrape
+            // endpoint) — match the path verbatim only. "/metrics" does NOT
+            // exempt "/metrics/foo" or "/metricsX" so an inadvertent route
+            // collision can't piggy-back on the bypass.
+            for (var i = 0; i < exactPaths.Length; i++)
+            {
+                if (ctx.Request.Path.Equals(exactPaths[i], StringComparison.Ordinal))
                 {
                     await next();
                     return;
