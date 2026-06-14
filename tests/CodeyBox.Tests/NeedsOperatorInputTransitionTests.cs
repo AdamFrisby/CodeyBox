@@ -107,6 +107,29 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkCompletionProgress_ClearsRecoveryAttemptsBeforeQuestionParking()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = BuildWithQuestions(seed, allowQuestions: true);
+        tp.Agent.QuestionToEmit = "q-reset";
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Test",
+            Prompt = "do something",
+            RecoveryAttempts = 2,
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Equal(0, final.RecoveryAttempts);
+    }
+
+    [Fact]
     public async Task AgentEmitsQuestion_WithStructuredStreamsEnabled_ParksAtNeedsOperatorInput()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -237,6 +260,37 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
         Assert.Equal("open", questions[0].State);
     }
 
+    [Fact]
+    public async Task ReworkCompletionProgress_ClearsRecoveryAttemptsBeforeQuestionParking()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = BuildWithQuestions(seed, allowQuestions: true, auditors: [new AlwaysFailAuditor()]);
+        tp.Agent.QuestionToEmit = "q-rework-reset";
+        tp.Agent.EmitOnlyOnRework = true;
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Test",
+            Prompt = "do something",
+        };
+        tp.Agent.AfterNonMergeCallAsync = async count =>
+        {
+            if (count != 2)
+                return;
+
+            var current = await tp.Store.GetAsync(item.Id);
+            await tp.Store.UpdateAsync(current! with { RecoveryAttempts = 2 });
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Equal(0, final.RecoveryAttempts);
+    }
+
 }
 
 internal sealed class TestPipelineWithQuestions : IDisposable
@@ -287,6 +341,7 @@ internal sealed class QuestionEmittingAgent : IAgentRunner, IStructuredStreamAge
     public string SeedRepoUrl { get; set; } = "";
     /// <summary>When true, only emit the question on rework (non-merge) calls after the first.</summary>
     public bool EmitOnlyOnRework { get; set; } = false;
+    public Func<int, Task>? AfterNonMergeCallAsync { get; set; }
     private int _nonMergeCallCount;
 
     public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default) =>
@@ -322,6 +377,8 @@ internal sealed class QuestionEmittingAgent : IAgentRunner, IStructuredStreamAge
         if (!write.Success) return new AgentResult(false, "write failed", write.Stdout, write.Stderr);
 
         _nonMergeCallCount++;
+        if (AfterNonMergeCallAsync is not null)
+            await AfterNonMergeCallAsync(_nonMergeCallCount);
 
         // Collect which question IDs to emit.
         var questionIds = QuestionsToEmit.Count > 0

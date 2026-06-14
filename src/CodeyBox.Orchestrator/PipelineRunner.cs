@@ -4572,6 +4572,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // re-check against the new work-branch tip. Refresh so the next
             // re-check sees any state mutations made by the rework path
             // (e.g. concurrent prompt edit captured by RunAgentPhaseAsync).
+            await ResetRecoveryAttemptsAfterRealProgressEventAsync(item.Id, "post-act-rework-completed", ct);
             item = await _store.GetAsync(item.Id, ct) ?? item;
         }
     }
@@ -5311,6 +5312,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var auditVerdict = blocking.Count == 0 ? AuditVerdict.Pass : AuditVerdict.Fail;
             await PublishAuditCompletedAsync(item, project, iteration, auditVerdict, auditPhaseStart, ct);
+            await ResetRecoveryAttemptsAfterRealProgressEventAsync(item.Id, "audit-verdict", ct);
 
             if (blocking.Count == 0)
             {
@@ -5506,6 +5508,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
             repoId, workBranch, reworkStart, ct);
+        await ResetRecoveryAttemptsAfterRealProgressEventAsync(item.Id, "audit-rework-completed", ct);
         if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
         {
             var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
@@ -11492,6 +11495,7 @@ Original merge-phase failure (for context):
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
             var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
                 current.With(state),
+                current.State,
                 state);
             await _store.UpdateAsync(next, transitionCt);
             _log.LogInformation("Work item {Id} → {State}", item.Id, state);
@@ -11513,6 +11517,22 @@ Original merge-phase failure (for context):
                     RevisionMatches = revision?.RevisionMatches,
                 }, CancellationToken.None);
             }
+        });
+    }
+
+    private async Task ResetRecoveryAttemptsAfterRealProgressEventAsync(
+        WorkItemId itemId,
+        string progressEvent,
+        CancellationToken ct)
+    {
+        await RunBoundedPostAgentAsync(itemId, $"reset-recovery-attempts-{progressEvent}", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(itemId, transitionCt);
+            if (current is null || current.RecoveryAttempts == 0)
+                return;
+
+            var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(current);
+            await _store.UpdateAsync(next, transitionCt);
         });
     }
 

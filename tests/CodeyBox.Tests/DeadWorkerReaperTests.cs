@@ -140,6 +140,49 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_WorkingWithPreemptCheckpoint_RequeuesAndCountsRecoveryAttempt()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/reaper",
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Equal(item.PreemptCheckpoint, after.PreemptCheckpoint);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Reaper_WorkingWithPreemptCheckpoint_AtRecoveryCap_Abandons()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            RecoveryAttempts = _opts.MaxRecoveryAttempts,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/reaper",
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
     public async Task Reaper_SuspendedItem_SkipsRecovery()
     {
         var item = MakeItem(WorkItemState.Working) with

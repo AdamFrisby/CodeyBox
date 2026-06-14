@@ -156,7 +156,14 @@ public sealed class RecoveryAttemptCapTests : IDisposable
             // Back-simulate: re-put the item in Auditing state for the next crash,
             // unless it's already abandoned.
             if (item.State == WorkItemState.WorkComplete)
-                await _store.UpdateAsync(item with { State = WorkItemState.Auditing });
+            {
+                var auditStarted = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                    item with { State = WorkItemState.Auditing },
+                    fromState: WorkItemState.WorkComplete,
+                    toState: WorkItemState.Auditing);
+                Assert.Equal(item.RecoveryAttempts, auditStarted.RecoveryAttempts);
+                await _store.UpdateAsync(auditStarted);
+            }
         }
 
         // After MaxAttempts+1 reaper runs the item should be abandoned.

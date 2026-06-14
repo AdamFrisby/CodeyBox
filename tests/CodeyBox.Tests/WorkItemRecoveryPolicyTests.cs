@@ -98,6 +98,32 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgress_ClearsAuditFailureToRework()
+    {
+        var item = MakeItem(WorkItemState.Auditing) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            item.With(WorkItemState.Reworking),
+            fromState: WorkItemState.Auditing,
+            toState: WorkItemState.Reworking);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgress_PreservesAuditStartTransition()
+    {
+        var item = MakeItem(WorkItemState.WorkComplete) with { RecoveryAttempts = 2 };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            item.With(WorkItemState.Auditing),
+            fromState: WorkItemState.WorkComplete,
+            toState: WorkItemState.Auditing);
+
+        Assert.Equal(2, reset.RecoveryAttempts);
+    }
+
+    [Fact]
     public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_Requeues()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-recovery-{Guid.NewGuid():N}.db");
@@ -172,6 +198,7 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.NotNull(recovered);
         Assert.Equal(WorkItemState.Working, recovered!.State);
         Assert.Null(recovered.StartedAt);
+        Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
     }
 

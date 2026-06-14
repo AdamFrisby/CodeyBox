@@ -183,7 +183,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task PreemptedWorking_ReenqueuesWithoutRecoveryReset()
+    public async Task PreemptedWorking_ReenqueuesAndCountsRecoveryAttempt()
     {
         var item = Item(WorkItemState.Working) with
         {
@@ -197,9 +197,30 @@ public sealed class WorkItemRecoveryTests : IDisposable
 
         var recovered = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, recovered!.State);
-        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Null(recovered.StartedAt);
         Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public async Task PreemptedWorking_AtRecoveryCap_TransitionsToAbandoned()
+    {
+        var item = Item(WorkItemState.Working, recoveryAttempts: 2) with
+        {
+            PreemptedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{Guid.NewGuid()}",
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator(maxRecovery: 2);
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Contains("2 recovery attempts", recovered.LastError);
+        Assert.Equal(3, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
     }
 
     [Fact]

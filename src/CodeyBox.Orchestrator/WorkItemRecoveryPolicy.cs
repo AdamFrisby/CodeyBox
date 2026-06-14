@@ -10,12 +10,25 @@ internal static class WorkItemRecoveryPolicy
         => maxAttempts > 0 && attempts > maxAttempts;
 
     public static WorkItem ResetRecoveryAttemptsAfterRealProgress(WorkItem item, WorkItemState completedState)
+        => ResetRecoveryAttemptsAfterRealProgress(item, item.State, completedState);
+
+    public static WorkItem ResetRecoveryAttemptsAfterRealProgress(
+        WorkItem item,
+        WorkItemState fromState,
+        WorkItemState toState)
     {
-        if (item.RecoveryAttempts == 0 || !IsRealProgressCompletionState(completedState))
+        if (item.RecoveryAttempts == 0 || !IsRealProgressTransition(fromState, toState))
             return item;
 
         return item with { RecoveryAttempts = 0 };
     }
+
+    public static WorkItem ResetRecoveryAttemptsAfterRealProgressEvent(WorkItem item)
+        => item.RecoveryAttempts == 0 ? item : item with { RecoveryAttempts = 0 };
+
+    private static bool IsRealProgressTransition(WorkItemState fromState, WorkItemState toState)
+        => IsRealProgressCompletionState(toState)
+        || (toState == WorkItemState.Reworking && fromState != WorkItemState.Reworking);
 
     private static bool IsRealProgressCompletionState(WorkItemState state) => state switch
     {
@@ -25,6 +38,35 @@ internal static class WorkItemRecoveryPolicy
         WorkItemState.Done => true,
         _ => false,
     };
+
+    public static WorkItem BuildPreemptCheckpointRecovery(
+        WorkItem item,
+        int recoveryAttempts,
+        int maxRecoveryAttempts,
+        DateTimeOffset now,
+        string exceededMessage)
+    {
+        if (ExceedsRecoveryAttempts(recoveryAttempts, maxRecoveryAttempts))
+        {
+            return item with
+            {
+                State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                LastError = exceededMessage,
+                RecoveryAttempts = recoveryAttempts,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                UpdatedAt = now,
+            };
+        }
+
+        return item with
+        {
+            RecoveryAttempts = recoveryAttempts,
+            StartedAt = null,
+            UpdatedAt = now,
+        };
+    }
 
     public static bool RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(WorkItem item) =>
         item.JobType is not JobType.CheckAndAct and not JobType.AgentControl
@@ -101,11 +143,12 @@ internal static class WorkItemRecoveryPolicy
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
-            return item with
-            {
-                StartedAt = null,
-                UpdatedAt = now,
-            };
+            return BuildPreemptCheckpointRecovery(
+                item,
+                NextRecoveryAttempt(item),
+                maxRecoveryAttempts: 0,
+                now,
+                "exceeded MaxRecoveryAttempts");
         }
 
         var target = item.State == WorkItemState.Working

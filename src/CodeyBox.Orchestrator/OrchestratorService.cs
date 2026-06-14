@@ -1340,11 +1340,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
-            return item with
-            {
-                StartedAt = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
-            };
+            return WorkItemRecoveryPolicy.BuildPreemptCheckpointRecovery(
+                item,
+                WorkItemRecoveryPolicy.NextRecoveryAttempt(item),
+                _opts.MaxRecoveryAttempts,
+                DateTimeOffset.UtcNow,
+                $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}");
         }
 
         if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))

@@ -269,13 +269,50 @@ public sealed class DeadWorkerReaper : BackgroundService
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
-            var preempted = item with { StartedAt = null, UpdatedAt = DateTimeOffset.UtcNow };
+            var preemptAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            var preempted = WorkItemRecoveryPolicy.BuildPreemptCheckpointRecovery(
+                item,
+                preemptAttempt,
+                _opts.MaxRecoveryAttempts,
+                DateTimeOffset.UtcNow,
+                "exceeded MaxRecoveryAttempts");
             await _store.UpdateAsync(preempted, ct);
-            await _queue.EnqueueAsync(itemId, ct);
             MarkRecoveredItem(itemId);
-            _log.LogInformation(
-                "Recovery ({WorkerId}): work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume",
-                workerIdContext, itemId, item.PreemptCheckpoint);
+
+            if (preempted.State == WorkItemState.AbandonedAfterRecoveryAttempts)
+            {
+                _log.LogWarning(
+                    "Recovery ({WorkerId}): preempt-checkpointed work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); abandoning for operator triage",
+                    workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, preemptAttempt);
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "checkpoint recovery exceeded MaxRecoveryAttempts; abandoned permanently", ct);
+            }
+            else
+            {
+                await _queue.EnqueueAsync(itemId, ct);
+                _log.LogInformation(
+                    "Recovery ({WorkerId}): work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume (attempt {Attempt}/{Max})",
+                    workerIdContext, itemId, item.PreemptCheckpoint, preemptAttempt, _opts.MaxRecoveryAttempts);
+            }
+
+            if (_webhooks is not null)
+            {
+                _ = _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.recovered",
+                    WorkItem = preempted,
+                    Details = new
+                    {
+                        workItemId = itemId.ToString(),
+                        projectId = item.ProjectId.Value,
+                        fromState = item.State.ToString(),
+                        toState = preempted.State.ToString(),
+                        reason = webhookReason,
+                        recoveryAttempt = preemptAttempt,
+                        maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                    },
+                }, CancellationToken.None);
+            }
             return;
         }
 

@@ -185,10 +185,32 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         Assert.Equal(item.PreemptCheckpoint, after.PreemptCheckpoint);
         // StartedAt is cleared so the item doesn't appear in-flight to budget queries.
         Assert.Null(after.StartedAt);
-        // RecoveryAttempts is NOT incremented for the clean-resume path.
-        Assert.Equal(0, after.RecoveryAttempts);
+        // Checkpoint resume is still a recovery; repeated checkpoint resumes
+        // without phase completion must reach MaxRecoveryAttempts.
+        Assert.Equal(1, after.RecoveryAttempts);
         // Re-enqueued for the dispatcher to pick up.
         Assert.Equal(1, _queue.Count);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Reworking)]
+    public async Task Sweep_PreemptCheckpoint_AtRecoveryCap_Abandons(WorkItemState state)
+    {
+        var item = MakeItem(
+            state,
+            recoveryAttempts: _opts.MaxRecoveryAttempts,
+            preemptCheckpoint: "refs/heads/codeybox/preempt/abc123");
+        await _store.CreateAsync(item);
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Equal(0, _queue.Count);
     }
 
     [Fact]

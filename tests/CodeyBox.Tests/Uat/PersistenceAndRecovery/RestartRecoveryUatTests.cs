@@ -62,7 +62,7 @@ public sealed class RestartRecoveryUatTests : IDisposable
         Assert.Null(failed.PreemptCheckpoint);
         Assert.Contains("without a preempt checkpoint", failed.LastError);
         Assert.Equal(WorkItemState.Working, resumable!.State);
-        Assert.Equal(0, resumable.RecoveryAttempts);
+        Assert.Equal(1, resumable.RecoveryAttempts);
         Assert.Null(resumable.StartedAt);
         Assert.Equal(preemptedWork.PreemptCheckpoint, resumable.PreemptCheckpoint);
     }
