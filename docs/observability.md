@@ -17,13 +17,16 @@ All options live under the `CodeyBox:Otel` section.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `Enabled` | bool | `false` | Enable OTel export. Nothing is registered when `false`. |
+| `Enabled` | bool | `false` | Enable OTel OTLP push. Nothing OTLP-related is registered when `false`. The Prometheus scrape exporter (see [`Prometheus:Enabled`](#prometheus-scrape-exporter)) is independent — either or both can be on. |
 | `ServiceName` | string | `"codeybox"` | OTel `service.name` resource attribute. |
 | `ServiceVersion` | string? | `null` | OTel `service.version` — use a git SHA or release tag. |
-| `OtlpEndpoint` | string | *(required if enabled)* | OTLP collector endpoint, e.g. `http://localhost:4317`. |
+| `OtlpEndpoint` | string | *(required if `Enabled`)* | OTLP collector endpoint, e.g. `http://localhost:4317`. |
 | `OtlpHeaders` | string? | `null` | CSV of extra headers forwarded to the collector, e.g. `x-honeycomb-team=abc,x-dataset=prod`. |
 | `ExportProtocol` | `"grpc"` \| `"httpprotobuf"` | `"grpc"` | OTLP wire format. |
 | `ResourceAttributes` | `{ key: value }` | `{}` | Extra OTel resource attributes merged into every span, metric point, and log record. Applied last, so they override the auto-derived attributes on key collision. |
+| `Prometheus:Enabled` | bool | `false` | In-process Prometheus scrape endpoint. See [Prometheus scrape exporter](#prometheus-scrape-exporter). |
+| `Prometheus:Path` | string | `"/metrics"` | Path the scrape endpoint is mapped at. Must begin with `/`. |
+| `Prometheus:RequireApiKey` | bool | `false` | When `false` (default), the scrape path is exempted from the API-key middleware (exact-path scope only). When `true`, the path requires the same `Authorization: Bearer` header as every other endpoint. |
 
 ### Standard `OTEL_*` environment variables
 
@@ -145,6 +148,125 @@ Polled at collection time; registered only when OTel is enabled.
 | `codeybox.agent.quota.available_pct` | `%` | `agent.kind`, `model` | Most-recent subscription quota headroom observed per agent/model during routing (`-1` = unknown). |
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.
+
+---
+
+## Prometheus scrape exporter
+
+CodeyBox can additionally expose its existing metric instruments as a Prometheus scrape endpoint, so operator scrapers (Prometheus, conky, a KDE widget, curl-from-cron) can read fleet state directly without an OTLP collector in the path. The Prometheus exporter is a **peer** of the OTLP push exporter: enabling one does not require the other. Both can run side by side against the same metric provider — no double instrumentation cost.
+
+### Configuration
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `CodeyBox:Otel:Prometheus:Enabled` | bool | `false` | When `false`, the exporter is not registered with the meter provider and the scrape endpoint is not mapped at all (the route is invisible — `404`, not `401`). Restart required to toggle. |
+| `CodeyBox:Otel:Prometheus:Path` | string | `"/metrics"` | Path to expose. Must begin with `/`. |
+| `CodeyBox:Otel:Prometheus:RequireApiKey` | bool | `false` | Whether the scrape path requires the API-key middleware. See [Authentication](#authentication-for-the-scrape-endpoint). |
+
+The Prometheus exporter and the OTLP push exporter are independent — enabling Prometheus does **not** require `CodeyBox:Otel:Enabled=true`. Setting `Prometheus:Enabled=true` alone wires up the metric provider (and the observable gauges) with the Prometheus exporter only; tracing, log forwarding, and OTLP push stay off until `Otel:Enabled=true`.
+
+### Series shape
+
+Exposed series are the **same** instruments documented in [Metric model](#metric-model), rendered in Prometheus exposition format. The OTel → Prometheus name conversion is:
+
+- Dots become underscores: `codeybox.work_item.active` → `codeybox_work_item_active`.
+- Tag keys become labels: `state="Queued"`, `agent_kind="claude"`, etc.
+- Counter instruments get a `_total` suffix per Prometheus convention.
+
+Examples:
+
+```
+# HELP codeybox_work_item_active Work items currently persisted in each state.
+# TYPE codeybox_work_item_active gauge
+codeybox_work_item_active{state="Queued"} 31
+codeybox_work_item_active{state="Working"} 4
+codeybox_work_item_active{state="Done"} 1812
+
+# HELP codeybox_workers_in_use Worker slots currently occupied by an in-flight pipeline run.
+# TYPE codeybox_workers_in_use gauge
+codeybox_workers_in_use 4
+
+# HELP codeybox_workers_max Configured MaxConcurrentWorkers ceiling for the worker pool.
+# TYPE codeybox_workers_max gauge
+codeybox_workers_max 16
+
+# HELP codeybox_sandbox_active Currently admitted live or provisioning sandboxes/VMs.
+# TYPE codeybox_sandbox_active gauge
+codeybox_sandbox_active{provider="multipass"} 4
+
+# HELP codeybox_agent_quota_available_pct Most-recent subscription quota headroom...
+# TYPE codeybox_agent_quota_available_pct gauge
+codeybox_agent_quota_available_pct{agent_kind="claude",model="claude-opus-4-7"} 71.4
+```
+
+The endpoint also includes the runtime / HTTP-client instrumentation series already registered (`process_runtime_dotnet_gc_*`, `http_server_request_duration_seconds`, etc.).
+
+### Authentication for the scrape endpoint
+
+Prometheus scrapers typically cannot send an `Authorization: Bearer ...` header. CodeyBox makes the auth posture for `/metrics` (or whatever `Path` resolves to) configurable:
+
+- **`RequireApiKey=false` (default)** — the configured path is exempted from the API-key middleware. The exemption is **exact-path only**: it does not cascade to descendants (`/metrics/leak` still requires the bearer token) or any other route. The default assumes the deployment binds the API to localhost (or a private network) and treats the fleet/quota gauges as non-sensitive operational data.
+- **`RequireApiKey=true`** — the scrape path requires the same `Authorization: Bearer <key>` header as every other endpoint. Use this when the API is reachable from a network you do not control end-to-end.
+
+When `Enabled=false`, the route is not mapped at all — there is no 401 to bypass, just a 404 from the routing table.
+
+### Example configurations
+
+Scrape from a Prometheus instance running on the same host:
+
+```json
+{
+  "CodeyBox": {
+    "Otel": {
+      "Prometheus": { "Enabled": true }
+    }
+  }
+}
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: codeybox
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['127.0.0.1:5000']
+```
+
+Run both OTLP push and Prometheus scrape side by side:
+
+```json
+{
+  "CodeyBox": {
+    "Otel": {
+      "Enabled": true,
+      "OtlpEndpoint": "http://otel-collector:4317",
+      "Prometheus": { "Enabled": true, "Path": "/metrics", "RequireApiKey": false }
+    }
+  }
+}
+```
+
+Locked-down scrape (token-protected):
+
+```json
+{
+  "CodeyBox": {
+    "Otel": {
+      "Prometheus": { "Enabled": true, "RequireApiKey": true }
+    }
+  }
+}
+```
+
+```yaml
+scrape_configs:
+  - job_name: codeybox
+    metrics_path: /metrics
+    bearer_token_file: /etc/prometheus/codeybox.token
+    static_configs:
+      - targets: ['codeybox.internal:5000']
+```
 
 ---
 

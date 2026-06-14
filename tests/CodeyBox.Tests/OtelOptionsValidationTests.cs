@@ -160,4 +160,62 @@ public sealed class OtelOptionsValidationTests
         Assert.Empty(OtelOptions.ParseResourceAttributesEnv(null));
         Assert.Empty(OtelOptions.ParseResourceAttributesEnv("   "));
     }
+
+    // ── Prometheus exporter validation ───────────────────────────────────────
+
+    [Fact]
+    public void PrometheusDisabled_DoesNotThrow_EvenWithInvalidPath()
+    {
+        // Validation only runs when the exporter is opted in; a stale Path
+        // value must not block startup of a deployment that never enables it.
+        var opts = new OtelOptions
+        {
+            Enabled = false,
+            Prometheus = new PrometheusExporterOptions { Enabled = false, Path = "garbage" },
+        };
+        OtelOptions.Validate(opts);
+    }
+
+    [Fact]
+    public void PrometheusEnabled_DefaultPath_DoesNotThrow()
+    {
+        var opts = new OtelOptions
+        {
+            Enabled = false,
+            Prometheus = new PrometheusExporterOptions { Enabled = true },
+        };
+        OtelOptions.Validate(opts);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("metrics")] // missing leading slash
+    [InlineData("/")] // slash only, no actual segment
+    public void PrometheusEnabled_InvalidPath_Throws(string path)
+    {
+        var opts = new OtelOptions
+        {
+            Enabled = false,
+            Prometheus = new PrometheusExporterOptions { Enabled = true, Path = path },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => OtelOptions.Validate(opts));
+        Assert.Contains("Prometheus", ex.Message);
+        Assert.Contains("Path", ex.Message);
+    }
+
+    [Fact]
+    public void PrometheusEnabled_AlongsideOtel_BothValidated()
+    {
+        // OTel and Prometheus share a single Validate entry point; if Otel is
+        // enabled with a bad endpoint the throw must still happen even when
+        // Prometheus options are valid (and vice versa).
+        var opts = new OtelOptions
+        {
+            Enabled = true,
+            OtlpEndpoint = null,
+            Prometheus = new PrometheusExporterOptions { Enabled = true, Path = "/metrics" },
+        };
+        Assert.Throws<InvalidOperationException>(() => OtelOptions.Validate(opts));
+    }
 }

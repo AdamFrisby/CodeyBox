@@ -131,13 +131,23 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 // Off by default (OtelOptions.Enabled = false). Operators opt in by setting
 // CodeyBox:Otel:Enabled=true and CodeyBox:Otel:OtlpEndpoint. When disabled,
 // no OTel types are registered — zero overhead in the default configuration.
+//
+// The Prometheus scrape exporter (CodeyBox:Otel:Prometheus:Enabled) is a
+// peer of the OTLP push exporter: enabling either one (or both) registers
+// the metric provider, observable gauges, and CodeyBox meters. The
+// tracing / logging providers and the OTLP push pipeline activate only
+// when CodeyBox:Otel:Enabled=true; Prometheus alone keeps tracing and logs
+// on the existing Serilog-only path.
 {
     var cbConf = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
         ?? new CodeyBoxOptions();
     var otelOpts = cbConf.Otel;
     OtelOptions.Validate(otelOpts);
 
-    if (otelOpts.Enabled)
+    var prometheusEnabled = otelOpts.Prometheus.Enabled;
+    var metricsEnabled = otelOpts.Enabled || prometheusEnabled;
+
+    if (metricsEnabled)
     {
         // service.version defaults to the API assembly version when the operator
         // hasn't pinned a git SHA / release tag.
@@ -173,42 +183,55 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
                 r.AddAttributes(envAttrs);
         }
 
-        builder.Services.AddOpenTelemetry()
-            .ConfigureResource(ConfigureResource)
-            .WithTracing(t => t
+        var otelBuilder = builder.Services.AddOpenTelemetry()
+            .ConfigureResource(ConfigureResource);
+
+        if (otelOpts.Enabled)
+        {
+            otelBuilder.WithTracing(t => t
                 .AddSource("CodeyBox.Pipeline")
                 .AddSource("CodeyBox.Sandbox")
                 .AddSource("CodeyBox.Upstream")
                 .AddSource("CodeyBox.Audit")
                 .AddAspNetCoreInstrumentation()
                 .AddHttpClientInstrumentation()
-                .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)))
-            .WithMetrics(m => m
-                .AddMeter("CodeyBox.Pipeline")
-                .AddMeter("CodeyBox.Sandbox")
-                .AddMeter("CodeyBox.Audit")
-                .AddMeter("CodeyBox.Upstream")
-                .AddRuntimeInstrumentation()
                 .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)));
+        }
 
-        // Route the existing ILogger output through the OpenTelemetry logging
-        // provider. Serilog forwards events here via the LoggerProviderCollection
-        // wired above (writeToProviders); LogRecords are stamped with the active
-        // Activity's TraceId/SpanId for log↔trace correlation.
-        builder.Logging.AddOpenTelemetry(o =>
+        otelBuilder.WithMetrics(m =>
         {
-            o.IncludeScopes = true;
-            o.IncludeFormattedMessage = true;
-            o.ParseStateValues = true;
-            var rb = ResourceBuilder.CreateDefault();
-            ConfigureResource(rb);
-            o.SetResourceBuilder(rb);
-            o.AddOtlpExporter(e => ConfigureOtlp(e, otelOpts));
+            m.AddMeter("CodeyBox.Pipeline")
+             .AddMeter("CodeyBox.Sandbox")
+             .AddMeter("CodeyBox.Audit")
+             .AddMeter("CodeyBox.Upstream")
+             .AddRuntimeInstrumentation();
+            if (otelOpts.Enabled)
+                m.AddOtlpExporter(o => ConfigureOtlp(o, otelOpts));
+            if (prometheusEnabled)
+                m.AddPrometheusExporter();
         });
 
+        if (otelOpts.Enabled)
+        {
+            // Route the existing ILogger output through the OpenTelemetry logging
+            // provider. Serilog forwards events here via the LoggerProviderCollection
+            // wired above (writeToProviders); LogRecords are stamped with the active
+            // Activity's TraceId/SpanId for log↔trace correlation.
+            builder.Logging.AddOpenTelemetry(o =>
+            {
+                o.IncludeScopes = true;
+                o.IncludeFormattedMessage = true;
+                o.ParseStateValues = true;
+                var rb = ResourceBuilder.CreateDefault();
+                ConfigureResource(rb);
+                o.SetResourceBuilder(rb);
+                o.AddOtlpExporter(e => ConfigureOtlp(e, otelOpts));
+            });
+        }
+
         // Observable gauges (work items by state, worker pool occupancy, active
-        // sandboxes, quota headroom) are registered only when OTel is enabled to
-        // preserve the zero-overhead disabled path.
+        // sandboxes, quota headroom) are registered only when at least one
+        // metric exporter is active to preserve the zero-overhead disabled path.
         builder.Services.AddHostedService<CodeyBoxObservableMetrics>();
     }
 }
@@ -2684,7 +2707,25 @@ app.Use(async (ctx, next) =>
     }
 });
 
-app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
+// Resolve the Prometheus exporter options once so middleware and endpoint
+// mapping see a consistent view. The options were validated at host build
+// time; this just reads the snapshot. Toggling Enabled at runtime is NOT
+// supported (the exporter is wired into the metric provider builder).
+var prometheusOpts = builder.Configuration
+    .GetSection("CodeyBox:Otel:Prometheus")
+    .Get<PrometheusExporterOptions>() ?? new PrometheusExporterOptions();
+
+// When the Prometheus scrape endpoint is enabled AND RequireApiKey is off,
+// exempt EXACTLY that path from API-key auth. Scrapers (Prometheus, conky,
+// curl-from-cron) typically cannot send the Bearer token. The exemption is
+// exact-path only so a sibling route or descendant can't piggy-back on it.
+var prometheusAnonymousPaths = (prometheusOpts.Enabled && !prometheusOpts.RequireApiKey)
+    ? new[] { prometheusOpts.Path }
+    : Array.Empty<string>();
+
+app.UseApiKeyAuth(
+    anonymousPrefixes: ["/healthz", "/webhooks/"],
+    anonymousExactPaths: prometheusAnonymousPaths);
 
 // Idempotency-Key support for mutating endpoints — see IdempotencyMiddleware
 // for behaviour. Ordered after auth so unauthenticated requests can't poison
@@ -2712,6 +2753,16 @@ BaselineEndpoints.Map(app);
 QuotaRetryStatusEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 AgentPauseEndpoints.Map(app);
+
+// Prometheus scrape endpoint — registered only when the exporter is enabled
+// so the surface is invisible (route not on the table) by default. Mapped
+// after the API-key middleware so the exemption above takes effect when
+// RequireApiKey=false; when RequireApiKey=true, the middleware enforces the
+// Bearer token on this path like any other endpoint.
+if (prometheusOpts.Enabled)
+{
+    app.MapPrometheusScrapingEndpoint(prometheusOpts.Path);
+}
 
 app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 
@@ -3844,12 +3895,23 @@ namespace CodeyBox.Api
         public Dictionary<string, string> ResourceAttributes { get; set; } = [];
 
         /// <summary>
+        /// In-process Prometheus scrape exporter. Off by default; opt in by
+        /// setting <c>CodeyBox:Otel:Prometheus:Enabled=true</c>. Runs alongside
+        /// the OTLP push exporter (when <see cref="Enabled"/> is also true), or
+        /// stands alone as the only metric exporter when OTLP is disabled.
+        /// </summary>
+        public PrometheusExporterOptions Prometheus { get; set; } = new();
+
+        /// <summary>
         /// Validates the options, throwing <see cref="InvalidOperationException"/> when
         /// <see cref="Enabled"/> is true and the configuration is incomplete or invalid.
-        /// Safe to call when disabled — no-ops immediately.
+        /// Also validates <see cref="Prometheus"/> when the scrape exporter is enabled.
+        /// Safe to call when both are disabled — no-ops immediately.
         /// </summary>
         public static void Validate(OtelOptions opts)
         {
+            PrometheusExporterOptions.Validate(opts.Prometheus);
+
             if (!opts.Enabled) return;
 
             // The endpoint may come from appsettings OR the standard
@@ -3904,6 +3966,74 @@ namespace CodeyBox.Api
                 result.Add(new KeyValuePair<string, object>(key, value));
             }
             return result;
+        }
+    }
+
+    /// <summary>
+    /// In-process Prometheus scrape exporter configuration. Bound from
+    /// <c>CodeyBox:Otel:Prometheus</c>. Off by default. Exposes the SAME
+    /// metric instruments the OTLP push pipeline carries, rendered in
+    /// Prometheus exposition format (dots → underscores, tags → labels), so a
+    /// Prometheus scraper / curl / kioskish dashboard widget can read fleet
+    /// state directly without an OTLP collector in the path.
+    /// </summary>
+    /// <remarks>
+    /// The exporter is wired into the OpenTelemetry metrics pipeline at host
+    /// build time, so toggling <see cref="Enabled"/> requires a restart;
+    /// hot-reloading the option does nothing on its own. <see cref="Path"/>
+    /// and <see cref="RequireApiKey"/> are also captured at startup.
+    /// </remarks>
+    public sealed class PrometheusExporterOptions
+    {
+        /// <summary>
+        /// Master switch. Default <c>false</c>. When false, the Prometheus
+        /// exporter is not registered with the meter provider and the scrape
+        /// endpoint is not mapped, so the surface is invisible (no 401, no
+        /// 404 — the route simply does not exist on the routing table).
+        /// </summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>
+        /// Scrape endpoint path. Default <c>/metrics</c>. Must begin with
+        /// <c>/</c> and contain at least one non-slash character.
+        /// </summary>
+        public string Path { get; set; } = "/metrics";
+
+        /// <summary>
+        /// When <c>true</c>, the scrape endpoint requires the same
+        /// <c>Authorization: Bearer &lt;key&gt;</c> header as every other API
+        /// endpoint. When <c>false</c> (default), the scrape path is exempted
+        /// from API-key auth at request time. The exemption is scoped to the
+        /// EXACT configured <see cref="Path"/> — no descendants, no sibling
+        /// routes, no other verbs picking up the bypass.
+        /// </summary>
+        /// <remarks>
+        /// The default <c>false</c> assumes the deployment binds the API to
+        /// localhost (or a private network) for the operator's own scrape
+        /// stack. The exposed series carry fleet/quota gauges and runtime /
+        /// HTTP instrumentation — non-sensitive operational data. If the API
+        /// is reachable from a public network, set <c>RequireApiKey=true</c>.
+        /// </remarks>
+        public bool RequireApiKey { get; set; } = false;
+
+        /// <summary>
+        /// Validates the options, throwing <see cref="InvalidOperationException"/>
+        /// when <see cref="Enabled"/> is true and the configuration is invalid.
+        /// No-ops when disabled.
+        /// </summary>
+        public static void Validate(PrometheusExporterOptions opts)
+        {
+            if (!opts.Enabled) return;
+
+            // Reject blank or malformed paths early. Without this, the
+            // Prometheus middleware would happily map "/" or "" and either
+            // shadow the root or fail at runtime with an opaque routing error.
+            if (string.IsNullOrWhiteSpace(opts.Path)
+                || opts.Path[0] != '/'
+                || opts.Path.TrimStart('/').Length == 0)
+                throw new InvalidOperationException(
+                    $"CodeyBox:Otel:Prometheus:Path '{opts.Path}' is not valid. " +
+                    "Expected a path beginning with '/' (e.g. '/metrics').");
         }
     }
 
