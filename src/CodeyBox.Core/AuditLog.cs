@@ -532,13 +532,15 @@ public static class AuditLog
     /// <summary>
     /// Emitted when every candidate agent (configured audit agent + class-chain
     /// members + work agent fallback) was quota-exhausted, so the LLM auditor
-    /// is being skipped for this audit iteration. The work item continues with
-    /// the remaining auditors rather than parking.
+    /// cannot run for this audit iteration. The work item parks in
+    /// WaitingForQuotaReset and the QuotaRetryScheduler re-dispatches the audit
+    /// when quota returns — silently skipping the auditor would let a Pass
+    /// verdict emerge with an incomplete review set.
     /// </summary>
-    public static void LlmAuditorSkippedQuota(WorkItemId workItemId, string auditorName, int candidateCount) =>
-        Audit("audit.llm_auditor_skipped_quota")
+    public static void LlmAuditorParkedQuota(WorkItemId workItemId, string auditorName, int candidateCount) =>
+        Audit("audit.llm_auditor_parked_quota")
             .Warning(
-                "LLM auditor '{AuditorName}' skipped for {WorkItemId}: all {CandidateCount} candidate agent(s) quota-exhausted",
+                "LLM auditor '{AuditorName}' parking {WorkItemId}: all {CandidateCount} candidate agent(s) quota-exhausted; audit cannot complete this iteration",
                 auditorName, workItemId.ToString(), candidateCount);
 
     /// <summary>

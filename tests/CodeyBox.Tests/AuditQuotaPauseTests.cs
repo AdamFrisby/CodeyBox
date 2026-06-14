@@ -23,13 +23,15 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditLlmQuotaFailure_AllClassMembersExhausted_SkipsLlmAuditorAndContinues()
+    public async Task AuditLlmQuotaFailure_AllClassMembersExhausted_ParksWorkItemForQuotaReset()
     {
-        // Bug 779e7dc9 (warning-and-skip variant): when every member of the
-        // work item's agent class is quota-exhausted for an LLM auditor, the
-        // pipeline now skips that auditor for the iteration rather than
-        // parking the whole work item. The remaining auditors still run and
-        // the item ships with degraded (but non-fatal) audit signal.
+        // When every member of the work item's agent class is quota-exhausted
+        // for an LLM auditor, the audit gate cannot complete this iteration.
+        // A Pass verdict requires every configured auditor to have produced
+        // a verdict, so the work item PARKS in WaitingForQuotaReset and the
+        // QuotaRetryScheduler resumes the same iteration when quota returns —
+        // silently skipping the auditor would let a Pass verdict emerge with
+        // an incomplete review set (the original warning-and-skip bug).
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => QuotaResult());
         using var fix = BuildFixture(seed, auditor, [AgentKind.Gemini]);
@@ -42,9 +44,9 @@ public sealed class AuditQuotaPauseTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
-        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
     }
 
     [Fact]
@@ -116,14 +118,16 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditLlmQuotaFailure_NoLongerParksWhenChainExhausted()
+    public async Task AuditLlmQuotaFailure_ParksWhenAuditChainExhaustedOnFirstAttempt()
     {
-        // Bug 779e7dc9: previously, when the audit-side quota fallback
-        // exhausted every class member, the pipeline parked the work item in
-        // WaitingForQuotaReset. The preferred behaviour now is warning-and-skip
-        // so non-LLM audit signal still completes. This test pins that —
-        // even with a class of one (gemini-only) and a quota-failing auditor,
-        // the item completes Done and the QuotaRetryScheduler is NOT armed.
+        // When the audit-side quota fallback exhausts every class member on
+        // the first attempt, the pipeline PARKS the work item in
+        // WaitingForQuotaReset and arms the QuotaRetryScheduler. The earlier
+        // warning-and-skip variant let a Pass verdict emerge with the LLM
+        // auditor never having run, which violates the per-auditor
+        // independent-gate contract — fixing that is the whole point of this
+        // change. With a class of one (gemini-only) and a quota-failing
+        // auditor, the only correct outcome is to park.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RoutingLlmAuditor("cheating:llm-review", _ =>
             _.CallNumber == 1 ? QuotaResult() : new AuditResult(true, []));
@@ -137,9 +141,9 @@ public sealed class AuditQuotaPauseTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Null(final.NextQuotaRetryAt);
-        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotNull(final.NextQuotaRetryAt);
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
     }
 
     [Fact]
@@ -172,8 +176,17 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditRouting_PausedPreferredAndQuotaBlockedFallback_DoesNotParkForAgentResume()
+    public async Task AuditRouting_PausedPreferredAndQuotaBlockedFallback_ParksForQuotaReset()
     {
+        // Mixed cause: the preferred audit agent (codex) is operator-paused
+        // and the work agent (gemini) is below the quota floor. The auditor
+        // cannot run, but the proximate cause is QUOTA, not the operator
+        // pause — the pause only matters because we walked past codex while
+        // looking for a non-exhausted member. The pipeline must park for
+        // QUOTA reset (not agent resume) so the QuotaRetryScheduler resumes
+        // the iteration when the gemini probe recovers; parking for agent
+        // resume would idle the item until an operator manually unpaused
+        // codex even though quota is the actual blocker.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var pauseDb = Path.Combine(_workspace, $"audit-pauses-{Guid.NewGuid():N}.db");
         using var pauses = new SqliteAgentPauseController(
@@ -201,10 +214,11 @@ public sealed class AuditQuotaPauseTests : IDisposable
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await fix.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.NotEqual(WorkItemState.WaitingForAgentResume, final.State);
         Assert.Empty(auditor.Invocations);
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_agent_resume");
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
     }
 
     [Fact]
@@ -282,9 +296,106 @@ public sealed class AuditQuotaPauseTests : IDisposable
         Assert.Empty(auditor.Invocations);
     }
 
+    [Fact]
+    public async Task AuditPass_RequiresEveryConfiguredAuditorToHaveRun_WholePoolExhaustedDoesNotPass()
+    {
+        // Hard invariant: a Pass verdict must NEVER emerge while one or more
+        // of the configured auditors did not run because its entire spill-to-
+        // peer pool was quota-exhausted. The bug this fix targets had item
+        // 286b7b44 silently pass with ALL 7 auditors skipped — a zero-review
+        // audit being scored as a pass. With multiple LLM auditors configured
+        // and every class member quota-failing each of them, the item must
+        // PARK in WaitingForQuotaReset rather than completing Done. The
+        // single-member class isolates the spill path: there is nowhere for
+        // the wrapper to fall through to, so quota exhaustion is unambiguous.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var bugsAuditor = new RoutingLlmAuditor("bugs:llm-review", _ => QuotaResult());
+        var securityAuditor = new RoutingLlmAuditor("security:llm-review", _ => QuotaResult());
+        var cheatingAuditor = new RoutingLlmAuditor("cheating:llm-review", _ => QuotaResult());
+
+        using var fix = BuildFixture(
+            seed,
+            [bugsAuditor, securityAuditor, cheatingAuditor],
+            [AgentKind.Gemini]);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Pass verdict requires every configured auditor to have produced a
+        // verdict — exhausted pools force a park, not a silent pass.
+        Assert.NotEqual(WorkItemState.Done, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final.State);
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        // The audit phase must not announce a pass when any auditor could
+        // not run — there must be no audit.completed event marking Pass for
+        // this iteration.
+        Assert.DoesNotContain(
+            fix.Webhooks.Events,
+            e => e.Event == "audit.completed"
+                 && e.Details is AuditCompletedDetails details
+                 && string.Equals(details.Verdict, "pass", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task AuditPass_PartialAuditorPoolExhaustion_ParksRatherThanCountingAsBlockingFinding()
+    {
+        // Regression cover for the 1aa5a13f swing: an auditor that cannot
+        // run due to quota exhaustion must NOT be counted as a code-quality
+        // finding either (the over-correction direction). When one auditor's
+        // pool is exhausted but a sibling auditor passes, the item parks for
+        // quota reset rather than auditing as failed — and rework iteration
+        // count is NOT incremented (it would burn the audit budget on a
+        // transient infra failure). The single-iteration budget pins the
+        // counter behaviour: a false rework increment would terminally fail
+        // the item AFTER park, but the park outcome is the only acceptable
+        // terminal-of-this-pickup state.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var exhaustedAuditor = new RoutingLlmAuditor("bugs:llm-review", _ => QuotaResult());
+        var passingAuditor = new RoutingLlmAuditor("style:llm-review", _ => new AuditResult(true, []));
+
+        using var fix = BuildFixture(
+            seed,
+            [exhaustedAuditor, passingAuditor],
+            [AgentKind.Gemini]);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        // Exhaustion must NOT be classified as audit_failed — the 1aa5a13f
+        // false-AuditFailed regression direction.
+        Assert.NotEqual(WorkItemState.AuditFailed, final.State);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.audit_failed");
+    }
+
     private AuditQuotaFixture BuildFixture(
         string seedRepoUrl,
         RoutingLlmAuditor auditor,
+        IReadOnlyList<AgentKind> classMembers,
+        IQuotaFailureStore? quotaFailures = null,
+        IAgentPauseController? pauses = null,
+        AgentKind? auditAgent = null,
+        IReadOnlyDictionary<AgentKind, IReadOnlyList<string>>? capabilities = null,
+        IReadOnlySet<AgentKind>? missingCredentials = null,
+        IReadOnlyDictionary<AgentKind, double>? auditProbeAvailablePct = null)
+        => BuildFixture(
+            seedRepoUrl, [auditor], classMembers, quotaFailures, pauses, auditAgent,
+            capabilities, missingCredentials, auditProbeAvailablePct);
+
+    private AuditQuotaFixture BuildFixture(
+        string seedRepoUrl,
+        IReadOnlyList<RoutingLlmAuditor> auditors,
         IReadOnlyList<AgentKind> classMembers,
         IQuotaFailureStore? quotaFailures = null,
         IAgentPauseController? pauses = null,
@@ -404,7 +515,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             prs,
             projects,
             new TestUpstreamFactory(),
-            new ProjectAuditorComposer(new ScriptedAuditorCatalog([auditor])),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([.. auditors])),
             store,
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },

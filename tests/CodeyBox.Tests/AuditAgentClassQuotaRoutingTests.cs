@@ -82,17 +82,21 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.Equal([AgentKind.Codex], auditor.Invocations);
     }
 
-    // ── Acceptance #3 (resolve-time path): every probe below floor → skip ─
+    // ── Acceptance #3 (resolve-time path): every probe below floor → PARK ──
 
     [Fact]
-    public async Task AllClassMembersExhausted_AtResolveTime_AuditorSkippedAndItemCompletes()
+    public async Task AllClassMembersExhausted_AtResolveTime_ParksWorkItemForQuotaReset()
     {
-        // Bug 779e7dc9 acceptance #3 — resolve-time path. Every probed
-        // candidate (preferred audit agent + every class member) reports
-        // available below MinQuotaPct, so ResolveAuditAgentRunnerAsync returns
-        // null and the audit-loop body skips the LLM auditor for this
-        // iteration rather than parking the item. Mid-iteration coverage of
-        // the same acceptance is in AuditQuotaPauseTests.
+        // Resolve-time path. Every probed candidate (preferred audit agent +
+        // every class member) reports available below MinQuotaPct, so the
+        // audit gate cannot run an LLM verdict this iteration. The work item
+        // PARKS in WaitingForQuotaReset rather than passing audit with an
+        // incomplete review set; the QuotaRetryScheduler resumes the same
+        // iteration once a class member's quota recovers. The earlier
+        // warning-and-skip variant let a Pass verdict emerge with zero LLM
+        // review which silently bypassed the gate — the bug this fix targets.
+        // Mid-iteration coverage of the same invariant lives in
+        // AuditQuotaPauseTests.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("security:llm-review");
         using var fix = BuildFixture(seed, auditor,
@@ -112,13 +116,13 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Done, final!.State);
-        // Auditor never ran — resolver returned null before the auditor was
-        // dispatched into a sandbox. This is the resolve-time skip path.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        // Auditor never ran — resolver threw AgentClassExhaustedException
+        // before any auditor was dispatched into a sandbox.
         Assert.Empty(auditor.Invocations);
-        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
         // The fix guarantees the LastError never carries the old
-        // "agent exited 1" string when the auditor is skipped for quota.
+        // "agent exited 1" string when the auditor cannot run for quota.
         Assert.DoesNotContain("agent exited 1", final.LastError ?? string.Empty);
     }
 

@@ -420,17 +420,21 @@ When the work item DOES have an agent class configured (see
 threshold, the audit router walks the work-item's class chain — preferring
 class members that pass the same observed-failure + probe checks the
 work-phase router uses — and routes the LLM auditor to the first viable
-member. If every member of the class is also quota-exhausted, the LLM
-auditor is **skipped with a warning for that iteration** rather than
-parking the work item. Other (non-LLM) auditors still run and the item
-keeps progressing; audit signal is degraded but not lost.
+member. If every member of the class (the entire spill-to-peer pool) is
+also quota-exhausted, the work item **parks in `WaitingForQuotaReset`**
+and the `QuotaRetryScheduler` resumes the same audit iteration when
+quota returns. A silently-skipped auditor would let a Pass verdict
+emerge with an incomplete review set — the per-auditor independent-gate
+contract requires every configured auditor to have produced a verdict
+before the iteration can pass.
 
 Fallback never crashes the pipeline. The `audit.cross_review_active`
 audit-tier event is NOT emitted when fallback occurs;
 `quota_router.audit_fallthrough` IS emitted so operators can observe when
 the correlation-breaking benefit was lost for an iteration.
-`audit.llm_auditor_skipped_quota` is emitted when an LLM auditor was
-skipped because every candidate agent was quota-exhausted.
+`audit.llm_auditor_parked_quota` is emitted when the work item is
+parked because every candidate agent for an LLM auditor was
+quota-exhausted.
 
 ### Observability
 
@@ -439,7 +443,7 @@ skipped because every candidate agent was quota-exhausted.
 | `auditor.run` | After each auditor. Now includes `agentKind` property. |
 | `audit.cross_review_active` | Once per iteration when at least one LLM auditor actually ran with a different agent (post-fallback). |
 | `quota_router.audit_fallthrough` | Once per auditor when quota triggered fallthrough. |
-| `audit.llm_auditor_skipped_quota` | Once per auditor when every candidate agent was quota-exhausted and the auditor was skipped for the iteration. |
+| `audit.llm_auditor_parked_quota` | Once per auditor when every candidate agent was quota-exhausted; the work item parks in `WaitingForQuotaReset` and the `QuotaRetryScheduler` resumes the same iteration when quota returns. |
 
 The `work_item.audit_iteration` webhook event (see `docs/webhooks.md`)
 gains an optional `auditAgentKind` field in its `details` object:

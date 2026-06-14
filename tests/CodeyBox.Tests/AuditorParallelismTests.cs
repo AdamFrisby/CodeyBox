@@ -625,17 +625,19 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         Assert.Equal(1, calls);
     }
 
-    // Bug 779e7dc9 changed the audit-side quota-exhaustion policy from
-    // "park the work item in WaitingForQuotaReset" to "skip the LLM auditor
-    // for this iteration and keep going". These three tests previously
-    // pinned the parsed/probe/default reset-time accuracy for the audit-park
-    // path; with the new behaviour the audit pipeline no longer parks on
-    // class-exhaustion, so they now pin the new skip-and-continue policy.
-    // Reset-time accuracy for the still-parking work-phase path is covered
-    // by PipelineRunnerQuotaFallbackTests.
+    // The audit-side quota-exhaustion policy parks the work item in
+    // WaitingForQuotaReset when the entire spill-to-peer pool is exhausted —
+    // silently skipping the auditor would let a Pass verdict emerge with an
+    // incomplete review set. (Bug 779e7dc9 briefly inverted this to a
+    // warning-and-skip variant, but the bypassed-gate hole that opened drove
+    // the revert to park-and-retry. The QuotaRetryScheduler resumes the
+    // same iteration when quota returns.) These three tests pin the
+    // parsed/probe/default reset-time accuracy for the audit-park path.
+    // Reset-time accuracy for the work-phase park is covered by
+    // PipelineRunnerQuotaFallbackTests.
 
     [Fact]
-    public async Task LlmAgentQuotaFailure_AuditClassExhausted_SkipsAuditorRatherThanParking_WithParsedReset()
+    public async Task LlmAgentQuotaFailure_AuditClassExhausted_ParksForQuotaReset_WithParsedReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var probe = new FixedQuotaProbe(AgentKind.Claude, DateTimeOffset.UtcNow.AddHours(1));
@@ -685,12 +687,15 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
+        // Single-member audit pool, quota-failing auditor → entire
+        // spill-to-peer pool exhausted → park for quota reset rather than
+        // silently passing audit.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
     }
 
     [Fact]
-    public async Task LlmAgentQuotaFailure_AuditClassExhausted_SkipsAuditor_WithProbeResetAvailable()
+    public async Task LlmAgentQuotaFailure_AuditClassExhausted_ParksForQuotaReset_WithProbeResetAvailable()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var resetAt = DateTimeOffset.UtcNow.AddMinutes(17);
@@ -740,12 +745,14 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Null(final.QuotaResetAt);
+        // Probe-supplied reset is parsed into the parked item's
+        // QuotaResetAt so the retry scheduler wakes at the right moment.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotNull(final.QuotaResetAt);
     }
 
     [Fact]
-    public async Task LlmAgentQuotaFailure_AuditClassExhausted_SkipsAuditor_WhenProbeHasNoReset()
+    public async Task LlmAgentQuotaFailure_AuditClassExhausted_ParksForQuotaReset_WhenProbeHasNoReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var probe = new ExhaustedNoResetQuotaProbe(AgentKind.Claude);
@@ -795,8 +802,9 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Null(final.QuotaResetAt);
+        // No probe-supplied reset → still parks; the retry scheduler will
+        // use the default quota-failure-pause window.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
     }
 }
 

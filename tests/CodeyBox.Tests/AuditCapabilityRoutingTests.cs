@@ -80,7 +80,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     // ── AC: gemini is NEVER picked for audit even when only it has quota ────
 
     [Fact]
-    public async Task OnlyGeminiHasQuota_GeminiNotAuditCapable_AuditSkipped()
+    public async Task OnlyGeminiHasQuota_GeminiNotAuditCapable_ParksForQuotaReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("security:llm-review");
@@ -105,10 +105,13 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await fix.Store.GetAsync(item.Id);
-        // Auditor never runs — gemini has quota but is excluded by the
-        // audit-capability gate. Item still completes (legacy "skip auditor
-        // rather than park" behaviour preserved).
-        Assert.Equal(WorkItemState.Done, final!.State);
+        // Every audit-capable member is quota-exhausted and Gemini is
+        // excluded from the audit pool by the capability gate. A Pass
+        // verdict cannot emerge without the auditor having produced a
+        // verdict, so the work item parks for quota reset rather than
+        // silently completing with zero LLM review.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
         Assert.Empty(auditor.Invocations);
     }
 
@@ -145,15 +148,17 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     // ── AC: mid-iteration spill stays inside the audit-capable pool ─────────
 
     [Fact]
-    public async Task MidIterationSpill_NonAuditCapableMember_StaysExcluded()
+    public async Task MidIterationSpill_NonAuditCapableMember_StaysExcludedAndParksForQuotaReset()
     {
         // Resolve-time gate is exercised by the other tests; this pins the
         // mid-iteration spill gate in InvokeAgentWithQuotaFallbackAsync. Setup
         // is "Claude looks healthy at resolve time but quota-fails when it
         // actually runs the auditor"; the spill candidate list contains only
         // Gemini (healthy, non-audit-capable). The requireCapability filter
-        // must drop Gemini, so the auditor is skipped instead of routing audit
-        // to a non-audit-capable member.
+        // must drop Gemini, so the entire audit-capable pool is exhausted and
+        // the work item parks for quota reset — silently skipping the auditor
+        // and routing through to Done would let a Pass verdict emerge with
+        // zero LLM review.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("cheating:llm-review",
             agent => agent == AgentKind.Claude ? QuotaAuditResult() : new AuditResult(true, []));
@@ -176,10 +181,11 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await fix.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
         // Claude ran first (preferred audit-capable) and quota-failed.
         // Gemini has quota but is NOT audit-capable — the mid-iter spill
-        // filter must skip it. Audit skipped, item still completes.
+        // filter must skip it, the pool is exhausted, the item parks.
         Assert.Equal([AgentKind.Claude], auditor.Invocations);
         Assert.DoesNotContain(AgentKind.Gemini, auditor.Invocations);
     }
