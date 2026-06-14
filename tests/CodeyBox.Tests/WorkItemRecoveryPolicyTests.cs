@@ -98,7 +98,7 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
-    public void ResetRecoveryAttemptsAfterRealProgress_PreservesAuditFailureToRework()
+    public void ResetRecoveryAttemptsAfterRealProgress_PreservesDirectAuditingToReworkingTransition()
     {
         var item = MakeItem(WorkItemState.Auditing) with { RecoveryAttempts = 2 };
 

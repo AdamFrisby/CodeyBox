@@ -5312,10 +5312,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var auditVerdict = blocking.Count == 0 ? AuditVerdict.Pass : AuditVerdict.Fail;
             await PublishAuditCompletedAsync(item, project, iteration, auditVerdict, auditPhaseStart, ct);
+            await ResetRecoveryAttemptsAfterRealProgressEventAsync(item.Id, "audit-verdict-produced", ct);
 
             if (blocking.Count == 0)
             {
-                await ResetRecoveryAttemptsAfterRealProgressEventAsync(item.Id, "audit-verdict-passed", ct);
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
                     iteration, item.Id, nonBlocking);
                 AuditLog.AuditPassed(iteration);

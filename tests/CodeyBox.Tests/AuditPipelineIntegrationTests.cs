@@ -451,7 +451,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task RecoveredWorkComplete_AuditFailureVerdictPreservesRecoveryAttempts()
+    public async Task RecoveredWorkComplete_AuditFailureVerdictResetsRecoveryAttempts()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new ScriptedAuditor(
@@ -475,8 +475,42 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Equal(2, final.RecoveryAttempts);
+        Assert.Equal(0, final.RecoveryAttempts);
         Assert.Equal([1], auditor.SeenIterations);
+    }
+
+    [Fact]
+    public async Task RecoveredWorkComplete_BlockingAuditVerdictResetsBeforeRework()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "needs rework", "x")]),
+            new AuditOutcome(true, []),
+        ], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            webhookDispatcher: webhooks);
+
+        var item = NewItem() with { RecoveryAttempts = 2 };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "reworked\n"));
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var reworking = Assert.Single(webhooks.Events, e => e.Event == "work_item.reworking");
+        var reworkingItem = Assert.IsType<WorkItem>(reworking.WorkItem);
+        Assert.Equal(0, reworkingItem.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Done, (await tp.Store.GetAsync(item.Id))!.State);
+        Assert.Equal([1, 2], auditor.SeenIterations);
     }
 
     [Fact]
