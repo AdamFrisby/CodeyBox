@@ -1559,6 +1559,20 @@ for the Fleet dashboard view — one round-trip per refresh instead of N+1 per-p
 - `isPaused` is always `false` until the budget-alerts work item adds `project_queue_state` table support.
 - `budgetThresholdState` is currently limited to `"ok"` or `"unknown"`; threshold-based values (`"warning"`, `"critical"`) require the budget-alerts work item.
 
+### `GET /fleet/transition-health`
+
+Returns an infrastructure-health score that classifies recent pipeline stage
+transitions as legitimate forward progress vs. infra failures. Done-rate is
+intentionally excluded — the score does not move when more items complete.
+
+See [`transition-health.md`](transition-health.md) for the full taxonomy
+(LEGITIMATE vs. INFRA_FAILURE vs. SKIPPED), the per-stage breakdown, and the
+configuration knobs (`CodeyBox:TransitionHealth:{Enabled,WindowHours,MaxTransitions}`,
+all hot-reloadable).
+
+When `CodeyBox:TransitionHealth:Enabled` is `false`, the endpoint returns
+`404` with `{ "error": "transition-health is disabled" }`.
+
 ## Local Development
 
 For local dev, create your own `local/run-e2e.sh` and run it from the repo root to boot the orchestrator on http://127.0.0.1:5050 — the `/local/` directory is gitignored (see `.gitignore`) for per-developer dev/test helpers, so no script ships in the tree.

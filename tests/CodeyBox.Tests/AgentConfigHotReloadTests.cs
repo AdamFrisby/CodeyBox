@@ -106,6 +106,154 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task TransitionHealthHotReload_SwapsLiveSnapshotOnChange()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            TransitionHealth = new TransitionHealthConfig
+            {
+                Enabled = true,
+                WindowHours = 24,
+                MaxTransitions = null,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var transitionHealth = new TransitionHealthOptionsSnapshot(
+            TransitionHealthConfigMapper.ToOptions(true, 24, null));
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            transitionHealth: transitionHealth);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Sanity: initial snapshot is what we built.
+        Assert.True(transitionHealth.Enabled);
+        Assert.Equal(TimeSpan.FromHours(24), transitionHealth.Current.Window);
+        Assert.Null(transitionHealth.Current.MaxTransitions);
+
+        // Change all three fields. The hot-reload branch must replace the
+        // live snapshot so subsequent reads through TransitionHealthOptionsSnapshot
+        // see the new values.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            TransitionHealth = new TransitionHealthConfig
+            {
+                Enabled = false,
+                WindowHours = 6,
+                MaxTransitions = 5000,
+            },
+        });
+
+        Assert.False(transitionHealth.Enabled);
+        Assert.Equal(TimeSpan.FromHours(6), transitionHealth.Current.Window);
+        Assert.Equal(5000, transitionHealth.Current.MaxTransitions);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task TransitionHealthHotReload_UnchangedConfig_IsNoOp()
+    {
+        // Firing an OnChange with an identical serialised config should not
+        // call Replace on the snapshot. The Replace path emits AuditLog noise
+        // and runs the mapper; we verify both stay quiet by checking the
+        // snapshot reference identity (no-op leaves the reference untouched).
+        var initial = new CodeyBoxOptions
+        {
+            TransitionHealth = new TransitionHealthConfig
+            {
+                Enabled = true,
+                WindowHours = 12,
+                MaxTransitions = 250,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var transitionHealth = new TransitionHealthOptionsSnapshot(
+            TransitionHealthConfigMapper.ToOptions(true, 12, 250));
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            transitionHealth: transitionHealth);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        var beforeReference = transitionHealth.Current;
+
+        // Identical config — the per-block change detector must short-circuit.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            TransitionHealth = new TransitionHealthConfig
+            {
+                Enabled = true,
+                WindowHours = 12,
+                MaxTransitions = 250,
+            },
+        });
+
+        // No Replace called → the snapshot still holds the same record
+        // instance. (A Replace would have written a fresh instance via the
+        // mapper.)
+        Assert.Same(beforeReference, transitionHealth.Current);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task TransitionHealthHotReload_WithoutSnapshot_DoesNotThrow()
+    {
+        // The transitionHealth parameter is optional; constructing the
+        // coordinator without it must leave the rest of the reload pipeline
+        // intact (no NullReferenceException from ApplyTransitionHealthIfChanged).
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(new CodeyBoxOptions());
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            TransitionHealth = new TransitionHealthConfig
+            {
+                Enabled = false,
+                WindowHours = 1,
+            },
+        });
+
+        // Nothing to assert beyond "didn't throw"; the early-return branch is
+        // executed by the firing above.
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task AgentPausesHotReload_ReconcilesConfigOwnedPausesOnly()
     {
         var initial = new CodeyBoxOptions();

@@ -89,6 +89,10 @@ Hot-reloadable today:
   stopping the process, and that shutdown uses the updated mode.
 - `Smoke.Enabled` — hot-reloaded through `SmokeOptionsSnapshot`; disables the
   pickup credential gate, router smoke exclusions, and in-VM smoke gate.
+- `TransitionHealth.{Enabled,WindowHours,MaxTransitions}` — hot-reloaded through
+  `TransitionHealthOptionsSnapshot`; controls the `/fleet/transition-health`
+  endpoint's rolling window and "last N transitions" cap.
+  See [`transition-health.md`](transition-health.md).
 - `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
   invocation; changes affect the next work/rework/audit/merge/check-and-act
   prompt.

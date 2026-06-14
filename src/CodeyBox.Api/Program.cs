@@ -1459,6 +1459,24 @@ builder.Services.AddSingleton<SmokeOptions>(sp =>
 });
 builder.Services.AddSingleton<SmokeOptionsSnapshot>(sp =>
     new SmokeOptionsSnapshot(sp.GetRequiredService<SmokeOptions>()));
+
+builder.Services.AddSingleton<TransitionHealthOptions>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var t = cbOpts.TransitionHealth;
+    return TransitionHealthConfigMapper.ToOptions(t.Enabled, t.WindowHours, t.MaxTransitions);
+});
+builder.Services.AddSingleton<TransitionHealthOptionsSnapshot>(sp =>
+    new TransitionHealthOptionsSnapshot(sp.GetRequiredService<TransitionHealthOptions>()));
+builder.Services.AddSingleton<ITransitionHealthDataSource>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteTransitionHealthDataSource(cbOpts.StateDatabasePath);
+});
+builder.Services.AddSingleton<TransitionHealthService>(sp =>
+    new TransitionHealthService(
+        sp.GetRequiredService<ITransitionHealthDataSource>(),
+        sp.GetRequiredService<TransitionHealthOptionsSnapshot>()));
 builder.Services.AddSingleton<AvailabilityOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2518,7 +2536,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
-        agents: sp.GetRequiredService<IAgentRegistry>());
+        agents: sp.GetRequiredService<IAgentRegistry>(),
+        transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -3483,6 +3502,13 @@ namespace CodeyBox.Api
         /// <summary>Credential smoke test tuning knobs.</summary>
         public SmokeConfig Smoke { get; set; } = new();
 
+        /// <summary>
+        /// Pipeline transition-health metric tuning. Controls the
+        /// <c>/fleet/transition-health</c> endpoint's rolling window and
+        /// optional "last N transitions" cap. Hot-reloadable.
+        /// </summary>
+        public TransitionHealthConfig TransitionHealth { get; set; } = new();
+
         /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
 
@@ -3942,6 +3968,32 @@ namespace CodeyBox.Api
         /// <c>CodeyBox:Smoke:InVm</c>.
         /// </summary>
         public InVmSmokeConfig InVm { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Config binding for the transition-health metric. Bound from
+    /// <c>CodeyBox:TransitionHealth</c>. All fields are hot-reloadable; see
+    /// <see cref="TransitionHealthOptionsSnapshot"/>.
+    /// </summary>
+    public sealed class TransitionHealthConfig
+    {
+        /// <summary>Enable the <c>/fleet/transition-health</c> endpoint and computation. Default true.</summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Rolling window in hours. Default 24. Floor 5 / 60 (5 minutes),
+        /// ceiling 30 * 24 (30 days). Values outside the range are clamped at
+        /// binding time.
+        /// </summary>
+        public double WindowHours { get; set; } = 24.0;
+
+        /// <summary>
+        /// Optional "last N transitions" cap. Null = use the wall-clock window
+        /// only. When set, the score is computed over the most recent
+        /// <c>MaxTransitions</c> transitions regardless of how long ago they
+        /// happened. Floor 50, ceiling 100_000.
+        /// </summary>
+        public int? MaxTransitions { get; set; }
     }
 
     /// <summary>Config binding for the in-VM smoke prober.</summary>

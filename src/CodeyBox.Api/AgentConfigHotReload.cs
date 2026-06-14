@@ -74,6 +74,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly QuotaRouterOptions? _quotaRouterOptions;
     private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
+    private readonly TransitionHealthOptionsSnapshot? _transitionHealth;
     private readonly IAgentPauseController? _pauses;
     private readonly IAgentRegistry? _agents;
     private readonly ILogger<AgentConfigHotReload> _log;
@@ -94,6 +95,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastPipelineTuning = "";
     private string _lastBudgetDeferralRecheck = "";
     private string _lastSmoke = "";
+    private string _lastTransitionHealth = "";
     private string _lastAgentPauses = "";
     private string _lastNetworkTolerance = "";
 
@@ -118,7 +120,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         IInVmSmokeCoveragePolicy? coverage = null,
         SmokeOptionsSnapshot? smokeOptions = null,
         IAgentPauseController? pauses = null,
-        IAgentRegistry? agents = null)
+        IAgentRegistry? agents = null,
+        TransitionHealthOptionsSnapshot? transitionHealth = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -143,6 +146,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _quotaRouterOptions = quotaRouterOptions;
         _coverage = coverage;
         _smokeOptions = smokeOptions;
+        _transitionHealth = transitionHealth;
         _pauses = pauses;
         _agents = agents;
         _log = log;
@@ -167,6 +171,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
         _lastBudgetDeferralRecheck = SerializeBudgetDeferralRecheck(initial.BudgetDeferralRecheck);
         _lastSmoke = SerializeSmoke(initial.Smoke);
+        _lastTransitionHealth = SerializeTransitionHealth(initial.TransitionHealth);
         _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
 
         AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
@@ -197,6 +202,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         {
             ApplyConcurrencyIfChanged(opts);
             ApplySmokeIfChanged(opts);
+            ApplyTransitionHealthIfChanged(opts);
             ApplyRouterIfChanged(opts);
             ApplyBurnIfChanged(opts);
             ApplyPricingIfChanged(opts);
@@ -954,6 +960,45 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         CacheTtlMinutes = cacheTtlMinutes,
         StartupTimeoutSeconds = opts.StartupTimeoutSeconds,
     };
+
+    private void ApplyTransitionHealthIfChanged(CodeyBoxOptions opts)
+    {
+        if (_transitionHealth is null) return;
+
+        var next = SerializeTransitionHealth(opts.TransitionHealth);
+        if (string.Equals(_lastTransitionHealth, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastTransitionHealth;
+        try
+        {
+            var nextOptions = TransitionHealthConfigMapper.ToOptions(
+                opts.TransitionHealth.Enabled,
+                opts.TransitionHealth.WindowHours,
+                opts.TransitionHealth.MaxTransitions);
+            _transitionHealth.Replace(nextOptions);
+            _lastTransitionHealth = next;
+            AuditLog.ConfigReloaded("TransitionHealth", prev, next);
+            _log.LogInformation("Hot-reloaded TransitionHealth: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of TransitionHealth rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    private static string SerializeTransitionHealth(TransitionHealthConfig opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.Enabled,
+                opts.WindowHours,
+                opts.MaxTransitions,
+            },
+            JsonOpts);
 
     private static string SerializeSmoke(SmokeConfig opts) =>
         JsonSerializer.Serialize(
