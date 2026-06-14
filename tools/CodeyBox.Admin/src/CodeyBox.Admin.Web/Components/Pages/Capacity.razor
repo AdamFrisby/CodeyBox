@@ -1,0 +1,289 @@
+@page "/capacity"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<Capacity> Logger
+
+<PageTitle>Capacity — CodeyBox Admin</PageTitle>
+
+<h1>
+    Subscription capacity
+    @if (_loading)
+    {
+        <span class="timeline-live-badge" style="margin-left:0.6rem;">refreshing…</span>
+    }
+    else
+    {
+        <span class="timeline-live-badge" style="margin-left:0.6rem;">● live (every 60s)</span>
+    }
+</h1>
+
+<p style="font-size:0.85rem;color:#666;max-width:60rem;">
+    Joins the captured quota time-series against actual token consumption. For each (agent, window) pair
+    we difference consecutive quota snapshots, sum the <code>agent_usage_events</code> in each interval,
+    and derive tokens / requests burned per 1% of window drained. Window resets (pct jumps back up)
+    are detected and excluded from the burn-rate average. Estimates improve with more samples.
+</p>
+
+@if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+
+<section style="margin-bottom:0.8rem;display:flex;gap:0.8rem;align-items:center;flex-wrap:wrap;">
+    <label style="font-size:0.85rem;">
+        Horizon:
+        <select @bind="_horizonHours" @bind:after="ReloadAsync" style="margin-left:0.3rem;">
+            <option value="24">Last 24h</option>
+            <option value="72">Last 3 days</option>
+            <option value="168">Last 7 days</option>
+            <option value="720">Last 30 days</option>
+        </select>
+    </label>
+    <label style="font-size:0.85rem;">
+        Agent:
+        <input @bind="_agentFilter" @bind:after="ReloadAsync" placeholder="any" style="width:8rem;margin-left:0.3rem;" />
+    </label>
+    <span style="font-size:0.8rem;color:#888;">@(_report is null ? "" : $"Generated {_report.GeneratedAt:HH:mm:ss UTC}")</span>
+</section>
+
+@if (_report is null || _report.Entries.Count == 0)
+{
+    <p style="color:#666;">
+        No capacity data yet. The statistics plugin needs at least two consecutive quota snapshots and
+        recorded usage events in the chosen horizon before estimates are produced.
+    </p>
+}
+else
+{
+    <section style="margin-bottom:1.5rem;">
+        <h2>Per-window capacity</h2>
+        <table class="queue-table">
+            <thead>
+                <tr>
+                    <th>Agent</th>
+                    <th>Window</th>
+                    <th>Model</th>
+                    <th title="Quota % remaining as of the latest sample">Now</th>
+                    <th title="Window resets at — provider-reported">Resets</th>
+                    <th title="Projected exhaustion based on recent burn rate">Exhausts</th>
+                    <th title="Billable input tokens consumed per 1% of window drained">Input tok / 1%</th>
+                    <th title="Cache-read input tokens consumed per 1% of window drained">Cached tok / 1%</th>
+                    <th title="Output tokens consumed per 1% of window drained">Output tok / 1%</th>
+                    <th title="Recorded agent_usage_events per 1% of window drained">Reqs / 1%</th>
+                    <th title="Implied capacity over a full 100% window — input tokens">Window cap (input)</th>
+                    <th title="Implied capacity over a full 100% window — output tokens">Window cap (output)</th>
+                    <th title="Implied capacity over a full 100% window — requests">Window cap (reqs)</th>
+                    <th title="Number of differencing intervals that survived noise-floor filtering">Samples</th>
+                    <th title="Confidence band">Conf</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var e in _report.Entries)
+                {
+                    <tr>
+                        <td><strong>@e.Agent</strong></td>
+                        <td>@e.WindowName</td>
+                        <td><code>@(e.ModelId ?? "—")</code></td>
+                        <td>
+                            @if (e.CurrentPct.HasValue)
+                            {
+                                <span>@e.CurrentPct.Value.ToString("F1")%</span>
+                            }
+                            else
+                            {
+                                <span style="color:#999">—</span>
+                            }
+                        </td>
+                        <td>@FormatReset(e.ResetAt)</td>
+                        <td>@FormatReset(e.EstimatedExhaustionAt)</td>
+                        <td>@FormatPerPct(e.InputTokensPerPercent)</td>
+                        <td>@FormatPerPct(e.CachedInputTokensPerPercent)</td>
+                        <td>@FormatPerPct(e.OutputTokensPerPercent)</td>
+                        <td>@FormatPerPct(e.RequestsPerPercent)</td>
+                        <td>@FormatFullCap(e.EstimatedFullWindowInputTokens)</td>
+                        <td>@FormatFullCap(e.EstimatedFullWindowOutputTokens)</td>
+                        <td>@FormatFullCap(e.EstimatedFullWindowRequests)</td>
+                        <td>@e.SampleIntervals</td>
+                        <td>
+                            <span style="font-size:0.8rem;color:@ConfidenceColor(e.Confidence);">@e.Confidence</span>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </section>
+
+    @foreach (var e in _report.Entries.Where(x => x.Intervals.Count > 0))
+    {
+        <section style="margin-bottom:2rem;">
+            <h3 style="font-size:1rem;">
+                <strong>@e.Agent</strong> · <code>@e.WindowName</code>
+                @if (!string.IsNullOrEmpty(e.ModelId))
+                {
+                    <span> · <code>@e.ModelId</code></span>
+                }
+                <span style="margin-left:0.6rem;font-size:0.75rem;color:#888;">burn-rate over time</span>
+            </h3>
+            @if (e.Notes.Count > 0)
+            {
+                <ul style="margin:0.2rem 0 0.6rem 1.2rem;font-size:0.8rem;color:#555;">
+                    @foreach (var note in e.Notes)
+                    {
+                        <li>@note</li>
+                    }
+                </ul>
+            }
+            @RenderBurnChart(e)
+        </section>
+    }
+}
+
+@code {
+    private CapacityReportDto? _report;
+    private bool _loading;
+    private string? _error;
+    private int _horizonHours = 168;
+    private string _agentFilter = "";
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await LoadAsync();
+        _ = RefreshLoopAsync(_cts.Token);
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(60));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                await LoadAsync();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private Task ReloadAsync()
+    {
+        return LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        _loading = true;
+        try
+        {
+            var agent = string.IsNullOrWhiteSpace(_agentFilter) ? null : _agentFilter.Trim();
+            _report = await ApiClient.GetCapacityAsync(
+                agent: agent,
+                hours: _horizonHours,
+                includeIntervals: true,
+                ct: ct);
+            _error = _report is null
+                ? "Capacity analysis unavailable. Is the statistics plugin loaded?"
+                : null;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Capacity: failed to load");
+            _error = "Failed to load capacity report. Check server logs for details.";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+
+    private static string FormatPerPct(double? value)
+    {
+        if (!value.HasValue || value.Value <= 0) return "—";
+        return value.Value >= 1000 ? value.Value.ToString("N0") : value.Value.ToString("F1");
+    }
+
+    private static string FormatFullCap(double? value)
+    {
+        if (!value.HasValue || value.Value <= 0) return "—";
+        return value.Value.ToString("N0");
+    }
+
+    private static string ConfidenceColor(string confidence) => confidence switch
+    {
+        "High" => "#0a7f2e",
+        "Medium" => "#a06400",
+        "Low" => "#b03030",
+        _ => "#999",
+    };
+
+    private static string FormatReset(DateTimeOffset? at)
+    {
+        if (at is null) return "—";
+        var delta = at.Value - DateTimeOffset.UtcNow;
+        if (delta <= TimeSpan.Zero) return "now";
+        if (delta.TotalHours < 1) return $"{(int)delta.TotalMinutes}m";
+        if (delta.TotalDays < 1) return $"{(int)delta.TotalHours}h {(int)(delta.Minutes)}m";
+        return $"{(int)delta.TotalDays}d {(int)(delta.Hours)}h";
+    }
+
+    private RenderFragment RenderBurnChart(CapacityEntryDto entry) => builder =>
+    {
+        // Inline SVG sparkline of tokens-per-percent across the interval series.
+        // Each bar = one interval; height ∝ inputTokens (the billable bucket).
+        // Window-reset boundaries are coloured red.
+        var intervals = entry.Intervals;
+        if (intervals.Count == 0) return;
+
+        var maxInput = intervals.Max(iv => iv.InputTokens);
+        if (maxInput <= 0) maxInput = 1;
+        const int chartWidth = 720;
+        const int chartHeight = 100;
+        const int barGap = 1;
+        var barWidth = Math.Max(2, (chartWidth - (intervals.Count - 1) * barGap) / Math.Max(1, intervals.Count));
+
+        builder.OpenElement(0, "svg");
+        builder.AddAttribute(1, "width", chartWidth);
+        builder.AddAttribute(2, "height", chartHeight + 20);
+        builder.AddAttribute(3, "style", "background:#fafafa;border:1px solid #ddd;border-radius:4px;");
+
+        for (int i = 0; i < intervals.Count; i++)
+        {
+            var iv = intervals[i];
+            var h = (int)((double)iv.InputTokens / maxInput * chartHeight);
+            if (h < 1 && iv.InputTokens > 0) h = 1;
+            var x = i * (barWidth + barGap);
+            var y = chartHeight - h;
+            var fill = iv.IsWindowReset ? "#d04040" : iv.DeltaPct >= 0.25 ? "#4080d0" : "#ccc";
+            builder.OpenElement(10, "rect");
+            builder.AddAttribute(11, "x", x);
+            builder.AddAttribute(12, "y", y);
+            builder.AddAttribute(13, "width", barWidth);
+            builder.AddAttribute(14, "height", h);
+            builder.AddAttribute(15, "fill", fill);
+            builder.AddAttribute(16, "title",
+                $"{iv.FromUtc:HH:mm} → {iv.ToUtc:HH:mm}\n" +
+                $"Δ {iv.DeltaPct.ToString("F2")}% · in {iv.InputTokens:N0} · out {iv.OutputTokens:N0} · {iv.Requests} reqs" +
+                (iv.IsWindowReset ? "\n(window reset)" : ""));
+            builder.CloseElement();
+        }
+
+        builder.OpenElement(20, "text");
+        builder.AddAttribute(21, "x", 4);
+        builder.AddAttribute(22, "y", chartHeight + 14);
+        builder.AddAttribute(23, "style", "font-size:10px;fill:#666;");
+        builder.AddContent(24, $"{intervals.Count} intervals · max input/interval {maxInput:N0} tok · red = window reset");
+        builder.CloseElement();
+
+        builder.CloseElement();
+    };
+}

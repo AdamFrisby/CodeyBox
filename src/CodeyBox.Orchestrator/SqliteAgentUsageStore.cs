@@ -212,6 +212,51 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
         return new AgentUsageWindowAggregate(sum, earliest, count);
     }
 
+    public async Task<AgentUsageWindowTokens> SumTokensWindowAsync(
+        string agentKind, string? modelId, DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken ct = default)
+    {
+        using var readConn = new SqliteConnection($"Data Source={_path};Mode=ReadOnly");
+        readConn.Open();
+
+        using var cmd = readConn.CreateCommand();
+        // Same model-null branch as SumWindowAsync — null modelId aggregates only
+        // null-model events; non-null narrows to that specific model. The capacity
+        // calculator passes null at the agent-window level (cross-model sum is the
+        // probe-side denominator) and a specific id when an operator drills into a
+        // single model bucket.
+        cmd.CommandText = """
+            SELECT
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(cached_input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cost_microcents), 0),
+                COUNT(*),
+                MIN(time_utc)
+            FROM agent_usage_events
+            WHERE agent_kind = $kind COLLATE NOCASE
+              AND (($model IS NULL) OR model_id = $model COLLATE NOCASE)
+              AND time_utc >= $from
+              AND time_utc < $to
+            """;
+        cmd.Parameters.AddWithValue("$kind", agentKind);
+        cmd.Parameters.AddWithValue("$model", modelId is not null ? modelId : DBNull.Value);
+        cmd.Parameters.AddWithValue("$from", fromUtc.ToUniversalTime().ToString("O"));
+        cmd.Parameters.AddWithValue("$to", toUtc.ToUniversalTime().ToString("O"));
+
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct)) return AgentUsageWindowTokens.Empty;
+
+        var input = reader.GetInt64(0);
+        var cached = reader.GetInt64(1);
+        var output = reader.GetInt64(2);
+        var cost = reader.GetInt64(3);
+        var count = reader.GetInt32(4);
+        DateTimeOffset? earliest = reader.IsDBNull(5)
+            ? null
+            : DateTimeOffset.Parse(reader.GetString(5)).ToUniversalTime();
+        return new AgentUsageWindowTokens(input, cached, output, cost, count, earliest);
+    }
+
     public async Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default)
     {
         var deleted = 0;
