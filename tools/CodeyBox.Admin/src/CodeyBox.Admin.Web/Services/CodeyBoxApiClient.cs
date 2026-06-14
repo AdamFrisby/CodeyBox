@@ -444,6 +444,31 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<ConcurrencyDto>(JsonOptions, ct);
     }
 
+    public async Task<CapacityReportDto?> GetCapacityAsync(
+        string? agent = null,
+        string? window = null,
+        string? model = null,
+        int? hours = null,
+        bool includeIntervals = true,
+        CancellationToken ct = default)
+    {
+        var qs = new List<string>();
+        if (!string.IsNullOrWhiteSpace(agent)) qs.Add($"agent={Uri.EscapeDataString(agent)}");
+        if (!string.IsNullOrWhiteSpace(window)) qs.Add($"window={Uri.EscapeDataString(window)}");
+        if (!string.IsNullOrWhiteSpace(model)) qs.Add($"model={Uri.EscapeDataString(model)}");
+        if (hours is { } h && h > 0)
+        {
+            var from = DateTimeOffset.UtcNow.AddHours(-h).ToString("O");
+            qs.Add($"from={Uri.EscapeDataString(from)}");
+        }
+        if (!includeIntervals) qs.Add("includeIntervals=false");
+        var path = "/stats/capacity" + (qs.Count > 0 ? "?" + string.Join("&", qs) : "");
+        var resp = await _http.GetAsync(path, ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable) return null;
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<CapacityReportDto>(JsonOptions, ct);
+    }
+
     public async Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default)
     {
         // GET /fleet/summary returns the per-project summary directly (its earlier

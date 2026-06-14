@@ -73,6 +73,14 @@ public interface ICodeyBoxApiClient
         => Task.FromResult<WorkersStatusDto?>(null);
     Task<ConcurrencyDto?> GetConcurrencyAsync(CancellationToken ct = default)
         => Task.FromResult<ConcurrencyDto?>(null);
+    Task<CapacityReportDto?> GetCapacityAsync(
+        string? agent = null,
+        string? window = null,
+        string? model = null,
+        int? hours = null,
+        bool includeIntervals = true,
+        CancellationToken ct = default)
+        => Task.FromResult<CapacityReportDto?>(null);
 
     // ── Agent questions ───────────────────────────────────────────────────────
     Task<List<QuestionDto>> GetQuestionsAsync(string workItemId, CancellationToken ct = default);

@@ -258,6 +258,132 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task SumTokensWindow_SumsInputCachedOutput_OnlyInRange()
+    {
+        // Anchor in the past so the [from, to) bounds in this test stay deterministic
+        // regardless of wall-clock skew between the test record and the read.
+        var anchor = DateTimeOffset.Parse("2026-06-14T15:00:00Z");
+        await _store.RecordAsync(EventWithTokens(anchor, input: 100, cached: 10, output: 20));
+        await _store.RecordAsync(EventWithTokens(anchor.AddMinutes(30), input: 200, cached: 20, output: 40));
+        await _store.RecordAsync(EventWithTokens(anchor.AddHours(10), input: 999_999, cached: 999_999, output: 999_999)); // outside window
+
+        var tokens = await _store.SumTokensWindowAsync(
+            "opencode", "m1", anchor.AddMinutes(-1), anchor.AddHours(1));
+
+        Assert.Equal(300, tokens.InputTokens);
+        Assert.Equal(30, tokens.CachedInputTokens);
+        Assert.Equal(60, tokens.OutputTokens);
+        Assert.Equal(2, tokens.Count);
+        Assert.NotNull(tokens.EarliestUtc);
+    }
+
+    [Fact]
+    public async Task SumTokensWindow_NullModel_AggregatesEveryModelForAgent()
+    {
+        // CapacityCalculator contract: a null modelId is a cross-model rollup
+        // (every billable token attributed to the agent). This is the opposite
+        // of SumWindowAsync's null-model semantics, and the production query
+        // is the only path the capacity calculator hits — a regression that
+        // gated on `model_id IS NULL` would silently zero out subscription
+        // capacity for every operator using model-specific recording.
+        var anchor = DateTimeOffset.Parse("2026-06-14T15:00:00Z");
+        await _store.RecordAsync(EventWithTokens(anchor, model: "m1", input: 100, output: 20));
+        await _store.RecordAsync(EventWithTokens(anchor, model: "m2", input: 300, output: 60));
+        await _store.RecordAsync(EventWithTokens(anchor, model: null, input: 50, output: 10));
+
+        var tokens = await _store.SumTokensWindowAsync(
+            "opencode", null, anchor.AddMinutes(-1), anchor.AddMinutes(1));
+
+        Assert.Equal(450, tokens.InputTokens);
+        Assert.Equal(90, tokens.OutputTokens);
+        Assert.Equal(3, tokens.Count);
+    }
+
+    [Fact]
+    public async Task SumTokensWindow_NonNullModel_NarrowsToSingleBucket()
+    {
+        var anchor = DateTimeOffset.Parse("2026-06-14T15:00:00Z");
+        await _store.RecordAsync(EventWithTokens(anchor, model: "m1", input: 100, output: 20));
+        await _store.RecordAsync(EventWithTokens(anchor, model: "m2", input: 300, output: 60));
+
+        var tokens = await _store.SumTokensWindowAsync(
+            "opencode", "m2", anchor.AddMinutes(-1), anchor.AddMinutes(1));
+
+        Assert.Equal(300, tokens.InputTokens);
+        Assert.Equal(60, tokens.OutputTokens);
+        Assert.Equal(1, tokens.Count);
+    }
+
+    [Fact]
+    public async Task SumTokensWindow_RangeIsHalfOpen_ExcludesUpperBound()
+    {
+        // The capacity calculator stitches consecutive intervals as [s_i, s_{i+1});
+        // a row at the boundary must land in exactly one interval — verify the
+        // upper bound is exclusive so two adjacent intervals don't double-count.
+        var anchor = DateTimeOffset.Parse("2026-06-14T15:00:00Z");
+        await _store.RecordAsync(EventWithTokens(anchor.AddMinutes(30), input: 100, output: 10));
+
+        var first = await _store.SumTokensWindowAsync("opencode", "m1", anchor, anchor.AddHours(1));
+        var second = await _store.SumTokensWindowAsync("opencode", "m1", anchor.AddHours(1), anchor.AddHours(2));
+        var boundaryExclusion = await _store.SumTokensWindowAsync(
+            "opencode", "m1", anchor.AddMinutes(30), anchor.AddMinutes(31));
+
+        Assert.Equal(1, first.Count);
+        Assert.Equal(0, second.Count);
+        Assert.Equal(1, boundaryExclusion.Count); // from inclusive
+    }
+
+    [Fact]
+    public async Task SumTokensWindow_MatchesAgentAndModelCaseInsensitively()
+    {
+        var anchor = DateTimeOffset.Parse("2026-06-14T15:00:00Z");
+        await _store.RecordAsync(EventWithTokens(anchor, agent: "opencode", model: "m1", input: 100, output: 20));
+        await _store.RecordAsync(EventWithTokens(anchor, agent: "opencode", model: "m1", input: 200, output: 40));
+
+        var tokens = await _store.SumTokensWindowAsync(
+            "OpenCode", "M1", anchor.AddMinutes(-1), anchor.AddMinutes(1));
+
+        Assert.Equal(300, tokens.InputTokens);
+        Assert.Equal(60, tokens.OutputTokens);
+        Assert.Equal(2, tokens.Count);
+    }
+
+    [Fact]
+    public async Task SumTokensWindow_NoRows_ReturnsEmpty()
+    {
+        var anchor = DateTimeOffset.Parse("2026-06-14T15:00:00Z");
+        var tokens = await _store.SumTokensWindowAsync(
+            "opencode", "m1", anchor, anchor.AddHours(1));
+
+        Assert.Equal(0, tokens.InputTokens);
+        Assert.Equal(0, tokens.CachedInputTokens);
+        Assert.Equal(0, tokens.OutputTokens);
+        Assert.Equal(0, tokens.SumMicroCents);
+        Assert.Equal(0, tokens.Count);
+        Assert.Null(tokens.EarliestUtc);
+    }
+
+    private static AgentUsageEvent EventWithTokens(
+        DateTimeOffset time,
+        string agent = "opencode",
+        string? model = "m1",
+        int input = 0,
+        int cached = 0,
+        int output = 0,
+        long microCents = 0) => new()
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            TimeUtc = time,
+            AgentKind = agent,
+            ModelId = model,
+            InputTokens = input,
+            CachedInputTokens = cached,
+            OutputTokens = output,
+            CostMicroCents = microCents,
+            WorkItemId = "wi-tokens",
+        };
+
+    [Fact]
     public async Task Prune_DeletesOnlyEventsOlderThanCutoff()
     {
         var now = DateTimeOffset.UtcNow;

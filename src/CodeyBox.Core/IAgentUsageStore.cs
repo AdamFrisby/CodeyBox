@@ -45,6 +45,25 @@ public readonly record struct AgentUsageWindowAggregate(
     int Count);
 
 /// <summary>
+/// Token-aware aggregate of usage events over a time window for one
+/// (agent, model) pair. Returned by
+/// <see cref="IAgentUsageStore.SumTokensWindowAsync"/> so the capacity
+/// calculator can match tokens consumed against quota-percent burned in the
+/// same interval. <see cref="AgentUsageWindowAggregate"/> stays the
+/// budget-side cost-only shape.
+/// </summary>
+public readonly record struct AgentUsageWindowTokens(
+    long InputTokens,
+    long CachedInputTokens,
+    long OutputTokens,
+    long SumMicroCents,
+    int Count,
+    DateTimeOffset? EarliestUtc)
+{
+    public static AgentUsageWindowTokens Empty => new(0, 0, 0, 0, 0, null);
+}
+
+/// <summary>
 /// Durable per-agent/per-model usage accounting. Writes are best-effort: callers
 /// must never let a store failure abort a pipeline phase.
 /// </summary>
@@ -63,6 +82,23 @@ public interface IAgentUsageStore
     /// </summary>
     Task<AgentUsageWindowAggregate> SumWindowAsync(
         string agentKind, string? modelId, DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken ct = default);
+
+    /// <summary>
+    /// Token-aware window aggregate. Returns input / cached input / output token
+    /// totals, cost (microcents), event count, and earliest event time for events
+    /// matching <paramref name="agentKind"/> + <paramref name="modelId"/> with
+    /// <see cref="AgentUsageEvent.TimeUtc"/> in <c>[fromUtc, toUtc)</c>.
+    /// <para>When <paramref name="modelId"/> is null the implementation MUST sum
+    /// across every model recorded for the agent — the capacity calculator pairs
+    /// this with provider-side per-agent (window) quota burn-down.</para>
+    /// <para>Default implementation returns <see cref="AgentUsageWindowTokens.Empty"/>
+    /// so existing in-memory stub implementations stay compilable; the production
+    /// SQLite store overrides this with a real aggregation query.</para>
+    /// </summary>
+    Task<AgentUsageWindowTokens> SumTokensWindowAsync(
+        string agentKind, string? modelId, DateTimeOffset fromUtc, DateTimeOffset toUtc,
+        CancellationToken ct = default) =>
+        Task.FromResult(AgentUsageWindowTokens.Empty);
 
     /// <summary>Deletes events older than <paramref name="cutoffUtc"/>. Returns the number deleted.</summary>
     Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default);

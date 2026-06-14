@@ -37,7 +37,7 @@ namespace CodeyBox.StatisticsPlugin;
     displayName: "CodeyBox: Statistics",
     minHostApiVersion: "1.2")]
 public sealed class StatisticsQuotaPlugin
-    : IMetricSampler, IQuotaTimeSeriesStore, IPluginInitializer, IAsyncDisposable
+    : IMetricSampler, IQuotaTimeSeriesStore, ICapacityCalculator, IPluginInitializer, IAsyncDisposable
 {
     public const string PluginId = "codeybox.statistics";
     public const string QuotaSamplerKind = "quota";
@@ -47,12 +47,14 @@ public sealed class StatisticsQuotaPlugin
 
     private readonly IReadOnlyList<IAgentQuotaProbe> _probes;
     private readonly IAgentQuotaGate? _quotaGate;
+    private readonly IAgentUsageStore? _usageStore;
     private readonly IConfiguration _configuration;
     private readonly TimeProvider _timeProvider;
 
     private IConfigurationSection? _scopedConfig;
     private ILogger _logger = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
     private QuotaTimeSeriesSqliteStore? _store;
+    private CapacityCalculator? _capacity;
 
     private readonly object _stateLock = new();
     private StatisticsPluginOptions _options = new();
@@ -66,12 +68,14 @@ public sealed class StatisticsQuotaPlugin
         IEnumerable<IAgentQuotaProbe> probes,
         IConfiguration configuration,
         IAgentQuotaGate? quotaGate = null,
+        IAgentUsageStore? usageStore = null,
         TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(probes);
         ArgumentNullException.ThrowIfNull(configuration);
         _probes = probes.ToList();
         _quotaGate = quotaGate;
+        _usageStore = usageStore;
         _configuration = configuration;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -263,6 +267,32 @@ public sealed class StatisticsQuotaPlugin
             ?? throw new InvalidOperationException("Statistics plugin: store not initialised — InitializeAsync has not run yet");
         var clamped = ClampFilterLimit(filter);
         return store.QueryRawAsync(clamped, ct);
+    }
+
+    /// <inheritdoc/>
+    public Task<CapacityReport> ComputeAsync(CapacityFilter filter, CancellationToken ct = default)
+    {
+        if (_store is null)
+            throw new InvalidOperationException("Statistics plugin: store not initialised — InitializeAsync has not run yet");
+        if (_usageStore is null)
+        {
+            // No agent_usage_events backing store registered — capacity is
+            // undefined. Returning an empty report keeps the API surface
+            // stable (200 OK + zero entries + a clear note) instead of
+            // 500-ing on a missing optional dependency.
+            var now = _timeProvider.GetUtcNow();
+            return Task.FromResult(new CapacityReport(
+                GeneratedAt: now,
+                FromUtc: filter.FromUtc ?? now - TimeSpan.FromHours(CapacityFilter.DefaultHorizonHours),
+                ToUtc: filter.ToUtc ?? now,
+                Entries: Array.Empty<CapacityEntry>()));
+        }
+
+        var calc = _capacity ??= new CapacityCalculator(
+            timeSeries: this,
+            usage: _usageStore,
+            clock: _timeProvider);
+        return calc.ComputeAsync(filter, ct);
     }
 
     private QuotaTimeSeriesFilter ClampFilterLimit(QuotaTimeSeriesFilter filter)

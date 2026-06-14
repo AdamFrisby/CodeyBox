@@ -201,6 +201,95 @@ produces, anchored to its sample time.
 
 ---
 
+## REST: `GET /stats/capacity`
+
+Returns subscription capacity estimates — for each (agent, window) pair, how
+many tokens / requests one percent of the window holds and the implied
+capacity of a full 100 % window, derived by joining the captured quota
+time-series against `agent_usage_events` consumption.
+
+Algorithm: for each pair of consecutive quota snapshots, the calculator
+reads the percent drop in the chosen window and sums the
+`agent_usage_events` whose `time_utc` falls in the interval. Intervals
+where the percent went UP (window reset) are flagged and excluded from
+the burn-rate average. Intervals with a percent drop below the noise
+floor (default 0.25 %) are also excluded so a 0.01 % drop with a stray
+million-token call does not pollute the average.
+
+The endpoint resolves `ICapacityCalculator` from DI; when the plugin is
+not loaded it returns `503 Service Unavailable` with a problem body.
+
+### Query parameters
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `agent` | string | (none) | Filter by agent kind (case-insensitive). |
+| `window` | string | (none) | Provider window name (`five_hour`, `seven_day`, …). |
+| `model` | string | (none) | When set, narrows the entry to a single per-model quota bucket; when omitted the entry aggregates the agent's overall reading across all models. |
+| `from` | RFC 3339 | now − 7 d | Lower bound on `sampled_at` (inclusive). |
+| `to` | RFC 3339 | now | Upper bound on `sampled_at` (exclusive). Max horizon 60 days. |
+| `minDeltaPct` | float | 0.25 | Minimum percent drop between consecutive samples for an interval to count toward the burn-rate average. |
+| `includeIntervals` | bool | true | Carry the per-interval burn-rate series in the response (set false to halve payload size). |
+
+### Example: seven-day capacity for Claude
+
+```sh
+curl 'http://orchestrator/stats/capacity?agent=claude&window=seven_day'
+```
+
+```json
+{
+  "generatedAt": "2026-06-14T15:00:00+00:00",
+  "fromUtc":     "2026-06-07T15:00:00+00:00",
+  "toUtc":       "2026-06-14T15:00:00+00:00",
+  "entries": [
+    {
+      "agent": "claude",
+      "windowName": "seven_day",
+      "modelId": null,
+      "sampleIntervals": 96,
+      "totalDeltaPct": 41.2,
+      "totalInputTokens": 41200000,
+      "totalCachedInputTokens": 18800000,
+      "totalOutputTokens": 12400000,
+      "totalRequests": 188,
+      "inputTokensPerPercent": 1000000,
+      "estimatedFullWindowInputTokens": 100000000,
+      "requestsPerPercent": 4.56,
+      "estimatedFullWindowRequests": 456,
+      "currentPct": 58.8,
+      "resetAt": "2026-06-21T15:00:00+00:00",
+      "estimatedExhaustionAt": "2026-06-15T03:24:00+00:00",
+      "confidence": "High",
+      "notes": [
+        "Cached input tokens are billed at a different rate than fresh input — both buckets are reported separately so totals stay meaningful."
+      ],
+      "intervals": [ /* one per consecutive-sample pair, with from/to/deltaPct/tokens/requests/isWindowReset */ ]
+    }
+  ]
+}
+```
+
+### Caveats
+
+- **Cached vs billable input.** The aggregator surfaces cache-read input
+  tokens separately from fresh-input tokens (`cachedInputTokensPerPercent`
+  vs `inputTokensPerPercent`). The two are billed at different rates and
+  conflating them would understate the value of cache hits.
+- **Rolling windows never reset.** Codex `5h-rolling` and similar rolling
+  windows oscillate continuously; the burn-rate represents amortised
+  consumption across the rolling horizon, not a discrete fill-and-empty
+  cycle. The entry includes a note flagging this case.
+- **Estimates improve with more samples.** Confidence is bucketed by
+  surviving-interval count: `Low` < 3, `Medium` 3-9, `High` 10+, `None`
+  when no intervals survived filtering.
+- **Provider-side accounting drift.** The quota probe reads the provider's
+  own % remaining, but provider counters can lag actual ingestion by
+  seconds-to-minutes. A short measurement window can show a misalignment
+  that washes out over longer horizons.
+
+---
+
 ## Adding further metric streams
 
 Implement `IMetricSampler` and decorate the class with `[CodeyBoxPlugin]`
