@@ -129,11 +129,21 @@ public sealed class WorkItemRetrier
             }
         }
 
-        // Reset RecoveryAttempts and increment QuotaRetryAttempts if this is an auto-retry.
+        // Reset RecoveryAttempts and increment QuotaRetryAttempts if this is a
+        // quota-scheduler auto-retry. Terminal-failure-recovery and manual
+        // retries do NOT bump QuotaRetryAttempts — those use their own
+        // counters (TerminalRetryAttempts; n/a respectively). On any retry
+        // we clear NextTerminalRetryAt so a stale backoff schedule does not
+        // gate the next sweep. A manual retry also clears
+        // TerminalRetryAttempts — operator-forgiveness lets the cap reset.
+        var bumpsQuotaCounter = trigger != "manual" && trigger != "terminal-failure-recovery";
+        var resetsTerminalRetries = trigger == "manual";
         var resumed = item.With(resumeState.Value, error: null) with
         {
             RecoveryAttempts = 0,
-            QuotaRetryAttempts = trigger != "manual" ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts,
+            QuotaRetryAttempts = bumpsQuotaCounter ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts,
+            TerminalRetryAttempts = resetsTerminalRetries ? 0 : item.TerminalRetryAttempts,
+            NextTerminalRetryAt = null,
             StartedAt = null
         };
 

@@ -218,6 +218,28 @@ public sealed record WorkItem
     public int ConflictReworkAttempts { get; init; }
 
     /// <summary>
+    /// Number of times the failure-class recovery service has auto-retried
+    /// this work item after classifying its terminal failure as
+    /// <see cref="TerminalFailureClass.Transient"/>. Distinct from
+    /// <see cref="QuotaRetryAttempts"/> (per-window quota retries owned by
+    /// <c>QuotaRetryScheduler</c>) and <see cref="TransientCancelRetries"/>
+    /// (in-pipeline transient-cancel reruns). Capped by the recovery
+    /// service's <c>MaxAutoRetriesPerWorkItem</c>; past the cap the item is
+    /// dead-lettered to <see cref="WorkItemState.NeedsOperatorInput"/>.
+    /// </summary>
+    public int TerminalRetryAttempts { get; init; }
+
+    /// <summary>
+    /// UTC timestamp at which the failure-class recovery service may next
+    /// retry this work item after a transient terminal failure. Used to
+    /// re-arm the periodic sweep after a restart and to enforce exponential
+    /// backoff between attempts. Null when the item is not eligible for a
+    /// transient terminal retry (cleared on any retry / transition out of
+    /// the terminal states the recovery service owns).
+    /// </summary>
+    public DateTimeOffset? NextTerminalRetryAt { get; init; }
+
+    /// <summary>
     /// IDs of work items this item depends on. The orchestrator will not pick
     /// this item up until every dependency has reached a terminal state
     /// (Done, Failed, AuditFailed, MergeConflictResolutionFailed, or Cancelled). Immutable after creation.

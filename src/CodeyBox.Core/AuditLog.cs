@@ -99,6 +99,41 @@ public static class AuditLog
         Audit("work_item.failed")
             .Warning("Work item {WorkItemId} failed: {Error}", id.ToString(), error);
 
+    /// <summary>
+    /// Emitted by <c>TerminalFailureRecoveryService</c> for every terminal
+    /// failure it inspects (Failed, AuditFailed,
+    /// MergeConflictResolutionFailed). Captures the classifier verdict and
+    /// the action the service took so operators can audit policy decisions
+    /// without re-running the classifier. <paramref name="action"/> is one
+    /// of: <c>scheduled</c> (transient: backoff timer armed),
+    /// <c>retried</c> (transient: retry executed),
+    /// <c>dead-lettered</c> (transient: cap reached → NeedsOperatorInput),
+    /// <c>parked</c> (deterministic / unknown: no auto-retry),
+    /// <c>delegated</c> (quota: owned by QuotaRetryScheduler), or
+    /// <c>skipped:&lt;reason&gt;</c> for gated outcomes.
+    /// </summary>
+    public static void TerminalFailureClassified(
+        WorkItemId id,
+        string failureClass,
+        string reason,
+        string state,
+        string action,
+        int attempt,
+        int maxAttempts,
+        DateTimeOffset? nextRetryAt = null) =>
+        Audit("work_item.terminal_failure_classified")
+            .ForContext("Reason", reason ?? "")
+            .Information(
+                "Terminal failure classified for work item {WorkItemId}: class={FailureClass} state={State} action={Action} attempt={Attempt}/{MaxAttempts} reason={Reason} nextRetryAt={NextRetryAt}",
+                id.ToString(),
+                failureClass,
+                state,
+                action,
+                attempt,
+                maxAttempts,
+                reason ?? "",
+                nextRetryAt?.ToString("O") ?? "");
+
     public static void WorkItemPickedUp(int workerId, WorkItemId id) =>
         Audit("work_item.picked_up")
             .Information("Worker {WorkerId} picked up work item {WorkItemId}", workerId, id.ToString());
