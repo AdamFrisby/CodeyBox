@@ -8,11 +8,23 @@
   {
     "sha": "2222222222222222222222222222222222222222",
     "commit": {
-      "message": "codeybox rework: address audit findings\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+      "message": "codeybox: stamp prompt-revision trailer\n\nCodeyBox-Prompt-Revision: 12\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  },
+  {
+    "sha": "2323232323232323232323232323232323232323",
+    "commit": {
+      "message": "chore: restamp prompt revision trailer\n\nCodeyBox-Prompt-Revision: 13\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
     }
   },
   {
     "sha": "3333333333333333333333333333333333333333",
+    "commit": {
+      "message": "codeybox rework: address audit findings\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+    }
+  },
+  {
+    "sha": "3434343434343434343434343434343434343434",
     "commit": {
       "message": "chore: resolve merge conflict\n\nAddress auditor feedback.\n\nCodeyBox-Prompt-Revision: 12\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
     }

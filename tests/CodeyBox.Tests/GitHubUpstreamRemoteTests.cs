@@ -296,6 +296,34 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Contains("CodeyBox-Prompt-Revision: 7", message);
     }
 
+    [Theory]
+    [InlineData("[skip ci]")]
+    [InlineData("   ")]
+    public async Task CompleteAsync_SquashMerge_UsesFallbackTitleWhenCleanedTitleIsEmpty(string title)
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(10, "https://github.com/myorg/myrepo/pull/10"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                "feat: keep fallback title body\n\nKeep a useful body while the title falls back.\n\nCodeyBox-Prompt-Revision: 9\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            ]));
+        handler.Enqueue(MergeOkResponse("fallback-title-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with { AutoMerge = true, MergeMethod = "squash" });
+
+        await remote.CompleteAsync(SampleRequest with { Title = title }, CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("chore: merge CodeyBox pull request (#10)",
+            mergeBody.RootElement.GetProperty("commit_title").GetString());
+        Assert.Contains("Keep a useful body while the title falls back.",
+            mergeBody.RootElement.GetProperty("commit_message").GetString());
+    }
+
     [Fact]
     public async Task CompleteAsync_SquashMergeFallback_CleansCapturedMultiCommitShape()
     {
@@ -334,6 +362,85 @@ public sealed class GitHubUpstreamRemoteTests
             Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
             """,
             message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMergeFallback_AllNoiseUsesLastResortBody()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(18, "https://github.com/myorg/myrepo/pull/18"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            "codeybox: stamp prompt-revision trailer\n\nCodeyBox-Prompt-Revision: 40\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            "chore: restamp prompt revision trailer\n\nCodeyBox-Prompt-Revision: 41\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            "codeybox rework: address audit findings\n\nCodeyBox-Prompt-Revision: 42\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"));
+        handler.Enqueue(MergeOkResponse("last-resort-body-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(
+            SampleRequest with { PromptRevision = 39, Description = null },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString();
+        Assert.Equal(
+            """
+            Apply the CodeyBox work item changes.
+
+            CodeyBox-Prompt-Revision: 42
+            Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+            """,
+            message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMergeFallback_WrapsCommitBodyParagraphs()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(19, "https://github.com/myorg/myrepo/pull/19"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                """
+                feat: add wrapped squash body
+
+                Update the squash merge fallback body with a deliberately long paragraph that should wrap across several conventional commit message lines before the trailer block is appended.
+
+                CodeyBox-Prompt-Revision: 43
+                Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+                """,
+            ]));
+        handler.Enqueue(MergeOkResponse("wrapped-body-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        var paragraphs = message.Split("\n\n", StringSplitOptions.None);
+        Assert.True(paragraphs.Length >= 3);
+        Assert.Contains('\n', paragraphs[1]);
+        Assert.All(
+            paragraphs[1].Split('\n', StringSplitOptions.RemoveEmptyEntries),
+            line => Assert.True(line.Length <= 72, $"Line was {line.Length} chars: {line}"));
     }
 
     [Fact]

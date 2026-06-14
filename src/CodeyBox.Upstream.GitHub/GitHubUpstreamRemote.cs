@@ -1050,6 +1050,11 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             return IsPureIterationNoise(lower["codeybox:".Length..]);
         if (lower.StartsWith("codeybox rework:", StringComparison.Ordinal))
             return IsPureIterationNoise(lower["codeybox rework:".Length..]);
+        if ((lower.StartsWith("stamp ", StringComparison.Ordinal) ||
+             lower.StartsWith("restamp ", StringComparison.Ordinal)) &&
+            (lower.Contains("prompt-revision trailer", StringComparison.Ordinal) ||
+             lower.Contains("prompt revision trailer", StringComparison.Ordinal)))
+            return true;
         if (lower.StartsWith("merge branch ", StringComparison.Ordinal)) return true;
         if (lower.StartsWith("merge main", StringComparison.Ordinal)) return true;
         if (lower.Contains("merge conflict", StringComparison.Ordinal) &&
