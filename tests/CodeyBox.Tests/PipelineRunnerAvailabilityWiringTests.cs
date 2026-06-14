@@ -223,6 +223,168 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.NotNull(snap.LastFastFailAt);
     }
 
+    // ── No-changes breaker (silent-failure backstop) ─────────────────────────
+    // The fast-fail breaker above only counts NON-ZERO exits. A silently-broken
+    // agent — auth collapse, capability collapse, or a failure mode whose
+    // signature we don't recognise yet — exits 0 but leaves the working tree
+    // unchanged. These tests pin the wiring that catches that pattern: the
+    // pipeline must call IAgentAvailabilityRegistry.RecordNoChangesOutcome at
+    // the "Agent produced no changes to commit" throw site, fire an
+    // agent.smoke_failed webhook on the trip transition, and call
+    // RecordChangesProduced on the success path so an isolated no-change does
+    // not trip the breaker.
+
+    [Fact]
+    public async Task ThreeConsecutiveDistinctNoChanges_ExcludeAgent_AndPublishOneTransitionWebhook()
+    {
+        // Headline: a clean-exit agent that produces no diff on 3 distinct
+        // work items in a row is excluded by the no-changes breaker. Exactly
+        // one agent.smoke_failed webhook fires (the trip transition).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        for (var i = 0; i < 3; i++)
+        {
+            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                Success: true, Summary: "ok", Stdout: null, Stderr: null));
+        }
+
+        for (var i = 0; i < 3; i++)
+        {
+            var item = NewItem(AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+            var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+            Assert.Equal(WorkItemState.Failed, final!.State);
+        }
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("no-changes circuit breaker", availability.Reason);
+
+        var transitionEvents = fix.Webhooks.Events
+            .Where(e => e.Event == "agent.smoke_failed")
+            .ToList();
+        Assert.Single(transitionEvents);
+        var details = Assert.IsType<AgentSmokeFailedDetails>(transitionEvents[0].Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Contains("no-changes circuit breaker", details.Reason);
+        // Persistent: a silent-failure agent will keep producing empty diffs
+        // until the operator intervenes — Unknown / Transient would mis-route
+        // the alert as recoverable noise.
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task SingleNoChanges_DoesNotExcludeAgent_AndPublishesNoTransitionWebhook()
+    {
+        // One no-changes outcome must not fire the alert (threshold is 3).
+        // Without this guard a regression that wired the trip predicate as
+        // `>= 1` would page the operator on every empty diff.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true, Summary: "ok", Stdout: null, Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+
+        var snap = fix.Registry.Snapshot().Single(s => s.Agent == AgentKind.Codex);
+        Assert.Equal(1, snap.ConsecutiveNoChanges);
+        Assert.NotNull(snap.LastNoChangesAt);
+        // Orthogonal to fast-fails: a clean-exit no-change must NOT inflate
+        // the fast-fail counter or it would race ahead of its own breaker.
+        Assert.Equal(0, snap.ConsecutiveFastFails);
+    }
+
+    [Fact]
+    public async Task NoChangesInterleavedWithRealCommit_ResetsBreakerFromPipeline()
+    {
+        // The success-path wiring (RecordChangesProduced after HEAD advances)
+        // must reset the no-changes streak. Sequence: no-change × 2, then a
+        // real-work item that commits → counter back to 0 → next no-change
+        // is only 1, well below threshold. A regression that omitted the
+        // RecordChangesProduced call would leave the counter at 2 and the
+        // next no-change would trip the breaker.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        // Queue and dispatch in three batches because ScriptedFailures takes
+        // precedence over WorkPlan in the scripted runner — interleaving by
+        // enqueueing the WorkPlan entry between the failure entries would
+        // still dequeue all ScriptedFailures first.
+
+        // Batch 1: two no-change runs (streak → 2).
+        for (var i = 0; i < 2; i++)
+        {
+            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                Success: true, Summary: "ok", Stdout: null, Stderr: null));
+            var item = NewItem(AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+        }
+
+        // Batch 2: one real-work run (streak → 0).
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
+        var success = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(success);
+        await fix.Pipeline.RunAsync(success, CancellationToken.None);
+
+        // Batch 3: two more no-change runs (streak → 2).
+        for (var i = 0; i < 2; i++)
+        {
+            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                Success: true, Summary: "ok", Stdout: null, Stderr: null));
+            var item = NewItem(AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+        }
+
+        // After the interleaved sequence the trailing streak is 2, still
+        // under the threshold of 3 — proving the success-path reset wired.
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var snap = fix.Registry.Snapshot().Single(s => s.Agent == AgentKind.Codex);
+        Assert.Equal(2, snap.ConsecutiveNoChanges);
+    }
+
+    [Fact]
+    public async Task NoChangesBreakerTripped_ResetEndpointPathRestoresAvailability()
+    {
+        // Recovery contract: the breaker is never permanent. After the
+        // operator hits /admin/agent/{name}/reset (which delegates to
+        // IAgentAvailabilityReset.Reset → AgentAvailabilityRegistry.Reset),
+        // the agent is routable again and the streak counter starts fresh.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        for (var i = 0; i < 3; i++)
+        {
+            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                Success: true, Summary: "ok", Stdout: null, Stderr: null));
+        }
+
+        for (var i = 0; i < 3; i++)
+        {
+            var item = NewItem(AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+        }
+
+        Assert.False(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+
+        fix.Registry.Reset(AgentKind.Codex);
+
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        var snap = fix.Registry.Snapshot().SingleOrDefault(s => s.Agent == AgentKind.Codex);
+        Assert.True(snap is null || snap.ConsecutiveNoChanges == 0);
+    }
+
     [Fact]
     public async Task SuccessfulWorkRun_ResetsFastFailCounterFromPipeline()
     {

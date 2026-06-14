@@ -8,18 +8,19 @@ namespace CodeyBox.Tests;
 public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
 {
     // Per-wait timeout for dispatch-pipeline signals. The happy path lands in
-    // ~300 ms locally; the 60 s ceiling is CI-contention headroom only.
+    // ~300 ms locally; the 120 s ceiling is CI-contention headroom only.
     // The audit suite fans the full xUnit collection out in parallel, the
     // [Theory] inline-data dispatches all four parameter combinations of
     // the precedence test concurrently, and each combination spins up its
     // own SqliteWorkItemStore + OrchestratorService BackgroundService —
     // sqlite file-creation latency under load has produced 15 s timeouts
-    // for the leading WaitForEnteredAsync, and audit iteration 15 of the
-    // Claude session-worker rollout (which added ~1500 lines of new tests
-    // running alongside this fixture) saw the leading wait time out at the
-    // prior 30 s boundary. We are not exercising a latency SLA here, only
-    // ordering, so a generous wall-clock cap is the right tool.
-    private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(60);
+    // for the leading WaitForEnteredAsync. The ceiling has been bumped
+    // repeatedly as new test surface is added (30 s -> 60 s during the
+    // Claude session-worker rollout; 60 s -> 120 s after the no-changes
+    // breaker commit added ~336 lines of new wiring tests running
+    // alongside this fixture). We are not exercising a latency SLA here,
+    // only ordering, so a generous wall-clock cap is the right tool.
+    private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(120);
 
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-finishing-precedence-{Guid.NewGuid():N}.db");

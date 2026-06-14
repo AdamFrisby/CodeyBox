@@ -16,15 +16,21 @@ public sealed class AgentAvailabilityRegistryTests
     private static readonly AgentKind Claude = AgentKind.Claude;
     private static readonly AgentKind Codex = AgentKind.Codex;
 
-    private static AgentAvailabilityRegistry NewRegistry(int fastFailThreshold = 10, int maxConsecutive = 3)
+    private static AgentAvailabilityRegistry NewRegistry(
+        int fastFailThreshold = 10,
+        int maxConsecutive = 3,
+        int maxConsecutiveNoChanges = 3)
     {
         var opts = new AvailabilityOptions
         {
             FastFailThresholdSeconds = fastFailThreshold,
             MaxConsecutiveFastFails = maxConsecutive,
+            MaxConsecutiveNoChanges = maxConsecutiveNoChanges,
         };
         return new AgentAvailabilityRegistry(opts, TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
     }
+
+    private static WorkItemId NewItem() => new(Guid.NewGuid());
 
     // ── Smoke probe signal ────────────────────────────────────────────────────
 
@@ -289,5 +295,171 @@ public sealed class AgentAvailabilityRegistryTests
         var x = snap.Single(s => s.Agent == Codex);
         Assert.False(c.Excluded);
         Assert.True(x.Excluded);
+    }
+
+    // ── No-changes circuit breaker ───────────────────────────────────────────
+    // Cause-agnostic backstop for silently-broken agents that exit 0 but leave
+    // the working tree unchanged (auth collapse, capability collapse, unknown
+    // failure modes). The fast-fail breaker only counts non-zero exits, so a
+    // silently-broken agent would never trip it. The brief: count CONSECUTIVE
+    // DISTINCT work items, not retries of the same item — so a single hard
+    // task can't trip the breaker on its own.
+
+    [Fact]
+    public void SingleNoChanges_DoesNotExclude()
+    {
+        // An isolated no-change is not evidence of a broken agent — a single
+        // work item could legitimately have nothing to do (rare but possible).
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void ThreeConsecutiveDistinctNoChanges_ExcludesAgent()
+    {
+        // The headline acceptance: N distinct items in a row produce no
+        // changes → agent excluded + reason names the breaker.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        var t1 = reg.RecordNoChangesOutcome(Claude, NewItem());
+        var t2 = reg.RecordNoChangesOutcome(Claude, NewItem());
+        var t3 = reg.RecordNoChangesOutcome(Claude, NewItem());
+
+        Assert.False(t1.NowExcluded);
+        Assert.False(t2.NowExcluded);
+        Assert.False(t3.PreviouslyExcluded);
+        Assert.True(t3.NowExcluded);
+
+        var av = reg.GetAvailability(Claude);
+        Assert.False(av.Available);
+        Assert.Contains("no-changes circuit breaker", av.Reason);
+    }
+
+    [Fact]
+    public void RepeatedNoChangesOnSameItem_DoesNotTrip()
+    {
+        // Distinct-item counting: a single hard item retried in place must not
+        // advance the counter. Otherwise one legitimately-empty task on a
+        // healthy agent would still trip the breaker on its 3rd retry.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        var item = NewItem();
+        reg.RecordNoChangesOutcome(Claude, item);
+        reg.RecordNoChangesOutcome(Claude, item);
+        reg.RecordNoChangesOutcome(Claude, item);
+        reg.RecordNoChangesOutcome(Claude, item);
+
+        Assert.True(reg.GetAvailability(Claude).Available);
+        var snap = reg.Snapshot().Single(s => s.Agent == Claude);
+        Assert.Equal(1, snap.ConsecutiveNoChanges);
+    }
+
+    [Fact]
+    public void NoChangesInterleavedWithSuccess_DoesNotTrip()
+    {
+        // Interleaving non-trip: a real "produced changes" run clears the
+        // streak, so [no, no, success, no, no] is two streaks of length 2 —
+        // never reaches the threshold of 3.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        reg.RecordChangesProduced(Claude);
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void NoChangesBreaker_NotTrippedByDifferentAgent()
+    {
+        // Per-agent isolation: claude's no-changes streak must not bench codex.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        for (var i = 0; i < 3; i++)
+            reg.RecordNoChangesOutcome(Claude, NewItem());
+
+        Assert.False(reg.GetAvailability(Claude).Available);
+        Assert.True(reg.GetAvailability(Codex).Available);
+    }
+
+    [Fact]
+    public void Reset_ClearsNoChangesExclusion()
+    {
+        // Recovery via the existing reset path — never bench permanently. The
+        // operator runs POST /admin/agent/{name}/reset after diagnosing the
+        // root cause and the agent is routable again.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        for (var i = 0; i < 3; i++)
+            reg.RecordNoChangesOutcome(Claude, NewItem());
+        Assert.False(reg.GetAvailability(Claude).Available);
+
+        reg.Reset(Claude);
+        Assert.True(reg.GetAvailability(Claude).Available);
+
+        // After reset the counter starts fresh — a single no-change does
+        // not immediately re-trip.
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void RecordChangesProduced_DoesNotLiftExistingExclusion()
+    {
+        // By design: an already-excluded agent never receives dispatch, so the
+        // signal would not fire in practice anyway — but if it ever does
+        // (e.g. concurrent in-flight runs), it must not silently lift the
+        // bench. Recovery is operator-only.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        for (var i = 0; i < 3; i++)
+            reg.RecordNoChangesOutcome(Claude, NewItem());
+        Assert.False(reg.GetAvailability(Claude).Available);
+
+        reg.RecordChangesProduced(Claude);
+        Assert.False(reg.GetAvailability(Claude).Available);
+        Assert.Contains("no-changes circuit breaker", reg.GetAvailability(Claude).Reason);
+    }
+
+    [Fact]
+    public void NoChangesBreaker_DisabledWhenThresholdIsZero()
+    {
+        // Disable knob: operator sets MaxConsecutiveNoChanges <= 0 to opt out
+        // of the breaker entirely (e.g. while diagnosing a flapping signal)
+        // without unwiring the rest of the registry.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 0);
+        for (var i = 0; i < 10; i++)
+            reg.RecordNoChangesOutcome(Claude, NewItem());
+
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void NoChangesBreaker_DoesNotAffectFastFailCounter()
+    {
+        // The two breakers are orthogonal: a clean-exit no-changes outcome
+        // must not increment ConsecutiveFastFails, and vice versa.
+        var reg = NewRegistry(maxConsecutive: 3, maxConsecutiveNoChanges: 3);
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+
+        var snap = reg.Snapshot().Single(s => s.Agent == Claude);
+        Assert.Equal(0, snap.ConsecutiveFastFails);
+        Assert.Equal(2, snap.ConsecutiveNoChanges);
+    }
+
+    [Fact]
+    public void SteadyStateNoChangesAfterTrip_StillReportsTransitionOnce()
+    {
+        // Webhook firing semantics: only the !PreviouslyExcluded -> NowExcluded
+        // edge fires the operator alert. Subsequent calls on the still-broken
+        // agent must report the steady-state transition, not a re-trip.
+        var reg = NewRegistry(maxConsecutiveNoChanges: 3);
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        reg.RecordNoChangesOutcome(Claude, NewItem());
+        var trip = reg.RecordNoChangesOutcome(Claude, NewItem());
+        var steady = reg.RecordNoChangesOutcome(Claude, NewItem());
+
+        Assert.False(trip.PreviouslyExcluded);
+        Assert.True(trip.NowExcluded);
+        Assert.True(steady.PreviouslyExcluded);
+        Assert.True(steady.NowExcluded);
     }
 }

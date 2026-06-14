@@ -34,6 +34,29 @@ public interface IAgentAvailabilityRegistry
     /// <summary>Feeds a real agent-run outcome into the fast-fail circuit breaker.</summary>
     AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration);
 
+    /// <summary>
+    /// Feeds a "produced no changes on clean exit" outcome — the silent-failure
+    /// signature a silently-broken agent exhibits when its exit code looks fine
+    /// but the working tree is unchanged. After
+    /// <see cref="AvailabilityOptions.MaxConsecutiveNoChanges"/> distinct work
+    /// items in a row produce no changes, the agent is excluded. The same
+    /// <paramref name="itemId"/> repeated (a retry of the same hard item) does
+    /// not advance the counter, so a single legitimately-empty task can't trip
+    /// the breaker on its own.
+    /// </summary>
+    AvailabilityTransition RecordNoChangesOutcome(AgentKind kind, WorkItemId itemId);
+
+    /// <summary>
+    /// Signals that <paramref name="kind"/> just produced real changes on a
+    /// work item — clears the no-changes streak counter so an isolated
+    /// no-change before this success is forgotten. Does NOT lift an existing
+    /// no-changes exclusion: by design recovery from the breaker is operator-
+    /// only via <c>POST /admin/agent/{name}/reset</c>, since an excluded
+    /// silently-broken agent never gets dispatched and so never reaches this
+    /// signal anyway.
+    /// </summary>
+    void RecordChangesProduced(AgentKind kind);
+
     /// <summary>Snapshot of every tracked agent's current state.</summary>
     IReadOnlyList<AgentAvailabilitySnapshot> Snapshot();
 }
@@ -75,4 +98,6 @@ public sealed record AgentAvailabilitySnapshot(
     int ConsecutiveFastFails,
     DateTimeOffset? LastSmokePassedAt,
     DateTimeOffset? LastSmokeFailedAt,
-    DateTimeOffset? LastFastFailAt);
+    DateTimeOffset? LastFastFailAt,
+    int ConsecutiveNoChanges = 0,
+    DateTimeOffset? LastNoChangesAt = null);
