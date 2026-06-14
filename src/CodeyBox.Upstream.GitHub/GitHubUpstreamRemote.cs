@@ -178,7 +178,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                     if (!string.IsNullOrWhiteSpace(existing.Title))
                         prTitle = existing.Title;
                     if (!string.IsNullOrWhiteSpace(existing.Body))
-                        prDescription = new PrDescriptionResult(existing.Body, Generated: _opts.PrDescription.Enabled);
+                        prDescription = new PrDescriptionResult(
+                            existing.Body,
+                            Generated: ShouldReuseExistingPrBodyAsGenerated(existing.Body, request));
                 }
             }
         }
@@ -495,6 +497,41 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
     private sealed record PrDescriptionResult(string Body, bool Generated);
 
+    private bool ShouldReuseExistingPrBodyAsGenerated(string body, UpstreamCompletionRequest request)
+    {
+        if (!_opts.PrDescription.Enabled)
+            return false;
+
+        return !LooksLikeStaticFallbackPrBody(body, request.Description);
+    }
+
+    private static bool LooksLikeStaticFallbackPrBody(string body, string? staticDescription)
+    {
+        var strippedBody = StripPrFooter(body);
+        if (strippedBody.Length == 0)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(staticDescription) &&
+            string.Equals(strippedBody, StripPrFooter(staticDescription), StringComparison.Ordinal))
+            return true;
+
+        return strippedBody.StartsWith("Automated via CodeyBox", StringComparison.Ordinal) ||
+            strippedBody.Contains("Untrusted agent output", StringComparison.Ordinal);
+    }
+
+    private static string StripPrFooter(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        var normalized = text.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var footerIndex = normalized.IndexOf("\n\n---\n*Co-Authored-By:", StringComparison.Ordinal);
+        if (footerIndex >= 0)
+            normalized = normalized[..footerIndex];
+
+        return normalized.Trim();
+    }
+
     /// <summary>Returns the last 2 KB of <paramref name="text"/> (raw agent stdout or fallback).</summary>
     private static string? ExtractAgentReasoningTail(string? text)
     {
@@ -510,6 +547,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
     private static readonly Regex CollapseWhitespace = new(@"\s+", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex PullRequestNumberSuffix = new(@"\s\(#\d+\)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex PullRequestNumberOnly = new(@"^\(#\d+\)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex PromptRevisionTrailer = new(
         @"(?im)^\s*\*?CodeyBox-Prompt-Revision\s*:\s*(\d+)\s*\*?\s*$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -533,6 +571,15 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
     private static readonly Regex PureReworkOrAuditSubject = new(
         @"^(?:fix|address|resolve|rework)\s+(?:audit|auditor|review|reviewer|findings?|feedback)\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex CiSkipDirective = new(
+        @"\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex SkipChecksTrailerLine = new(
+        @"^\s*\*?skip-checks\s*:",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex ExcessBlankLines = new(
+        @"\n{3,}",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly (string Prefix, string Replacement)[] ImperativePrefixes =
@@ -710,8 +757,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 prNumber, ex.Message);
         }
 
-        var commitTitle = BuildSquashCommitTitle(prTitle, prNumber);
-        var commitMessage = BuildSquashCommitMessage(prDescription, commitMessages, completionRequest);
+        var commitTitle = StripCiSkipControlsFromTitle(BuildSquashCommitTitle(prTitle, prNumber));
+        if (string.IsNullOrWhiteSpace(commitTitle) || PullRequestNumberOnly.IsMatch(commitTitle))
+            commitTitle = BuildSquashCommitTitle("chore: merge CodeyBox pull request", prNumber);
+
+        var commitMessage = StripCiSkipControlsFromBody(
+            BuildSquashCommitMessage(prDescription, commitMessages, completionRequest));
         return new GitHubMergeRequest(_opts.MergeMethod, commitTitle, commitMessage);
     }
 
@@ -719,7 +770,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     {
         const int perPage = 100;
         const int maxPages = 10;
+        const int maxCommitMessageBytes = 8192;
+        const int maxTotalCommitMessageBytes = 65536;
         var messages = new List<string>();
+        var retainedBytes = 0;
 
         for (var page = 1; page <= maxPages; page++)
         {
@@ -741,8 +795,21 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 break;
 
             foreach (var commit in commits)
-                if (!string.IsNullOrWhiteSpace(commit.Commit?.Message))
-                    messages.Add(commit.Commit.Message);
+            {
+                var message = commit.Commit?.Message;
+                if (string.IsNullOrWhiteSpace(message))
+                    continue;
+
+                var remainingBytes = maxTotalCommitMessageBytes - retainedBytes;
+                if (remainingBytes < 64)
+                    return messages;
+
+                var truncated = TruncateCommitMessageForSquashFallback(
+                    message,
+                    Math.Min(maxCommitMessageBytes, remainingBytes));
+                messages.Add(truncated);
+                retainedBytes += Encoding.UTF8.GetByteCount(truncated);
+            }
 
             if (commits.Length < perPage)
                 break;
@@ -815,12 +882,28 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             yield break;
 
         var current = new StringBuilder();
+        var inFence = false;
 
         foreach (var rawLine in text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
             var trimmedRaw = rawLine.Trim();
             if (stopAtPrFooter && trimmedRaw == "---")
                 break;
+
+            if (trimmedRaw.StartsWith("```", StringComparison.Ordinal))
+            {
+                if (current.Length > 0)
+                {
+                    yield return ToImperativeSentence(current.ToString());
+                    current.Clear();
+                }
+
+                inFence = !inFence;
+                continue;
+            }
+
+            if (inFence)
+                continue;
 
             if (IsSkippableCommitMessageLine(trimmedRaw))
             {
@@ -866,6 +949,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         if (line.Contains("Generated with [CodeyBox]", StringComparison.Ordinal)) return true;
         if (line.Contains(CodeyBoxTrailers.CoAuthoredBy, StringComparison.Ordinal)) return true;
         if (KnownTrailerLine.IsMatch(line)) return true;
+        if (SkipChecksTrailerLine.IsMatch(line)) return true;
         if (ChecklistPrefix.IsMatch(line)) return true;
         return false;
     }
@@ -987,6 +1071,46 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return string.Create(
             CultureInfo.InvariantCulture,
             $"{CodeyBoxTrailers.PromptRevisionTrailerKey}: {promptRevision}\n{CodeyBoxTrailers.CoAuthoredBy}");
+    }
+
+    private static string StripCiSkipControlsFromTitle(string title)
+        => CollapseWhitespace.Replace(CiSkipDirective.Replace(title, string.Empty), " ").Trim();
+
+    private static string StripCiSkipControlsFromBody(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return body;
+
+        var normalized = body.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var cleaned = new StringBuilder(normalized.Length);
+        foreach (var rawLine in normalized.Split('\n'))
+        {
+            if (SkipChecksTrailerLine.IsMatch(rawLine.Trim()))
+                continue;
+
+            cleaned.Append(CiSkipDirective.Replace(rawLine, string.Empty).TrimEnd()).Append('\n');
+        }
+
+        return ExcessBlankLines.Replace(cleaned.ToString().Trim(), "\n\n");
+    }
+
+    private static string TruncateCommitMessageForSquashFallback(string message, int maxBytes)
+    {
+        if (ExtractLastPromptRevision(message) is not { } promptRevision)
+            return RawOutputRedactor.TruncateToBytes(message, maxBytes);
+
+        var promptRevisionTrailer = string.Create(
+            CultureInfo.InvariantCulture,
+            $"\n\n{CodeyBoxTrailers.PromptRevisionTrailerKey}: {promptRevision}");
+        var trailerBytes = Encoding.UTF8.GetByteCount(promptRevisionTrailer);
+        if (maxBytes <= trailerBytes + 64)
+            return promptRevisionTrailer.Trim();
+
+        var truncated = RawOutputRedactor.TruncateToBytes(message, maxBytes - trailerBytes);
+        if (ExtractLastPromptRevision(truncated) is not null)
+            return truncated;
+
+        return truncated.TrimEnd() + promptRevisionTrailer;
     }
 
     private static int? ExtractLastPromptRevision(IReadOnlyList<string> commitMessages)

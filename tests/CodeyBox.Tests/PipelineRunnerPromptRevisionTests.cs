@@ -240,6 +240,37 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
         Assert.Equal("1", log.Trim());
     }
 
+    [Fact]
+    public async Task UpstreamCompletionRequest_CarriesCurrentPromptRevision()
+    {
+        // PipelineRunner.cs:9308-9323 must forward the work item's current
+        // PromptRevision into the upstream request. GitHub uses it only as a
+        // last-resort squash trailer fallback, so GitHub-level tests that set
+        // the field manually do not catch a broken orchestrator handoff.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var upstream = new CapturingUpstreamRemote();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "capturing",
+                AutoMerge = true,
+                MergeMethod = "squash",
+            },
+            upstreamFactory: new FixedUpstreamFactory(upstream));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("upstream-revision.txt", "x\n"));
+
+        var item = NewItem("feature/upstream-revision") with { PromptRevision = 7 };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var request = Assert.Single(upstream.CompletionRequests);
+        Assert.Equal(7, request.PromptRevision);
+        Assert.True(request.AutoMerge);
+        Assert.Equal("squash", request.MergeMethod);
+    }
+
     // ── BuildTerminalRevisionAsync ─────────────────────────────────────────
 
     [Fact]

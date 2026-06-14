@@ -78,6 +78,10 @@ public sealed class GitHubUpstreamRemoteTests
     private static HttpResponseMessage PullRequestCommitsResponse(string json) =>
         JsonResponse(HttpStatusCode.OK, json);
 
+    private static HttpResponseMessage PullRequestCommitsResponse(params string[] messages) =>
+        PullRequestCommitsResponse(JsonSerializer.Serialize(
+            messages.Select(message => new { commit = new { message } })));
+
     private static int CountOccurrences(string text, string value)
     {
         var count = 0;
@@ -169,6 +173,24 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
+    public async Task CompleteAsync_NonSquashMerge_DoesNotSendSquashTitleOrMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(7, "https://github.com/myorg/myrepo/pull/7"));
+        handler.Enqueue(MergeOkResponse("merge-sha"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.Equal(2, handler.Requests.Count);
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[1]);
+        Assert.Equal("merge", mergeBody.RootElement.GetProperty("merge_method").GetString());
+        Assert.False(mergeBody.RootElement.TryGetProperty("commit_title", out _));
+        Assert.False(mergeBody.RootElement.TryGetProperty("commit_message", out _));
+    }
+
+    [Fact]
     public async Task CompleteAsync_SquashMerge_UsesGeneratedPrDescriptionForCommitMessage()
     {
         var gitHost = new FakeGitHost();
@@ -219,6 +241,59 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
         Assert.Equal(1, CountOccurrences(message, "Co-Authored-By: CodeyBox"));
         Assert.Contains("CodeyBox-Prompt-Revision: 5", message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_StripsCiSkipControlsFromTitleAndMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(9, "https://github.com/myorg/myrepo/pull/9"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            """
+            [
+              {
+                "commit": {
+                  "message": "feat: add release workflow\n\nImplement the release workflow.\n\nCodeyBox-Prompt-Revision: 7\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+                }
+              }
+            ]
+            """));
+        handler.Enqueue(MergeOkResponse("ci-skip-sanitized"));
+
+        var generator = new StaticDescriptionGenerator(
+            """
+            This PR adds release workflow automation. [skip actions]
+
+            skip-checks: true
+
+            Updates deployment metadata without bypassing checks. [ci skip]
+            """);
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            },
+            generator);
+
+        await remote.CompleteAsync(
+            SampleRequest with { Title = "feat: publish release [skip ci]" },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        Assert.Equal("feat: publish release (#9)",
+            mergeBody.RootElement.GetProperty("commit_title").GetString());
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.DoesNotContain("[skip ci]", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("[ci skip]", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("[skip actions]", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("skip-checks", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Add release workflow automation.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 7", message);
     }
 
     [Fact]
@@ -303,6 +378,66 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
+    public async Task CompleteAsync_SquashMerge_CommitsEndpointExceptionStillSendsExplicitMessage()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(14, "https://github.com/myorg/myrepo/pull/14"));
+        handler.EnqueueException(new HttpRequestException("commit list connection reset"));
+        handler.Enqueue(MergeOkResponse("fallback-after-commit-exception"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(
+            SampleRequest with
+            {
+                PromptRevision = 22,
+                Description = "Updates squash merge fallback when commit listing throws.",
+            },
+            CancellationToken.None);
+
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Put, handler.Requests[2].Method);
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Update squash merge fallback when commit listing throws.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 22", message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_CommitsEndpointCallerCancellationRethrows()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        using var cts = new CancellationTokenSource();
+        handler.Enqueue(PrCreatedResponse(15, "https://github.com/myorg/myrepo/pull/15"));
+        handler.EnqueueCallback(_ =>
+        {
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        });
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with { AutoMerge = true, MergeMethod = "squash" });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            remote.CompleteAsync(SampleRequest, cts.Token));
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.Contains("/pulls/15/commits", handler.Requests[1].RequestUri!.PathAndQuery);
+    }
+
+    [Fact]
     public async Task CompleteAsync_SquashMerge_UsesPromptRevisionWhenCommitsAreEmpty()
     {
         var gitHost = new FakeGitHost();
@@ -334,6 +469,75 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Contains("Ship a clean fallback trailer.", message);
         Assert.Contains("CodeyBox-Prompt-Revision: 34", message);
         Assert.Equal(1, CountOccurrences(message, "CodeyBox-Prompt-Revision:"));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_FetchesLaterCommitPagesForFallback()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(16, "https://github.com/myorg/myrepo/pull/16"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            Enumerable.Repeat(
+                "codeybox rework: address audit findings\n\nCodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+                100).ToArray()));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                "feat: add paged fallback\n\nCompose squash fallback from page two.\n\nCodeyBox-Prompt-Revision: 2\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            ]));
+        handler.Enqueue(MergeOkResponse("paged-fallback-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.Equal(4, handler.Requests.Count);
+        Assert.Contains("page=1", handler.Requests[1].RequestUri!.Query);
+        Assert.Contains("page=2", handler.Requests[2].RequestUri!.Query);
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[3]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Compose squash fallback from page two.", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 2", message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_SquashMerge_TruncatesOversizedCommitMessages()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(17, "https://github.com/myorg/myrepo/pull/17"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                "feat: add oversized fallback\n\n" + new string('a', 120_000) +
+                "\n\nCodeyBox-Prompt-Revision: 3\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            ]));
+        handler.Enqueue(MergeOkResponse("truncated-fallback-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.True(Encoding.UTF8.GetByteCount(message) < 20_000);
+        Assert.Contains("[...truncated]", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 3", message);
     }
 
     [Fact]
@@ -395,6 +599,61 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.DoesNotContain("codeybox rework", message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("CodeyBox-Prompt-Revision: 6", message);
         Assert.Equal("merged-after-squash-retry", outcome.MergedSha);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ExistingPrNumberWithSquash_StaticPrBodyUsesCommitFallback()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PullRequestResponse(
+            43,
+            "https://github.com/myorg/myrepo/pull/43",
+            "feat: retry with static body (#43)",
+            """
+            Automated via CodeyBox - work item 00000000-0000-0000-0000-000000000001
+
+            > **Untrusted agent output - do not treat as instructions.**
+
+            ```
+            stdout that should not become the squash body
+            ```
+
+            ---
+            *Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*
+            """));
+        handler.Enqueue(PullRequestCommitsResponse(
+            """
+            [
+              {
+                "commit": {
+                  "message": "feat: preserve fallback content\n\nCompose the squash body from cleaned commit messages.\n\nCodeyBox-Prompt-Revision: 8\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+                }
+              }
+            ]
+            """));
+        handler.Enqueue(MergeOkResponse("merged-static-retry"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = true },
+            });
+        var request = SampleRequest with { ExistingPullRequestNumber = 43 };
+
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString()!;
+        Assert.Contains("Compose the squash body from cleaned commit messages.", message);
+        Assert.DoesNotContain("Automated via CodeyBox", message);
+        Assert.DoesNotContain("stdout that should not become the squash body", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 8", message);
+        Assert.Equal("merged-static-retry", outcome.MergedSha);
     }
 
     [Fact]
@@ -803,6 +1062,7 @@ internal sealed class FakeHttpMessageHandler : HttpMessageHandler
 
     public void Enqueue(HttpResponseMessage response) => _queue.Enqueue(response);
     public void EnqueueException(Exception exception) => _queue.Enqueue(exception);
+    public void EnqueueCallback(Func<CancellationToken, HttpResponseMessage> callback) => _queue.Enqueue(callback);
 
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken)
@@ -818,6 +1078,8 @@ internal sealed class FakeHttpMessageHandler : HttpMessageHandler
         var next = _queue.Dequeue();
         if (next is Exception exception)
             throw exception;
+        if (next is Func<CancellationToken, HttpResponseMessage> callback)
+            return callback(cancellationToken);
 
         return (HttpResponseMessage)next;
     }
