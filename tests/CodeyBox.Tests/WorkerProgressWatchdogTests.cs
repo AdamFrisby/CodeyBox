@@ -291,11 +291,25 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
         var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
         await _store.CreateAsync(item);
-        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+        var workerId = Guid.NewGuid().ToString();
+        await PlantHeartbeatingWorkerAsync(workerId, item.Id);
 
         using var process = StartBusyProcess(item.Id);
         try
         {
+            var activitySource = new DefaultWorkerProgressActivitySource();
+            var activityProbe = new WorkerProgressActivityProbe(
+                ProcessCpuProgressSignalEnabled: true,
+                ActiveSandboxProgressSignalEnabled: false);
+            var primed = await WaitForActivityAsync(
+                activitySource,
+                WorkerForItem(workerId, item.Id),
+                item.Id,
+                activityProbe,
+                requiredReason: "process-cpu");
+            Assert.NotNull(primed);
+            await Task.Delay(TimeSpan.FromMilliseconds(150));
+
             var opts = new WorkerProgressWatchdogOptions
             {
                 ProgressTimeout = TimeSpan.FromMinutes(30),
@@ -307,7 +321,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
                 _registry, _store, _queue, opts,
                 NullLogger<WorkerProgressWatchdog>.Instance,
                 _streams, _webhooks, _slotReleaser,
-                activitySource: new DefaultWorkerProgressActivitySource());
+                activitySource: activitySource);
 
             await watchdog.RunOnceAsync(CancellationToken.None);
 

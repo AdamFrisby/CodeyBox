@@ -354,15 +354,30 @@ public sealed class MultipassExecWrapperDiagnosticsTests
 
         public static StubHttpIngestServer Start(Func<StubHttpRequest, int> statusSelector)
         {
-            var port = GetFreeTcpPort();
-            var prefix = $"http://127.0.0.1:{port}/";
-            var listener = new HttpListener();
-            listener.Prefixes.Add(prefix);
-            listener.Start();
-            return new StubHttpIngestServer(
-                listener,
-                prefix.TrimEnd('/') + "/codeybox-agent-output",
-                statusSelector);
+            const int maxAttempts = 20;
+            HttpListenerException? lastError = null;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var port = GetFreeTcpPort();
+                var prefix = $"http://127.0.0.1:{port}/";
+                var listener = new HttpListener();
+                listener.Prefixes.Add(prefix);
+                try
+                {
+                    listener.Start();
+                    return new StubHttpIngestServer(
+                        listener,
+                        prefix.TrimEnd('/') + "/codeybox-agent-output",
+                        statusSelector);
+                }
+                catch (HttpListenerException ex)
+                {
+                    lastError = ex;
+                    listener.Close();
+                }
+            }
+
+            throw new InvalidOperationException("Could not allocate a free HTTP listener port for the test stub.", lastError);
         }
 
         public async ValueTask DisposeAsync()
