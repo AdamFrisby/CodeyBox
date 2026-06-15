@@ -3238,8 +3238,9 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Deadline for the post-launch poll that waits for the VM to reach
-        /// the <c>Running</c> state. Defaults to 3 minutes. Bump on hosts that
-        /// observe boot contention under concurrent launches.
+        /// the <c>Running</c> state, and for each blocking cloud-init readiness
+        /// probe. Defaults to 3 minutes. Bump on hosts that observe boot
+        /// contention under concurrent launches.
         /// </summary>
         public TimeSpan VmStartTimeout { get; set; } =
             MultipassSandboxOptions.DefaultVmStartTimeout;

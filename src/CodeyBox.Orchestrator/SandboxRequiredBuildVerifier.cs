@@ -34,6 +34,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // Internal BuildScript sentinel: marker inspection said this gate applies,
     // but no buildable .NET target was present after checkout.
     private const int NoRequiredBuildTargetExitCode = 125;
+    // Internal verifier sentinel for branch-controlled clone / checkout / build
+    // execution exceeding the required-build budget.
+    private const int BuildTimeoutExitCode = 124;
 
     private static readonly string BuildScript = $$"""
         set -eu
@@ -261,29 +264,42 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             var spec = BuildSandboxSpec(access, request);
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-            await RunOrUnavailableAsync(
-                sandbox,
-                ct,
-                "git",
-                "clone",
-                access.CloneUrlInsideSandbox,
-                SandboxConventions.WorkDir);
-            await RunOrUnavailableAsync(
-                sandbox,
-                ct,
-                "git",
-                "-C",
-                SandboxConventions.WorkDir,
-                "checkout",
-                "-B",
-                request.WorkBranch,
-                $"origin/{request.WorkBranch}");
-
-            var build = await sandbox.ExecAsync(new SandboxExec
+            using var buildTimeoutCts = new CancellationTokenSource(_pipelineOptions.RequiredBuildVerificationTimeout);
+            using var buildCts = CancellationTokenSource.CreateLinkedTokenSource(ct, buildTimeoutCts.Token);
+            var buildCt = buildCts.Token;
+            SandboxExecResult build;
+            try
             {
-                Argv = ["sh", "-c", BuildScript],
-                WorkingDirectory = SandboxConventions.WorkDir,
-            }, ct);
+                await RunOrUnavailableAsync(
+                    sandbox,
+                    buildCt,
+                    "git",
+                    "clone",
+                    access.CloneUrlInsideSandbox,
+                    SandboxConventions.WorkDir);
+                await RunOrUnavailableAsync(
+                    sandbox,
+                    buildCt,
+                    "git",
+                    "-C",
+                    SandboxConventions.WorkDir,
+                    "checkout",
+                    "-B",
+                    request.WorkBranch,
+                    $"origin/{request.WorkBranch}");
+
+                build = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", BuildScript],
+                    WorkingDirectory = SandboxConventions.WorkDir,
+                }, buildCt);
+            }
+            catch (OperationCanceledException) when (buildTimeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                return RequiredBuildVerificationResult.Failed(
+                    BuildTimeoutExitCode,
+                    BuildTimeoutExceededOutput());
+            }
 
             var rawOutput = CombinedOutput(build);
             var redactedOutput = TruncateOutput(rawOutput);
@@ -398,6 +414,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 $"{argv[0]} failed while preparing required build: {SingleLineSummary(CombinedOutput(result))}");
         }
     }
+
+    private string BuildTimeoutExceededOutput() =>
+        $"build exceeded the required-build verification timeout of {_pipelineOptions.RequiredBuildVerificationTimeout.TotalMinutes:0.##} minutes";
 
     private sealed record DotnetBuildMarkerInspection(
         RequiredBuildProbeStatus Status,

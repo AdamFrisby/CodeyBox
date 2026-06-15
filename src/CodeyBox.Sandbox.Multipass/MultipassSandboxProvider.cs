@@ -2142,8 +2142,12 @@ git push origin HEAD:{refName}";
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
         }
         if (DateTime.UtcNow >= deadline)
-            throw new InvalidOperationException(
+        {
+            ThrowProvisioningDeferred(
+                "vm-start",
+                "multipass-vm-start-timeout",
                 $"multipass VM {name} did not reach Running state within {startTimeout}");
+        }
 
         await WaitForCloudInitReadyAsync(opts, name, workItemId, ct);
     }
@@ -2176,10 +2180,11 @@ git push origin HEAD:{refName}";
 
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
-            cloudInit = await RunAsync(
+            cloudInit = await RunCloudInitStatusWaitAsync(
                 opts,
-                [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
-                stdin: null, ct: ct, workItemId: workItemId);
+                name,
+                workItemId,
+                ct);
             ThrowIfProvisioningRetryExhausted("exec", cloudInit);
 
             if (cloudInit.ExitCode == 0)
@@ -2189,7 +2194,9 @@ git push origin HEAD:{refName}";
                 break;
 
             if (cloudInit.ExitCode != 1)
-                throw new InvalidOperationException(
+                ThrowProvisioningDeferred(
+                    "cloud-init",
+                    "multipass-cloud-init-failed",
                     $"cloud-init failed for multipass VM {name} (exit {cloudInit.ExitCode}): " +
                     $"{await ReadCloudInitLongStatusAsync(opts, name, workItemId, ct)}");
 
@@ -2224,7 +2231,9 @@ git push origin HEAD:{refName}";
 
         if (cloudInit.ExitCode == 2)
         {
-            throw new InvalidOperationException(
+            ThrowProvisioningDeferred(
+                "cloud-init",
+                "multipass-cloud-init-degraded",
                 $"cloud-init degraded for multipass VM {name}, and readiness probe failed " +
                 $"(exit {probe.ExitCode}; stdout: {DiagnosticText(probe.Stdout)}; stderr: {DiagnosticText(probe.Stderr)}). " +
                 $"cloud-init stderr: {DiagnosticText(cloudInit.Stderr)}. " +
@@ -2232,12 +2241,48 @@ git push origin HEAD:{refName}";
                 "Expected /work and /usr/local/bin/codeybox-exec to exist.");
         }
 
-        throw new InvalidOperationException(
+        ThrowProvisioningDeferred(
+            "cloud-init",
+            "multipass-cloud-init-not-ready",
             $"cloud-init did not report ready for multipass VM {name} after {attempts} attempt(s) " +
             $"(last exit 1 stderr: {DiagnosticText(cloudInit.Stderr)}). " +
             $"readiness probe failed (exit {probe.ExitCode}; stdout: {DiagnosticText(probe.Stdout)}; stderr: {DiagnosticText(probe.Stderr)}). " +
             "Expected /work and /usr/local/bin/codeybox-exec to exist.");
     }
+
+    private async Task<ProcessRunResult> RunCloudInitStatusWaitAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        var timeout = ResolveCloudInitStatusWaitTimeout(opts);
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+        try
+        {
+            return await RunAsync(
+                opts,
+                [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
+                stdin: null,
+                ct: linkedCts.Token,
+                workItemId: workItemId);
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            ThrowProvisioningDeferred(
+                "cloud-init",
+                "multipass-cloud-init-timeout",
+                $"cloud-init status --wait for multipass VM {name} did not complete within {timeout}");
+            throw;
+        }
+    }
+
+    private static TimeSpan ResolveCloudInitStatusWaitTimeout(MultipassSandboxOptions opts) =>
+        opts.VmStartTimeout > TimeSpan.Zero
+            ? opts.VmStartTimeout
+            : MultipassSandboxOptions.DefaultVmStartTimeout;
 
     private Task<ProcessRunResult> ProbeCloudInitReadinessAsync(
         MultipassSandboxOptions opts,
@@ -4511,7 +4556,8 @@ public sealed record MultipassSandboxOptions
 
     /// <summary>
     /// Deadline for the post-launch poll that waits for <c>multipass info</c>
-    /// to report the VM in the <c>Running</c> state. Defaults to 3 minutes.
+    /// to report the VM in the <c>Running</c> state, and for each blocking
+    /// <c>cloud-init status --wait</c> readiness probe. Defaults to 3 minutes.
     /// Bump on hosts that observe boot contention (concurrent launches starving
     /// disk/CPU) — a healthy VM can exceed the default when 6+ VMs boot at once
     /// even though a clean isolated launch completes in ~106s.

@@ -41,7 +41,7 @@ internal enum RequiredBuildWorkPhaseOutcome
 /// <summary>
 /// Cohesive build-gate service that owns the entire required-build workflow:
 /// applicability probing, phase-specific enforcement (work / audit / merge),
-/// timeout wrapping around the verifier, audit-finding construction, and
+/// audit-finding construction, and
 /// adaptation of the verifier result into the canonical audit-report shape
 /// for persistence.
 ///
@@ -69,16 +69,13 @@ internal sealed class RequiredBuildGate
         CancellationToken ct);
 
     private readonly IRequiredBuildVerifier _verifier;
-    private readonly TimeSpan _verificationTimeout;
     private readonly PersistAuditReport? _persistReport;
 
     public RequiredBuildGate(
         IRequiredBuildVerifier verifier,
-        TimeSpan verificationTimeout,
         PersistAuditReport? persistReport)
     {
         _verifier = verifier ?? throw new ArgumentNullException(nameof(verifier));
-        _verificationTimeout = verificationTimeout;
         _persistReport = persistReport;
     }
 
@@ -259,23 +256,12 @@ internal sealed class RequiredBuildGate
             },
         };
 
-        // Branch-controlled MSBuild targets can sleep or loop forever.
-        // Bound every verification call (work, audit, AuditPassed-resume)
-        // so the gate cannot hold the pipeline worker indefinitely.
-        using var timeoutCts = new CancellationTokenSource(_verificationTimeout);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-
         var startedAt = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
         RequiredBuildVerificationResult result;
         try
         {
-            result = await _verifier.VerifyAsync(request, linkedCts.Token);
-        }
-        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
-        {
-            throw new RequiredBuildVerificationUnavailableException(
-                $"could not verify required build: build exceeded the required-build verification timeout of {_verificationTimeout.TotalMinutes:0.##} minutes");
+            result = await _verifier.VerifyAsync(request, ct);
         }
         finally
         {
