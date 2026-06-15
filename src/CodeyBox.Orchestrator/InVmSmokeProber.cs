@@ -177,6 +177,18 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         return _availability.GetAvailability(kind);
     }
 
+    public async Task<AgentAvailability?> ForceProbeAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        if (!Enabled) return null;
+        if (_probes.All(p => p.Kind != kind)) return null;
+
+        await EnsureProbedAsync(kind, target, ct, bypassCache: true);
+        return _availability.GetAvailability(kind);
+    }
+
     /// <summary>
     /// <see cref="IInVmSmokeGate.EnsureAvailableAsync"/>. Owns the full
     /// read→probe→re-read sequence so routing consumers get a verdict from this

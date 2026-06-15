@@ -612,6 +612,7 @@ public sealed class AgenticConflictResolverTests
         Assert.True(authFailure.AgentSucceeded);
         Assert.False(authFailure.ResolutionSucceeded);
         Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
+        Assert.True(authFailure.StdoutOnlyEvidence);
     }
 
     [Fact]

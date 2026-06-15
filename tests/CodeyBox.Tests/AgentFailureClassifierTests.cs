@@ -93,14 +93,14 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
-    public async Task LoginPromptTranscript_InStdout_Classified_AsAuthRequired()
+    public async Task LoginPromptTranscript_InStdout_IsNotAuthoritativeForSharedFailureClassifier()
     {
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: transcript);
 
-        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Theory]
@@ -146,7 +146,7 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
         Assert.True(detection.IsStdoutOnly);
         Assert.True(detection.MatchedTrustedStdoutTranscript);
-        Assert.False(detection.MatchedDefaultStdoutPattern);
+        Assert.True(detection.MatchedDefaultStdoutPattern);
     }
 
     [Theory]
@@ -191,7 +191,7 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
-    public void AgentAuthFailureClassifier_DoesNotMatchPerAgentConfiguredPatternsInStdout()
+    public void AgentAuthFailureClassifier_HonorsPerAgentConfiguredPatternsInStdout()
     {
         var classifier = new AgentAuthFailureClassifier(
             new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
@@ -204,11 +204,29 @@ public sealed class AgentFailureClassifierTests
             stderr: null,
             stdout: "stdout-only login ceremony required");
 
-        Assert.Null(hit);
+        Assert.NotNull(hit);
+        Assert.True(hit.IsStdoutOnly);
+        Assert.True(hit.MatchedConfiguredStdoutPattern);
         Assert.Null(classifier.Detect(
             AgentKind.Codex,
             stderr: null,
             stdout: "stdout-only login ceremony required"));
+    }
+
+    [Fact]
+    public void AgentAuthFailureClassifier_StdoutPromptWithStderr401_IsCorroboratedByStderr()
+    {
+        var classifier = new AgentAuthFailureClassifier();
+
+        var hit = classifier.DetectDetailed(
+            AgentKind.Codex,
+            stderr: "API Error: 401 Unauthorized",
+            stdout: "Authentication required. Please visit the URL to log in:\nWaiting for authentication (timeout 30s)...\nError: authentication timed out.");
+
+        Assert.NotNull(hit);
+        Assert.False(hit.IsStdoutOnly);
+        Assert.True(hit.MatchedStderr);
+        Assert.True(hit.MatchedStdout);
     }
 
     [Theory]

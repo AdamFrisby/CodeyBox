@@ -113,8 +113,10 @@ public static class AgentFailureClassifier
     /// response shape, or coding an auth flow — does NOT trip the breaker on
     /// an otherwise healthy agent. Generic substrings like "not logged in"
     /// were intentionally rejected after the auditor flagged them as too
-    /// broad. Operator-supplied <c>CodeyBox:AuthFailurePatterns</c> entries are
-    /// matched against stderr, not untrusted model stdout.</para>
+    /// broad. The orchestrator-side <c>AgentAuthFailureClassifier</c> applies
+    /// operator-supplied <c>CodeyBox:AuthFailurePatterns</c> to both streams and
+    /// decides whether stdout-only evidence is corroborated strongly enough to
+    /// bench the agent globally.</para>
     /// </summary>
     public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]
     {
@@ -276,7 +278,7 @@ public static class AgentFailureClassifier
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
-        if (ContainsAuthRequiredPatternInStderr(stderr) || ContainsAuthRequiredPatternInStdout(stdout))
+        if (ContainsAuthRequiredPatternInStderr(stderr))
             return new AgentFailureClassification(AgentFailureKind.AuthRequired, Reason: "auth-required pattern matched");
 
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
@@ -436,6 +438,9 @@ public static class AgentFailureClassifier
 
     public static bool ContainsAuthRequiredPatternInStderr(string? stderr) =>
         ContainsAny(stderr, AuthRequiredPatterns) || ContainsStandaloneOAuthLoginUrlLine(stderr);
+
+    public static bool ContainsAuthErrorPattern(string? text) =>
+        ContainsAny(text, AuthPatterns);
 
     public static bool ContainsAuthRequiredPatternInStdout(string? stdout)
     {

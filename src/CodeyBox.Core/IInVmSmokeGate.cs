@@ -118,6 +118,19 @@ public interface IInVmSmokeGate
     /// verdict for its 404 / response decision).
     /// </summary>
     Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct);
+
+    /// <summary>
+    /// Operator/runtime-triggered forced re-probe of a single agent against the
+    /// sandbox target associated with the current dispatch. Implementations that
+    /// cannot use a per-dispatch target may fall back to their process-wide
+    /// target. Never throws; returns <c>null</c> when no in-VM verdict is
+    /// available.
+    /// </summary>
+    Task<AgentAvailability?> ForceProbeAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+        => ForceProbeAsync(kind, ct);
 }
 
 /// <summary>

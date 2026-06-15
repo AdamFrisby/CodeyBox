@@ -420,7 +420,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_FailsItemWithoutGlobalBench_WhenNotCorroborated()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
@@ -440,17 +440,13 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("not globally benched", final.LastError);
         Assert.Equal("infrastructure", final.FailureKind);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.True(availability.Available);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
-        Assert.Contains("auth required from agent output", details.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -490,6 +486,37 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
         Assert.Equal("codex", details.AgentKind);
         Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task FailedWorkRun_WithAuthLoginPromptAnd401_IsAuthRequired_NotQuotaParked()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: """
+                Authentication required. Please visit the URL to log in:
+                Waiting for authentication (timeout 30s)...
+                Error: authentication timed out.
+                """,
+            Stderr: "API Error: 401 Unauthorized"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Null(final.QuotaRetryFrom);
+        Assert.Contains("auth required from agent output", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
     }
 
     [Fact]
@@ -563,7 +590,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task MergePhaseDirectAgentRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task MergePhaseDirectAgentRun_WithStderrAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         // The merge-phase fix call site is decoupled from the work-phase call
         // site: a regression that drops EITHER would leave half the outage
@@ -582,8 +609,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: transcript,
-            Stderr: null));
+            Stdout: null,
+            Stderr: transcript));
 
         var item = NewItem(AgentKind.Codex);
         await fix.Store.CreateAsync(item);
@@ -620,8 +647,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: transcript,
-            Stderr: null));
+            Stdout: null,
+            Stderr: transcript));
 
         var item = NewItem(AgentKind.Codex) with
         {
@@ -703,7 +730,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_DoesNotNeedInVmCorroboration_ToExcludeAgentAndAlert()
+    public async Task StdoutOnlyAuthPrompt_RequiresInVmCorroboration_ToExcludeAgentAndAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new AuthCorroboratingInVmSmokeGate();
@@ -728,7 +755,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -1361,7 +1388,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         {
             ForceProbeCalls++;
             return Task.FromResult<AgentAvailability?>(
-                new AgentAvailability(false, "credential login required", null));
+                new AgentAvailability(false, "smoke probe failed [persistent]: credential login required", null));
         }
     }
 

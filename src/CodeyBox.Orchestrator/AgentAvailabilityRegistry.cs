@@ -327,9 +327,10 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
 
     /// <summary>
     /// Benches <paramref name="kind"/> because a real runtime invocation was
-    /// classified as blocked on interactive authentication. This is not a
-    /// smoke probe result: it is stored under its own non-smoke source so
-    /// dispatch still honors it when the operator disables smoke gating.
+    /// authoritatively classified as blocked on interactive authentication.
+    /// This is not a smoke probe result: it is stored under its own non-smoke
+    /// source so dispatch still honors it when the operator disables smoke
+    /// gating.
     /// </summary>
     public AvailabilityTransition MarkAuthRequired(AgentKind kind, string reason)
     {
@@ -503,11 +504,12 @@ public enum SmokeExclusionSource
     NoChangesBreaker,
 
     /// <summary>
-    /// Runtime auth/login prompt detected in real agent output (not a probe).
+    /// Runtime auth/login prompt detected from authoritative real agent output,
+    /// or stdout-only output corroborated by an in-VM persistent smoke failure.
     /// Tracked outside the smoke gate so a deployment with
     /// <c>CodeyBox:Smoke:Enabled=false</c> still benches an unauthenticated
-    /// agent — the operator's "trust the smoke probes less" knob must not
-    /// keep routing work to a CLI that printed an OAuth login URL and exited 0.
+    /// agent when the non-model-controlled stream proves the CLI printed an
+    /// OAuth login URL and exited 0.
     /// </summary>
     AuthRequired,
 }

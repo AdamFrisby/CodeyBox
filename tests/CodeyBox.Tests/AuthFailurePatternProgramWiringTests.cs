@@ -29,7 +29,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task ProgramWiredCustomAuthPattern_ReachesPipelineRunner_AndBenchesAgent()
+    public async Task ProgramWiredCustomStdoutAuthPattern_ReachesPipelineRunner_AndBenchesAgentAfterSmokeCorroboration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var factory = new AuthPatternPipelineFactory(seed);
@@ -37,8 +37,8 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
         factory.Agent.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: null,
-            Stderr: "operator-only login prompt"));
+            Stdout: "operator-only login prompt",
+            Stderr: null));
 
         var item = new WorkItem
         {
@@ -69,6 +69,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
         var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
         Assert.Equal("codex", details.AgentKind);
         Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Equal(1, factory.InVmSmoke.ForceProbeCalls);
     }
 
     private sealed class AuthPatternPipelineFactory : WebApplicationFactory<Program>
@@ -81,6 +82,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
 
         public ScriptableAgent Agent { get; } = new(AgentKind.Codex);
         public CapturingWebhookDispatcher Webhooks { get; } = new();
+        public CorroboratingInVmSmokeGate InVmSmoke { get; } = new();
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -93,7 +95,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:SandboxProvider"] = "process",
-                    ["CodeyBox:Smoke:Enabled"] = "false",
+                    ["CodeyBox:Smoke:Enabled"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
                     ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
@@ -107,9 +109,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
             {
                 services.RemoveAll<IHostedService>();
 
-                services.RemoveAll<IAgentRunner>();
                 services.RemoveAll<IAgentRegistry>();
-                services.AddSingleton<IAgentRunner>(Agent);
                 services.AddSingleton<IAgentRegistry>(new AgentRegistry([Agent]));
 
                 services.RemoveAll<ICredentialProvider>();
@@ -123,11 +123,15 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
                     RepositoryUrl = _seedRepoUrl,
                     DefaultBaseBranch = "main",
                     DefaultAgent = AgentKind.Codex,
+                    SkipCredentialSmokeTest = true,
                     Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
                 }));
 
                 services.RemoveAll<IWebhookDispatcher>();
                 services.AddSingleton<IWebhookDispatcher>(Webhooks);
+
+                services.RemoveAll<IInVmSmokeGate>();
+                services.AddSingleton<IInVmSmokeGate>(InVmSmoke);
 
                 services.RemoveAll<IRequiredBuildVerifier>();
                 services.AddSingleton<IRequiredBuildVerifier>(TestRequiredBuildVerifier.NotApplicable);
@@ -139,6 +143,35 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
             base.Dispose(disposing);
+        }
+    }
+
+    public sealed class CorroboratingInVmSmokeGate : IInVmSmokeGate
+    {
+        public int ForceProbeCalls { get; private set; }
+        public bool Enabled => true;
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct) =>
+            Task.FromResult(new AgentAvailability(true, null, null));
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+            ForceProbeAsync(kind, default, ct);
+
+        public Task<AgentAvailability?> ForceProbeAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            ForceProbeCalls++;
+            return Task.FromResult<AgentAvailability?>(
+                new AgentAvailability(false, "smoke probe failed [persistent]: credential login required", null));
         }
     }
 }

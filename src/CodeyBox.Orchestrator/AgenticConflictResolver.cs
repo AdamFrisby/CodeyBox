@@ -105,15 +105,17 @@ public enum AgenticConflictResolverOperation
 /// failure. <see cref="LastAttemptedRunner"/> is also populated when at least
 /// one candidate ran so older/custom callers can still bench the specific
 /// agent whose output is captured in <see cref="Stdout"/>/<see cref="Stderr"/>.
-/// <see cref="AuthFailures"/> carries narrow auth/login-prompt evidence so
-/// callers can bench the exact failed candidate without exposing every
-/// candidate's raw output through the public result API.
+    /// <see cref="AuthFailures"/> carries narrow auth/login-prompt evidence so
+    /// callers can attribute the exact failed candidate without exposing every
+    /// candidate's raw output through the public result API. Stdout-only evidence
+    /// is flagged so the caller can require corroboration before benching.
 /// </summary>
 public sealed record AgenticConflictResolverAuthFailureEvidence(
     IAgentRunner Runner,
     bool AgentSucceeded,
     bool ResolutionSucceeded,
-    AgentFailureClassification Classification);
+    AgentFailureClassification Classification,
+    bool StdoutOnlyEvidence = false);
 
 public sealed record AgenticConflictResolverResult(
     bool Success,
@@ -634,15 +636,16 @@ public sealed class AgenticConflictResolver
         Func<AgenticConflictResolverAuthFailureEvidence, CancellationToken, Task>? authFailureCallback,
         CancellationToken ct)
     {
-        var classification = _authFailureClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
-        if (classification is null || classification.Kind != AgentFailureKind.AuthRequired)
+        var detection = _authFailureClassifier.DetectDetailed(runner.Kind, agentResult.Stderr, agentResult.Stdout);
+        if (detection is null || detection.Classification.Kind != AgentFailureKind.AuthRequired)
             return null;
 
         var evidence = new AgenticConflictResolverAuthFailureEvidence(
             runner,
             agentSucceeded,
             resolutionSucceeded,
-            classification);
+            detection.Classification,
+            detection.IsStdoutOnly);
         authFailures.Add(evidence);
 
         if (authFailureCallback is not null)
