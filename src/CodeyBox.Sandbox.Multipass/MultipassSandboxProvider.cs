@@ -2160,12 +2160,14 @@ git push origin HEAD:{refName}";
         //   1  = not run / status unavailable. This can be transient, and on
         //        some images the status command bails out even though userdata
         //        has been applied.
-        //   2  = degraded done. Treat as fatal: cloud-init schema validation
-        //        failures can drop user-data blocks while leaving a superficially
-        //        usable VM, which is worse than a failed bake.
+        //   2  = degraded done. This is often a benign schema warning on an
+        //        otherwise usable VM, but schema validation failures can also
+        //        drop user-data blocks. Use the same marker probe as the exit-1
+        //        fallback before deciding whether the VM is usable.
         //   >2 = genuine error.
-        // We accept only 0. Exit 1 gets a bounded retry, then a marker probe
-        // before we decide the VM is actually unusable.
+        // We accept only 0 directly. Exit 1 gets a bounded retry, then a marker
+        // probe before we decide the VM is actually unusable. Exit 2 is terminal
+        // from cloud-init's perspective, so skip retrying and probe immediately.
         var attempts = Math.Max(1, opts.CloudInitReadyRetryAttempts);
         var retryDelay = opts.CloudInitReadyRetryDelay < TimeSpan.Zero
             ? TimeSpan.Zero
@@ -2184,9 +2186,7 @@ git push origin HEAD:{refName}";
                 return;
 
             if (cloudInit.ExitCode == 2)
-                throw new InvalidOperationException(
-                    $"cloud-init degraded for multipass VM {name}: " +
-                    $"{await ReadCloudInitLongStatusAsync(opts, name, workItemId, ct)}");
+                break;
 
             if (cloudInit.ExitCode != 1)
                 throw new InvalidOperationException(
@@ -2206,10 +2206,30 @@ git push origin HEAD:{refName}";
         ThrowIfProvisioningRetryExhausted("exec", probe);
         if (probe.ExitCode == 0)
         {
-            _log.LogWarning(
-                "cloud-init status kept returning exit 1 for multipass VM {Name} after {Attempts} attempt(s), but readiness probe passed ({ProbeStdout}); proceeding. Last stderr: {Stderr}",
-                name, attempts, DiagnosticText(probe.Stdout), DiagnosticText(cloudInit.Stderr));
+            if (cloudInit.ExitCode == 2)
+            {
+                _log.LogWarning(
+                    "cloud-init status returned degraded (exit 2) for multipass VM {Name}, but readiness probe passed ({ProbeStdout}); proceeding. Stderr: {Stderr}",
+                    name, DiagnosticText(probe.Stdout), DiagnosticText(cloudInit.Stderr));
+            }
+            else
+            {
+                _log.LogWarning(
+                    "cloud-init status kept returning exit 1 for multipass VM {Name} after {Attempts} attempt(s), but readiness probe passed ({ProbeStdout}); proceeding. Last stderr: {Stderr}",
+                    name, attempts, DiagnosticText(probe.Stdout), DiagnosticText(cloudInit.Stderr));
+            }
+
             return;
+        }
+
+        if (cloudInit.ExitCode == 2)
+        {
+            throw new InvalidOperationException(
+                $"cloud-init degraded for multipass VM {name}, and readiness probe failed " +
+                $"(exit {probe.ExitCode}; stdout: {DiagnosticText(probe.Stdout)}; stderr: {DiagnosticText(probe.Stderr)}). " +
+                $"cloud-init stderr: {DiagnosticText(cloudInit.Stderr)}. " +
+                $"{await ReadCloudInitLongStatusAsync(opts, name, workItemId, ct)}. " +
+                "Expected /work and /usr/local/bin/codeybox-exec to exist.");
         }
 
         throw new InvalidOperationException(

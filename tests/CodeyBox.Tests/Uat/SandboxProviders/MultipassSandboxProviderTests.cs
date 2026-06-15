@@ -2279,6 +2279,96 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_CloudInitDegradedUsesReadinessProbeWhenProbePasses()
+    {
+        var staging = Path.Combine(_workspace, "staging-cloud-init-degraded-probe-success");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var cloudInitCalls = 0;
+        var probeCalls = 0;
+        var logger = new RecordingLogger<MultipassSandboxProvider>();
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+            {
+                cloudInitCalls++;
+                return Task.FromResult(new ProcessRunResult(2, "", "status: degraded"));
+            }
+
+            if (argv is [_, "exec", _, "--", "bash", "-c", var command])
+            {
+                probeCalls++;
+                Assert.Contains("test -e /work", command, StringComparison.Ordinal);
+                Assert.Contains("test -e /usr/local/bin/codeybox-exec", command, StringComparison.Ordinal);
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    "/work=present /usr/local/bin/codeybox-exec=present\n",
+                    ""));
+            }
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            logger: logger);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
+
+        Assert.Equal(2, cloudInitCalls);
+        Assert.Equal(2, probeCalls);
+        Assert.Contains(logger.Entries, e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Warning
+            && e.Message.Contains("cloud-init status returned degraded", StringComparison.Ordinal)
+            && e.Message.Contains("readiness probe passed", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task CreateAsync_CloudInitExitOneAfterRetriesThrowsWhenReadinessProbeFails()
     {
         var staging = Path.Combine(_workspace, "staging-cloud-init-probe-failure");
@@ -2435,6 +2525,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         string? launchedName = null;
         string? deletedName = null;
+        var probeCalls = 0;
 
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
@@ -2454,6 +2545,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
                 return Task.FromResult(new ProcessRunResult(2, "", "status: degraded"));
+
+            if (argv is [_, "exec", _, "--", "bash", "-c", var command])
+            {
+                probeCalls++;
+                Assert.Contains("test -e /work", command, StringComparison.Ordinal);
+                Assert.Contains("test -e /usr/local/bin/codeybox-exec", command, StringComparison.Ordinal);
+                return Task.FromResult(new ProcessRunResult(
+                    1,
+                    "/work=present /usr/local/bin/codeybox-exec=missing\n",
+                    ""));
+            }
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--long"])
                 return Task.FromResult(new ProcessRunResult(0, "status: degraded\ncloud-config failed schema validation", ""));
@@ -2480,7 +2582,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             provider.CreateAsync(spec, CancellationToken.None));
 
         Assert.Contains("cloud-init degraded", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("readiness probe failed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("/usr/local/bin/codeybox-exec=missing", ex.Message, StringComparison.Ordinal);
         Assert.Contains("cloud-config failed schema validation", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, probeCalls);
         Assert.Equal(launchedName, deletedName);
     }
 
@@ -2499,6 +2604,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         string? launchedName = null;
         string? deletedName = null;
+        var probeCalls = 0;
 
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
@@ -2518,6 +2624,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
                 return Task.FromResult(new ProcessRunResult(2, "", "status: degraded"));
+
+            if (argv is [_, "exec", _, "--", "bash", "-c", var command])
+            {
+                probeCalls++;
+                Assert.Contains("test -e /work", command, StringComparison.Ordinal);
+                Assert.Contains("test -e /usr/local/bin/codeybox-exec", command, StringComparison.Ordinal);
+                return Task.FromResult(new ProcessRunResult(
+                    1,
+                    "/work=missing /usr/local/bin/codeybox-exec=missing\n",
+                    "marker probe failed"));
+            }
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--long"])
                 return Task.FromResult(new ProcessRunResult(3, "partial status output", "permission denied"));
@@ -2545,12 +2662,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         // The degraded-state framing must survive.
         Assert.Contains("cloud-init degraded", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("readiness probe failed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("status: degraded", ex.Message, StringComparison.Ordinal);
         // The long-status failure framing AND its exit code / streams must be
         // surfaced — otherwise an operator looking at a bake failure sees only
         // "degraded" and never learns that the diagnostic itself broke.
         Assert.Contains("cloud-init status --long failed (exit 3)", ex.Message, StringComparison.Ordinal);
         Assert.Contains("partial status output", ex.Message, StringComparison.Ordinal);
         Assert.Contains("permission denied", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, probeCalls);
         Assert.Equal(launchedName, deletedName);
     }
 
