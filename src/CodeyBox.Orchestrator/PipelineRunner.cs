@@ -3511,15 +3511,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // visibility into what the agent reasoned.
             LogAgentOutput(_log, runner.Kind, agentResult);
             if (agentResult.Success)
+                // Normal work stdout is model-controlled. Stderr evidence
+                // benches immediately; stdout-only auth transcripts need
+                // in-VM smoke corroboration before a global bench.
                 await ThrowIfAuthRequiredOutputAsync(
                     item, project, runner.Kind, agentPhase, agentResult,
-                    benchStdoutOnlyEvidence: true,
+                    benchStdoutOnlyEvidence: false,
                     ct: ct);
             if (!agentResult.Success)
             {
+                // Same policy as the success branch: nonzero exits can still
+                // carry model-controlled stdout, so stdout-only evidence is
+                // corroborated before globally benching the agent.
                 await ThrowIfAuthRequiredOutputAsync(
                     item, project, runner.Kind, agentPhase, agentResult,
-                    benchStdoutOnlyEvidence: true,
+                    benchStdoutOnlyEvidence: false,
                     ct: ct);
 
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
@@ -5365,10 +5371,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         CancellationToken ct)
     {
+        var auditPhase = IsAuditPhase(phase);
         if (_dispatchAvailability is null)
-            return (false, "no in-VM smoke gate is wired");
+            return auditPhase
+                ? (true, "audit CLI stdout accepted because in-VM smoke corroboration is unavailable")
+                : (false, "no in-VM smoke gate is wired");
 
-        var smokePhase = phase.StartsWith("audit", StringComparison.OrdinalIgnoreCase)
+        var smokePhase = auditPhase
             ? "audit"
             : phase;
         var target = ResolvePhaseSmokeTarget(project, smokePhase, item.BaselineImageRef);
@@ -5388,11 +5397,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Could not force in-VM smoke corroboration for stdout-only auth/login evidence from agent {Agent} during {Phase}",
                 agent.Value,
                 phase);
-            return (false, "in-VM smoke corroboration threw");
+            return auditPhase
+                ? (true, "audit CLI stdout accepted because in-VM smoke corroboration threw")
+                : (false, "in-VM smoke corroboration threw");
         }
 
         if (availability is null)
-            return (false, "no in-VM smoke probe is available");
+            return auditPhase
+                ? (true, "audit CLI stdout accepted because in-VM smoke corroboration is unavailable")
+                : (false, "no in-VM smoke probe is available");
         if (availability.Available)
             return (false, "in-VM smoke probe passed");
         if (IsPersistentSmokeFailure(availability))
@@ -5402,6 +5415,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ? "in-VM smoke probe failed without persistent classification"
             : $"in-VM smoke probe failed without persistent classification: {availability.Reason}");
     }
+
+    private static bool IsAuditPhase(string phase) =>
+        phase.StartsWith("audit", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsPersistentSmokeFailure(AgentAvailability availability) =>
         availability.Reason?.Contains("smoke probe failed [persistent]", StringComparison.OrdinalIgnoreCase) == true;
@@ -8367,6 +8383,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(stderr))
             return;
 
+        // Keep stdout-only audit evidence on the corroboration path so a
+        // passing/non-persistent in-VM probe can veto false positives. The
+        // helper treats audit stdout as authoritative when that corroboration
+        // layer is unavailable or globally disabled, matching the outage mode.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, run.Runner.Kind, $"audit:{run.Auditor.Name}", stdout, stderr,
             benchStdoutOnlyEvidence: false,

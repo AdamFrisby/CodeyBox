@@ -29,7 +29,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task ProgramWiredCustomStdoutAuthPattern_ReachesPipelineRunner_AndBenchesWorkAgent()
+    public async Task ProgramWiredCustomStderrAuthPattern_ReachesPipelineRunner_AndBenchesWorkAgent()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var factory = new AuthPatternPipelineFactory(seed);
@@ -37,8 +37,8 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
         factory.Agent.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: "operator-only login prompt",
-            Stderr: null));
+            Stdout: null,
+            Stderr: "operator-only login prompt"));
 
         var item = new WorkItem
         {

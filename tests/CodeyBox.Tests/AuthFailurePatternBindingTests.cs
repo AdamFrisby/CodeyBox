@@ -41,22 +41,25 @@ public sealed class AuthFailurePatternBindingTests
     }
 
     [Fact]
-    public void Build_AppliesAdditionalPerAgentPattern_ToStdout()
+    public void Build_DoesNotApplyAdditionalPerAgentPattern_ToStdout()
     {
         var classifier = BindAndBuild(new Dictionary<string, string?>
         {
             ["CodeyBox:AuthFailurePatterns:antigravity:0:Pattern"] = "stdout says: needs login",
         });
 
-        var hit = classifier.DetectDetailed(
+        var stdoutHit = classifier.DetectDetailed(
             AgentKind.Antigravity,
             stderr: null,
             stdout: "stdout says: needs login");
 
-        Assert.NotNull(hit);
-        Assert.Equal(AgentFailureKind.AuthRequired, hit.Classification.Kind);
-        Assert.True(hit.IsStdoutOnly);
-        Assert.True(hit.MatchedConfiguredStdoutPattern);
+        Assert.Null(stdoutHit);
+        var stderrHit = classifier.DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: "stdout says: needs login",
+            stdout: null);
+        Assert.NotNull(stderrHit);
+        Assert.Equal(AgentFailureKind.AuthRequired, stderrHit.Classification.Kind);
         Assert.Null(classifier.Detect(AgentKind.Codex, stderr: null, stdout: "stdout says: needs login"));
     }
 
@@ -90,6 +93,7 @@ public sealed class AuthFailurePatternBindingTests
         });
 
         Assert.NotNull(classifier.Detect(AgentKind.Antigravity, stderr: "real-entry", stdout: null));
+        Assert.Null(classifier.Detect(new AgentKind(""), stderr: "blank-key entry", stdout: null));
     }
 
     private static IAgentAuthFailureClassifier BindAndBuild(Dictionary<string, string?> values)
