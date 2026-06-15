@@ -3683,7 +3683,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         deferredSuccessStdoutOnlyAuthDetection.Classification,
                         throwOnMatch: true,
                         stdoutOnlyEvidence: true,
-                        benchStdoutOnlyEvidence: true,
+                        benchStdoutOnlyEvidence: false,
                         ct: ct);
                 }
 
@@ -4441,12 +4441,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
         // Check-and-act stdout is parsed model output. Detect auth evidence so
-        // the item fails as infrastructure instead of verdict-parse noise, but
-        // keep stdout-only evidence on the in-VM corroboration path before
-        // globally benching the agent.
+        // the item fails as infrastructure instead of verdict-parse noise.
+        // Check/recheck invocations have no diff-based success signal, and
+        // the original outage mode had in-VM smoke disabled, so a trusted
+        // login transcript on stdout must bench the CLI here.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
-            benchStdoutOnlyEvidence: false,
+            benchStdoutOnlyEvidence: true,
             ct: ct);
 
         if (!result.Success)
@@ -4942,12 +4943,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             agentRunner.Kind, item.AgentInstanceId, item.Id, "post-act-recheck", iteration,
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
-        // See RunCheckAndActAgentAsync above for the rationale: this is parsed
-        // model output, so stdout-only evidence requires in-VM corroboration
-        // before a global auth bench is applied.
+        // See RunCheckAndActAgentAsync above for the phase policy.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, agentRunner.Kind, "post-act-recheck", aggregatedStdout, result.Stderr,
-            benchStdoutOnlyEvidence: false,
+            benchStdoutOnlyEvidence: true,
             ct: ct);
 
         if (!result.Success)

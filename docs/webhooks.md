@@ -25,7 +25,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.failed` | Work item failed (unrecoverable error) |
 | `work_item.cancelled` | Work item was cancelled via the API |
 | `work_item.agent_stuck` | Stuck-agent probe detected a hang and killed the agent (see [Details](#agent_stuck-details)) |
-| `agent.smoke_failed` | Credential smoke test failed at startup or work-item pickup (see [Details](#agent_smoke_failed-details)) |
+| `agent.smoke_failed` | Credential smoke test failed, runtime auth/login-prompt detection benched an agent, or the fast-fail breaker excluded an agent (see [Details](#agent_smoke_failed-details)) |
 | `agent.paused` | Operator paused new dispatch to one agent kind (see [Details](#agent_paused-details)) |
 | `agent.resumed` | Operator resumed dispatch to one agent kind (see [Details](#agent_resumed-details)) |
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |

@@ -416,7 +416,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthPromptDuringCheck_FailsAsInfrastructureWithoutGlobalBenchWhenUncorroborated()
+    public async Task AuthPromptDuringCheck_BenchesAgentAndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var registry = NewAvailabilityRegistry();
@@ -455,10 +455,14 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("check", final.LastError);
-        Assert.Contains("not globally benched", final.LastError);
-        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
 
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("check", details.Reason);
     }
 
     [Fact]
@@ -1092,7 +1096,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthPromptDuringPostActRecheck_FailsAsInfrastructureWithoutGlobalBenchWhenUncorroborated()
+    public async Task AuthPromptDuringPostActRecheck_BenchesAgentAndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var registry = NewAvailabilityRegistry();
@@ -1140,10 +1144,14 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Equal("infrastructure", finalFollowup.FailureKind);
         Assert.Contains("auth required from agent output", finalFollowup.LastError);
         Assert.Contains("post-act-recheck", finalFollowup.LastError);
-        Assert.Contains("not globally benched", finalFollowup.LastError);
-        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+        Assert.Contains("stdout accepted as authoritative CLI output", finalFollowup.LastError);
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
 
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("post-act-recheck", details.Reason);
     }
 
     [Fact]

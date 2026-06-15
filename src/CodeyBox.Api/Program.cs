@@ -3740,11 +3740,11 @@ namespace CodeyBox.Api
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
-        /// Operator-extensible per-agent auth/login-prompt stderr patterns.
+        /// Operator-extensible per-agent auth/login-prompt output patterns.
         /// Keys are agent kind values (e.g. <c>antigravity</c>); each entry adds
-        /// a case-insensitive stderr substring to the built-in login-prompt
-        /// detector. Stdout remains restricted to trusted transcript shapes
-        /// because it can contain model-produced task text.
+        /// a case-insensitive stderr/stdout substring to the built-in login-prompt
+        /// detector. Keep stdout patterns narrowly tied to CLI login transcripts
+        /// because stdout can contain model-produced task text.
         /// </summary>
         public Dictionary<string, List<AuthFailurePatternOptions>> AuthFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
