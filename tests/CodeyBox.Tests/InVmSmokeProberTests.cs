@@ -917,6 +917,42 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task ForceProbeAsync_WithDispatchTarget_UsesTargetAndBypassesCache()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        cache.Set(AgentKind.Cursor, "base-DISPATCH",
+            new AgentSmokeResult(true, null, TimeSpan.Zero, SmokeFailureCategory.None));
+        var resolver = new FakeBaselineResolver("base-CONFIGURED");
+        var target = new InVmSmokeSandboxTarget(
+            "dispatch-profile",
+            SandboxProfileFlavor.Headless,
+            "base-DISPATCH");
+        var prober = Build(provider, registry, cache, resolver,
+            opts: new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                NetworkProfile = "configured-smoke-profile",
+                SweepIntervalSeconds = 0,
+            });
+
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, target, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result!.Available);
+        Assert.Equal(1, provider.CreateCount);
+        Assert.Equal("base-DISPATCH", provider.LastBaselineRef);
+        Assert.Equal("dispatch-profile", provider.LastProfileName);
+        Assert.Equal(target.Flavor, provider.LastFlavor);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal("dispatch-profile", ensureCall.Profile);
+        Assert.Equal(target.Flavor, ensureCall.Flavor);
+        Assert.Equal("base-DISPATCH", ensureCall.PinnedRef);
+    }
+
+    [Fact]
     public async Task StalePass_RegressesWithinSameRef_ForceProbeReExecsAndInvalidates_NextSweepStaysBenched()
     {
         // Production regression the smoke gate exists to catch: a baseline that

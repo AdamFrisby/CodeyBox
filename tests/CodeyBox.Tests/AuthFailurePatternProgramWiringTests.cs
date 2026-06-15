@@ -29,7 +29,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task ProgramWiredCustomStdoutAuthPattern_ReachesPipelineRunner_AndBenchesAgentAfterSmokeCorroboration()
+    public async Task ProgramWiredCustomStdoutAuthPattern_ReachesPipelineRunner_AndBenchesWorkAgent()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var factory = new AuthPatternPipelineFactory(seed);
@@ -69,7 +69,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
         var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
         Assert.Equal("codex", details.AgentKind);
         Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
-        Assert.Equal(1, factory.InVmSmoke.ForceProbeCalls);
+        Assert.Equal(0, factory.InVmSmoke.ForceProbeCalls);
     }
 
     private sealed class AuthPatternPipelineFactory : WebApplicationFactory<Program>

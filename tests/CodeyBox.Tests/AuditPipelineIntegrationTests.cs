@@ -223,14 +223,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_Exit0AuthPromptWithoutResult_BenchesAgentAndPublishesAlert()
+    public async Task LlmAuditAgent_Exit0StderrAuthPromptWithoutResult_BenchesAgentAndPublishesAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
         var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
         agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
-        agent.AuditAgentResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+        agent.AuditAgentResults.Enqueue(new AgentResult(true, "ok", null, transcript));
 
         var availability = new AgentAvailabilityRegistry(
             new AvailabilityOptions(), TimeProvider.System,
@@ -274,14 +274,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_NonzeroAuthPrompt_BenchesBeforeTransientRetry()
+    public async Task LlmAuditAgent_NonzeroStderrAuthPrompt_BenchesBeforeTransientRetry()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
         var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
         agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
-        agent.AuditAgentResults.Enqueue(new AgentResult(false, "agent exited 1", transcript, null));
+        agent.AuditAgentResults.Enqueue(new AgentResult(false, "agent exited 1", null, transcript));
         agent.AuditAgentResults.Enqueue(new AgentResult(true, "would be retry", "retry should not run", null));
 
         var availability = new AgentAvailabilityRegistry(

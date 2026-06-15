@@ -3511,10 +3511,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // visibility into what the agent reasoned.
             LogAgentOutput(_log, runner.Kind, agentResult);
             if (agentResult.Success)
-                await ThrowIfAuthRequiredOutputAsync(item, project, runner.Kind, agentPhase, agentResult, ct);
+                await ThrowIfAuthRequiredOutputAsync(
+                    item, project, runner.Kind, agentPhase, agentResult,
+                    benchStdoutOnlyEvidence: true,
+                    ct: ct);
             if (!agentResult.Success)
             {
-                await ThrowIfAuthRequiredOutputAsync(item, project, runner.Kind, agentPhase, agentResult, ct);
+                await ThrowIfAuthRequiredOutputAsync(
+                    item, project, runner.Kind, agentPhase, agentResult,
+                    benchStdoutOnlyEvidence: true,
+                    ct: ct);
 
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
                 // stderr/stdout and structured stream events. Per-CLI classification +
@@ -8344,7 +8350,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         CancellationToken ct)
     {
-        _ = ct;
         if (!needsCreds)
             return;
 
@@ -8364,7 +8369,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         await ThrowIfAuthRequiredOutputAsync(
             item, project, run.Runner.Kind, $"audit:{run.Auditor.Name}", stdout, stderr,
-            benchStdoutOnlyEvidence: true,
+            benchStdoutOnlyEvidence: false,
             ct: ct);
     }
 

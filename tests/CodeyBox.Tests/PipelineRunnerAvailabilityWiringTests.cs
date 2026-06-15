@@ -420,7 +420,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_FailsItemWithoutGlobalBench_WhenNotCorroborated()
+    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
@@ -440,13 +440,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("not globally benched", final.LastError);
         Assert.Equal("infrastructure", final.FailureKind);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.True(availability.Available);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
 
-        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
     [Fact]
@@ -730,7 +733,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_RequiresInVmCorroboration_ToExcludeAgentAndAlert()
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_ExcludesWithoutInVmCorroboration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new AuthCorroboratingInVmSmokeGate();
@@ -755,7 +758,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Equal(1, gate.ForceProbeCalls);
+        Assert.Equal(0, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -765,6 +768,71 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
         Assert.Equal("codex", details.AgentKind);
         Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task AuditStdoutOnlyAuthPrompt_WithPassingInVmProbe_FailsItemWithoutGlobalBenchOrAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var gate = new AuthCorroboratingInVmSmokeGate(new AgentAvailability(true, null, null));
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            AgentStdout: transcript));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("not globally benched", final.LastError);
+        Assert.Contains("in-VM smoke probe passed", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task AuditStdoutOnlyAuthPrompt_WithTransientInVmFailure_FailsItemWithoutGlobalBenchOrAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var gate = new AuthCorroboratingInVmSmokeGate(
+            new AgentAvailability(false, "transient: try later", null));
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            AgentStdout: transcript));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("not globally benched", final.LastError);
+        Assert.Contains("failed without persistent classification", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -1198,7 +1266,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         string seedRepoUrl,
         int maxConsecutiveFastFails = 3,
         SmokeOptionsSnapshot? smokeOptions = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        IReadOnlyList<IAuditor>? auditors = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1214,6 +1283,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // sees the outcome via PipelineRunner's RecordRunOutcome call.
         var codex = new ScriptableAgent(AgentKind.Codex);
         var registry = new AgentRegistry([codex]);
+        var auditorList = auditors ?? Array.Empty<IAuditor>();
 
         var project = new Project
         {
@@ -1225,11 +1295,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             Audit = new ProjectAudit
             {
                 MaxIterations = 1,
-                AuditTypes = [],
+                AuditTypes = auditorList.Count > 0 ? ["scripted"] : [],
             },
         };
         var projects = new InMemoryProjectRepository(project);
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
 
         var availability = new AgentAvailabilityRegistry(
             new AvailabilityOptions
@@ -1368,8 +1438,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
     private sealed class AuthCorroboratingInVmSmokeGate : IInVmSmokeGate
     {
+        private readonly AgentAvailability _forcedAvailability;
+
+        public AuthCorroboratingInVmSmokeGate(AgentAvailability? forcedAvailability = null)
+        {
+            _forcedAvailability = forcedAvailability
+                ?? new AgentAvailability(false, "smoke probe failed [persistent]: credential login required", null);
+        }
+
         public int EnsureCalls { get; private set; }
         public int ForceProbeCalls { get; private set; }
+        public List<InVmSmokeSandboxTarget> ForceProbeTargets { get; } = [];
         public bool Enabled => true;
 
         public Task<AgentAvailability> EnsureAvailableAsync(
@@ -1387,8 +1466,45 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
         {
             ForceProbeCalls++;
-            return Task.FromResult<AgentAvailability?>(
-                new AgentAvailability(false, "smoke probe failed [persistent]: credential login required", null));
+            return Task.FromResult<AgentAvailability?>(_forcedAvailability);
+        }
+
+        public Task<AgentAvailability?> ForceProbeAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            ForceProbeCalls++;
+            ForceProbeTargets.Add(target);
+            return Task.FromResult<AgentAvailability?>(_forcedAvailability);
+        }
+    }
+
+    private sealed class CredentialAuditOutputAuditor : IAuditor
+    {
+        private readonly AuditResult _result;
+
+        public CredentialAuditOutputAuditor(AuditResult result, string name = "security:llm-review")
+        {
+            _result = result;
+            Name = name;
+        }
+
+        public string Name { get; }
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(_result);
         }
     }
 
