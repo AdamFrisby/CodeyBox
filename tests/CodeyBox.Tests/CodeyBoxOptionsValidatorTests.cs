@@ -522,6 +522,18 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive", result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsNegativeAuditorIdleTimeout()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.AuditorIdleTimeout = TimeSpan.FromSeconds(-1);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:PipelineTuning:AuditorIdleTimeout must be non-negative", result.FailureMessage);
+    }
+
     [Theory]
     [InlineData("MaxPromptChars")]
     [InlineData("MaxOutputBufferChars")]

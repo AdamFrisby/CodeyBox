@@ -5065,6 +5065,55 @@ public sealed class PipelineRunner : IPipelineRunner
         return false;
     }
 
+    private async Task<bool> CanCaptureAuditStructuredStreamAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string phase,
+        string auditorName,
+        CancellationToken ct)
+    {
+        var timeout = _pipelineTuning.Current.AuditorIdleTimeout;
+        if (timeout <= TimeSpan.Zero)
+            return await CanCaptureStructuredStreamAsync(runner, sandbox, phase, ct).ConfigureAwait(false);
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var lastActivityTicks = Stopwatch.GetTimestamp();
+        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+
+        var watchedSandbox = new ActivityTrackingSandbox(sandbox, Touch);
+        var probeTask = CanCaptureStructuredStreamAsync(runner, watchedSandbox, phase, linkedCts.Token);
+        var timeoutTask = WaitForAuditorIdleTimeoutAsync(linkedCts.Token, () => Volatile.Read(ref lastActivityTicks));
+
+        try
+        {
+            var completed = await Task.WhenAny(probeTask, timeoutTask).ConfigureAwait(false);
+            if (completed == timeoutTask)
+            {
+                var timedOutAfter = await timeoutTask.ConfigureAwait(false);
+                if (timedOutAfter is not null)
+                {
+                    await CancelAndObserveAfterIdleTimeoutAsync(linkedCts, probeTask).ConfigureAwait(false);
+                    throw new AuditorIdleTimeoutException(auditorName, timedOutAfter.Value);
+                }
+
+                ct.ThrowIfCancellationRequested();
+            }
+
+            var result = await probeTask.ConfigureAwait(false);
+            Touch();
+            ct.ThrowIfCancellationRequested();
+            return result;
+        }
+        finally
+        {
+            try { await linkedCts.CancelAsync().ConfigureAwait(false); }
+            catch (ObjectDisposedException) { }
+
+            try { await timeoutTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+    }
+
     private Action<string>? BuildStdoutCallback(
         WorkItemId workItemId,
         string phase,
@@ -6073,6 +6122,14 @@ public sealed class PipelineRunner : IPipelineRunner
         if (remainingAuditors.Count == 0)
             return gate with { DeclaredShortCircuitBlocking = false };
 
+        Func<IReadOnlyList<AuditFinding>, IReadOnlyList<string>, CancellationToken, Task>? remainingProgressUpdate = progressUpdate is null
+            ? null
+            : (remainingFindings, remainingCompletedAuditors, progressCt) =>
+                progressUpdate(
+                    [.. gate.Findings, .. remainingFindings],
+                    [.. (gate.CompletedAuditors ?? []), .. remainingCompletedAuditors],
+                    progressCt);
+
         var remaining = await CollectFindingsBatchAsync(
             item,
             project,
@@ -6081,7 +6138,7 @@ public sealed class PipelineRunner : IPipelineRunner
             repoId,
             ctx,
             detectDeclaredShortCircuit: false,
-            progressUpdate,
+            remainingProgressUpdate,
             ct);
 
         return new AuditorBatchResult(
@@ -6730,7 +6787,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var sw = Stopwatch.StartNew();
         var auditPhase = $"audit-llm-{auditor.Name}";
         var canCaptureStructuredStream = auditor.Kind == "llm"
-            && await CanCaptureStructuredStreamAsync(runner, sandbox, auditPhase, ct);
+            && await CanCaptureAuditStructuredStreamAsync(runner, sandbox, auditPhase, auditor.Name, ct);
         // Capture only for LLM-style auditors. Tool auditors don't run an
         // agent through this codepath (see IAuditor docs — tool auditors
         // ignore AuditContext.StdoutChunkCallback), so opening a capture
@@ -6859,7 +6916,6 @@ public sealed class PipelineRunner : IPipelineRunner
             return await auditor.RunAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var timedOut = 0;
         var lastActivityTicks = Stopwatch.GetTimestamp();
         void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
 
@@ -6873,56 +6929,90 @@ public sealed class PipelineRunner : IPipelineRunner
             },
         };
 
-        var monitorTask = Task.Run(async () =>
-        {
-            while (!linkedCts.IsCancellationRequested)
-            {
-                var currentTimeout = _pipelineTuning.Current.AuditorIdleTimeout;
-                if (currentTimeout <= TimeSpan.Zero)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(1), linkedCts.Token).ConfigureAwait(false);
-                    continue;
-                }
-
-                var elapsed = Stopwatch.GetElapsedTime(Volatile.Read(ref lastActivityTicks));
-                if (elapsed >= currentTimeout)
-                {
-                    Interlocked.Exchange(ref timedOut, 1);
-                    try { await linkedCts.CancelAsync().ConfigureAwait(false); }
-                    catch (ObjectDisposedException) { }
-                    return;
-                }
-
-                var remaining = currentTimeout - elapsed;
-                var delay = remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1);
-                if (delay <= TimeSpan.Zero)
-                    delay = TimeSpan.FromMilliseconds(100);
-                await Task.Delay(delay, linkedCts.Token).ConfigureAwait(false);
-            }
-        }, CancellationToken.None);
+        var watchedSandbox = new ActivityTrackingSandbox(sandbox, Touch);
+        var auditorTask = auditor.RunAsync(watchedSandbox, workingDirectory, watchedContext, linkedCts.Token);
+        var timeoutTask = WaitForAuditorIdleTimeoutAsync(
+            linkedCts.Token,
+            () => Volatile.Read(ref lastActivityTicks));
 
         try
         {
-            var result = await auditor.RunAsync(sandbox, workingDirectory, watchedContext, linkedCts.Token)
-                .ConfigureAwait(false);
+            var completed = await Task.WhenAny(auditorTask, timeoutTask).ConfigureAwait(false);
+            if (completed == timeoutTask)
+            {
+                var timedOutAfter = await timeoutTask.ConfigureAwait(false);
+                if (timedOutAfter is not null)
+                {
+                    await CancelAndObserveAfterIdleTimeoutAsync(linkedCts, auditorTask).ConfigureAwait(false);
+                    throw new AuditorIdleTimeoutException(auditor.Name, timedOutAfter.Value);
+                }
+
+                ct.ThrowIfCancellationRequested();
+            }
+
+            var result = await auditorTask.ConfigureAwait(false);
             Touch();
             ct.ThrowIfCancellationRequested();
-            if (Volatile.Read(ref timedOut) != 0)
-                throw new AuditorIdleTimeoutException(auditor.Name, timeout);
             return result;
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested && Volatile.Read(ref timedOut) != 0)
-        {
-            throw new AuditorIdleTimeoutException(auditor.Name, timeout);
         }
         finally
         {
             try { await linkedCts.CancelAsync().ConfigureAwait(false); }
             catch (ObjectDisposedException) { }
 
-            try { await monitorTask.ConfigureAwait(false); }
+            try { await timeoutTask.ConfigureAwait(false); }
             catch (OperationCanceledException) { }
         }
+    }
+
+    private async Task<TimeSpan?> WaitForAuditorIdleTimeoutAsync(
+        CancellationToken ct,
+        Func<long> getLastActivityTicks)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var currentTimeout = _pipelineTuning.Current.AuditorIdleTimeout;
+                if (currentTimeout <= TimeSpan.Zero)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                var elapsed = Stopwatch.GetElapsedTime(getLastActivityTicks());
+                if (elapsed >= currentTimeout)
+                    return currentTimeout;
+
+                var remaining = currentTimeout - elapsed;
+                var delay = remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1);
+                if (delay <= TimeSpan.Zero)
+                    delay = TimeSpan.FromMilliseconds(100);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+
+        return null;
+    }
+
+    private static async Task CancelAndObserveAfterIdleTimeoutAsync<T>(
+        CancellationTokenSource cts,
+        Task<T> task)
+    {
+        try { await cts.CancelAsync().ConfigureAwait(false); }
+        catch (ObjectDisposedException) { }
+
+        _ = task.ContinueWith(
+            completed =>
+            {
+                _ = completed.Exception;
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -13435,6 +13525,56 @@ Original merge-phase failure (for context):
                     suggestion.Title.ReplaceLineEndings(" "), item.Id);
             }
         }
+    }
+
+    private sealed class ActivityTrackingSandbox : ISandbox
+    {
+        private readonly ISandbox _inner;
+        private readonly Action _touch;
+
+        public ActivityTrackingSandbox(ISandbox inner, Action touch)
+        {
+            _inner = inner;
+            _touch = touch;
+        }
+
+        public string Id => _inner.Id;
+
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var originalStdout = exec.StdoutChunkCallback;
+            var originalStderr = exec.StderrChunkCallback;
+            var watchedExec = exec with
+            {
+                StdoutChunkCallback = chunk =>
+                {
+                    _touch();
+                    originalStdout?.Invoke(chunk);
+                },
+                StderrChunkCallback = chunk =>
+                {
+                    _touch();
+                    originalStderr?.Invoke(chunk);
+                },
+            };
+            return _inner.ExecAsync(watchedExec, ct);
+        }
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+            => _inner.GetScreenshotAsync(ct);
+
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+            => _inner.SynthesizeInputAsync(events, ct);
+
+        public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+            => _inner.GetAccessibilityAtPointAsync(x, y, ct);
+
+        public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+            => _inner.GetAccessibilityTreeJsonAsync(ct);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
 

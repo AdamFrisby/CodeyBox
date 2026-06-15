@@ -2393,6 +2393,7 @@ public sealed class AgentConfigHotReloadTests
                 AgentSuspendMaxRetries = 1,
                 AgentSessionResumeMaxAttempts = 4,
                 AuditShortCircuitEnabled = true,
+                AuditorIdleTimeout = TimeSpan.FromMinutes(5),
             },
         };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
@@ -2403,6 +2404,7 @@ public sealed class AgentConfigHotReloadTests
             AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
             AgentSessionResumeMaxAttempts = initial.PipelineTuning.AgentSessionResumeMaxAttempts,
             AuditShortCircuitEnabled = initial.PipelineTuning.AuditShortCircuitEnabled,
+            AuditorIdleTimeout = initial.PipelineTuning.AuditorIdleTimeout,
         });
 
         var router = new AgentClassRouter(
@@ -2432,6 +2434,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(4, snapshot.Current.AgentSessionResumeMaxAttempts);
             Assert.True(snapshot.Current.AuditShortCircuitEnabled);
+            Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.AuditorIdleTimeout);
 
             // SetMaxRetries / SetMaxResumeAttempts are called on start; verify
             // the process-wide runner knobs were initialised.
@@ -2447,12 +2450,14 @@ public sealed class AgentConfigHotReloadTests
                     AgentSuspendMaxRetries = 3,
                     AgentSessionResumeMaxAttempts = 6,
                     AuditShortCircuitEnabled = false,
+                    AuditorIdleTimeout = TimeSpan.Zero,
                 },
             });
             Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
             Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
             Assert.False(snapshot.Current.AuditShortCircuitEnabled);
+            Assert.Equal(TimeSpan.Zero, snapshot.Current.AuditorIdleTimeout);
             Assert.Equal(3, AgentSuspendResilience.MaxRetries);
             Assert.Equal(6, SessionResumeOptions.MaxResumeAttempts);
 
