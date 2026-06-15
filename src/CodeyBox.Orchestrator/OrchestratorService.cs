@@ -667,11 +667,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (projectClaim is not null)
             return RefactorDispatchGateDecision.Block(projectClaim.Reason);
 
-        var queuedRefactor = await FindEligibleFreshRefactorForProjectBeforeCandidateAsync(
-            candidate.ProjectId,
-            candidate.Id,
+        var queuedRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+            candidate,
             ct);
         if (queuedRefactor is null)
+            return RefactorDispatchGateDecision.Allow;
+
+        var (queuedRefactorInFlight, queuedOtherInFlight) =
+            await _store.CountInFlightSplitByRefactorAsync(candidate.ProjectId, ct, queuedRefactor.Id);
+        if (queuedRefactorInFlight == 0 && queuedOtherInFlight == 0)
             return RefactorDispatchGateDecision.Allow;
 
         return RefactorDispatchGateDecision.Block(
@@ -1064,6 +1068,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     catch (Exception ex)
                     {
                         _log.LogError(ex, "OnWorkerReservedForTest callback threw; releasing concurrency slot and skipping item {Id}", id);
+                        await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
                         _activeItems.TryRemove(id.Value, out _);
                         TryReleaseConcurrencyGate();
                         blockForFirstSlot = false;
@@ -1094,6 +1099,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             var pacing = await WaitForSpawnPacingAsync(wait, stoppingToken);
                             if (pacing == SpawnPacingWaitResult.Cancelled)
                             {
+                                await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
                                 _activeItems.TryRemove(id.Value, out _);
                                 TryReleaseConcurrencyGate();
                                 stopDispatchLoop = true;
@@ -1101,6 +1107,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             }
                             if (pacing == SpawnPacingWaitResult.DispatchPaused)
                             {
+                                await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
                                 _activeItems.TryRemove(id.Value, out _);
                                 TryReleaseConcurrencyGate();
                                 stopDispatchLoop = true;
@@ -1108,6 +1115,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             }
                             if (pacing == SpawnPacingWaitResult.QueuePaused)
                             {
+                                await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
                                 _activeItems.TryRemove(id.Value, out _);
                                 TryReleaseConcurrencyGate();
                                 await _queue.EnqueueDispatchWakeAsync(stoppingToken);
@@ -1119,6 +1127,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
                 if (IsDispatchPaused)
                 {
+                    await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
                     _activeItems.TryRemove(id.Value, out _);
                     TryReleaseConcurrencyGate();
                     stopDispatchLoop = true;
@@ -1127,6 +1136,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
                 if (IsQueuePaused)
                 {
+                    await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
                     _activeItems.TryRemove(id.Value, out _);
                     TryReleaseConcurrencyGate();
                     await RequeueDispatchWakeAsync(CancellationToken.None);
@@ -1139,6 +1149,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 catch (Exception ex)
                 {
                     _log.LogError(ex, "OnWorkerSpawned callback threw; releasing concurrency slot and skipping item {Id}", id);
+                    await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
                     _activeItems.TryRemove(id.Value, out _);
                     TryReleaseConcurrencyGate();
                     blockForFirstSlot = false;
@@ -1163,6 +1174,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 "Worker {WorkerId} skipping {Id}: queue paused after spawn reservation but before pipeline start",
                                 workerIndex,
                                 capturedId);
+                            await ClearPreStartRefactorDrainClaimAsync(capturedId, stoppingToken);
                             return;
                         }
                         await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
@@ -1353,6 +1365,49 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
                 ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
                 continue;
+            }
+
+            if (candidate.StartedAt is null)
+            {
+                var (refactorInFlight, _) =
+                    await _store.CountInFlightSplitByRefactorAsync(
+                        candidate.ProjectId,
+                        stoppingToken,
+                        candidate.Id);
+                if (refactorInFlight > 0)
+                {
+                    var reason =
+                        $"refactor exclusivity: a refactor is in flight for project '{candidate.ProjectId.Value}'; non-refactor items wait until it completes";
+                    AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
+                    ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
+                    continue;
+                }
+
+                var olderRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+                    candidate,
+                    stoppingToken);
+                if (olderRefactor is not null)
+                {
+                    var (claimedRefactorInFlight, claimedOtherInFlight) =
+                        await _store.CountInFlightSplitByRefactorAsync(
+                            olderRefactor.ProjectId,
+                            stoppingToken,
+                            olderRefactor.Id);
+                    if (claimedRefactorInFlight > 0 || claimedOtherInFlight > 0)
+                    {
+                        var claimReason = RefactorCandidateBlockedReason(
+                            olderRefactor,
+                            claimedRefactorInFlight,
+                            claimedOtherInFlight);
+                        SetRefactorDrainClaim(olderRefactor, claimReason);
+                        pendingRefactorProjects[candidate.ProjectId.Value] = olderRefactor.Id;
+
+                        var reason = RefactorDrainHoldReason(candidate.ProjectId, olderRefactor.Id);
+                        AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
+                        ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
+                        continue;
+                    }
+                }
             }
 
             return candidate.Id;
@@ -1741,6 +1796,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             or WorkItemState.AbandonedAfterRecoveryAttempts)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
+            ClearPreStartRefactorDrainClaim(item);
             _activeItems.TryRemove(id, out _);
             return;
         }
@@ -1750,6 +1806,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (item.State is WorkItemState.NeedsOperatorInput)
         {
             _log.LogWarning("Worker {WorkerId} skipping {Id}: still in NeedsOperatorInput state", workerIndex, id);
+            ClearPreStartRefactorDrainClaim(item);
             _activeItems.TryRemove(id, out _);
             return;
         }
@@ -1761,11 +1818,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (item.State is WorkItemState.WaitingForQuotaReset)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForQuotaReset", workerIndex, id);
+            ClearPreStartRefactorDrainClaim(item);
             return;
         }
         if (item.State is WorkItemState.WaitingForAgentResume)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForAgentResume", workerIndex, id);
+            ClearPreStartRefactorDrainClaim(item);
             return;
         }
 
@@ -1830,6 +1889,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 or WorkItemState.AbandonedAfterRecoveryAttempts)
             {
                 _log.LogInformation("Worker {WorkerId} skipping {Id} after active claim: terminal state {State}", workerIndex, id, current.State);
+                ClearPreStartRefactorDrainClaim(current);
                 return;
             }
 
@@ -1840,6 +1900,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 _log.LogInformation(
                     "Worker {WorkerId} skipping {Id} after active claim: parked state {State}",
                     workerIndex, id, item.State);
+                ClearPreStartRefactorDrainClaim(item);
                 return;
             }
 
@@ -1862,6 +1923,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     _log.LogInformation(
                         "Worker {WorkerId} skipping {Id}: dependsOn gate not satisfied", workerIndex, id);
+                    ClearPreStartRefactorDrainClaim(item);
                     return;
                 }
             }
@@ -1958,6 +2020,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     {
                         if (decision.WaitingForPausedAgent)
                         {
+                            ClearPreStartRefactorDrainClaim(item);
                             await ParkForAgentResumeAsync(
                                 item,
                                 decision.Reason,
@@ -1992,6 +2055,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             }
                         }
                         AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
+                        ClearPreStartRefactorDrainClaim(item);
                         ScheduleDeferredRequeue(item.Id, deferDelay, ct);
                         return;
                     }
@@ -2017,6 +2081,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
                     AuditLog.WorkItemFailed(item.Id, decision.Reason);
+                    ClearPreStartRefactorDrainClaim(item);
                     await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
                     return;
                 }
@@ -2047,6 +2112,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     && IsOperatorPaused(directAvailability))
                 {
                     var reason = directAvailability?.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
+                    ClearPreStartRefactorDrainClaim(item);
                     await ParkForAgentResumeAsync(
                         item,
                         $"agent '{pausedCandidate.Value}' {reason}",
@@ -2066,6 +2132,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             "Worker {WorkerId} deferring {Id}: per-agent cap reached for {RouteKey} (running={Running} cap={Cap})",
                             workerIndex, id, routeKey, running, cap);
                         AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
+                        ClearPreStartRefactorDrainClaim(item);
                         ScheduleDeferredRequeue(item.Id, _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval, ct);
                         return;
                     }
@@ -2086,6 +2153,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     _log.LogInformation(
                         "Worker {WorkerId} skipping {Id}: project {ProjectId} queue is paused — {Reason}",
                         workerIndex, id, item.ProjectId.Value, projState.PausedReason);
+                    ClearPreStartRefactorDrainClaim(item);
                     ScheduleDeferredRequeue(item.Id, _budgetDeferralRecheck?.Current.PausedProjectRecheck ?? TimeSpan.FromMinutes(1), ct);
                     return;
                 }
@@ -2123,6 +2191,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 Details = new { deferReason.Reason, suggestedRetryAt = DateTimeOffset.UtcNow + deferReason.RecheckIn },
                             }, CancellationToken.None);
                         }
+                        ClearPreStartRefactorDrainClaim(item);
                         ScheduleDeferredRequeue(item.Id, deferReason.RecheckIn, ct);
                         return;
                     }
@@ -2523,30 +2592,34 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             ? 0
             : 1;
 
-    private async Task<WorkItem?> FindEligibleFreshRefactorForProjectBeforeCandidateAsync(
-        ProjectId projectId,
-        WorkItemId candidateId,
+    private async Task<WorkItem?> FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+        WorkItem candidate,
         CancellationToken ct)
     {
+        if (candidate.StartedAt is not null || candidate.JobType == JobType.Refactor)
+            return null;
+
         var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
         foreach (var deferredId in _deferredItems.Keys)
         {
-            if (deferredId != candidateId)
+            if (deferredId != candidate.Id)
                 skipIds.Add(deferredId);
         }
 
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
-        await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+        WorkItem? selected = null;
+        await foreach (var refactorCandidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
         {
-            if (candidate.Id == candidateId)
-                return null;
-
-            if (candidate.ProjectId != projectId)
+            if (refactorCandidate.Id == candidate.Id
+                || refactorCandidate.ProjectId != candidate.ProjectId
+                || refactorCandidate.JobType != JobType.Refactor
+                || refactorCandidate.StartedAt is not null
+                || refactorCandidate.CreatedAt > candidate.CreatedAt)
             {
                 continue;
             }
 
-            if (candidate.DependsOn.Count > 0)
+            if (refactorCandidate.DependsOn.Count > 0)
             {
                 if (statesById is null)
                 {
@@ -2555,18 +2628,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     statesById = WorkItemDependencies.BuildStateMap(snapshot);
                 }
 
-                if (!WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById))
+                if (!WorkItemDependencies.AreSatisfied(refactorCandidate.DependsOn, statesById))
                     continue;
             }
 
-            if (candidate.JobType == JobType.Refactor && candidate.StartedAt is null)
-                return candidate;
-
-            if (candidate.StartedAt is null)
-                return null;
+            if (selected is null
+                || refactorCandidate.CreatedAt < selected.CreatedAt
+                || (refactorCandidate.CreatedAt == selected.CreatedAt
+                    && refactorCandidate.Priority > selected.Priority))
+            {
+                selected = refactorCandidate;
+            }
         }
 
-        return null;
+        return selected;
     }
 
     private static string RefactorCandidateBlockedReason(
@@ -2642,6 +2717,27 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return;
 
         _refactorDrainClaims.TryRemove(projectId.Value, out _);
+    }
+
+    private void ClearPreStartRefactorDrainClaim(WorkItem item)
+    {
+        if (item.JobType == JobType.Refactor && item.StartedAt is null)
+            ClearRefactorDrainClaim(item.ProjectId, item.Id);
+    }
+
+    private async Task ClearPreStartRefactorDrainClaimAsync(
+        WorkItemId id,
+        CancellationToken ct)
+    {
+        try
+        {
+            var item = await _store.GetAsync(id, ct);
+            if (item is not null)
+                ClearPreStartRefactorDrainClaim(item);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
     }
 
     private async Task<IReadOnlyList<RefactorDrainClaim>> CollectActiveRefactorDrainClaimsAsync(
@@ -2733,7 +2829,38 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
 
         if (refactorInFlight == 0)
-            return false;
+        {
+            var activeClaims = await CollectActiveRefactorDrainClaimsAsync(ct);
+            var projectClaim = activeClaims.FirstOrDefault(c => c.ProjectId == item.ProjectId);
+            if (projectClaim is not null)
+            {
+                AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, projectClaim.Reason);
+                ScheduleRefactorExclusivityRequeue(item.Id, ct);
+                return true;
+            }
+
+            var olderRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(item, ct);
+            if (olderRefactor is null)
+                return false;
+
+            var (claimedRefactorInFlight, claimedOtherInFlight) =
+                await _store.CountInFlightSplitByRefactorAsync(
+                    olderRefactor.ProjectId,
+                    ct,
+                    olderRefactor.Id);
+            if (claimedRefactorInFlight == 0 && claimedOtherInFlight == 0)
+                return false;
+
+            var claimReason = RefactorCandidateBlockedReason(
+                olderRefactor,
+                claimedRefactorInFlight,
+                claimedOtherInFlight);
+            SetRefactorDrainClaim(olderRefactor, claimReason);
+            var reason = RefactorDrainHoldReason(item.ProjectId, olderRefactor.Id);
+            AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, reason);
+            ScheduleRefactorExclusivityRequeue(item.Id, ct);
+            return true;
+        }
 
         var nonRefactorReason =
             $"refactor exclusivity: a refactor is in flight for project '{item.ProjectId.Value}'; non-refactor items wait until it completes";
