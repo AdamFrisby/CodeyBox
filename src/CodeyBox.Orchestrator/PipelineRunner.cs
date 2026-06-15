@@ -5206,16 +5206,35 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var auditShortCircuitEnabled = _pipelineTuning.Current.AuditShortCircuitEnabled;
             var scheduledAuditors = OrderAuditorsForShortCircuit(auditors, auditShortCircuitEnabled);
+            var scheduledAuditorNames = scheduledAuditors.Select(a => a.Name).ToList();
             await PublishAuditStartedAsync(item, project, iteration, scheduledAuditors, ct);
             var auditPhaseStart = DateTimeOffset.UtcNow;
             await Transition(item, WorkItemState.Auditing, ct, project);
             using var auditPhase = new PhaseCancellation("audit", ct, _opts.TimeProvider);
             auditPhase.SetPhaseTimeout(project.Audit.PerIterationTimeout);
             auditPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+            var startingWorkBranchTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
+            await PersistAuditProgressAsync(
+                item,
+                currentWorkAttemptStartedAt,
+                BuildAuditProgressSnapshot(
+                    iteration,
+                    maxIterations,
+                    [],
+                    [],
+                    0,
+                    startingWorkBranchTip,
+                    AuditProgressStatuses.InProgress,
+                    scheduledAuditorNames,
+                    []),
+                ct);
 
             IReadOnlyList<AuditFinding> findings;
             AgentKind? activeAuditAgentKind;
             bool declaredShortCircuitBlocking;
+            bool incompleteVerdict;
+            IReadOnlyList<string> completedAuditors;
+            IReadOnlyList<string> incompleteAuditors;
             AuditFinding? requiredBuildFinding;
             try
             {
@@ -5233,6 +5252,28 @@ public sealed class PipelineRunner : IPipelineRunner
                     repoId,
                     ctx,
                     auditShortCircuitEnabled,
+                    async (partialFindings, partialCompletedAuditors, progressCt) =>
+                    {
+                        var partialBlocking = partialFindings
+                            .Where(f => f.Severity >= project.Audit.FailingSeverity)
+                            .ToList();
+                        var partialTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, progressCt)
+                            .ConfigureAwait(false);
+                        await PersistAuditProgressAsync(
+                            item,
+                            currentWorkAttemptStartedAt,
+                            BuildAuditProgressSnapshot(
+                                iteration,
+                                maxIterations,
+                                partialFindings,
+                                partialBlocking,
+                                partialFindings.Count - partialBlocking.Count,
+                                partialTip,
+                                AuditProgressStatuses.InProgress,
+                                scheduledAuditorNames,
+                                partialCompletedAuditors),
+                            progressCt).ConfigureAwait(false);
+                    },
                     auditPhase.Token);
                 var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completedAuditTask != collectTask)
@@ -5246,12 +5287,20 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
 
-                (findings, activeAuditAgentKind, declaredShortCircuitBlocking) = await collectTask;
+                var collection = await collectTask;
+                findings = collection.Findings;
+                activeAuditAgentKind = collection.ActiveAuditAgentKind;
+                declaredShortCircuitBlocking = collection.DeclaredShortCircuitBlocking;
+                incompleteVerdict = collection.IncompleteVerdict;
+                completedAuditors = collection.CompletedAuditors ?? [];
+                incompleteAuditors = collection.IncompleteAuditors ?? [];
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
 
-                requiredBuildFinding = await _requiredBuildGate.RunForAuditAsync(
-                    item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
+                requiredBuildFinding = incompleteVerdict
+                    ? null
+                    : await _requiredBuildGate.RunForAuditAsync(
+                        item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
@@ -5259,7 +5308,10 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             if (requiredBuildFinding is not null)
+            {
                 findings = [.. findings, requiredBuildFinding];
+                completedAuditors = [.. completedAuditors, RequiredBuildGateIdentity.AuditorName];
+            }
 
             // Emit cross-review event once per iteration when at least one LLM
             // auditor actually ran with a different agent than the work agent.
@@ -5267,6 +5319,29 @@ public sealed class PipelineRunner : IPipelineRunner
                 AuditLog.CrossReviewActive(runner.Kind, activeAuditAgentKind.Value);
 
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
+            if (incompleteVerdict && findings.Count == 0)
+            {
+                var incompleteList = incompleteAuditors.Count == 0
+                    ? "unknown auditor"
+                    : string.Join(", ", incompleteAuditors);
+                var incompleteTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
+                await PersistAuditProgressAsync(
+                    item,
+                    currentWorkAttemptStartedAt,
+                    BuildAuditProgressSnapshot(
+                        iteration,
+                        maxIterations,
+                        findings,
+                        [],
+                        0,
+                        incompleteTip,
+                        AuditProgressStatuses.Incomplete,
+                        scheduledAuditorNames,
+                        completedAuditors),
+                    ct);
+                throw new AuditUnavailableException(
+                    $"audit iteration {iteration} did not reach a complete verdict before any auditor produced findings; incomplete auditor(s): {incompleteList}");
+            }
             if (declaredShortCircuitBlocking && blocking.Count == 0)
             {
                 if (findings.Count == 0)
@@ -5280,10 +5355,22 @@ public sealed class PipelineRunner : IPipelineRunner
 
                 blocking = findings.ToList();
             }
+            if (incompleteVerdict && blocking.Count == 0)
+            {
+                blocking = findings.ToList();
+            }
             var nonBlocking = findings.Count - blocking.Count;
             var workBranchTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
             var progressSnapshot = BuildAuditProgressSnapshot(
-                iteration, maxIterations, findings, blocking, nonBlocking, workBranchTip);
+                iteration,
+                maxIterations,
+                findings,
+                blocking,
+                nonBlocking,
+                workBranchTip,
+                incompleteVerdict ? AuditProgressStatuses.Incomplete : AuditProgressStatuses.Complete,
+                scheduledAuditorNames,
+                completedAuditors);
             auditHistory.Add(progressSnapshot);
             await PersistAuditProgressAsync(item, currentWorkAttemptStartedAt, progressSnapshot, ct);
 
@@ -5377,7 +5464,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyList<AuditProgressSnapshot> auditHistory,
         CancellationToken ct)
     {
-        if (auditHistory.Count == 0 || auditHistory[^1].BlockingFindings == 0)
+        if (auditHistory.Count == 0 || !AuditProgressRequiresRework(auditHistory[^1]))
             return false;
 
         if (HasAuditConvergenceProgress(auditHistory))
@@ -5390,12 +5477,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var last = auditHistory[^1];
         CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
-        AuditLog.AuditFailed(last.Iteration, last.BlockingFindings);
-        var summary = string.Join("; ", last.BlockingFindingsDetails
+        var blockingFindings = BlockingProgressFindingsForSummary(last);
+        AuditLog.AuditFailed(last.Iteration, blockingFindings.Count);
+        var summary = string.Join("; ", blockingFindings
             .Take(5)
             .Select(f => $"[{f.AuditorName}] {f.Title}"));
         throw new AuditFailedException(
-            $"Audit did not pass after {last.Iteration} iterations. {last.BlockingFindings} blocking finding(s): {summary}");
+            $"Audit did not pass after {last.Iteration} iterations. {blockingFindings.Count} blocking finding(s): {summary}");
     }
 
     private async Task<bool> RunMissingAuditResumeReworkAsync(
@@ -5415,7 +5503,7 @@ public sealed class PipelineRunner : IPipelineRunner
             return false;
 
         var last = auditHistory[^1];
-        if (last.BlockingFindings == 0)
+        if (!AuditProgressRequiresRework(last))
             return false;
 
         var iterations = await _store.GetIterationsAsync(item.Id, ct);
@@ -5619,7 +5707,10 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyList<AuditFinding> findings,
         IReadOnlyList<AuditFinding> blocking,
         int nonBlocking,
-        string? workBranchTip)
+        string? workBranchTip,
+        string status = AuditProgressStatuses.Complete,
+        IReadOnlyList<string>? scheduledAuditors = null,
+        IReadOnlyList<string>? completedAuditors = null)
     {
         return new AuditProgressSnapshot(
             iteration,
@@ -5629,11 +5720,23 @@ public sealed class PipelineRunner : IPipelineRunner
             FingerprintFindings(blocking),
             blocking.Select(ToProgressFinding).ToList(),
             findings.Select(ToProgressFinding).ToList(),
-            workBranchTip);
+            workBranchTip,
+            status,
+            scheduledAuditors,
+            completedAuditors);
     }
 
     private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
         => BuildAuditProgressSignals(history).Count > 0;
+
+    private static bool AuditProgressRequiresRework(AuditProgressSnapshot progress)
+        => progress.BlockingFindings > 0
+           || (!progress.IsComplete && progress.Findings.Count > 0);
+
+    private static IReadOnlyList<AuditProgressFinding> BlockingProgressFindingsForSummary(AuditProgressSnapshot progress)
+        => progress.BlockingFindingsDetails.Count > 0
+            ? progress.BlockingFindingsDetails
+            : progress.Findings;
 
     private async Task<IReadOnlyList<AuditProgressSnapshot>> LoadPersistedAuditProgressHistoryAsync(
         WorkItem item,
@@ -5655,7 +5758,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 ex);
         }
 
-        return records
+        var snapshots = records
             .Where(r => r.Iteration > 0)
             .OrderBy(r => r.Iteration)
             .Select(r => new AuditProgressSnapshot(
@@ -5666,8 +5769,18 @@ public sealed class PipelineRunner : IPipelineRunner
                 r.BlockingFindingIds,
                 r.BlockingFindingsDetails,
                 r.Findings,
-                r.WorkBranchTip))
+                r.WorkBranchTip,
+                r.Status,
+                r.ScheduledAuditors,
+                r.CompletedAuditors))
             .ToList();
+
+        if (snapshots is [.., { IsComplete: false, Findings.Count: 0 }])
+        {
+            snapshots.RemoveAt(snapshots.Count - 1);
+        }
+
+        return snapshots;
     }
 
     private async Task PersistAuditProgressAsync(
@@ -5692,7 +5805,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     progress.BlockingFindingIds,
                     progress.BlockingFindingsDetails,
                     progress.Findings,
-                    progress.WorkBranchTip),
+                    progress.WorkBranchTip,
+                    progress.Status,
+                    progress.ScheduledAuditors,
+                    progress.CompletedAuditors),
                 DateTimeOffset.UtcNow,
                 ct);
         }
@@ -5821,13 +5937,14 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyList<AuditProgressSnapshot> history)
     {
         var last = history[^1];
-        var summary = string.Join("; ", last.BlockingFindingsDetails
+        var remaining = BlockingProgressFindingsForSummary(last);
+        var summary = string.Join("; ", remaining
             .Take(5)
             .Select(f => $"[{f.AuditorName}] {f.Title}"));
 
         return
             $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
-            $"{last.BlockingFindings} blocking finding(s) remain: {summary}";
+            $"{remaining.Count} blocking finding(s) remain: {summary}";
     }
 
     private static AuditMaxIterationsEscalationDetails BuildAuditMaxIterationEscalationDetails(
@@ -5860,7 +5977,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     .Select(ToEscalationWebhookFinding)
                     .ToList(),
             }).ToList(),
-            RemainingBlockingFindings = last.BlockingFindingsDetails
+            RemainingBlockingFindings = BlockingProgressFindingsForSummary(last)
                 .Take(AuditEscalationFindingsPerIterationLimit)
                 .Select(ToEscalationWebhookFinding)
                 .ToList(),
@@ -5893,7 +6010,7 @@ public sealed class PipelineRunner : IPipelineRunner
         return signals;
     }
 
-    private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind, bool DeclaredShortCircuitBlocking)> CollectFindingsAsync(
+    private async Task<AuditorBatchResult> CollectFindingsAsync(
         WorkItem item,
         Project project,
         IAgentRunner workRunner,
@@ -5901,6 +6018,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string repoId,
         AuditContext ctx,
         bool auditShortCircuitEnabled,
+        Func<IReadOnlyList<AuditFinding>, IReadOnlyList<string>, CancellationToken, Task>? progressUpdate,
         CancellationToken ct)
     {
         if (!auditShortCircuitEnabled)
@@ -5913,8 +6031,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 repoId,
                 ctx,
                 detectDeclaredShortCircuit: false,
+                progressUpdate,
                 ct);
-            return (all.Findings, all.ActiveAuditAgentKind, false);
+            return all with { DeclaredShortCircuitBlocking = false };
         }
 
         var gateAuditors = auditors
@@ -5930,8 +6049,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 repoId,
                 ctx,
                 detectDeclaredShortCircuit: false,
+                progressUpdate,
                 ct);
-            return (all.Findings, all.ActiveAuditAgentKind, false);
+            return all with { DeclaredShortCircuitBlocking = false };
         }
 
         var gate = await CollectFindingsBatchAsync(
@@ -5942,15 +6062,16 @@ public sealed class PipelineRunner : IPipelineRunner
             repoId,
             ctx,
             detectDeclaredShortCircuit: true,
+            progressUpdate,
             ct);
         if (gate.DeclaredShortCircuitBlocking)
-            return (gate.Findings, gate.ActiveAuditAgentKind, true);
+            return gate with { DeclaredShortCircuitBlocking = true };
 
         var remainingAuditors = auditors
             .Where(a => !a.CanShortCircuitOnBlockingFinding)
             .ToList();
         if (remainingAuditors.Count == 0)
-            return (gate.Findings, gate.ActiveAuditAgentKind, false);
+            return gate with { DeclaredShortCircuitBlocking = false };
 
         var remaining = await CollectFindingsBatchAsync(
             item,
@@ -5960,12 +6081,16 @@ public sealed class PipelineRunner : IPipelineRunner
             repoId,
             ctx,
             detectDeclaredShortCircuit: false,
+            progressUpdate,
             ct);
 
-        return (
+        return new AuditorBatchResult(
             [.. gate.Findings, .. remaining.Findings],
             gate.ActiveAuditAgentKind ?? remaining.ActiveAuditAgentKind,
-            false);
+            false,
+            gate.IncompleteVerdict || remaining.IncompleteVerdict,
+            [.. (gate.CompletedAuditors ?? []), .. (remaining.CompletedAuditors ?? [])],
+            [.. (gate.IncompleteAuditors ?? []), .. (remaining.IncompleteAuditors ?? [])]);
     }
 
     private static IReadOnlyList<IAuditor> OrderAuditorsForShortCircuit(
@@ -5997,11 +6122,33 @@ public sealed class PipelineRunner : IPipelineRunner
         string repoId,
         AuditContext ctx,
         bool detectDeclaredShortCircuit,
+        Func<IReadOnlyList<AuditFinding>, IReadOnlyList<string>, CancellationToken, Task>? progressUpdate,
         CancellationToken ct)
     {
         var findings = new List<AuditFinding>();
+        var completedAuditors = new List<string>();
         AgentKind? activeAuditAgentKind = null;
         var declaredShortCircuitBlocking = false;
+        using var progressWriteLock = new SemaphoreSlim(1, 1);
+
+        async Task PublishPartialProgressAsync(
+            IReadOnlyList<AuditFinding> currentFindings,
+            IReadOnlyList<string> currentCompletedAuditors,
+            CancellationToken progressCt)
+        {
+            if (progressUpdate is null)
+                return;
+
+            await progressWriteLock.WaitAsync(progressCt).ConfigureAwait(false);
+            try
+            {
+                await progressUpdate(currentFindings, currentCompletedAuditors, progressCt).ConfigureAwait(false);
+            }
+            finally
+            {
+                progressWriteLock.Release();
+            }
+        }
 
         // Resolve the audit agent runner per LLM auditor (once, before grouping).
         // Tool auditors don't carry a runner — they stay with workRunner as a
@@ -6171,6 +6318,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         if (needsCreds && runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= runner.Kind;
                         findings.AddRange(run.Result.Findings);
+                        completedAuditors.Add(auditor.Name);
+                        await PublishPartialProgressAsync(findings.ToList(), completedAuditors.ToList(), ct);
                         if (detectDeclaredShortCircuit
                             && auditor.CanShortCircuitOnBlockingFinding
                             && IsDeclaredShortCircuitBlockingResult(run.Result))
@@ -6178,8 +6327,28 @@ public sealed class PipelineRunner : IPipelineRunner
                             declaredShortCircuitBlocking = true;
                         }
                         if (project.Audit.StopOnFirstFailure && HasAuditBlockingFinding(run.Result, project))
-                            return new AuditorBatchResult(findings, activeAuditAgentKind, declaredShortCircuitBlocking);
+                            return new AuditorBatchResult(
+                                findings.ToList(),
+                                activeAuditAgentKind,
+                                declaredShortCircuitBlocking,
+                                CompletedAuditors: completedAuditors.ToList());
                     }
+                }
+                catch (AuditorIdleTimeoutException ex)
+                {
+                    _log.LogWarning(
+                        ex,
+                        "Auditor {Auditor} timed out during iteration {Iteration}; returning incomplete audit verdict with {FindingCount} completed finding(s)",
+                        ex.AuditorName,
+                        ctx.Iteration,
+                        findings.Count);
+                    return new AuditorBatchResult(
+                        findings.ToList(),
+                        activeAuditAgentKind,
+                        declaredShortCircuitBlocking,
+                        IncompleteVerdict: true,
+                        CompletedAuditors: completedAuditors.ToList(),
+                        IncompleteAuditors: [ex.AuditorName]);
                 }
                 finally
                 {
@@ -6254,7 +6423,19 @@ public sealed class PipelineRunner : IPipelineRunner
                     WorkItem trialItem,
                     CancellationToken attemptCt)
                 {
-                    var run = await RunLlmPairOnceAsync(pair, candidateRunner, trialItem, attemptCt);
+                    AuditorRunRecord run;
+                    try
+                    {
+                        run = await RunLlmPairOnceAsync(pair, candidateRunner, trialItem, attemptCt);
+                    }
+                    catch (AuditorIdleTimeoutException ex)
+                    {
+                        _log.LogWarning(
+                            ex,
+                            "LLM auditor {Auditor} timed out; retrying once in a fresh sandbox",
+                            pair.Auditor.Name);
+                        run = await RunLlmPairOnceAsync(pair, candidateRunner, trialItem, attemptCt);
+                    }
 
                     // A nonzero review-agent exit is audit infrastructure, not a
                     // source-code finding. Retry once in a fresh sandbox to ride out
@@ -6326,7 +6507,37 @@ public sealed class PipelineRunner : IPipelineRunner
                         requireCapability: WellKnownCapabilities.Audit);
                 }
 
-                var llmTasks = llmPairs.Select(async pair =>
+                var baseFindingsBeforeLlm = findings.ToList();
+                var baseCompletedBeforeLlm = completedAuditors.ToList();
+                var llmProgressGate = new object();
+                var completedLlmProgress = new List<(int Index, AuditorRunRecord Run)>();
+
+                async Task PublishLlmPartialProgressAsync(
+                    int index,
+                    AuditorRunRecord run,
+                    CancellationToken progressCt)
+                {
+                    List<(int Index, AuditorRunRecord Run)> completedSnapshot;
+                    lock (llmProgressGate)
+                    {
+                        completedLlmProgress.Add((index, run));
+                        completedSnapshot = completedLlmProgress.ToList();
+                    }
+
+                    var orderedCompleted = completedSnapshot
+                        .OrderBy(e => e.Index)
+                        .ToList();
+                    var currentFindings = baseFindingsBeforeLlm
+                        .Concat(orderedCompleted.SelectMany(e => e.Run.Result.Findings))
+                        .ToList();
+                    var currentCompleted = baseCompletedBeforeLlm
+                        .Concat(orderedCompleted.Select(e => e.Run.Auditor.Name))
+                        .ToList();
+                    await PublishPartialProgressAsync(currentFindings, currentCompleted, progressCt)
+                        .ConfigureAwait(false);
+                }
+
+                var llmTasks = llmPairs.Select(async (pair, index) =>
                 {
                     await sem.WaitAsync(ct);
                     try
@@ -6357,7 +6568,8 @@ public sealed class PipelineRunner : IPipelineRunner
                                 pair.Auditor.Name, ex.MemberCount, ex.Message);
                             throw;
                         }
-                        return (Run: run, Auditor: pair.Auditor);
+                        await PublishLlmPartialProgressAsync(index, run, ct);
+                        return (Run: run, Auditor: pair.Auditor, Index: index);
                     }
                     finally { sem.Release(); }
                 }).ToList();
@@ -6398,6 +6610,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // iteration at the earliest reset.
                 AgentClassExhaustedException? firstExhaustion = null;
                 ExceptionDispatchInfo? firstOtherException = null;
+                var incompleteAuditors = new List<string>();
                 foreach (var task in llmTasks)
                 {
                     if (task.IsCompletedSuccessfully) continue;
@@ -6414,15 +6627,51 @@ public sealed class PipelineRunner : IPipelineRunner
                     if (inner is null) continue;
                     if (firstExhaustion is null && inner is AgentClassExhaustedException exhaustion)
                         firstExhaustion = exhaustion;
+                    else if (inner is AuditorIdleTimeoutException timeout)
+                        incompleteAuditors.Add(timeout.AuditorName);
                     else if (firstExhaustion is null && firstOtherException is null)
                         firstOtherException = ExceptionDispatchInfo.Capture(inner);
                 }
                 if (firstExhaustion is not null)
                     throw firstExhaustion;
+
+                if (incompleteAuditors.Count > 0)
+                {
+                    var completedSnapshot = completedLlmProgress
+                        .OrderBy(e => e.Index)
+                        .ToList();
+                    foreach (var entry in completedSnapshot)
+                    {
+                        var run = entry.Run;
+                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                        if (needsCreds && run.Runner.Kind != workRunner.Kind)
+                            activeAuditAgentKind ??= run.Runner.Kind;
+                    }
+
+                    var partialFindings = baseFindingsBeforeLlm
+                        .Concat(completedSnapshot.SelectMany(e => e.Run.Result.Findings))
+                        .ToList();
+                    var partialCompleted = baseCompletedBeforeLlm
+                        .Concat(completedSnapshot.Select(e => e.Run.Auditor.Name))
+                        .ToList();
+                    _log.LogWarning(
+                        "Audit iteration {Iteration} has incomplete LLM auditor verdict(s): {Auditors}; continuing with {FindingCount} completed finding(s)",
+                        ctx.Iteration,
+                        string.Join(", ", incompleteAuditors),
+                        partialFindings.Count);
+                    return new AuditorBatchResult(
+                        partialFindings,
+                        activeAuditAgentKind,
+                        declaredShortCircuitBlocking,
+                        IncompleteVerdict: true,
+                        CompletedAuditors: partialCompleted,
+                        IncompleteAuditors: incompleteAuditors);
+                }
+
                 firstOtherException?.Throw();
 
                 // Every task succeeded — gather results in stable order.
-                var llmRuns = llmTasks.Select(t => t.Result).ToList();
+                var llmRuns = llmTasks.Select(t => t.Result).OrderBy(t => t.Index).ToList();
 
                 // Post-process in stable auditor order (same as llmPairs).
                 // entry.Run is non-nullable here: the only path that could
@@ -6436,6 +6685,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     if (needsCreds && run.Runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= run.Runner.Kind;
                     findings.AddRange(run.Result.Findings);
+                    completedAuditors.Add(run.Auditor.Name);
                     if (detectDeclaredShortCircuit
                         && run.Auditor.CanShortCircuitOnBlockingFinding
                         && IsDeclaredShortCircuitBlockingResult(run.Result))
@@ -6444,11 +6694,19 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
                 if (project.Audit.StopOnFirstFailure && findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
-                    return new AuditorBatchResult(findings, activeAuditAgentKind, declaredShortCircuitBlocking);
+                    return new AuditorBatchResult(
+                        findings.ToList(),
+                        activeAuditAgentKind,
+                        declaredShortCircuitBlocking,
+                        CompletedAuditors: completedAuditors.ToList());
             }
         }
 
-        return new AuditorBatchResult(findings, activeAuditAgentKind, declaredShortCircuitBlocking);
+        return new AuditorBatchResult(
+            findings.ToList(),
+            activeAuditAgentKind,
+            declaredShortCircuitBlocking,
+            CompletedAuditors: completedAuditors.ToList());
     }
 
     /// <summary>
@@ -6553,7 +6811,12 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await using (timingScope)
             {
-                result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+                result = await RunAuditorWithIdleTimeoutAsync(
+                    auditor,
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    auditorCtx,
+                    ct);
             }
         }
         catch (Exception ex)
@@ -6582,6 +6845,84 @@ public sealed class PipelineRunner : IPipelineRunner
             sw.Elapsed,
             timingScope.ElapsedMs,
             canCaptureStructuredStream);
+    }
+
+    private async Task<AuditResult> RunAuditorWithIdleTimeoutAsync(
+        IAuditor auditor,
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct)
+    {
+        var timeout = _pipelineTuning.Current.AuditorIdleTimeout;
+        if (timeout <= TimeSpan.Zero)
+            return await auditor.RunAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var timedOut = 0;
+        var lastActivityTicks = Stopwatch.GetTimestamp();
+        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+
+        var originalCallback = context.StdoutChunkCallback;
+        var watchedContext = context with
+        {
+            StdoutChunkCallback = chunk =>
+            {
+                Touch();
+                originalCallback?.Invoke(chunk);
+            },
+        };
+
+        var monitorTask = Task.Run(async () =>
+        {
+            while (!linkedCts.IsCancellationRequested)
+            {
+                var currentTimeout = _pipelineTuning.Current.AuditorIdleTimeout;
+                if (currentTimeout <= TimeSpan.Zero)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), linkedCts.Token).ConfigureAwait(false);
+                    continue;
+                }
+
+                var elapsed = Stopwatch.GetElapsedTime(Volatile.Read(ref lastActivityTicks));
+                if (elapsed >= currentTimeout)
+                {
+                    Interlocked.Exchange(ref timedOut, 1);
+                    try { await linkedCts.CancelAsync().ConfigureAwait(false); }
+                    catch (ObjectDisposedException) { }
+                    return;
+                }
+
+                var remaining = currentTimeout - elapsed;
+                var delay = remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1);
+                if (delay <= TimeSpan.Zero)
+                    delay = TimeSpan.FromMilliseconds(100);
+                await Task.Delay(delay, linkedCts.Token).ConfigureAwait(false);
+            }
+        }, CancellationToken.None);
+
+        try
+        {
+            var result = await auditor.RunAsync(sandbox, workingDirectory, watchedContext, linkedCts.Token)
+                .ConfigureAwait(false);
+            Touch();
+            ct.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref timedOut) != 0)
+                throw new AuditorIdleTimeoutException(auditor.Name, timeout);
+            return result;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && Volatile.Read(ref timedOut) != 0)
+        {
+            throw new AuditorIdleTimeoutException(auditor.Name, timeout);
+        }
+        finally
+        {
+            try { await linkedCts.CancelAsync().ConfigureAwait(false); }
+            catch (ObjectDisposedException) { }
+
+            try { await monitorTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
     }
 
     /// <summary>
@@ -6682,7 +7023,10 @@ public sealed class PipelineRunner : IPipelineRunner
     private sealed record AuditorBatchResult(
         IReadOnlyList<AuditFinding> Findings,
         AgentKind? ActiveAuditAgentKind,
-        bool DeclaredShortCircuitBlocking);
+        bool DeclaredShortCircuitBlocking,
+        bool IncompleteVerdict = false,
+        IReadOnlyList<string>? CompletedAuditors = null,
+        IReadOnlyList<string>? IncompleteAuditors = null);
 
     private async Task PersistAuditReportAsync(
         AuditContext ctx,
@@ -13123,6 +13467,19 @@ internal sealed class AuditHistoryPersistenceFailedException : Exception
         : base(message, innerException) { }
 }
 
+internal sealed class AuditorIdleTimeoutException : TimeoutException
+{
+    public AuditorIdleTimeoutException(string auditorName, TimeSpan timeout)
+        : base($"auditor '{auditorName}' produced no output or verdict within {timeout}")
+    {
+        AuditorName = auditorName;
+        Timeout = timeout;
+    }
+
+    public string AuditorName { get; }
+    public TimeSpan Timeout { get; }
+}
+
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
 {
     public SandboxPushReconcileConflictException(string branch, string strategy)
@@ -13206,7 +13563,13 @@ internal sealed record AuditProgressSnapshot(
     IReadOnlyList<string> BlockingFindingIds,
     IReadOnlyList<AuditProgressFinding> BlockingFindingsDetails,
     IReadOnlyList<AuditProgressFinding> Findings,
-    string? WorkBranchTip);
+    string? WorkBranchTip,
+    string Status = AuditProgressStatuses.Complete,
+    IReadOnlyList<string>? ScheduledAuditors = null,
+    IReadOnlyList<string>? CompletedAuditors = null)
+{
+    public bool IsComplete => AuditProgressStatuses.IsComplete(Status);
+}
 
 internal sealed record SuggestionWebhookDetails(
     string Id,

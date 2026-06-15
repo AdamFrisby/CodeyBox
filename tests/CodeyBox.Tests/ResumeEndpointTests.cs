@@ -19,7 +19,7 @@ namespace CodeyBox.Tests;
 /// commits across a Cancelled → re-pickup round trip.
 ///
 /// Coverage matrix:
-///   - from=work (default) re-queues; from=audit goes to WorkComplete; from=merge goes to AuditPassed.
+///   - from=work (default) re-queues; from=rework/from=audit go to WorkComplete; from=merge goes to AuditPassed.
 ///   - Bare repo missing → 412.
 ///   - Work-branch missing → 412.
 ///   - Non-Cancelled state → 409.
@@ -182,6 +182,31 @@ public sealed class ResumeEndpointTests : IDisposable
         var resp = await _client.PostAsJsonAsync(
             $"/workitems/{item.Id}/resume",
             new ResumeRequestBody(From: "audit", Reason: null));
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, readBack!.State);
+        Assert.Equal(item.WorkBranch, readBack.WorkBranch);
+        Assert.False(readBack.PreserveWorkBranchOnQueuedPickup);
+
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        Assert.Equal(1, queue.Count);
+    }
+
+    // ── from=rework goes to WorkComplete, preserving audited branch state ────
+
+    [Fact]
+    public async Task Resume_FromRework_TransitionsToWorkCompleteAndKicksDispatcher()
+    {
+        var item = CancelledItem();
+        await _factory.Store.CreateAsync(item);
+        await SeedAuditProgressAsync(item);
+        _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/resume",
+            new ResumeRequestBody(From: "rework", Reason: null));
 
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
@@ -401,7 +426,6 @@ public sealed class ResumeEndpointTests : IDisposable
 
     [Theory]
     [InlineData("upstream")]
-    [InlineData("rework")]
     [InlineData("")]
     [InlineData("FROM_THE_BEGINNING")]
     public async Task Resume_InvalidFrom_Returns400(string from)
