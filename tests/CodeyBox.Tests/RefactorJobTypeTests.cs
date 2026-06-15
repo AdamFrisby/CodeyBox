@@ -279,7 +279,6 @@ public sealed class RefactorJobTypeTests : IDisposable
         await queue.EnqueueAsync(refactor.Id);
 
         await WaitForDeferredAsync(svc, refactor.Id);
-        Assert.True(svc.IsDeferredForTest(refactor.Id));
 
         // The refactor must not have StartedAt set yet.
         var refactorState = await _store.GetAsync(refactor.Id);

@@ -136,6 +136,16 @@ public sealed record WorkItem
     public string? QuotaRetryFrom { get; init; }
 
     /// <summary>
+    /// Original pipeline phase that parked this item for quota recovery. This
+    /// remains distinct from <see cref="QuotaRetryFrom"/> because rework quota
+    /// parks resume at the audit entry point while still needing work/rework
+    /// routing capabilities when the scheduler checks whether quota returned.
+    /// Values: "work", "rework", "audit", "merge", or "upstream".
+    /// Null for rows written before this metadata existed.
+    /// </summary>
+    public string? QuotaRetryPhase { get; init; }
+
+    /// <summary>
     /// Agent kind whose operator pause parked this item in
     /// <see cref="WorkItemState.WaitingForAgentResume"/>. Separate from
     /// <see cref="Agent"/> because later phases can be blocked by an audit,
@@ -544,6 +554,7 @@ public sealed record WorkItem
             QuotaResetAt = IsQuotaShapedState(state) ? (quotaResetAt ?? QuotaResetAt) : null,
             NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
             QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
+            QuotaRetryPhase = IsQuotaShapedState(state) ? QuotaRetryPhase : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.

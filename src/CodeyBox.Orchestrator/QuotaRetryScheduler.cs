@@ -772,8 +772,18 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _ => "work",
     };
 
-    private static string? RequiredCapabilityForRetry(WorkItem item) =>
-        NormalizeRetryFrom(item.QuotaRetryFrom) == "audit"
+    private static string? RequiredCapabilityForRetry(WorkItem item)
+    {
+        if (!string.IsNullOrWhiteSpace(item.QuotaRetryPhase))
+            return RequiredCapabilityForPhase(item.QuotaRetryPhase);
+
+        return NormalizeRetryFrom(item.QuotaRetryFrom) == "audit"
+            ? WellKnownCapabilities.Audit
+            : null;
+    }
+
+    private static string? RequiredCapabilityForPhase(string? phase) =>
+        string.Equals(phase?.Trim(), "audit", StringComparison.OrdinalIgnoreCase)
             ? WellKnownCapabilities.Audit
             : null;
 

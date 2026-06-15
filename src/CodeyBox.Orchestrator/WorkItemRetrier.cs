@@ -291,6 +291,7 @@ public sealed class WorkItemRetrier
             QuotaResetAt = null,
             NextQuotaRetryAt = null,
             QuotaRetryFrom = null,
+            QuotaRetryPhase = null,
             AgentPauseRetryFrom = null,
             StartedAt = null,
         };

@@ -94,6 +94,64 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         AssertQuotaAttempt(item, "periodic", "skipped:quota-still-gated", "WaitingForQuotaReset");
     }
 
+    [Fact]
+    public async Task PeriodicSweep_ReworkParkedItemUsesParkPhaseCapabilityNotAuditResumeSlot()
+    {
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "frontier",
+                    DisplayName = "Frontier",
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Codex,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 100,
+                            Capabilities = [WellKnownCapabilities.Audit],
+                        },
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Gemini,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 95,
+                        },
+                    ],
+                },
+            ],
+            [
+                new KindedStaticQuotaProbe(AgentKind.Codex, availablePct: 0),
+                new KindedStaticQuotaProbe(AgentKind.Gemini, availablePct: 100),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var fixture = BuildScheduler(router, BuildProjects());
+        var workBranch = "codeybox/rework-quota-phase";
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            BaseBranch = "main",
+            WorkBranch = workBranch,
+            QuotaRetryFrom = "audit",
+            QuotaRetryPhase = "rework",
+        };
+        await fixture.Store.CreateAsync(item);
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var repoId = await fixture.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(fixture.GitHost.GetRepoPath(repoId), workBranch);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WorkComplete, stored!.State);
+        Assert.Equal(1, stored.QuotaRetryAttempts);
+        Assert.Null(stored.QuotaRetryPhase);
+        Assert.Equal("from=audit", GetScalar<string>(
+            AssertQuotaAttempt(item, "periodic", "retried", "WaitingForQuotaReset"), "Reason"));
+    }
+
     [Theory]
     [MemberData(nameof(AuditOutcomeCases))]
     public async Task TryRetry_AuditLogsOutcomeForSkippedAndFailedBranches(

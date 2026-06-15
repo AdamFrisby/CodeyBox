@@ -12491,6 +12491,7 @@ Original merge-phase failure (for context):
         {
             NextQuotaRetryAt = effectiveResetAt,
             QuotaRetryFrom = RetryFromForQuotaPhase(phase),
+            QuotaRetryPhase = NormalizeQuotaRetryPhase(phase),
         };
 
         var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
@@ -12543,10 +12544,19 @@ Original merge-phase failure (for context):
     /// (<see cref="ResumeStateForTransientRetry"/>: <c>rework → WorkComplete</c>).
     /// Internal (not private) so the phase table is unit-testable directly.
     /// </summary>
-    internal static string RetryFromForQuotaPhase(string phase) => phase switch
+    internal static string RetryFromForQuotaPhase(string phase) => NormalizeQuotaRetryPhase(phase) switch
     {
         "audit" => "audit",
         "rework" => "audit",
+        "merge" => "merge",
+        "upstream" => "upstream",
+        _ => "work",
+    };
+
+    internal static string NormalizeQuotaRetryPhase(string phase) => phase.Trim().ToLowerInvariant() switch
+    {
+        "audit" => "audit",
+        "rework" => "rework",
         "merge" => "merge",
         "upstream" => "upstream",
         _ => "work",
