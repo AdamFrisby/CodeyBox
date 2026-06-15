@@ -82,7 +82,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly record struct MemberQuotaKey(string RouteKey, AgentKind Agent, string ModelId);
-    private sealed record QuotaRetryAdmission(string RouteKey, string ModelId, DateTimeOffset ExpiresAt);
+    private sealed record QuotaRetryAdmission(
+        string RouteKey,
+        string ModelId,
+        string? RequiredCapability,
+        DateTimeOffset ExpiresAt);
     private sealed record ExhaustionEntry(DateTimeOffset ExpiresAt);
     private sealed record PrecomputedQuota(AgentQuotaSnapshot Snapshot, BudgetAdjustedQuota Budgeted);
 
@@ -302,7 +306,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             commitDispatchSideEffects: true,
             requiredCapability: requiredCapability);
         if (decision.Chosen is { } chosen)
-            RecordQuotaRetryAdmission(item, chosen);
+            RecordQuotaRetryAdmission(item, chosen, requiredCapability);
 
         return new QuotaRetryRoutingDecision(
             decision.ShouldWait,
@@ -655,7 +659,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                         quota.AvailablePct);
                 }
 
-                if (commitDispatchSideEffects)
+                if (commitDispatchSideEffects && ShouldConsumeOnDispatch(quotaRetryAdmission))
                     ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
                 return new AgentRoutingDecision
                 {
@@ -674,7 +678,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         AgentRoutingDecision BuildPausedWaitDecision()
         {
-            if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
+            if (commitDispatchSideEffects
+                && quotaRetryAdmissionDeniedAfterProbe
+                && ShouldConsumeOnDispatch(quotaRetryAdmission))
                 ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
 
             var reason = $"all eligible members of class '{classId}' are paused by operator: "
@@ -701,7 +707,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (pausedRejected.Count > 0 && pausedRejected.Count == ordered.Count)
             return BuildPausedWaitDecision();
 
-        if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
+        if (commitDispatchSideEffects
+            && quotaRetryAdmissionDeniedAfterProbe
+            && ShouldConsumeOnDispatch(quotaRetryAdmission))
             ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
 
         // No member was chosen. Distinguish stall reasons so the caller picks
@@ -823,7 +831,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
                     item.Id, classId, fallback.Agent);
             }
-            if (commitDispatchSideEffects)
+            if (commitDispatchSideEffects && ShouldConsumeOnDispatch(quotaRetryAdmission))
                 ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
             return new AgentRoutingDecision
             {
@@ -1452,7 +1460,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
     }
 
-    private void RecordQuotaRetryAdmission(WorkItem item, AgentMembership member)
+    private void RecordQuotaRetryAdmission(WorkItem item, AgentMembership member, string? requiredCapability)
     {
         var nowUtc = _time.GetUtcNow();
         PruneExpiredQuotaRetryAdmissions(nowUtc);
@@ -1462,6 +1470,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var admission = new QuotaRetryAdmission(
             member.RouteKey,
             member.ModelId ?? string.Empty,
+            string.IsNullOrWhiteSpace(requiredCapability) ? null : requiredCapability,
             nowUtc + ttl);
         _quotaRetryAdmissions[item.Id] = admission;
     }
@@ -1492,6 +1501,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         => admission is not null
            && string.Equals(admission.RouteKey, member.RouteKey, StringComparison.OrdinalIgnoreCase)
            && string.Equals(admission.ModelId, member.ModelId ?? string.Empty, StringComparison.Ordinal);
+
+    // Capability-scoped admissions, currently audit retries, must survive the
+    // generic pickup route so the phase-specific resolver can use the bypass.
+    private static bool ShouldConsumeOnDispatch(QuotaRetryAdmission? admission)
+        => admission is not null && admission.RequiredCapability is null;
 
     public bool TryConsumeQuotaRetryAdmission(
         WorkItemId itemId,
