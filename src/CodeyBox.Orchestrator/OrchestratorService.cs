@@ -2599,17 +2599,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private void ScheduleDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken)
     {
+        // A concurrent pickup race can try to defer the same queued item from
+        // more than one worker. Keep one timer owner per item so stale duplicate
+        // retries do not amplify dispatcher wakeups or deferral backlog.
+        if (!_deferredItems.TryAdd(id, 0))
+            return;
+
         var count = Interlocked.Increment(ref _pendingDeferrals);
         if (count > DeferralWarningThreshold)
             _log.LogWarning(
                 "Deferred requeue backlog is {Count} items; deferrals may be sustained across many work items",
                 count);
-
-        // Mark the item as currently-deferred so the priority pickup query skips it
-        // while the Task.Delay is sleeping. Without this guard, every dispatch tick
-        // would re-pick the same Queued item, hit the same defer condition, and
-        // accumulate redundant deferral tasks.
-        _deferredItems[id] = 0;
 
         _ = Task.Run(async () =>
         {
