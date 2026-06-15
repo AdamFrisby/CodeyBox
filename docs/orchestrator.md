@@ -265,13 +265,18 @@ remain Queued and are picked up automatically on resume.
 ### API
 
 ```
-GET  /queue/status          → { state, pausedAt, pausedReason }
+GET  /queue/status          → { state, pausedAt, pausedReason, refactorGates }
 POST /queue/pause           body: { "reason": "..." }  → { state, pausedAt }
 POST /queue/resume          → { state }
 ```
 
 Operators must supply a non-empty reason when pausing. The reason is stored
 in the audit log and shown in the admin dashboard banner.
+
+`refactorGates` lists project-scoped refactor drains and locks. A
+`draining` entry means a queued refactor is holding fresh same-project
+non-refactor starts while existing in-flight work completes. A `locked`
+entry means the refactor itself is in flight.
 
 ### Webhook events
 

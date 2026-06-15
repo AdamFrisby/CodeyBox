@@ -49,6 +49,34 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task GetQueueStatus_IncludesRefactorDrainState()
+    {
+        var projectId = new ProjectId("proj");
+        var normal = MakeWorkItem(projectId) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+        };
+        await _factory.Store.CreateAsync(normal);
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var gate = Assert.Single(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+        Assert.Equal("proj", gate.GetProperty("projectId").GetString());
+        Assert.Equal("draining", gate.GetProperty("state").GetString());
+        Assert.Equal(refactor.Id.ToString(), gate.GetProperty("refactorWorkItemId").GetString());
+        Assert.Equal(1, gate.GetProperty("otherInFlight").GetInt32());
+        Assert.Contains("refactor drain", gate.GetProperty("reason").GetString() ?? "");
+    }
+
+    [Fact]
     public async Task PauseQueue_Returns200_AndStateIsPaused()
     {
         var resp = await _client.PostAsJsonAsync("/queue/pause", new { reason = "test pause" });
@@ -307,6 +335,15 @@ public sealed class QueueStatusHttpTests : IDisposable
         int Last24h,
         int CurrentlyInFlight,
         BudgetLimitsResponse? Limits);
+
+    private static WorkItem MakeWorkItem(ProjectId projectId) => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = projectId,
+        Title = "queue status",
+        Prompt = "do work",
+        State = WorkItemState.Queued,
+    };
 }
 
 /// <summary>

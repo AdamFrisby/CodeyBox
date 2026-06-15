@@ -733,6 +733,69 @@ public sealed class RefactorJobTypeTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task EligibleRefactorDrainsProjectBeforeHigherPriorityFreshNormalStarts()
+    {
+        var pid = "proj-refactor-drain";
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor Drain",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+
+        var pipeline = new PerItemReleasePipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 3 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMilliseconds(100),
+        });
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var inFlightNormal = MakeQueued(pid) with { Priority = 0 };
+        await _store.CreateAsync(inFlightNormal);
+        await queue.EnqueueAsync(inFlightNormal.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        await WaitForStartedAsync(_store, inFlightNormal.Id);
+
+        var refactor = MakeQueued(pid, JobType.Refactor) with { Priority = 0 };
+        var higherPriorityNormal = MakeQueued(pid) with { Priority = 100 };
+        await _store.CreateAsync(refactor);
+        await _store.CreateAsync(higherPriorityNormal);
+        await queue.EnqueueAsync(higherPriorityNormal.Id);
+        await queue.EnqueueAsync(refactor.Id);
+
+        await WaitForDeferredAsync(svc, refactor.Id);
+        await WaitForDeferredAsync(svc, higherPriorityNormal.Id);
+        Assert.Null((await _store.GetAsync(higherPriorityNormal.Id))!.StartedAt);
+
+        var draining = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
+        Assert.Equal("draining", draining.State);
+        Assert.Equal(refactor.Id, draining.RefactorWorkItemId);
+        Assert.Equal(1, draining.OtherInFlight);
+
+        pipeline.Release(inFlightNormal.Id);
+        await WaitForStartedAsync(_store, refactor.Id);
+        Assert.Null((await _store.GetAsync(higherPriorityNormal.Id))!.StartedAt);
+
+        var locked = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
+        Assert.Equal("locked", locked.State);
+        Assert.Equal(refactor.Id, locked.RefactorWorkItemId);
+
+        pipeline.Release(refactor.Id);
+        await WaitForStartedAsync(_store, higherPriorityNormal.Id);
+
+        pipeline.Release(higherPriorityNormal.Id);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static async Task WaitForStartedAsync(
@@ -896,6 +959,46 @@ public sealed class RefactorJobTypeTests : IDisposable
         {
             _entered?.TrySetResult(item.Id);
             try { await _releaseGate.WaitAsync(ct); }
+            catch (OperationCanceledException) { return; }
+            await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+        }
+    }
+
+    private sealed class PerItemReleasePipelineRunner : IPipelineRunner
+    {
+        private readonly IWorkItemStore _store;
+        private readonly Dictionary<WorkItemId, TaskCompletionSource> _releaseGates = [];
+        private readonly object _lock = new();
+
+        public PerItemReleasePipelineRunner(IWorkItemStore store) => _store = store;
+
+        public void Release(WorkItemId id)
+        {
+            TaskCompletionSource gate;
+            lock (_lock)
+            {
+                if (!_releaseGates.TryGetValue(id, out gate!))
+                {
+                    gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _releaseGates[id] = gate;
+                }
+            }
+            gate.TrySetResult();
+        }
+
+        public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+        {
+            TaskCompletionSource gate;
+            lock (_lock)
+            {
+                if (!_releaseGates.TryGetValue(item.Id, out gate!))
+                {
+                    gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _releaseGates[item.Id] = gate;
+                }
+            }
+
+            try { await gate.Task.WaitAsync(ct); }
             catch (OperationCanceledException) { return; }
             await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
         }

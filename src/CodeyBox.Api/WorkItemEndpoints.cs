@@ -1541,13 +1541,26 @@ internal static class WorkItemEndpoints
 
     // ── Queue control ─────────────────────────────────────────────────────────
 
-    private static IResult GetQueueStatusAsync(IQueueController queueController)
+    private static async Task<IResult> GetQueueStatusAsync(
+        IQueueController queueController,
+        OrchestratorService orchestrator,
+        CancellationToken ct)
     {
+        var refactorGates = await orchestrator.GetRefactorProjectGateStatusAsync(ct);
         return Results.Ok(new
         {
             state = queueController.State.ToString(),
             pausedAt = queueController.PausedAt,
             pausedReason = queueController.PausedReason,
+            refactorGates = refactorGates.Select(g => new
+            {
+                projectId = g.ProjectId.Value,
+                state = g.State,
+                refactorWorkItemId = g.RefactorWorkItemId.ToString(),
+                refactorInFlight = g.RefactorInFlight,
+                otherInFlight = g.OtherInFlight,
+                reason = g.Reason,
+            }),
         });
     }
 
