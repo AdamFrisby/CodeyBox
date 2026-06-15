@@ -575,6 +575,43 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         await fixture.Scheduler.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task StartAsync_HotEnableTransientRetry_RearmsPersistedTransientRetry()
+    {
+        var liveOptions = EnabledRetryOptions() with
+        {
+            Enabled = false,
+            PeriodicCheckInterval = TimeSpan.FromMinutes(10),
+        };
+        using var fixture = BuildScheduler(
+            liveOptions,
+            transientRetryOptionsAccessor: () => liveOptions);
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.StartAsync(CancellationToken.None);
+        await Task.Delay(250);
+
+        var stillParked = await fixture.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stillParked!.State);
+        Assert.Equal(0, stillParked.TransientRetryAttempts);
+
+        liveOptions = liveOptions with { Enabled = true };
+
+        var retried = await WaitForAsync(
+            async () => (await fixture.Store.GetAsync(item.Id))?.State == WorkItemState.Queued);
+        Assert.True(retried);
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(1, stored!.TransientRetryAttempts);
+        Assert.Equal(item.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
+
+        await fixture.Scheduler.StopAsync(CancellationToken.None);
+    }
+
     private SchedulerFixture BuildScheduler(
         AutoRetryOnTransientFailureOptions transientOptions,
         RecordingGitHost? gitHost = null,
@@ -582,7 +619,8 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Func<double>? jitterRandom = null,
         IProjectRepository? projects = null,
         bool includeProjects = true,
-        IWebhookDispatcher? webhooks = null)
+        IWebhookDispatcher? webhooks = null,
+        Func<AutoRetryOnTransientFailureOptions>? transientRetryOptionsAccessor = null)
     {
         var store = new SqliteWorkItemStore(Path.Combine(_workspace, $"state-{Guid.NewGuid():N}.db"));
         var queue = new InMemoryTaskQueue();
@@ -609,7 +647,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             queueController: queueController,
             webhooks: webhooks,
             timeProvider: _time,
-            transientRetryOptionsAccessor: () => transientOptions,
+            transientRetryOptionsAccessor: transientRetryOptionsAccessor ?? (() => transientOptions),
             jitterRandom: jitterRandom);
 
         return new SchedulerFixture(store, queue, scheduler);

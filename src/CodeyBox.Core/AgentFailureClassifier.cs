@@ -329,7 +329,7 @@ public static class AgentFailureClassifier
                 }
 
                 var message = ExtractTurnFailedMessage(root);
-                if (ContainsAny(message, TransientNetworkPatterns))
+                if (IsTurnFailedTransientNetworkMessage(message))
                     return true;
             }
             catch (JsonException)
@@ -366,5 +366,13 @@ public static class AgentFailureClassifier
         }
 
         return null;
+    }
+
+    private static bool IsTurnFailedTransientNetworkMessage(string? message)
+    {
+        if (ContainsAny(message, TransientNetworkPatterns))
+            return true;
+
+        return string.Equals(message?.Trim(), "timeout", StringComparison.OrdinalIgnoreCase);
     }
 }

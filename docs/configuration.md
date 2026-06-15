@@ -212,7 +212,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count after suspend-related transient exits. |
+| `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count for unknown failures with suspend-related exit codes. Classified transient-network failures use the durable scheduler instead. |
 | `AgentSessionResumeMaxAttempts` | `2` | CLI-native same-session resume attempts after a transient non-zero agent crash with a captured session id and a live sandbox including `/repo`. Set to `0` to disable session resume. |
 
 ---
@@ -507,7 +507,9 @@ the work branch.
 `CodeyBox:TransientNetworkFailurePatterns` appends extra classifier substrings
 without a rebuild. Built-in patterns deliberately avoid bare `timeout` so
 genuine build/test timeouts are not misclassified as retryable transport
-incidents.
+incidents. A parsed stream-json `turn.failed` event whose `error.message` is
+exactly `timeout` is the exception because that is provider transport metadata,
+not free-form build output.
 
 ---
 

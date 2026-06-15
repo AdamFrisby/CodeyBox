@@ -117,6 +117,8 @@ public sealed class AutoRetryOptionsFactoryTests
     [InlineData("bad", "00:00:01", 2, "00:00:02", 1, "00:01:00", "Full", "PeriodicCheckInterval")]
     [InlineData("00:00:01", "00:00:00", 2, "00:00:02", 1, "00:01:00", "Full", "BaseDelay")]
     [InlineData("00:00:01", "00:00:01", 0.5, "00:00:02", 1, "00:01:00", "Full", "Multiplier")]
+    [InlineData("00:00:01", "00:00:01", double.NaN, "00:00:02", 1, "00:01:00", "Full", "Multiplier")]
+    [InlineData("00:00:01", "00:00:01", double.PositiveInfinity, "00:00:02", 1, "00:01:00", "Full", "Multiplier")]
     [InlineData("00:00:01", "00:00:05", 2, "00:00:02", 1, "00:01:00", "Full", "MaxDelay")]
     [InlineData("00:00:01", "00:00:01", 2, "00:00:02", -1, "00:01:00", "Full", "MaxAutoRetriesPerWorkItem")]
     [InlineData("00:00:01", "00:00:01", 2, "00:00:02", 1, "00:00:00", "Full", "MaxElapsedTime")]
