@@ -77,6 +77,38 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task GetQueueStatus_ExcludesRefactorDrainWhenFreshNormalIsAheadInDispatchOrder()
+    {
+        var projectId = new ProjectId("proj");
+        var createdAt = DateTimeOffset.UtcNow.AddSeconds(-10);
+        var activeNormal = MakeWorkItem(projectId) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var higherPriorityNormal = MakeWorkItem(projectId) with
+        {
+            Priority = 100,
+            CreatedAt = createdAt,
+        };
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+            Priority = 0,
+            CreatedAt = createdAt.AddSeconds(1),
+        };
+        await _factory.Store.CreateAsync(activeNormal);
+        await _factory.Store.CreateAsync(higherPriorityNormal);
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Empty(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+    }
+
+    [Fact]
     public async Task GetQueueStatus_IncludesRefactorLockedState()
     {
         var projectId = new ProjectId("proj-locked");

@@ -2467,6 +2467,8 @@ builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
     sp => sp.GetRequiredService<OrchestratorService>());
+builder.Services.AddSingleton<IRefactorProjectDispatchGate>(
+    sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolHealthCoordinator(
     sp.GetRequiredService<OrchestratorService>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -2477,7 +2479,7 @@ builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolH
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<IAgentRoutingReadiness>(),
     sp.GetRequiredService<IAgentDispatchAvailability>(),
-    sp.GetRequiredService<IRefactorProjectGateStatusProvider>()));
+    sp.GetRequiredService<IRefactorProjectDispatchGate>()));
 builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
     sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>

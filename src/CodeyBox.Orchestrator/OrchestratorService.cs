@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler, IRefactorProjectGateStatusProvider
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler, IRefactorProjectGateStatusProvider, IRefactorProjectDispatchGate
 {
     // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -611,7 +611,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     public async Task<RefactorDispatchGateDecision> CheckRefactorDispatchGateAsync(
-        WorkItem candidate,
+        RefactorDispatchCandidate candidate,
         CancellationToken ct = default)
     {
         var activeClaims = await CollectActiveRefactorDrainClaimsAsync(ct);
@@ -1384,7 +1384,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
 
                 var olderRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
-                    candidate,
+                    RefactorDispatchCandidate.FromWorkItem(candidate),
                     stoppingToken);
                 if (olderRefactor is not null)
                 {
@@ -1495,6 +1495,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal void MarkDeferredForTest(WorkItemId id) =>
         _deferredItems[id] = new DeferredItemLease(0, DeferredItemKind.Generic);
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+    internal long? DeferredGenerationForTest(WorkItemId id) =>
+        _deferredItems.TryGetValue(id, out var lease) ? lease.Generation : null;
     internal bool IsActiveForTest(WorkItemId id) => _activeItems.ContainsKey(id);
     internal void SetLastSpawnAtForTest(DateTimeOffset at)
     {
@@ -2592,8 +2594,29 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             ? 0
             : 1;
 
+    private static int DispatchPhaseBucket(RefactorDispatchCandidate item) =>
+        item.State is WorkItemState.AuditPassed
+            or WorkItemState.Merging
+            or WorkItemState.Merged
+            or WorkItemState.UpstreamPushing
+            ? 0
+            : 1;
+
+    private static bool DispatchPrecedes(WorkItem left, RefactorDispatchCandidate right)
+    {
+        var leftBucket = DispatchPhaseBucket(left);
+        var rightBucket = DispatchPhaseBucket(right);
+        if (leftBucket != rightBucket)
+            return leftBucket < rightBucket;
+
+        if (left.Priority != right.Priority)
+            return left.Priority > right.Priority;
+
+        return left.CreatedAt < right.CreatedAt;
+    }
+
     private async Task<WorkItem?> FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
-        WorkItem candidate,
+        RefactorDispatchCandidate candidate,
         CancellationToken ct)
     {
         if (candidate.StartedAt is not null || candidate.JobType == JobType.Refactor)
@@ -2614,7 +2637,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 || refactorCandidate.ProjectId != candidate.ProjectId
                 || refactorCandidate.JobType != JobType.Refactor
                 || refactorCandidate.StartedAt is not null
-                || refactorCandidate.CreatedAt > candidate.CreatedAt)
+                || !DispatchPrecedes(refactorCandidate, candidate))
             {
                 continue;
             }
@@ -2632,10 +2655,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
             }
 
-            if (selected is null
-                || refactorCandidate.CreatedAt < selected.CreatedAt
-                || (refactorCandidate.CreatedAt == selected.CreatedAt
-                    && refactorCandidate.Priority > selected.Priority))
+            if (selected is null || DispatchPrecedes(refactorCandidate, RefactorDispatchCandidate.FromWorkItem(selected)))
             {
                 selected = refactorCandidate;
             }
@@ -2646,6 +2666,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private static string RefactorCandidateBlockedReason(
         WorkItem item,
+        int refactorInFlight,
+        int otherInFlight) =>
+        RefactorCandidateBlockedReason(
+            RefactorDispatchCandidate.FromWorkItem(item),
+            refactorInFlight,
+            otherInFlight);
+
+    private static string RefactorCandidateBlockedReason(
+        RefactorDispatchCandidate item,
         int refactorInFlight,
         int otherInFlight) =>
         refactorInFlight > 0
@@ -2839,7 +2868,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 return true;
             }
 
-            var olderRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(item, ct);
+            var olderRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+                RefactorDispatchCandidate.FromWorkItem(item),
+                ct);
             if (olderRefactor is null)
                 return false;
 

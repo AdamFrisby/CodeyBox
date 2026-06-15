@@ -9,10 +9,35 @@ public interface IRefactorProjectGateStatusProvider
 {
     Task<IReadOnlyList<RefactorProjectGateStatus>> GetRefactorProjectGateStatusAsync(
         CancellationToken ct = default);
+}
 
+/// <summary>
+/// Dispatch-health port for project-scoped refactor drain and lock decisions.
+/// </summary>
+public interface IRefactorProjectDispatchGate
+{
     Task<RefactorDispatchGateDecision> CheckRefactorDispatchGateAsync(
-        WorkItem candidate,
+        RefactorDispatchCandidate candidate,
         CancellationToken ct = default);
+}
+
+public sealed record RefactorDispatchCandidate(
+    WorkItemId Id,
+    ProjectId ProjectId,
+    JobType JobType,
+    WorkItemState State,
+    int Priority,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? StartedAt)
+{
+    public static RefactorDispatchCandidate FromWorkItem(WorkItem item) => new(
+        item.Id,
+        item.ProjectId,
+        item.JobType,
+        item.State,
+        item.Priority,
+        item.CreatedAt,
+        item.StartedAt);
 }
 
 public sealed record RefactorDispatchGateDecision(bool IsBlocked, string? Reason)

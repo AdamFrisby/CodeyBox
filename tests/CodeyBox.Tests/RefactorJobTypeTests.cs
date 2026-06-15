@@ -797,13 +797,13 @@ public sealed class RefactorJobTypeTests : IDisposable
     }
 
     [Fact]
-    public async Task BusyProjectOlderRefactorDrainsBeforeLaterHigherPriorityFreshNormals()
+    public async Task BusyProjectLowerPriorityRefactorDoesNotDrainBeforeHigherPriorityFreshNormal()
     {
-        var pid = "proj-refactor-drain-higher-priority";
+        var pid = "proj-refactor-drain-priority-order";
         var projectRepo = new InMemoryProjectRepository(new Project
         {
             Id = new ProjectId(pid),
-            DisplayName = "Refactor Drain Higher Priority",
+            DisplayName = "Refactor Drain Priority Order",
             RepositoryUrl = "https://github.com/test/repo",
         });
 
@@ -836,46 +836,25 @@ public sealed class RefactorJobTypeTests : IDisposable
             Priority = 0,
             CreatedAt = refactorCreatedAt,
         };
-        var laterHighPriorityNormal = MakeQueued(pid) with
+        var higherPriorityNormal = MakeQueued(pid) with
         {
             Priority = 100,
             CreatedAt = refactorCreatedAt.AddSeconds(1),
         };
         await _store.CreateAsync(refactor);
-        await _store.CreateAsync(laterHighPriorityNormal);
-        await queue.EnqueueAsync(laterHighPriorityNormal.Id);
+        await _store.CreateAsync(higherPriorityNormal);
         await queue.EnqueueAsync(refactor.Id);
+        await queue.EnqueueAsync(higherPriorityNormal.Id);
 
-        await WaitForDeferredAsync(svc, laterHighPriorityNormal.Id);
-        await WaitForDeferredAsync(svc, refactor.Id);
-        Assert.Null((await _store.GetAsync(laterHighPriorityNormal.Id))!.StartedAt);
+        await WaitForStartedAsync(_store, higherPriorityNormal.Id);
+        Assert.False(svc.IsDeferredForTest(higherPriorityNormal.Id));
+        Assert.Null((await _store.GetAsync(refactor.Id))!.StartedAt);
 
-        var postClaimHighPriorityNormal = MakeQueued(pid) with
-        {
-            Priority = 100,
-            CreatedAt = refactorCreatedAt.AddSeconds(2),
-        };
-        await _store.CreateAsync(postClaimHighPriorityNormal);
-        await queue.EnqueueAsync(postClaimHighPriorityNormal.Id);
-
-        await WaitForDeferredAsync(svc, postClaimHighPriorityNormal.Id);
-        Assert.Null((await _store.GetAsync(postClaimHighPriorityNormal.Id))!.StartedAt);
-
-        var draining = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
-        Assert.Equal("draining", draining.State);
-        Assert.Equal(refactor.Id, draining.RefactorWorkItemId);
-
+        pipeline.Release(higherPriorityNormal.Id);
         pipeline.Release(inFlightNormal.Id);
         await WaitForStartedAsync(_store, refactor.Id, timeoutSeconds: 30);
-        Assert.Null((await _store.GetAsync(laterHighPriorityNormal.Id))!.StartedAt);
-        Assert.Null((await _store.GetAsync(postClaimHighPriorityNormal.Id))!.StartedAt);
 
         pipeline.Release(refactor.Id);
-        await WaitForStartedAsync(_store, laterHighPriorityNormal.Id, timeoutSeconds: 30);
-        await WaitForStartedAsync(_store, postClaimHighPriorityNormal.Id, timeoutSeconds: 30);
-
-        pipeline.Release(laterHighPriorityNormal.Id);
-        pipeline.Release(postClaimHighPriorityNormal.Id);
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -1105,6 +1084,67 @@ public sealed class RefactorJobTypeTests : IDisposable
     }
 
     [Fact]
+    public async Task PartialDrainReleaseKeepsClaimedRefactorDeferredUntilFinalNormalCompletes()
+    {
+        var pid = "proj-refactor-partial-drain-wake";
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor Partial Drain Wake",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+
+        var pipeline = new PerItemReleasePipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMinutes(5),
+        });
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 3 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var normal1 = MakeQueued(pid);
+        var normal2 = MakeQueued(pid);
+        await _store.CreateAsync(normal1);
+        await _store.CreateAsync(normal2);
+        await queue.EnqueueAsync(normal1.Id);
+        await queue.EnqueueAsync(normal2.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        await WaitForStartedAsync(_store, normal1.Id);
+        await WaitForStartedAsync(_store, normal2.Id);
+
+        var refactor = MakeQueued(pid, JobType.Refactor) with { Priority = 100 };
+        await _store.CreateAsync(refactor);
+        await queue.EnqueueAsync(refactor.Id);
+        await WaitForDeferredAsync(svc, refactor.Id);
+        var initialGeneration = svc.DeferredGenerationForTest(refactor.Id);
+        Assert.NotNull(initialGeneration);
+
+        pipeline.Release(normal1.Id);
+        await WaitForConditionAsync(
+            () => svc.CurrentlyRunningTotal == 1,
+            "first normal did not leave the worker pool");
+        await Task.Delay(200);
+
+        Assert.Equal(initialGeneration, svc.DeferredGenerationForTest(refactor.Id));
+        Assert.Null((await _store.GetAsync(refactor.Id))!.StartedAt);
+
+        pipeline.Release(normal2.Id);
+        await WaitForStartedAsync(_store, refactor.Id, timeoutSeconds: 30);
+
+        pipeline.Release(refactor.Id);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task RefactorCompletionWakesHeldNormalWithoutWaitingForRecheckTimer()
     {
         var pid = "proj-refactor-normal-wake";
@@ -1231,7 +1271,7 @@ public sealed class RefactorJobTypeTests : IDisposable
     }
 
     [Fact]
-    public async Task DrainClaimPreservesFirstEligibleRefactorForProject()
+    public async Task DrainClaimUsesDispatchPriorityBeforeCreatedAtForRefactorOwner()
     {
         var pid = "proj-refactor-first-claim";
         var projectRepo = new InMemoryProjectRepository(new Project
@@ -1263,8 +1303,17 @@ public sealed class RefactorJobTypeTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
         await WaitForStartedAsync(_store, normal.Id);
 
-        var firstRefactor = MakeQueued(pid, JobType.Refactor) with { Priority = 10 };
-        var laterRefactor = MakeQueued(pid, JobType.Refactor) with { Priority = 0 };
+        var createdAt = DateTimeOffset.UtcNow.AddSeconds(-10);
+        var firstRefactor = MakeQueued(pid, JobType.Refactor) with
+        {
+            Priority = 10,
+            CreatedAt = createdAt,
+        };
+        var laterRefactor = MakeQueued(pid, JobType.Refactor) with
+        {
+            Priority = 100,
+            CreatedAt = createdAt.AddSeconds(1),
+        };
         await _store.CreateAsync(firstRefactor);
         await _store.CreateAsync(laterRefactor);
         await queue.EnqueueAsync(laterRefactor.Id);
@@ -1275,7 +1324,7 @@ public sealed class RefactorJobTypeTests : IDisposable
 
         var gate = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
         Assert.Equal("draining", gate.State);
-        Assert.Equal(firstRefactor.Id, gate.RefactorWorkItemId);
+        Assert.Equal(laterRefactor.Id, gate.RefactorWorkItemId);
 
         pipelineGate.TrySetResult();
         await svc.StopAsync(CancellationToken.None);
@@ -1566,6 +1615,21 @@ public sealed class RefactorJobTypeTests : IDisposable
         }
         throw new InvalidOperationException(
             $"Work item {id} was not deferred within {timeoutSeconds}s");
+    }
+
+    private static async Task WaitForConditionAsync(
+        Func<bool> predicate,
+        string failureMessage,
+        int timeoutSeconds = 10)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(timeoutSeconds);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (predicate()) return;
+            await Task.Delay(25);
+        }
+
+        throw new InvalidOperationException(failureMessage);
     }
 
     private sealed class BarrierProjectRepository : IProjectRepository
