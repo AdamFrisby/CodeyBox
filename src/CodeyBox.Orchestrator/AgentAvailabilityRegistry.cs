@@ -505,7 +505,8 @@ public enum SmokeExclusionSource
 
     /// <summary>
     /// Runtime auth/login prompt detected from authoritative real agent output,
-    /// or stdout-only output corroborated by an in-VM persistent smoke failure.
+    /// phase-authoritative stdout, or stdout-only output corroborated by an in-VM
+    /// persistent smoke failure.
     /// Tracked outside the smoke gate so a deployment with
     /// <c>CodeyBox:Smoke:Enabled=false</c> still benches an unauthenticated
     /// agent when the non-model-controlled stream proves the CLI printed an

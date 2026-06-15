@@ -2461,7 +2461,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     var emittingAgent = resolveResult.LastAttemptedRunner?.Kind ?? runner.Kind;
                     await ThrowIfAuthRequiredOutputAsync(
                         item, project, emittingAgent, "rebase-resolver",
-                        resolveResult.Stdout, resolveResult.Stderr, ct);
+                        resolveResult.Stdout, resolveResult.Stderr,
+                        benchStdoutOnlyEvidence: true,
+                        ct: ct);
 
                     if (candidateResult is { HasTransientlyUnavailableStrongerAgent: true })
                     {
@@ -4391,7 +4393,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // failure — the broken agent stays routable. Inspect aggregated stdout
         // (covers both streamed chunks and the final payload) so the auth
         // breaker fires regardless of result.Success.
-        await ThrowIfAuthRequiredOutputAsync(item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr, ct);
+        await ThrowIfAuthRequiredOutputAsync(
+            item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
+            benchStdoutOnlyEvidence: true,
+            ct: ct);
 
         if (!result.Success)
         {
@@ -4890,7 +4895,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // prompt during post-act re-validation would otherwise reach the
         // verdict parser as a malformed payload, leaving the unauthenticated
         // agent routable for the next item.
-        await ThrowIfAuthRequiredOutputAsync(item, project, agentRunner.Kind, "post-act-recheck", aggregatedStdout, result.Stderr, ct);
+        await ThrowIfAuthRequiredOutputAsync(
+            item, project, agentRunner.Kind, "post-act-recheck", aggregatedStdout, result.Stderr,
+            benchStdoutOnlyEvidence: true,
+            ct: ct);
 
         if (!result.Success)
         {
@@ -5245,6 +5253,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? stdout,
         string? stderr,
         bool throwOnMatch,
+        bool benchStdoutOnlyEvidence,
         CancellationToken ct = default)
     {
         var detection = _authFailureClassifier.DetectDetailed(agent, stderr, stdout);
@@ -5259,6 +5268,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             detection.Classification,
             throwOnMatch,
             detection.IsStdoutOnly,
+            benchStdoutOnlyEvidence,
             ct);
     }
 
@@ -5270,14 +5280,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentFailureClassification classification,
         bool throwOnMatch,
         bool stdoutOnlyEvidence = false,
+        bool benchStdoutOnlyEvidence = false,
         CancellationToken ct = default)
     {
         if (classification.Kind != AgentFailureKind.AuthRequired)
             return false;
 
-        var shouldBenchAgent = !stdoutOnlyEvidence;
+        var shouldBenchAgent = !stdoutOnlyEvidence || benchStdoutOnlyEvidence;
         string? corroborationReason = null;
-        if (stdoutOnlyEvidence)
+        if (stdoutOnlyEvidence && !benchStdoutOnlyEvidence)
         {
             var corroboration = await TryCorroborateStdoutAuthAsync(item, project, agent, phase, ct);
             shouldBenchAgent = corroboration.Corroborated;
@@ -5288,7 +5299,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (stdoutOnlyEvidence)
         {
             reasonDetail = shouldBenchAgent
-                ? $"{reasonDetail}; stdout corroborated by in-VM smoke: {corroborationReason ?? "persistent failure"}"
+                ? benchStdoutOnlyEvidence
+                    ? $"{reasonDetail}; stdout accepted as control-phase CLI output"
+                    : $"{reasonDetail}; stdout corroborated by in-VM smoke: {corroborationReason ?? "persistent failure"}"
                 : $"{reasonDetail}; stdout-only evidence was not corroborated by in-VM smoke, so the agent was not globally benched ({corroborationReason ?? "no corroboration"})";
         }
 
@@ -5394,10 +5407,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         string? stdout,
         string? stderr,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool benchStdoutOnlyEvidence = false)
     {
         return HandleAuthRequiredOutputAsync(
-            item, project, agent, phase, stdout, stderr, throwOnMatch: true, ct: ct);
+            item, project, agent, phase, stdout, stderr,
+            throwOnMatch: true,
+            benchStdoutOnlyEvidence: benchStdoutOnlyEvidence,
+            ct: ct);
     }
 
     private Task ThrowIfAuthRequiredOutputAsync(
@@ -5406,8 +5423,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentKind agent,
         string phase,
         AgentResult result,
-        CancellationToken ct = default)
-        => ThrowIfAuthRequiredOutputAsync(item, project, agent, phase, result.Stdout, result.Stderr, ct);
+        CancellationToken ct = default,
+        bool benchStdoutOnlyEvidence = false)
+        => ThrowIfAuthRequiredOutputAsync(
+            item, project, agent, phase, result.Stdout, result.Stderr,
+            benchStdoutOnlyEvidence: benchStdoutOnlyEvidence,
+            ct: ct);
 
     private async Task HandleAgenticResolverAuthRequiredOutputAsync(
         WorkItem item,
@@ -5420,7 +5441,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (authFailures.Count == 0)
         {
             var emittingAgent = result.LastAttemptedRunner?.Kind ?? result.ChosenRunner?.Kind ?? item.Agent ?? project.DefaultAgent;
-            await ThrowIfAuthRequiredOutputAsync(item, project, emittingAgent, phase, result.Stdout, result.Stderr, ct);
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, emittingAgent, phase, result.Stdout, result.Stderr,
+                benchStdoutOnlyEvidence: true,
+                ct: ct);
             return;
         }
 
@@ -5440,7 +5464,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 failure.Classification,
                 throwOnMatch,
                 failure.StdoutOnlyEvidence,
-                ct);
+                benchStdoutOnlyEvidence: true,
+                ct: ct);
         }
     }
 
@@ -5459,6 +5484,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             evidence.Classification,
             throwOnMatch: false,
             stdoutOnlyEvidence: evidence.StdoutOnlyEvidence,
+            benchStdoutOnlyEvidence: true,
             ct: ct);
     }
 
@@ -8337,7 +8363,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return;
 
         await ThrowIfAuthRequiredOutputAsync(
-            item, project, run.Runner.Kind, $"audit:{run.Auditor.Name}", stdout, stderr, ct);
+            item, project, run.Runner.Kind, $"audit:{run.Auditor.Name}", stdout, stderr,
+            benchStdoutOnlyEvidence: true,
+            ct: ct);
     }
 
     private async Task ThrowIfAuditorRunQuotaAsync(
@@ -10912,10 +10940,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
             LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
             if (agentResult.Success)
-                await ThrowIfAuthRequiredOutputAsync(item, project, chosenMergeRunner.Kind, "merge", agentResult, ct);
+                await ThrowIfAuthRequiredOutputAsync(
+                    item, project, chosenMergeRunner.Kind, "merge", agentResult,
+                    benchStdoutOnlyEvidence: true,
+                    ct: ct);
             if (!agentResult.Success)
             {
-                await ThrowIfAuthRequiredOutputAsync(item, project, chosenMergeRunner.Kind, "merge", agentResult, ct);
+                await ThrowIfAuthRequiredOutputAsync(
+                    item, project, chosenMergeRunner.Kind, "merge", agentResult,
+                    benchStdoutOnlyEvidence: true,
+                    ct: ct);
 
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
@@ -12805,7 +12839,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // the unauthenticated agent routable. Detection runs before the
             // semantic-incompatible branch so an auth break is always reported
             // as the breaking signal, not as the agent's own reasoned refusal.
-            await ThrowIfAuthRequiredOutputAsync(item, project, runner.Kind, ConflictReworkPhaseKey, agentResult, ct);
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, runner.Kind, ConflictReworkPhaseKey, agentResult,
+                benchStdoutOnlyEvidence: true,
+                ct: ct);
             if (semanticIncompatible is not null)
             {
                 return new ConflictReworkAgentOutcome(

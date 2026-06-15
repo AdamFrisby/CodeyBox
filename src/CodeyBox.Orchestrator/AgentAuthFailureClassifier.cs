@@ -21,9 +21,10 @@ public interface IAgentAuthFailureClassifier
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
     /// the evidence. Stderr is treated as CLI diagnostics and matched by
-    /// substring. Stdout is still scanned for operator extensibility, but
-    /// stdout-only detections require pipeline-level corroboration before a
-    /// global auth bench is applied.
+    /// substring. Stdout is still scanned for operator extensibility. Pipeline
+    /// call sites decide whether stdout-only detections are authoritative for
+    /// that phase or require in-VM corroboration before a global auth bench is
+    /// applied.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }
@@ -129,7 +130,8 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
 /// Raised when a real agent invocation emitted an interactive login prompt.
 /// The pipeline catches this as infrastructure/auth failure instead of letting
 /// exit-0/no-diff output masquerade as a normal no-change result. Global
-/// benching is applied only when the evidence is authoritative or corroborated.
+/// benching is applied when the evidence is authoritative for the phase or
+/// corroborated by an in-VM probe.
 /// </summary>
 public sealed class AgentAuthRequiredException : Exception
 {
