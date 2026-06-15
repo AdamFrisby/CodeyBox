@@ -5428,8 +5428,11 @@ public sealed class PipelineRunner : IPipelineRunner
             return false;
 
         var iterations = await _store.GetIterationsAsync(item.Id, ct);
-        if (iterations.Any(i => i.Iteration == startIteration))
+        if (iterations.Any(i => i.Iteration == startIteration)
+            && await HasCompletedAuditReworkAsync(item, startIteration, ct))
+        {
             return false;
+        }
 
         var findings = last.Findings
             .Select(ToAuditFinding)
@@ -5442,6 +5445,51 @@ public sealed class PipelineRunner : IPipelineRunner
         return await RunAuditReworkAsync(
             item, project, runner, repoId, baseBranch, workBranch,
             findings, last.Iteration, startIteration, maxIterations, ct, hostShutdownToken);
+    }
+
+    private async Task<bool> HasCompletedAuditReworkAsync(
+        WorkItem item,
+        int reworkIterationNumber,
+        CancellationToken ct)
+    {
+        if (_involvement is null)
+        {
+            _log.LogInformation(
+                "Work item {Id} has dispatch row for audit rework iteration {Iteration}, but no involvement store is wired; re-running rework to avoid treating an incomplete quota/infra attempt as progress",
+                item.Id,
+                reworkIterationNumber);
+            return false;
+        }
+
+        IReadOnlyList<AgentInvolvement> rows;
+        try
+        {
+            rows = await _involvement.ListByWorkItemAsync(item.Id, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Could not verify completed audit rework iteration {Iteration} for work item {Id}; re-running rework rather than skipping on a dispatch row alone",
+                reworkIterationNumber,
+                item.Id);
+            return false;
+        }
+
+        var completed = rows.Any(row =>
+            string.Equals(row.Phase, "rework", StringComparison.Ordinal)
+            && row.Iteration == reworkIterationNumber
+            && string.Equals(row.Outcome, "success", StringComparison.Ordinal)
+            && row.EndedAt is not null);
+        if (!completed)
+        {
+            _log.LogInformation(
+                "Work item {Id} has dispatch row for audit rework iteration {Iteration}, but no completed rework involvement; re-running before the next audit iteration",
+                item.Id,
+                reworkIterationNumber);
+        }
+
+        return completed;
     }
 
     private async Task<bool> RunAuditReworkAsync(
@@ -6854,7 +6902,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     ModelId = ResolveObservedModelId(workRunner, modelId: null),
                     QualityScore = 100,
                 };
-                if (IsRouterCachedExhausted(workMember))
+                if (IsRouterCachedExhausted(item.Id, workMember))
                 {
                     _log.LogInformation(
                         "Audit-capable work agent '{WorkKind}' rejected (router cache: exhausted) for auditor '{Auditor}'; spilling to audit pool",
@@ -6955,7 +7003,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var preferredOk = false;
         string? preferredReason = null;
         string? preferredPauseReason = null;
-        var preferredCachedExhausted = IsRouterCachedExhausted(preferredMember);
+        var preferredCachedExhausted = IsRouterCachedExhausted(item.Id, preferredMember);
 
         if (preferredCachedExhausted)
         {
@@ -7219,7 +7267,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 ModelId = ResolveObservedModelId(workRunner, modelId: null),
                 QualityScore = 100,
             };
-            if (IsRouterCachedExhausted(workMember))
+            if (IsRouterCachedExhausted(item.Id, workMember))
             {
                 _log.LogInformation(
                     "Audit-capable work agent '{WorkKind}' rejected (router cache: exhausted) for auditor '{Auditor}'; spilling to audit pool",
@@ -7454,9 +7502,11 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/> already
     /// applies the same gate for its candidates.
     /// </summary>
-    private bool IsRouterCachedExhausted(AgentMembership? member)
+    private bool IsRouterCachedExhausted(WorkItemId itemId, AgentMembership? member)
     {
         if (_classRouter is null || member is null)
+            return false;
+        if (_classRouter.HasQuotaRetryAdmission(itemId, member, _opts.TimeProvider.GetUtcNow()))
             return false;
         return _classRouter.IsExhausted(member, _opts.TimeProvider.GetUtcNow());
     }

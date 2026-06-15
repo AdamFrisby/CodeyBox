@@ -1126,6 +1126,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var nowUtc = _time.GetUtcNow();
         PruneExpiredExhaustion(nowUtc);
+        var quotaRetryAdmission = GetQuotaRetryAdmission(item.Id, nowUtc);
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
 
         // Score + order the eligible, non-exhausted members first. Availability
@@ -1138,7 +1139,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 x.Member,
                 item.RequiredCapabilities,
                 effectiveCapabilities))
-            .Where(x => !IsExhausted(x.Member, nowUtc))
+            .Where(x => QuotaRetryAdmissionMatches(quotaRetryAdmission, x.Member)
+                || !IsExhausted(x.Member, nowUtc))
             .Select(x => new
             {
                 x.Member,

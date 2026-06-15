@@ -457,6 +457,68 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditDrivenRework_QuotaRetryRerunsReworkWhenOnlyDispatchRowExists()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            useClassRouter: false,
+            wireAuditProgress: true);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            AgentClassId = null,
+        };
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.Contains(await fix.Store.GetIterationsAsync(item.Id), i => i.Iteration == 2);
+        Assert.DoesNotContain(
+            await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "success");
+
+        var retrier = new WorkItemRetrier(
+            fix.Store,
+            new InMemoryTaskQueue(),
+            fix.GitHost,
+            NullLogger<WorkItemRetrier>.Instance,
+            auditProgress: fix.Store);
+        var retry = await retrier.RetryAsync(parked, from: "audit", trigger: "test-quota-return");
+        Assert.True(retry.Success, retry.Error);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
+        var resumed = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(resumed);
+        await fix.Pipeline.RunAsync(resumed!, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(rows, r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "failure:quota");
+        Assert.Contains(rows, r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "success");
+
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = fix.GitHost.GetRepoPath(repoId);
+        var (_, contents, _) = await TestSupport.RunGit(bareRepo, "show", $"{final.WorkBranch}:a.txt");
+        Assert.Equal("reworked", contents);
+    }
+
+    [Fact]
     public async Task Claude_RateLimitEventStdout_FallsBackToPeerWithinClass_SameIteration()
     {
         // The exact regression that prompted the mid-rework Claude 5h-window
@@ -1797,7 +1859,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         AgentQuotaSnapshot? codexQuotaSnapshot = null,
         AgentQuotaSnapshot? claudeQuotaSnapshot = null,
         bool singleMemberClass = false,
-        IQuotaFailureStore? quotaFailures = null)
+        IQuotaFailureStore? quotaFailures = null,
+        bool wireAuditProgress = false)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1886,6 +1949,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
             quotaFailures: quotaFailures,
             involvement: involvementForPipeline,
+            auditProgress: wireAuditProgress ? store : null,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: inVmSmokeGate is null
                 ? null

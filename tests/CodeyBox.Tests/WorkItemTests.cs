@@ -68,4 +68,53 @@ public sealed class WorkItemTests
         Assert.Null(requeued.WorkBranch);
         Assert.False(requeued.PreserveWorkBranchOnQueuedPickup);
     }
+
+    [Fact]
+    public void With_WaitingForQuotaResetPreservesRetryPhase()
+    {
+        var resetAt = DateTimeOffset.UtcNow.AddMinutes(10);
+        var item = Sample() with
+        {
+            State = WorkItemState.Auditing,
+            FailureKind = "quota",
+            QuotaResetAt = resetAt,
+            NextQuotaRetryAt = resetAt,
+            QuotaRetryFrom = "audit",
+            QuotaRetryPhase = "rework",
+        };
+
+        var waiting = item.With(
+            WorkItemState.WaitingForQuotaReset,
+            "quota",
+            failureKind: "quota",
+            quotaResetAt: resetAt);
+
+        Assert.Equal("quota", waiting.FailureKind);
+        Assert.Equal(resetAt, waiting.QuotaResetAt);
+        Assert.Equal(resetAt, waiting.NextQuotaRetryAt);
+        Assert.Equal("audit", waiting.QuotaRetryFrom);
+        Assert.Equal("rework", waiting.QuotaRetryPhase);
+    }
+
+    [Fact]
+    public void With_NonQuotaTransitionClearsRetryPhase()
+    {
+        var item = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaResetAt = DateTimeOffset.UtcNow.AddMinutes(10),
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddMinutes(10),
+            QuotaRetryFrom = "audit",
+            QuotaRetryPhase = "rework",
+        };
+
+        var queued = item.With(WorkItemState.Queued);
+
+        Assert.Null(queued.FailureKind);
+        Assert.Null(queued.QuotaResetAt);
+        Assert.Null(queued.NextQuotaRetryAt);
+        Assert.Null(queued.QuotaRetryFrom);
+        Assert.Null(queued.QuotaRetryPhase);
+    }
 }

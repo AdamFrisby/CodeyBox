@@ -152,6 +152,58 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             AssertQuotaAttempt(item, "periodic", "retried", "WaitingForQuotaReset"), "Reason"));
     }
 
+    [Fact]
+    public async Task RearmTimers_AuditParkedItemPassesAuditCapabilityToStartupPreflight()
+    {
+        var router = new RecordingQuotaRetryRouter
+        {
+            ResolveDecision = new QuotaRetryRoutingDecision(
+                ShouldWait: false,
+                NoEligibleMembers: false,
+                Reason: "audit admission"),
+        };
+        using var fixture = BuildScheduler(router, BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            QuotaRetryFrom = "audit",
+            QuotaRetryPhase = "audit",
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RearmTimersAsync(fixture.Scheduler);
+
+        Assert.Contains(WellKnownCapabilities.Audit, router.ResolveRequiredCapabilities);
+    }
+
+    [Fact]
+    public async Task NotifyQuotaFailure_AuditParkedItemComputesResetFromAuditScopedPool()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var auditReset = now.AddMinutes(7);
+        var genericReset = now.AddHours(1);
+        var router = new RecordingQuotaRetryRouter
+        {
+            AuditResetAt = auditReset,
+            GenericResetAt = genericReset,
+        };
+        using var fixture = BuildScheduler(router, BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            QuotaRetryFrom = "audit",
+            QuotaRetryPhase = "audit",
+            NextQuotaRetryAt = null,
+            QuotaResetAt = null,
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.NotifyQuotaFailureAsync(item);
+
+        Assert.Contains(WellKnownCapabilities.Audit, router.ResetRequiredCapabilities);
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(auditReset.AddMinutes(2), stored!.NextQuotaRetryAt);
+    }
+
     [Theory]
     [MemberData(nameof(AuditOutcomeCases))]
     public async Task TryRetry_AuditLogsOutcomeForSkippedAndFailedBranches(
@@ -986,6 +1038,39 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             CancellationToken ct,
             string? requiredCapability = null)
             => Task.FromResult<DateTimeOffset?>(null);
+    }
+
+    private sealed class RecordingQuotaRetryRouter : IQuotaRetryRouter
+    {
+        public QuotaRetryRoutingDecision ResolveDecision { get; init; } =
+            new(ShouldWait: false, NoEligibleMembers: false, Reason: "test");
+
+        public DateTimeOffset? AuditResetAt { get; init; }
+        public DateTimeOffset? GenericResetAt { get; init; }
+        public List<string?> ResolveRequiredCapabilities { get; } = [];
+        public List<string?> ResetRequiredCapabilities { get; } = [];
+
+        public Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null)
+        {
+            ResolveRequiredCapabilities.Add(requiredCapability);
+            return Task.FromResult(ResolveDecision);
+        }
+
+        public Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null)
+        {
+            ResetRequiredCapabilities.Add(requiredCapability);
+            return Task.FromResult(string.Equals(requiredCapability, WellKnownCapabilities.Audit, StringComparison.Ordinal)
+                ? AuditResetAt
+                : GenericResetAt);
+        }
     }
 
     private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher

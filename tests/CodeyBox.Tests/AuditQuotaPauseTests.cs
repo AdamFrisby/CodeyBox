@@ -593,6 +593,54 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditPass_QuotaRetryAdmissionBypassesStaleInProcessExhaustionBeforePass()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RoutingLlmAuditor("bugs:llm-review", inv =>
+            inv.CallNumber == 1 ? QuotaResult() : new AuditResult(true, []));
+
+        using var fix = BuildFixture(seed, auditor, [AgentKind.Gemini]);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+
+        var member = Assert.Single(fix.Router.GetClassMembers("frontier"), m => m.Agent == AgentKind.Gemini);
+        Assert.True(
+            fix.Router.IsExhausted(member, fix.Time.UtcNow),
+            "the retry admission must bypass the still-live in-process exhaustion cache");
+
+        var retryDecision = await fix.Router.ResolveQuotaRetryAsync(
+            parked,
+            project: null,
+            CancellationToken.None,
+            WellKnownCapabilities.Audit);
+        Assert.False(retryDecision.ShouldWait, retryDecision.Reason);
+        Assert.False(retryDecision.NoEligibleMembers, retryDecision.Reason);
+
+        var (retrySuccess, retryError, _, _, _) = await fix.Retrier.RetryAsync(
+            parked, from: "audit", trigger: "test-quota-return", CancellationToken.None);
+        Assert.True(retrySuccess, retryError);
+
+        var resumed = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+
+        await fix.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini, AgentKind.Gemini], auditor.Invocations);
+    }
+
+    [Fact]
     public async Task AuditPass_QuotaRetryAdmissionBypassesRecentObservedFailureForEveryResolvedAuditor()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
