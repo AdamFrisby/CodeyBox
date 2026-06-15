@@ -275,9 +275,9 @@ in the audit log and shown in the admin dashboard banner.
 
 `refactorGates` lists project-scoped refactor drains and locks. A
 `draining` entry means a queued refactor has reached its normal dispatch turn
-for that project and is holding lower-priority fresh same-project starts while
-existing in-flight work completes. A `locked` entry means the refactor itself
-is in flight.
+for that project and is holding all fresh same-project non-refactor starts,
+including later higher-priority items, while existing in-flight work completes.
+A `locked` entry means the refactor itself is in flight.
 
 ### Webhook events
 
