@@ -2249,6 +2249,12 @@ builder.Services.AddSingleton<ICheckAndActCompletionRunner>(sp =>
         sp.GetRequiredService<CheckAndActCompletionOptions>(),
         sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>()));
 
+builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp => new WorkItemTerminalTransition(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<ILogger<WorkItemTerminalTransition>>()));
+
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -2315,7 +2321,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sessionHandleSnapshot: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>() is { } worker
         ? worker.SnapshotPersistedHandle
         : null,
-    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>()));
+    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>(),
+    terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2351,7 +2358,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.MaxElapsedTime,
             current.JitterMode);
     },
-    quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
+    quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
+    terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>()));
 builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>

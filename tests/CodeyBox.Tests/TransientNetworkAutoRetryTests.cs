@@ -612,6 +612,42 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         await fixture.Scheduler.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task StartAsync_HotEnableTransientRetry_SchedulesParkedTransientRetryWithoutTimestamp()
+    {
+        var liveOptions = EnabledRetryOptions() with
+        {
+            Enabled = false,
+            PeriodicCheckInterval = TimeSpan.FromMinutes(10),
+            BaseDelay = TimeSpan.FromSeconds(30),
+        };
+        using var fixture = BuildScheduler(
+            liveOptions,
+            transientRetryOptionsAccessor: () => liveOptions);
+        var item = NewTransientItem() with { NextTransientRetryAt = null };
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.StartAsync(CancellationToken.None);
+        await Task.Delay(250);
+
+        var stillUnscheduled = await fixture.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stillUnscheduled!.State);
+        Assert.Null(stillUnscheduled.NextTransientRetryAt);
+
+        liveOptions = liveOptions with { Enabled = true };
+
+        var scheduled = await WaitForAsync(
+            async () => (await fixture.Store.GetAsync(item.Id))?.NextTransientRetryAt is not null);
+        Assert.True(scheduled);
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(30), stored.NextTransientRetryAt);
+
+        await fixture.Scheduler.StopAsync(CancellationToken.None);
+    }
+
     private SchedulerFixture BuildScheduler(
         AutoRetryOnTransientFailureOptions transientOptions,
         RecordingGitHost? gitHost = null,

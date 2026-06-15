@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
@@ -55,6 +56,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly ProjectAuditorComposer _auditorComposer;
     private readonly IWorkItemStore _store;
     private readonly IWebhookDispatcher _webhooks;
+    private readonly IWorkItemTerminalTransition _terminalTransitions;
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
     private readonly CredentialSmokeGate? _smokeGate;
@@ -271,7 +273,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // when no snapshotting is needed (or in tests that don't assert on
         // the persisted shape).
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null,
-        CancellationRegistry? cancellationRegistry = null)
+        CancellationRegistry? cancellationRegistry = null,
+        IWorkItemTerminalTransition? terminalTransitions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -283,6 +286,12 @@ public sealed class PipelineRunner : IPipelineRunner
         _auditorComposer = auditorComposer;
         _store = store;
         _webhooks = webhooks;
+        _terminalTransitions = terminalTransitions
+            ?? new WorkItemTerminalTransition(
+                store,
+                webhooks,
+                projects,
+                NullLogger<WorkItemTerminalTransition>.Instance);
         _opts = opts;
         _timings = timingStore;
         _costStore = costStore;
@@ -13168,28 +13177,7 @@ Original merge-phase failure (for context):
     /// return null so the existing payload shape is unchanged.
     /// </summary>
     internal async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
-    {
-        if (!WorkItemDependencies.TerminalStates.Contains(item.State)) return null;
-        var iterations = await _store.GetIterationsAsync(item.Id, ct);
-        // Pick the row with the largest iteration number — i.e. the last
-        // iteration that actually ran. Using .Max(i => i.PromptRevisionAtDispatch)
-        // would only agree when iteration numbers and recorded revisions are
-        // monotonic; future out-of-order or backfilled dispatch rows could
-        // diverge from "the revision attributed to the LAST iteration."
-        int? lastDispatched = iterations.Count == 0
-            ? null
-            : iterations.OrderByDescending(i => i.Iteration).First().PromptRevisionAtDispatch;
-        // RevisionMatches is null when no iteration was ever dispatched (e.g.
-        // the item failed during dependency resolution before any work began).
-        // Returning `false` here would tell a tracker like JobTrack that the
-        // agent finished against a stale prompt, prompting a spurious one-click
-        // re-run for an item that never actually ran. The contract is:
-        // null ↔ RevisionAtCompletion null.
-        return new TerminalRevisionDetails(
-            PromptRevision: item.PromptRevision,
-            RevisionAtCompletion: lastDispatched,
-            RevisionMatches: lastDispatched is { } r ? r == item.PromptRevision : null);
-    }
+        => await _terminalTransitions.BuildTerminalRevisionAsync(item, ct);
 
     /// <summary>
     /// Best-effort cost summary lookup for webhook usage blocks. Returns null
@@ -13219,35 +13207,30 @@ Original merge-phase failure (for context):
         await RunBoundedPostAgentAsync(item.Id, "transition-failed", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
-            WorkItem next;
+            DateTimeOffset? effectiveQuotaResetAt = quotaResetAt;
             if (failureKind == "quota")
             {
                 var phase = PhaseForQuotaPark(current.State);
-                var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(
+                effectiveQuotaResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(
                     current,
                     project,
                     quotaResetAt,
                     phase,
                     transitionCt);
-                next = current.With(WorkItemState.Failed, error,
-                    failureKind: failureKind,
-                    quotaResetAt: effectiveResetAt,
-                    cancellationSource: cancellationSource) with
-                {
-                    NextQuotaRetryAt = effectiveResetAt,
-                };
-            }
-            else
-            {
-                next = current.With(WorkItemState.Failed, error,
-                    failureKind: failureKind,
-                    quotaResetAt: quotaResetAt,
-                    cancellationSource: cancellationSource);
             }
 
-            // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
-            var updated = await _store.TryUpdateIfStateAsync(next, current.State, transitionCt);
-            if (!updated)
+            var transition = await _terminalTransitions.TransitionFailedAsync(
+                current,
+                error,
+                new WorkItemTerminalFailureTransitionOptions
+                {
+                    Project = project,
+                    FailureKind = failureKind,
+                    QuotaResetAt = effectiveQuotaResetAt,
+                    CancellationSource = cancellationSource,
+                },
+                transitionCt);
+            if (!transition.Updated || transition.FailedWorkItem is not { } next)
             {
                 _log.LogInformation("Work item {Id} state changed concurrently; skipping Failed transition", item.Id);
                 return;
@@ -13258,23 +13241,6 @@ Original merge-phase failure (for context):
                 await _retryScheduler.NotifyQuotaFailureAsync(next);
             }
             _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
-            AuditLog.WorkItemFailed(item.Id, error);
-            var effectiveProject = project ?? new Project
-            {
-                Id = item.ProjectId,
-                DisplayName = item.ProjectId.Value,
-                RepositoryUrl = string.Empty,
-            };
-            var failedRevision = await BuildTerminalRevisionAsync(next, CancellationToken.None);
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.failed",
-                WorkItem = next,
-                Project = effectiveProject,
-                PromptRevision = failedRevision?.PromptRevision,
-                RevisionAtCompletion = failedRevision?.RevisionAtCompletion,
-                RevisionMatches = failedRevision?.RevisionMatches,
-            }, CancellationToken.None);
         });
     }
 
@@ -14309,20 +14275,6 @@ public sealed record AgentFallbackDetails(
     string? ToAgent,
     string? ToModel,
     string Reason);
-
-/// <summary>
-/// Internal carrier for revision-attribution fields lifted onto webhook
-/// payloads at terminal-state transitions (Done / Failed / Cancelled /
-/// AuditFailed / MergeConflictResolutionFailed). The fields themselves are
-/// serialised at the TOP LEVEL of the webhook payload (see
-/// <see cref="WebhookEvent.PromptRevision"/> et al.) so trackers like
-/// JobTrack can read <c>payload.promptRevision</c> directly; this record is
-/// just the in-process plumbing.
-/// </summary>
-internal sealed record TerminalRevisionDetails(
-    int PromptRevision,
-    int? RevisionAtCompletion,
-    bool? RevisionMatches);
 
 internal sealed record AuditIterationDetails(
     int Iteration,

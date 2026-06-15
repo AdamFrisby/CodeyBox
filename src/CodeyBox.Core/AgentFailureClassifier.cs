@@ -369,10 +369,5 @@ public static class AgentFailureClassifier
     }
 
     private static bool IsTurnFailedTransientNetworkMessage(string? message)
-    {
-        if (ContainsAny(message, TransientNetworkPatterns))
-            return true;
-
-        return string.Equals(message?.Trim(), "timeout", StringComparison.OrdinalIgnoreCase);
-    }
+        => ContainsAny(message, TransientNetworkPatterns);
 }
