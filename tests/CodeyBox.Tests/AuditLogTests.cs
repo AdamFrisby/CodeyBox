@@ -480,6 +480,22 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void LlmAuditorParkedQuota_emits_audit_llm_auditor_parked_quota_event_at_Warning()
+    {
+        var id = WorkItemId.New();
+
+        AuditLog.LlmAuditorParkedQuota(id, "security:llm-review", candidateCount: 3);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("audit.llm_auditor_parked_quota", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+        Assert.Equal(id.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("security:llm-review", GetScalar<string>(evt, "AuditorName"));
+        Assert.Equal(3, GetScalar<int>(evt, "CandidateCount"));
+    }
+
+    [Fact]
     public void QuotaRetryAttempted_emits_source_outcome_state_and_reason()
     {
         var id = WorkItemId.New();

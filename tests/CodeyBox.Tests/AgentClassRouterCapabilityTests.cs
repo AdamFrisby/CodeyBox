@@ -142,6 +142,35 @@ public sealed class AgentClassRouterCapabilityTests
     }
 
     [Fact]
+    public async Task ResolveQuotaRetry_RequiredCapabilityInheritsAcrossSameKindInstances()
+    {
+        var tagged = Member(Claude, 100, "audit") with { InstanceId = "acct-a" };
+        var sibling = Member(Claude, 99) with { InstanceId = "acct-b" };
+        var cls = Class(
+            tagged,
+            sibling,
+            Member(Codex, 98));
+        var router = BuildRouter([cls],
+        [
+            new InstanceRouteProbe(Claude, new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            {
+                [tagged.RouteKey] = 0.0,
+                [sibling.RouteKey] = 50.0,
+            }),
+            new FakeProbe(Codex, 50.0),
+        ]);
+
+        var retryDecision = await router.ResolveQuotaRetryAsync(
+            Item(),
+            project: null,
+            CancellationToken.None,
+            requiredCapability: "audit");
+
+        Assert.False(retryDecision.ShouldWait);
+        Assert.False(retryDecision.NoEligibleMembers);
+    }
+
+    [Fact]
     public async Task RequiredCapability_MemberMustCoverEveryTag()
     {
         // Claude declares "sensitive" only; item requires both — Claude rejected.
@@ -284,6 +313,203 @@ public sealed class AgentClassRouterCapabilityTests
     }
 
     [Fact]
+    public async Task ComputeEarliestExhaustedReset_RequiredCapabilityUsesInheritedSameKindPool()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var nonAuditReset = now.AddHours(1);
+        var auditReset = now.AddHours(5);
+        var taggedBelowFloor = Member(Claude, 50, "audit") with { InstanceId = "acct-a" };
+        var inheritedAuditSibling = Member(Claude, 100) with { InstanceId = "acct-b" };
+        var cls = Class(
+            taggedBelowFloor,
+            inheritedAuditSibling,
+            Member(Codex, 100));
+        var router = BuildRouter([cls],
+        [
+            new InstanceSnapshotProbe(Claude, new Dictionary<string, AgentQuotaSnapshot>(StringComparer.OrdinalIgnoreCase)
+            {
+                [taggedBelowFloor.RouteKey] = new() { AvailablePct = 0, ResetAt = now.AddHours(10) },
+                [inheritedAuditSibling.RouteKey] = new() { AvailablePct = 0, ResetAt = auditReset },
+            }),
+            new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = nonAuditReset }),
+        ]);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            Item(minScore: 90),
+            project: null,
+            CancellationToken.None,
+            requiredCapability: "audit");
+
+        Assert.Equal(auditReset, earliest);
+    }
+
+    // ── CountEligibleExhaustedClassMembersWithCapability honours eligibility ─
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_SkipsMembersBelowMinModelScore()
+    {
+        // Two members both declare "audit"; one is below the work item's
+        // MinModelScore floor. Both are marked exhausted. The helper must
+        // count ONLY the eligible one — otherwise the audit resolver would
+        // mistakenly park work for quota reset on the strength of an
+        // exhausted member that could never have been picked for this item.
+        var cls = Class(
+            Member(Claude, 100, "audit"),
+            Member(Codex, 70, "audit"));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(minScore: 90), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_SkipsMembersMissingRequiredCapabilities()
+    {
+        // The item requires "sensitive". One audit-capable member also
+        // declares "sensitive" (eligible); the other only declares "audit"
+        // (NOT eligible — missing the required capability). Both are
+        // exhausted. Only the eligible one must count, or the resolver
+        // would surface a member that could never have been picked.
+        var cls = Class(
+            Member(Claude, 100, "audit", "sensitive"),
+            Member(Codex, 90, "audit"));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(required: "sensitive"), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_SkipsMembersMissingCapabilityTag()
+    {
+        // Two eligible-by-score members are exhausted; only one declares
+        // the capability. The helper must not count the non-audit-tagged
+        // member — that mirrors the existing
+        // AuditPool_NonAuditMemberCachedExhausted_AuditCapableMisconfigured_FailsInfrastructure
+        // pin, but at the router-API level.
+        var cls = Class(
+            Member(Claude, 100, "audit"),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_InheritsAcrossSameKindInstances()
+    {
+        var taggedBelowFloor = Member(Claude, 50, "audit") with { InstanceId = "acct-a" };
+        var inheritedAuditSibling = Member(Claude, 100) with { InstanceId = "acct-b" };
+        var codex = Member(Codex, 100);
+        var cls = Class(taggedBelowFloor, inheritedAuditSibling, codex);
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(inheritedAuditSibling, TimeSpan.FromHours(1));
+        router.MarkExhausted(codex, TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(minScore: 90), project: null, capability: "audit");
+
+        Assert.Equal(1, count);
+    }
+
+    // ── capability == null branch: legacy no-audit-tag class path ─────────────
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_CountsEveryEligibleExhaustedMember()
+    {
+        // Legacy no-audit-tag class path: no member of the class declares the
+        // audit capability tag, so SelectFromAuditClassChainAsync is invoked
+        // with requireAuditCapability=false and the helper is called with
+        // capability=null. Every score-eligible member that is cached-exhausted
+        // must be counted; otherwise the resolver would surface the all-pool-
+        // exhausted state as an infrastructure failure rather than parking the
+        // item in WaitingForQuotaReset (the silent-skip regression this fix
+        // targets).
+        var cls = Class(
+            Member(Claude, 100),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(), project: null, capability: null);
+
+        Assert.Equal(2, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_StillRespectsMinModelScore()
+    {
+        // capability filter dropped, but the score floor still applies — the
+        // helper must mirror OrderedFallbackCandidatesAsync exactly, or the
+        // legacy no-tag path would inflate the exhausted count with members
+        // that could never have been picked for this work item.
+        var cls = Class(
+            Member(Claude, 100),
+            Member(Codex, 70));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(minScore: 90), project: null, capability: null);
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_StillRespectsRequiredCapabilities()
+    {
+        // The legacy no-audit-tag path drops the audit-tag filter, but the
+        // work item's RequiredCapabilities filter remains: a member missing a
+        // required tag could never have been picked, so the exhausted count
+        // must skip it.
+        var cls = Class(
+            Member(Claude, 100, "sensitive"),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(required: "sensitive"), project: null, capability: null);
+
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void CountEligibleExhaustedClassMembersWithCapability_NullCapability_NotExhausted_ReturnsZero()
+    {
+        // capability=null branch: nothing in the class is exhausted, so the
+        // count must be 0 — the resolver falls through to the
+        // configuration-infrastructure error path rather than parking for
+        // quota reset.
+        var cls = Class(
+            Member(Claude, 100),
+            Member(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+
+        var count = router.CountEligibleExhaustedClassMembersWithCapability(
+            Item(), project: null, capability: null);
+
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
     public async Task ComputeEarliestExhaustedReset_SkipsMembersBelowMinModelScore()
     {
         // Codex's reset is earlier but its score is below the floor.
@@ -305,5 +531,25 @@ public sealed class AgentClassRouterCapabilityTests
             Item(minScore: 90), null, CancellationToken.None);
 
         Assert.Equal(claudeReset, earliest);
+    }
+
+    private sealed class InstanceSnapshotProbe : IAgentQuotaProbe
+    {
+        private readonly IReadOnlyDictionary<string, AgentQuotaSnapshot> _snapshotsByRoute;
+
+        public InstanceSnapshotProbe(
+            AgentKind kind,
+            IReadOnlyDictionary<string, AgentQuotaSnapshot> snapshotsByRoute)
+        {
+            Kind = kind;
+            _snapshotsByRoute = snapshotsByRoute;
+        }
+
+        public AgentKind Kind { get; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
+            Task.FromResult(_snapshotsByRoute.TryGetValue(member.RouteKey, out var snapshot)
+                ? snapshot
+                : new AgentQuotaSnapshot { AvailablePct = 100.0 });
     }
 }

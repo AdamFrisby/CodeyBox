@@ -308,7 +308,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 item = item with { BaselineImageRef = pinnedRef };
         }
 
-        var decision = await _router.ResolveQuotaRetryAsync(item, project, ct);
+        var decision = await _router.ResolveQuotaRetryAsync(
+            item,
+            project,
+            ct,
+            RequiredCapabilityForRetry(item));
         _log.LogDebug(
             "Quota retry startup preflight for work item {Id}: shouldWait={ShouldWait} noEligible={NoEligible} reason={Reason}",
             item.Id,
@@ -573,7 +577,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 item = item with { BaselineImageRef = pinnedRef };
         }
 
-        var decision = await _router.ResolveQuotaRetryAsync(item, project, ct);
+        var decision = await _router.ResolveQuotaRetryAsync(
+            item,
+            project,
+            ct,
+            RequiredCapabilityForRetry(item));
         if (decision.ShouldWait)
         {
             if (decision.WaitingForPausedAgent)
@@ -764,6 +772,21 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _ => "work",
     };
 
+    private static string? RequiredCapabilityForRetry(WorkItem item)
+    {
+        if (!string.IsNullOrWhiteSpace(item.QuotaRetryPhase))
+            return RequiredCapabilityForPhase(item.QuotaRetryPhase);
+
+        return NormalizeRetryFrom(item.QuotaRetryFrom) == "audit"
+            ? WellKnownCapabilities.Audit
+            : null;
+    }
+
+    private static string? RequiredCapabilityForPhase(string? phase) =>
+        string.Equals(phase?.Trim(), "audit", StringComparison.OrdinalIgnoreCase)
+            ? WellKnownCapabilities.Audit
+            : null;
+
     /// <summary>
     /// Notifies the scheduler that a work item has failed with a quota error,
     /// so it can schedule a targeted retry.
@@ -786,7 +809,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             try
             {
                 var project = await _projects.GetAsync(item.ProjectId, CancellationToken.None);
-                resetAt = await _router.ComputeEarliestExhaustedResetAsync(item, project, CancellationToken.None);
+                resetAt = await _router.ComputeEarliestExhaustedResetAsync(
+                    item,
+                    project,
+                    CancellationToken.None,
+                    RequiredCapabilityForRetry(item));
             }
             catch (Exception ex)
             {

@@ -146,6 +146,79 @@ public sealed class AgentClassRouterReadinessTests
         Assert.Null(blockedAfterAdmissionConsumed.Chosen);
     }
 
+    [Fact]
+    public async Task TryConsumeQuotaRetryAdmission_ConsumesOnlyMatchingAdmission()
+    {
+        var time = new ManualTimeProvider();
+        var member = Member(Claude);
+        var router = BuildRouter(
+            [Class(member)],
+            [new FakeProbe(Claude, 100)],
+            timeProvider: time);
+        var item = Item();
+
+        var retryDecision = await router.ResolveQuotaRetryAsync(item, project: null, CancellationToken.None);
+
+        Assert.False(retryDecision.ShouldWait);
+        Assert.False(router.TryConsumeQuotaRetryAdmission(item.Id, Member(Codex), time.GetUtcNow()));
+        Assert.False(router.TryConsumeQuotaRetryAdmission(
+            item.Id,
+            Member(Claude, modelId: "other-model"),
+            time.GetUtcNow()));
+        Assert.True(router.TryConsumeQuotaRetryAdmission(item.Id, member, time.GetUtcNow()));
+        Assert.False(router.TryConsumeQuotaRetryAdmission(item.Id, member, time.GetUtcNow()));
+    }
+
+    [Fact]
+    public async Task TryConsumeQuotaRetryAdmission_PrunesExpiredAdmission()
+    {
+        var time = new ManualTimeProvider();
+        var member = Member(Claude);
+        var router = BuildRouter(
+            [Class(member)],
+            [new FakeProbe(Claude, 100)],
+            timeProvider: time);
+        var item = Item();
+
+        var retryDecision = await router.ResolveQuotaRetryAsync(item, project: null, CancellationToken.None);
+        time.Advance(TimeSpan.FromMinutes(11));
+
+        Assert.False(retryDecision.ShouldWait);
+        Assert.False(router.TryConsumeQuotaRetryAdmission(item.Id, member, time.GetUtcNow()));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_DoesNotConsumeAuditScopedQuotaRetryAdmission()
+    {
+        var time = new ManualTimeProvider();
+        var failures = new InMemoryQuotaFailureStore();
+        await failures.RecordAsync(
+            Claude,
+            modelId: null,
+            QuotaFailureKind.LimitReached,
+            time.GetUtcNow(),
+            CancellationToken.None);
+        var member = Member(Claude, capabilities: [WellKnownCapabilities.Audit]);
+        var router = BuildRouter(
+            [Class(member)],
+            [new FakeProbe(Claude, 100)],
+            timeProvider: time,
+            quotaFailures: failures);
+        var item = Item();
+
+        var retryDecision = await router.ResolveQuotaRetryAsync(
+            item,
+            project: null,
+            CancellationToken.None,
+            WellKnownCapabilities.Audit);
+        var dispatchDecision = await router.ResolveAsync(item, project: null, CancellationToken.None);
+
+        Assert.False(retryDecision.ShouldWait);
+        Assert.Equal(Claude, dispatchDecision.Chosen?.Agent);
+        Assert.True(router.TryConsumeQuotaRetryAdmission(item.Id, member, time.GetUtcNow()));
+        Assert.False(router.TryConsumeQuotaRetryAdmission(item.Id, member, time.GetUtcNow()));
+    }
+
     private static AgentClassRouter BuildRouter(
         IReadOnlyList<AgentClass> classes,
         IEnumerable<IAgentQuotaProbe> probes,
@@ -173,11 +246,13 @@ public sealed class AgentClassRouterReadinessTests
     private static AgentMembership Member(
         AgentKind agent,
         int score = 100,
-        string[]? capabilities = null) => new()
+        string[]? capabilities = null,
+        string? modelId = null) => new()
         {
             Agent = agent,
             Billing = AgentBilling.Subscription,
             QualityScore = score,
+            ModelId = modelId,
             Capabilities = capabilities ?? [],
         };
 

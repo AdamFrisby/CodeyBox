@@ -80,7 +80,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     // ── AC: gemini is NEVER picked for audit even when only it has quota ────
 
     [Fact]
-    public async Task OnlyGeminiHasQuota_GeminiNotAuditCapable_AuditSkipped()
+    public async Task OnlyGeminiHasQuota_GeminiNotAuditCapable_ParksForQuotaReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("security:llm-review");
@@ -105,10 +105,13 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await fix.Store.GetAsync(item.Id);
-        // Auditor never runs — gemini has quota but is excluded by the
-        // audit-capability gate. Item still completes (legacy "skip auditor
-        // rather than park" behaviour preserved).
-        Assert.Equal(WorkItemState.Done, final!.State);
+        // Every audit-capable member is quota-exhausted and Gemini is
+        // excluded from the audit pool by the capability gate. A Pass
+        // verdict cannot emerge without the auditor having produced a
+        // verdict, so the work item parks for quota reset rather than
+        // silently completing with zero LLM review.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
         Assert.Empty(auditor.Invocations);
     }
 
@@ -145,15 +148,17 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     // ── AC: mid-iteration spill stays inside the audit-capable pool ─────────
 
     [Fact]
-    public async Task MidIterationSpill_NonAuditCapableMember_StaysExcluded()
+    public async Task MidIterationSpill_NonAuditCapableMember_StaysExcludedAndParksForQuotaReset()
     {
         // Resolve-time gate is exercised by the other tests; this pins the
         // mid-iteration spill gate in InvokeAgentWithQuotaFallbackAsync. Setup
         // is "Claude looks healthy at resolve time but quota-fails when it
         // actually runs the auditor"; the spill candidate list contains only
         // Gemini (healthy, non-audit-capable). The requireCapability filter
-        // must drop Gemini, so the auditor is skipped instead of routing audit
-        // to a non-audit-capable member.
+        // must drop Gemini, so the entire audit-capable pool is exhausted and
+        // the work item parks for quota reset — silently skipping the auditor
+        // and routing through to Done would let a Pass verdict emerge with
+        // zero LLM review.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("cheating:llm-review",
             agent => agent == AgentKind.Claude ? QuotaAuditResult() : new AuditResult(true, []));
@@ -176,12 +181,732 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await fix.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
         // Claude ran first (preferred audit-capable) and quota-failed.
         // Gemini has quota but is NOT audit-capable — the mid-iter spill
-        // filter must skip it. Audit skipped, item still completes.
+        // filter must skip it, the pool is exhausted, the item parks.
         Assert.Equal([AgentKind.Claude], auditor.Invocations);
         Assert.DoesNotContain(AgentKind.Gemini, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: when no preferred audit agent is configured and the
+    // selected work runner is itself in the audit-capable pool, the resolver
+    // must still gate it on quota before returning. An already-exhausted
+    // work runner has to spill to another audit-capable peer (or park if
+    // the whole pool is exhausted), not be returned blindly. This is the
+    // resolve-time gate that audit:llm-review flagged: previously the
+    // shortcut at PipelineRunner.cs:~6780 trusted the work runner solely on
+    // the audit-capability tag + paused-state check, so an exhausted work
+    // agent could still dispatch the auditor and reach a Pass verdict if
+    // the CLI happened to return cleanly.
+    [Fact]
+    public async Task NoPreferredAuditAgent_WorkAgentAuditCapableButQuotaExhausted_SpillsToPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Both Claude (the work runner) and Codex are audit-capable; Claude
+        // is quota-exhausted at resolve time, Codex is healthy. With no
+        // explicit AuditAgent set, the resolver previously returned the
+        // work runner (Claude) directly without re-gating on quota — the
+        // bug fixed here. The resolver must now spill to Codex.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 1.0,    // exhausted (work runner)
+                [AgentKind.Codex] = 80.0,   // healthy peer
+            },
+            // No AuditAgent configured — forces the "no preferred kind"
+            // branch of ResolveAuditAgentRunnerAsync, which is the path
+            // that previously bypassed the quota gate for an audit-capable
+            // work runner.
+            preferredAuditAgent: null,
+            defaultAgent: AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit must NOT run on the exhausted work runner; it must spill to
+        // the healthy audit-capable peer. Asserting the exact pick (rather
+        // than "anything but Claude") catches a future regression where the
+        // shortcut returns Claude again and the auditor happens to succeed.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: a smoke-benched audit-capable work runner must NOT
+    // be selected for auditing. The no-preferred-audit-agent shortcut in
+    // ResolveAuditAgentRunnerAsync (PipelineRunner.cs:~6802) now routes the
+    // work runner through EnsureAgentSmokeAvailableAsync before trusting it,
+    // and on smoke rejection falls through to SelectFromAuditCapablePoolAsync
+    // for a healthy peer. Without this gate, a work runner whose CLI is
+    // benched (exit-127 / auth drift) could still be dispatched as auditor,
+    // and a happens-to-return-cleanly run would silently produce a Pass
+    // verdict on an agent the production smoke gate had already rejected.
+    //
+    // The sibling quota-exhausted shortcut is covered by
+    // NoPreferredAuditAgent_WorkAgentAuditCapableButQuotaExhausted_SpillsToPeer
+    // above; this test pins the smoke-gate branch explicitly so a regression
+    // that ignores the smoke verdict cannot pass both tests.
+    [Fact]
+    public async Task NoPreferredAuditAgent_WorkAgentAuditCapableButSmokeRejected_SpillsToPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Both Claude (the work runner) and Codex are audit-capable AND both
+        // have healthy quota. The only thing wrong with Claude is that the
+        // in-VM smoke gate benches it FOR THE AUDIT-PHASE sandbox target —
+        // exactly the shape a real CLI outage produces against the audit
+        // profile while the work profile is fine. With no AuditAgent
+        // configured, the resolver enters the no-preferred-kind branch; the
+        // work runner's audit-capable shortcut MUST gate on the smoke
+        // verdict and fall through to the audit pool walk, which then picks
+        // Codex.
+        //
+        // The work-phase smoke target uses NetworkProfiles.Work, and the
+        // audit-phase target uses NetworkProfiles.AuditAgent — distinct
+        // strings let the gate bench only the audit-phase view of Claude
+        // without breaking the work phase. The same pattern keeps the
+        // OrderedFallbackCandidatesAsync pool walk (also targeting the audit
+        // profile) from surfacing Claude.
+        const string workProfile = "work";
+        const string auditProfile = "audit";
+        var smokeGate = new BenchKindByNetworkProfileSmokeGate(AgentKind.Claude, auditProfile);
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                // Both healthy on quota — only the smoke gate excludes Claude.
+                // If quota were the lever, this test would collapse into the
+                // sibling quota-exhaustion test above; keeping both healthy is
+                // what isolates the smoke-gate branch.
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Codex] = 80.0,
+            },
+            preferredAuditAgent: null,
+            defaultAgent: AgentKind.Claude,
+            inVmSmokeGate: smokeGate,
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                Work = workProfile,
+                AuditAgent = auditProfile,
+            });
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Auditor must NOT run on the smoke-benched work runner; it must
+        // spill to the healthy audit-capable peer. Asserting the exact pick
+        // (not "anything but Claude") catches a regression where the
+        // shortcut skips the smoke gate and dispatches the auditor on the
+        // benched Claude runner.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: a cached-exhausted audit-capable work runner must
+    // NOT be selected for auditing — even when its live smoke + quota probes
+    // currently look healthy. The router's in-process exhaustion cache is
+    // set by mid-iteration spills (AgentClassRouter.MarkExhausted); a fast-
+    // path that ignores it can re-dispatch against the very bucket the
+    // spill was meant to avoid, since the live probe lags behind the cache.
+    // Without this gate a Pass verdict can emerge on a quota-exhausted
+    // member that the rest of the pipeline is treating as out-of-rotation.
+    [Fact]
+    public async Task NoPreferredAuditAgent_WorkAgentAuditCapableButCachedExhausted_SpillsToPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Both Claude (the work runner) and Codex are audit-capable AND both
+        // have healthy quota by the live probe. The only thing wrong with
+        // Claude is that the router cache says it's exhausted — the shape
+        // a recent MarkExhausted leaves behind. The fast path that returns
+        // the work runner after smoke + EvaluateAuditCandidateQuotaAsync
+        // must also consult AgentClassRouter.IsExhausted; otherwise the
+        // live healthy probe wins and the auditor runs on the cached-out
+        // bucket. With the gate in place, the resolver spills to Codex.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,   // healthy live probe
+                [AgentKind.Codex] = 80.0,    // healthy peer
+            },
+            preferredAuditAgent: null,
+            defaultAgent: AgentKind.Claude);
+        fix.MarkExhausted(AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST spill past the cached-exhausted work runner onto the
+        // healthy peer. Asserting the exact pick catches a regression where
+        // a missing IsExhausted check lets the live probe re-select Claude.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: a cached-exhausted preferred audit agent must NOT
+    // be selected for auditing — same shape as the work-runner fast path,
+    // but for the explicit Audit.AuditAgent override. The preferred fast
+    // path runs smoke + EvaluateAuditCandidateQuotaAsync, both of which
+    // consult live state; neither catches a member that was marked
+    // exhausted by a mid-iteration spill an instant earlier. The resolver
+    // must also consult AgentClassRouter.IsExhausted before returning, or
+    // a Pass verdict can emerge against the very bucket the spill avoided.
+    [Fact]
+    public async Task PreferredAuditAgent_CachedExhausted_SpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,    // healthy live probe
+                [AgentKind.Claude] = 80.0,   // healthy peer
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            defaultAgent: AgentKind.Codex);
+        fix.MarkExhausted(AgentKind.Codex);
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST spill past the cached-exhausted preferred agent onto
+        // the healthy peer. Pinning the exact pick catches a regression
+        // where the live probe re-selects Codex despite the cache verdict.
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Codex, auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredAuditAgent_CachedExhausted_SpillsToInheritedSameKindPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true,  QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: false, QualityScore: 99),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 98),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Gemini] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Claude,
+            defaultAgent: AgentKind.Claude,
+            memberModelIds: ["audit-model", "peer-model", "gemini-model"]);
+        fix.MarkExhausted(AgentKind.Claude, modelId: "audit-model");
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude, modelId: "audit-model");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.Equal(["peer-model"], auditor.ModelInvocations);
+        Assert.DoesNotContain("gemini-model", auditor.ModelInvocations);
+    }
+
+    [Fact]
+    public async Task MidIterationSpill_UsesInheritedSameKindAuditPeerBeforeParking()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var calls = 0;
+        var auditor = new RecordingLlmAuditor("cheating:llm-review", _ =>
+            ++calls == 1 ? QuotaAuditResult() : new AuditResult(true, []));
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true,  QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: false, QualityScore: 99),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 98),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Gemini] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Claude,
+            defaultAgent: AgentKind.Claude,
+            memberModelIds: ["audit-model", "peer-model", "gemini-model"]);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude, modelId: "audit-model");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Claude, AgentKind.Claude], auditor.Invocations);
+        Assert.Equal(["audit-model", "peer-model"], auditor.ModelInvocations);
+        Assert.DoesNotContain("gemini-model", auditor.ModelInvocations);
+    }
+
+    [Fact]
+    public async Task PreferredAuditAgent_CachedExhausted_NoPeer_ParksForQuotaReset()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Codex, IsAuditCapable: true, QualityScore: 100),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,    // healthy live probe; cache marks it out
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            defaultAgent: AgentKind.Codex);
+        fix.MarkExhausted(AgentKind.Codex);
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.Empty(auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredAuditAgent_CachedExhausted_SpillsToHealthySameRouteDifferentModel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Codex, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex, IsAuditCapable: true, QualityScore: 99),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            defaultAgent: AgentKind.Codex,
+            memberModelIds: ["gpt-5.5", "gpt-5.4"]);
+        fix.MarkExhausted(AgentKind.Codex, modelId: "gpt-5.5");
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Codex, modelId: "gpt-5.5");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.Equal(["gpt-5.4"], auditor.ModelInvocations);
+    }
+
+    // ── HARD INVARIANT: a ModelId-pinned cached-exhausted preferred audit
+    // member must NOT be selected for auditing. The sibling
+    // PreferredAuditAgent_CachedExhausted_SpillsToHealthyPeer pins the
+    // unpinned-member shape, but the production class for our largest
+    // operator runs ModelId-pinned members (each model id is its own quota
+    // bucket on the gateway side). The legacy FindMember(modelId:null)
+    // lookup only matched members with ModelId null/empty, so a class
+    // configured with a real ModelId-pinned audit member fell through to
+    // a synthetic AgentMembership against the runner's default model id —
+    // and the router-cache check ran against a bucket no probe / cache
+    // entry actually tracks. With the synthetic check returning "not
+    // cached-exhausted" while the configured member sat in the
+    // MarkExhausted cache, a Pass verdict could emerge against an
+    // exhausted pool. FindPreferredAuditMember walks every class member
+    // of preferredKind regardless of ModelId, so the cache check runs
+    // against the real bucket; this test pins that wiring.
+    [Fact]
+    public async Task PreferredAuditAgent_ModelIdPinned_CachedExhausted_SpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Two Codex members share the preferred kind. Only the gpt-5.5 member
+        // matches the work item's model hint and is marked cached-exhausted.
+        // The first Codex member is below the work item's score floor, so it
+        // is not a legal fallback candidate; a selector that ignores ModelId
+        // and blindly picks it will still dispatch the auditor on Codex.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 50),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,    // healthy live probe — only the cache marks it out
+                [AgentKind.Claude] = 80.0,   // healthy peer
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            defaultAgent: AgentKind.Codex,
+            memberModelIds: ["gpt-5.4", "gpt-5.5", null]);
+        fix.MarkExhausted(AgentKind.Codex, modelId: "gpt-5.5");
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Codex, modelId: "gpt-5.5") with { MinModelScore = 80 };
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST spill past the cached-exhausted gpt-5.5 Codex member
+        // onto Claude. Reverting FindPreferredAuditMember to "first member of
+        // preferred kind" or ignoring the preferredModelId hint would choose
+        // the below-floor gpt-5.4 Codex member before fallback filtering and
+        // this assertion would fail.
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Codex, auditor.Invocations);
+    }
+
+    // ── Companion to the ModelId-pinned test above: the production class
+    // also runs members that are BOTH ModelId-pinned AND InstanceId-named
+    // (one subscription per gateway model). FindPreferredAuditMember
+    // scores +2 on InstanceId match and +1 on ModelId match (most-specific
+    // wins). The work item carries item.AgentInstanceId, the resolver
+    // threads it through, and the +2 bonus picks the correct instance.
+    // This test pins the InstanceId scoring path alongside the ModelId
+    // pinning: with two Codex members on the same model, a regression that
+    // drops the InstanceId match would pick the wrong account bucket before
+    // fallback filtering ever runs.
+    [Fact]
+    public async Task PreferredAuditAgent_InstanceIdAndModelIdPinned_CachedExhausted_SpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // Two Codex members share the same model but have distinct instances.
+        // Only acct-a matches the work item's AgentInstanceId and is marked
+        // cached-exhausted. acct-b is below the work item's score floor, so it
+        // is not a legal fallback candidate; a selector that ignores instance
+        // matching will still dispatch the auditor on Codex.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 50),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,
+                [AgentKind.Claude] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            defaultAgent: AgentKind.Codex,
+            memberModelIds: ["gpt-5.5", "gpt-5.5", null],
+            memberInstanceIds: ["acct-b", "acct-a", null]);
+        fix.MarkExhausted(AgentKind.Codex, modelId: "gpt-5.5", instanceId: "codex/acct-a");
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(
+            AgentKind.Codex,
+            modelId: "gpt-5.5",
+            agentInstanceId: "codex/acct-a") with
+        { MinModelScore = 80 };
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST spill onto Claude. Dropping the InstanceId score while
+        // keeping ModelId scoring would select the below-floor acct-b Codex
+        // member before fallback filtering and dispatch the auditor on the
+        // wrong account bucket.
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Codex, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: when the preferred audit agent is registered but
+    // has NO credentials, the fallback MUST gate the work runner through
+    // the same smoke + quota checks the no-preferred branch applies — NOT
+    // hand the auditor straight to the work runner with only a pause check.
+    // The unregistered-preferred branch is covered by
+    // PreferredAuditAgent_NotRegistered_FallbackGatesWorkRunner_AndSpillsToHealthyPeer;
+    // this test pins the SIBLING branch where the preferred agent IS
+    // registered but its credential resolves to null. Both branches share
+    // FallbackToWorkRunnerOrSpillToAuditPoolAsync, so a regression that
+    // bypasses the helper in the missing-credentials branch would slip
+    // past the unregistered-branch test alone — exactly the coverage gap
+    // the tests:meaningfulness-review finding called out.
+    [Fact]
+    public async Task PreferredAuditAgent_MissingCredentials_FallbackGatesWorkRunner_AndSpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+                (AgentKind.Gemini, IsAuditCapable: true, QualityScore: 80),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 1.0,    // exhausted (work runner)
+                [AgentKind.Codex] = 80.0,    // healthy peer
+                [AgentKind.Gemini] = 80.0,   // preferred (no creds → fallback)
+            },
+            // Gemini is the preferred audit agent and IS in the registry,
+            // but its credential resolves to null (operator forgot to set
+            // CODEYBOX_GEMINI_API_KEY). The resolver hits the missing-
+            // credentials branch and routes through
+            // FallbackToWorkRunnerOrSpillToAuditPoolAsync; without gating
+            // it would hand the auditor straight to the quota-exhausted
+            // work runner (Claude).
+            preferredAuditAgent: AgentKind.Gemini,
+            defaultAgent: AgentKind.Claude,
+            credentials: new MissingCredentialsForKind(AgentKind.Gemini));
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST run on Codex (the healthy peer), NEVER on the quota-
+        // exhausted Claude work runner. A regression that drops the gate
+        // would dispatch the auditor on Claude — which may happen to return
+        // cleanly and produce a Pass verdict against an exhausted bucket.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: when the operator NAMED a preferred audit agent
+    // that isn't registered, the fallback MUST gate the work runner through
+    // the same smoke + quota checks the no-preferred branch applies — NOT
+    // hand the auditor straight to the work runner with only a pause check.
+    // Before the fix at PipelineRunner.cs:~6827 the unregistered-preferred
+    // branch routed to WorkRunnerForAuditUnlessPaused (operator-pause only)
+    // even when the work runner was already smoke-rejected or quota-
+    // exhausted, so the auditor could dispatch against an unroutable bucket
+    // and produce a Pass against an effectively skipped review. The same
+    // shape applies to the missing-credentials-preferred branch (~line 6851),
+    // which now shares the same gated fallback helper. Below pins the
+    // quota-exhausted case for the unregistered-preferred branch; an
+    // analogous regression in the missing-credentials path would also have
+    // to bypass the helper.
+    [Fact]
+    public async Task PreferredAuditAgent_NotRegistered_FallbackGatesWorkRunner_AndSpillsToHealthyPeer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 1.0,    // exhausted (work runner)
+                [AgentKind.Codex] = 80.0,    // healthy peer
+            },
+            // Cursor is not present in members → not in the registry →
+            // ResolveAuditAgentRunnerAsync hits the unregistered-preferred
+            // branch and (pre-fix) returned the work runner unchecked.
+            // With the fix it must gate the work runner on smoke + quota
+            // and spill to the audit pool on rejection.
+            preferredAuditAgent: AgentKind.Cursor,
+            defaultAgent: AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Audit MUST run on the healthy peer (Codex), NEVER on the quota-
+        // exhausted work runner (Claude). Asserting the exact pick catches
+        // a regression that drops the gating helper and lets the work
+        // runner audit against an exhausted bucket.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Claude, auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredAuditAgent_NotRegistered_WorkKindInAuditPoolViaSameKindSibling_UsesWorkMember()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        // The Codex work member does not directly carry "audit", but a same-kind
+        // Codex sibling does. The router contract treats that capability as
+        // effective across same-kind members, so the healthy work member is a
+        // valid audit candidate after the unregistered preferred agent is
+        // demoted.
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Cursor, IsAuditCapable: true,  QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: false, QualityScore: 95),
+                (AgentKind.Codex,  IsAuditCapable: true,  QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Cursor] = 80.0,
+                [AgentKind.Codex] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Cursor,
+            defaultAgent: AgentKind.Codex,
+            memberModelIds: [null, "work-model", "audit-model"],
+            unregisteredAgents: new HashSet<AgentKind> { AgentKind.Cursor });
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Codex, modelId: "work-model");
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+        Assert.Equal(["work-model"], auditor.ModelInvocations);
+    }
+
+    // Sibling pin to PreferredAuditAgent_NotRegistered_…: when the work
+    // runner itself is quota-exhausted AND the whole spill pool is also
+    // exhausted, the unregistered-preferred fallback must PARK the item
+    // for quota reset rather than silently dispatching against the
+    // exhausted work runner (pre-fix behaviour) — the hard invariant being
+    // defended is that a Pass verdict never emerges while a configured
+    // auditor's spill-to-peer pool was entirely quota-blocked.
+    [Fact]
+    public async Task PreferredAuditAgent_NotRegistered_AllAuditPoolExhausted_ParksForQuotaReset()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Codex,  IsAuditCapable: true, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 1.0,    // exhausted (work runner)
+                [AgentKind.Codex] = 1.0,     // exhausted peer
+            },
+            preferredAuditAgent: AgentKind.Cursor,
+            defaultAgent: AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        // Whole pool exhausted → park for quota reset; the auditor must
+        // NEVER have run. A regression that bypasses the gate would
+        // instead dispatch the auditor against the quota-exhausted work
+        // runner — either silently passing (the 094bb05 hole this fix
+        // descends from) or terminally failing with the wrong shape.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.Empty(auditor.Invocations);
+    }
+
+    // ── HARD INVARIANT: a sibling auditor's non-quota exception must NOT
+    // mask another auditor's mid-iteration AgentClassExhaustedException.
+    // The settling logic in CollectFindingsAsync (PipelineRunner.cs:~6320)
+    // waits for all parallel tasks to finish, then surfaces exhaustion
+    // FIRST so the work item parks in WaitingForQuotaReset for a quota-
+    // blocked audit; only when no auditor was exhaustion-blocked does a
+    // sibling generic exception propagate. Without this priority, a
+    // sibling InvalidOperationException would route the item to
+    // failureKind=other (or worse, infrastructure) and the
+    // QuotaRetryScheduler would never re-pick it up — the quota would
+    // return and the item would stay terminally Failed.
+    [Fact]
+    public async Task ParallelAuditors_ExhaustionPrioritisedOverSiblingNonQuotaException_ParksForQuotaReset()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Auditor A returns a Claude-shaped quota failure on dispatch; the
+        // single-member audit pool then exhausts in
+        // InvokeAgentWithQuotaFallbackAsync → AgentClassExhaustedException.
+        var quotaAuditor = new RecordingLlmAuditor(
+            "cheating:llm-review",
+            agent => agent == AgentKind.Claude ? QuotaAuditResult() : new AuditResult(true, []));
+        // Auditor B throws a generic (non-quota) exception from inside its
+        // RunAsync body — the same shape an unexpected fault would take.
+        var throwingAuditor = new RecordingLlmAuditor(
+            "security:llm-review",
+            agent => throw new InvalidOperationException(
+                "simulated non-quota auditor body fault (must NOT mask sibling exhaustion)"));
+
+        using var fix = BuildFixture(seed,
+            auditors: [quotaAuditor, throwingAuditor],
+            members: [
+                // Single-member audit pool. Both auditors land on Claude;
+                // the quota-failing auditor's spill therefore exhausts the
+                // whole pool, which is what raises AgentClassExhaustedException.
+                (AgentKind.Claude, IsAuditCapable: true, QualityScore: 100),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Gemini] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Claude,
+            // Parallel dispatch is what makes the settling order matter —
+            // sequential settling would never see both exceptions land at
+            // once.
+            maxLlmAuditorParallelism: 2);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        // The hard invariant: AgentClassExhaustedException wins over a sibling
+        // non-quota exception, so the work item parks for quota reset rather
+        // than landing terminally Failed on the sibling fault.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
     }
 
     // ── AC: per-auditor routing dispatches across distinct audit-capable members ─
@@ -486,7 +1211,15 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         IReadOnlyList<(AgentKind Agent, bool IsAuditCapable, int QualityScore)> members,
         Dictionary<AgentKind, double> quotas,
         AgentKind? preferredAuditAgent,
-        AgentKind? defaultAgent = null)
+        AgentKind? defaultAgent = null,
+        IInVmSmokeGate? inVmSmokeGate = null,
+        ProjectNetworkProfiles? networkProfiles = null,
+        ICredentialProvider? credentials = null,
+        IReadOnlyDictionary<AgentKind, string>? modelIds = null,
+        IReadOnlyDictionary<AgentKind, string>? instanceIds = null,
+        IReadOnlyList<string?>? memberModelIds = null,
+        IReadOnlyList<string?>? memberInstanceIds = null,
+        IReadOnlySet<AgentKind>? unregisteredAgents = null)
         => BuildFixture(
             seedRepoUrl,
             auditors: [auditor],
@@ -495,7 +1228,15 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             preferredAuditAgent,
             defaultAgent: defaultAgent,
             perAuditorAgent: null,
-            maxLlmAuditorParallelism: 1);
+            maxLlmAuditorParallelism: 1,
+            inVmSmokeGate: inVmSmokeGate,
+            networkProfiles: networkProfiles,
+            credentials: credentials,
+            modelIds: modelIds,
+            instanceIds: instanceIds,
+            memberModelIds: memberModelIds,
+            memberInstanceIds: memberInstanceIds,
+            unregisteredAgents: unregisteredAgents);
 
     private RoutingFixture BuildFixture(
         string seedRepoUrl,
@@ -505,7 +1246,15 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         AgentKind? preferredAuditAgent,
         AgentKind? defaultAgent = null,
         IReadOnlyDictionary<string, AgentKind>? perAuditorAgent = null,
-        int maxLlmAuditorParallelism = 1)
+        int maxLlmAuditorParallelism = 1,
+        IInVmSmokeGate? inVmSmokeGate = null,
+        ProjectNetworkProfiles? networkProfiles = null,
+        ICredentialProvider? credentials = null,
+        IReadOnlyDictionary<AgentKind, string>? modelIds = null,
+        IReadOnlyDictionary<AgentKind, string>? instanceIds = null,
+        IReadOnlyList<string?>? memberModelIds = null,
+        IReadOnlyList<string?>? memberInstanceIds = null,
+        IReadOnlySet<AgentKind>? unregisteredAgents = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -518,7 +1267,15 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         var prs = new InMemoryPullRequestService();
         var webhooks = new CapturingWebhookDispatcher();
 
-        var agents = members.Select(m => new ScriptableAgent(m.Agent)).ToList();
+        var unregistered = unregisteredAgents is null
+            ? new HashSet<AgentKind>()
+            : new HashSet<AgentKind>(unregisteredAgents);
+        var agents = members
+            .Select(m => m.Agent)
+            .Distinct()
+            .Where(kind => !unregistered.Contains(kind))
+            .Select(kind => new ScriptableAgent(kind))
+            .ToList();
         var codex = agents.FirstOrDefault(a => a.Kind == AgentKind.Codex);
         var gemini = agents.FirstOrDefault(a => a.Kind == AgentKind.Gemini);
         var claude = agents.FirstOrDefault(a => a.Kind == AgentKind.Claude);
@@ -529,27 +1286,58 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             Id = "frontier",
             DisplayName = "Frontier",
             Members = members
-                .Select(m => new AgentMembership
+                .Select((m, idx) => new AgentMembership
                 {
                     Agent = m.Agent,
                     Billing = AgentBilling.Subscription,
                     QualityScore = m.QualityScore,
                     Capabilities = m.IsAuditCapable ? [WellKnownCapabilities.Audit] : [],
+                    ModelId = memberModelIds is not null
+                        && idx < memberModelIds.Count
+                        && !string.IsNullOrWhiteSpace(memberModelIds[idx])
+                            ? memberModelIds[idx]
+                            : modelIds is not null
+                        && modelIds.TryGetValue(m.Agent, out var pinnedModel)
+                        && !string.IsNullOrWhiteSpace(pinnedModel)
+                            ? pinnedModel
+                            : null,
+                    InstanceId = memberInstanceIds is not null
+                        && idx < memberInstanceIds.Count
+                        && !string.IsNullOrWhiteSpace(memberInstanceIds[idx])
+                            ? memberInstanceIds[idx]
+                            : instanceIds is not null
+                        && instanceIds.TryGetValue(m.Agent, out var pinnedInstance)
+                        && !string.IsNullOrWhiteSpace(pinnedInstance)
+                            ? pinnedInstance
+                            : null,
                 })
                 .ToList(),
         };
 
         var probes = members
-            .Select(m => (IAgentQuotaProbe)new ConfigurableProbe(
-                m.Agent,
-                quotas.GetValueOrDefault(m.Agent, 80.0)))
+            .Select(m => m.Agent)
+            .Distinct()
+            .Select(kind => (IAgentQuotaProbe)new ConfigurableProbe(
+                kind,
+                quotas.GetValueOrDefault(kind, 80.0)))
             .ToList();
+
+        // Wire the smoke gate into both the router (so OrderedFallbackCandidatesAsync
+        // filters smoke-rejected members from its candidate list) AND the pipeline
+        // (so EnsureAgentSmokeAvailableAsync gates the work-runner-audit-capable
+        // shortcut). Without both, the pool walk and the shortcut would drift in
+        // smoke verdicts and the test would not exercise the real production
+        // wiring.
+        var dispatchAvailability = inVmSmokeGate is null
+            ? null
+            : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate);
 
         var router = new AgentClassRouter(
             [frontier],
             probes,
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance);
+            NullLogger<AgentClassRouter>.Instance,
+            dispatchAvailability: dispatchAvailability);
 
         var project = new Project
         {
@@ -559,6 +1347,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             DefaultBaseBranch = "main",
             DefaultAgent = defaultAgent ?? AgentKind.Codex,
             DefaultAgentClass = "frontier",
+            NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Audit = new ProjectAudit
             {
                 MaxIterations = 1,
@@ -578,7 +1367,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             sandboxes,
             gitHost,
             registry,
-            new PermissiveCredentialProvider(),
+            credentials ?? new PermissiveCredentialProvider(),
             prs,
             projects,
             new TestUpstreamFactory(),
@@ -597,22 +1386,28 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
             ]),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: dispatchAvailability);
 
-        return new RoutingFixture(pipeline, store, webhooks, codex, gemini, claude);
+        return new RoutingFixture(pipeline, store, webhooks, codex, gemini, claude, router, frontier);
     }
 
-    private static WorkItem NewItem(AgentKind agent) => new()
-    {
-        Id = WorkItemId.New(),
-        ProjectId = new ProjectId("test-project"),
-        Title = "audit-capability routing test",
-        Prompt = "do thing",
-        BaseBranch = "main",
-        Agent = agent,
-        AgentClassId = "frontier",
-        PushUpstream = false,
-    };
+    private static WorkItem NewItem(
+        AgentKind agent,
+        string? modelId = null,
+        string? agentInstanceId = null) => new()
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "audit-capability routing test",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            Agent = agent,
+            AgentClassId = "frontier",
+            ModelId = modelId,
+            AgentInstanceId = agentInstanceId,
+            PushUpstream = false,
+        };
 
     private sealed class RecordingLlmAuditor : IAuditor
     {
@@ -627,6 +1422,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         public string Kind => "llm";
         public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
         public List<AgentKind> Invocations { get; } = [];
+        public List<string?> ModelInvocations { get; } = [];
 
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
         {
@@ -637,6 +1433,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             Assert.NotNull(context.AuditRunner);
             var agent = context.AuditRunner!.Kind;
             Invocations.Add(agent);
+            ModelInvocations.Add(context.ModelId);
             return Task.FromResult(_resultBuilder?.Invoke(agent) ?? new AuditResult(true, []));
         }
     }
@@ -657,13 +1454,22 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
     private sealed class ConfigurableProbe : IAgentQuotaProbe
     {
         private double _pct;
+        private readonly HashSet<(string RouteKey, string ModelId)> _exhaustedMembers = [];
+
         public ConfigurableProbe(AgentKind kind, double initialPct) { Kind = kind; _pct = initialPct; }
         public AgentKind Kind { get; }
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _pct });
+        {
+            var key = (member.RouteKey, member.ModelId ?? string.Empty);
+            return Task.FromResult(new AgentQuotaSnapshot
+            {
+                AvailablePct = _exhaustedMembers.Contains(key) ? 0.0 : _pct,
+            });
+        }
+
         public Task MarkExhaustedAsync(AgentMembership member, TimeSpan ttl, DateTimeOffset? resetAt = null, CancellationToken ct = default)
         {
-            _pct = 0.0;
+            _exhaustedMembers.Add((member.RouteKey, member.ModelId ?? string.Empty));
             return Task.CompletedTask;
         }
     }
@@ -677,14 +1483,104 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                 Files: new Dictionary<string, string>()));
     }
 
+    /// <summary>
+    /// Credential provider that returns a non-null bundle for every kind
+    /// EXCEPT the configured "missing" kind, which always resolves to null
+    /// (operator forgot to wire the credential env var). Pins the audit
+    /// resolver's missing-credentials preferred-audit branch.
+    /// </summary>
+    private sealed class MissingCredentialsForKind : ICredentialProvider
+    {
+        private readonly AgentKind _missing;
+        public MissingCredentialsForKind(AgentKind missing) => _missing = missing;
+
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+            => Task.FromResult<AgentCredential?>(
+                agent == _missing
+                    ? null
+                    : new AgentCredential(
+                        agent,
+                        EnvironmentVariables: new Dictionary<string, string>(),
+                        Files: new Dictionary<string, string>()));
+    }
+
     private sealed record RoutingFixture(
         PipelineRunner Pipeline,
         SqliteWorkItemStore Store,
         CapturingWebhookDispatcher Webhooks,
         ScriptableAgent? Codex,
         ScriptableAgent? Gemini,
-        ScriptableAgent? Claude) : IDisposable
+        ScriptableAgent? Claude,
+        AgentClassRouter Router,
+        AgentClass Class) : IDisposable
     {
         public void Dispose() => Store.Dispose();
+
+        /// <summary>
+        /// Mark a configured class member exhausted in the router's in-process
+        /// cache so subsequent fast paths see it as quota-out before any live
+        /// probe runs. Used to pin the IsExhausted gate that the audit
+        /// resolver applies before trusting an apparently-healthy preferred
+        /// or audit-capable work runner.
+        /// </summary>
+        public void MarkExhausted(
+            AgentKind kind,
+            TimeSpan? ttl = null,
+            string? modelId = null,
+            string? instanceId = null)
+        {
+            var member = Class.Members.First(m =>
+                m.Agent == kind
+                && (modelId is null || string.Equals(m.ModelId, modelId, StringComparison.Ordinal))
+                && (instanceId is null || AgentInstanceIds.Matches(m, instanceId)));
+            Router.MarkExhausted(
+                member,
+                ttl ?? TimeSpan.FromHours(1),
+                resetAt: DateTimeOffset.UtcNow.AddHours(1));
+        }
+    }
+
+    /// <summary>
+    /// In-VM smoke gate stub that benches a single agent kind ONLY when the
+    /// probe target's <see cref="InVmSmokeSandboxTarget.NetworkProfile"/>
+    /// matches the configured "bench" profile string. Used by the smoke-
+    /// rejected work-runner shortcut test to simulate a CLI outage that
+    /// affects the audit-phase sandbox profile but leaves the work-phase
+    /// profile healthy — without this distinction the work phase would fail
+    /// on smoke before the audit phase ever ran. Production wiring runs the
+    /// gate inside both the router (which filters smoke-rejected members
+    /// from its candidate list) and the pipeline (which gates the audit-
+    /// capable work-runner shortcut), so the test wires it into both via
+    /// <see cref="AgentDispatchAvailability"/>.
+    /// </summary>
+    private sealed class BenchKindByNetworkProfileSmokeGate : IInVmSmokeGate
+    {
+        private readonly AgentKind _kind;
+        private readonly string _benchProfile;
+
+        public BenchKindByNetworkProfileSmokeGate(AgentKind kind, string benchProfile)
+        {
+            _kind = kind;
+            _benchProfile = benchProfile;
+        }
+
+        public bool Enabled => true;
+
+        private bool ShouldBench(AgentKind kind, InVmSmokeSandboxTarget target) =>
+            kind == _kind
+            && string.Equals(target.NetworkProfile, _benchProfile, StringComparison.Ordinal);
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+            => Task.FromResult(ShouldBench(kind, target)
+                ? new AgentAvailability(false, "in-VM smoke: bench (test)", null, AgentAvailabilityCause.SmokeGate)
+                : new AgentAvailability(true, null, null));
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+            => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
     }
 }

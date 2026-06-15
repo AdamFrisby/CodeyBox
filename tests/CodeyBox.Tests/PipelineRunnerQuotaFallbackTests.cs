@@ -421,6 +421,104 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditDrivenRework_AllClassMembersQuotaExhausted_ParksWithOriginalReworkPhase()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.NotNull(parked.NextQuotaRetryAt);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var exhausted = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent is null);
+        Assert.Equal(AgentKind.Claude, exhausted.FromAgent);
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_QuotaRetryRerunsReworkWhenOnlyDispatchRowExists()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            useClassRouter: false,
+            wireAuditProgress: true);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            AgentClassId = null,
+        };
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.Contains(await fix.Store.GetIterationsAsync(item.Id), i => i.Iteration == 2);
+        Assert.DoesNotContain(
+            await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "success");
+
+        var retrier = new WorkItemRetrier(
+            fix.Store,
+            new InMemoryTaskQueue(),
+            fix.GitHost,
+            NullLogger<WorkItemRetrier>.Instance,
+            auditProgress: fix.Store);
+        var retry = await retrier.RetryAsync(parked, from: "audit", trigger: "test-quota-return");
+        Assert.True(retry.Success, retry.Error);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
+        var resumed = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(resumed);
+        await fix.Pipeline.RunAsync(resumed!, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(rows, r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "failure:quota");
+        Assert.Contains(rows, r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "success");
+
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = fix.GitHost.GetRepoPath(repoId);
+        var (_, contents, _) = await TestSupport.RunGit(bareRepo, "show", $"{final.WorkBranch}:a.txt");
+        Assert.Equal("reworked", contents);
+    }
+
+    [Fact]
     public async Task Claude_RateLimitEventStdout_FallsBackToPeerWithinClass_SameIteration()
     {
         // The exact regression that prompted the mid-rework Claude 5h-window
@@ -796,6 +894,61 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         AssertInvolvement(failedAudit, AgentKind.Codex, "audit:review-crash", 1, "failure:agent");
         Assert.NotNull(failedAudit.EndedAt);
         Assert.Contains(auditRows, r => r.Outcome == "success");
+    }
+
+    [Fact]
+    public async Task PersistentAuditAgentExecutionFailure_TransitionsItemToFailedInfrastructure()
+    {
+        // Persistent non-quota auditor execution failure path: the first
+        // RunLlmPairAttemptAsync call returns the "review agent failed to run"
+        // sentinel, the transient fresh-sandbox retry returns the SAME sentinel,
+        // and the second IsLlmAgentExecutionFailure check at
+        // PipelineRunner.cs:6237 throws AuditUnavailableException — routing the
+        // item to Failed/failureKind="infrastructure" via the RunAsync catch at
+        // PipelineRunner.cs:1543.
+        //
+        // The existing AuditAgentExecutionFailure_FinalizesAuditInvolvementFailureAgent
+        // covers ONLY the first-attempt-fails-then-retry-succeeds shape. Without
+        // this test, a regression that
+        //   (a) removed the throw and let the second-attempt sentinel post-process
+        //       into the findings list (re-introducing the 1aa5a13f false-
+        //       AuditFailed regression by burning a rework iteration), or
+        //   (b) routed the persistent failure to WaitingForQuotaReset (the
+        //       non-quota execution failure has no reset semantics), or
+        //   (c) let the item reach Done with a Pass verdict (the bug-report
+        //       hard invariant: a Pass requires every configured auditor to
+        //       have actually run),
+        // would all pass every other test in this file.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedLlmAuditor("review-crash", persistentAgentFailure: true);
+        using var fix = BuildPipeline(seed, [auditor], maxAuditIterations: 1);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        // Hard invariant: an unrunnable auditor must NOT pass the audit gate.
+        Assert.NotEqual(WorkItemState.Done, finalItem!.State);
+        // Non-quota infra failure must NOT park (no reset semantics).
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, finalItem.State);
+        // Must NOT be AuditFailed (would burn a rework iteration on infra).
+        Assert.NotEqual(WorkItemState.AuditFailed, finalItem.State);
+        Assert.Equal(WorkItemState.Failed, finalItem.State);
+        Assert.Equal("infrastructure", finalItem.FailureKind);
+
+        // Both the first attempt and the transient retry must have recorded
+        // a failure:agent involvement row — confirms the retry actually fired
+        // (without it, only one failure row would land) and that no Pass-shaped
+        // success row sneaked in.
+        var auditRows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase == "audit:review-crash").ToList();
+        Assert.Equal(2, auditRows.Count);
+        Assert.All(auditRows, r => Assert.Equal("failure:agent", r.Outcome));
+        Assert.DoesNotContain(auditRows, r => r.Outcome == "success");
     }
 
     [Fact]
@@ -1706,7 +1859,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         AgentQuotaSnapshot? codexQuotaSnapshot = null,
         AgentQuotaSnapshot? claudeQuotaSnapshot = null,
         bool singleMemberClass = false,
-        IQuotaFailureStore? quotaFailures = null)
+        IQuotaFailureStore? quotaFailures = null,
+        bool wireAuditProgress = false)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1795,6 +1949,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
             quotaFailures: quotaFailures,
             involvement: involvementForPipeline,
+            auditProgress: wireAuditProgress ? store : null,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: inVmSmokeGate is null
                 ? null
@@ -2419,18 +2574,21 @@ internal sealed class ScriptedLlmAuditor : IAuditor
     private readonly int _failOnCall;
     private readonly int _quotaStderrOnCall;
     private readonly int _agentFailOnCall;
+    private readonly bool _persistentAgentFailure;
     private int _calls;
 
     public ScriptedLlmAuditor(
         string name,
         int failOnCall = 0,
         int quotaStderrOnCall = 0,
-        int agentFailOnCall = 0)
+        int agentFailOnCall = 0,
+        bool persistentAgentFailure = false)
     {
         Name = name;
         _failOnCall = failOnCall;
         _quotaStderrOnCall = quotaStderrOnCall;
         _agentFailOnCall = agentFailOnCall;
+        _persistentAgentFailure = persistentAgentFailure;
     }
 
     public string Name { get; }
@@ -2455,7 +2613,7 @@ internal sealed class ScriptedLlmAuditor : IAuditor
                 AgentStderr: "API Error: rate_limit_exceeded; please try again after 1h"));
         }
 
-        if (call == _agentFailOnCall)
+        if (call == _agentFailOnCall || _persistentAgentFailure)
         {
             // The review agent failed to RUN (audit infrastructure failure, not a
             // source-code finding). IsLlmAgentExecutionFailure recognises this

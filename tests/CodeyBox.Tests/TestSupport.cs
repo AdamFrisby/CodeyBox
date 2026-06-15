@@ -117,6 +117,12 @@ internal static class TestSupport
         CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null,
         ISessionAgentRunner? sessionAgentRunnerOverride = null,
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshotOverride = null,
+        // Extra registry entries — register additional agent runners alongside
+        // the default ScriptedAgent so tests can exercise audit-pool routing
+        // for non-work agents (e.g. asserting missing-credentials / smoke-
+        // rejected paths without the runner-missing branch swallowing the
+        // case first).
+        IEnumerable<IAgentRunner>? extraAgentRunners = null,
         // New orchestrator-owned dispatch options. When the test already
         // passes claudeSessionOptions (legacy shape), its Enabled flag is
         // projected into AgentSessionDispatchOptions at the seam below so
@@ -140,7 +146,10 @@ internal static class TestSupport
         ScriptedAgent agent = cliSessionResumableAgent
             ? new CliSessionResumableScriptedAgent(mergeStrategies)
             : new ScriptedAgent(mergeStrategies);
-        var registry = new AgentRegistry([agent]);
+        var runnerList = new List<IAgentRunner> { agent };
+        if (extraAgentRunners is not null)
+            runnerList.AddRange(extraAgentRunners);
+        var registry = new AgentRegistry(runnerList);
         var auditorList = (auditors ?? []).ToList();
 
         // Project repo: a single in-memory project pointing at the seed.
