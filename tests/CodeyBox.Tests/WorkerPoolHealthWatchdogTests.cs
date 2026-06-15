@@ -196,8 +196,8 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
                 await WaitUntilAsync(() => orchestrator.IsActiveForTest(active.Id), DispatchWaitTimeout),
                 "Expected active work to be reserved before evaluating the drain gate.");
 
-            var refactor = Item() with { JobType = JobType.Refactor };
-            var freshNormal = Item() with { Priority = 100 };
+            var refactor = Item() with { JobType = JobType.Refactor, Priority = 100 };
+            var freshNormal = Item() with { Priority = 0 };
             await _store.CreateAsync(refactor);
             await _store.CreateAsync(freshNormal);
 
@@ -368,6 +368,97 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
                 Assert.True(
                     await WaitUntilAsync(
                         () => !orchestrator.IsActiveForTest(refactor.Id)
+                            && orchestrator.CurrentlyRunningTotal == 0,
+                        DispatchWaitTimeout),
+                    "Expected reserved refactor to drain before stopping the orchestrator.");
+                using var stopCts = new CancellationTokenSource(DispatchWaitTimeout);
+                await orchestrator.StopAsync(stopCts.Token);
+            }
+            finally
+            {
+                orchestrator.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task IdleQueuedRefactor_IsRunnableForHealthRecovery()
+    {
+        var refactor = Item() with { JobType = JobType.Refactor };
+        await _store.CreateAsync(refactor);
+        var health = BuildHealthSource();
+
+        var candidates = await health.ListRunnableCandidatesAsync(10, CancellationToken.None);
+        Assert.Contains(candidates, c => c.Id == refactor.Id);
+
+        var watchdog = BuildWatchdog(StandardOptions(), health);
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        _time.Advance(TimeSpan.FromMinutes(2));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(1, _queue.Count);
+        Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+    }
+
+    [Fact]
+    public async Task RefactorDrainOwnerBlocksSecondRefactorButNotStartedContinuationInHealth()
+    {
+        var projectRepo = new BlockingProjectRepository(Project());
+        var firstRefactor = Item() with { JobType = JobType.Refactor, Priority = 100 };
+        await _store.CreateAsync(firstRefactor);
+        var blocking = new BlockingPipeline();
+        var orchestrator = new OrchestratorService(
+            _queue,
+            _store,
+            blocking,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 2,
+                ShutdownDrainTimeout = TimeSpan.FromSeconds(5),
+            },
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo);
+
+        try
+        {
+            await _queue.EnqueueAsync(firstRefactor.Id);
+            await orchestrator.StartAsync(CancellationToken.None);
+            await projectRepo.Entered.Task.WaitAsync(DispatchWaitTimeout);
+
+            Assert.True(
+                await WaitUntilAsync(() => orchestrator.IsActiveForTest(firstRefactor.Id), DispatchWaitTimeout),
+                "Expected first refactor reservation to own the drain before evaluating health.");
+            Assert.Null((await _store.GetAsync(firstRefactor.Id))!.StartedAt);
+
+            var secondRefactor = Item() with { JobType = JobType.Refactor, Priority = 0 };
+            var continuation = Item() with
+            {
+                State = WorkItemState.WorkComplete,
+                StartedAt = DateTimeOffset.UtcNow,
+                Priority = 50,
+            };
+            await _store.CreateAsync(secondRefactor);
+            await _store.CreateAsync(continuation);
+
+            var health = BuildHealthSource(
+                orchestrator: orchestrator,
+                projects: new InMemoryProjectRepository(Project()));
+            var candidates = await health.ListRunnableCandidatesAsync(10, CancellationToken.None);
+
+            Assert.DoesNotContain(candidates, c => c.Id == secondRefactor.Id);
+            Assert.Contains(candidates, c => c.Id == continuation.Id);
+            Assert.Equal(0, _queue.Count);
+        }
+        finally
+        {
+            projectRepo.Release.TrySetResult();
+            blocking.Release.TrySetResult();
+            try
+            {
+                Assert.True(
+                    await WaitUntilAsync(
+                        () => !orchestrator.IsActiveForTest(firstRefactor.Id)
                             && orchestrator.CurrentlyRunningTotal == 0,
                         DispatchWaitTimeout),
                     "Expected reserved refactor to drain before stopping the orchestrator.");

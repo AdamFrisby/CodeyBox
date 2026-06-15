@@ -734,7 +734,7 @@ public sealed class RefactorJobTypeTests : IDisposable
     }
 
     [Fact]
-    public async Task EligibleRefactorDrainsProjectBeforeHigherPriorityFreshNormalStarts()
+    public async Task EligibleRefactorDrainsProjectBeforeLowerPriorityFreshNormalStarts()
     {
         var pid = "proj-refactor-drain";
         var projectRepo = new InMemoryProjectRepository(new Project
@@ -765,16 +765,16 @@ public sealed class RefactorJobTypeTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
         await WaitForStartedAsync(_store, inFlightNormal.Id);
 
-        var refactor = MakeQueued(pid, JobType.Refactor) with { Priority = 0 };
-        var higherPriorityNormal = MakeQueued(pid) with { Priority = 100 };
+        var refactor = MakeQueued(pid, JobType.Refactor) with { Priority = 100 };
+        var lowerPriorityNormal = MakeQueued(pid) with { Priority = 0 };
         await _store.CreateAsync(refactor);
-        await _store.CreateAsync(higherPriorityNormal);
-        await queue.EnqueueAsync(higherPriorityNormal.Id);
+        await _store.CreateAsync(lowerPriorityNormal);
+        await queue.EnqueueAsync(lowerPriorityNormal.Id);
         await queue.EnqueueAsync(refactor.Id);
 
         await WaitForDeferredAsync(svc, refactor.Id);
-        await WaitForDeferredAsync(svc, higherPriorityNormal.Id);
-        Assert.Null((await _store.GetAsync(higherPriorityNormal.Id))!.StartedAt);
+        await WaitForDeferredAsync(svc, lowerPriorityNormal.Id);
+        Assert.Null((await _store.GetAsync(lowerPriorityNormal.Id))!.StartedAt);
 
         var draining = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
         Assert.Equal("draining", draining.State);
@@ -783,17 +783,43 @@ public sealed class RefactorJobTypeTests : IDisposable
 
         pipeline.Release(inFlightNormal.Id);
         await WaitForStartedAsync(_store, refactor.Id);
-        Assert.Null((await _store.GetAsync(higherPriorityNormal.Id))!.StartedAt);
+        Assert.Null((await _store.GetAsync(lowerPriorityNormal.Id))!.StartedAt);
 
         var locked = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
         Assert.Equal("locked", locked.State);
         Assert.Equal(refactor.Id, locked.RefactorWorkItemId);
 
         pipeline.Release(refactor.Id);
-        await WaitForStartedAsync(_store, higherPriorityNormal.Id);
+        await WaitForStartedAsync(_store, lowerPriorityNormal.Id);
 
-        pipeline.Release(higherPriorityNormal.Id);
+        pipeline.Release(lowerPriorityNormal.Id);
         await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task LowerPriorityRefactorDoesNotClaimDrainBeforeHigherPriorityFreshNormal()
+    {
+        var pid = "proj-refactor-priority";
+        var queue = new InMemoryTaskQueue();
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            new ManualReleasePipelineRunner(_store, Task.CompletedTask),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        var refactor = MakeQueued(pid, JobType.Refactor) with { Priority = 0 };
+        var higherPriorityNormal = MakeQueued(pid) with { Priority = 100 };
+        await _store.CreateAsync(refactor);
+        await _store.CreateAsync(higherPriorityNormal);
+
+        var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+
+        Assert.Equal(higherPriorityNormal.Id, picked);
+        Assert.False(svc.IsDeferredForTest(higherPriorityNormal.Id));
+        Assert.Empty(await svc.GetRefactorProjectGateStatusAsync());
+        svc.Dispose();
     }
 
     [Fact]
@@ -1007,6 +1033,39 @@ public sealed class RefactorJobTypeTests : IDisposable
         releaseGate.TrySetResult();
         await WaitForStartedAsync(_store, refactor.Id);
         await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task FreshRefactorDrainAllowsStartedRefactorContinuationToRun()
+    {
+        var pid = "proj-refactor-continuation-refactor";
+        var queue = new InMemoryTaskQueue();
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            new ManualReleasePipelineRunner(_store, Task.CompletedTask),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        var continuation = MakeQueued(pid, JobType.Refactor) with
+        {
+            State = WorkItemState.WorkComplete,
+            StartedAt = DateTimeOffset.UtcNow,
+            Priority = 0,
+        };
+        var freshRefactor = MakeQueued(pid, JobType.Refactor) with { Priority = 100 };
+        await _store.CreateAsync(continuation);
+        await _store.CreateAsync(freshRefactor);
+
+        using var cts = new CancellationTokenSource();
+        var picked = await svc.PickNextEligibleForTestAsync(cts.Token);
+
+        Assert.Equal(continuation.Id, picked);
+        Assert.False(svc.IsDeferredForTest(continuation.Id));
+        await WaitForDeferredAsync(svc, freshRefactor.Id);
+        cts.Cancel();
+        svc.Dispose();
     }
 
     [Fact]

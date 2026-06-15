@@ -582,12 +582,12 @@ dispatch-time exclusivity gate.
 
 ### Anti-starvation
 
-Once a refactor is dispatch-eligible for a project, the dispatcher opens a
-project-scoped drain: fresh non-refactor starts for that project are deferred
-while already-started work continues through its remaining phases. When the
-project reaches zero in-flight items, the refactor starts; while it is in
-flight, same-project fresh starts remain deferred. Normal dispatch resumes
-after the refactor completes.
+Once a refactor is the highest-priority eligible fresh start for its project
+by the normal dispatch order, the dispatcher opens a project-scoped drain:
+lower-priority fresh starts for that project are deferred while already-started
+work continues through its remaining phases. When the project reaches zero
+in-flight items, the refactor starts; while it is in flight, same-project fresh
+starts remain deferred. Normal dispatch resumes after the refactor completes.
 
 This drain is project-scoped. A refactor drain in project X does not pause
 work in project Y, including another project's refactor.

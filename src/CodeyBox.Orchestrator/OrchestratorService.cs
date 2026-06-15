@@ -132,9 +132,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // store; the pickup query skips them until the delay fires and removes them.
     private readonly ConcurrentDictionary<WorkItemId, byte> _deferredItems = new();
 
-    // Project-scoped drain claims created when a queued Refactor is ready to
-    // run but the project still has in-flight work. While the claim is active,
-    // fresh same-project non-refactor starts are held so the project can drain.
+    // Project-scoped drain claims created when a queued Refactor reaches its
+    // normal dispatch turn but the project still has in-flight work. While the
+    // claim is active, fresh same-project non-refactor starts are held so the
+    // project can drain.
     // The claim is rebuilt from durable queued refactor rows after restart.
     private readonly ConcurrentDictionary<string, RefactorDrainClaim> _refactorDrainClaims = new(StringComparer.Ordinal);
 
@@ -564,19 +565,28 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
 
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
+        var priorFreshDispatchProjects = new HashSet<string>(StringComparer.Ordinal);
         foreach (var item in allItems
             .OrderBy(DispatchPhaseBucket)
             .ThenByDescending(i => i.Priority)
             .ThenBy(i => i.CreatedAt))
         {
-            if (item.JobType != JobType.Refactor
-                || item.StartedAt is not null
+            if (item.StartedAt is not null
                 || WorkItemInFlight.IsExcludedState(item.State)
                 || !WorkItemDependencies.AreSatisfied(item.DependsOn, statesById)
                 || statuses.ContainsKey(item.ProjectId.Value))
             {
                 continue;
             }
+
+            if (item.JobType != JobType.Refactor)
+            {
+                priorFreshDispatchProjects.Add(item.ProjectId.Value);
+                continue;
+            }
+
+            if (!priorFreshDispatchProjects.Add(item.ProjectId.Value))
+                continue;
 
             var counts = await _store.CountInFlightSplitByRefactorAsync(item.ProjectId, ct, item.Id);
             if (counts.Refactor == 0 && counts.Other == 0)
@@ -606,6 +616,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var activeClaims = await CollectActiveRefactorDrainClaimsAsync(ct);
         var projectClaim = activeClaims.FirstOrDefault(c => c.ProjectId == candidate.ProjectId);
 
+        if (candidate.StartedAt is not null)
+            return RefactorDispatchGateDecision.Allow;
+
         if (candidate.JobType == JobType.Refactor)
         {
             if (projectClaim is not null && projectClaim.RefactorWorkItemId != candidate.Id)
@@ -631,13 +644,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 $"refactor exclusivity: a refactor is in flight for project '{candidate.ProjectId.Value}'; non-refactor items wait until it completes");
         }
 
-        if (candidate.StartedAt is not null)
-            return RefactorDispatchGateDecision.Allow;
-
         if (projectClaim is not null)
             return RefactorDispatchGateDecision.Block(projectClaim.Reason);
 
-        var queuedRefactor = await FindFirstEligibleFreshRefactorForProjectAsync(candidate.ProjectId, ct);
+        var queuedRefactor = await FindEligibleFreshRefactorForProjectBeforeCandidateAsync(
+            candidate.ProjectId,
+            candidate.Id,
+            ct);
         if (queuedRefactor is null)
             return RefactorDispatchGateDecision.Allow;
 
@@ -1208,7 +1221,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         // Build the state map lazily only when we encounter an item with deps.
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
-        var eligibleCandidates = new List<WorkItem>();
         var pendingRefactorProjects = (await CollectActiveRefactorDrainClaimsAsync(stoppingToken))
             .ToDictionary(c => c.ProjectId.Value, c => c.RefactorWorkItemId, StringComparer.Ordinal);
 
@@ -1217,15 +1229,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
                 continue;
 
-            eligibleCandidates.Add(candidate);
-            if (candidate.JobType == JobType.Refactor && candidate.StartedAt is null)
-                pendingRefactorProjects.TryAdd(candidate.ProjectId.Value, candidate.Id);
-        }
-
-        foreach (var candidate in eligibleCandidates)
-        {
             if (candidate.JobType == JobType.Refactor)
             {
+                if (candidate.StartedAt is not null)
+                    return candidate.Id;
+
                 if (pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var ownerRefactorId)
                     && ownerRefactorId != candidate.Id)
                 {
@@ -1234,7 +1242,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
 
                 if (await TryClaimOrDeferRefactorDrainAsync(candidate, stoppingToken))
+                {
+                    pendingRefactorProjects[candidate.ProjectId.Value] = candidate.Id;
                     continue;
+                }
 
                 if (candidate.StartedAt is null)
                     SetRefactorDrainClaim(candidate, RefactorStartReservationReason(candidate));
@@ -2409,20 +2420,25 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             ? 0
             : 1;
 
-    private async Task<WorkItem?> FindFirstEligibleFreshRefactorForProjectAsync(
+    private async Task<WorkItem?> FindEligibleFreshRefactorForProjectBeforeCandidateAsync(
         ProjectId projectId,
+        WorkItemId candidateId,
         CancellationToken ct)
     {
         var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
         foreach (var deferredId in _deferredItems.Keys)
-            skipIds.Add(deferredId);
+        {
+            if (deferredId != candidateId)
+                skipIds.Add(deferredId);
+        }
 
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
         await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
         {
-            if (candidate.ProjectId != projectId
-                || candidate.JobType != JobType.Refactor
-                || candidate.StartedAt is not null)
+            if (candidate.Id == candidateId)
+                return null;
+
+            if (candidate.ProjectId != projectId)
             {
                 continue;
             }
@@ -2440,7 +2456,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
             }
 
-            return candidate;
+            if (candidate.JobType == JobType.Refactor && candidate.StartedAt is null)
+                return candidate;
+
+            if (candidate.StartedAt is null)
+                return null;
         }
 
         return null;
@@ -2564,11 +2584,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private async Task<bool> TryDeferForRefactorExclusivityAsync(WorkItem item, CancellationToken ct)
     {
+        // Started continuations are already in-flight work; the refactor gate
+        // only holds fresh starts.
+        if (item.StartedAt is not null)
+            return false;
+
         // Reads the same in-flight population CountInFlightAsync sees, split by
-        // JobType, while excluding the candidate itself. The exclusion matters
-        // for recovered pass-through states (WorkComplete, AuditPassed, Merged):
-        // they keep StartedAt and are dispatch-eligible continuations, so a
-        // resumed Refactor must not mistake its own row for a competing refactor.
+        // JobType, while excluding the fresh candidate itself.
         var (refactorInFlight, otherInFlight) =
             await _store.CountInFlightSplitByRefactorAsync(item.ProjectId, ct, item.Id);
 
@@ -2580,8 +2602,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             var reason = refactorInFlight > 0
                 ? $"refactor exclusivity: another refactor is in flight for project '{item.ProjectId.Value}' (refactor={refactorInFlight}, other={otherInFlight})"
                 : $"refactor exclusivity: project '{item.ProjectId.Value}' has {otherInFlight} in-flight non-refactor item(s); refactor waits for the project to drain";
-            if (item.StartedAt is null)
-                SetRefactorDrainClaim(item, reason);
+            SetRefactorDrainClaim(item, reason);
             AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, reason);
             ScheduleDeferredRequeue(item.Id, RefactorExclusivityRecheckInterval, ct);
             return true;
