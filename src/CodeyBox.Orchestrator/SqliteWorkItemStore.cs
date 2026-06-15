@@ -17,8 +17,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     {
         Converters = { new JsonStringEnumConverter() },
     };
-    private static readonly string InFlightExcludedStatesSql =
-        string.Join(", ", WorkItemInFlight.ExcludedStates.Select(state => (int)state));
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
     private readonly SqliteDatabaseWriteGate _writeLock;
@@ -1117,14 +1115,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         using var cmd = _conn.CreateCommand();
         // NeedsOperatorInput items are parked (pipeline not running); exclude them so they
         // don't consume a concurrent slot while operators are offline for hours/days.
-        cmd.CommandText = $"""
+        cmd.CommandText = """
             SELECT COUNT(*) FROM work_items
             WHERE project_id = $pid
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({InFlightExcludedStatesSql});
+              AND state NOT IN (
+                  $inflight_done,
+                  $inflight_failed,
+                  $inflight_cancelled,
+                  $inflight_audit_failed,
+                  $inflight_merge_conflict_resolution_failed,
+                  $inflight_needs_operator_input,
+                  $inflight_waiting_for_quota_reset,
+                  $inflight_waiting_for_agent_resume,
+                  $inflight_abandoned_after_recovery_attempts
+              );
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
+        AddInFlightExcludedStateParameters(cmd);
         var result = await cmd.ExecuteScalarAsync(ct);
         return result is long l ? (int)l : 0;
     }
@@ -1140,7 +1149,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // single scan over the (project_id, state) index. job_type is stored as
         // text so we compare ordinally to JobType.Refactor.ToString().
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = $"""
+        cmd.CommandText = """
             SELECT
                 SUM(CASE WHEN job_type = $refactor THEN 1 ELSE 0 END) AS refactor_count,
                 SUM(CASE WHEN job_type = $refactor THEN 0 ELSE 1 END) AS other_count
@@ -1149,16 +1158,40 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
               AND ($exclude_id IS NULL OR id != $exclude_id)
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({InFlightExcludedStatesSql});
+              AND state NOT IN (
+                  $inflight_done,
+                  $inflight_failed,
+                  $inflight_cancelled,
+                  $inflight_audit_failed,
+                  $inflight_merge_conflict_resolution_failed,
+                  $inflight_needs_operator_input,
+                  $inflight_waiting_for_quota_reset,
+                  $inflight_waiting_for_agent_resume,
+                  $inflight_abandoned_after_recovery_attempts
+              );
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         cmd.Parameters.AddWithValue("$refactor", JobType.Refactor.ToString());
         cmd.Parameters.AddWithValue("$exclude_id", excludeId?.ToString() ?? (object)DBNull.Value);
+        AddInFlightExcludedStateParameters(cmd);
         using var reader = await cmd.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) return (0, 0);
         var refactor = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetInt64(0));
         var other = reader.IsDBNull(1) ? 0 : Convert.ToInt32(reader.GetInt64(1));
         return (refactor, other);
+    }
+
+    private static void AddInFlightExcludedStateParameters(SqliteCommand cmd)
+    {
+        cmd.Parameters.AddWithValue("$inflight_done", (int)WorkItemState.Done);
+        cmd.Parameters.AddWithValue("$inflight_failed", (int)WorkItemState.Failed);
+        cmd.Parameters.AddWithValue("$inflight_cancelled", (int)WorkItemState.Cancelled);
+        cmd.Parameters.AddWithValue("$inflight_audit_failed", (int)WorkItemState.AuditFailed);
+        cmd.Parameters.AddWithValue("$inflight_merge_conflict_resolution_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+        cmd.Parameters.AddWithValue("$inflight_needs_operator_input", (int)WorkItemState.NeedsOperatorInput);
+        cmd.Parameters.AddWithValue("$inflight_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
+        cmd.Parameters.AddWithValue("$inflight_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
+        cmd.Parameters.AddWithValue("$inflight_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
     }
 
     public async Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default)

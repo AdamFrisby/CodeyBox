@@ -1003,12 +1003,12 @@ public sealed class PipelineRunner : IPipelineRunner
             // For non-Queued entries (resume from audit/merge/upstream) the
             // existing rebase preserves prior phase commits as intended.
             //
-            // Before the reset, verify any pre-existing broken branch state.
-            // A from=work re-drive of a non-compiling branch must either be
-            // fixed or fail loud with the build error — silently resetting
-            // such a branch back to base would erase the broken commits and
-            // proceed from pristine state, neither fixing the intrinsic
-            // compile error nor reporting it.
+            // Do not run the required-build gate here. Queued entry is the
+            // agent's chance to produce or repair work; a pre-existing broken
+            // branch is inherited state, not this turn's output. Reset-eligible
+            // branches are reset to base before the agent runs, and preserved
+            // branches are handed to the agent as-is. The required-build gate
+            // runs after the agent turn below and classifies only that output.
             using (BeginPhaseScope(item, "pickup"))
             {
                 if (entry is WorkItemState.Queued)
@@ -1029,20 +1029,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         {
                             await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
                         }
-                        else
-                        {
-                            await _requiredBuildGate.EnforceBeforePickupResetAsync(
-                                item, project, _gitHost, repoId, baseBranch, workBranch, ct);
-                        }
-
                         _log.LogInformation(
                             "Preserving work branch {WorkBranch} for queued pickup of work item {WorkItemId}",
                             workBranch, item.Id);
                     }
                     else
                     {
-                        await _requiredBuildGate.EnforceBeforePickupResetAsync(
-                            item, project, _gitHost, repoId, baseBranch, workBranch, ct);
                         await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
                     }
                 }

@@ -26,7 +26,7 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
-    public async Task RetryFromWork_NoChangesOnBrokenCSharpBranch_FailsWithBuildErrorNotNoChanges()
+    public async Task RetryFromWork_PreservedBrokenBranch_RunsAgentAndGatesOutput()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddDotnetSolutionMarkerAsync(seed);
@@ -39,8 +39,20 @@ public sealed class RequiredBuildGateTests : IDisposable
         var item = NewItem("feature/broken-csharp");
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = (await TestSupport.RunGit(barePath, "rev-parse", "main")).stdout.Trim();
         await CommitToBareBranchAsync(barePath, item.WorkBranch!, "build.fail", "broken\n", "broken prior attempt");
 
+        var agentInvoked = false;
+        var inheritedBuildFailVisible = true;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            agentInvoked = true;
+            var probe = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["test", "-f", $"{workingDirectory}/build.fail"],
+            }, ct);
+            inheritedBuildFailVisible = probe.Success;
+        };
         tp.Agent.WorkPlan.Enqueue(new FileWrite("build.fail", "broken\n"));
 
         await tp.Store.CreateAsync(item);
@@ -48,10 +60,14 @@ public sealed class RequiredBuildGateTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("retry-from-work received a non-compiling branch", final.LastError);
+        Assert.Contains("work left the branch non-compiling", final.LastError);
         Assert.Contains("error CS1061", final.LastError);
         Assert.Equal("build", final.FailureKind);
         Assert.DoesNotContain("no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.True(agentInvoked);
+        Assert.True(inheritedBuildFailVisible);
+        Assert.Empty(tp.Agent.WorkPlan);
+        Assert.Equal(baseTip, (await TestSupport.RunGit(barePath, "rev-parse", $"{item.WorkBranch}~1")).stdout.Trim());
     }
 
     [Theory]
@@ -112,15 +128,12 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
-    public async Task RetryFromWork_DefaultCodeyBoxOwnedBranchWithBrokenBuild_FailsBeforePickupReset()
+    public async Task RetryFromWork_DefaultCodeyBoxOwnedBranchWithBrokenBuild_ResetsAndRunsCleanWork()
     {
-        // Cheating-finding regression: a Queued/from=work pickup on the
-        // server-owned codeybox/{id8} branch used to force-reset the work
-        // branch back to base BEFORE inspecting whether the prior branch
-        // compiled. That silently erased a non-compiling branch and
-        // proceeded from pristine base, neither fixing the intrinsic
-        // compile error nor reporting it. The pre-reset build gate must
-        // fail loud with the build error instead.
+        // retry-from-work must not let inherited non-compiling state dead-end
+        // the item before the work agent runs. The reset-eligible
+        // server-owned branch is reset to base and the agent gets a clean
+        // work pass; the required-build gate applies only to the agent output.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddDotnetSolutionMarkerAsync(seed);
         var fakeDotnet = await CreateFakeDotnetAsync();
@@ -132,38 +145,44 @@ public sealed class RequiredBuildGateTests : IDisposable
         // Use the default codeybox/{id8} branch naming so the pickup path
         // takes the IsPickupRebaseOwnedWorkBranch=true reset branch — the
         // branch suffix MUST match the work item id's first 8 chars or the
-        // ownership check rejects it and the pre-reset gate is bypassed.
+        // ownership check rejects it and the branch is preserved instead.
         var workItemId = WorkItemId.New();
         var item = NewItem($"codeybox/{workItemId.ToString()[..8]}") with { Id = workItemId };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = (await TestSupport.RunGit(barePath, "rev-parse", "main")).stdout.Trim();
         await CommitToBareBranchAsync(barePath, item.WorkBranch!, "build.fail", "broken\n", "broken prior attempt");
+
+        var agentInvoked = false;
+        tp.Agent.BeforeWorkAsync = (_, _, _) =>
+        {
+            agentInvoked = true;
+            return Task.CompletedTask;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fixed.txt", "clean retry\n"));
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("retry-from-work received a non-compiling branch", final.LastError);
-        Assert.Contains("error CS1061", final.LastError);
-        Assert.Equal("build", final.FailureKind);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(agentInvoked);
+        Assert.Null(final.FailureKind);
 
-        // The broken commit must still be on the bare repo's work branch —
-        // the pre-reset gate must fail BEFORE the reset wipes it, so an
-        // operator inspecting the branch can see exactly what failed to
-        // compile rather than finding a pristine base tip.
-        var workTipFile = await TestSupport.RunGit(
+        var workTipFile = await TestSupport.RunGitNoThrow(
             barePath, "show", $"{item.WorkBranch}:build.fail");
-        Assert.Equal(0, workTipFile.code);
-        Assert.Equal("broken\n", workTipFile.stdout);
+        Assert.NotEqual(0, workTipFile.code);
+        Assert.Equal(baseTip, (await TestSupport.RunGit(barePath, "rev-parse", $"{item.WorkBranch}~1")).stdout.Trim());
+        var fixedFile = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:fixed.txt");
+        Assert.Equal("clean retry\n", fixedFile.stdout);
     }
 
     [Fact]
-    public async Task RetryFromWork_RecoveredNonOwnedBrokenBranch_FailsBeforePickupReset()
+    public async Task RetryFromWork_RecoveredNonOwnedBrokenBranch_ResetsAndRunsCleanWork()
     {
         // Recovered queued items with non-owned/anomalous branches now take the
-        // reset path, but the build gate still has to inspect the existing
-        // broken branch before that reset erases it.
+        // reset path. A broken inherited branch must not fail before the
+        // agent runs; resetting to base gives the retry a clean chance.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddDotnetSolutionMarkerAsync(seed);
         var fakeDotnet = await CreateFakeDotnetAsync();
@@ -175,24 +194,32 @@ public sealed class RequiredBuildGateTests : IDisposable
         var item = NewItem("feature/recovered-anomalous-broken") with { RecoveryAttempts = 1 };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = (await TestSupport.RunGit(barePath, "rev-parse", "main")).stdout.Trim();
         await CommitToBareBranchAsync(
             barePath, item.WorkBranch!, "build.fail", "broken\n", "broken recovered anomalous branch");
-        var brokenTip = await TestSupport.RunGit(barePath, "rev-parse", item.WorkBranch!);
+        var agentInvoked = false;
+        tp.Agent.BeforeWorkAsync = (_, _, _) =>
+        {
+            agentInvoked = true;
+            return Task.CompletedTask;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fixed.txt", "clean recovered retry\n"));
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("retry-from-work received a non-compiling branch", final.LastError);
-        Assert.Contains("error CS1061", final.LastError);
-        Assert.Equal("build", final.FailureKind);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(agentInvoked);
+        Assert.Null(final.FailureKind);
 
         var workTip = await TestSupport.RunGit(barePath, "rev-parse", item.WorkBranch!);
-        Assert.Equal(brokenTip.stdout.Trim(), workTip.stdout.Trim());
-        var workTipFile = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:build.fail");
-        Assert.Equal(0, workTipFile.code);
-        Assert.Equal("broken\n", workTipFile.stdout);
+        Assert.NotEqual(baseTip, workTip.stdout.Trim());
+        Assert.Equal(baseTip, (await TestSupport.RunGit(barePath, "rev-parse", $"{item.WorkBranch}~1")).stdout.Trim());
+        var workTipFile = await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:build.fail");
+        Assert.NotEqual(0, workTipFile.code);
+        var fixedFile = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:fixed.txt");
+        Assert.Equal("clean recovered retry\n", fixedFile.stdout);
     }
 
     [Fact]
