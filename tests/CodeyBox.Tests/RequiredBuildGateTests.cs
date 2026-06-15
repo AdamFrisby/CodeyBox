@@ -896,6 +896,50 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxRequiredBuildVerifier_GitCheckoutInsideSandboxExceedsTimeout_ReturnsFailed()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var provider = new HangingRequiredBuildCheckoutSandboxProvider();
+        var verifier = new SandboxRequiredBuildVerifier(
+            provider,
+            gitHost,
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                RequiredBuildVerificationTimeout = TimeSpan.FromMilliseconds(75),
+            });
+
+        var item = NewItem("feature/sandbox-checkout-timeout") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        using var outerCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, outerCts.Token);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, result.Status);
+        Assert.Equal(124, result.ExitCode);
+        Assert.Contains("exceeded the required-build verification timeout", result.Output);
+        Assert.Null(result.Reason);
+        Assert.True(provider.ObservedCheckoutCancellation,
+            "git checkout never observed cancellation, so the build timeout token was not linked into checkout");
+    }
+
+    [Fact]
     public async Task SandboxRequiredBuildVerifier_SandboxCreateAsyncThrows_ReturnsUnavailable()
     {
         // Coverage gap: VerifyAsync's catch-Exception arm at the sandbox
@@ -2449,6 +2493,19 @@ public sealed class RequiredBuildGateTests : IDisposable
         }
     }
 
+    private sealed class HangingRequiredBuildCheckoutSandboxProvider : PassingRequiredBuildSandboxProvider
+    {
+        public bool ObservedCheckoutCancellation { get; private set; }
+
+        public override Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            _ = spec;
+            _ = ct;
+            return Task.FromResult<ISandbox>(
+                new HangingRequiredBuildCheckoutSandbox(() => ObservedCheckoutCancellation = true));
+        }
+    }
+
     private class PassingRequiredBuildSandbox : ISandbox
     {
         public string Id { get; } = "required-build-" + Guid.NewGuid().ToString("N")[..8];
@@ -2480,6 +2537,31 @@ public sealed class RequiredBuildGateTests : IDisposable
                 }
 
                 return new SandboxExecResult(0, "unreachable: git clone should be cancelled before returning", string.Empty);
+            }
+
+            return await base.ExecAsync(exec, ct);
+        }
+    }
+
+    private sealed class HangingRequiredBuildCheckoutSandbox(Action onCheckoutCancellation) : PassingRequiredBuildSandbox
+    {
+        public override async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 5
+                && exec.Argv[0] == "git"
+                && exec.Argv.Contains("checkout", StringComparer.Ordinal))
+            {
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    onCheckoutCancellation();
+                    throw;
+                }
+
+                return new SandboxExecResult(0, "unreachable: git checkout should be cancelled before returning", string.Empty);
             }
 
             return await base.ExecAsync(exec, ct);

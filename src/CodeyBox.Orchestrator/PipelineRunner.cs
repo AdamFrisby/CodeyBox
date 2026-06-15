@@ -13227,11 +13227,11 @@ public sealed record PipelineOptions
     public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
     public double PhaseAbsoluteTimeoutMultiplier { get; init; } = 3.0;
     /// <summary>
-    /// Hard ceiling on a single required-build verification (per call) across
-    /// every phase / resume path. Bounds branch-controlled MSBuild targets
-    /// that sleep or loop forever so they cannot hold a pipeline worker
-    /// indefinitely; on timeout the gate fails as <c>Unavailable</c> and the
-    /// item defers / fails-infrastructure rather than passing by default.
+    /// Ceiling for the in-sandbox required-build work after the verifier
+    /// sandbox has been created: repository clone, checkout, and build script.
+    /// Sandbox admission wait is queueing and VM provisioning is bounded by the
+    /// sandbox provider. On timeout the required-build gate returns a failed
+    /// build result rather than an infrastructure-unavailable result.
     /// </summary>
     public TimeSpan RequiredBuildVerificationTimeout { get; init; } = TimeSpan.FromMinutes(15);
     public TimeSpan AuditShutdownDrain => Min(TimeSpan.FromSeconds(60), ShutdownGrace);

@@ -2188,6 +2188,84 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_CloudInitStatusWaitTimeoutDefersProvisioning()
+    {
+        var staging = Path.Combine(_workspace, "staging-cloud-init-wait-timeout");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? launchedName = null;
+        string? deletedName = null;
+        var observedCloudInitCancellation = false;
+
+        var runner = new RecordingMultipassRunner(async (argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? new ProcessRunResult(0, state, "")
+                    : new ProcessRunResult(1, "", "not found");
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchedName = argv[3];
+                states[launchedName] = "Running";
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+            {
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    observedCloudInitCancellation = true;
+                    throw;
+                }
+
+                return new ProcessRunResult(0, "unreachable: cloud-init wait should be cancelled", "");
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deletedName = deleteName;
+                states.TryRemove(deleteName, out _);
+                return new ProcessRunResult(0, "", "");
+            }
+
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+        });
+
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            vmStartTimeout: TimeSpan.FromMilliseconds(50));
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("cloud-init", ex.Operation);
+        Assert.Equal("multipass-cloud-init-timeout", ex.ErrorClass);
+        Assert.Contains("cloud-init status --wait", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("did not complete within", ex.Message, StringComparison.Ordinal);
+        Assert.True(observedCloudInitCancellation);
+        Assert.Equal(launchedName, deletedName);
+        Assert.False(
+            Directory.Exists(Path.Combine(staging, launchedName!)),
+            "staging directory for failed sandbox must be removed during cleanup");
+    }
+
+    [Fact]
     public async Task CreateAsync_CloudInitExitOneAfterRetriesUsesReadinessProbe()
     {
         var staging = Path.Combine(_workspace, "staging-cloud-init-probe-success");
@@ -2432,9 +2510,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             WorkingDirectory = "/work",
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(spec, CancellationToken.None));
 
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("cloud-init", ex.Operation);
+        Assert.Equal("multipass-cloud-init-not-ready", ex.ErrorClass);
         Assert.Equal(MultipassSandboxOptions.DefaultCloudInitReadyRetryAttempts, cloudInitCalls);
         Assert.Equal(1, probeCalls);
         Assert.Contains("readiness probe failed", ex.Message, StringComparison.Ordinal);
@@ -2504,9 +2585,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             WorkingDirectory = "/work",
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(spec, CancellationToken.None));
 
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("cloud-init", ex.Operation);
+        Assert.Equal("multipass-cloud-init-failed", ex.ErrorClass);
         Assert.Contains("cloud-init failed", ex.Message, StringComparison.Ordinal);
         Assert.Contains("schema validation failed: bad runcmd", ex.Message, StringComparison.Ordinal);
         Assert.NotNull(launchedName);
@@ -2578,9 +2662,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             WorkingDirectory = "/work",
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(spec, CancellationToken.None));
 
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("cloud-init", ex.Operation);
+        Assert.Equal("multipass-cloud-init-degraded", ex.ErrorClass);
         Assert.Contains("cloud-init degraded", ex.Message, StringComparison.Ordinal);
         Assert.Contains("readiness probe failed", ex.Message, StringComparison.Ordinal);
         Assert.Contains("/usr/local/bin/codeybox-exec=missing", ex.Message, StringComparison.Ordinal);
@@ -2657,9 +2744,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             WorkingDirectory = "/work",
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(spec, CancellationToken.None));
 
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("cloud-init", ex.Operation);
+        Assert.Equal("multipass-cloud-init-degraded", ex.ErrorClass);
         // The degraded-state framing must survive.
         Assert.Contains("cloud-init degraded", ex.Message, StringComparison.Ordinal);
         Assert.Contains("readiness probe failed", ex.Message, StringComparison.Ordinal);
