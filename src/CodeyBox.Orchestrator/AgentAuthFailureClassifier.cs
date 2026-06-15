@@ -12,19 +12,21 @@ public interface IAgentAuthFailureClassifier
 {
     /// <summary>
     /// Returns an <see cref="AgentFailureKind.AuthRequired"/> classification
-    /// when stderr contains a configured/default login-prompt signature, or
-    /// stdout contains the compact trusted CLI login transcript shape.
+    /// when stderr contains a configured/default login-prompt signature, stdout
+    /// contains a configured signature, or stdout contains the compact trusted
+    /// CLI login transcript shape.
     /// </summary>
     AgentFailureClassification? Detect(AgentKind kind, string? stderr, string? stdout);
 
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
     /// the evidence. Stderr is treated as CLI diagnostics and matched by
-    /// substring. Stdout is restricted to trusted transcript shapes so broad
-    /// operator-supplied stderr patterns cannot be echoed by model output and
-    /// unexpectedly bench a healthy agent. Pipeline call sites decide whether
-    /// stdout-only detections are authoritative for that phase or require in-VM
-    /// corroboration before a global auth bench is applied.
+    /// substring. Stdout defaults stay restricted to trusted transcript shapes;
+    /// operator-supplied patterns are also applied to stdout so newly observed
+    /// CLI login prompts can be configured without a rebuild. Pipeline call
+    /// sites decide whether stdout-only detections are authoritative for that
+    /// phase or require in-VM corroboration before a global auth bench is
+    /// applied.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }
@@ -84,6 +86,12 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
                 && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
                 matchedStderr = true;
+            }
+
+            if (!string.IsNullOrEmpty(stdout)
+                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedConfiguredStdout = true;
             }
         }
 

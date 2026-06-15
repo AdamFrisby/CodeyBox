@@ -3510,22 +3510,48 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // but produces no useful diff — without this log, we have no
             // visibility into what the agent reasoned.
             LogAgentOutput(_log, runner.Kind, agentResult);
+            AgentAuthFailureDetection? deferredSuccessStdoutOnlyAuthDetection = null;
             if (agentResult.Success)
-                // Normal work stdout is model-controlled. Stderr evidence
-                // benches immediately; stdout-only auth transcripts need
-                // in-VM smoke corroboration before a global bench.
-                await ThrowIfAuthRequiredOutputAsync(
-                    item, project, runner.Kind, agentPhase, agentResult,
-                    benchStdoutOnlyEvidence: false,
-                    ct: ct);
+            {
+                var authDetection = _authFailureClassifier.DetectDetailed(
+                    runner.Kind,
+                    agentResult.Stderr,
+                    agentResult.Stdout);
+                if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+                {
+                    if (authDetection.IsStdoutOnly)
+                    {
+                        // Normal work stdout is the channel that carried the
+                        // original exit-0/no-diff login prompt outage. Defer
+                        // stdout-only handling until the staged-diff check so a
+                        // run that actually changed files is not globally
+                        // benched just because model output echoed a login
+                        // transcript. The no-diff branch below treats the same
+                        // evidence as authoritative.
+                        deferredSuccessStdoutOnlyAuthDetection = authDetection;
+                    }
+                    else
+                    {
+                        await HandleAuthRequiredDetectionAsync(
+                            item,
+                            project,
+                            runner.Kind,
+                            agentPhase,
+                            authDetection.Classification,
+                            throwOnMatch: true,
+                            stdoutOnlyEvidence: false,
+                            benchStdoutOnlyEvidence: true,
+                            ct: ct);
+                    }
+                }
+            }
             if (!agentResult.Success)
             {
-                // Same policy as the success branch: nonzero exits can still
-                // carry model-controlled stdout, so stdout-only evidence is
-                // corroborated before globally benching the agent.
+                // Same policy as the success branch: a nonzero CLI can also
+                // print the login prompt on stdout before exiting.
                 await ThrowIfAuthRequiredOutputAsync(
                     item, project, runner.Kind, agentPhase, agentResult,
-                    benchStdoutOnlyEvidence: false,
+                    benchStdoutOnlyEvidence: true,
                     ct: ct);
 
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
@@ -3647,6 +3673,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var shaAfter = afterHead.Stdout.Trim();
             if (string.Equals(shaBefore, shaAfter, StringComparison.Ordinal))
             {
+                if (deferredSuccessStdoutOnlyAuthDetection is not null)
+                {
+                    await HandleAuthRequiredDetectionAsync(
+                        item,
+                        project,
+                        runner.Kind,
+                        agentPhase,
+                        deferredSuccessStdoutOnlyAuthDetection.Classification,
+                        throwOnMatch: true,
+                        stdoutOnlyEvidence: true,
+                        benchStdoutOnlyEvidence: true,
+                        ct: ct);
+                }
+
                 if (resumingPreempt)
                 {
                     await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",
@@ -4400,14 +4440,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
-        // An exit-0 login prompt from a check-and-act CLI would otherwise be
-        // handed to the verdict parser and surface as a generic verdict-parse
-        // failure — the broken agent stays routable. Inspect aggregated stdout
-        // (covers both streamed chunks and the final payload) so the auth
-        // breaker fires regardless of result.Success.
+        // Check-and-act stdout is parsed model output. Detect auth evidence so
+        // the item fails as infrastructure instead of verdict-parse noise, but
+        // keep stdout-only evidence on the in-VM corroboration path before
+        // globally benching the agent.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
-            benchStdoutOnlyEvidence: true,
+            benchStdoutOnlyEvidence: false,
             ct: ct);
 
         if (!result.Success)
@@ -4903,13 +4942,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             agentRunner.Kind, item.AgentInstanceId, item.Id, "post-act-recheck", iteration,
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
-        // See RunCheckAndActAgentAsync above for the rationale: an exit-0 login
-        // prompt during post-act re-validation would otherwise reach the
-        // verdict parser as a malformed payload, leaving the unauthenticated
-        // agent routable for the next item.
+        // See RunCheckAndActAgentAsync above for the rationale: this is parsed
+        // model output, so stdout-only evidence requires in-VM corroboration
+        // before a global auth bench is applied.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, agentRunner.Kind, "post-act-recheck", aggregatedStdout, result.Stderr,
-            benchStdoutOnlyEvidence: true,
+            benchStdoutOnlyEvidence: false,
             ct: ct);
 
         if (!result.Success)
@@ -5312,7 +5350,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             reasonDetail = shouldBenchAgent
                 ? benchStdoutOnlyEvidence
-                    ? $"{reasonDetail}; stdout accepted as control-phase CLI output"
+                    ? $"{reasonDetail}; stdout accepted as authoritative CLI output for this phase"
                     : $"{reasonDetail}; stdout corroborated by in-VM smoke: {corroborationReason ?? "persistent failure"}"
                 : $"{reasonDetail}; stdout-only evidence was not corroborated by in-VM smoke, so the agent was not globally benched ({corroborationReason ?? "no corroboration"})";
         }

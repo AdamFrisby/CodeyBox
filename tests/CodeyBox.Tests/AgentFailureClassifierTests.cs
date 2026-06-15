@@ -191,7 +191,7 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
-    public void AgentAuthFailureClassifier_DoesNotApplyPerAgentConfiguredPatternsInStdout()
+    public void AgentAuthFailureClassifier_AppliesPerAgentConfiguredPatternsInStdout()
     {
         var classifier = new AgentAuthFailureClassifier(
             new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
@@ -204,7 +204,10 @@ public sealed class AgentFailureClassifierTests
             stderr: null,
             stdout: "stdout-only login ceremony required");
 
-        Assert.Null(stdoutHit);
+        Assert.NotNull(stdoutHit);
+        Assert.True(stdoutHit.IsStdoutOnly);
+        Assert.True(stdoutHit.MatchedConfiguredStdoutPattern);
+        Assert.Equal(AgentFailureKind.AuthRequired, stdoutHit.Classification.Kind);
         var stderrHit = classifier.DetectDetailed(
             new AgentKind("custom"),
             stderr: "stdout-only login ceremony required",

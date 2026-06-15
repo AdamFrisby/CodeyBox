@@ -114,8 +114,8 @@ public static class AgentFailureClassifier
     /// an otherwise healthy agent. Generic substrings like "not logged in"
     /// were intentionally rejected after the auditor flagged them as too
     /// broad. The orchestrator-side <c>AgentAuthFailureClassifier</c> applies
-    /// operator-supplied <c>CodeyBox:AuthFailurePatterns</c> to stderr only and
-    /// decides whether trusted stdout-only transcript evidence is corroborated
+    /// operator-supplied <c>CodeyBox:AuthFailurePatterns</c> to stderr/stdout
+    /// and decides whether stdout-only transcript evidence is corroborated
     /// strongly enough to bench the agent globally.</para>
     /// </summary>
     public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]

@@ -2523,6 +2523,7 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
     public Queue<TimeSpan> ReworkDelays { get; } = new();
     public Queue<TimeSpan> MergeDelays { get; } = new();
     public Queue<FileWrite> WorkPlan { get; } = new();
+    public Queue<string?> WorkStdouts { get; } = new();
     public int CallCount { get; private set; }
     public event Action<AgentKind, string>? PhaseInvocationStarted;
 
@@ -2598,8 +2599,9 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
             Argv = ["sh", "-c", "cat > \"$0\"", path],
             Stdin = fw.Contents,
         }, ct);
+        var stdout = WorkStdouts.Count > 0 ? WorkStdouts.Dequeue() : null;
         return write.Success
-            ? new AgentResult(true, "ok", null, null)
+            ? new AgentResult(true, "ok", stdout, null)
             : new AgentResult(false, "write failed", write.Stdout, write.Stderr);
     }
 
