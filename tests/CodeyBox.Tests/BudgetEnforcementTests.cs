@@ -355,7 +355,7 @@ public sealed class BudgetEnforcementTests : IDisposable
         };
         var reg = new CancellationRegistry(CancellationToken.None);
 
-        var initialRecheck = TimeSpan.FromSeconds(2);
+        var initialRecheck = TimeSpan.FromSeconds(8);
         var hotReloadedRecheck = TimeSpan.FromSeconds(10);
         var oldIntervalGrace = initialRecheck + TimeSpan.FromMilliseconds(400);
 

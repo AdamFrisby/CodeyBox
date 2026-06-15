@@ -300,6 +300,8 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         };
         foreach (var a in args)
             psi.ArgumentList.Add(a);
+
+        ClearInheritedCodeyBoxTransportEnvironment(psi);
         if (environment is not null)
         {
             foreach (var (key, value) in environment)
@@ -314,6 +316,14 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         await process.WaitForExitAsync();
         await Task.WhenAll(stdoutTask, stderrTask);
         return (process.ExitCode, stdout.ToString(), stderr.ToString());
+    }
+
+    private static void ClearInheritedCodeyBoxTransportEnvironment(ProcessStartInfo psi)
+    {
+        psi.Environment.Remove("CODEYBOX_AGENT_LOG_FILE");
+        psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
+        psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
+        psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
     }
 
     private static async Task ReadAllAsync(System.IO.StreamReader reader, StringBuilder sink)
