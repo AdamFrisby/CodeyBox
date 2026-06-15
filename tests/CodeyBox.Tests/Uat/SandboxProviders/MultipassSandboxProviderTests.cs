@@ -2758,11 +2758,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             WorkingDirectory = "/work",
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(spec, CancellationToken.None));
 
         Assert.Contains("did not reach Running state", ex.Message, StringComparison.Ordinal);
         Assert.Contains(configuredTimeout.ToString(), ex.Message, StringComparison.Ordinal);
+        Assert.Equal("vm-start", ex.Operation);
+        Assert.Equal("multipass-vm-start-timeout", ex.ErrorClass);
         Assert.NotNull(launchedName);
         Assert.Equal(launchedName, deletedName);
     }

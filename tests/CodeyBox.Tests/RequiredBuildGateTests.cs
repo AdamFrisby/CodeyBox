@@ -1545,23 +1545,20 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
-    public async Task RequiredBuildVerification_ExceedsTimeout_FailsAsInfrastructure_NotAuditPassed()
+    public async Task RequiredBuildVerification_BuildScriptExceedsTimeout_FailsAsInfrastructure_NotAuditPassed()
     {
-        // Drives the dedicated RequiredBuildVerificationTimeout code path:
-        // the verifier observes its cancellation token but never returns. The
-        // orchestrator's per-call timeout must cancel the verify call, surface
-        // a RequiredBuildVerificationUnavailableException with a clear
-        // "exceeded" reason, and fail the item as infrastructure. Without
-        // this coverage, a regression that fails to link the timeout token,
-        // treats the timeout as ordinary cancellation, or lets the verifier
-        // hang would not be caught.
+        // The verifier timeout starts only after the sandbox is created, but
+        // branch-controlled build scripts must still be bounded. This sandbox
+        // lets the in-VM git preparation succeed and then hangs the build exec
+        // until the build-only timeout cancels it.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var hangingVerifier = new HangingRequiredBuildVerifier();
+        await AddDotnetSolutionMarkerAsync(seed);
+        var hangingProvider = new HangingRequiredBuildSandboxProvider();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             maxAuditIterations: 1,
-            requiredBuildVerifier: hangingVerifier,
+            sandboxProvider: hangingProvider,
             pipelineOptions: new PipelineOptions
             {
                 SandboxImageReference = "ignored",
@@ -1589,10 +1586,69 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.NotEqual(WorkItemState.AuditPassed, final.State);
         Assert.NotEqual(WorkItemState.Merging, final.State);
         Assert.NotEqual(WorkItemState.Done, final.State);
-        Assert.True(hangingVerifier.VerifyCalls >= 1,
-            $"expected the timeout test to call VerifyAsync at least once; observed {hangingVerifier.VerifyCalls}");
-        Assert.True(hangingVerifier.ObservedCancellation,
-            "verifier never observed cancellation, so the timeout token was not linked into VerifyAsync");
+        Assert.True(hangingProvider.ObservedBuildCancellation,
+            "build exec never observed cancellation, so the build timeout token was not linked into the build script");
+    }
+
+    [Fact]
+    public async Task RequiredBuildVerification_SandboxAdmissionWaitIsExcludedFromBuildTimeout()
+    {
+        // A saturated sandbox admission gate is queueing, not a build hang.
+        // Hold the only admission token past RequiredBuildVerificationTimeout,
+        // then release it; the required build should still get its full
+        // build-only budget after CreateAsync returns.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            new PassingRequiredBuildSandboxProvider(),
+            maxConcurrentSandboxes: 1,
+            NullLogger.Instance);
+        var timeout = TimeSpan.FromMilliseconds(75);
+        var verifier = new SandboxRequiredBuildVerifier(
+            provider,
+            gitHost,
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                RequiredBuildVerificationTimeout = timeout,
+            });
+        var gate = new RequiredBuildGate(verifier, timeout, persistReport: null);
+
+        var item = NewItem("feature/admission-wait-excluded") with { State = WorkItemState.WorkComplete };
+        var project = NewProject(item);
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var occupied = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }, CancellationToken.None);
+        try
+        {
+            var verifyTask = gate.EnforceForWorkPhaseAsync(
+                item,
+                project,
+                repoId,
+                item.BaseBranch!,
+                item.WorkBranch!,
+                agentPhase: "work",
+                RequiredBuildPolicy.Terminal,
+                CancellationToken.None);
+
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+            Assert.False(verifyTask.IsCompleted);
+
+            await occupied.DisposeAsync();
+            var outcome = await verifyTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(RequiredBuildWorkPhaseOutcome.PassedOrSkipped, outcome);
+        }
+        finally
+        {
+            await occupied.DisposeAsync();
+        }
     }
 
     [Fact]
@@ -2300,47 +2356,69 @@ public sealed class RequiredBuildGateTests : IDisposable
             => inner.DisposeLeakedAsync(name, ct);
     }
 
-    /// <summary>
-    /// Required-build verifier that probes Applies and then blocks inside
-    /// VerifyAsync until its cancellation token fires. Used to exercise the
-    /// RequiredBuildVerificationTimeout path: when the orchestrator's
-    /// per-call timeout linked token cancels, the verifier throws
-    /// OperationCanceledException and the orchestrator must convert that
-    /// into a RequiredBuildVerificationUnavailableException with an
-    /// "exceeded" reason.
-    /// </summary>
-    private sealed class HangingRequiredBuildVerifier : IRequiredBuildVerifier
+    private class PassingRequiredBuildSandboxProvider : ISandboxProvider
     {
-        public int ProbeCalls { get; private set; }
-        public int VerifyCalls { get; private set; }
-        public bool ObservedCancellation { get; private set; }
+        public string Name => "passing-required-build";
 
-        public Task<RequiredBuildProbeResult> ProbeAsync(
-            RequiredBuildProbeRequest request,
-            CancellationToken ct)
+        public virtual Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
-            _ = request;
+            _ = spec;
             _ = ct;
-            ProbeCalls++;
-            return Task.FromResult(RequiredBuildProbeResult.Applies);
+            return Task.FromResult<ISandbox>(new PassingRequiredBuildSandbox());
         }
 
-        public async Task<RequiredBuildVerificationResult> VerifyAsync(
-            RequiredBuildVerificationRequest request,
-            CancellationToken ct)
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(Array.Empty<ManagedSandboxInfo>());
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class HangingRequiredBuildSandboxProvider : PassingRequiredBuildSandboxProvider
+    {
+        public bool ObservedBuildCancellation { get; private set; }
+
+        public override Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
-            _ = request;
-            VerifyCalls++;
-            try
+            _ = spec;
+            _ = ct;
+            return Task.FromResult<ISandbox>(new HangingRequiredBuildSandbox(() => ObservedBuildCancellation = true));
+        }
+    }
+
+    private class PassingRequiredBuildSandbox : ISandbox
+    {
+        public string Id { get; } = "required-build-" + Guid.NewGuid().ToString("N")[..8];
+
+        public virtual Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _ = exec;
+            _ = ct;
+            return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class HangingRequiredBuildSandbox(Action onBuildCancellation) : PassingRequiredBuildSandbox
+    {
+        public override async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "sh")
             {
-                await Task.Delay(Timeout.Infinite, ct);
-                return RequiredBuildVerificationResult.Passed(0, "unreachable: verifier should be cancelled before returning");
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    onBuildCancellation();
+                    throw;
+                }
+
+                return new SandboxExecResult(0, "unreachable: build should be cancelled before returning", string.Empty);
             }
-            catch (OperationCanceledException)
-            {
-                ObservedCancellation = true;
-                throw;
-            }
+
+            return await base.ExecAsync(exec, ct);
         }
     }
 

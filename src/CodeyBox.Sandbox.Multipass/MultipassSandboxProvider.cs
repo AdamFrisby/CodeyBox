@@ -2142,8 +2142,12 @@ git push origin HEAD:{refName}";
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
         }
         if (DateTime.UtcNow >= deadline)
-            throw new InvalidOperationException(
+        {
+            ThrowProvisioningDeferred(
+                "vm-start",
+                "multipass-vm-start-timeout",
                 $"multipass VM {name} did not reach Running state within {startTimeout}");
+        }
 
         await WaitForCloudInitReadyAsync(opts, name, workItemId, ct);
     }
