@@ -1247,17 +1247,19 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             ? WellKnownCapabilities.Audit
             : null;
 
-    public async Task NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default)
+    public async Task<WorkItemAutoRetryScheduleResult> NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default)
     {
         var retryOptions = CurrentTransientRetryOptions;
-        if (!retryOptions.Enabled) return;
-        if (!IsTransientRetryPending(item)) return;
+        if (!retryOptions.Enabled)
+            return WorkItemAutoRetryScheduleResult.Skipped(item, "disabled");
+        if (!IsTransientRetryPending(item))
+            return WorkItemAutoRetryScheduleResult.Skipped(item, "not-transient");
 
         var now = _time.GetUtcNow();
         if (ShouldExhaustTransientRetry(item, retryOptions, now, out var capReason))
         {
             await TransitionTransientItemAtRetryCapAsync(item, capReason, ct);
-            return;
+            return await GetTransientScheduleResultAfterCapAsync(item, capReason, ct);
         }
 
         var firstFailedAt = item.TransientRetryFirstFailedAt ?? now;
@@ -1270,17 +1272,21 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 item with { TransientRetryFirstFailedAt = firstFailedAt },
                 $"elapsed would exceed max={retryOptions.MaxElapsedTime}",
                 ct);
-            return;
+            return await GetTransientScheduleResultAfterCapAsync(
+                item with { TransientRetryFirstFailedAt = firstFailedAt },
+                $"elapsed would exceed max={retryOptions.MaxElapsedTime}",
+                ct);
         }
 
         try
         {
+            var scheduledItem = item with
+            {
+                NextTransientRetryAt = nextRetryAt,
+                TransientRetryFirstFailedAt = firstFailedAt,
+            };
             var updated = await _store.TryUpdateIfStateAsync(
-                item with
-                {
-                    NextTransientRetryAt = nextRetryAt,
-                    TransientRetryFirstFailedAt = firstFailedAt,
-                },
+                scheduledItem,
                 item.State,
                 ct);
             if (updated)
@@ -1292,12 +1298,29 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     item.TransientRetryAttempts + 1,
                     nextRetryAt,
                     delay);
+                return WorkItemAutoRetryScheduleResult.Scheduled(scheduledItem, nextRetryAt);
             }
+
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            return WorkItemAutoRetryScheduleResult.Skipped(current, "state-changed");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogError(ex, "Error updating NextTransientRetryAt for work item {Id}", item.Id);
+            return WorkItemAutoRetryScheduleResult.Skipped(item, ex.Message);
         }
+    }
+
+    private async Task<WorkItemAutoRetryScheduleResult> GetTransientScheduleResultAfterCapAsync(
+        WorkItem item,
+        string reason,
+        CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        return current.State == WorkItemState.Failed
+            && string.Equals(current.FailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase)
+            ? WorkItemAutoRetryScheduleResult.Exhausted(current, reason)
+            : WorkItemAutoRetryScheduleResult.Skipped(current, reason);
     }
 
     private bool ShouldExhaustTransientRetry(

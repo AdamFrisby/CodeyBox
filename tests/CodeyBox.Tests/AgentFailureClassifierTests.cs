@@ -235,6 +235,17 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
+    public void SummaryOnlyTransientNetworkPattern_Classified_AsTransient()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: null,
+            summary: "agent stream failed: request timed out while waiting for provider");
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Fact]
     public void AdditionalTransientNetworkPatterns_AreOperatorTunable()
     {
         try

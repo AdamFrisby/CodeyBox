@@ -82,6 +82,40 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task TransientNetworkWorkFailures_DoNotFeedFastFailBreaker()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        for (var i = 0; i < 3; i++)
+        {
+            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                Success: false,
+                Summary: "agent transport failed",
+                Stdout: null,
+                Stderr: "request timed out while reading agent stream"));
+        }
+
+        for (var i = 0; i < 3; i++)
+        {
+            var item = NewItem(AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+            var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+            Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+            Assert.Equal("transient", final.FailureKind);
+        }
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available);
+
+        var snap = fix.Registry.Snapshot().SingleOrDefault(s => s.Agent == AgentKind.Codex);
+        Assert.True(snap is null || snap.ConsecutiveFastFails == 0);
+        Assert.True(snap is null || snap.LastFastFailAt is null);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
     public async Task InfrastructureFailure_PreservesExistingFastFailCount_AndStillTripsOnNextGenuineFail()
     {
         // Inverse of the zero-counter case above: prove the infra filter is

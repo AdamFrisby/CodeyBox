@@ -218,8 +218,7 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent binary was not found in the sandbox");
         }
 
-        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
-            return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
+        var noCapturedOutput = string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout);
 
         if (ContainsAny(stderr, HardQuotaPatterns) || ContainsAny(stdout, HardQuotaPatterns))
             return new AgentFailureClassification(
@@ -238,9 +237,14 @@ public static class AgentFailureClassifier
 
         if (ContainsAny(stderr, TransientNetworkPatterns)
             || ContainsAny(stdout, TransientNetworkPatterns)
+            || ContainsAny(summary, TransientNetworkPatterns)
             || ContainsTurnFailedTransientNetwork(stderr)
-            || ContainsTurnFailedTransientNetwork(stdout))
+            || ContainsTurnFailedTransientNetwork(stdout)
+            || ContainsTurnFailedTransientNetwork(summary))
             return new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "network pattern matched");
+
+        if (noCapturedOutput)
+            return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
         return new AgentFailureClassification(AgentFailureKind.Normal);
     }

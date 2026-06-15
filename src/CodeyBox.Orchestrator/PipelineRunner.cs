@@ -4945,18 +4945,23 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!result.Success)
         {
             var classification = runner.ClassifyFailure(classificationResult ?? result);
-            if (classification.Kind == AgentFailureKind.Infrastructure)
+            if (classification.Kind is AgentFailureKind.Infrastructure or AgentFailureKind.TransientNetwork)
             {
-                AuditLog.SandboxAgentInfrastructureFailure(
-                    item.Id,
-                    runner.Kind,
-                    sandboxId,
-                    phase,
-                    result.Summary,
-                    classification.Reason);
+                if (classification.Kind == AgentFailureKind.Infrastructure)
+                {
+                    AuditLog.SandboxAgentInfrastructureFailure(
+                        item.Id,
+                        runner.Kind,
+                        sandboxId,
+                        phase,
+                        result.Summary,
+                        classification.Reason);
+                }
+
                 _log.LogWarning(
-                    "Agent {Agent} infrastructure failure in sandbox {Sandbox} during {Phase}; skipping fast-fail breaker: {Summary} ({Reason})",
+                    "Agent {Agent} {Kind} failure in sandbox {Sandbox} during {Phase}; skipping fast-fail breaker: {Summary} ({Reason})",
                     runner.Kind.Value,
+                    classification.Kind,
                     sandboxId,
                     phase,
                     result.Summary,
@@ -8903,6 +8908,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw quotaEx;
                 }
 
+                if (TryConvertResumeExhaustionToTransient(runner, ex) is { } transientEx)
+                {
+                    await FinalizeInvolvementAsync(involvementId, "failure:transient");
+                    throw transientEx;
+                }
+
                 await FinalizeInvolvementAsync(involvementId, "failure:agent");
                 throw;
             }
@@ -8960,6 +8971,25 @@ public sealed class PipelineRunner : IPipelineRunner
                 detection.Kind,
                 $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}",
                 detection.ResetAt);
+        }
+
+        TerminalTransientNetworkError? TryConvertResumeExhaustionToTransient(
+            IAgentRunner runner,
+            AgentSessionResumeExhaustedException resumeEx)
+        {
+            var last = resumeEx.LastResult;
+            var classification = runner.ClassifyFailure(last);
+            if (classification.Kind != AgentFailureKind.TransientNetwork)
+                return null;
+
+            var reason = string.IsNullOrWhiteSpace(classification.Reason)
+                ? "transient transport/network failure"
+                : classification.Reason;
+            return new TerminalTransientNetworkError(
+                runner.Kind,
+                phase,
+                classification,
+                $"Agent {runner.Kind} reported transient transport failure after exhausting session resume during {phase}: {last.Summary} ({reason})");
         }
 
         // Resolve the initial member from the work item's currently-selected agent.
@@ -13496,17 +13526,19 @@ Original merge-phase failure (for context):
                 return;
             }
 
+            var scheduled = next;
             if (_retryScheduler is not null)
-                await _retryScheduler.NotifyTransientFailureAsync(next, transitionCt);
-
-            var scheduled = await _store.GetAsync(item.Id, transitionCt) ?? next;
-            if (scheduled.State == WorkItemState.Failed
-                && string.Equals(scheduled.FailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase))
             {
-                _log.LogWarning(
-                    "Work item {Id} exhausted transient retry budget during WaitingForTransientRetry scheduling",
-                    item.Id);
-                return;
+                var scheduling = await _retryScheduler.NotifyTransientFailureAsync(next, transitionCt);
+                scheduled = scheduling.UpdatedItem;
+                if (scheduling.Status == WorkItemAutoRetryScheduleStatus.Exhausted)
+                {
+                    _log.LogWarning(
+                        "Work item {Id} exhausted transient retry budget during WaitingForTransientRetry scheduling: {Reason}",
+                        item.Id,
+                        scheduling.Reason);
+                    return;
+                }
             }
 
             AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForTransientRetry.ToString());

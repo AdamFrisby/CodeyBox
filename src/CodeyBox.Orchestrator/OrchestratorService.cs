@@ -1822,6 +1822,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id}: parked state {State}", workerIndex, id, item.State);
             ClearPreStartRefactorDrainClaim(item);
+            _activeItems.TryRemove(id, out _);
             return;
         }
 

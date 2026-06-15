@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -32,10 +33,13 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         var item = NewTransientItem();
         await fixture.Store.CreateAsync(item);
 
-        await fixture.Scheduler.NotifyTransientFailureAsync(item);
+        var result = await fixture.Scheduler.NotifyTransientFailureAsync(item);
 
         var stored = await fixture.Store.GetAsync(item.Id);
         Assert.NotNull(stored);
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Scheduled, result.Status);
+        Assert.Equal(item.Id, result.UpdatedItem.Id);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(30), result.NextRetryAt);
         Assert.Equal("transient", stored!.FailureKind);
         Assert.Equal(_time.GetUtcNow(), stored.TransientRetryFirstFailedAt);
         Assert.Equal(_time.GetUtcNow().AddSeconds(30), stored.NextTransientRetryAt);
@@ -200,6 +204,73 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, untouched!.State);
         Assert.Equal(0, untouched.TransientRetryAttempts);
         Assert.Equal(transient.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_RetriesFailedTransientRows_UsingAutoPick()
+    {
+        using var fixture = BuildScheduler(EnabledRetryOptions());
+        var transient = NewTransientItem() with
+        {
+            State = WorkItemState.Failed,
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+        };
+        var normal = NewTransientItem() with
+        {
+            State = WorkItemState.Failed,
+            FailureKind = "other",
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+        };
+        await fixture.Store.CreateAsync(transient);
+        await fixture.Store.CreateAsync(normal);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var retried = await fixture.Store.GetAsync(transient.Id);
+        var untouched = await fixture.Store.GetAsync(normal.Id);
+        Assert.NotNull(retried);
+        Assert.NotNull(untouched);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.TransientRetryAttempts);
+        Assert.Null(retried.FailureKind);
+        Assert.Null(retried.NextTransientRetryAt);
+        Assert.Equal(WorkItemState.Failed, untouched!.State);
+        Assert.Equal(0, untouched.TransientRetryAttempts);
+        Assert.Equal(transient.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_TransientRetrySuccess_PublishesTransientAutoRetryWebhook()
+    {
+        var webhooks = new CapturingWebhookDispatcher();
+        using var fixture = BuildScheduler(EnabledRetryOptions(), webhooks: webhooks);
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryFrom = "merge",
+            TransientRetryAttempts = 2,
+            WorkBranch = "codeybox/transient-webhook",
+            BaseBranch = "main",
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(retried);
+        Assert.Equal(WorkItemState.AuditPassed, retried!.State);
+        Assert.Equal(3, retried.TransientRetryAttempts);
+
+        var evt = Assert.Single(webhooks.Events, e => e.Event == "work_item.auto_retry");
+        Assert.Equal(item.Id, evt.WorkItem?.Id);
+        using var details = JsonDocument.Parse(JsonSerializer.Serialize(evt.Details));
+        var root = details.RootElement;
+        Assert.Equal(item.Id.ToString(), root.GetProperty("workItemId").GetString());
+        Assert.Equal("transient", root.GetProperty("reason").GetString());
+        Assert.Equal(3, root.GetProperty("attemptNumber").GetInt32());
+        Assert.Equal("periodic", root.GetProperty("triggeredBy").GetString());
+        Assert.Equal("merge", root.GetProperty("from").GetString());
+        Assert.Equal("merge", root.GetProperty("actualFrom").GetString());
     }
 
     [Fact]
