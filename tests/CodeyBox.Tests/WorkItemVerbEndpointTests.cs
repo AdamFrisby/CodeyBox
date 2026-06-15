@@ -70,20 +70,40 @@ public sealed class WorkItemVerbEndpointTests : IDisposable
     [Fact]
     public async Task Abandon_AlreadyAbandoned_IsIdempotent()
     {
-        var item = MakeItem(WorkItemState.AbandonedAfterRecoveryAttempts);
+        var originalUpdatedAt = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        var item = MakeItem(WorkItemState.AbandonedAfterRecoveryAttempts) with
+        {
+            LastError = "exceeded MaxRecoveryAttempts",
+            UpdatedAt = originalUpdatedAt,
+        };
         await _factory.Store.CreateAsync(item);
+        var summaries = _factory.Services.GetRequiredService<IAgentStreamSummaryStore>();
+        await SeedSummaryAsync(summaries, item.Id);
 
         var resp = await _client.PostAsync($"/workitems/{item.Id}/abandon", null);
 
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var readBack = await _factory.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, readBack!.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", readBack.LastError);
+        Assert.Equal(originalUpdatedAt, readBack.UpdatedAt);
+
+        var rows = await summaries.GetByWorkItemAsync(item.Id);
+        var row = Assert.Single(rows);
+        Assert.Equal("work-1-abcdef.jsonl", row.FileName);
     }
 
     [Theory]
     [InlineData(WorkItemState.Done)]
     [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merging)]
+    [InlineData(WorkItemState.Merged)]
+    [InlineData(WorkItemState.UpstreamPushing)]
+    [InlineData(WorkItemState.ReworkingForConflict)]
     public async Task Abandon_RejectedStates_Return409AndDoNotMutate(WorkItemState state)
     {
         var item = MakeItem(state);
@@ -134,7 +154,9 @@ public sealed class WorkItemVerbEndpointTests : IDisposable
         var readBack = await _factory.Store.GetAsync(item.Id);
         Assert.Equal(1000, readBack!.Priority);
         Assert.Equal(WorkItemState.Queued, readBack.State);
-        Assert.Equal(1, _factory.Services.GetRequiredService<ITaskQueue>().Count);
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        Assert.Equal(1, queue.Count);
+        Assert.Equal(item.Id, await queue.DequeueAsync());
     }
 
     [Fact]
@@ -148,7 +170,9 @@ public sealed class WorkItemVerbEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var readBack = await _factory.Store.GetAsync(item.Id);
         Assert.Equal(200, readBack!.Priority);
-        Assert.Equal(1, _factory.Services.GetRequiredService<ITaskQueue>().Count);
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        Assert.Equal(1, queue.Count);
+        Assert.Equal(item.Id, await queue.DequeueAsync());
     }
 
     [Fact]
