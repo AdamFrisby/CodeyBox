@@ -77,6 +77,31 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task GetQueueStatus_IncludesRefactorLockedState()
+    {
+        var projectId = new ProjectId("proj-locked");
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var gate = Assert.Single(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+        Assert.Equal("proj-locked", gate.GetProperty("projectId").GetString());
+        Assert.Equal("locked", gate.GetProperty("state").GetString());
+        Assert.Equal(refactor.Id.ToString(), gate.GetProperty("refactorWorkItemId").GetString());
+        Assert.Equal(1, gate.GetProperty("refactorInFlight").GetInt32());
+        Assert.Equal(0, gate.GetProperty("otherInFlight").GetInt32());
+        Assert.Contains("refactor exclusivity", gate.GetProperty("reason").GetString() ?? "");
+    }
+
+    [Fact]
     public async Task PauseQueue_Returns200_AndStateIsPaused()
     {
         var resp = await _client.PostAsJsonAsync("/queue/pause", new { reason = "test pause" });

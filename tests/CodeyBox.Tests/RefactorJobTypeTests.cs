@@ -628,7 +628,7 @@ public sealed class RefactorJobTypeTests : IDisposable
             DisplayName = "Refactor Final Race",
             RepositoryUrl = "https://github.com/test/repo",
         };
-        var projectRepo = new BarrierProjectRepository(project, expectedBarrierCalls: 2);
+        var projectRepo = new BarrierProjectRepository(project, expectedBarrierCalls: 1);
 
         var pipelineGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = new ManualReleasePipelineRunner(_store, pipelineGate.Task);
@@ -796,6 +796,256 @@ public sealed class RefactorJobTypeTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task SelectedRefactorReservationHoldsFreshNormalUntilStartedAtIsDurable()
+    {
+        var pid = "proj-refactor-reservation";
+        var projectRepo = new BlockingProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor Reservation",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+
+        var pipeline = new PerItemReleasePipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMilliseconds(100),
+        });
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var refactor = MakeQueued(pid, JobType.Refactor);
+        await _store.CreateAsync(refactor);
+        await queue.EnqueueAsync(refactor.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        await projectRepo.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Null((await _store.GetAsync(refactor.Id))!.StartedAt);
+
+        var normal = MakeQueued(pid) with { Priority = 100 };
+        await _store.CreateAsync(normal);
+        await queue.EnqueueAsync(normal.Id);
+
+        await WaitForDeferredAsync(svc, normal.Id);
+        Assert.Null((await _store.GetAsync(normal.Id))!.StartedAt);
+
+        var gate = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
+        Assert.Equal("draining", gate.State);
+        Assert.Equal(refactor.Id, gate.RefactorWorkItemId);
+        Assert.Equal(0, gate.RefactorInFlight);
+        Assert.Equal(0, gate.OtherInFlight);
+
+        projectRepo.Release.TrySetResult();
+        await WaitForStartedAsync(_store, refactor.Id);
+
+        pipeline.Release(refactor.Id);
+        await WaitForStartedAsync(_store, normal.Id);
+        pipeline.Release(normal.Id);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task DrainClaimPreservesFirstEligibleRefactorForProject()
+    {
+        var pid = "proj-refactor-first-claim";
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor First Claim",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+
+        var pipelineGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new ManualReleasePipelineRunner(_store, pipelineGate.Task);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 3 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMilliseconds(100),
+        });
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var normal = MakeQueued(pid);
+        await _store.CreateAsync(normal);
+        await queue.EnqueueAsync(normal.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        await WaitForStartedAsync(_store, normal.Id);
+
+        var firstRefactor = MakeQueued(pid, JobType.Refactor) with { Priority = 10 };
+        var laterRefactor = MakeQueued(pid, JobType.Refactor) with { Priority = 0 };
+        await _store.CreateAsync(firstRefactor);
+        await _store.CreateAsync(laterRefactor);
+        await queue.EnqueueAsync(laterRefactor.Id);
+        await queue.EnqueueAsync(firstRefactor.Id);
+
+        await WaitForDeferredAsync(svc, firstRefactor.Id);
+        await WaitForDeferredAsync(svc, laterRefactor.Id);
+
+        var gate = Assert.Single(await svc.GetRefactorProjectGateStatusAsync());
+        Assert.Equal("draining", gate.State);
+        Assert.Equal(firstRefactor.Id, gate.RefactorWorkItemId);
+
+        pipelineGate.TrySetResult();
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task QueuedRefactorDrainDoesNotBlockOtherProjectStarts()
+    {
+        var projectRepo = new InMemoryProjectRepository(
+            new Project
+            {
+                Id = new ProjectId("proj-drain-a"),
+                DisplayName = "Drain A",
+                RepositoryUrl = "https://github.com/test/a",
+            },
+            new Project
+            {
+                Id = new ProjectId("proj-drain-b"),
+                DisplayName = "Drain B",
+                RepositoryUrl = "https://github.com/test/b",
+            });
+
+        var pipeline = new PerItemReleasePipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 3 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMilliseconds(100),
+        });
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var inFlightA = MakeQueued("proj-drain-a");
+        await _store.CreateAsync(inFlightA);
+        await queue.EnqueueAsync(inFlightA.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        await WaitForStartedAsync(_store, inFlightA.Id);
+
+        var refactorA = MakeQueued("proj-drain-a", JobType.Refactor);
+        var normalB = MakeQueued("proj-drain-b") with { Priority = 100 };
+        await _store.CreateAsync(refactorA);
+        await _store.CreateAsync(normalB);
+        await queue.EnqueueAsync(refactorA.Id);
+        await queue.EnqueueAsync(normalB.Id);
+
+        await WaitForDeferredAsync(svc, refactorA.Id);
+        await WaitForStartedAsync(_store, normalB.Id);
+        Assert.Null((await _store.GetAsync(refactorA.Id))!.StartedAt);
+        Assert.False(svc.IsDeferredForTest(normalB.Id));
+
+        pipeline.Release(inFlightA.Id);
+        await WaitForStartedAsync(_store, refactorA.Id);
+        pipeline.Release(refactorA.Id);
+        pipeline.Release(normalB.Id);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task RefactorDrainAllowsStartedSameProjectContinuationToRun()
+    {
+        var pid = "proj-refactor-continuation";
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor Continuation",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+
+        var releaseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource<WorkItemId>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new ManualReleasePipelineRunner(_store, releaseGate.Task, entered);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMilliseconds(100),
+        });
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var continuation = MakeQueued(pid) with
+        {
+            State = WorkItemState.WorkComplete,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var refactor = MakeQueued(pid, JobType.Refactor);
+        await _store.CreateAsync(continuation);
+        await _store.CreateAsync(refactor);
+        await queue.EnqueueAsync(refactor.Id);
+        await queue.EnqueueAsync(continuation.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        var enteredId = await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(continuation.Id, enteredId);
+        Assert.False(svc.IsDeferredForTest(continuation.Id));
+        await WaitForDeferredAsync(svc, refactor.Id);
+
+        releaseGate.TrySetResult();
+        await WaitForStartedAsync(_store, refactor.Id);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task RefactorWithUnsatisfiedDependenciesDoesNotClaimDrain()
+    {
+        var pid = "proj-refactor-unsatisfied-dep";
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor Unsatisfied Dep",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+        var queue = new InMemoryTaskQueue();
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            new ManualReleasePipelineRunner(_store, Task.CompletedTask),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo);
+
+        var failedDependency = MakeQueued(pid) with { State = WorkItemState.Failed };
+        var blockedRefactor = MakeQueued(pid, JobType.Refactor) with
+        {
+            Priority = 100,
+            DependsOn = [failedDependency.Id],
+        };
+        var normal = MakeQueued(pid);
+        await _store.CreateAsync(failedDependency);
+        await _store.CreateAsync(blockedRefactor);
+        await _store.CreateAsync(normal);
+
+        var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+
+        Assert.Equal(normal.Id, picked);
+        Assert.Empty(await svc.GetRefactorProjectGateStatusAsync());
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static async Task WaitForStartedAsync(
@@ -881,6 +1131,32 @@ public sealed class RefactorJobTypeTests : IDisposable
             }
 
             return id == _project.Id ? _project : null;
+        }
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Project>>([_project]);
+    }
+
+    private sealed class BlockingProjectRepository : IProjectRepository
+    {
+        private readonly Project _project;
+
+        public BlockingProjectRepository(Project project) => _project = project;
+
+        public TaskCompletionSource Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        {
+            if (id != _project.Id)
+                return null;
+
+            Entered.TrySetResult();
+            await Release.Task.WaitAsync(ct);
+            return _project;
         }
 
         public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default) =>

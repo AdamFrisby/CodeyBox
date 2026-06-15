@@ -1543,10 +1543,10 @@ internal static class WorkItemEndpoints
 
     private static async Task<IResult> GetQueueStatusAsync(
         IQueueController queueController,
-        OrchestratorService orchestrator,
+        IRefactorProjectGateStatusProvider refactorProjectGates,
         CancellationToken ct)
     {
-        var refactorGates = await orchestrator.GetRefactorProjectGateStatusAsync(ct);
+        var refactorGates = await refactorProjectGates.GetRefactorProjectGateStatusAsync(ct);
         return Results.Ok(new
         {
             state = queueController.State.ToString(),
