@@ -1498,6 +1498,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal long? DeferredGenerationForTest(WorkItemId id) =>
         _deferredItems.TryGetValue(id, out var lease) ? lease.Generation : null;
     internal bool IsActiveForTest(WorkItemId id) => _activeItems.ContainsKey(id);
+    internal Func<WorkItemId, TimeSpan, CancellationToken, Task>? DeferredRequeueDelayForTest { get; set; }
     internal void SetLastSpawnAtForTest(DateTimeOffset at)
     {
         lock (_spawnTimeLock) { _lastSpawnAtTicks = at.Ticks; }
@@ -2946,7 +2947,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             try
             {
-                await Task.Delay(delay, stoppingToken);
+                var delayHook = DeferredRequeueDelayForTest;
+                if (delayHook is null)
+                    await Task.Delay(delay, stoppingToken);
+                else
+                    await delayHook(id, delay, stoppingToken);
+
                 if (RemoveDeferredItem(id, lease))
                 {
                     _log.LogInformation("Re-enqueueing deferred work item {Id} after defer interval", id);

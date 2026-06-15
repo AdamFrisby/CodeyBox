@@ -320,6 +320,64 @@ public sealed class BudgetEnforcementTests : IDisposable
         }
     }
 
+    private sealed class DeferredRequeueController
+    {
+        private readonly object _gate = new();
+        private readonly List<DeferredWait> _waits = [];
+
+        public Task WaitAsync(WorkItemId id, TimeSpan delay, CancellationToken ct)
+        {
+            var wait = new DeferredWait(id, delay);
+            lock (_gate)
+            {
+                _waits.Add(wait);
+            }
+
+            return wait.Release.Task.WaitAsync(ct);
+        }
+
+        public async Task<IReadOnlyList<DeferredWait>> WaitForAsync(
+            Func<IReadOnlyList<DeferredWait>, bool> predicate,
+            string description,
+            TimeSpan timeout)
+        {
+            var deadline = DateTimeOffset.UtcNow + timeout;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                var snapshot = Snapshot();
+                if (predicate(snapshot))
+                    return snapshot;
+
+                await Task.Delay(20);
+            }
+
+            var observed = string.Join(", ", Snapshot().Select(w => $"{w.Id}:{w.Delay}"));
+            throw new TimeoutException($"Timed out waiting for {description}. Observed deferrals: {observed}");
+        }
+
+        public void Release(IEnumerable<DeferredWait> waits)
+        {
+            foreach (var wait in waits)
+                wait.Release.TrySetResult();
+        }
+
+        public void ReleaseAll() => Release(Snapshot());
+
+        private IReadOnlyList<DeferredWait> Snapshot()
+        {
+            lock (_gate)
+            {
+                return _waits.ToArray();
+            }
+        }
+    }
+
+    private sealed record DeferredWait(WorkItemId Id, TimeSpan Delay)
+    {
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
     [Fact]
     public async Task BudgetDeferralRecheckSnapshot_IsConsumedByOrchestratorService()
     {
@@ -357,141 +415,98 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         var initialRecheck = TimeSpan.FromSeconds(8);
         var hotReloadedRecheck = TimeSpan.FromSeconds(10);
-        var oldIntervalGrace = initialRecheck + TimeSpan.FromMilliseconds(400);
 
         var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
             ConcurrentLimitRecheck = initialRecheck,
         });
+        var deferredRequeues = new DeferredRequeueController();
 
         var svc = new OrchestratorService(
             queue, _store, pipeline, reg, opts,
             NullLogger<OrchestratorService>.Instance,
             projects: projectRepo,
             budgetDeferralRecheck: snapshot);
+        svc.DeferredRequeueDelayForTest = deferredRequeues.WaitAsync;
 
-        var first = MakeQueued("budget-recheck-conc");
-        await _store.CreateAsync(first);
-        await queue.EnqueueAsync(first.Id);
-
-        await svc.StartAsync(CancellationToken.None);
-
-        var runningDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
-        while (!IsRunning(await _store.GetAsync(first.Id)) && DateTimeOffset.UtcNow < runningDeadline)
+        try
         {
-            await Task.Delay(50);
-        }
+            var first = MakeQueued("budget-recheck-conc");
+            await _store.CreateAsync(first);
+            await queue.EnqueueAsync(first.Id);
 
-        Assert.True(
-            IsRunning(await _store.GetAsync(first.Id)),
-            "the first item must be running before the budget deferral is exercised");
+            await svc.StartAsync(CancellationToken.None);
 
-        var ids = new List<WorkItemId> { first.Id };
-        for (var i = 0; i < 3; i++)
-        {
-            var item = MakeQueued("budget-recheck-conc");
-            await _store.CreateAsync(item);
-            ids.Add(item.Id);
-            await queue.EnqueueAsync(item.Id);
-        }
-
-        var successors = ids.Skip(1).ToArray();
-
-        // Poll until every successor has been deferred under the initial
-        // snapshot value while the first item is still running. The window is
-        // sized for loaded CI hosts: the runningDeadline above already grants
-        // the first item 30 s, and the dispatch loop has to walk each
-        // successor through enqueue → pickup → defer; a stingy 10 s window
-        // has been observed to expire on heavily-loaded test hosts even
-        // though the consumer-side logic is healthy. The full audit suite
-        // runs many integration tests in parallel, so the dispatch loop can
-        // be CPU-starved for longer than the first item's run window itself
-        // — give the second walk an independent 60 s budget to absorb that
-        // pressure without flaking.
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(60);
-        while (!successors.All(svc.IsDeferredForTest)
-               && DateTimeOffset.UtcNow < deferDeadline)
-        {
-            await Task.Delay(50);
-        }
-
-        Assert.True(
-            successors.All(svc.IsDeferredForTest),
-            "all successor items must be deferred by the concurrent cap before hot-reload");
-
-        // Hot-reload to a long recheck interval. The next deferral cycle
-        // (after items are re-enqueued and hit the cap again) must read this
-        // new value from the snapshot. The initial interval is deliberately
-        // long enough that this replacement wins the race against the first
-        // deferred requeue on loaded test hosts.
-        snapshot.Replace(new BudgetDeferralRecheckOptions
-        {
-            ConcurrentLimitRecheck = hotReloadedRecheck,
-        });
-
-        // Unblock the first item so the deferred items can be re-enqueued
-        // when their initial deferral expires.
-        gate1.TrySetResult();
-
-        // Wait for the initial deferral to expire and the dispatch
-        // loop to process the deferred items again. One will grab the freed slot
-        // and block on gate2; at least one other hits the concurrent cap and is
-        // deferred again — this time reading the hot-reloaded interval.
-        await Task.Delay(oldIntervalGrace);
-
-        int? secondDeferredIdx = null;
-        var secondDeferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (secondDeferredIdx is null && DateTimeOffset.UtcNow < secondDeferDeadline)
-        {
-            // Identify an item deferred in the second cycle. With several
-            // successors queued, one can grab the freed slot and block on gate2
-            // while another is deferred under the cap. On a loaded test
-            // host, the worker that consumes the expired initial deferral can lag
-            // behind the fixed delay above, so poll like the first-cycle
-            // assertion instead of baking in a scheduler timing assumption.
-            var successorStates = new Dictionary<WorkItemId, WorkItem?>();
-            foreach (var id in successors)
-                successorStates[id] = await _store.GetAsync(id);
-
-            var runningSuccessors = successors.Count(id => IsRunning(successorStates[id]));
-            var deferredSuccessors = successors.Count(svc.IsDeferredForTest);
-            var activeOrDeferred = runningSuccessors + deferredSuccessors;
-
-            secondDeferredIdx = Enumerable.Range(1, ids.Count - 1)
-                .Cast<int?>()
-                .FirstOrDefault(i => svc.IsDeferredForTest(ids[i!.Value]));
-
-            if (secondDeferredIdx is not null
-                && (activeOrDeferred != successors.Length
-                    || runningSuccessors == 0
-                    || deferredSuccessors == 0
-                    || pipeline.StartedCount < 2))
-                secondDeferredIdx = null;
-
-            if (secondDeferredIdx is null)
+            var runningDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+            while (!IsRunning(await _store.GetAsync(first.Id)) && DateTimeOffset.UtcNow < runningDeadline)
+            {
                 await Task.Delay(50);
+            }
+
+            Assert.True(
+                IsRunning(await _store.GetAsync(first.Id)),
+                "the first item must be running before the budget deferral is exercised");
+
+            var ids = new List<WorkItemId> { first.Id };
+            for (var i = 0; i < 3; i++)
+            {
+                var item = MakeQueued("budget-recheck-conc");
+                await _store.CreateAsync(item);
+                ids.Add(item.Id);
+                await queue.EnqueueAsync(item.Id);
+            }
+
+            var successors = ids.Skip(1).ToArray();
+            var initialWaits = await deferredRequeues.WaitForAsync(
+                waits => successors.All(id => waits.Any(w => w.Id == id && w.Delay == initialRecheck)),
+                "all successor items to be deferred by the initial concurrent cap",
+                TimeSpan.FromSeconds(30));
+            var initialDeferrals = initialWaits
+                .Where(w => successors.Contains(w.Id) && w.Delay == initialRecheck)
+                .ToArray();
+            Assert.Equal(successors.Length, initialDeferrals.Length);
+            Assert.True(
+                successors.All(svc.IsDeferredForTest),
+                "all successor items must be deferred by the concurrent cap before hot-reload");
+
+            // Hot-reload to a different interval before releasing the first
+            // deferral cycle. The next cap deferral must pass the new interval
+            // to ScheduleDeferredRequeue; observing that argument is a direct
+            // assertion that OrchestratorService read the current snapshot
+            // instead of caching the value from construction or first use.
+            snapshot.Replace(new BudgetDeferralRecheckOptions
+            {
+                ConcurrentLimitRecheck = hotReloadedRecheck,
+            });
+            var initialObservedCount = initialWaits.Count;
+
+            // Unblock the first item and release the initial deferred requeues.
+            // At least one successor will then hit the concurrent cap again,
+            // creating a second-cycle deferral with the hot-reloaded delay.
+            gate1.TrySetResult();
+            deferredRequeues.Release(initialDeferrals);
+
+            var afterReloadWaits = await deferredRequeues.WaitForAsync(
+                waits => waits.Count > initialObservedCount
+                    && waits.Skip(initialObservedCount).Any(w => w.Delay == hotReloadedRecheck),
+                "a second-cycle deferral using the hot-reloaded concurrent-cap interval",
+                TimeSpan.FromSeconds(30));
+
+            var secondCycleDeferrals = afterReloadWaits.Skip(initialObservedCount).ToArray();
+            var secondDeferral = secondCycleDeferrals.First(w => w.Delay == hotReloadedRecheck);
+            Assert.Contains(secondDeferral.Id, successors);
+            Assert.DoesNotContain(secondCycleDeferrals, w => w.Delay == initialRecheck);
+            Assert.True(
+                svc.IsDeferredForTest(secondDeferral.Id),
+                "the second-cycle item must remain deferred while the captured hot-reload delay is blocked");
         }
-
-        Assert.NotNull(secondDeferredIdx);
-
-        // Now the item is deferred with the hot-reloaded interval.
-        // If the old value was cached, it would have re-enqueued the
-        // item and spawned another worker shortly after the old interval. Wait
-        // past the old window and verify no retry happened.
-        var spawnCountAfterHotReloadDeferral = Volatile.Read(ref spawnCount);
-        await Task.Delay(oldIntervalGrace);
-
-        Assert.True(
-            svc.IsDeferredForTest(ids[secondDeferredIdx.Value]),
-            "the deferred item must still be deferred after hot-reload " +
-            "(the long hot-reloaded ConcurrentLimitRecheck was consumed, " +
-            "not the short initial value)");
-        Assert.Equal(spawnCountAfterHotReloadDeferral, Volatile.Read(ref spawnCount));
-
-        // Release the blocked item so StopAsync can drain cleanly.
-        gate2.TrySetResult();
-
-        await svc.StopAsync(CancellationToken.None);
+        finally
+        {
+            gate1.TrySetResult();
+            gate2.TrySetResult();
+            deferredRequeues.ReleaseAll();
+            await svc.StopAsync(CancellationToken.None);
+        }
 
         static bool IsRunning(WorkItem? item) =>
             item?.StartedAt is not null && !WorkItemDependencies.TerminalStates.Contains(item.State);
