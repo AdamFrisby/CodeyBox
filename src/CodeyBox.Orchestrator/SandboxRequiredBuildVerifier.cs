@@ -34,6 +34,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // Internal BuildScript sentinel: marker inspection said this gate applies,
     // but no buildable .NET target was present after checkout.
     private const int NoRequiredBuildTargetExitCode = 125;
+    // Internal verifier sentinel for branch-controlled clone / checkout / build
+    // execution exceeding the required-build budget.
+    private const int BuildTimeoutExitCode = 124;
 
     private static readonly string BuildScript = $$"""
         set -eu
@@ -293,7 +296,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             }
             catch (OperationCanceledException) when (buildTimeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
             {
-                return RequiredBuildVerificationResult.Unavailable(BuildTimeoutExceededReason());
+                return RequiredBuildVerificationResult.Failed(
+                    BuildTimeoutExitCode,
+                    BuildTimeoutExceededOutput());
             }
 
             var rawOutput = CombinedOutput(build);
@@ -410,8 +415,8 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         }
     }
 
-    private string BuildTimeoutExceededReason() =>
-        $"could not verify required build: build exceeded the required-build verification timeout of {_pipelineOptions.RequiredBuildVerificationTimeout.TotalMinutes:0.##} minutes";
+    private string BuildTimeoutExceededOutput() =>
+        $"build exceeded the required-build verification timeout of {_pipelineOptions.RequiredBuildVerificationTimeout.TotalMinutes:0.##} minutes";
 
     private sealed record DotnetBuildMarkerInspection(
         RequiredBuildProbeStatus Status,

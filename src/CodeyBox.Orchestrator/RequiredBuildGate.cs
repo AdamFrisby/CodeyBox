@@ -73,12 +73,9 @@ internal sealed class RequiredBuildGate
 
     public RequiredBuildGate(
         IRequiredBuildVerifier verifier,
-        TimeSpan verificationTimeout,
         PersistAuditReport? persistReport)
     {
         _verifier = verifier ?? throw new ArgumentNullException(nameof(verifier));
-        // Verifier implementations own build-only timeout boundaries.
-        _ = verificationTimeout;
         _persistReport = persistReport;
     }
 

@@ -375,7 +375,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new TestRequiredBuildVerifier(
             RequiredBuildProbeResult.Applies,
             RequiredBuildVerificationResult.Failed(1, "fake build error"));
-        var gate = new RequiredBuildGate(verifier, TimeSpan.FromMinutes(5), persistReport: null);
+        var gate = new RequiredBuildGate(verifier, persistReport: null);
 
         var ex = await Assert.ThrowsAsync<RequiredBuildFailedException>(() =>
             gate.EnforceForWorkPhaseAsync(
@@ -401,7 +401,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new TestRequiredBuildVerifier(
             RequiredBuildProbeResult.Applies,
             RequiredBuildVerificationResult.Failed(1, "fake build error"));
-        var gate = new RequiredBuildGate(verifier, TimeSpan.FromMinutes(5), persistReport: null);
+        var gate = new RequiredBuildGate(verifier, persistReport: null);
 
         // No exception → DeferToAuditLoop returns a deferred build failure
         // for the caller's next audit iteration to surface as a finding.
@@ -427,7 +427,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new TestRequiredBuildVerifier(
             RequiredBuildProbeResult.Applies,
             RequiredBuildVerificationResult.Failed(1, "fake build error"));
-        var gate = new RequiredBuildGate(verifier, TimeSpan.FromMinutes(5), persistReport: null);
+        var gate = new RequiredBuildGate(verifier, persistReport: null);
 
         var ex = await Assert.ThrowsAsync<RequiredBuildFailedException>(() =>
             gate.EnforceForWorkPhaseAsync(
@@ -849,6 +849,50 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Contains("could not verify required build", result.Reason);
         Assert.Contains("git", result.Reason);
         Assert.Contains("simulated git clone failure", result.Reason);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_GitCloneInsideSandboxExceedsTimeout_ReturnsFailed()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var provider = new HangingRequiredBuildPreparationSandboxProvider();
+        var verifier = new SandboxRequiredBuildVerifier(
+            provider,
+            gitHost,
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                RequiredBuildVerificationTimeout = TimeSpan.FromMilliseconds(75),
+            });
+
+        var item = NewItem("feature/sandbox-clone-timeout") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        using var outerCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, outerCts.Token);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, result.Status);
+        Assert.Equal(124, result.ExitCode);
+        Assert.Contains("exceeded the required-build verification timeout", result.Output);
+        Assert.Null(result.Reason);
+        Assert.True(provider.ObservedPreparationCancellation,
+            "git clone never observed cancellation, so the build timeout token was not linked into preparation");
     }
 
     [Fact]
@@ -1545,7 +1589,7 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
-    public async Task RequiredBuildVerification_BuildScriptExceedsTimeout_FailsAsInfrastructure_NotAuditPassed()
+    public async Task RequiredBuildVerification_BuildScriptExceedsTimeout_SurfacesAsBuildFinding_NotAuditPassed()
     {
         // The verifier timeout starts only after the sandbox is created, but
         // branch-controlled build scripts must still be bounded. This sandbox
@@ -1579,15 +1623,22 @@ public sealed class RequiredBuildGateTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
-        Assert.Contains("could not verify required build", final.LastError);
-        Assert.Contains("exceeded the required-build verification timeout", final.LastError);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.NotEqual("infrastructure", final.FailureKind);
+        Assert.Contains("required build failed", final.LastError);
         Assert.NotEqual(WorkItemState.AuditPassed, final.State);
         Assert.NotEqual(WorkItemState.Merging, final.State);
         Assert.NotEqual(WorkItemState.Done, final.State);
         Assert.True(hangingProvider.ObservedBuildCancellation,
             "build exec never observed cancellation, so the build timeout token was not linked into the build script");
+
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttemptStartedAt: null);
+        var iteration = Assert.Single(progress);
+        Assert.Contains(
+            iteration.BlockingFindingsDetails,
+            f => f.AuditorName == RequiredBuildGateIdentity.AuditorName
+                && f.Title.Contains("required build failed", StringComparison.OrdinalIgnoreCase)
+                && f.Description.Contains("exceeded the required-build verification timeout", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -1616,7 +1667,7 @@ public sealed class RequiredBuildGateTests : IDisposable
                 AgentAllowedHosts = [],
                 RequiredBuildVerificationTimeout = timeout,
             });
-        var gate = new RequiredBuildGate(verifier, timeout, persistReport: null);
+        var gate = new RequiredBuildGate(verifier, persistReport: null);
 
         var item = NewItem("feature/admission-wait-excluded") with { State = WorkItemState.WorkComplete };
         var project = NewProject(item);
@@ -2385,6 +2436,19 @@ public sealed class RequiredBuildGateTests : IDisposable
         }
     }
 
+    private sealed class HangingRequiredBuildPreparationSandboxProvider : PassingRequiredBuildSandboxProvider
+    {
+        public bool ObservedPreparationCancellation { get; private set; }
+
+        public override Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            _ = spec;
+            _ = ct;
+            return Task.FromResult<ISandbox>(
+                new HangingRequiredBuildPreparationSandbox(() => ObservedPreparationCancellation = true));
+        }
+    }
+
     private class PassingRequiredBuildSandbox : ISandbox
     {
         public string Id { get; } = "required-build-" + Guid.NewGuid().ToString("N")[..8];
@@ -2397,6 +2461,29 @@ public sealed class RequiredBuildGateTests : IDisposable
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class HangingRequiredBuildPreparationSandbox(Action onPreparationCancellation) : PassingRequiredBuildSandbox
+    {
+        public override async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "git" && exec.Argv[1] == "clone")
+            {
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    onPreparationCancellation();
+                    throw;
+                }
+
+                return new SandboxExecResult(0, "unreachable: git clone should be cancelled before returning", string.Empty);
+            }
+
+            return await base.ExecAsync(exec, ct);
+        }
     }
 
     private sealed class HangingRequiredBuildSandbox(Action onBuildCancellation) : PassingRequiredBuildSandbox

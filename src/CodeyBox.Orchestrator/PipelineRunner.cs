@@ -382,7 +382,6 @@ public sealed class PipelineRunner : IPipelineRunner
         _claudeSessionOptions = sessionDispatchOptions ?? new AgentSessionDispatchOptions();
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
-            _opts.RequiredBuildVerificationTimeout,
             _auditReports is null ? null : PersistAuditReportAsync);
     }
 
