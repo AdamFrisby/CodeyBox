@@ -5,6 +5,7 @@ using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
+[Collection("Background service timing")]
 public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
 {
     // Per-wait timeout for dispatch-pipeline signals. The happy path lands in

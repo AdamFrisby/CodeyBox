@@ -199,12 +199,17 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(5, (int)AgentFailureKind.Infrastructure);
     }
 
-    [Fact]
-    public void TurnFailed_WithConservativeTimeoutMessage_Classified_AsTransient()
+    [Theory]
+    [InlineData("""{"type":"turn.failed","error":"request\u0020timed\u0020out while reading stream"}""")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"request\u005ftimeout"}}""")]
+    [InlineData("""{"type":"turn.failed","result":{"error":{"message":"Transport\u0020channel\u0020closed"}}}""")]
+    public void TurnFailed_WithStructuredTransientMessage_Classified_AsTransient(string payload)
     {
-        var c = AgentFailureClassifier.Classify(
-            stderr: null,
-            stdout: """{"type":"turn.failed","error":{"message":"request timed out while reading stream"}}""");
+        Assert.DoesNotContain("request timed out", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("request_timeout", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Transport channel closed", payload, StringComparison.OrdinalIgnoreCase);
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
 
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
     }
