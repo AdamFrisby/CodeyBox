@@ -207,6 +207,37 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task PeriodicSweep_WhenDueItemExceededElapsedCap_MarksTransientExhaustedWithoutEnqueueing()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(15),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromMinutes(10),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryFirstFailedAt = _time.GetUtcNow().AddMinutes(-11),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal("transient-exhausted", stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Contains("elapsed=", stored.LastError);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
     public async Task PeriodicSweep_RetriesFailedTransientRows_UsingAutoPick()
     {
         using var fixture = BuildScheduler(EnabledRetryOptions());

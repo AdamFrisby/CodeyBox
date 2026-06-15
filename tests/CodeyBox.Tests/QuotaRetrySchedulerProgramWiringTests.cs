@@ -1,5 +1,6 @@
 using System.Reflection;
 using CodeyBox.Api;
+using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -87,6 +88,47 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         Assert.Equal(TransientRetryJitterMode.Full, reloadedTransient.JitterMode);
     }
 
+    [Fact]
+    public async Task ProgramWiredTransientRetryOptionsHotReloadAffectsSchedulingBehavior()
+    {
+        var monitor = new MutableOptionsMonitor<CodeyBoxOptions>(OptionsWithQuotaRetry(
+            enabled: true,
+            interval: "00:00:07",
+            margin: "00:00:03",
+            maxRetries: 9,
+            transientBaseDelay: "00:00:45",
+            transientMultiplier: 2.5,
+            transientMaxDelay: "00:10:00",
+            transientMaxRetries: 6,
+            transientMaxElapsed: "00:40:00",
+            transientJitterMode: "None"));
+        using var factory = new QuotaRetrySchedulerWiringFactory(monitor);
+
+        var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
+        var store = factory.Services.GetRequiredService<IWorkItemStore>();
+        var item = NewTransientRetryItem() with { TransientRetryAttempts = 2 };
+        await store.CreateAsync(item);
+
+        monitor.Set(OptionsWithQuotaRetry(
+            enabled: true,
+            interval: "00:00:07",
+            margin: "00:00:03",
+            maxRetries: 9,
+            transientBaseDelay: "00:01:10",
+            transientMultiplier: 3.0,
+            transientMaxDelay: "00:02:00",
+            transientMaxRetries: 8,
+            transientMaxElapsed: "00:50:00",
+            transientJitterMode: "None"));
+
+        var result = await scheduler.NotifyTransientFailureAsync(item);
+
+        var stored = await store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Scheduled, result.Status);
+        Assert.Equal(TimeSpan.FromMinutes(2), stored!.NextTransientRetryAt - stored.TransientRetryFirstFailedAt);
+    }
+
     private static CodeyBoxOptions OptionsWithQuotaRetry(
         bool enabled,
         string interval,
@@ -119,6 +161,18 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
                 JitterMode = transientJitterMode,
             },
         };
+
+    private static WorkItem NewTransientRetryItem() => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("transient-wiring"),
+        Title = "Transient retry wiring",
+        Prompt = "retry after transient transport failure",
+        State = WorkItemState.WaitingForTransientRetry,
+        LastError = "Agent claude reported transient transport failure",
+        FailureKind = "transient",
+        PushUpstream = false,
+    };
 
     private sealed class QuotaRetrySchedulerWiringFactory : WebApplicationFactory<Program>
     {
