@@ -4269,12 +4269,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var reason = string.IsNullOrWhiteSpace(classification.Reason)
             ? "transient transport/network failure"
-            : classification.Reason;
+            : RedactAndTruncateAgentDetail(classification.Reason);
+        var summary = RedactAndTruncateAgentDetail(result.Summary);
         throw new TerminalTransientNetworkError(
             runner.Kind,
             phase,
             classification,
-            $"Agent {runner.Kind} reported transient transport failure during {phase}: {result.Summary} ({reason})");
+            $"Agent {runner.Kind} reported transient transport failure during {phase}: {summary} ({reason})");
     }
 
     /// <summary>
@@ -8984,12 +8985,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var reason = string.IsNullOrWhiteSpace(classification.Reason)
                 ? "transient transport/network failure"
-                : classification.Reason;
+                : RedactAndTruncateAgentDetail(classification.Reason);
+            var summary = RedactAndTruncateAgentDetail(last.Summary);
             return new TerminalTransientNetworkError(
                 runner.Kind,
                 phase,
                 classification,
-                $"Agent {runner.Kind} reported transient transport failure after exhausting session resume during {phase}: {last.Summary} ({reason})");
+                $"Agent {runner.Kind} reported transient transport failure after exhausting session resume during {phase}: {summary} ({reason})");
         }
 
         // Resolve the initial member from the work item's currently-selected agent.
@@ -13506,12 +13508,13 @@ Original merge-phase failure (for context):
         AgentKind? agent)
     {
         var ct = CancellationToken.None;
+        var safeError = RedactAndTruncateAgentDetail(error);
         await RunBoundedPostAgentAsync(item.Id, "transition-waiting-for-transient-retry", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
             var next = current.With(
                 WorkItemState.WaitingForTransientRetry,
-                error,
+                safeError,
                 failureKind: "transient") with
             {
                 TransientRetryFrom = RetryFromForTransientPhase(phase, current.State),
@@ -13558,7 +13561,7 @@ Original merge-phase failure (for context):
                     workItemId = item.Id.ToString(),
                     phase,
                     agent = agent?.Value,
-                    reason = error,
+                    reason = safeError,
                     nextRetryAt = scheduled.NextTransientRetryAt,
                     attempts = scheduled.TransientRetryAttempts,
                 },

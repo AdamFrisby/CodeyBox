@@ -315,6 +315,44 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task TryUpdateIfStateAndUpdatedAtAsync_PersistsTransientRetryFields()
+    {
+        var item = Sample();
+        await _store.CreateAsync(item);
+        var persisted = await _store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var nextRetryAt = DateTimeOffset.UtcNow.AddMinutes(5);
+        var updated = persisted! with
+        {
+            State = WorkItemState.WaitingForTransientRetry,
+            LastError = "Agent claude reported transient transport failure",
+            FailureKind = "transient",
+            NextTransientRetryAt = nextRetryAt,
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = firstFailedAt,
+            TransientRetryFrom = "merge",
+            UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
+        };
+
+        var wrote = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            updated,
+            WorkItemState.Queued,
+            persisted.UpdatedAt);
+
+        Assert.True(wrote);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, read!.State);
+        Assert.Equal("transient", read.FailureKind);
+        Assert.Equal(nextRetryAt, read.NextTransientRetryAt);
+        Assert.Equal(2, read.TransientRetryAttempts);
+        Assert.Equal(firstFailedAt, read.TransientRetryFirstFailedAt);
+        Assert.Equal("merge", read.TransientRetryFrom);
+    }
+
+    [Fact]
     public async Task RoundTrip_NormalItem_DefaultsToJobTypeNormal_NoCheckOrVerdict()
     {
         // The migration defaults legacy / new-row job_type to 'Normal' and the

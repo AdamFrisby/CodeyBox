@@ -244,11 +244,7 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 // provider's view, and re-runs on every IOptionsMonitor reload.
 builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
-    .PostConfigure(opts =>
-    {
-        AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration);
-        AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns);
-    });
+    .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
@@ -283,7 +279,8 @@ builder.Services.AddSingleton(sp =>
 });
 builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
     sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
-        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
+        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value,
+        opts => AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns)));
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new ImmutableCodeyBoxOptionsValidator(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));

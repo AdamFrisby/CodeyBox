@@ -334,6 +334,45 @@ public sealed class WorkItemRecoveryTests : IDisposable
         Assert.Equal(0, queue.Count);
     }
 
+    [Fact]
+    public async Task WaitingForTransientRetry_IsNotRecoveredOrEnqueued()
+    {
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-3);
+        var nextRetryAt = DateTimeOffset.UtcNow.AddMinutes(7);
+        var item = Item(WorkItemState.WaitingForTransientRetry) with
+        {
+            LastError = "Agent claude reported transient transport failure",
+            FailureKind = "transient",
+            NextTransientRetryAt = nextRetryAt,
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = firstFailedAt,
+            TransientRetryFrom = "merge",
+            RecoveryAttempts = 0,
+        };
+        await _store.CreateAsync(item);
+
+        var queue = new InMemoryTaskQueue();
+        var svc = new OrchestratorService(queue, _store, new FakePipelineRunner(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        Assert.Null(svc.TryBuildRecoveredStateForTest(item));
+
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var readBack = await _store.GetAsync(item.Id);
+        Assert.NotNull(readBack);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, readBack!.State);
+        Assert.Equal("transient", readBack.FailureKind);
+        Assert.Equal(nextRetryAt, readBack.NextTransientRetryAt);
+        Assert.Equal(2, readBack.TransientRetryAttempts);
+        Assert.Equal(firstFailedAt, readBack.TransientRetryFirstFailedAt);
+        Assert.Equal("merge", readBack.TransientRetryFrom);
+        Assert.Equal(0, readBack.RecoveryAttempts);
+        Assert.Equal(0, queue.Count);
+    }
+
     // ── RecoveryAttempts cap ──────────────────────────────────────────────────
 
     [Fact]

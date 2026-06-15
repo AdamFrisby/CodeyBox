@@ -104,8 +104,9 @@ public sealed record WorkItem
     public string? LastError { get; init; }
 
     /// <summary>
-    /// Informational category of the failure. Set when transitioning to Failed.
-    /// Values: "quota", "timeout", "agent", "infrastructure", "other".
+    /// Informational category for failed or scheduler-parked rows. Values
+    /// include "quota", "transient", "transient-exhausted", "timeout",
+    /// "agent", "infrastructure", and "other".
     /// </summary>
     public string? FailureKind { get; init; }
 

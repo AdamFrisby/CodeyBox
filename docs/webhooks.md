@@ -38,7 +38,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `project.queue_paused` | Per-project queue was paused (manual or auto) |
 | `project.queue_resumed` | Per-project queue was resumed |
 | `work_item.recovered` | Dead-worker reaper recovered a work item with a state-changing crash recovery transition (see [Details](#recovered-details)) |
-| `work_item.auto_retry` | Quota auto-retry scheduler re-queued a Failed work item once its quota window reopened (see [Details](#auto_retry-details)) |
+| `work_item.auto_retry` | Auto-retry scheduler re-queued a work item after quota reset or transient retry backoff (see [Details](#auto_retry-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
 | `work_item.waiting_for_agent_resume` | Work item parked because its only eligible agent is paused |

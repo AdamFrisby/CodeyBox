@@ -285,9 +285,10 @@ public sealed class PipelineIntegrationTests : IDisposable
             webhookDispatcher: webhooks,
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
+        const string Secret = "ghp_XYZabc789012345678901234567890";
         tp.Agent.WorkResults.Enqueue(new AgentResult(
             Success: false,
-            Summary: "agent transport failed",
+            Summary: $"agent transport failed {Secret}",
             Stdout: null,
             Stderr: "request timed out while reading agent stream"));
 
@@ -304,6 +305,8 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.DoesNotContain(Secret, final.LastError, StringComparison.Ordinal);
+        Assert.Contains("***", final.LastError, StringComparison.Ordinal);
 
         var waiting = Assert.Single(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
         Assert.Equal(item.Id, waiting.WorkItem?.Id);
@@ -313,6 +316,10 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal("claude", root.GetProperty("agent").GetString());
         Assert.Equal(final.NextTransientRetryAt, root.GetProperty("nextRetryAt").GetDateTimeOffset());
         Assert.Equal(final.TransientRetryAttempts, root.GetProperty("attempts").GetInt32());
+        var reason = root.GetProperty("reason").GetString();
+        Assert.NotNull(reason);
+        Assert.DoesNotContain(Secret, reason, StringComparison.Ordinal);
+        Assert.Contains("***", reason, StringComparison.Ordinal);
     }
 
     [Fact]

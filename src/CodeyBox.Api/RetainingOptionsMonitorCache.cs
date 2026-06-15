@@ -19,11 +19,16 @@ public sealed class RetainingOptionsMonitorCache<TOptions> : IOptionsMonitorCach
     where TOptions : class
 {
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+    private readonly Action<TOptions>? _onSuccessfulCreate;
 
-    public RetainingOptionsMonitorCache() { }
-
-    public RetainingOptionsMonitorCache(TOptions defaultValue)
+    public RetainingOptionsMonitorCache(Action<TOptions>? onSuccessfulCreate = null)
     {
+        _onSuccessfulCreate = onSuccessfulCreate;
+    }
+
+    public RetainingOptionsMonitorCache(TOptions defaultValue, Action<TOptions>? onSuccessfulCreate = null)
+    {
+        _onSuccessfulCreate = onSuccessfulCreate;
         TryAdd(Options.DefaultName, defaultValue);
     }
 
@@ -38,7 +43,7 @@ public sealed class RetainingOptionsMonitorCache<TOptions> : IOptionsMonitorCach
         ArgumentNullException.ThrowIfNull(createOptions);
 
         var entry = _entries.GetOrAdd(Normalize(name), static _ => new Entry());
-        return entry.GetOrCreate(createOptions);
+        return entry.GetOrCreate(createOptions, _onSuccessfulCreate);
     }
 
     public bool TryAdd(string? name, TOptions options)
@@ -64,7 +69,7 @@ public sealed class RetainingOptionsMonitorCache<TOptions> : IOptionsMonitorCach
         private bool _hasValue;
         private bool _refreshPending = true;
 
-        public TOptions GetOrCreate(Func<TOptions> createOptions)
+        public TOptions GetOrCreate(Func<TOptions> createOptions, Action<TOptions>? onSuccessfulCreate)
         {
             lock (_gate)
             {
@@ -77,6 +82,7 @@ public sealed class RetainingOptionsMonitorCache<TOptions> : IOptionsMonitorCach
                     _value = next;
                     _hasValue = true;
                     _refreshPending = false;
+                    onSuccessfulCreate?.Invoke(next);
                     return next;
                 }
                 catch when (_hasValue)

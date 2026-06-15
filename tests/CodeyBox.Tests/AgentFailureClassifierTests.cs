@@ -297,6 +297,24 @@ public sealed class AgentFailureClassifierTests
             Assert.Equal(
                 AgentFailureKind.Normal,
                 AgentFailureClassifier.Classify(stderr: "fatal: operator initial transport marker").Kind);
+
+            var rejected = BuildProgramConfig(root, "operator rejected transport marker");
+            rejected["CodeyBox:StateDatabasePath"] = Path.Combine(root, "different-state.db");
+            var reloadException = Record.Exception(() => source.TriggerReload(rejected));
+            var currentValueException = Record.Exception(() => _ = monitor.CurrentValue);
+
+            Assert.True(
+                reloadException is not null || currentValueException is not null,
+                "invalid reload should be rejected by options validation");
+            Assert.Contains(
+                "operator reloaded transport marker",
+                monitor.CurrentValue.TransientNetworkFailurePatterns);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
+            Assert.Equal(
+                AgentFailureKind.Normal,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator rejected transport marker").Kind);
         }
         finally
         {
