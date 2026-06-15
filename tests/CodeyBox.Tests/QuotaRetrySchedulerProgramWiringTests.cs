@@ -16,6 +16,26 @@ namespace CodeyBox.Tests;
 public sealed class QuotaRetrySchedulerProgramWiringTests
 {
     [Fact]
+    public void ProgramDefaultsTransientRetryToEnabledWhenConfigSectionIsOmitted()
+    {
+        using var factory = new DefaultTransientRetryWiringFactory();
+
+        var cbOptions = factory.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+        Assert.True(cbOptions.AutoRetryOnTransientFailure.Enabled);
+
+        var orchestratorOptions = factory.Services.GetRequiredService<OrchestratorOptions>();
+        Assert.True(orchestratorOptions.AutoRetryOnTransientFailure.Enabled);
+
+        var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
+        var accessor = Assert.IsType<Func<AutoRetryOnTransientFailureOptions>>(
+            typeof(QuotaRetryScheduler)
+                .GetField("_transientRetryOptionsAccessor", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(scheduler));
+
+        Assert.True(accessor().Enabled);
+    }
+
+    [Fact]
     public void ProgramWiresQuotaRetrySchedulerLiveOptionsAccessorAndAvailabilitySignal()
     {
         var monitor = new MutableOptionsMonitor<CodeyBoxOptions>(OptionsWithQuotaRetry(
@@ -206,6 +226,43 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
                 services.RemoveAll<IHostedService>();
                 services.RemoveAll<IOptionsMonitor<CodeyBoxOptions>>();
                 services.AddSingleton<IOptionsMonitor<CodeyBoxOptions>>(_monitor);
+            });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class DefaultTransientRetryWiringFactory : WebApplicationFactory<Program>
+    {
+        private readonly string _dbPath = Path.Combine(
+            Path.GetTempPath(), $"codeybox-transient-default-wiring-{Guid.NewGuid():N}.db");
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                var tmp = Path.GetTempPath();
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:StateDatabasePath"] = _dbPath,
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AutoRetryOnQuotaFailure:Enabled"] = "false",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IHostedService>();
             });
         }
 

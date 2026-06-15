@@ -77,6 +77,32 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditAgentSummaryOnlyTransientFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new LlmSummaryOnlyTransientFailureAuditor()],
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("audit", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+    }
+
+    [Fact]
     public async Task ReworkAgentTransientFailure_ParksWaitingForTransientRetryFromAudit()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2380,6 +2406,36 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 ],
                 AgentSummary: "request timed out",
                 AgentStderr: "request timed out while reading audit stream"));
+        }
+    }
+
+    private sealed class LlmSummaryOnlyTransientFailureAuditor : IAuditor
+    {
+        public string Name => "llm-summary-transient";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(new AuditResult(
+                Passed: false,
+                Findings:
+                [
+                    new AuditFinding(
+                        "llm-summary-transient",
+                        AuditSeverity.Error,
+                        "review agent failed to run",
+                        "summary-only transient transport failure")
+                ],
+                AgentSummary: "request timed out"));
         }
     }
 

@@ -217,8 +217,17 @@ public sealed class AgentFailureClassifierTests
     [Theory]
     [InlineData("""{"type":"turn.failed","error":{"message":"timeout"}}""")]
     [InlineData("""{"type":"turn.failed","error":{"message":"Timeout"}}""")]
-    public void TurnFailed_WithBareStructuredTimeout_NotClassified_AsTransient(string payload)
+    public void TurnFailed_WithExactStructuredTimeout_Classified_AsTransient(string payload)
     {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Fact]
+    public void TurnFailed_WithStructuredBuildTimeout_NotClassified_AsTransient()
+    {
+        var payload = """{"type":"turn.failed","error":{"message":"build timeout after 10 minutes"}}""";
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
 
         Assert.Equal(AgentFailureKind.Normal, c.Kind);

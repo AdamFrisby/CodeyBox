@@ -5,13 +5,16 @@ namespace CodeyBox.Orchestrator;
 
 public interface IWorkItemTerminalTransition
 {
-    Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct);
-
     Task<WorkItemTerminalTransitionResult> TransitionFailedAsync(
         WorkItem item,
         string error,
         WorkItemTerminalFailureTransitionOptions options,
         CancellationToken ct);
+}
+
+internal interface IWorkItemTerminalRevisionBuilder
+{
+    Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct);
 }
 
 public sealed record WorkItemTerminalFailureTransitionOptions
@@ -39,7 +42,7 @@ public sealed record WorkItemTerminalTransitionResult(
 /// Pipeline workers and retry schedulers both route through this service so
 /// terminal webhooks get identical revision fields and audit-log behavior.
 /// </summary>
-public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition
+public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IWorkItemTerminalRevisionBuilder
 {
     private readonly IWorkItemStore _store;
     private readonly IWebhookDispatcher? _webhooks;
@@ -58,7 +61,12 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition
         _log = log;
     }
 
-    public async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
+    async Task<TerminalRevisionDetails?> IWorkItemTerminalRevisionBuilder.BuildTerminalRevisionAsync(
+        WorkItem item,
+        CancellationToken ct)
+        => await BuildTerminalRevisionCoreAsync(item, ct);
+
+    private async Task<TerminalRevisionDetails?> BuildTerminalRevisionCoreAsync(WorkItem item, CancellationToken ct)
     {
         if (!WorkItemDependencies.TerminalStates.Contains(item.State))
             return null;
@@ -155,7 +163,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition
         WorkItemTerminalFailureTransitionOptions options)
     {
         var project = await ResolveProjectAsync(failed, options);
-        var revision = await BuildTerminalRevisionAsync(failed, CancellationToken.None);
+        var revision = await BuildTerminalRevisionCoreAsync(failed, CancellationToken.None);
         await _webhooks!.PublishAsync(new WebhookEvent
         {
             Event = "work_item.failed",
@@ -198,7 +206,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition
 /// JobTrack can read <c>payload.promptRevision</c> directly; this record is
 /// just the in-process plumbing.
 /// </summary>
-public sealed record TerminalRevisionDetails(
+internal sealed record TerminalRevisionDetails(
     int PromptRevision,
     int? RevisionAtCompletion,
     bool? RevisionMatches);

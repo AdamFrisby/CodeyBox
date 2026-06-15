@@ -57,6 +57,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemStore _store;
     private readonly IWebhookDispatcher _webhooks;
     private readonly IWorkItemTerminalTransition _terminalTransitions;
+    private readonly IWorkItemTerminalRevisionBuilder _terminalRevisionBuilder;
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
     private readonly CredentialSmokeGate? _smokeGate;
@@ -287,6 +288,12 @@ public sealed class PipelineRunner : IPipelineRunner
         _store = store;
         _webhooks = webhooks;
         _terminalTransitions = terminalTransitions
+            ?? new WorkItemTerminalTransition(
+                store,
+                webhooks,
+                projects,
+                NullLogger<WorkItemTerminalTransition>.Instance);
+        _terminalRevisionBuilder = _terminalTransitions as IWorkItemTerminalRevisionBuilder
             ?? new WorkItemTerminalTransition(
                 store,
                 webhooks,
@@ -7537,31 +7544,34 @@ public sealed class PipelineRunner : IPipelineRunner
         ProjectId projectId,
         CancellationToken ct)
     {
-        if (!needsCreds || (run.Result.AgentStderr is null && run.Result.AgentStdout is null))
+        if (!needsCreds)
             return;
 
-        _quotaAuditEmitter.EmitAdvisoryAuditEvents(
-            run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
-        var quotaDetection = _quotaClassifier.Detect(
-            run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
-        await _quotaClassifier.RecordIfQuotaFailureAsync(
-            _quotaFailures,
-            run.Runner.Kind,
-            ResolveObservedModelId(run.Runner, modelId: null),
-            run.Result.AgentSummary,
-            run.Result.AgentStderr,
-            DateTimeOffset.UtcNow,
-            _auditQuotaOptions.ObservedFailureRetention,
-            ct,
-            projectId: projectId,
-            stdout: run.Result.AgentStdout);
-
-        if (quotaDetection is not null)
+        if (run.Result.AgentStderr is not null || run.Result.AgentStdout is not null)
         {
-            throw new TerminalQuotaError(
-                quotaDetection.Kind,
-                $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
-                quotaDetection.ResetAt);
+            _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
+            var quotaDetection = _quotaClassifier.Detect(
+                run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                run.Runner.Kind,
+                ResolveObservedModelId(run.Runner, modelId: null),
+                run.Result.AgentSummary,
+                run.Result.AgentStderr,
+                DateTimeOffset.UtcNow,
+                _auditQuotaOptions.ObservedFailureRetention,
+                ct,
+                projectId: projectId,
+                stdout: run.Result.AgentStdout);
+
+            if (quotaDetection is not null)
+            {
+                throw new TerminalQuotaError(
+                    quotaDetection.Kind,
+                    $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
+                    quotaDetection.ResetAt);
+            }
         }
 
         if (IsLlmAgentExecutionFailure(run.Result))
@@ -13177,7 +13187,7 @@ Original merge-phase failure (for context):
     /// return null so the existing payload shape is unchanged.
     /// </summary>
     internal async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
-        => await _terminalTransitions.BuildTerminalRevisionAsync(item, ct);
+        => await _terminalRevisionBuilder.BuildTerminalRevisionAsync(item, ct);
 
     /// <summary>
     /// Best-effort cost summary lookup for webhook usage blocks. Returns null

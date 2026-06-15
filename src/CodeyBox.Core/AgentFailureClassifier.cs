@@ -369,5 +369,16 @@ public static class AgentFailureClassifier
     }
 
     private static bool IsTurnFailedTransientNetworkMessage(string? message)
-        => ContainsAny(message, TransientNetworkPatterns);
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        // A structured turn.failed "timeout" is provider transport metadata.
+        // Keep bare timeout out of the general substring list so build/test
+        // timeouts in ordinary logs remain non-retryable.
+        if (string.Equals(message.Trim(), "timeout", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return ContainsAny(message, TransientNetworkPatterns);
+    }
 }
