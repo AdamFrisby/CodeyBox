@@ -307,27 +307,15 @@ public sealed class BudgetEnforcementTests : IDisposable
     /// </summary>
     private sealed class GatedPipelineRunner(TaskCompletionSource[] gates, IWorkItemStore store) : IPipelineRunner
     {
-        private readonly object _startedIdsLock = new();
-        private readonly List<WorkItemId> _startedIds = [];
         private int _started;
         private int _completed;
 
         public int StartedCount => Volatile.Read(ref _started);
         public int CompletedCount => Volatile.Read(ref _completed);
-        public IReadOnlyList<WorkItemId> StartedIds
-        {
-            get
-            {
-                lock (_startedIdsLock)
-                    return _startedIds.ToArray();
-            }
-        }
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
             var n = Interlocked.Increment(ref _started) - 1;
-            lock (_startedIdsLock)
-                _startedIds.Add(item.Id);
             if (n < gates.Length)
                 await gates[n].Task.WaitAsync(ct);
             await store.UpdateAsync(item.With(WorkItemState.Done), ct);

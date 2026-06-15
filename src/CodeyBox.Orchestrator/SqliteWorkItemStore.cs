@@ -835,6 +835,22 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         int priority,
         DateTimeOffset updatedAt,
         CancellationToken ct = default)
+        => await UpdatePriorityCoreAsync(id, priority, updatedAt, onlyIfState: null, ct);
+
+    public async Task<PriorityUpdateResult> UpdatePriorityIfStateAsync(
+        WorkItemId id,
+        int priority,
+        DateTimeOffset updatedAt,
+        WorkItemState onlyIfState,
+        CancellationToken ct = default)
+        => await UpdatePriorityCoreAsync(id, priority, updatedAt, onlyIfState, ct);
+
+    private async Task<PriorityUpdateResult> UpdatePriorityCoreAsync(
+        WorkItemId id,
+        int priority,
+        DateTimeOffset updatedAt,
+        WorkItemState? onlyIfState,
+        CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct);
         try
@@ -858,18 +874,34 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
 
+            if (onlyIfState is { } requiredState && current.State != requiredState)
+                return new PriorityUpdateResult(PriorityUpdateOutcome.StateMismatch, current, current.Priority);
+
             // Partial UPDATE: touch only priority + updated_at. Crucially does NOT
             // write state/started_at/recovery_attempts/etc, so a worker that picks
             // the item up concurrently isn't stomped.
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                UPDATE work_items SET priority = $priority, updated_at = $updated_at
-                WHERE id = $id;
-                """;
+            cmd.CommandText = onlyIfState is null
+                ? """
+                    UPDATE work_items SET priority = $priority, updated_at = $updated_at
+                    WHERE id = $id;
+                    """
+                : """
+                    UPDATE work_items SET priority = $priority, updated_at = $updated_at
+                    WHERE id = $id AND state = $only_if_state;
+                    """;
             cmd.Parameters.AddWithValue("$priority", priority);
             cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
             cmd.Parameters.AddWithValue("$id", id.ToString());
-            await cmd.ExecuteNonQueryAsync(ct);
+            if (onlyIfState is { } guardedState)
+                cmd.Parameters.AddWithValue("$only_if_state", (int)guardedState);
+            var affected = await cmd.ExecuteNonQueryAsync(ct);
+            if (affected == 0)
+            {
+                return onlyIfState is null
+                    ? new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null)
+                    : new PriorityUpdateResult(PriorityUpdateOutcome.StateMismatch, current, current.Priority);
+            }
 
             var updated = current with { Priority = priority, UpdatedAt = updatedAt };
             return new PriorityUpdateResult(PriorityUpdateOutcome.Updated, updated, current.Priority);

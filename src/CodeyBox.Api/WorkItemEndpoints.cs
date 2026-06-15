@@ -836,7 +836,14 @@ internal static class WorkItemEndpoints
         var abandoned = item.With(
             WorkItemState.AbandonedAfterRecoveryAttempts,
             "abandoned via API");
-        await store.UpdateAsync(abandoned, ct);
+        var updated = await store.TryUpdateIfStateAndUpdatedAtAsync(
+            abandoned,
+            item.State,
+            item.UpdatedAt,
+            ct);
+        if (!updated)
+            return Results.Conflict(new { error = "work item changed before it could be abandoned; retry the request" });
+
         if (streamSummaries is not null)
             await streamSummaries.DeleteByWorkItemAsync(abandoned.Id, ct);
         AuditLog.WorkItemTransitioned(abandoned.Id, abandoned.State.ToString());
@@ -955,7 +962,12 @@ internal static class WorkItemEndpoints
         if (item.Priority == promotedPriority)
             return Results.Ok(new { id = item.Id.ToString(), state = item.State.ToString() });
 
-        var result = await store.UpdatePriorityAsync(item.Id, promotedPriority, DateTimeOffset.UtcNow, ct);
+        var result = await store.UpdatePriorityIfStateAsync(
+            item.Id,
+            promotedPriority,
+            DateTimeOffset.UtcNow,
+            WorkItemState.Queued,
+            ct);
         switch (result.Outcome)
         {
             case PriorityUpdateOutcome.NotFound:
@@ -964,6 +976,11 @@ internal static class WorkItemEndpoints
                 return Results.Conflict(new
                 {
                     error = $"work item transitioned to terminal state '{result.Item!.State}' before it could be promoted",
+                });
+            case PriorityUpdateOutcome.StateMismatch:
+                return Results.Conflict(new
+                {
+                    error = $"work item transitioned to state '{result.Item!.State}' before it could be promoted",
                 });
             case PriorityUpdateOutcome.Updated:
                 break;

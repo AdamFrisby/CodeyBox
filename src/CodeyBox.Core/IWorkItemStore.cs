@@ -11,13 +11,16 @@ public enum PriorityUpdateOutcome
     NotFound,
     /// <summary>The row exists but is in a terminal state; no write was issued.</summary>
     TerminalState,
+    /// <summary>The row exists but is no longer in the state required by the caller; no write was issued.</summary>
+    StateMismatch,
 }
 
 /// <summary>
 /// Result returned by <see cref="IWorkItemStore.UpdatePriorityAsync"/>.
 /// <see cref="Item"/> is populated on <see cref="PriorityUpdateOutcome.Updated"/>
-/// and on <see cref="PriorityUpdateOutcome.TerminalState"/> (so callers can
-/// surface the current state to the client); null on <see cref="PriorityUpdateOutcome.NotFound"/>.
+/// and on <see cref="PriorityUpdateOutcome.TerminalState"/> /
+/// <see cref="PriorityUpdateOutcome.StateMismatch"/> (so callers can surface
+/// the current state to the client); null on <see cref="PriorityUpdateOutcome.NotFound"/>.
 /// </summary>
 public readonly record struct PriorityUpdateResult(PriorityUpdateOutcome Outcome, WorkItem? Item, int? OldPriority);
 
@@ -150,6 +153,35 @@ public interface IWorkItemStore
     /// not modified.
     /// </summary>
     Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default);
+
+    /// <summary>
+    /// Partial priority update guarded by the persisted state. Returns
+    /// <see cref="PriorityUpdateOutcome.StateMismatch"/> when the row exists but
+    /// is no longer in <paramref name="onlyIfState"/>. Persistent stores should
+    /// implement this as a single read/write critical section or conditional SQL
+    /// update so callers cannot mutate a row that raced out of the expected state.
+    /// </summary>
+    async Task<PriorityUpdateResult> UpdatePriorityIfStateAsync(
+        WorkItemId id,
+        int priority,
+        DateTimeOffset updatedAt,
+        WorkItemState onlyIfState,
+        CancellationToken ct = default)
+    {
+        var current = await GetAsync(id, ct).ConfigureAwait(false);
+        if (current is null)
+            return new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null);
+        if (current.State is WorkItemState.Done
+            or WorkItemState.Failed
+            or WorkItemState.AuditFailed
+            or WorkItemState.Cancelled
+            or WorkItemState.MergeConflictResolutionFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts)
+            return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
+        if (current.State != onlyIfState)
+            return new PriorityUpdateResult(PriorityUpdateOutcome.StateMismatch, current, current.Priority);
+        return await UpdatePriorityAsync(id, priority, updatedAt, ct).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Partial UPDATE that touches only the <c>depends_on_json</c> and
