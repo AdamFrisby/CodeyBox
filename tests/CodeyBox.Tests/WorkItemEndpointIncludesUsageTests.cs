@@ -79,6 +79,39 @@ public sealed class WorkItemEndpointIncludesUsageTests : IClassFixture<CostsApiF
     }
 
     [Fact]
+    public async Task GetAndList_WaitingForQuotaReset_IncludesQuotaRetryPhase()
+    {
+        var resetAt = DateTimeOffset.UtcNow.AddHours(1);
+        var item = NewItem() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaResetAt = resetAt,
+            NextQuotaRetryAt = resetAt,
+            QuotaRetryFrom = "audit",
+            QuotaRetryPhase = "rework",
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var client = _factory.CreateClient();
+        var getResp = await client.GetAsync($"/workitems/{item.Id}");
+        getResp.EnsureSuccessStatusCode();
+
+        var getBody = await getResp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("audit", getBody.GetProperty("quotaRetryFrom").GetString());
+        Assert.Equal("rework", getBody.GetProperty("quotaRetryPhase").GetString());
+
+        var listResp = await client.GetAsync("/workitems");
+        listResp.EnsureSuccessStatusCode();
+        var listBody = await listResp.Content.ReadFromJsonAsync<JsonElement>();
+        var row = Assert.Single(
+            listBody.EnumerateArray(),
+            candidate => candidate.GetProperty("id").GetString() == item.Id.ToString());
+        Assert.Equal("audit", row.GetProperty("quotaRetryFrom").GetString());
+        Assert.Equal("rework", row.GetProperty("quotaRetryPhase").GetString());
+    }
+
+    [Fact]
     public async Task List_ItemWithCostRows_IncludesUsageAndUsageTotal()
     {
         // Verifies that the LIST endpoint (GET /workitems) — not just GET /{id}

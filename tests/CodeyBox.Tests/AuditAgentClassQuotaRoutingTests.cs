@@ -19,7 +19,7 @@ namespace CodeyBox.Tests;
 /// and park the entire work item — even when another class member (codex)
 /// was available and would have served fine. These tests pin the fix at the
 /// router level: the audit pipeline now walks the class chain on quota
-/// exhaustion before deciding whether to skip the auditor for the iteration.
+/// exhaustion and parks the work item when no audit-capable member can run.
 /// </summary>
 [Collection("Pipeline integration")]
 public sealed class AuditAgentClassQuotaRoutingTests : IDisposable

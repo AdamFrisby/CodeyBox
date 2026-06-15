@@ -421,6 +421,42 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditDrivenRework_AllClassMembersQuotaExhausted_ParksWithOriginalReworkPhase()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.NotNull(parked.NextQuotaRetryAt);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var exhausted = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent is null);
+        Assert.Equal(AgentKind.Claude, exhausted.FromAgent);
+    }
+
+    [Fact]
     public async Task Claude_RateLimitEventStdout_FallsBackToPeerWithinClass_SameIteration()
     {
         // The exact regression that prompted the mid-rework Claude 5h-window
