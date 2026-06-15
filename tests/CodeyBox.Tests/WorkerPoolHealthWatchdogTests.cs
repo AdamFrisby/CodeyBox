@@ -239,6 +239,149 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task RefactorInFlightGate_IsNotTreatedAsRunnableStall()
+    {
+        var refactor = Item() with { JobType = JobType.Refactor };
+        await _store.CreateAsync(refactor);
+        var blocking = new BlockingPipeline();
+        var orchestrator = new OrchestratorService(
+            _queue,
+            _store,
+            blocking,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 2,
+                ShutdownDrainTimeout = TimeSpan.FromSeconds(5),
+            },
+            NullLogger<OrchestratorService>.Instance);
+
+        try
+        {
+            await _queue.EnqueueAsync(refactor.Id);
+            await orchestrator.StartAsync(CancellationToken.None);
+            await blocking.Started.Task.WaitAsync(DispatchWaitTimeout);
+
+            Assert.True(
+                await WaitUntilAsync(() => orchestrator.IsActiveForTest(refactor.Id), DispatchWaitTimeout),
+                "Expected active refactor to be reserved before evaluating the health gate.");
+            Assert.NotNull((await _store.GetAsync(refactor.Id))!.StartedAt);
+
+            var freshNormal = Item() with { Priority = 100 };
+            await _store.CreateAsync(freshNormal);
+
+            var health = BuildHealthSource(orchestrator: orchestrator);
+            var candidates = await health.ListRunnableCandidatesAsync(10, CancellationToken.None);
+            Assert.DoesNotContain(candidates, c => c.Id == freshNormal.Id);
+
+            var watchdog = BuildWatchdog(StandardOptions(), health);
+            await watchdog.RunOnceAsync(CancellationToken.None);
+            _time.Advance(TimeSpan.FromMinutes(2));
+            await watchdog.RunOnceAsync(CancellationToken.None);
+
+            Assert.DoesNotContain(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+            Assert.Equal(0, _queue.Count);
+
+            blocking.Release.TrySetResult();
+            await blocking.Exited.Task.WaitAsync(DispatchWaitTimeout);
+        }
+        finally
+        {
+            blocking.Release.TrySetResult();
+            try
+            {
+                Assert.True(
+                    await WaitUntilAsync(
+                        () => !orchestrator.IsActiveForTest(refactor.Id)
+                            && orchestrator.CurrentlyRunningTotal == 0,
+                        DispatchWaitTimeout),
+                    "Expected active refactor to drain before stopping the orchestrator.");
+                using var stopCts = new CancellationTokenSource(DispatchWaitTimeout);
+                await orchestrator.StopAsync(stopCts.Token);
+            }
+            finally
+            {
+                orchestrator.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RefactorStartReservationGate_IsNotTreatedAsRunnableStall()
+    {
+        var projectRepo = new BlockingProjectRepository(Project());
+        var refactor = Item() with { JobType = JobType.Refactor };
+        await _store.CreateAsync(refactor);
+        var blocking = new BlockingPipeline();
+        var orchestrator = new OrchestratorService(
+            _queue,
+            _store,
+            blocking,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 2,
+                ShutdownDrainTimeout = TimeSpan.FromSeconds(5),
+            },
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo);
+
+        try
+        {
+            await _queue.EnqueueAsync(refactor.Id);
+            await orchestrator.StartAsync(CancellationToken.None);
+            await projectRepo.Entered.Task.WaitAsync(DispatchWaitTimeout);
+
+            Assert.True(
+                await WaitUntilAsync(() => orchestrator.IsActiveForTest(refactor.Id), DispatchWaitTimeout),
+                "Expected refactor reservation to be active before evaluating the health gate.");
+            Assert.Null((await _store.GetAsync(refactor.Id))!.StartedAt);
+
+            var freshNormal = Item() with { Priority = 100 };
+            await _store.CreateAsync(freshNormal);
+
+            var health = BuildHealthSource(
+                orchestrator: orchestrator,
+                projects: new InMemoryProjectRepository(Project()));
+            var candidates = await health.ListRunnableCandidatesAsync(10, CancellationToken.None);
+            Assert.DoesNotContain(candidates, c => c.Id == freshNormal.Id);
+
+            var watchdog = BuildWatchdog(StandardOptions(), health);
+            await watchdog.RunOnceAsync(CancellationToken.None);
+            _time.Advance(TimeSpan.FromMinutes(2));
+            await watchdog.RunOnceAsync(CancellationToken.None);
+
+            Assert.DoesNotContain(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+            Assert.Equal(0, _queue.Count);
+
+            projectRepo.Release.TrySetResult();
+            await blocking.Started.Task.WaitAsync(DispatchWaitTimeout);
+            blocking.Release.TrySetResult();
+            await blocking.Exited.Task.WaitAsync(DispatchWaitTimeout);
+        }
+        finally
+        {
+            projectRepo.Release.TrySetResult();
+            blocking.Release.TrySetResult();
+            try
+            {
+                Assert.True(
+                    await WaitUntilAsync(
+                        () => !orchestrator.IsActiveForTest(refactor.Id)
+                            && orchestrator.CurrentlyRunningTotal == 0,
+                        DispatchWaitTimeout),
+                    "Expected reserved refactor to drain before stopping the orchestrator.");
+                using var stopCts = new CancellationTokenSource(DispatchWaitTimeout);
+                await orchestrator.StopAsync(stopCts.Token);
+            }
+            finally
+            {
+                orchestrator.Dispose();
+            }
+        }
+    }
+
+    [Fact]
     public async Task StallTimeoutZero_DisablesRuntimeWatchdog()
     {
         await _store.CreateAsync(Item());
@@ -803,6 +946,32 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
                 Exited.TrySetResult();
             }
         }
+    }
+
+    private sealed class BlockingProjectRepository : IProjectRepository
+    {
+        private readonly Project _project;
+
+        public BlockingProjectRepository(Project project) => _project = project;
+
+        public TaskCompletionSource Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        {
+            if (id != _project.Id)
+                return null;
+
+            Entered.TrySetResult();
+            await Release.Task.WaitAsync(ct);
+            return _project;
+        }
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Project>>([_project]);
     }
 
     private sealed class FakePoolHealthSource : IWorkerPoolHealthSource
