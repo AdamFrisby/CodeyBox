@@ -181,6 +181,67 @@ public sealed class WorkItemVerbEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Promote_MissingProject_Returns400WithoutChangingPriorityOrEnqueueing()
+    {
+        var item = MakeItem(WorkItemState.Queued, projectId: "missing-project", priority: 10);
+        await _factory.Store.CreateAsync(item);
+
+        var resp = await _client.PostAsync($"/workitems/{item.Id}/promote", null);
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("unknown project 'missing-project'", body.GetProperty("error").GetString());
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(10, readBack!.Priority);
+        Assert.Equal(WorkItemState.Queued, readBack.State);
+        Assert.Equal(0, _factory.Services.GetRequiredService<ITaskQueue>().Count);
+    }
+
+    [Fact]
+    public async Task Promote_RowDeletedAfterResolve_Returns404WithoutEnqueueing()
+    {
+        using var factory = new WorkItemApiFactory();
+        var racingStore = new PromoteDeletedRowStore(factory.Store);
+        factory.WorkItemStoreDecorator = _ => racingStore;
+        using var client = factory.CreateClient();
+
+        var item = MakeItem(WorkItemState.Queued, priority: 10);
+        await factory.Store.CreateAsync(item);
+
+        var resp = await client.PostAsync($"/workitems/{item.Id}/promote", null);
+
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains($"work item '{item.Id}' no longer exists", body.GetProperty("error").GetString());
+        Assert.Null(await factory.Store.GetAsync(item.Id));
+        Assert.Equal(0, factory.Services.GetRequiredService<ITaskQueue>().Count);
+    }
+
+    [Fact]
+    public async Task Promote_RowBecomesTerminalAfterResolve_Returns409WithoutPriorityPatchOrEnqueueing()
+    {
+        using var factory = new WorkItemApiFactory();
+        var racingStore = new PromoteTerminalRaceStore(factory.Store);
+        factory.WorkItemStoreDecorator = _ => racingStore;
+        using var client = factory.CreateClient();
+
+        var item = MakeItem(WorkItemState.Queued, priority: 10);
+        await factory.Store.CreateAsync(item);
+
+        var resp = await client.PostAsync($"/workitems/{item.Id}/promote", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("terminal state 'Done'", body.GetProperty("error").GetString());
+
+        var readBack = await factory.Store.GetAsync(item.Id);
+        Assert.Equal(10, readBack!.Priority);
+        Assert.Equal(WorkItemState.Done, readBack.State);
+        Assert.Equal(0, factory.Services.GetRequiredService<ITaskQueue>().Count);
+    }
+
+    [Fact]
     public async Task Promote_RaceOutOfQueued_Returns409DoesNotPatchPriorityOrEnqueue()
     {
         using var factory = new WorkItemApiFactory();
@@ -281,6 +342,50 @@ public sealed class WorkItemVerbEndpointTests : IDisposable
                 {
                     State = WorkItemState.Working,
                     StartedAt = DateTimeOffset.UtcNow,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                }, ct);
+            }
+
+            return await Inner.UpdatePriorityIfStateAsync(id, priority, updatedAt, onlyIfState, ct);
+        }
+    }
+
+    private sealed class PromoteDeletedRowStore(SqliteWorkItemStore inner) : ForwardingWorkItemStore(inner)
+    {
+        private int _injected;
+
+        public override async Task<PriorityUpdateResult> UpdatePriorityIfStateAsync(
+            WorkItemId id,
+            int priority,
+            DateTimeOffset updatedAt,
+            WorkItemState onlyIfState,
+            CancellationToken ct = default)
+        {
+            if (onlyIfState == WorkItemState.Queued && Interlocked.Exchange(ref _injected, 1) == 0)
+                await Inner.DeleteRowForTestAsync(id, ct);
+
+            return await Inner.UpdatePriorityIfStateAsync(id, priority, updatedAt, onlyIfState, ct);
+        }
+    }
+
+    private sealed class PromoteTerminalRaceStore(SqliteWorkItemStore inner) : ForwardingWorkItemStore(inner)
+    {
+        private int _injected;
+
+        public override async Task<PriorityUpdateResult> UpdatePriorityIfStateAsync(
+            WorkItemId id,
+            int priority,
+            DateTimeOffset updatedAt,
+            WorkItemState onlyIfState,
+            CancellationToken ct = default)
+        {
+            if (onlyIfState == WorkItemState.Queued && Interlocked.Exchange(ref _injected, 1) == 0)
+            {
+                var current = await Inner.GetAsync(id, ct);
+                Assert.NotNull(current);
+                await Inner.UpdateAsync(current! with
+                {
+                    State = WorkItemState.Done,
                     UpdatedAt = DateTimeOffset.UtcNow,
                 }, ct);
             }

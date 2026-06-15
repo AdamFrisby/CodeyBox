@@ -105,6 +105,40 @@ public sealed class WorkerRegistryTests : IDisposable
     }
 
     [Fact]
+    public async Task Dispose_UsesTolerantSqliteTeardownHelperAndReleasesWriteGate()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"codeybox-regtest-teardown-{Guid.NewGuid():N}.db");
+        var disposeHookCalled = false;
+        try
+        {
+            var registry = new SqliteWorkerRegistry(
+                path,
+                logger: null,
+                busyTimeoutMilliseconds: 30000,
+                disposeConnection: connection =>
+                {
+                    disposeHookCalled = true;
+                    SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(
+                        new ThrowingDisposable(MakeInvalidOperationFromSqliteTeardown()));
+                    connection.Dispose();
+                });
+
+            registry.Dispose();
+
+            Assert.True(disposeHookCalled);
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var reopened = await Task.Run(() => new SqliteWorkerRegistry(path), cts.Token);
+            await reopened.RegisterAsync(MakeReg(), cts.Token);
+            Assert.Single(await reopened.ListAsync(cts.Token));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Deregister_RemovesRow()
     {
         var reg = MakeReg();
@@ -179,5 +213,34 @@ public sealed class WorkerRegistryTests : IDisposable
 
         var claimed = await _registry.ClaimDeadWorkersAsync(DateTimeOffset.UtcNow.AddMinutes(-99999));
         Assert.Empty(claimed);
+    }
+
+    private static InvalidOperationException MakeInvalidOperationFromSqliteTeardown()
+    {
+        try
+        {
+            var ioe = new InvalidOperationException(
+                "Collection was modified; enumeration operation may not execute.");
+            ioe.GetType().GetMethod(
+                    "SetRemoteStackTrace",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public,
+                    [typeof(string)])!
+                .Invoke(ioe,
+                [
+                    "   at System.Collections.Generic.List`1.Enumerator.MoveNext()\n" +
+                    "   at Microsoft.Data.Sqlite.SqliteCommand.DisposePreparedStatements(Boolean disposing)\n" +
+                    "   at Microsoft.Data.Sqlite.SqliteCommand.Dispose(Boolean disposing)\n",
+                ]);
+            throw ioe;
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ex;
+        }
+    }
+
+    private sealed class ThrowingDisposable(Exception throwOnDispose) : IDisposable
+    {
+        public void Dispose() => throw throwOnDispose;
     }
 }
