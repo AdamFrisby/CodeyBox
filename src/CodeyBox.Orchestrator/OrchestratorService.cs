@@ -2968,6 +2968,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 "Deferred requeue backlog is {Count} items; deferrals may be sustained across many work items",
                 count);
 
+        try { _opts.OnDeferredForTest?.Invoke(id, delay); }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "OnDeferredForTest callback threw for deferred work item {Id}", id);
+        }
+
         var delayHook = DeferredRequeueDelayForTest;
         Task? hookedDelayTask = null;
         if (delayHook is not null)
@@ -3115,6 +3121,13 @@ public sealed record OrchestratorOptions
     /// and before spawn pacing. Used by tests to close pause/reservation races.
     /// </summary>
     internal Func<WorkItemId, Task>? OnWorkerReservedForTest { get; init; }
+
+    /// <summary>
+    /// Called immediately after a work item is marked deferred and before its
+    /// delayed requeue task sleeps. Used by tests that need to observe the
+    /// exact deferral interval without racing the wall-clock timer.
+    /// </summary>
+    internal Action<WorkItemId, TimeSpan>? OnDeferredForTest { get; init; }
 
     /// <summary>
     /// Legacy alias for <see cref="MaxConcurrentWorkers"/>.
