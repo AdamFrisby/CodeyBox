@@ -385,8 +385,9 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         public static StubHttpIngestServer Start(Func<StubHttpRequest, int> statusSelector)
         {
             const int maxAttempts = 20;
-            HttpListenerException? lastError = null;
-            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            HttpListenerException? lastBindFailure = null;
+
+            for (var attempt = 0; attempt < maxAttempts; attempt++)
             {
                 var port = GetFreeTcpPort();
                 var prefix = $"http://127.0.0.1:{port}/";
@@ -400,14 +401,14 @@ public sealed class MultipassExecWrapperDiagnosticsTests
                         prefix.TrimEnd('/') + "/codeybox-agent-output",
                         statusSelector);
                 }
-                catch (HttpListenerException ex)
+                catch (HttpListenerException ex) when (IsAddressAlreadyInUse(ex))
                 {
-                    lastError = ex;
+                    lastBindFailure = ex;
                     listener.Close();
                 }
             }
 
-            throw new InvalidOperationException("Could not allocate a free HTTP listener port for the test stub.", lastError);
+            throw new InvalidOperationException("Could not bind test HTTP listener to a free loopback port.", lastBindFailure);
         }
 
         public async ValueTask DisposeAsync()
@@ -464,6 +465,10 @@ public sealed class MultipassExecWrapperDiagnosticsTests
                 listener.Stop();
             }
         }
+
+        private static bool IsAddressAlreadyInUse(HttpListenerException ex)
+            => ex.ErrorCode is 98 or 183 or 10048
+               || ex.Message.Contains("Address already in use", StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed record StubHttpRequest(string RunId, string Stream, long Seq, string BodyText)
