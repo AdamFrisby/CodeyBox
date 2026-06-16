@@ -156,7 +156,8 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         finally
         {
             File.Delete(wrapperPath);
-            File.Delete(envPath);
+            if (File.Exists(envPath))
+                File.Delete(envPath);
             Directory.Delete(workDir, recursive: true);
         }
     }
@@ -188,6 +189,27 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             File.Delete(wrapperPath);
             File.Delete(stdinPath);
             Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecWrapper_StdinFileMissingPathEmitsDiagnostic()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        try
+        {
+            var (exit, _, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, "--stdin-file"]);
+
+            Assert.Equal(127, exit);
+            Assert.Contains("--stdin-file requires a path argument", stderr, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
         }
     }
 
@@ -248,6 +270,9 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             var stderrRequest = Assert.Single(requests, r => r.Stream == "stderr");
             Assert.Equal(0, stderrRequest.Seq);
             Assert.Equal("err-1\n", stderrRequest.BodyText);
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal(0, exitRequest.Seq);
+            Assert.Equal("0\n", exitRequest.BodyText);
             Assert.DoesNotContain(requests, r => r.BodyText.Contains(token, StringComparison.Ordinal));
         }
         finally

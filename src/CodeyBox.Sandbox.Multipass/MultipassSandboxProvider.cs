@@ -3180,17 +3180,19 @@ test "$work" = present && test "$exec_wrapper" = present
                 rm -f "$codeybox_err_file"
                 exit 127
             fi
+            codeybox_env_file_path=$2
             set -a
-            . "$2" 2>"$codeybox_err_file"
+            . "$codeybox_env_file_path" 2>"$codeybox_err_file"
             codeybox_src_rc=$?
             set +a
             if [ "$codeybox_src_rc" -ne 0 ]; then
-                echo "codeybox-exec: failed to source env file '$2' (exit $codeybox_src_rc):" >&2
+                echo "codeybox-exec: failed to source env file '$codeybox_env_file_path' (exit $codeybox_src_rc):" >&2
                 cat "$codeybox_err_file" >&2 2>/dev/null
                 rm -f "$codeybox_err_file"
                 exit 126
             fi
             shift 2
+            rm -f "$codeybox_env_file_path" 2>/dev/null || true
         fi
         rm -f "$codeybox_err_file"
         # Optional agent-output HTTP transport. The host injects these
@@ -3305,6 +3307,9 @@ test "$work" = present && test "$exec_wrapper" = present
         codeybox_http_ready() {
             codeybox_http_post ready 0 </dev/null
         }
+        codeybox_http_exit() {
+            printf '%s\n' "$1" | codeybox_http_post exit 0
+        }
         codeybox_run_user_command() {
             if [ "$keep_stdin" = "1" ]; then
                 "$@"
@@ -3338,6 +3343,10 @@ test "$work" = present && test "$exec_wrapper" = present
                     echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
                     exit 87
                 fi
+                if ! codeybox_http_exit "$codeybox_user_rc"; then
+                    echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
+                    exit 87
+                fi
                 exit "$codeybox_user_rc"
             fi
 
@@ -3358,6 +3367,10 @@ test "$work" = present && test "$exec_wrapper" = present
             wait "$codeybox_out_stream_pid"; codeybox_out_stream_rc=$?
             wait "$codeybox_err_stream_pid"; codeybox_err_stream_rc=$?
             if [ "$codeybox_out_stream_rc" -ne 0 ] || [ "$codeybox_err_stream_rc" -ne 0 ]; then
+                echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
+                exit 87
+            fi
+            if ! codeybox_http_exit "$codeybox_user_rc"; then
                 echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
                 exit 87
             fi
@@ -4774,7 +4787,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
     internal const int AgentOutputHttpSetupFailedExitCode = 86;
     private const int DetachedProcessGroupMalformedExitCode = 73;
-    private const int DetachedProcessExitedBeforeMarkerExitCode = 74;
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -4908,7 +4920,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         var stderrChunkCallback = exec.StderrChunkCallback;
         var forceEnvironmentFile = false;
         var detachedHttpIngest = false;
-        string? detachedExitMarker = null;
         string? detachedProcessGroupMarker = null;
         string? detachedStdinFile = null;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
@@ -4943,8 +4954,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 transferredVmPaths.Add(envFile);
                 if (detachedHttpIngest)
                 {
-                    detachedExitMarker = $"/home/ubuntu/.codeybox-exec/exit-{Guid.NewGuid():N}";
-                    detachedProcessGroupMarker = $"{detachedExitMarker}.pgid";
+                    detachedProcessGroupMarker = $"/home/ubuntu/.codeybox-exec/detached-{Guid.NewGuid():N}.pgid";
                     if (exec.Stdin is not null)
                     {
                         detachedStdinFile = await TransferExecStdinAsync(exec.Stdin, ct);
@@ -4953,7 +4963,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 }
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile, detachedStdinFile);
                 argv = detachedHttpIngest
-                    ? await BuildDetachedMultipassExecArgvAsync(wrapped, envFile, detachedExitMarker!, detachedProcessGroupMarker!, transferredVmPaths, ct)
+                    ? await BuildDetachedMultipassExecArgvAsync(wrapped, envFile, detachedProcessGroupMarker!, transferredVmPaths, ct)
                         .ConfigureAwait(false)
                     : BuildMultipassExecArgv(wrapped);
             }
@@ -4970,7 +4980,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 effectiveEnvironment = pipeEnvironment;
                 forceEnvironmentFile = false;
                 detachedHttpIngest = false;
-                detachedExitMarker = null;
                 detachedProcessGroupMarker = null;
                 detachedStdinFile = null;
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null, stdinFile: null);
@@ -5048,7 +5057,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 if (result.ExitCode != 0)
                     return result;
 
-                var detachedExit = await WaitForDetachedExitMarkerAsync(detachedExitMarker!, detachedProcessGroupMarker!, ct)
+                var detachedExit = await WaitForDetachedCompletionAsync(agentOutputIngest, detachedProcessGroupMarker!, ct)
                     .ConfigureAwait(false);
                 await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
                 var detachedIngested = agentOutputIngest;
@@ -5372,7 +5381,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private async Task<IReadOnlyList<string>> BuildDetachedMultipassExecArgvAsync(
         IReadOnlyList<string> wrapped,
         string envFile,
-        string exitMarker,
         string processGroupMarker,
         List<string> transferredVmPaths,
         CancellationToken ct)
@@ -5381,13 +5389,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         transferredVmPaths.Add(commandScript);
         var launchScript = await TransferDetachedLaunchScriptAsync(
             envFile,
-            exitMarker,
             processGroupMarker,
             ["/bin/sh", commandScript],
             ct).ConfigureAwait(false);
         transferredVmPaths.Add(launchScript);
-        transferredVmPaths.Add(exitMarker);
-        transferredVmPaths.Add($"{exitMarker}.tmp");
         transferredVmPaths.Add(processGroupMarker);
         transferredVmPaths.Add($"{processGroupMarker}.tmp");
         return [_opts.MultipassBinary, "exec", _name, "--", "/bin/sh", launchScript];
@@ -5395,7 +5400,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     private async Task<string> TransferDetachedLaunchScriptAsync(
         string envFile,
-        string exitMarker,
         string processGroupMarker,
         IReadOnlyList<string> command,
         CancellationToken ct)
@@ -5405,7 +5409,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         Directory.CreateDirectory(hostDir);
         MultipassSandboxProvider.TryChmod0700(hostDir);
         var hostPath = Path.Combine(hostDir, fileName);
-        await File.WriteAllTextAsync(hostPath, BuildDetachedLaunchScript(envFile, exitMarker, processGroupMarker, command), ct);
+        await File.WriteAllTextAsync(hostPath, BuildDetachedLaunchScript(envFile, processGroupMarker, command), ct);
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
@@ -5429,7 +5433,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     internal static string BuildDetachedLaunchScript(
         string envFile,
-        string exitMarker,
         string processGroupMarker,
         IReadOnlyList<string> command)
     {
@@ -5437,8 +5440,22 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("set -e");
         sb.Append("codeybox_env_file=").Append(MultipassSandboxProvider.ShellSingleQuote(envFile)).Append('\n');
-        sb.Append("codeybox_exit_marker=").Append(MultipassSandboxProvider.ShellSingleQuote(exitMarker)).Append('\n');
         sb.Append("codeybox_pgid_marker=").Append(MultipassSandboxProvider.ShellSingleQuote(processGroupMarker)).Append('\n');
+        sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
+        sb.AppendLine("mkdir -p \"$(dirname \"$codeybox_pgid_marker\")\"");
+        sb.AppendLine("if [ -f \"$codeybox_pgid_marker\" ]; then exit 0; fi");
+        sb.AppendLine("codeybox_lock_i=0");
+        sb.AppendLine("while ! mkdir \"$codeybox_lock_dir\" 2>/dev/null; do");
+        sb.AppendLine("    if [ -f \"$codeybox_pgid_marker\" ]; then exit 0; fi");
+        sb.AppendLine("    if [ \"$codeybox_lock_i\" -ge 300 ]; then");
+        sb.AppendLine("        echo \"codeybox-detached: timed out waiting for launch lock\" >&2");
+        sb.AppendLine("        exit 88");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    sleep 0.1");
+        sb.AppendLine("    codeybox_lock_i=$((codeybox_lock_i + 1))");
+        sb.AppendLine("done");
+        sb.AppendLine("trap 'rmdir \"$codeybox_lock_dir\" 2>/dev/null || true' EXIT");
+        sb.AppendLine("if [ -f \"$codeybox_pgid_marker\" ]; then exit 0; fi");
         sb.AppendLine("set -a");
         sb.AppendLine(". \"$codeybox_env_file\"");
         sb.AppendLine("set +a");
@@ -5465,16 +5482,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             .AppendLine(" >&2");
         sb.AppendLine("    exit 86");
         sb.AppendLine("fi");
-        sb.AppendLine("mkdir -p \"$(dirname \"$codeybox_exit_marker\")\"");
-        sb.AppendLine("rm -f \"$codeybox_exit_marker\" \"$codeybox_exit_marker.tmp\" \"$codeybox_pgid_marker\" \"$codeybox_pgid_marker.tmp\"");
+        sb.AppendLine("rm -f \"$codeybox_pgid_marker.tmp\"");
         sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_RUN_ID");
-        sb.Append("setsid /bin/bash -c '")
-            .Append("codeybox_exit_marker=$1; shift; \"$@\"; codeybox_user_rc=$?; ")
-            .Append("umask 077; ")
-            .Append("printf \"%s\\n\" \"$codeybox_user_rc\" > \"$codeybox_exit_marker.tmp\" 2>/dev/null || exit 88; ")
-            .Append("mv -f \"$codeybox_exit_marker.tmp\" \"$codeybox_exit_marker\" 2>/dev/null || { rm -f \"$codeybox_exit_marker.tmp\" 2>/dev/null || true; exit 88; }; ")
-            .Append("exit \"$codeybox_user_rc\"")
-            .Append("' codeybox-detached \"$codeybox_exit_marker\"");
+        sb.Append("setsid");
         foreach (var arg in command)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
         sb.AppendLine(" </dev/null >/dev/null 2>/dev/null &");
@@ -5525,69 +5535,122 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             throw new InvalidOperationException($"multipass exec setup command failed: {result.Stderr}");
     }
 
-    private async Task<DetachedExitResult> WaitForDetachedExitMarkerAsync(
-        string exitMarker,
+    private async Task<DetachedExitResult> WaitForDetachedCompletionAsync(
+        MultipassAgentOutputHttpIngestSession ingest,
         string processGroupMarker,
         CancellationToken ct)
     {
-        var pollCommand = $$"""
-            codeybox_exit_marker={{MultipassSandboxProvider.ShellSingleQuote(exitMarker)}}
-            codeybox_pgid_marker={{MultipassSandboxProvider.ShellSingleQuote(processGroupMarker)}}
-            if test -f "$codeybox_exit_marker"; then
-                cat -- "$codeybox_exit_marker"
-                exit 0
-            fi
-            if test -f "$codeybox_pgid_marker"; then
-                codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
-                case "$codeybox_pgid" in
-                    ''|*[!0-9]*|0)
-                        printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
-                        exit {{DetachedProcessGroupMalformedExitCode}}
-                        ;;
-                esac
-                if ! kill -0 "-$codeybox_pgid" 2>/dev/null; then
-                    printf 'detached exec process group %s exited before marker %s was written\n' "$codeybox_pgid" "$codeybox_exit_marker" >&2
-                    exit {{DetachedProcessExitedBeforeMarkerExitCode}}
-                fi
-            fi
-            exit 1
-            """;
+        var exitTask = ingest.WaitForExitAsync(ct);
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var result = await RunMultipassAsync(
-                [_opts.MultipassBinary, "exec", _name, "--", "sh", "-c", pollCommand],
-                stdin: null,
-                ct: ct,
-                maxStdoutBytes: 64,
-                maxStderrBytes: 4096,
-                killOnOutputLimit: false).ConfigureAwait(false);
+            var completed = await Task.WhenAny(exitTask, Task.Delay(TimeSpan.FromSeconds(2), ct)).ConfigureAwait(false);
+            if (completed == exitTask)
+                break;
 
-            if (result.ExitCode == 0)
-            {
-                var text = result.Stdout.Trim();
-                if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var exitCode))
-                    return new DetachedExitResult(exitCode, Error: null);
-
+            var state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (exitTask.IsCompleted)
+                break;
+            if (state.Error is not null)
+                return new DetachedExitResult(1, state.Error);
+            if (state.Status == DetachedProcessGroupStatus.Missing)
                 return new DetachedExitResult(
                     1,
-                    $"detached exec exit marker {exitMarker} was malformed: {text}");
-            }
-
-            if (result.ExitCode is DetachedProcessGroupMalformedExitCode or DetachedProcessExitedBeforeMarkerExitCode)
-                return new DetachedExitResult(1, result.Stderr.TrimEnd() + "\n");
-
-            if (result.ExitCode != 1)
-            {
-                _log.LogDebug(
-                    "Detached exec marker poll for {Name} returned exit {ExitCode}: {Stderr}",
-                    _name,
-                    result.ExitCode,
-                    result.Stderr.Trim());
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                    $"detached exec process group marker {processGroupMarker} was not written\n");
+            if (state.Status == DetachedProcessGroupStatus.Exited)
+                return new DetachedExitResult(
+                    1,
+                    $"detached exec process group {state.ProcessGroupId} exited before HTTP exit notification was received\n");
         }
+
+        var exitCode = await exitTask.ConfigureAwait(false);
+        var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+        return new DetachedExitResult(reapError is null ? exitCode : 1, reapError);
+    }
+
+    private async Task<string?> EnsureDetachedProcessGroupReapedAsync(string processGroupMarker, CancellationToken ct)
+    {
+        DetachedProcessGroupProbe state = default;
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (state.Error is not null)
+                return state.Error;
+            if (state.Status == DetachedProcessGroupStatus.Exited)
+                return null;
+            if (state.Status == DetachedProcessGroupStatus.Missing)
+                return $"detached exec process group marker {processGroupMarker} disappeared before cleanup\n";
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100), ct).ConfigureAwait(false);
+        }
+
+        await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
+        state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+        if (state.Error is not null)
+            return state.Error;
+        return state.Status == DetachedProcessGroupStatus.Alive
+            ? $"detached exec process group {state.ProcessGroupId} remained alive after termination\n"
+            : null;
+    }
+
+    private async Task<DetachedProcessGroupProbe> ProbeDetachedProcessGroupAsync(
+        string processGroupMarker,
+        CancellationToken ct)
+    {
+        const string pollCommand = """
+            codeybox_pgid_marker=$1
+            if ! test -f "$codeybox_pgid_marker"; then
+                printf 'missing\n'
+                exit 0
+            fi
+            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
+            case "$codeybox_pgid" in
+                ''|*[!0-9]*|0)
+                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
+                    exit 73
+                    ;;
+            esac
+            if kill -0 "-$codeybox_pgid" 2>/dev/null; then
+                printf 'alive %s\n' "$codeybox_pgid"
+            else
+                printf 'exited %s\n' "$codeybox_pgid"
+            fi
+            exit 0
+            """;
+        var result = await RunMultipassAsync(
+            [_opts.MultipassBinary, "exec", _name, "--", "sh", "-c", pollCommand, "codeybox-detached-poll", processGroupMarker],
+            stdin: null,
+            ct: ct,
+            maxStdoutBytes: 128,
+            maxStderrBytes: 4096,
+            killOnOutputLimit: false).ConfigureAwait(false);
+
+        if (result.ExitCode == DetachedProcessGroupMalformedExitCode)
+            return new DetachedProcessGroupProbe(
+                DetachedProcessGroupStatus.Malformed,
+                ProcessGroupId: null,
+                Error: result.Stderr.TrimEnd() + "\n");
+
+        if (result.ExitCode != 0)
+            return new DetachedProcessGroupProbe(
+                DetachedProcessGroupStatus.PollFailed,
+                ProcessGroupId: null,
+                Error: $"detached exec process group poll failed (exit {result.ExitCode}): {result.Stderr.TrimEnd()}\n");
+
+        var text = result.Stdout.Trim();
+        if (string.Equals(text, "missing", StringComparison.Ordinal))
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Missing, ProcessGroupId: null, Error: null);
+        if (text.StartsWith("alive ", StringComparison.Ordinal)
+            && int.TryParse(text["alive ".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var alivePgid))
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Alive, alivePgid, Error: null);
+        if (text.StartsWith("exited ", StringComparison.Ordinal)
+            && int.TryParse(text["exited ".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid))
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Exited, exitedPgid, Error: null);
+
+        return new DetachedProcessGroupProbe(
+            DetachedProcessGroupStatus.Malformed,
+            ProcessGroupId: null,
+            Error: $"detached exec process group poll returned malformed output: {text}\n");
     }
 
     private async Task TryTerminateDetachedProcessGroupAsync(string processGroupMarker)
@@ -5640,12 +5703,28 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     {
         if (string.IsNullOrEmpty(markerError))
             return stderr;
+        var normalized = markerError.EndsWith('\n')
+            ? markerError
+            : markerError + "\n";
         return string.IsNullOrEmpty(stderr)
-            ? markerError + "\n"
-            : stderr + markerError + "\n";
+            ? normalized
+            : stderr + normalized;
     }
 
     private readonly record struct DetachedExitResult(int ExitCode, string? Error);
+    private readonly record struct DetachedProcessGroupProbe(
+        DetachedProcessGroupStatus Status,
+        int? ProcessGroupId,
+        string? Error);
+
+    private enum DetachedProcessGroupStatus
+    {
+        Missing = 0,
+        Alive = 1,
+        Exited = 2,
+        Malformed = 3,
+        PollFailed = 4,
+    }
 
     private async Task TryRemoveTransferredFilesAsync(IReadOnlyList<string> vmPaths)
     {

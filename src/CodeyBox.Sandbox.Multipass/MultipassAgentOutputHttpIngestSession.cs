@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Globalization;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -27,10 +28,13 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _listenTask;
     private readonly object _rateGate = new();
+    private readonly object _exitGate = new();
     private readonly StreamState _stdout;
     private readonly StreamState _stderr;
+    private readonly TaskCompletionSource<int> _exitCode = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private DateTimeOffset _rateWindowStart = DateTimeOffset.UtcNow;
     private int _rateWindowCount;
+    private int? _reportedExitCode;
     private bool _disposed;
 
     private MultipassAgentOutputHttpIngestSession(
@@ -59,6 +63,7 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     public bool ReceivedAgentBytes => _stdout.BytesReceived > 0 || _stderr.BytesReceived > 0;
     public string Stdout => _stdout.Text;
     public string Stderr => _stderr.Text;
+    public Task<int> WaitForExitAsync(CancellationToken ct) => _exitCode.Task.WaitAsync(ct);
 
     public static async Task<MultipassAgentOutputHttpIngestSession?> TryStartAsync(
         IPAddress bindAddress,
@@ -242,6 +247,38 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         if (!long.TryParse(parts[3], out var seq) || seq < 0)
         {
             Reject(response, HttpStatusCode.BadRequest);
+            return;
+        }
+
+        if (string.Equals(streamName, "exit", StringComparison.Ordinal))
+        {
+            if (seq != 0)
+            {
+                Reject(response, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            using var reader = new StreamReader(request.InputStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 128);
+            var body = (await reader.ReadToEndAsync(ct).ConfigureAwait(false)).Trim();
+            if (!int.TryParse(body, NumberStyles.Integer, CultureInfo.InvariantCulture, out var exitCode))
+            {
+                Reject(response, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            lock (_exitGate)
+            {
+                if (_reportedExitCode is { } existing)
+                {
+                    Reject(response, existing == exitCode ? HttpStatusCode.OK : HttpStatusCode.Conflict);
+                    return;
+                }
+
+                _reportedExitCode = exitCode;
+                _exitCode.TrySetResult(exitCode);
+            }
+
+            Reject(response, HttpStatusCode.NoContent);
             return;
         }
 

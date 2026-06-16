@@ -630,7 +630,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         string? transferredStdinContent = null;
         string? transferredCommandScript = null;
         string? transferredLaunchScript = null;
-        var markerReady = false;
         var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
@@ -643,7 +642,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 else if (destination.Contains(".codeybox-exec-stdin/", StringComparison.Ordinal))
                     transferredStdinContent = content;
                 else if (destination.Contains(".codeybox-exec/", StringComparison.Ordinal)
-                         && content.Contains("setsid /bin/bash -c", StringComparison.Ordinal))
+                         && content.Contains("codeybox_lock_dir=", StringComparison.Ordinal))
                     transferredLaunchScript = content;
                 else if (destination.Contains(".codeybox-exec/", StringComparison.Ordinal))
                     transferredCommandScript = content;
@@ -663,15 +662,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 await PostAgentOutputAsync(client, url, runId, "ready", 0, token, "", ct);
                 await PostAgentOutputAsync(client, url, runId, "stdout", 0, token, "hello detached\n", ct);
                 await PostAgentOutputAsync(client, url, runId, "stderr", 0, token, "warn detached\n", ct);
-                markerReady = true;
+                await PostAgentOutputAsync(client, url, runId, "exit", 0, token, "7\n", ct);
                 return new ProcessRunResult(0, "", "");
             }
-            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
-                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            if (IsDetachedProcessGroupPoll(argv))
             {
-                return markerReady
-                    ? new ProcessRunResult(0, "7\n", "")
-                    : new ProcessRunResult(1, "", "");
+                return new ProcessRunResult(0, "exited 123\n", "");
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
                 return new ProcessRunResult(0, "", "");
@@ -702,7 +698,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("--stdin-file", transferredCommandScript);
         Assert.DoesNotContain("--keep-stdin", transferredCommandScript);
         Assert.NotNull(transferredLaunchScript);
-        Assert.Contains("setsid /bin/bash -c", transferredLaunchScript);
+        Assert.Contains("setsid '/bin/sh'", transferredLaunchScript);
+        Assert.DoesNotContain("codeybox_exit_marker", transferredLaunchScript);
         Assert.DoesNotContain(runner.Calls, IsCodeyboxExecCall);
 
         var launchCall = Assert.Single(
@@ -715,57 +712,146 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public void BuildDetachedLaunchScript_ScrubsWrapperEnvironmentAndPublishesMarkers()
+    public void BuildDetachedLaunchScript_ScrubsWrapperEnvironmentAndPublishesProcessGroupMarker()
     {
         var script = MultipassSandbox.BuildDetachedLaunchScript(
             "/home/ubuntu/.codeybox-exec-env/env file",
-            "/home/ubuntu/.codeybox-exec/exit marker",
-            "/home/ubuntu/.codeybox-exec/exit marker.pgid",
+            "/home/ubuntu/.codeybox-exec/detached marker.pgid",
             ["/bin/sh", "/home/ubuntu/.codeybox-exec/command script.sh"]);
 
         Assert.Contains(
             "unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_RUN_ID",
             script);
-        Assert.Contains("setsid /bin/bash -c", script);
+        Assert.Contains("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"", script);
+        Assert.Contains("while ! mkdir \"$codeybox_lock_dir\"", script);
+        Assert.Contains("if [ -f \"$codeybox_pgid_marker\" ]; then exit 0; fi", script);
+        Assert.Contains("setsid '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
         Assert.Contains("codeybox_detached_pid=$!", script);
         Assert.Contains("printf \"%s\\n\" \"$codeybox_detached_pid\" > \"$codeybox_pgid_marker.tmp\"", script);
         Assert.Contains("mv -f \"$codeybox_pgid_marker.tmp\" \"$codeybox_pgid_marker\"", script);
         Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
-        Assert.Contains("printf \"%s\\n\" \"$codeybox_user_rc\" > \"$codeybox_exit_marker.tmp\"", script);
-        Assert.Contains("mv -f \"$codeybox_exit_marker.tmp\" \"$codeybox_exit_marker\"", script);
+        Assert.DoesNotContain("codeybox_exit_marker", script);
         Assert.Contains("exit 88", script);
-        Assert.Contains("'/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedMalformedExitMarkerReturnsDiagnostic()
+    public async Task BuildDetachedLaunchScript_RunsCommandInBackgroundAndReturnsBeforeCommandCompletes()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "run-detached-launch-script",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-env");
+        var commandScript = Path.Combine(_workspace, "detached-command.sh");
+        var launchScript = Path.Combine(_workspace, "detached-launch.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached.pgid");
+        var doneFile = Path.Combine(_workspace, "detached.done");
+        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
+        await File.WriteAllTextAsync(commandScript, "sleep 3\nprintf done > \"$1\"\n");
+        File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, ["/bin/sh", commandScript, doneFile]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var sw = Stopwatch.StartNew();
+        var (exit, _, stderr) = await RunLocalProcessAsync("/bin/bash", [launchScript]);
+        sw.Stop();
+
+        Assert.Equal(0, exit);
+        Assert.Equal("", stderr);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2.5), $"detached launch stayed attached for {sw.Elapsed}");
+        Assert.True(File.Exists(processGroupMarker));
+        await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_DoesNotLaunchAgainWhenProcessGroupMarkerAlreadyExists()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "run-detached-launch-idempotent",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-env-idempotent");
+        var commandScript = Path.Combine(_workspace, "detached-command-idempotent.sh");
+        var launchScript = Path.Combine(_workspace, "detached-launch-idempotent.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-idempotent.pgid");
+        var countFile = Path.Combine(_workspace, "detached.count");
+        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
+        await File.WriteAllTextAsync(commandScript, "printf run >> \"$1\"\n");
+        File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, ["/bin/sh", commandScript, countFile]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var first = await RunLocalProcessAsync("/bin/bash", [launchScript]);
+        await WaitForFileAsync(countFile, TimeSpan.FromSeconds(3));
+        var second = await RunLocalProcessAsync("/bin/bash", [launchScript]);
+        await Task.Delay(200);
+
+        Assert.Equal(0, first.Exit);
+        Assert.Equal(0, second.Exit);
+        Assert.Equal("run", await File.ReadAllTextAsync(countFile));
+    }
+
+    [Fact]
+    public async Task ExecAsync_DetachedProcessGroupPollFailureReturnsDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
+        string? transferredEnvContent = null;
+        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return Task.FromResult(new ProcessRunResult(0, "", ""));
-            if (argv is [_, "transfer", _, _])
-                return Task.FromResult(new ProcessRunResult(0, "", ""));
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "transfer", var hostPath, var destination])
+            {
+                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
+                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
+                return new ProcessRunResult(0, "", "");
+            }
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return Task.FromResult(new ProcessRunResult(0, "", ""));
+                return new ProcessRunResult(0, "", "");
             if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                return Task.FromResult(new ProcessRunResult(0, "", ""));
+                Assert.NotNull(transferredEnvContent);
+                var url = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
+                var token = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
+                var runId = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
+                using var client = new HttpClient();
+                await PostAgentOutputAsync(client, url, runId, "exit", 0, token, "0\n", ct);
+                return new ProcessRunResult(0, "", "");
             }
-            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
-                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            if (IsDetachedProcessGroupPoll(argv))
             {
-                return Task.FromResult(new ProcessRunResult(0, "not-an-int\n", ""));
+                return new ProcessRunResult(1, "", "instance \"codeybox-test\" does not exist");
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return Task.FromResult(new ProcessRunResult(0, "", ""));
+                return new ProcessRunResult(0, "", "");
 
-            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -777,8 +863,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("detached exec exit marker", result.Stderr);
-        Assert.Contains("was malformed: not-an-int", result.Stderr);
+        Assert.Contains("detached exec process group poll failed (exit 1)", result.Stderr);
+        Assert.Contains("does not exist", result.Stderr);
     }
 
     [Fact]
@@ -787,7 +873,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        const string diagnostic = "detached exec process group marker /home/ubuntu/.codeybox-exec/exit-test.pgid was malformed: not-a-pid\n";
+        const string diagnostic = "detached exec process group marker /home/ubuntu/.codeybox-exec/detached-test.pgid was malformed: not-a-pid\n";
         var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
@@ -802,10 +888,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Assert.Null(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
-                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            if (IsDetachedProcessGroupPoll(argv))
             {
-                Assert.Contains("detached exec process group marker", poll, StringComparison.Ordinal);
                 return Task.FromResult(new ProcessRunResult(73, "", diagnostic));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
@@ -828,12 +912,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedProcessGroupExitedBeforeMarkerReturnsDiagnostic()
+    public async Task ExecAsync_DetachedProcessGroupExitedBeforeHttpExitReturnsDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        const string diagnostic = "detached exec process group 12345 exited before marker /home/ubuntu/.codeybox-exec/exit-test was written\n";
         var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
@@ -848,11 +931,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Assert.Null(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
-                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            if (IsDetachedProcessGroupPoll(argv))
             {
-                Assert.Contains("exited before marker", poll, StringComparison.Ordinal);
-                return Task.FromResult(new ProcessRunResult(74, "", diagnostic));
+                return Task.FromResult(new ProcessRunResult(0, "exited 12345\n", ""));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
@@ -869,7 +950,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("detached exec process group 12345 exited before marker", result.Stderr);
+        Assert.Contains("detached exec process group 12345 exited before HTTP exit notification", result.Stderr);
     }
 
     [Fact]
@@ -896,8 +977,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                     "",
                     "codeybox-detached: failed to write process group marker\n"));
             }
-            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
-                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            if (IsDetachedProcessGroupPoll(argv))
             {
                 pollCalls++;
                 return Task.FromResult(new ProcessRunResult(99, "", "poll should not run after launch failure"));
@@ -946,10 +1026,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                     (failingTransfer == "stdin" && destination.Contains(".codeybox-exec-stdin/", StringComparison.Ordinal))
                     || (failingTransfer == "command"
                         && destination.Contains(".codeybox-exec/", StringComparison.Ordinal)
-                        && !content.Contains("setsid /bin/bash -c", StringComparison.Ordinal))
+                        && !content.Contains("codeybox_lock_dir=", StringComparison.Ordinal))
                     || (failingTransfer == "launch"
                         && destination.Contains(".codeybox-exec/", StringComparison.Ordinal)
-                        && content.Contains("setsid /bin/bash -c", StringComparison.Ordinal));
+                        && content.Contains("codeybox_lock_dir=", StringComparison.Ordinal));
                 if (isFailingTransfer)
                 {
                     transferFailed = true;
@@ -1071,7 +1151,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             return;
 
         using var cts = new CancellationTokenSource();
-        var pollCount = 0;
+        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
         var killAttempted = false;
         var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
@@ -1091,16 +1171,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 && command.Contains("kill -TERM", StringComparison.Ordinal))
             {
                 killAttempted = true;
-                Assert.Contains("/home/ubuntu/.codeybox-exec/exit-", processGroupMarker, StringComparison.Ordinal);
+                Assert.Contains("/home/ubuntu/.codeybox-exec/detached-", processGroupMarker, StringComparison.Ordinal);
                 Assert.EndsWith(".pgid", processGroupMarker, StringComparison.Ordinal);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
-                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            if (IsDetachedProcessGroupPoll(argv))
             {
-                pollCount++;
-                cts.Cancel();
-                return Task.FromResult(new ProcessRunResult(1, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "alive 123\n", ""));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
@@ -1116,7 +1193,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
             }, cts.Token));
 
-        Assert.Equal(1, pollCount);
         Assert.True(killAttempted);
     }
 
@@ -1231,11 +1307,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Theory]
-    [InlineData(false, null, null)]
-    [InlineData(true, 256, null)]
-    [InlineData(true, null, 128)]
+    [InlineData(SandboxAgentOutputTransportPreference.ExecPipe, null, null)]
+    [InlineData(SandboxAgentOutputTransportPreference.PreferHttpIngest, 256, null)]
+    [InlineData(SandboxAgentOutputTransportPreference.PreferHttpIngest, null, 128)]
+    [InlineData(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, 256, null)]
+    [InlineData(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, null, 128)]
     public async Task ExecAsync_UsesExecPipeUnlessHttpIngestIsPreferredAndOutputIsUnbounded(
-        bool preferHttpIngest,
+        SandboxAgentOutputTransportPreference transport,
         int? maxStdoutBytes,
         int? maxStderrBytes)
     {
@@ -1254,9 +1332,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["agent-cli", "--json"],
-            AgentOutputTransport = preferHttpIngest
-                ? SandboxAgentOutputTransportPreference.PreferHttpIngest
-                : SandboxAgentOutputTransportPreference.ExecPipe,
+            AgentOutputTransport = transport,
             MaxStdoutBytes = maxStdoutBytes,
             MaxStderrBytes = maxStderrBytes,
             StdoutChunkCallback = _ => { },
@@ -3557,6 +3633,40 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         response.EnsureSuccessStatusCode();
     }
 
+    private static async Task<(int Exit, string Stdout, string Stderr)> RunLocalProcessAsync(
+        string fileName,
+        IReadOnlyList<string> args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = fileName,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var process = Process.Start(psi)!;
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        return (process.ExitCode, await stdoutTask, await stderrTask);
+    }
+
+    private static async Task WaitForFileAsync(string path, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (File.Exists(path))
+                return;
+            await Task.Delay(50);
+        }
+
+        Assert.True(File.Exists(path), $"Expected file to be written: {path}");
+    }
+
     private MultipassSandbox NewLoopbackHttpIngestSandbox(RecordingMultipassRunner runner)
         => new(
             "codeybox-test",
@@ -3580,6 +3690,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     private static bool IsCodeyboxExecArgv(IReadOnlyList<string> argv)
         => argv.Contains("/usr/local/bin/codeybox-exec", StringComparer.Ordinal);
+
+    private static bool IsDetachedProcessGroupPoll(IReadOnlyList<string> argv)
+        => argv is [_, "exec", _, "--", "sh", "-c", var command, "codeybox-detached-poll", _]
+           && command.Contains("codeybox_pgid_marker", StringComparison.Ordinal);
 
     private static void AssertPngSignature(byte[] bytes)
     {

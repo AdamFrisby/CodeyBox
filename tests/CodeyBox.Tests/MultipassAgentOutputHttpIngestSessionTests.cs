@@ -35,12 +35,34 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
 
         var readyStatus = await PostAsync(client, session, "run-x", "ready", 0, session.Token, "");
         var stdoutStatus = await PostAsync(client, session, "run-x", "stdout", 0, session.Token, "hello\n");
+        var exitStatus = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "7\n");
 
         Assert.Equal(HttpStatusCode.NoContent, readyStatus);
         Assert.Equal(HttpStatusCode.OK, stdoutStatus);
+        Assert.Equal(HttpStatusCode.NoContent, exitStatus);
         Assert.Equal("hello\n", session.Stdout);
         Assert.Equal(["hello\n"], chunks);
         Assert.True(session.ReceivedAgentBytes);
+        Assert.Equal(7, await session.WaitForExitAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Post_RejectsMalformedAndConflictingExitNotifications()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+
+        var malformed = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "not-an-int");
+        var first = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "3\n");
+        var duplicate = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "3\n");
+        var conflicting = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "4\n");
+
+        Assert.Equal(HttpStatusCode.BadRequest, malformed);
+        Assert.Equal(HttpStatusCode.NoContent, first);
+        Assert.Equal(HttpStatusCode.OK, duplicate);
+        Assert.Equal(HttpStatusCode.Conflict, conflicting);
+        Assert.Equal(3, await session.WaitForExitAsync(CancellationToken.None));
     }
 
     [Fact]
