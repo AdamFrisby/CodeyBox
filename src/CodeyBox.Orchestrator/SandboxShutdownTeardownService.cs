@@ -273,7 +273,10 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
     /// </summary>
     private async Task StopOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
     {
-        var item = await _store.GetAsync(workItemId, CancellationToken.None);
+        var (loaded, item) = await TryLoadWorkItemForStopTeardownAsync(workItemId, sandbox.Id);
+        if (!loaded)
+            return;
+
         if (item is not null && WorkItemRecoveryPolicy.RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(item))
         {
             _log.LogInformation(
@@ -311,6 +314,23 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
                 "Stop/preserve failed for work item {WorkItemId} sandbox {SandboxId}",
                 workItemId, sandbox.Id);
             throw;
+        }
+    }
+
+    private async Task<(bool Loaded, WorkItem? Item)> TryLoadWorkItemForStopTeardownAsync(
+        WorkItemId workItemId,
+        string sandboxId)
+    {
+        try
+        {
+            return (true, await _store.GetAsync(workItemId, CancellationToken.None));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "Cannot inspect work item {WorkItemId} before stop teardown for sandbox {SandboxId}; leaving it running for PipelineRunner or startup recovery",
+                workItemId, sandboxId);
+            return (false, null);
         }
     }
 

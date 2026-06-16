@@ -293,6 +293,35 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task ShutdownHandler_StopMode_LeavesSandboxRunning_WhenStoreIsUnavailable()
+    {
+        // Host shutdown can dispose the SQLite store while the teardown sweep is
+        // still draining active sandboxes. If Stop mode cannot inspect the work
+        // item, it must fail closed and leave the VM to PipelineRunner/startup
+        // recovery instead of guessing that stop/preserve is safe.
+        var item = MakeItem(WorkItemState.Auditing);
+        await _store.CreateAsync(item);
+        _store.Dispose();
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-stop-store-unavailable");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.TeardownAllAsync();
+
+        Assert.False(sandbox.StopAndPreserveCalled);
+        Assert.False(sandbox.SuspendCalled);
+        Assert.False(sandbox.DisposeCalled);
+        Assert.False(sandbox.OwnedByShutdownHandler);
+        Assert.Equal(1, provider.SnapshotCalls);
+    }
+
+    [Fact]
     public async Task ShutdownHandler_StopMode_UsesActiveProviderWithoutSuspendCapability()
     {
         var item = MakeItem(WorkItemState.Auditing);
