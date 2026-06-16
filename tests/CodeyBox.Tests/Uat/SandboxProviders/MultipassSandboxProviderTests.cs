@@ -781,6 +781,149 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("was malformed: not-an-int", result.Stderr);
     }
 
+    [Fact]
+    public async Task ExecAsync_DetachedMalformedProcessGroupMarkerReturnsDiagnostic()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        const string diagnostic = "detached exec process group marker /home/ubuntu/.codeybox-exec/exit-test.pgid was malformed: not-a-pid\n";
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                Assert.Null(stdin);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
+                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            {
+                Assert.Contains("detached exec process group marker", poll, StringComparison.Ordinal);
+                return Task.FromResult(new ProcessRunResult(73, "", diagnostic));
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+        });
+
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("detached exec process group marker", result.Stderr);
+        Assert.Contains("was malformed: not-a-pid", result.Stderr);
+    }
+
+    [Fact]
+    public async Task ExecAsync_DetachedProcessGroupExitedBeforeMarkerReturnsDiagnostic()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        const string diagnostic = "detached exec process group 12345 exited before marker /home/ubuntu/.codeybox-exec/exit-test was written\n";
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                Assert.Null(stdin);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
+                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            {
+                Assert.Contains("exited before marker", poll, StringComparison.Ordinal);
+                return Task.FromResult(new ProcessRunResult(74, "", diagnostic));
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+        });
+
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("detached exec process group 12345 exited before marker", result.Stderr);
+    }
+
+    [Fact]
+    public async Task ExecAsync_DetachedLauncherFailureReturnsLauncherResultWithoutFallback()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var pollCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                Assert.Null(stdin);
+                return Task.FromResult(new ProcessRunResult(
+                    88,
+                    "",
+                    "codeybox-detached: failed to write process group marker\n"));
+            }
+            if (argv is [_, "exec", _, "--", "sh", "-c", var poll]
+                && poll.Contains("/home/ubuntu/.codeybox-exec/exit-", StringComparison.Ordinal))
+            {
+                pollCalls++;
+                return Task.FromResult(new ProcessRunResult(99, "", "poll should not run after launch failure"));
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (IsCodeyboxExecArgv(argv))
+                return Task.FromResult(new ProcessRunResult(99, "", "attached exec fallback should not run"));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+        });
+
+        Assert.False(result.Success);
+        Assert.Equal(88, result.ExitCode);
+        Assert.Contains("failed to write process group marker", result.Stderr);
+        Assert.Equal(0, pollCalls);
+        Assert.DoesNotContain(runner.Calls, IsCodeyboxExecCall);
+    }
+
     [Theory]
     [InlineData("stdin")]
     [InlineData("command")]

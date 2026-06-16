@@ -162,6 +162,36 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     }
 
     [Fact]
+    public async Task ExecWrapper_StdinFileFeedsChildCommandStdin()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        var stdinPath = Path.Combine(Path.GetTempPath(), $"codeybox-stdin-{Guid.NewGuid():N}");
+        const string prompt = "prompt line 1\nprompt line 2 with $dollars and 'quotes'\n";
+        Directory.CreateDirectory(workDir);
+        await File.WriteAllTextAsync(stdinPath, prompt);
+
+        try
+        {
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, "--stdin-file", stdinPath, workDir, "sh", "-c", "cat"]);
+
+            Assert.Equal(0, exit);
+            Assert.Equal(prompt, stdout);
+            Assert.Equal("", stderr);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            File.Delete(stdinPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ExecWrapper_HttpOutputTransportStreamsLineBatchesAndRetriesSameSequence()
     {
         if (OperatingSystem.IsWindows()) return;
