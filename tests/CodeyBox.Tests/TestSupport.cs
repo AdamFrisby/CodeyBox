@@ -139,7 +139,8 @@ internal static class TestSupport
         // existing test signatures keep working.
         AgentSessionDispatchOptions? sessionDispatchOptions = null,
         AutoRetryOnTransientFailureOptions? transientRetryOptions = null,
-        TimeProvider? retryTimeProvider = null)
+        TimeProvider? retryTimeProvider = null,
+        CancellationRegistry? cancellationRegistry = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -283,6 +284,7 @@ internal static class TestSupport
                 : (claudeSessionWorker is null
                     ? null
                     : new Func<AgentSessionHandle, AgentSessionHandle>(claudeSessionWorker.SnapshotPersistedHandle)),
+            cancellationRegistry: cancellationRegistry,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
 

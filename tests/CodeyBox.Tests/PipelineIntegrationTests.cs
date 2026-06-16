@@ -323,6 +323,46 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkPhaseTransientAgentFailure_WithOperatorCancellation_CancelsInsteadOfSchedulingRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var cancellations = new CancellationRegistry(CancellationToken.None);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time,
+            cancellationRegistry: cancellations);
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        var item = NewItem("feature/transient-operator-cancel");
+        await tp.Store.CreateAsync(item);
+        using var registration = cancellations.Register(item.Id);
+        Assert.True(cancellations.Cancel(item.Id));
+        Assert.Equal(CancellationRequestKind.Operator, cancellations.GetRequestKind(item.Id));
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Cancelled, final!.State);
+        Assert.Equal(WorkItemCancellationReason.OperatorRequested, final.CancellationReason);
+        Assert.Equal(CancellationSources.Operator, final.CancellationSource);
+        Assert.NotEqual("transient", final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.Contains(webhooks.Events, e => e.Event == "work_item.cancelled" && e.WorkItem?.Id == item.Id);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
+    }
+
+    [Fact]
     public async Task WorkPhaseTransientRetry_WithExistingWorkBranch_AutoPicksAudit()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

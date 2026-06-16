@@ -265,6 +265,47 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task NotifyTransientFailure_StaleAtCapSnapshot_RecomputesCapAgainstCurrentRow()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(15),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var staleAtCap = NewTransientItem() with
+        {
+            TransientRetryAttempts = 5,
+            TransientRetryFirstFailedAt = _time.GetUtcNow().AddMinutes(-20),
+        };
+        await fixture.Store.CreateAsync(staleAtCap);
+        var currentFreshRetry = staleAtCap with
+        {
+            TransientRetryAttempts = 1,
+            TransientRetryFirstFailedAt = _time.GetUtcNow(),
+            NextTransientRetryAt = null,
+            UpdatedAt = staleAtCap.UpdatedAt.AddSeconds(1),
+        };
+        await fixture.Store.UpdateAsync(currentFreshRetry);
+
+        var result = await fixture.Scheduler.NotifyTransientFailureAsync(staleAtCap);
+
+        var stored = await fixture.Store.GetAsync(staleAtCap.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Scheduled, result.Status);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal("transient", stored.FailureKind);
+        Assert.Equal(1, stored.TransientRetryAttempts);
+        Assert.Equal(currentFreshRetry.TransientRetryFirstFailedAt, stored.TransientRetryFirstFailedAt);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(60), stored.NextTransientRetryAt);
+        Assert.DoesNotContain("transient-exhausted", stored.FailureKind, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task NotifyTransientFailure_AtAttemptCap_WhenFailedWebhookThrows_StillMarksTransientExhausted()
     {
         using var fixture = BuildScheduler(

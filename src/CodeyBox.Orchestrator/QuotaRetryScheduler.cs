@@ -1059,7 +1059,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
 
         if (ShouldExhaustTransientRetry(item, retryOptions, _time.GetUtcNow(), out var capReason))
-            return await TransitionTransientItemAtRetryCapAsync(item, capReason, ct);
+            return await TransitionTransientItemAtRetryCapAsync(item, capReason, ct, item.UpdatedAt);
 
         return await PerformTransientRetryAsync(item, trigger, ct);
     }
@@ -1067,7 +1067,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private async Task<TransientRetryAttemptResult> TransitionTransientItemAtRetryCapAsync(
         WorkItem item,
         string reason,
-        CancellationToken ct)
+        CancellationToken ct,
+        DateTimeOffset? expectedUpdatedAt = null)
     {
         var current = await _store.GetAsync(item.Id, ct);
         if (current is not null)
@@ -1080,6 +1081,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     current.State,
                     current.FailureKind);
                 return new TransientRetryAttemptResult("skipped:not-transient", $"state={current.State}; failureKind={current.FailureKind}");
+            }
+
+            if (expectedUpdatedAt is { } expected && current.UpdatedAt != expected)
+            {
+                _log.LogInformation(
+                    "Skipping transient retry exhaustion transition for work item {Id}; row changed after cap check",
+                    item.Id);
+                return new TransientRetryAttemptResult("skipped:state-changed", $"updatedAt={current.UpdatedAt:O}");
             }
 
             item = current with
@@ -1099,6 +1108,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     WorkItemState.Failed,
                     WorkItemState.WaitingForTransientRetry,
                 ],
+                ExpectedUpdatedAt = expectedUpdatedAt,
                 PrepareFailedItem = failed => failed with
                 {
                     NextTransientRetryAt = null,
@@ -1223,9 +1233,16 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             return WorkItemAutoRetryScheduleResult.Skipped(item, "not-transient");
 
         var now = _time.GetUtcNow();
+        var current = await _store.GetAsync(item.Id, ct);
+        if (current is null)
+            return WorkItemAutoRetryScheduleResult.Skipped(item, "not-found");
+        if (!IsTransientRetryPending(current))
+            return WorkItemAutoRetryScheduleResult.Skipped(current, "state-changed");
+
+        item = current;
         if (ShouldExhaustTransientRetry(item, retryOptions, now, out var capReason))
         {
-            await TransitionTransientItemAtRetryCapAsync(item, capReason, ct);
+            await TransitionTransientItemAtRetryCapAsync(item, capReason, ct, item.UpdatedAt);
             return await GetTransientScheduleResultAfterCapAsync(item, capReason, ct);
         }
 
@@ -1238,7 +1255,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             await TransitionTransientItemAtRetryCapAsync(
                 item with { TransientRetryFirstFailedAt = firstFailedAt },
                 $"elapsed would exceed max={retryOptions.MaxElapsedTime}",
-                ct);
+                ct,
+                item.UpdatedAt);
             return await GetTransientScheduleResultAfterCapAsync(
                 item with { TransientRetryFirstFailedAt = firstFailedAt },
                 $"elapsed would exceed max={retryOptions.MaxElapsedTime}",
@@ -1270,8 +1288,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 return WorkItemAutoRetryScheduleResult.Scheduled(scheduledItem, nextRetryAt);
             }
 
-            var current = await _store.GetAsync(item.Id, ct) ?? item;
-            return WorkItemAutoRetryScheduleResult.Skipped(current, "state-changed");
+            var latest = await _store.GetAsync(item.Id, ct) ?? item;
+            return WorkItemAutoRetryScheduleResult.Skipped(latest, "state-changed");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

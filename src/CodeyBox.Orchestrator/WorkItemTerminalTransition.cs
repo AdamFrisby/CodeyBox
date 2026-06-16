@@ -24,6 +24,7 @@ public sealed record WorkItemTerminalFailureTransitionOptions
     public DateTimeOffset? QuotaResetAt { get; init; }
     public string? CancellationSource { get; init; }
     public IReadOnlyCollection<WorkItemState>? ExpectedStates { get; init; }
+    public DateTimeOffset? ExpectedUpdatedAt { get; init; }
     public Func<WorkItem, WorkItem>? PrepareFailedItem { get; init; }
     public object? Details { get; init; }
     public Func<WorkItem, object?>? DetailsFactory { get; init; }
@@ -97,6 +98,15 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
                 CurrentWorkItem: current);
         }
 
+        if (options.ExpectedUpdatedAt is { } expectedUpdatedAt
+            && current.UpdatedAt != expectedUpdatedAt)
+        {
+            return new WorkItemTerminalTransitionResult(
+                Updated: false,
+                FailedWorkItem: null,
+                CurrentWorkItem: current);
+        }
+
         var failed = current.With(
             WorkItemState.Failed,
             error,
@@ -114,7 +124,9 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
             failed = options.PrepareFailedItem(failed);
         }
 
-        var updated = await _store.TryUpdateIfStateAsync(failed, current.State, ct);
+        var updated = options.ExpectedUpdatedAt is { } expectedForUpdate
+            ? await _store.TryUpdateIfStateAndUpdatedAtAsync(failed, current.State, expectedForUpdate, ct)
+            : await _store.TryUpdateIfStateAsync(failed, current.State, ct);
         if (!updated)
         {
             return new WorkItemTerminalTransitionResult(
