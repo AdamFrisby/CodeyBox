@@ -156,6 +156,37 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadMethods_WaitBehindSharedConnectionGate()
+    {
+        var queued = Sample();
+        var working = Sample() with { State = WorkItemState.Working };
+        await _store.CreateAsync(queued);
+        await _store.CreateAsync(working);
+
+        using var gate = _store.AcquireConnectionGateForTesting();
+        var reads = new Dictionary<string, Task>(StringComparer.Ordinal)
+        {
+            ["GetAsync"] = _store.GetAsync(queued.Id),
+            ["ListAsync"] = DrainAsync(_store.ListAsync()),
+            ["ListByStateAsync"] = DrainAsync(_store.ListByStateAsync(WorkItemState.Working)),
+            ["CountByStateAsync"] = _store.CountByStateAsync(WorkItemState.Queued),
+            ["ListDispatchEligibleByPriorityAsync"] = DrainAsync(
+                _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>())),
+        };
+
+        await Task.Delay(100);
+
+        var completedBeforeRelease = reads
+            .Where(kv => kv.Value.IsCompleted)
+            .Select(kv => kv.Key)
+            .ToArray();
+        Assert.Empty(completedBeforeRelease);
+
+        gate.Dispose();
+        await Task.WhenAll(reads.Values).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task RoundTrip_NonEmptyDependsOn_Preserved()
     {
         var dep1 = Sample();
@@ -552,5 +583,12 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         // Fail closed: surfacing the corruption beats silently routing the item
         // as if no clearance were required.
         await Assert.ThrowsAsync<InvalidDataException>(() => _store.GetAsync(item.Id));
+    }
+
+    private static async Task DrainAsync(IAsyncEnumerable<WorkItem> items)
+    {
+        await foreach (var _ in items)
+        {
+        }
     }
 }

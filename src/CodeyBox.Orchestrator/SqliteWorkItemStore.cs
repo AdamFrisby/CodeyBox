@@ -803,6 +803,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
     }
 
+    internal IDisposable AcquireConnectionGateForTesting()
+    {
+        _writeLock.Wait();
+        return new ConnectionGateLease(_writeLock);
+    }
+
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
@@ -2350,5 +2356,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         if (item is null) return null;
         var extIds = await LoadExternalIdsForAsync(item.Id, tx: null, ct);
         return item with { ExternalIds = extIds };
+    }
+
+    private sealed class ConnectionGateLease(SqliteDatabaseWriteGate gate) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                gate.Release();
+        }
     }
 }

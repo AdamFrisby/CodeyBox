@@ -5572,6 +5572,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             var state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
             if (exitTask.IsCompleted)
                 break;
+            if (state.Status == DetachedProcessGroupStatus.PollFailed)
+            {
+                _log.LogDebug(
+                    "Detached exec process group poll for {Name} failed while waiting for HTTP exit; keeping detached run alive: {Error}",
+                    _name,
+                    state.Error?.Trim());
+                continue;
+            }
             if (state.Error is not null)
             {
                 await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
@@ -5595,9 +5603,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private async Task<string?> EnsureDetachedProcessGroupReapedAsync(string processGroupMarker, CancellationToken ct)
     {
         DetachedProcessGroupProbe state = default;
+        DetachedProcessGroupProbe? lastPollFailure = null;
         for (var attempt = 0; attempt < 10; attempt++)
         {
             state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (state.Status == DetachedProcessGroupStatus.PollFailed)
+            {
+                lastPollFailure = state;
+                await Task.Delay(TimeSpan.FromMilliseconds(100), ct).ConfigureAwait(false);
+                continue;
+            }
             if (state.Error is not null)
                 return state.Error;
             if (state.Status == DetachedProcessGroupStatus.Exited)
@@ -5609,12 +5624,24 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         }
 
         await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
-        state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
-        if (state.Error is not null)
-            return state.Error;
-        return state.Status == DetachedProcessGroupStatus.Alive
-            ? $"detached exec process group {state.ProcessGroupId} remained alive after termination\n"
-            : null;
+        lastPollFailure = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (state.Status == DetachedProcessGroupStatus.PollFailed)
+            {
+                lastPollFailure = state;
+                await Task.Delay(TimeSpan.FromMilliseconds(100), ct).ConfigureAwait(false);
+                continue;
+            }
+            if (state.Error is not null)
+                return state.Error;
+            return state.Status == DetachedProcessGroupStatus.Alive
+                ? $"detached exec process group {state.ProcessGroupId} remained alive after termination\n"
+                : null;
+        }
+
+        return lastPollFailure?.Error;
     }
 
     private async Task<DetachedProcessGroupProbe> ProbeDetachedProcessGroupAsync(
