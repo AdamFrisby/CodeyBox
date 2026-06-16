@@ -52,6 +52,7 @@ internal static class PipelineLifecycleUatHelpers
         });
         var composer = new ProjectAuditorComposer(new UatAuditorCatalog(auditorList));
         var webhooks = new CapturingWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             sandboxes,
             gitHost,
@@ -70,7 +71,9 @@ internal static class PipelineLifecycleUatHelpers
                 UpstreamPushBackoff = TimeSpan.Zero,
             },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new UatPipelineContext(pipeline, store, agent, gitHost, gitRoot, webhooks);
     }

@@ -657,6 +657,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         };
         var projects = new InMemoryProjectRepository(project);
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -666,7 +667,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            dispatchAvailability: new AgentDispatchAvailability(availability, prober));
+            dispatchAvailability: new AgentDispatchAvailability(availability, prober),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = new WorkItem
         {
@@ -781,6 +784,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         };
         var projects = new InMemoryProjectRepository(project);
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -790,7 +794,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            dispatchAvailability: new AgentDispatchAvailability(availability, gate, smokeOptions));
+            dispatchAvailability: new AgentDispatchAvailability(availability, gate, smokeOptions),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = new WorkItem
         {
@@ -883,6 +889,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             },
             TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -902,7 +909,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             }),
             availability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions));
+            dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
     }
@@ -962,6 +971,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             },
             TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -977,7 +987,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new ConflictMergeFixture(pipeline, store, gitHost, webhooks, availability);
     }

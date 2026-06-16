@@ -176,6 +176,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = 1 },
         };
         var projects = new InMemoryProjectRepository(project);
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -187,13 +189,15 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaOptions: quotaOptions,
             classRouter: router,
             auditReports: auditReportStore,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new CascadeFixture(pipeline, store, gitHost);
     }

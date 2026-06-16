@@ -89,6 +89,7 @@ public sealed class PickupSmokeTests : IDisposable
 
         var presetCatalog = new ScriptedAuditorCatalog([]);
         var composer = new ProjectAuditorComposer(presetCatalog);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -97,7 +98,9 @@ public sealed class PickupSmokeTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
             smokeGate: gate,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestResources
         {

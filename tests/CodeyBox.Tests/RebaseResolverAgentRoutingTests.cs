@@ -538,6 +538,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = 1, AuditAgent = auditAgent },
         };
         var projects = new InMemoryProjectRepository(project);
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -549,13 +551,15 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: probes,
             auditQuotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
             classRouter: router,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new CandidateFixture(pipeline, store, project);
     }
@@ -656,6 +660,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = 1, AuditAgent = auditAgent },
         };
         var projects = new InMemoryProjectRepository(project);
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -667,7 +673,7 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: probes,
@@ -675,7 +681,9 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             classRouter: router,
             agentRunningCounters: runningCounters,
             agentConcurrency: agentConcurrency,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new RoutingFixture(pipeline, store, gitHost);
     }

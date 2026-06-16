@@ -859,6 +859,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             },
         };
         var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -868,7 +869,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
             projects,
             null,
             webhooks,
-            time);
+            time,
+            terminalTransitions: terminalTransitions);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -897,7 +899,9 @@ public sealed class AuditQuotaPauseTests : IDisposable
             ]),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: dispatchAvailability,
-            agentPauseController: pauses);
+            agentPauseController: pauses,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new AuditQuotaFixture(
             pipeline,

@@ -83,14 +83,18 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var presetCatalog = new ScriptedAuditorCatalog([]);
         var composer = new ProjectAuditorComposer(presetCatalog);
         var upstreamFactory = new TestUpstreamFactory();
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, upstreamFactory, composer, store,
-            new NullWebhookDispatcher(),
+            webhooks,
             options ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             logger ?? NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new ShutdownTestHarness(pipeline, store, gitHost);
     }
@@ -351,14 +355,18 @@ public sealed class HostShutdownCancellationTests : IDisposable
             },
             Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
         });
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             sandboxes,
             gitHost, registry, new StaticCredentialProvider(), new InMemoryPullRequestService(),
             projects, new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store, new NullWebhookDispatcher(),
+            store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = NewItem() with
         {
@@ -398,23 +406,28 @@ public sealed class HostShutdownCancellationTests : IDisposable
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
         var agent = new StartupResumeRecordingAgent();
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        });
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
-            new InMemoryPullRequestService(), new InMemoryProjectRepository(new Project
-            {
-                Id = new ProjectId("test-project"),
-                DisplayName = "Test Project",
-                RepositoryUrl = seed,
-                DefaultBaseBranch = "main",
-                DefaultAgent = AgentKind.Claude,
-                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
-            }),
+            new InMemoryPullRequestService(), projects,
             new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store, new NullWebhookDispatcher(),
+            store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
         using var orchestrator = new OrchestratorService(
             queue, store, pipeline, new CancellationRegistry(CancellationToken.None),
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
@@ -545,24 +558,29 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var wrappingProvider = new SuspendableSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         var agent = new BlockingAgentRunner();
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        });
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             wrappingProvider, gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
             new InMemoryPullRequestService(),
-            new InMemoryProjectRepository(new Project
-            {
-                Id = new ProjectId("test-project"),
-                DisplayName = "Test Project",
-                RepositoryUrl = seed,
-                DefaultBaseBranch = "main",
-                DefaultAgent = AgentKind.Claude,
-                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
-            }),
+            projects,
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store, new NullWebhookDispatcher(),
+            store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             logger,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = NewItem();
         await store.CreateAsync(item);
@@ -643,24 +661,29 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var wrappingProvider = new SuspendableSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         var agent = new BlockingAgentRunner();
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        });
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             wrappingProvider, gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
             new InMemoryPullRequestService(),
-            new InMemoryProjectRepository(new Project
-            {
-                Id = new ProjectId("test-project"),
-                DisplayName = "Test Project",
-                RepositoryUrl = seed,
-                DefaultBaseBranch = "main",
-                DefaultAgent = AgentKind.Claude,
-                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
-            }),
+            projects,
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store, new NullWebhookDispatcher(),
+            store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             logger,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = NewItem();
         await store.CreateAsync(item);
@@ -729,24 +752,29 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var wrappingProvider = new SuspendableSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         var agent = new BlockingAgentRunner();
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        });
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             wrappingProvider, gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
             new InMemoryPullRequestService(),
-            new InMemoryProjectRepository(new Project
-            {
-                Id = new ProjectId("test-project"),
-                DisplayName = "Test Project",
-                RepositoryUrl = seed,
-                DefaultBaseBranch = "main",
-                DefaultAgent = AgentKind.Claude,
-                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
-            }),
+            projects,
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store, new NullWebhookDispatcher(),
+            store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             logger,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = NewItem();
         await store.CreateAsync(item);
@@ -818,23 +846,28 @@ public sealed class HostShutdownCancellationTests : IDisposable
         SqliteWorkItemStore store,
         IAgentRunner agent)
     {
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        });
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         return new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
-            new InMemoryPullRequestService(), new InMemoryProjectRepository(new Project
-            {
-                Id = new ProjectId("test-project"),
-                DisplayName = "Test Project",
-                RepositoryUrl = seed,
-                DefaultBaseBranch = "main",
-                DefaultAgent = AgentKind.Claude,
-                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
-            }),
+            new InMemoryPullRequestService(), projects,
             new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store, new NullWebhookDispatcher(),
+            store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
     }
 
     private async Task CreatePreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed, bool includeScratchpad = true)

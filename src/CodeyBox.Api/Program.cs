@@ -2249,11 +2249,15 @@ builder.Services.AddSingleton<ICheckAndActCompletionRunner>(sp =>
         sp.GetRequiredService<CheckAndActCompletionOptions>(),
         sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>()));
 
-builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp => new WorkItemTerminalTransition(
+builder.Services.AddSingleton<WorkItemTerminalTransition>(sp => new WorkItemTerminalTransition(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<ILogger<WorkItemTerminalTransition>>()));
+builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
+    sp.GetRequiredService<WorkItemTerminalTransition>());
+builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
+    sp.GetRequiredService<WorkItemTerminalTransition>());
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -2322,7 +2326,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
         ? worker.SnapshotPersistedHandle
         : null,
     cancellationRegistry: sp.GetRequiredService<CancellationRegistry>(),
-    terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>()));
+    terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>(),
+    terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

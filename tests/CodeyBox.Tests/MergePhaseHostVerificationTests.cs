@@ -214,6 +214,10 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
             DefaultAgent = AgentKind.Claude,
             Audit = new ProjectAudit(),
         };
+        var store = new SqliteWorkItemStore(stateDb);
+        var webhooks = new NullWebhookDispatcher();
+        var projects = new InMemoryProjectRepository(project);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         return new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
@@ -221,14 +225,16 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
             new AgentRegistry([agent]),
             new StaticCredentialProvider(),
             new InMemoryPullRequestService(),
-            new InMemoryProjectRepository(project),
+            projects,
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            new SqliteWorkItemStore(stateDb),
-            new NullWebhookDispatcher(),
+            store,
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
     }
 
     private static async Task<(int Code, string Stdout, string Stderr)> RunGitRaw(string cwd, params string[] args)
@@ -493,6 +499,9 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             DefaultAgent = AgentKind.Claude,
             Audit = new ProjectAudit(),
         };
+        var webhooks = new NullWebhookDispatcher();
+        var projects = new InMemoryProjectRepository(project);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(workStore, webhooks, projects);
 
         return new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
@@ -500,15 +509,17 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             new AgentRegistry([agent]),
             new StaticCredentialProvider(),
             new InMemoryPullRequestService(),
-            new InMemoryProjectRepository(project),
+            projects,
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             workStore,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
             auditReports: auditStore,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
     }
 
     private static async Task<(int Code, string Stdout, string Stderr)> RunGitRaw(string cwd, params string[] args)

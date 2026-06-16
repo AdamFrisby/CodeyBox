@@ -798,6 +798,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
 
         var projects = new InMemoryProjectRepository(project);
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var queue = wireRetrier ? new InMemoryTaskQueue() : null;
         var retrier = wireRetrier
@@ -828,7 +829,9 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             ]),
             budgetProvider: budgetProvider,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new RoutingFixture(pipeline, store, webhooks, codex, router, configurableProbes, retrier);
     }

@@ -127,6 +127,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
 
         var taskQueue = new InMemoryTaskQueue();
         var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -137,7 +138,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             webhooks,
             _time,
-            autoRetryOptionsAccessor: autoRetryOptionsAccessor);
+            autoRetryOptionsAccessor: autoRetryOptionsAccessor,
+            terminalTransitions: terminalTransitions);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -146,7 +148,9 @@ public sealed class QuotaAutoRetryTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             retryScheduler: scheduler,
             quotaClassifier: BuildQuotaClassifier(),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return (pipeline, store, scheduler, webhooks);
     }

@@ -273,6 +273,7 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
             DefaultAgent = AgentKind.Claude,
             Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
         });
+        var terminalTransitions = TestSupport.CreateTerminalTransition(pipelineStore, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registryOfAgents, new StaticCredentialProvider(), prs,
@@ -283,7 +284,9 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            cancellationRegistry: registry);
+            cancellationRegistry: registry,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new RecoveryCancelTestHarness(pipeline, store, pipelineStore);
     }

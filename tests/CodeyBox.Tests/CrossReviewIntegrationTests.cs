@@ -206,6 +206,7 @@ public sealed class CrossReviewIntegrationTests : IDisposable
         var composer = new ProjectAuditorComposer(presetCatalog);
         // Gemini has credentials; Claude uses the null provider (existing test convention).
         var credentials = new SelectiveCredentialProvider(AgentKind.Gemini);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials, prs,
@@ -213,7 +214,9 @@ public sealed class CrossReviewIntegrationTests : IDisposable
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new CrossReviewTestPipeline(pipeline, store, claudeAgent, recorders, webhooks);
     }

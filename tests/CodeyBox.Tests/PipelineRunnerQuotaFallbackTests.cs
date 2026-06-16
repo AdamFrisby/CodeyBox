@@ -1955,6 +1955,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         // Tests assert against the inner InMemory store; an optional wrapper lets a
         // test inject store faults while still reading the rows that landed.
         IAgentInvolvementStore involvementForPipeline = wrapInvolvement?.Invoke(involvement) ?? involvement;
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -1979,7 +1980,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: inVmSmokeGate is null
                 ? null
-                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
+                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
@@ -2044,6 +2047,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             [AgentKind.Codex] = new FakeFallbackExtractor(AgentKind.Codex),
             [AgentKind.Claude] = new FakeFallbackExtractor(AgentKind.Claude),
         };
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -2060,7 +2064,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
             involvement: involvement,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
@@ -2145,6 +2151,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -2163,7 +2170,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector(), new GeminiQuotaFailureDetector() }),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new ThreeMemberFixture(
             pipeline,

@@ -275,7 +275,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // the persisted shape).
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null,
         CancellationRegistry? cancellationRegistry = null,
-        IWorkItemTerminalTransition? terminalTransitions = null)
+        IWorkItemTerminalTransition? terminalTransitions = null,
+        IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -287,18 +288,6 @@ public sealed class PipelineRunner : IPipelineRunner
         _auditorComposer = auditorComposer;
         _store = store;
         _webhooks = webhooks;
-        _terminalTransitions = terminalTransitions
-            ?? new WorkItemTerminalTransition(
-                store,
-                webhooks,
-                projects,
-                NullLogger<WorkItemTerminalTransition>.Instance);
-        _terminalRevisionBuilder = _terminalTransitions as IWorkItemTerminalRevisionBuilder
-            ?? new WorkItemTerminalTransition(
-                store,
-                webhooks,
-                projects,
-                NullLogger<WorkItemTerminalTransition>.Instance);
         _opts = opts;
         _timings = timingStore;
         _costStore = costStore;
@@ -374,6 +363,14 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? throw new ArgumentNullException(
                 nameof(requiredBuildVerifier),
                 "PipelineRunner requires an IRequiredBuildVerifier supplied by the composition root.");
+        _terminalTransitions = terminalTransitions
+            ?? throw new ArgumentNullException(
+                nameof(terminalTransitions),
+                "PipelineRunner requires an IWorkItemTerminalTransition supplied by the composition root.");
+        _terminalRevisionBuilder = terminalRevisionBuilder
+            ?? throw new ArgumentNullException(
+                nameof(terminalRevisionBuilder),
+                "PipelineRunner requires an IWorkItemTerminalRevisionBuilder supplied by the composition root.");
         _checkCompletionRunner = checkCompletionRunner;
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
@@ -11147,6 +11144,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // orchestrator requeue path; retrying them here would hard-fail
                 // infrastructure flaps after the upstream attempt budget.
                 catch (Exception ex) when (ex is not MergeConflictResolutionFailedException
+                    && ex is not TerminalTransientNetworkError
                     && ex is not SandboxProvisioningDeferredException
                     && ex is not AgentPausedException)
                 {

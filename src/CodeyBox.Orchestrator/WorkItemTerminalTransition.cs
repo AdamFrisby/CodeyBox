@@ -12,7 +12,7 @@ public interface IWorkItemTerminalTransition
         CancellationToken ct);
 }
 
-internal interface IWorkItemTerminalRevisionBuilder
+public interface IWorkItemTerminalRevisionBuilder
 {
     Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct);
 }
@@ -206,7 +206,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
 /// JobTrack can read <c>payload.promptRevision</c> directly; this record is
 /// just the in-process plumbing.
 /// </summary>
-internal sealed record TerminalRevisionDetails(
+public sealed record TerminalRevisionDetails(
     int PromptRevision,
     int? RevisionAtCompletion,
     bool? RevisionMatches);

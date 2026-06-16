@@ -164,6 +164,7 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -180,7 +181,9 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
                 new CursorQuotaFailureDetector(),
                 new ClaudeQuotaFailureDetector(),
             }),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new CursorFallbackFixture(pipeline, store, cursor, claude, cursorProbe, claudeProbe, webhooks, fallbackHistory);
     }
@@ -238,6 +241,7 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -254,7 +258,9 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
                 new CursorQuotaFailureDetector(),
                 new ClaudeQuotaFailureDetector(),
             }),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new CursorFallbackFixture(pipeline, store, cursor, claude, cursorProbe, claudeProbe, webhooks, fallbackHistory);
     }

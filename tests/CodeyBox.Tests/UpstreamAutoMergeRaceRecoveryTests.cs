@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
@@ -203,6 +204,55 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         Assert.NotNull(final);
         Assert.NotEqual(WorkItemState.Failed, final!.State);
         Assert.NotEqual(WorkItemState.MergeConflictResolutionFailed, final.State);
+    }
+
+    [Fact]
+    public async Task AutoMergeRace_TransientTransportDuringMergeRerun_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var remote = new RacingUpstreamRemote
+        {
+            SeedRepoPath = seed,
+            ResponsePlan =
+            {
+                new RacingResponse(AutoMergeRaced: true, AdvanceSeedBeforeReturning: false),
+            },
+        };
+        var sandboxes = new FailingNthMergeCommandSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            failOnMergePhaseOccurrence: 2);
+        var factory = new SingleRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "racing-upstream",
+                AutoMerge = true,
+                MergeMethod = "squash",
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge, MergeStrategy.RealMerge],
+            sandboxProvider: sandboxes,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("race-fix.txt", "fixes race\n"));
+
+        var item = NewItem("feature/race-rerun-transient");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("merge", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Contains("transient transport failure", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, remote.CompleteCalls);
+        Assert.Equal(2, sandboxes.MatchingMergePhaseCreates);
     }
 
     [Fact]
@@ -584,6 +634,17 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         // and not the "main is being hammered" cap message.
         Assert.Contains("race recovery", final.LastError, StringComparison.OrdinalIgnoreCase);
     }
+
+    private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
+    };
 }
 
 /// <summary>
@@ -698,6 +759,67 @@ internal sealed class ThrowingNthTimingPhaseSandboxProvider : ISandboxProvider
 
     public Task DisposeLeakedAsync(string name, CancellationToken ct)
         => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class FailingNthMergeCommandSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+    private readonly int _failOnMergePhaseOccurrence;
+    private int _matchingMergePhaseCreates;
+
+    public FailingNthMergeCommandSandboxProvider(
+        ISandboxProvider inner,
+        int failOnMergePhaseOccurrence)
+    {
+        _inner = inner;
+        _failOnMergePhaseOccurrence = failOnMergePhaseOccurrence;
+    }
+
+    public string Name => _inner.Name;
+    public int MatchingMergePhaseCreates => Volatile.Read(ref _matchingMergePhaseCreates);
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+    {
+        var sandbox = await _inner.CreateAsync(spec, ct);
+        if (string.Equals(spec.TimingPhase, "merge", StringComparison.Ordinal)
+            && Interlocked.Increment(ref _matchingMergePhaseCreates) == _failOnMergePhaseOccurrence)
+        {
+            return new FailingMergeCommandSandbox(sandbox);
+        }
+
+        return sandbox;
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class FailingMergeCommandSandbox : ISandbox
+{
+    private readonly ISandbox _inner;
+
+    public FailingMergeCommandSandbox(ISandbox inner) => _inner = inner;
+
+    public string Id => _inner.Id;
+    public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+    {
+        if (IsGitMerge(exec.Argv))
+            return Task.FromResult(new SandboxExecResult(1, "", "Transport channel closed"));
+
+        return _inner.ExecAsync(exec, ct);
+    }
+
+    public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+    private static bool IsGitMerge(IReadOnlyList<string> argv) =>
+        argv.Count > 0
+        && string.Equals(argv[0], "git", StringComparison.Ordinal)
+        && argv.Any(arg => string.Equals(arg, "merge", StringComparison.Ordinal));
 }
 
 /// <summary>

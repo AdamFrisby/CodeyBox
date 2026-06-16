@@ -47,6 +47,29 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task NotifyTransientFailure_WhenRowLeftTransientState_ReturnsStateChangedWithoutScheduling()
+    {
+        using var fixture = BuildScheduler(EnabledRetryOptions());
+        var stale = NewTransientItem();
+        await fixture.Store.CreateAsync(stale);
+        var alreadyRetried = stale.With(WorkItemState.Queued, "retry already resumed");
+        await fixture.Store.UpdateAsync(alreadyRetried);
+
+        var result = await fixture.Scheduler.NotifyTransientFailureAsync(stale);
+
+        var stored = await fixture.Store.GetAsync(stale.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Skipped, result.Status);
+        Assert.Equal("state-changed", result.Reason);
+        Assert.Equal(WorkItemState.Queued, result.UpdatedItem.State);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+        Assert.Null(stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
     public async Task NotifyTransientFailure_AppliesFullJitterSpread()
     {
         var randoms = new Queue<double>([0.10, 0.90]);

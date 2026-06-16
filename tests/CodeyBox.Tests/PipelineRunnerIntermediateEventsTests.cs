@@ -440,6 +440,7 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
 
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var upstreamFactory = new TestUpstreamFactory();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -448,7 +449,9 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

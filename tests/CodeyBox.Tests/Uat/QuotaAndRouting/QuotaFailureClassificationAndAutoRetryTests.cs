@@ -478,6 +478,7 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             DefaultAgent = AgentKind.Claude,
         });
         var retryScheduler = BuildRetrySchedulerForStore(store, gitHost);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             gitHost,
@@ -493,7 +494,9 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             retryScheduler: retryScheduler,
             quotaClassifier: BuildClassifier(),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new PipelineContext(pipeline, store);
     }

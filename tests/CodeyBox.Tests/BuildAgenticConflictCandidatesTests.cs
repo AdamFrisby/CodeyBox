@@ -670,6 +670,8 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = 1 },
         };
         var projects = new InMemoryProjectRepository(project);
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -681,7 +683,7 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             classRouter: router,
@@ -693,7 +695,9 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: inVmSmokeGate is null
                 ? null
-                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
+                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new Fixture(pipeline, store, project);
     }

@@ -1120,13 +1120,15 @@ public sealed class AgentPauseTests : IDisposable
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
+        var projects = ProjectRepo();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         return new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             gitHost,
             new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge])]),
             new StaticCredentialProvider(),
             new InMemoryPullRequestService(),
-            ProjectRepo(),
+            projects,
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
@@ -1134,7 +1136,9 @@ public sealed class AgentPauseTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            agentPauseController: pauses);
+            agentPauseController: pauses,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
     }
 
     private SqliteAgentPauseController MakeController(TimeProvider? timeProvider = null) =>

@@ -26,6 +26,16 @@ namespace CodeyBox.Tests;
 /// </summary>
 internal static class TestSupport
 {
+    public static WorkItemTerminalTransition CreateTerminalTransition(
+        IWorkItemStore store,
+        IWebhookDispatcher? webhooks,
+        IProjectRepository? projects) =>
+        new(
+            store,
+            webhooks ?? new NullWebhookDispatcher(),
+            projects,
+            NullLogger<WorkItemTerminalTransition>.Instance);
+
     public static async Task<string> CreateSeedRepoAsync(string root, string name = "seed")
     {
         var seed = Path.Combine(root, name + "-" + Guid.NewGuid().ToString("N")[..8]);
@@ -179,6 +189,11 @@ internal static class TestSupport
             Audit = audit,
         };
         var projects = projectRepository ?? new InMemoryProjectRepository(defaultProject);
+        var terminalWebhookDispatcher = webhookDispatcher ?? new NullWebhookDispatcher();
+        var terminalTransitions = CreateTerminalTransition(
+            pipelineStore,
+            terminalWebhookDispatcher,
+            projects);
 
         var presetCatalog = presetCatalogOverride ?? new ScriptedAuditorCatalog(auditorList);
         var composer = new ProjectAuditorComposer(presetCatalog);
@@ -211,14 +226,15 @@ internal static class TestSupport
                 projects: projects,
                 webhooks: webhookDispatcher,
                 timeProvider: retryTimeProvider,
-                transientRetryOptionsAccessor: () => transientRetryOptions);
+                transientRetryOptionsAccessor: () => transientRetryOptions,
+                terminalTransitions: terminalTransitions);
         }
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, resolvedUpstreamFactory, composer,
             pipelineStore,
-            webhookDispatcher ?? new NullWebhookDispatcher(),
+            terminalWebhookDispatcher,
             resolvedOptions,
             NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
@@ -266,7 +282,9 @@ internal static class TestSupport
                 ? sessionHandleSnapshotOverride
                 : (claudeSessionWorker is null
                     ? null
-                    : new Func<AgentSessionHandle, AgentSessionHandle>(claudeSessionWorker.SnapshotPersistedHandle)));
+                    : new Func<AgentSessionHandle, AgentSessionHandle>(claudeSessionWorker.SnapshotPersistedHandle)),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement, retryScheduler);
     }
