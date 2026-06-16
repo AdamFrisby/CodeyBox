@@ -5395,7 +5395,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         transferredVmPaths.Add(launchScript);
         transferredVmPaths.Add(processGroupMarker);
         transferredVmPaths.Add($"{processGroupMarker}.tmp");
-        return [_opts.MultipassBinary, "exec", _name, "--", "/bin/sh", launchScript];
+        return [_opts.MultipassBinary, "exec", _name, "--", "/bin/bash", launchScript];
     }
 
     private async Task<string> TransferDetachedLaunchScriptAsync(
@@ -5434,20 +5434,25 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal static string BuildDetachedLaunchScript(
         string envFile,
         string processGroupMarker,
-        IReadOnlyList<string> command)
+        IReadOnlyList<string> command,
+        int launchLockAttempts = 300)
     {
+        if (launchLockAttempts < 0)
+            throw new ArgumentOutOfRangeException(nameof(launchLockAttempts), "Launch lock attempts must be non-negative.");
+
         var sb = new StringBuilder();
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("set -e");
         sb.Append("codeybox_env_file=").Append(MultipassSandboxProvider.ShellSingleQuote(envFile)).Append('\n');
         sb.Append("codeybox_pgid_marker=").Append(MultipassSandboxProvider.ShellSingleQuote(processGroupMarker)).Append('\n');
+        sb.Append("codeybox_lock_max=").Append(launchLockAttempts.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
         sb.AppendLine("mkdir -p \"$(dirname \"$codeybox_pgid_marker\")\"");
         sb.AppendLine("if [ -f \"$codeybox_pgid_marker\" ]; then exit 0; fi");
         sb.AppendLine("codeybox_lock_i=0");
         sb.AppendLine("while ! mkdir \"$codeybox_lock_dir\" 2>/dev/null; do");
         sb.AppendLine("    if [ -f \"$codeybox_pgid_marker\" ]; then exit 0; fi");
-        sb.AppendLine("    if [ \"$codeybox_lock_i\" -ge 300 ]; then");
+        sb.AppendLine("    if [ \"$codeybox_lock_i\" -ge \"$codeybox_lock_max\" ]; then");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for launch lock\" >&2");
         sb.AppendLine("        exit 88");
         sb.AppendLine("    fi");

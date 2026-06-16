@@ -15,6 +15,7 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     internal const string TokenEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_TOKEN";
     internal const string RunIdEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_RUN_ID";
     internal const int MaxChunkBytes = 256 * 1024;
+    internal const int MaxExitBodyBytes = 32;
     internal const int MaxRequestsPerSecond = 2048;
 
     private const int TokenBytes = 32;
@@ -258,8 +259,19 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
                 return;
             }
 
-            using var reader = new StreamReader(request.InputStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 128);
-            var body = (await reader.ReadToEndAsync(ct).ConfigureAwait(false)).Trim();
+            if (request.ContentLength64 > MaxExitBodyBytes)
+            {
+                Reject(response, HttpStatusCode.RequestEntityTooLarge);
+                return;
+            }
+
+            var body = await ReadExitBodyAsync(request.InputStream, ct).ConfigureAwait(false);
+            if (body is null)
+            {
+                Reject(response, HttpStatusCode.RequestEntityTooLarge);
+                return;
+            }
+
             if (!int.TryParse(body, NumberStyles.Integer, CultureInfo.InvariantCulture, out var exitCode))
             {
                 Reject(response, HttpStatusCode.BadRequest);
@@ -303,6 +315,32 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
             AppendOutcome.TooLarge => HttpStatusCode.RequestEntityTooLarge,
             _ => HttpStatusCode.InternalServerError,
         });
+    }
+
+    private static async Task<string?> ReadExitBodyAsync(Stream body, CancellationToken ct)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(MaxExitBodyBytes + 1);
+        var total = 0;
+        try
+        {
+            while (total <= MaxExitBodyBytes)
+            {
+                var read = await body
+                    .ReadAsync(buffer.AsMemory(total, MaxExitBodyBytes + 1 - total), ct)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                    return Encoding.UTF8.GetString(buffer, 0, total).Trim();
+                total += read;
+                if (total > MaxExitBodyBytes)
+                    return null;
+            }
+
+            return null;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private bool TokenMatches(string? authorization)

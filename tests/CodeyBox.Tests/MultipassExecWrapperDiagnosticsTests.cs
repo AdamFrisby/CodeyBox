@@ -283,6 +283,62 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     }
 
     [Fact]
+    public async Task ExecWrapper_HttpOutputTransportWithLogFileTeesOutputAndPostsExit()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        if (!await CommandAvailableAsync("python3")) return;
+
+        await using var server = StubHttpIngestServer.Start(request =>
+            request.Stream == "ready" ? 204 : 200);
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        Directory.CreateDirectory(workDir);
+        var logPath = Path.Combine(workDir, "agent.log");
+        var env = new Dictionary<string, string?>
+        {
+            [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
+            [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-log",
+            ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
+        };
+
+        try
+        {
+            var agentScript = """
+                printf 'out-log\n'
+                printf 'err-log\n' >&2
+                exit 5
+                """;
+
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, workDir, "sh", "-c", agentScript],
+                env);
+
+            Assert.Equal(5, exit);
+            Assert.Equal("", stdout);
+            Assert.Equal("", stderr);
+            Assert.Equal("out-log\nerr-log\n", await File.ReadAllTextAsync(logPath));
+            Assert.Equal("5\n", await File.ReadAllTextAsync(logPath + ".exit"));
+
+            var requests = server.Requests.ToArray();
+            Assert.Contains(requests, r => r.Stream == "ready" && r.RunId == "run-wrapper-log" && r.Seq == 0);
+            Assert.DoesNotContain(requests, r => r.Stream == "stderr");
+            Assert.Equal("out-log\nerr-log\n", string.Concat(
+                requests.Where(r => r.Stream == "stdout").OrderBy(r => r.Seq).Select(r => r.BodyText)));
+
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal(0, exitRequest.Seq);
+            Assert.Equal("5\n", exitRequest.BodyText);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ExecWrapper_HttpOutputTransportTerminalStreamStatusFailsRun()
     {
         if (OperatingSystem.IsWindows()) return;
@@ -315,6 +371,60 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             var stdoutRequest = Assert.Single(server.Requests, r => r.Stream == "stdout");
             Assert.Equal(0, stdoutRequest.Seq);
             Assert.Equal("out-1\n", stdoutRequest.BodyText);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecWrapper_HttpOutputTransportTerminalExitStatusFailsRunAfterStreamsSucceed()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        if (!await CommandAvailableAsync("python3")) return;
+
+        await using var server = StubHttpIngestServer.Start(request => request.Stream switch
+        {
+            "ready" => 204,
+            "exit" => 409,
+            _ => 200,
+        });
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        Directory.CreateDirectory(workDir);
+        var env = new Dictionary<string, string?>
+        {
+            [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
+            [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-exit-conflict",
+            ["CODEYBOX_AGENT_LOG_FILE"] = "",
+        };
+
+        try
+        {
+            var agentScript = """
+                printf 'out-before-exit\n'
+                printf 'err-before-exit\n' >&2
+                exit 4
+                """;
+
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, workDir, "sh", "-c", agentScript],
+                env);
+
+            Assert.Equal(87, exit);
+            Assert.Equal("", stdout);
+            Assert.Contains("agent output HTTP ingest failed during run", stderr, StringComparison.Ordinal);
+
+            var requests = server.Requests.ToArray();
+            Assert.Contains(requests, r => r.Stream == "stdout" && r.BodyText == "out-before-exit\n");
+            Assert.Contains(requests, r => r.Stream == "stderr" && r.BodyText == "err-before-exit\n");
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal(0, exitRequest.Seq);
+            Assert.Equal("4\n", exitRequest.BodyText);
         }
         finally
         {

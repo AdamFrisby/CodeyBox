@@ -651,7 +651,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return new ProcessRunResult(0, "", "");
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -709,7 +709,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         var launchCall = Assert.Single(
             runner.Calls,
-            c => c.Argv is [_, "exec", _, "--", "/bin/sh", var script]
+            c => c.Argv is [_, "exec", _, "--", "/bin/bash", var script]
                  && script.Contains("/detached-", StringComparison.Ordinal));
         Assert.False(launchCall.HasStdoutChunkCallback);
         Assert.False(launchCall.HasStderrChunkCallback);
@@ -735,7 +735,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return new ProcessRunResult(0, "", "");
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -783,7 +783,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return new ProcessRunResult(0, "", "");
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -836,7 +836,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return new ProcessRunResult(0, "", "");
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -972,6 +972,32 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildDetachedLaunchScript_TimesOutWhenLaunchLockIsHeld()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var launchScript = Path.Combine(_workspace, "detached-launch-lock-timeout.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-lock-timeout.pgid");
+        Directory.CreateDirectory(processGroupMarker + ".lock");
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                "/does/not/need/to/exist",
+                processGroupMarker,
+                ["/bin/sh", "-c", "printf should-not-run"],
+                launchLockAttempts: 0));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var (exit, stdout, stderr) = await RunLocalProcessAsync("/bin/bash", [launchScript]);
+
+        Assert.Equal(88, exit);
+        Assert.Equal("", stdout);
+        Assert.Contains("codeybox-detached: timed out waiting for launch lock", stderr, StringComparison.Ordinal);
+        Assert.False(File.Exists(processGroupMarker));
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedProcessGroupPollFailureReturnsDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
@@ -990,7 +1016,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return new ProcessRunResult(0, "", "");
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -1040,7 +1066,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -1083,7 +1109,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -1112,6 +1138,49 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_DetachedProcessGroupMarkerMissingBeforeHttpExitReturnsDiagnostic()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                Assert.Null(stdin);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (IsDetachedProcessGroupPoll(argv))
+            {
+                return Task.FromResult(new ProcessRunResult(0, "missing\n", ""));
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+        });
+
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("detached exec process group marker", result.Stderr);
+        Assert.Contains("was not written", result.Stderr);
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedLauncherFailureReturnsLauncherResultWithoutFallback()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
@@ -1126,7 +1195,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
@@ -1197,7 +1266,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return new ProcessRunResult(0, "", "");
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 launchCalls++;
@@ -1256,7 +1325,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 detachedLaunchCalls++;
@@ -1319,7 +1388,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
-            if (argv is [_, "exec", _, "--", "/bin/sh", var launchScript]
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);

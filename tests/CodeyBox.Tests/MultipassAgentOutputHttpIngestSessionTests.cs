@@ -66,6 +66,37 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
     }
 
     [Fact]
+    public async Task Post_RejectsOutOfOrderExitNotificationWithoutCompletingRun()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+
+        var outOfOrder = await PostAsync(client, session, "run-x", "exit", 1, session.Token, "9\n");
+        var first = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "5\n");
+
+        Assert.Equal(HttpStatusCode.BadRequest, outOfOrder);
+        Assert.Equal(HttpStatusCode.NoContent, first);
+        Assert.Equal(5, await session.WaitForExitAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Post_RejectsOversizedExitBodyWithoutCompletingRun()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+        var oversized = new string('9', MultipassAgentOutputHttpIngestSession.MaxExitBodyBytes + 1);
+
+        var rejected = await PostAsync(client, session, "run-x", "exit", 0, session.Token, oversized);
+        var first = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "6\n");
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, rejected);
+        Assert.Equal(HttpStatusCode.NoContent, first);
+        Assert.Equal(6, await session.WaitForExitAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Post_EnforcesPerStreamOrderingAndIgnoresDuplicateRetries()
     {
         var chunks = new List<string>();
