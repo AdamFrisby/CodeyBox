@@ -643,6 +643,7 @@ public sealed class ClaudeAcpTransportTests
 
         var bridgeExec = sandbox.BridgeExecs.Single();
         Assert.Contains("$HOME/.codeybox/claude-acp-bridge.cjs", bridgeExec.Argv[2]);
+        Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, bridgeExec.AgentOutputTransport);
 
         // Stdin frames the full envelope sequence: hello → initialize → session/new → session/prompt.
         var stdin = bridgeExec.Stdin!;

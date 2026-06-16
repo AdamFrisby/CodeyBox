@@ -32,7 +32,7 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
         Assert.True(env!.TryGetValue(SandboxConventions.AgentLogFileEnv, out var path));
         Assert.Equal("/work/.codeybox/agent-logs/wi-work-i0.log", path);
     }
@@ -52,7 +52,7 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
         Assert.False(env!.ContainsKey(SandboxConventions.AgentLogFileEnv));
     }
 
@@ -72,7 +72,7 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
         Assert.False(env!.ContainsKey(SandboxConventions.AgentLogFileEnv));
     }
 
@@ -96,7 +96,7 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
         Assert.True(env!.TryGetValue(SandboxConventions.AgentLogFileEnv, out var path));
         Assert.Equal("/work/.codeybox/agent-logs/wi-resume.log", path);
     }

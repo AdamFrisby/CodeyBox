@@ -581,6 +581,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             ExtraEnvironment = invocation.ExtraEnvironment,
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
         };
         var execResult = await sandbox.ExecAsync(exec, ct).ConfigureAwait(false);
         return new AgentResult(

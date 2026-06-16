@@ -969,6 +969,7 @@ public enum SandboxAgentOutputTransportPreference
 {
     ExecPipe = 0,
     PreferHttpIngest = 1,
+    PreferDetachedHttpIngest = 2,
 }
 
 public enum SandboxAgentOutputTransportKind
