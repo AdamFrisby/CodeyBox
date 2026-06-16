@@ -86,10 +86,13 @@ public sealed class FleetSummaryEndpointTests : IDisposable
         Assert.Equal("Working", row.CurrentPhase);
     }
 
-    [Fact]
-    public async Task GetFleetSummary_WaitingForTransientRetry_IsNotInFlight()
+    [Theory]
+    [InlineData(WorkItemState.WaitingForQuotaReset)]
+    [InlineData(WorkItemState.WaitingForAgentResume)]
+    [InlineData(WorkItemState.WaitingForTransientRetry)]
+    public async Task GetFleetSummary_ParkedWaitingState_IsNotInFlight(WorkItemState state)
     {
-        _factory.SeedWorkItem("proj-alpha", WorkItemState.WaitingForTransientRetry);
+        _factory.SeedWorkItem("proj-alpha", state);
 
         var resp = await _client.GetAsync("/fleet/summary");
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();

@@ -1582,6 +1582,31 @@ public sealed class PipelineRunner : IPipelineRunner
                 project: project,
                 iteration: null);
         }
+        catch (AgentSessionResumeExhaustedException ex)
+        {
+            var exhaustedRunner = _agents.TryGet(ex.Agent, out var resolvedRunner)
+                ? resolvedRunner
+                : agentRunner;
+            var transient = TryBuildTransientAgentFailure(
+                exhaustedRunner,
+                ex.LastResult,
+                phase: null,
+                failureContext: "after exhausting session resume");
+            if (transient is not null)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Work item {Id} hit transient transport failure after session resume exhaustion: agent={Agent} error={Error}",
+                    item.Id,
+                    ex.Agent.Value,
+                    transient.Message);
+                await TransitionWaitingForTransientRetryAsync(item, transient, project);
+                return;
+            }
+
+            _log.LogError(ex, "Work item {Id} failed after session resume exhaustion", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "other");
+        }
         catch (TerminalTransientNetworkError ex)
         {
             _log.LogWarning(
@@ -4276,19 +4301,45 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentResult result,
         string phase)
     {
+        if (TryBuildTransientAgentFailure(runner, result, phase, "during") is { } transient)
+            throw transient;
+    }
+
+    private static void ThrowIfTransientAgentFailure(
+        IAgentRunner runner,
+        AgentSessionResumeExhaustedException resumeEx,
+        string phase)
+    {
+        if (TryBuildTransientAgentFailure(
+                runner,
+                resumeEx.LastResult,
+                phase,
+                "after exhausting session resume during") is { } transient)
+        {
+            throw transient;
+        }
+    }
+
+    private static TerminalTransientNetworkError? TryBuildTransientAgentFailure(
+        IAgentRunner runner,
+        AgentResult result,
+        string? phase,
+        string failureContext)
+    {
         var classification = runner.ClassifyFailure(result);
         if (classification.Kind != AgentFailureKind.TransientNetwork)
-            return;
+            return null;
 
         var reason = string.IsNullOrWhiteSpace(classification.Reason)
             ? "transient transport/network failure"
             : RedactAndTruncateAgentDetail(classification.Reason);
         var summary = RedactAndTruncateAgentDetail(result.Summary);
-        throw new TerminalTransientNetworkError(
+        var phaseSuffix = string.IsNullOrWhiteSpace(phase) ? "" : $" {phase}";
+        return new TerminalTransientNetworkError(
             runner.Kind,
             phase,
             classification,
-            $"Agent {runner.Kind} reported transient transport failure during {phase}: {summary} ({reason})");
+            $"Agent {runner.Kind} reported transient transport failure {failureContext}{phaseSuffix}: {summary} ({reason})");
     }
 
     /// <summary>
@@ -11852,6 +11903,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 await FinalizeInvolvementAsync(conflictInvolvementId, "failure:cancelled");
                 throw phase.Wrap(oce);
             }
+            catch (AgentSessionResumeExhaustedException ex)
+            {
+                var classification = runner.ClassifyFailure(ex.LastResult);
+                await FinalizeInvolvementAsync(
+                    conflictInvolvementId,
+                    classification.Kind == AgentFailureKind.TransientNetwork
+                        ? "failure:transient"
+                        : "failure:agent");
+                ThrowIfTransientAgentFailure(runner, ex, ConflictReworkPhaseKey);
+                throw;
+            }
             catch (Exception ex)
             {
                 // A phase timeout (PhaseCancellationException) or any other
@@ -13483,9 +13545,36 @@ Original merge-phase failure (for context):
     {
         var ct = CancellationToken.None;
         var safeError = RedactAndTruncateAgentDetail(error);
+        if (IsOperatorCancellationRequested(item.Id))
+        {
+            _log.LogInformation(
+                "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
+                item.Id);
+            await HandleOperatorCancelAsync(item, project);
+            return;
+        }
+
         await RunBoundedPostAgentAsync(item.Id, "transition-waiting-for-transient-retry", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            if (ShouldRejectTransientRetryParking(current))
+            {
+                _log.LogInformation(
+                    "Work item {Id} is already in state {State}; skipping WaitingForTransientRetry transition",
+                    item.Id,
+                    current.State);
+                return;
+            }
+
+            if (IsOperatorCancellationRequested(item.Id))
+            {
+                _log.LogInformation(
+                    "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
+                    item.Id);
+                await HandleOperatorCancelAsync(current, project);
+                return;
+            }
+
             var next = current.With(
                 WorkItemState.WaitingForTransientRetry,
                 safeError,
@@ -13542,6 +13631,13 @@ Original merge-phase failure (for context):
             }, CancellationToken.None);
         });
     }
+
+    private bool IsOperatorCancellationRequested(WorkItemId itemId) =>
+        _cancellations?.GetRequestKind(itemId) == CancellationRequestKind.Operator;
+
+    private static bool ShouldRejectTransientRetryParking(WorkItem item) =>
+        item.State == WorkItemState.NeedsOperatorInput
+        || WorkItemDependencies.TerminalStates.Contains(item.State);
 
     private async Task TransitionWaitingForQuotaResetAsync(
         WorkItem item,

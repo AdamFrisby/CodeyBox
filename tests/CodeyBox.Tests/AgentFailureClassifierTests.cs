@@ -1,3 +1,4 @@
+using System.Text;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using Microsoft.AspNetCore.Hosting;
@@ -220,6 +221,21 @@ public sealed class AgentFailureClassifierTests
     public void TurnFailed_WithExactStructuredTimeout_Classified_AsTransient(string payload)
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Fact]
+    public void TurnFailed_WithExactStructuredTimeout_AfterLongStream_Classified_AsTransient()
+    {
+        var stream = new StringBuilder();
+        for (var i = 0; i < 250; i++)
+        {
+            stream.AppendLine("""{"type":"turn.update","event":"delta"}""");
+        }
+        stream.AppendLine("""{"type":"turn.failed","error":{"message":"timeout"}}""");
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: stream.ToString());
 
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
     }

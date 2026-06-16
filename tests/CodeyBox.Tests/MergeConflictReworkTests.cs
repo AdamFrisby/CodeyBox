@@ -498,6 +498,58 @@ public sealed class MergeConflictReworkTests : IDisposable
     }
 
     [Fact]
+    public async Task ConflictRework_SessionResumeTransientLastResult_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var involvement = new InMemoryAgentInvolvementStore();
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            involvement: involvement,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox;
+            _ = workDir;
+            _ = ct;
+            throw new AgentSessionResumeExhaustedException(
+                tp.Agent.Kind,
+                maxResumeAttempts: 2,
+                new AgentResult(
+                    Success: false,
+                    Summary: "agent exited 1",
+                    Stdout: """{"type":"turn.failed","error":{"message":"timeout"}}""",
+                    Stderr: null));
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("conflict_rework", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+
+        var conflictRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "conflict_rework");
+        Assert.Equal("failure:transient", conflictRow.Outcome);
+        Assert.NotNull(conflictRow.EndedAt);
+    }
+
+    [Fact]
     public async Task ConflictRework_TransientRetry_ReEntersConflictReworkDespiteReservedAttempt()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

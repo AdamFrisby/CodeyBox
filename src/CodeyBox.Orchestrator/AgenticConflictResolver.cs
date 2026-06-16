@@ -344,6 +344,25 @@ public sealed class AgenticConflictResolver
                 {
                     throw;
                 }
+                catch (AgentSessionResumeExhaustedException ex)
+                {
+                    _log.LogWarning(ex,
+                        "Agentic conflict resolver: agent '{Agent}' exhausted session resume on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir})",
+                        runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
+                    AuditLog.AgenticConflictResolverAttemptFailed(
+                        workItemId, runner.Kind, sandbox.Id, workingDirectory,
+                        attempt, maxAttemptsPerAgent,
+                        $"session resume exhausted: {ex.LastResult.Summary}",
+                        stdoutTail: ex.LastResult.Stdout,
+                        stderrTail: ex.LastResult.Stderr);
+                    attemptTrail.Add(
+                        $"{runner.Kind.Value}#{attempt}(session resume exhausted: {Truncate(ex.LastResult.Summary, 120)}; stderr: {Truncate(ex.LastResult.Stderr, 200)})");
+                    lastAgentResult = ex.LastResult;
+                    lastFailureRunner = runner;
+                    lastFailureCredential = candidate.Credential;
+                    lastFailureClassificationResult = ex.LastResult;
+                    break;
+                }
                 catch (Exception ex)
                 {
                     _log.LogWarning(ex,
