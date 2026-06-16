@@ -29,6 +29,7 @@ public sealed class RetryAndBranchLifecycleTests : IDisposable
 
     [Theory]
     [InlineData("work", WorkItemState.Queued)]
+    [InlineData("rework", WorkItemState.WorkComplete)]
     [InlineData("audit", WorkItemState.WorkComplete)]
     [InlineData("merge", WorkItemState.AuditPassed)]
     [InlineData("upstream", WorkItemState.Merged)]

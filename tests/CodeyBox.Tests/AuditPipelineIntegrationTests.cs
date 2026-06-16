@@ -1418,6 +1418,114 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task FinalIncompleteAuditExtension_IsUsedOnlyOnce()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(new AuditResult(false,
+            [
+                new AuditFinding("architecture", AuditSeverity.Error, "still incomplete", "same blocker"),
+            ]));
+        });
+        var hangingCalls = 0;
+        var alwaysHangs = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, alwaysHangs],
+            maxAuditIterations: 1,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-one-extra-rework"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-second-extra-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State is WorkItemState.NeedsOperatorInput or WorkItemState.AuditFailed,
+            $"expected bounded audit stop, got {final.State}");
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(4, hangingCalls);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Single(tp.Agent.WorkPlan);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        Assert.Equal([1, 2], progress.Select(p => p.Iteration).Order().ToArray());
+    }
+
+    [Fact]
+    public async Task IncompleteAudit_SkipsRequiredBuildGateUntilCompleteVerdict()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("architecture", AuditSeverity.Error, "build-gate skip blocker", "fix first")])
+                : new AuditResult(true, []));
+        });
+        var hangingCalls = 0;
+        var sometimesHangs = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            if (hangingCalls <= 2)
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var requiredBuild = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Passed(0, "ok"));
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, sometimesHangs],
+            maxAuditIterations: 2,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning,
+            requiredBuildVerifier: requiredBuild);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        var auditBuildRequests = requiredBuild.VerificationRequests
+            .Where(r => r.Phase == "audit")
+            .ToList();
+        var auditBuildRequest = Assert.Single(auditBuildRequests);
+        Assert.Equal(2, auditBuildRequest.Iteration);
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(3, hangingCalls);
+    }
+
+    [Fact]
     public async Task QuotaParkAfterPartialAuditProgress_RetryRestartsAuditInsteadOfReworkingPartialRow()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1962,6 +2070,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal([2], auditor.SeenIterations);
+        var reworkPrompt = Assert.Single(tp.Agent.WorkPrompts);
+        Assert.Contains("architecture", reworkPrompt);
+        Assert.Contains("persisted blocker", reworkPrompt);
+        Assert.Contains("fix it", reworkPrompt);
     }
 
     private static async Task<(WorkItemId WorkItemId, AuditProgressRecord Progress)> WaitForProgressAsync(

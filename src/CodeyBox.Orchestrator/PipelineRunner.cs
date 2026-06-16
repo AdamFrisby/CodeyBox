@@ -5229,7 +5229,11 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
         var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, currentWorkAttemptStartedAt, ct);
+        var configuredMaxIterations = ResolveConfiguredAuditMaxIterations(item, project);
         var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
+        var incompleteFinalReworkExtensionUsed = HasIncompleteFinalReworkExtension(
+            priorAuditHistory,
+            configuredMaxIterations);
         var auditHistory = priorAuditHistory
             .Select(h => h with { MaxIterations = maxIterations })
             .ToList();
@@ -5415,9 +5419,13 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 blocking = findings.ToList();
             }
-            if (incompleteVerdict && iteration == maxIterations)
+            if (incompleteVerdict
+                && iteration == maxIterations
+                && !incompleteFinalReworkExtensionUsed
+                && maxIterations < ProjectAudit.MaxIterationBudget)
             {
                 maxIterations++;
+                incompleteFinalReworkExtensionUsed = true;
             }
             var nonBlocking = findings.Count - blocking.Count;
             var workBranchTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
@@ -5897,8 +5905,8 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         IReadOnlyList<AuditProgressSnapshot> priorAuditHistory)
     {
-        var projectBudget = Math.Clamp(project.Audit.MaxIterations, 1, ProjectAudit.MaxIterationBudget);
-        var maxIterations = ResolveConfiguredAuditIterationBudget(item, project.Audit, projectBudget);
+        var projectBudget = ResolveProjectAuditIterationBudget(project);
+        var maxIterations = ResolveConfiguredAuditMaxIterations(item, project);
 
         if (priorAuditHistory.Count > 0)
         {
@@ -5912,6 +5920,25 @@ public sealed class PipelineRunner : IPipelineRunner
 
         return Math.Min(ProjectAudit.MaxIterationBudget, maxIterations);
     }
+
+    private static int ResolveConfiguredAuditMaxIterations(WorkItem item, Project project)
+    {
+        var projectBudget = ResolveProjectAuditIterationBudget(project);
+        return Math.Min(
+            ProjectAudit.MaxIterationBudget,
+            ResolveConfiguredAuditIterationBudget(item, project.Audit, projectBudget));
+    }
+
+    private static int ResolveProjectAuditIterationBudget(Project project)
+        => Math.Clamp(project.Audit.MaxIterations, 1, ProjectAudit.MaxIterationBudget);
+
+    private static bool HasIncompleteFinalReworkExtension(
+        IReadOnlyList<AuditProgressSnapshot> priorAuditHistory,
+        int configuredMaxIterations)
+        => priorAuditHistory.Any(progress =>
+            !progress.IsComplete
+            && AuditProgressRequiresRework(progress)
+            && progress.Iteration >= configuredMaxIterations);
 
     private static int ResolveConfiguredAuditIterationBudget(
         WorkItem item,

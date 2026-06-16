@@ -297,6 +297,7 @@ internal sealed class TestRequiredBuildVerifier : IRequiredBuildVerifier
 
     public int ProbeCalls { get; private set; }
     public int VerifyCalls { get; private set; }
+    public List<RequiredBuildVerificationRequest> VerificationRequests { get; } = [];
 
     public Task<RequiredBuildProbeResult> ProbeAsync(
         RequiredBuildProbeRequest request,
@@ -312,8 +313,8 @@ internal sealed class TestRequiredBuildVerifier : IRequiredBuildVerifier
         RequiredBuildVerificationRequest request,
         CancellationToken ct)
     {
-        _ = request;
         _ = ct;
+        VerificationRequests.Add(request);
         VerifyCalls++;
         return Task.FromResult(_verificationResult);
     }
