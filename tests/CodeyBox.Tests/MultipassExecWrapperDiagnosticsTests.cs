@@ -230,11 +230,13 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         var wrapperPath = await CreateExecutableWrapperAsync();
         Directory.CreateDirectory(workDir);
         const string token = "test-token-not-for-agent";
+        const string exitToken = "test-exit-token-not-for-agent";
         const string runId = "run-wrapper-ok";
         var env = new Dictionary<string, string?>
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = token,
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = exitToken,
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = runId,
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
         };
@@ -243,6 +245,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             var agentScript = """
                 if [ -n "${CODEYBOX_AGENT_OUTPUT_TOKEN:-}" ]; then printf 'token leaked\n'; fi
+                if [ -n "${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}" ]; then printf 'exit token leaked\n'; fi
                 printf 'out-1\n'
                 printf 'out-2\n'
                 printf 'err-1\n' >&2
@@ -274,6 +277,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             Assert.Equal(0, exitRequest.Seq);
             Assert.Equal("0\n", exitRequest.BodyText);
             Assert.DoesNotContain(requests, r => r.BodyText.Contains(token, StringComparison.Ordinal));
+            Assert.DoesNotContain(requests, r => r.BodyText.Contains(exitToken, StringComparison.Ordinal));
         }
         finally
         {
@@ -298,6 +302,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-log",
             ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
         };
@@ -353,6 +358,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-conflict",
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
         };
@@ -398,6 +404,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-exit-conflict",
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
         };

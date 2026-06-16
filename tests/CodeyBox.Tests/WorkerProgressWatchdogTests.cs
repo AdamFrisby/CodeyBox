@@ -595,6 +595,38 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task DefaultActivitySource_ActiveProcessStateCountsAsProgressWithoutCpuDelta()
+    {
+        var itemId = WorkItemId.New();
+        var active = false;
+        var source = new DefaultWorkerProgressActivitySource(
+            activeSandboxProvider: null,
+            processCpuSampleReader: (WorkItemId _, out DefaultWorkerProgressActivitySource.ProcessCpuSample sample) =>
+            {
+                sample = new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                    CpuTicks: 42,
+                    ProcessSetSignature: "123:456",
+                    HasActiveProcessState: active);
+                return true;
+            });
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: true,
+            ActiveSandboxProgressSignalEnabled: false);
+        var worker = WorkerForItem("active-state-test", itemId);
+
+        var baseline = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        active = true;
+        var activeState = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+
+        Assert.Null(baseline);
+        Assert.NotNull(activeState);
+        Assert.Equal("process-cpu", activeState!.Reason);
+        Assert.True(DefaultWorkerProgressActivitySource.IsActiveProcessState('R'));
+        Assert.True(DefaultWorkerProgressActivitySource.IsActiveProcessState('D'));
+        Assert.False(DefaultWorkerProgressActivitySource.IsActiveProcessState('S'));
+    }
+
+    [Fact]
     public async Task Watchdog_IdleTaggedProcess_Recovers()
     {
         if (!OperatingSystem.IsLinux())

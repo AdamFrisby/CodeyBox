@@ -3198,24 +3198,26 @@ test "$work" = present && test "$exec_wrapper" = present
         # Optional agent-output HTTP transport. The host injects these
         # variables only for agent CLI invocations that opted into the
         # transport. Copy them into shell locals and remove them from the
-        # exported environment before launching the agent; the streamer
-        # subprocesses receive the token out-of-band, but the agent process
-        # does not inherit it.
+        # exported environment before launching the agent. Long-lived streamer
+        # subprocesses receive only the stream token; the exit token remains
+        # shell-local until the one-shot completion post, and the agent process
+        # inherits neither token.
         codeybox_output_url="${CODEYBOX_AGENT_OUTPUT_URL:-}"
         codeybox_output_token="${CODEYBOX_AGENT_OUTPUT_TOKEN:-}"
+        codeybox_output_exit_token="${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}"
         codeybox_output_run_id="${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}"
-        unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID
+        unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID
         codeybox_http_post() {
             local codeybox_stream_name="$1"
             local codeybox_stream_seq="$2"
-            CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
-            CODEYBOX_AGENT_OUTPUT_TOKEN="$codeybox_output_token" \
+            local codeybox_post_token="$3"
+            { printf '%s\n' "$codeybox_post_token"; cat; } | CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
             CODEYBOX_AGENT_OUTPUT_RUN_ID="$codeybox_output_run_id" \
             python3 -c '
         import os, sys, time, urllib.error, urllib.parse, urllib.request
         base = os.environ["CODEYBOX_AGENT_OUTPUT_URL"].rstrip("/")
         run_id = os.environ["CODEYBOX_AGENT_OUTPUT_RUN_ID"]
-        token = os.environ["CODEYBOX_AGENT_OUTPUT_TOKEN"]
+        token = sys.stdin.buffer.readline().decode("utf-8").rstrip("\n")
         stream = sys.argv[1]
         seq = sys.argv[2]
         data = sys.stdin.buffer.read()
@@ -3305,10 +3307,10 @@ test "$work" = present && test "$exec_wrapper" = present
         ' "$codeybox_stream_name"
         }
         codeybox_http_ready() {
-            codeybox_http_post ready 0 </dev/null
+            codeybox_http_post ready 0 "$codeybox_output_token" </dev/null
         }
         codeybox_http_exit() {
-            printf '%s\n' "$1" | codeybox_http_post exit 0
+            printf '%s\n' "$1" | codeybox_http_post exit 0 "$codeybox_output_exit_token"
         }
         codeybox_run_user_command() {
             if [ "$keep_stdin" = "1" ]; then
@@ -3319,8 +3321,8 @@ test "$work" = present && test "$exec_wrapper" = present
                 "$@" </dev/null
             fi
         }
-        if [ -n "$codeybox_output_url$codeybox_output_token$codeybox_output_run_id" ]; then
-            if [ -z "$codeybox_output_url" ] || [ -z "$codeybox_output_token" ] || [ -z "$codeybox_output_run_id" ]; then
+        if [ -n "$codeybox_output_url$codeybox_output_token$codeybox_output_exit_token$codeybox_output_run_id" ]; then
+            if [ -z "$codeybox_output_url" ] || [ -z "$codeybox_output_token" ] || [ -z "$codeybox_output_exit_token" ] || [ -z "$codeybox_output_run_id" ]; then
                 echo "codeybox-exec: agent output HTTP ingest unavailable before launch" >&2
                 exit 86
             fi
@@ -5464,7 +5466,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("set -a");
         sb.AppendLine(". \"$codeybox_env_file\"");
         sb.AppendLine("set +a");
+        sb.AppendLine("codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
+        sb.AppendLine("codeybox_output_token=\"${CODEYBOX_AGENT_OUTPUT_TOKEN:-}\"");
+        sb.AppendLine("codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"");
+        sb.AppendLine("codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
+        sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_RUN_ID");
         sb.AppendLine("codeybox_http_ready() {");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
         sb.AppendLine("python3 - <<'PY'");
         sb.AppendLine("import os, sys, urllib.parse, urllib.request");
         sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
@@ -5481,6 +5491,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("    sys.exit(1)");
         sb.AppendLine("PY");
         sb.AppendLine("}");
+        sb.AppendLine("if [ -z \"$codeybox_output_url\" ] || [ -z \"$codeybox_output_token\" ] || [ -z \"$codeybox_output_exit_token\" ] || [ -z \"$codeybox_output_run_id\" ]; then");
+        sb.Append("    echo ")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(AgentOutputHttpSetupFailureMarker))
+            .AppendLine(" >&2");
+        sb.AppendLine("    exit 86");
+        sb.AppendLine("fi");
         sb.AppendLine("if ! codeybox_http_ready; then");
         sb.Append("    echo ")
             .Append(MultipassSandboxProvider.ShellSingleQuote(AgentOutputHttpSetupFailureMarker))
@@ -5488,7 +5504,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("    exit 86");
         sb.AppendLine("fi");
         sb.AppendLine("rm -f \"$codeybox_pgid_marker.tmp\"");
-        sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_RUN_ID");
         sb.Append("setsid");
         foreach (var arg in command)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
@@ -5558,7 +5573,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             if (exitTask.IsCompleted)
                 break;
             if (state.Error is not null)
+            {
+                await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
                 return new DetachedExitResult(1, state.Error);
+            }
             if (state.Status == DetachedProcessGroupStatus.Missing)
                 return new DetachedExitResult(
                     1,

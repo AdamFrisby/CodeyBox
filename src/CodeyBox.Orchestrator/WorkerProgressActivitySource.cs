@@ -53,11 +53,32 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(50);
     private const int InitialCpuSampleAttempts = 10;
     private readonly IActiveSandboxProgressProvider? _activeSandboxProvider;
+    private readonly ProcessCpuSampleReader _processCpuSampleReader;
+    private readonly bool _requireLinuxProcFs;
     private readonly ConcurrentDictionary<WorkItemId, ProcessCpuSample> _processSamples = new();
     private readonly ConcurrentDictionary<WorkItemId, string> _activeSandboxSignatures = new();
 
     public DefaultWorkerProgressActivitySource(IActiveSandboxProgressProvider? activeSandboxProvider = null)
-        => _activeSandboxProvider = activeSandboxProvider;
+        : this(activeSandboxProvider, TryReadWorkItemCpuTicks, requireLinuxProcFs: true)
+    {
+    }
+
+    internal DefaultWorkerProgressActivitySource(
+        IActiveSandboxProgressProvider? activeSandboxProvider,
+        ProcessCpuSampleReader processCpuSampleReader)
+        : this(activeSandboxProvider, processCpuSampleReader, requireLinuxProcFs: false)
+    {
+    }
+
+    private DefaultWorkerProgressActivitySource(
+        IActiveSandboxProgressProvider? activeSandboxProvider,
+        ProcessCpuSampleReader processCpuSampleReader,
+        bool requireLinuxProcFs)
+    {
+        _activeSandboxProvider = activeSandboxProvider;
+        _processCpuSampleReader = processCpuSampleReader;
+        _requireLinuxProcFs = requireLinuxProcFs;
+    }
 
     public ValueTask<WorkerProgressActivity?> ObserveAsync(
         WorkerRegistration worker,
@@ -127,10 +148,10 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     private bool TryObserveProcessCpu(WorkItemId itemId, out string reason)
     {
         reason = "";
-        if (!OperatingSystem.IsLinux())
+        if (_requireLinuxProcFs && !OperatingSystem.IsLinux())
             return false;
 
-        if (!TryReadWorkItemCpuTicks(itemId, out var sample))
+        if (!_processCpuSampleReader(itemId, out var sample))
         {
             _processSamples.TryRemove(itemId, out _);
             return false;
@@ -148,7 +169,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
 
         if (!_processSamples.TryGetValue(itemId, out var previous))
         {
-            if (TryConfirmImmediateCpuProgress(itemId, sample, out var observedSample))
+            if (TryConfirmImmediateCpuProgress(itemId, sample, _processCpuSampleReader, out var observedSample))
             {
                 _processSamples[itemId] = observedSample;
                 reason = "process-cpu";
@@ -195,6 +216,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     private static bool TryConfirmImmediateCpuProgress(
         WorkItemId itemId,
         ProcessCpuSample baseline,
+        ProcessCpuSampleReader processCpuSampleReader,
         out ProcessCpuSample observedSample)
     {
         observedSample = baseline;
@@ -207,7 +229,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         {
             Thread.Sleep(InitialCpuSampleDelay);
 
-            if (!TryReadWorkItemCpuTicks(itemId, out var next))
+            if (!processCpuSampleReader(itemId, out var next))
                 return false;
 
             observedSample = next;
@@ -277,7 +299,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         return true;
     }
 
-    private static bool IsActiveProcessState(char state) =>
+    internal static bool IsActiveProcessState(char state) =>
         state is 'R' or 'D';
 
     private static bool ProcessEnvironmentContains(string procDir, string envEntry)
@@ -350,7 +372,9 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         return true;
     }
 
-    private readonly record struct ProcessCpuSample(
+    internal delegate bool ProcessCpuSampleReader(WorkItemId itemId, out ProcessCpuSample sample);
+
+    internal readonly record struct ProcessCpuSample(
         long CpuTicks,
         string ProcessSetSignature,
         bool HasActiveProcessState,

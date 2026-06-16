@@ -18,9 +18,11 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
 
         var wrongToken = new string('A', session.Token.Length);
         var wrongTokenStatus = await PostAsync(client, session, "run-x", "stdout", 0, wrongToken, "blocked");
+        var exitTokenOnStdoutStatus = await PostAsync(client, session, "run-x", "stdout", 0, session.ExitToken, "blocked");
         var wrongRunStatus = await PostAsync(client, session, "run-y", "stdout", 0, session.Token, "blocked");
 
         Assert.Equal(HttpStatusCode.Unauthorized, wrongTokenStatus);
+        Assert.Equal(HttpStatusCode.Unauthorized, exitTokenOnStdoutStatus);
         Assert.Equal(HttpStatusCode.Forbidden, wrongRunStatus);
         Assert.Empty(chunks);
         Assert.Equal("", session.Stdout);
@@ -35,7 +37,7 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
 
         var readyStatus = await PostAsync(client, session, "run-x", "ready", 0, session.Token, "");
         var stdoutStatus = await PostAsync(client, session, "run-x", "stdout", 0, session.Token, "hello\n");
-        var exitStatus = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "7\n");
+        var exitStatus = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "7\n");
 
         Assert.Equal(HttpStatusCode.NoContent, readyStatus);
         Assert.Equal(HttpStatusCode.OK, stdoutStatus);
@@ -53,10 +55,10 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         await using var session = await StartAsync(chunks.Add);
         using var client = new HttpClient();
 
-        var malformed = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "not-an-int");
-        var first = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "3\n");
-        var duplicate = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "3\n");
-        var conflicting = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "4\n");
+        var malformed = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "not-an-int");
+        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "3\n");
+        var duplicate = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "3\n");
+        var conflicting = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "4\n");
 
         Assert.Equal(HttpStatusCode.BadRequest, malformed);
         Assert.Equal(HttpStatusCode.NoContent, first);
@@ -72,8 +74,8 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         await using var session = await StartAsync(chunks.Add);
         using var client = new HttpClient();
 
-        var outOfOrder = await PostAsync(client, session, "run-x", "exit", 1, session.Token, "9\n");
-        var first = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "5\n");
+        var outOfOrder = await PostAsync(client, session, "run-x", "exit", 1, session.ExitToken, "9\n");
+        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "5\n");
 
         Assert.Equal(HttpStatusCode.BadRequest, outOfOrder);
         Assert.Equal(HttpStatusCode.NoContent, first);
@@ -88,10 +90,43 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         using var client = new HttpClient();
         var oversized = new string('9', MultipassAgentOutputHttpIngestSession.MaxExitBodyBytes + 1);
 
-        var rejected = await PostAsync(client, session, "run-x", "exit", 0, session.Token, oversized);
-        var first = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "6\n");
+        var rejected = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, oversized);
+        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "6\n");
 
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, rejected);
+        Assert.Equal(HttpStatusCode.NoContent, first);
+        Assert.Equal(6, await session.WaitForExitAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Post_RejectsStreamTokenForExitWithoutCompletingRun()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+
+        var forged = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "0\n");
+        var real = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "8\n");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, forged);
+        Assert.Equal(HttpStatusCode.NoContent, real);
+        Assert.Equal(8, await session.WaitForExitAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Post_RejectsUnknownLengthOversizedExitBodyWithoutCompletingRun()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+        var oversized = Encoding.UTF8.GetBytes(new string('9', MultipassAgentOutputHttpIngestSession.MaxExitBodyBytes + 1));
+
+        using var request = NewPostRequest(session, "run-x", "exit", 0, session.ExitToken);
+        request.Content = new UnknownLengthContent(oversized);
+        using var response = await client.SendAsync(request);
+        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "6\n");
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
         Assert.Equal(HttpStatusCode.NoContent, first);
         Assert.Equal(6, await session.WaitForExitAsync(CancellationToken.None));
     }
@@ -174,13 +209,24 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         string token,
         string body)
     {
-        using var request = new HttpRequestMessage(
-            HttpMethod.Post,
-            $"{session.BaseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{seq}");
-        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        using var request = NewPostRequest(session, runId, stream, seq, token);
         request.Content = new ByteArrayContent(Encoding.UTF8.GetBytes(body));
         using var response = await client.SendAsync(request);
         return response.StatusCode;
+    }
+
+    private static HttpRequestMessage NewPostRequest(
+        MultipassAgentOutputHttpIngestSession session,
+        string runId,
+        string stream,
+        long seq,
+        string token)
+    {
+        var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"{session.BaseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{seq}");
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        return request;
     }
 
     private static void SetRateWindow(
@@ -195,5 +241,17 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         typeof(MultipassAgentOutputHttpIngestSession)
             .GetField("_rateWindowCount", flags)!
             .SetValue(session, count);
+    }
+
+    private sealed class UnknownLengthContent(byte[] bytes) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+            => stream.WriteAsync(bytes, 0, bytes.Length);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
     }
 }

@@ -13,6 +13,7 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
 {
     internal const string UrlEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_URL";
     internal const string TokenEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_TOKEN";
+    internal const string ExitTokenEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN";
     internal const string RunIdEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_RUN_ID";
     internal const int MaxChunkBytes = 256 * 1024;
     internal const int MaxExitBodyBytes = 32;
@@ -25,7 +26,8 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
 
     private readonly HttpListener _listener;
     private readonly ILogger _log;
-    private readonly byte[] _expectedTokenHash;
+    private readonly byte[] _expectedStreamTokenHash;
+    private readonly byte[] _expectedExitTokenHash;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _listenTask;
     private readonly object _rateGate = new();
@@ -42,7 +44,8 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         HttpListener listener,
         string baseUrl,
         string runId,
-        string token,
+        string streamToken,
+        string exitToken,
         ILogger log,
         Action<string>? stdoutChunkCallback,
         Action<string>? stderrChunkCallback)
@@ -50,9 +53,11 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         _listener = listener;
         BaseUrl = baseUrl;
         RunId = runId;
-        Token = token;
+        Token = streamToken;
+        ExitToken = exitToken;
         _log = log;
-        _expectedTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
+        _expectedStreamTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(streamToken));
+        _expectedExitTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(exitToken));
         _stdout = new StreamState(stdoutChunkCallback);
         _stderr = new StreamState(stderrChunkCallback);
         _listenTask = Task.Run(ListenAsync);
@@ -61,6 +66,7 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     public string BaseUrl { get; }
     public string RunId { get; }
     public string Token { get; }
+    public string ExitToken { get; }
     public bool ReceivedAgentBytes => _stdout.BytesReceived > 0 || _stderr.BytesReceived > 0;
     public string Stdout => _stdout.Text;
     public string Stderr => _stderr.Text;
@@ -77,7 +83,8 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         if (bindAddress.AddressFamily != AddressFamily.InterNetwork)
             return null;
 
-        var token = GenerateToken();
+        var streamToken = GenerateToken();
+        var exitToken = GenerateToken();
         for (var attempt = 0; attempt < 20; attempt++)
         {
             ct.ThrowIfCancellationRequested();
@@ -93,7 +100,8 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
                     listener,
                     prefix.TrimEnd('/'),
                     runId,
-                    token,
+                    streamToken,
+                    exitToken,
                     log,
                     stdoutChunkCallback,
                     stderrChunkCallback);
@@ -145,6 +153,7 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         {
             [UrlEnvironmentVariable] = BaseUrl,
             [TokenEnvironmentVariable] = Token,
+            [ExitTokenEnvironmentVariable] = ExitToken,
             [RunIdEnvironmentVariable] = RunId,
         };
 
@@ -217,12 +226,6 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
             return;
         }
 
-        if (!TokenMatches(request.Headers["Authorization"]))
-        {
-            Reject(response, HttpStatusCode.Unauthorized);
-            return;
-        }
-
         var parts = request.Url?.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
         if (parts is not { Length: 4 }
             || !string.Equals(parts[0], PathPrefix, StringComparison.Ordinal)
@@ -232,13 +235,23 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
             return;
         }
 
+        var streamName = Uri.UnescapeDataString(parts[2]);
+        var isExit = string.Equals(streamName, "exit", StringComparison.Ordinal);
+        if (!TokenMatches(
+                request.Headers["Authorization"],
+                isExit ? ExitToken : Token,
+                isExit ? _expectedExitTokenHash : _expectedStreamTokenHash))
+        {
+            Reject(response, HttpStatusCode.Unauthorized);
+            return;
+        }
+
         if (!AllowRequest())
         {
             Reject(response, (HttpStatusCode)429);
             return;
         }
 
-        var streamName = Uri.UnescapeDataString(parts[2]);
         if (string.Equals(streamName, "ready", StringComparison.Ordinal))
         {
             Reject(response, HttpStatusCode.NoContent);
@@ -343,7 +356,7 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         }
     }
 
-    private bool TokenMatches(string? authorization)
+    private static bool TokenMatches(string? authorization, string expectedToken, byte[] expectedTokenHash)
     {
         const string bearerPrefix = "Bearer ";
         var provided = authorization is not null
@@ -351,8 +364,8 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
                 ? authorization[bearerPrefix.Length..]
                 : string.Empty;
         var providedHash = SHA256.HashData(Encoding.UTF8.GetBytes(provided));
-        return CryptographicOperations.FixedTimeEquals(providedHash, _expectedTokenHash)
-            && provided.Length == Token.Length;
+        return CryptographicOperations.FixedTimeEquals(providedHash, expectedTokenHash)
+            && provided.Length == expectedToken.Length;
     }
 
     private bool AllowRequest()
