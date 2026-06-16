@@ -134,6 +134,22 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(0, fixture.Queue.Count);
     }
 
+    [Fact]
+    public async Task WorkItemAutoRetryScheduler_WhenTransientSchedulerUnavailable_ReturnsSkipped()
+    {
+        using var store = new SqliteWorkItemStore(Path.Combine(_workspace, $"state-{Guid.NewGuid():N}.db"));
+        using var quotaScheduler = BuildDisabledQuotaScheduler(store);
+        var scheduler = new WorkItemAutoRetryScheduler(quotaScheduler, transient: null);
+        var item = NewTransientItem();
+
+        var result = await scheduler.NotifyTransientFailureAsync(item);
+
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Skipped, result.Status);
+        Assert.Equal("transient-scheduler-unavailable", result.Reason);
+        Assert.Equal(item, result.UpdatedItem);
+        Assert.Null(result.NextRetryAt);
+    }
+
     [Theory]
     [InlineData("work", WorkItemState.Queued, null)]
     [InlineData("audit", WorkItemState.WorkComplete, "audit")]
@@ -181,6 +197,41 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal("transient", stored.FailureKind);
         Assert.Equal(newerBackoff.NextTransientRetryAt, stored.NextTransientRetryAt);
         Assert.Equal(2, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task TryTransientRetry_WhenDueItemAtAttemptCap_MarksTransientExhaustedWithoutEnqueueing()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(15),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryAttempts = 5,
+            TransientRetryFirstFailedAt = _time.GetUtcNow().AddMinutes(-5),
+        };
+        await fixture.Store.CreateAsync(item);
+        var dueSnapshot = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(dueSnapshot);
+
+        await InvokeTryTransientRetryAsync(fixture.Scheduler, dueSnapshot!, "targeted");
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal("transient-exhausted", stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Equal(5, stored.TransientRetryAttempts);
+        Assert.Contains("attempts=5; max=5", stored.LastError);
         Assert.Equal(0, fixture.Queue.Count);
     }
 
@@ -936,6 +987,28 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             jitterRandom: jitterRandom);
 
         return new SchedulerFixture(sqliteStore, queue, scheduler);
+    }
+
+    private QuotaRetryScheduler BuildDisabledQuotaScheduler(SqliteWorkItemStore store)
+    {
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, queue, new RecordingGitHost(), NullLogger<WorkItemRetrier>.Instance);
+        return new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions { Enabled = false },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            projects: new InMemoryProjectRepository(new Project
+            {
+                Id = TestProjectId,
+                DisplayName = "Transient retry",
+                RepositoryUrl = "file:///tmp/transient-retry",
+                DefaultAgent = AgentKind.Claude,
+            }),
+            timeProvider: _time);
     }
 
     private static async Task RunTransientPeriodicSweepAsync(TransientRetryScheduler scheduler)

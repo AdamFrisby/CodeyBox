@@ -353,8 +353,8 @@ public sealed class AgenticConflictResolver
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
                         attempt, maxAttemptsPerAgent,
                         $"session resume exhausted: {ex.LastResult.Summary}",
-                        stdoutTail: ex.LastResult.Stdout,
-                        stderrTail: ex.LastResult.Stderr);
+                        stdoutTail: RedactAuditTail(ex.LastResult.Stdout),
+                        stderrTail: RedactAuditTail(ex.LastResult.Stderr));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(session resume exhausted: {Truncate(ex.LastResult.Summary, 120)}; stderr: {Truncate(ex.LastResult.Stderr, 200)})");
                     lastAgentResult = ex.LastResult;
@@ -373,7 +373,7 @@ public sealed class AgenticConflictResolver
                         attempt, maxAttemptsPerAgent,
                         $"threw {ex.GetType().Name}: {ex.Message}",
                         stdoutTail: null,
-                        stderrTail: Truncate(ex.ToString(), 4096));
+                        stderrTail: RedactAuditTail(ex.ToString()));
                     attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {ex.Message})");
                     lastFailureRunner = runner;
                     lastFailureCredential = candidate.Credential;
@@ -415,8 +415,8 @@ public sealed class AgenticConflictResolver
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
                         attempt, maxAttemptsPerAgent,
                         agentResult.Summary,
-                        stdoutTail: agentResult.Stdout,
-                        stderrTail: agentResult.Stderr);
+                        stdoutTail: RedactAuditTail(agentResult.Stdout),
+                        stderrTail: RedactAuditTail(agentResult.Stderr));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(agent failed: {Truncate(agentResult.Summary, 120)}; stderr: {Truncate(agentResult.Stderr, 200)})");
                     lastFailureRunner = runner;
@@ -447,14 +447,14 @@ public sealed class AgenticConflictResolver
                 lastFailureClassificationResult = new AgentResult(
                     false,
                     verification.Reason,
-                    agentResult.Stdout,
-                    agentResult.Stderr);
+                    Stdout: null,
+                    Stderr: null);
                 AuditLog.AgenticConflictResolverAttemptFailed(
                     workItemId, runner.Kind, sandbox.Id, workingDirectory,
                     attempt, maxAttemptsPerAgent,
                     $"verification: {verification.Reason}",
-                    stdoutTail: agentResult.Stdout,
-                    stderrTail: agentResult.Stderr);
+                    stdoutTail: RedactAuditTail(agentResult.Stdout),
+                    stderrTail: RedactAuditTail(agentResult.Stderr));
                 _log.LogInformation(
                     "Agentic conflict resolver: verification failed for agent '{Agent}' attempt {Attempt}/{Max} on {WorkItemId} (sandbox {Sandbox}): {Reason}",
                     runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, verification.Reason);
@@ -672,6 +672,9 @@ public sealed class AgenticConflictResolver
         if (string.IsNullOrEmpty(value)) return "";
         return value.Length <= maxChars ? value : value[..maxChars] + "…";
     }
+
+    private static string? RedactAuditTail(string? value) =>
+        value is null ? null : RawOutputRedactor.Redact(value);
 
     private static bool NeedsStructuredStreamForResume(IAgentRunner runner)
         => runner is ICliSessionResumableAgentRunner

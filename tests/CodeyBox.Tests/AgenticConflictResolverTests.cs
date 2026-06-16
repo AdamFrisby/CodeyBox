@@ -397,7 +397,11 @@ public sealed class AgenticConflictResolverTests
         {
             // Agent claims success, but leaves conflict markers in the file so verification fails.
             sb.GitAdd("src/a.txt");
-            return new AgentResult(true, "agent thought it resolved", "stdout text", "stderr text");
+            return new AgentResult(
+                true,
+                "agent thought it resolved",
+                "stdout text",
+                "Transport channel closed after a harmless reconnect");
         })
         { Kind = new AgentKind("lying-agent") };
         var cred = new AgentCredential(new AgentKind("lying-agent"), new Dictionary<string, string>(), new Dictionary<string, string>());
@@ -416,8 +420,13 @@ public sealed class AgenticConflictResolverTests
         var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
         Assert.False(classificationResult.Success);
         Assert.Contains("conflict markers remain", classificationResult.Summary);
-        Assert.Equal("stdout text", classificationResult.Stdout);
-        Assert.Equal("stderr text", classificationResult.Stderr);
+        Assert.Null(classificationResult.Stdout);
+        Assert.Null(classificationResult.Stderr);
+        Assert.Equal("stdout text", result.Stdout);
+        Assert.Equal("Transport channel closed after a harmless reconnect", result.Stderr);
+
+        var classification = ((IAgentRunner)runner).ClassifyFailure(classificationResult);
+        Assert.NotEqual(AgentFailureKind.TransientNetwork, classification.Kind);
     }
 
     [Fact]

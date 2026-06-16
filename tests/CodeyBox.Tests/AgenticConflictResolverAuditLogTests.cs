@@ -149,6 +149,51 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         Assert.Equal("warning: incomplete model output", GetScalar<string>(evt, "StderrTail"));
     }
 
+    [Fact]
+    public async Task ResolveAsync_SessionResumeExhausted_RedactsAuditStdoutAndStderrWithoutLoggerEnricher()
+    {
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
+
+        var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
+        sandbox.AddConflictedFile("conflict.txt",
+            "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");
+
+        var lastResult = new AgentResult(
+            false,
+            "agent exited 1",
+            "stdout leaked ghp_XYZabc789012345678901234567890 before resume failed",
+            "stderr leaked sk-ant-api03-AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT-0123456 before resume failed");
+        var runner = new ThrowingAgentRunner(new AgentSessionResumeExhaustedException(
+            new AgentKind("resumable"),
+            maxResumeAttempts: 2,
+            lastResult))
+        { Kind = new AgentKind("resumable") };
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            NullLogger<AgenticConflictResolver>.Instance);
+
+        var workItemId = WorkItemId.New();
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            workItemId,
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
+        var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
+        Assert.DoesNotContain("ghp_", stdoutTail, StringComparison.Ordinal);
+        Assert.DoesNotContain("sk-ant", stderrTail, StringComparison.Ordinal);
+        Assert.Contains("***", stdoutTail, StringComparison.Ordinal);
+        Assert.Contains("***", stderrTail, StringComparison.Ordinal);
+    }
+
     private LogEvent AssertSingleAttemptFailedEvent(WorkItemId workItemId)
     {
         var attemptFailed = _sink.Events
