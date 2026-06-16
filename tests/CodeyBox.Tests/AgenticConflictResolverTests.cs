@@ -342,6 +342,49 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_FailureClassificationResult_SessionResumeExhausted_PreservesLastResult()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var lastResult = new AgentResult(
+            false,
+            "agent exited 1",
+            "resume stdout",
+            "Transport channel closed");
+        var runner = new FakeAgentResolverRunner(_ =>
+            throw new AgentSessionResumeExhaustedException(
+                new AgentKind("resumable-agent"),
+                maxResumeAttempts: 2,
+                lastResult))
+        { Kind = new AgentKind("resumable-agent") };
+        var cred = new AgentCredential(new AgentKind("resumable-agent"), new Dictionary<string, string>(), new Dictionary<string, string>());
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, cred)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Same(runner, result.FailureRunner);
+        Assert.Same(cred, result.FailureCredential);
+        Assert.Same(lastResult, result.FailureClassificationResult);
+        Assert.Equal("resume stdout", result.Stdout);
+        Assert.Equal("Transport channel closed", result.Stderr);
+        Assert.Contains("session resume exhausted", result.Summary);
+
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        var classification = ((IAgentRunner)runner).ClassifyFailure(classificationResult);
+        Assert.Equal(AgentFailureKind.TransientNetwork, classification.Kind);
+    }
+
+    [Fact]
     public async Task ResolveAsync_FailureClassificationResult_VerificationFails_AssignsMetadata()
     {
         var sandbox = new ConflictSandbox();

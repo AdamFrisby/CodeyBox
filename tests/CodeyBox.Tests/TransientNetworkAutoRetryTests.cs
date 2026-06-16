@@ -46,6 +46,30 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(0, stored.TransientRetryAttempts);
     }
 
+    [Fact]
+    public async Task NotifyTransientFailure_WhenLiveOptionsAccessorThrows_FallsBackToStartupOptions()
+    {
+        var startupOptions = EnabledRetryOptions() with
+        {
+            BaseDelay = TimeSpan.FromSeconds(45),
+            JitterMode = TransientRetryJitterMode.None,
+        };
+        using var fixture = BuildScheduler(
+            startupOptions,
+            transientRetryOptionsAccessor: () => throw new InvalidOperationException("invalid hot reload"));
+        var item = NewTransientItem();
+        await fixture.Store.CreateAsync(item);
+
+        var result = await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Scheduled, result.Status);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(45), result.NextRetryAt);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(45), stored!.NextTransientRetryAt);
+        Assert.Equal(_time.GetUtcNow(), stored.TransientRetryFirstFailedAt);
+    }
+
     [Theory]
     [InlineData(WorkItemState.Failed, "other")]
     [InlineData(WorkItemState.Failed, "quota")]
@@ -108,6 +132,23 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Null(stored.NextTransientRetryAt);
         Assert.Equal(0, stored.TransientRetryAttempts);
         Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Theory]
+    [InlineData("work", WorkItemState.Queued, null)]
+    [InlineData("audit", WorkItemState.WorkComplete, "audit")]
+    [InlineData("rework", WorkItemState.WorkComplete, "audit")]
+    [InlineData("conflict_rework", WorkItemState.ReworkingForConflict, "conflict_rework")]
+    [InlineData("post-act-recheck", WorkItemState.AuditPassed, "merge")]
+    [InlineData("rebase", WorkItemState.Merging, "merge")]
+    [InlineData("merge", WorkItemState.Merging, "merge")]
+    [InlineData("upstream", WorkItemState.UpstreamPushing, "upstream")]
+    public void RetryFromForTransientPhase_MapsPhaseToRetryFrom(
+        string phase,
+        WorkItemState currentState,
+        string? expectedRetryFrom)
+    {
+        Assert.Equal(expectedRetryFrom, PipelineRunner.RetryFromForTransientPhase(phase, currentState));
     }
 
     [Fact]

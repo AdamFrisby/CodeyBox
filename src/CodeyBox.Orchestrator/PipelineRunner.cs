@@ -4,7 +4,6 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
@@ -2400,6 +2399,14 @@ public sealed class PipelineRunner : IPipelineRunner
                             candidateResult.EarliestResetAt,
                             candidateResult.DeferReason ?? "stronger agent(s) transiently unavailable");
                     }
+                    if (resolveResult.FailureRunner is not null
+                        && resolveResult.FailureClassificationResult is not null)
+                    {
+                        ThrowIfTransientAgentFailure(
+                            resolveResult.FailureRunner,
+                            resolveResult.FailureClassificationResult,
+                            "rebase");
+                    }
                     throw new MergeConflictResolutionFailedException(
                         $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}");
                 }
@@ -2429,11 +2436,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
                 }, CancellationToken.None);
-                // AgentUnavailableException is a routing failure, not a merge
-                // conflict failure — let it propagate so the catch in RunAsync
-                // surfaces failureKind=agent_unavailable instead of overwriting
-                // it as MergeConflictResolutionFailed.
-                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException or AgentPausedException or AgentClassExhaustedException)
+                // Routing, pause, quota, and transient failures are not merge
+                // conflict failures — let them propagate so the catch in
+                // RunAsync preserves the classified work-item outcome.
+                if (ex is MergeConflictResolutionFailedException
+                    or AgentUnavailableException
+                    or AgentPausedException
+                    or AgentClassExhaustedException
+                    or TerminalTransientNetworkError)
                     throw;
                 throw new MergeConflictResolutionFailedException(
                     $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}: {ex.Message}",
@@ -13737,6 +13747,7 @@ Original merge-phase failure (for context):
         "rework" => "audit",
         ConflictReworkPhaseKey => "conflict_rework",
         "post-act-recheck" => "merge",
+        "rebase" => "merge",
         "merge" => "merge",
         "upstream" => "upstream",
         _ => ExplicitTransientRetryFromForState(currentState),

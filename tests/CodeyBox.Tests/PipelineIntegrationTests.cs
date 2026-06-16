@@ -363,6 +363,52 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task WaitingForTransientRetryTransition_CurrentNeedsOperatorInput_DoesNotOverwrite()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+
+        var stale = NewItem("feature/transient-operator-race") with
+        {
+            State = WorkItemState.Working,
+            LastError = "stale transient snapshot",
+        };
+        var needsOperatorInput = stale.With(
+            WorkItemState.NeedsOperatorInput,
+            "operator answer required");
+        await tp.Store.CreateAsync(needsOperatorInput);
+
+        var method = typeof(PipelineRunner).GetMethod(
+            "TransitionWaitingForTransientRetryAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance,
+            binder: null,
+            types: [typeof(WorkItem), typeof(string), typeof(Project), typeof(string), typeof(AgentKind?)],
+            modifiers: null);
+        Assert.NotNull(method);
+
+        await (Task)method!.Invoke(
+            tp.Pipeline,
+            [stale, "Transport channel closed", null, "work", AgentKind.Claude])!;
+
+        var final = await tp.Store.GetAsync(stale.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Equal("operator answer required", final.LastError);
+        Assert.Null(final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Null(final.TransientRetryFirstFailedAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
+    }
+
+    [Fact]
     public async Task WorkPhaseTransientRetry_WithExistingWorkBranch_AutoPicksAudit()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
