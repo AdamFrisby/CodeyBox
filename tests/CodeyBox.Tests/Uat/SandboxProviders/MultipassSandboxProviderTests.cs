@@ -80,6 +80,40 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains($"sha256={expected}", manifest);
     }
 
+    [Fact]
+    public void CloudInit_WriteFilePermissionsUseSchemaSafeOctalStrings()
+    {
+        var variants = new[]
+        {
+            MultipassSandboxProvider.BuildCloudInit(
+                extraRuncmd: null,
+                extraCloudInit: null,
+                includeGraphicalInstall: false,
+                baselineInstallCommands: ["npm install -g @openai/codex"]),
+            MultipassSandboxProvider.BuildCloudInit(
+                extraRuncmd: [],
+                extraCloudInit: null,
+                flavor: SandboxProfileFlavor.Graphical),
+        };
+
+        foreach (var cloudInit in variants)
+        {
+            Assert.DoesNotContain("permissions: '0644'", cloudInit, StringComparison.Ordinal);
+            Assert.DoesNotContain("permissions: '0755'", cloudInit, StringComparison.Ordinal);
+            Assert.DoesNotContain("permissions: '0700'", cloudInit, StringComparison.Ordinal);
+
+            foreach (var entry in ExtractWriteFilesEntries(cloudInit))
+            {
+                var path = ExtractRequiredScalar(entry, "path");
+                var permissions = ExtractRequiredScalar(entry, "permissions");
+
+                Assert.True(
+                    IsSchemaSafeOctalPermission(permissions),
+                    $"write_files entry for path '{path}' must use 0o### permissions, got '{permissions}'");
+            }
+        }
+    }
+
     /// <summary>
     /// Parses the rendered cloud-init as YAML, walks to <c>write_files</c>,
     /// and returns the <c>content</c> field of the entry whose <c>path</c>
@@ -90,6 +124,21 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     /// substring somewhere in the document.
     /// </summary>
     private static string ExtractWriteFilesEntryContent(string cloudInit, string path)
+    {
+        foreach (var entry in ExtractWriteFilesEntries(cloudInit))
+        {
+            var entryPath = ExtractRequiredScalar(entry, "path");
+            if (!string.Equals(entryPath, path, StringComparison.Ordinal))
+                continue;
+
+            return ExtractRequiredScalar(entry, "content");
+        }
+
+        Assert.Fail($"no write_files entry found for path '{path}'");
+        return string.Empty;
+    }
+
+    private static IReadOnlyList<YamlDotNet.RepresentationModel.YamlMappingNode> ExtractWriteFilesEntries(string cloudInit)
     {
         // Strip the leading "#cloud-config" header — it's a cloud-init marker
         // comment, not a YAML directive, and YamlDotNet treats it like any
@@ -107,27 +156,28 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             root.Children.TryGetValue(writeFilesKey, out var writeFilesNode),
             "cloud-init must contain a top-level write_files block");
         var entries = Assert.IsType<YamlDotNet.RepresentationModel.YamlSequenceNode>(writeFilesNode);
+        return entries.Children
+            .Select(entry => Assert.IsType<YamlDotNet.RepresentationModel.YamlMappingNode>(entry))
+            .ToList();
+    }
 
-        var pathKey = new YamlDotNet.RepresentationModel.YamlScalarNode("path");
-        var contentKey = new YamlDotNet.RepresentationModel.YamlScalarNode("content");
-        foreach (var entry in entries.Children.OfType<YamlDotNet.RepresentationModel.YamlMappingNode>())
-        {
-            if (!entry.Children.TryGetValue(pathKey, out var pathNode))
-                continue;
-            if (pathNode is not YamlDotNet.RepresentationModel.YamlScalarNode pathScalar)
-                continue;
-            if (!string.Equals(pathScalar.Value, path, StringComparison.Ordinal))
-                continue;
+    private static string ExtractRequiredScalar(
+        YamlDotNet.RepresentationModel.YamlMappingNode entry,
+        string key)
+    {
+        var scalarKey = new YamlDotNet.RepresentationModel.YamlScalarNode(key);
+        Assert.True(
+            entry.Children.TryGetValue(scalarKey, out var value),
+            $"write_files entry is missing a {key} field");
+        var scalar = Assert.IsType<YamlDotNet.RepresentationModel.YamlScalarNode>(value);
+        return scalar.Value ?? string.Empty;
+    }
 
-            Assert.True(
-                entry.Children.TryGetValue(contentKey, out var contentNode),
-                $"write_files entry for path '{path}' is missing a content field");
-            var contentScalar = Assert.IsType<YamlDotNet.RepresentationModel.YamlScalarNode>(contentNode);
-            return contentScalar.Value ?? string.Empty;
-        }
-
-        Assert.Fail($"no write_files entry found for path '{path}'");
-        return string.Empty;
+    private static bool IsSchemaSafeOctalPermission(string permissions)
+    {
+        if (permissions.Length != 5 || !permissions.StartsWith("0o", StringComparison.Ordinal))
+            return false;
+        return permissions[2..].All(c => c is >= '0' and <= '7');
     }
 
     [Fact]
