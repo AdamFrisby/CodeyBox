@@ -1358,6 +1358,55 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Contains("simulated audit infrastructure failure", final.LastError);
         Assert.Single(tp.Agent.WorkPrompts);
         Assert.Single(tp.Agent.WorkPlan);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progressAfterFailure = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var failedAudit = Assert.Single(progressAfterFailure, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.InProgress, failedAudit.Status);
+        Assert.Empty(failedAudit.Findings);
+        Assert.Empty(failedAudit.CompletedAuditors ?? []);
+    }
+
+    [Fact]
+    public async Task ToolAuditorInfrastructureFailure_ClearsPriorPartialProgress()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blocker = new DelegateAuditor("tool-blocker", "tool", (_, _, _) =>
+            Task.FromResult(new AuditResult(false,
+            [
+                new AuditFinding("tool-blocker", AuditSeverity.Error, "completed tool blocker", "fix it"),
+            ])));
+        var unavailable = new DelegateAuditor("tool-infra", "tool", (_, _, _) =>
+            throw new AuditUnavailableException("simulated tool auditor infrastructure failure"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, unavailable],
+            maxAuditIterations: 2);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("simulated tool auditor infrastructure failure", final.LastError);
+        Assert.Single(tp.Agent.WorkPrompts);
+        Assert.Single(tp.Agent.WorkPlan);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progressAfterFailure = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var failedAudit = Assert.Single(progressAfterFailure, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.InProgress, failedAudit.Status);
+        Assert.Empty(failedAudit.Findings);
+        Assert.Empty(failedAudit.CompletedAuditors ?? []);
     }
 
     [Fact]

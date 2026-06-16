@@ -3958,6 +3958,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains(
             runner.Calls,
             call => call.Argv.SequenceEqual(["/bin/true", "stop", "codeybox-test"]));
+
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(1, deleteCalls);
+        Assert.Contains(
+            runner.Calls,
+            call => call.Argv.SequenceEqual(["/bin/true", "delete", "--purge", "codeybox-test"]));
     }
 
     [Fact]

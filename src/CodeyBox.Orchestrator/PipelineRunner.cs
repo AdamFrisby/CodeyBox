@@ -6261,6 +6261,13 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
 
+        Task ClearPartialProgressAsync(CancellationToken progressCt) =>
+            PublishPartialProgressAsync(
+                [],
+                [],
+                progressCt,
+                AuditProgressUpdateOperation.Replace);
+
         // Resolve the audit agent runner per LLM auditor (once, before grouping).
         // Tool auditors don't carry a runner — they stay with workRunner as a
         // harmless sentinel that only affects grouping.
@@ -6484,6 +6491,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         IncompleteVerdict: true,
                         CompletedAuditors: completedAuditors.ToList(),
                         IncompleteAuditors: [ex.AuditorName]);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException
+                                           && (findings.Count > 0 || completedAuditors.Count > 0))
+                {
+                    await ClearPartialProgressAsync(ct).ConfigureAwait(false);
+                    throw;
                 }
                 finally
                 {
@@ -6800,7 +6813,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw firstExhaustion;
                 }
 
-                firstOtherException?.Throw();
+                if (firstOtherException is not null)
+                {
+                    await ClearPartialProgressAsync(ct).ConfigureAwait(false);
+                    firstOtherException.Throw();
+                }
 
                 if (incompleteAuditors.Count > 0)
                 {
