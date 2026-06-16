@@ -28,6 +28,9 @@ public sealed class ClaudeAcpTransportTests
 
         var argv = sandbox.LastClaudeExec!.Argv.ToList();
         Assert.Contains("--print", argv);
+        Assert.Equal(
+            SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+            sandbox.LastClaudeExec.AgentOutputTransport);
         Assert.Equal("print", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
     }
 
