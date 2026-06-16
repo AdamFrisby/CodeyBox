@@ -1884,18 +1884,13 @@ builder.Services.AddSingleton<IReleaseStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteReleaseStore(opts.StateDatabasePath);
 });
-builder.Services.AddSingleton<IWorkItemStore>(sp =>
+builder.Services.AddSingleton<SqliteWorkItemStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemStore(opts.StateDatabasePath);
 });
-// Workflow-owned durable audit progress shares the same SqliteWorkItemStore
-// instance. Registered explicitly (rather than relying on a runtime `as`
-// cast inside PipelineRunner / WorkItemRetrier) so an alternate IWorkItemStore
-// composition fails DI resolution loud instead of silently degrading the
-// audit-progress feature to a no-op.
-builder.Services.AddSingleton<IAuditProgressStore>(sp =>
-    (IAuditProgressStore)sp.GetRequiredService<IWorkItemStore>());
+builder.Services.AddSingleton<IWorkItemStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
+builder.Services.AddSingleton<IAuditProgressStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
 builder.Services.AddSingleton<IIdempotencyStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;

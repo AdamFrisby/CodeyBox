@@ -269,6 +269,23 @@ public sealed class ResumeEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Resume_FromRework_NoPriorAuditProgress_Returns409()
+    {
+        var item = CancelledItem();
+        await _factory.Store.CreateAsync(item);
+        _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/resume",
+            new ResumeRequestBody(From: "rework", Reason: null));
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Cancelled, readBack!.State);
+    }
+
+    [Fact]
     public async Task Resume_FromMerge_NoPriorAuditProgress_Returns409()
     {
         var item = CancelledItem();

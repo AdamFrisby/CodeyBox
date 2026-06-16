@@ -426,6 +426,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// Used to simulate transient text-only failures during resolver cascade.
     /// </summary>
     public Queue<TextOnlyAgentResult> TextOnlyResults { get; } = new();
+    public List<string> WorkPrompts { get; } = new();
 
     /// <summary>
     /// Captured prompts the agentic (in-sandbox) conflict resolver sent to this
@@ -608,7 +609,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         {
             return await HandleCheckAsync(prompt, stdoutChunkCallback, ct);
         }
-        return await HandleWorkAsync(sandbox, workingDirectory, ct);
+        return await HandleWorkAsync(sandbox, workingDirectory, prompt, ct);
     }
 
     private Task<AgentResult> HandleCheckAsync(
@@ -742,8 +743,9 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
             ?? [];
     }
 
-    private async Task<AgentResult> HandleWorkAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct)
+    private async Task<AgentResult> HandleWorkAsync(ISandbox sandbox, string workingDirectory, string prompt, CancellationToken ct)
     {
+        WorkPrompts.Add(prompt);
         if (BeforeWorkAsync is not null)
             await BeforeWorkAsync(sandbox, workingDirectory, ct);
 

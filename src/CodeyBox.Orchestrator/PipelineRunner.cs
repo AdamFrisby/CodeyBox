@@ -5306,8 +5306,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     repoId,
                     ctx,
                     auditShortCircuitEnabled,
-                    async (partialFindings, partialCompletedAuditors, progressCt) =>
+                    async (progress, progressCt) =>
                     {
+                        var partialFindings = progress.Findings;
+                        var partialCompletedAuditors = progress.CompletedAuditors;
                         var partialBlocking = partialFindings
                             .Where(f => f.Severity >= project.Audit.FailingSeverity)
                             .ToList();
@@ -5412,6 +5414,10 @@ public sealed class PipelineRunner : IPipelineRunner
             if (incompleteVerdict && blocking.Count == 0)
             {
                 blocking = findings.ToList();
+            }
+            if (incompleteVerdict && iteration == maxIterations)
+            {
+                maxIterations++;
             }
             var nonBlocking = findings.Count - blocking.Count;
             var workBranchTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
@@ -6072,7 +6078,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string repoId,
         AuditContext ctx,
         bool auditShortCircuitEnabled,
-        Func<IReadOnlyList<AuditFinding>, IReadOnlyList<string>, CancellationToken, Task>? progressUpdate,
+        Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate,
         CancellationToken ct)
     {
         if (!auditShortCircuitEnabled)
@@ -6120,6 +6126,10 @@ public sealed class PipelineRunner : IPipelineRunner
             ct);
         if (gate.DeclaredShortCircuitBlocking)
             return gate with { DeclaredShortCircuitBlocking = true };
+        if (gate.IncompleteVerdict)
+            return gate;
+        if (gate.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+            return gate;
 
         var remainingAuditors = auditors
             .Where(a => !a.CanShortCircuitOnBlockingFinding)
@@ -6127,13 +6137,21 @@ public sealed class PipelineRunner : IPipelineRunner
         if (remainingAuditors.Count == 0)
             return gate with { DeclaredShortCircuitBlocking = false };
 
-        Func<IReadOnlyList<AuditFinding>, IReadOnlyList<string>, CancellationToken, Task>? remainingProgressUpdate = progressUpdate is null
+        Func<AuditProgressUpdate, CancellationToken, Task>? remainingProgressUpdate = progressUpdate is null
             ? null
-            : (remainingFindings, remainingCompletedAuditors, progressCt) =>
-                progressUpdate(
-                    [.. gate.Findings, .. remainingFindings],
-                    [.. (gate.CompletedAuditors ?? []), .. remainingCompletedAuditors],
+            : (remainingProgress, progressCt) =>
+            {
+                if (remainingProgress.Operation == AuditProgressUpdateOperation.Replace)
+                    return progressUpdate(remainingProgress, progressCt);
+
+                return progressUpdate(
+                    remainingProgress with
+                    {
+                        Findings = [.. gate.Findings, .. remainingProgress.Findings],
+                        CompletedAuditors = [.. (gate.CompletedAuditors ?? []), .. remainingProgress.CompletedAuditors],
+                    },
                     progressCt);
+            };
 
         var remaining = await CollectFindingsBatchAsync(
             item,
@@ -6184,7 +6202,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string repoId,
         AuditContext ctx,
         bool detectDeclaredShortCircuit,
-        Func<IReadOnlyList<AuditFinding>, IReadOnlyList<string>, CancellationToken, Task>? progressUpdate,
+        Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate,
         CancellationToken ct)
     {
         var findings = new List<AuditFinding>();
@@ -6196,7 +6214,8 @@ public sealed class PipelineRunner : IPipelineRunner
         async Task PublishPartialProgressAsync(
             IReadOnlyList<AuditFinding> currentFindings,
             IReadOnlyList<string> currentCompletedAuditors,
-            CancellationToken progressCt)
+            CancellationToken progressCt,
+            AuditProgressUpdateOperation operation = AuditProgressUpdateOperation.Accumulate)
         {
             if (progressUpdate is null)
                 return;
@@ -6204,7 +6223,9 @@ public sealed class PipelineRunner : IPipelineRunner
             await progressWriteLock.WaitAsync(progressCt).ConfigureAwait(false);
             try
             {
-                await progressUpdate(currentFindings, currentCompletedAuditors, progressCt).ConfigureAwait(false);
+                await progressUpdate(
+                    new AuditProgressUpdate(currentFindings, currentCompletedAuditors, operation),
+                    progressCt).ConfigureAwait(false);
             }
             finally
             {
@@ -6300,15 +6321,36 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 async Task<ISandbox> CreatePreparedToolSandboxAsync(
                     SandboxRepositoryAccess repositoryAccess,
-                    SandboxSpec sandboxSpec)
+                    SandboxSpec sandboxSpec,
+                    string auditorName)
                 {
                     var prepared = await _sandboxes.CreateAsync(sandboxSpec, ct);
                     try
                     {
-                        if (credential is not null && credential.Files.Count > 0)
-                            await MaterialiseCredentialFilesAsync(prepared, credential, ct);
-                        await Run(prepared, "git", "clone", repositoryAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-                        await Run(prepared, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+                        await RunAuditSandboxSetupWithIdleTimeoutAsync(
+                            prepared,
+                            auditorName,
+                            async (setupSandbox, setupCt) =>
+                            {
+                                if (credential is not null && credential.Files.Count > 0)
+                                    await MaterialiseCredentialFilesAsync(setupSandbox, credential, setupCt);
+                                await RunWithCancellation(
+                                    setupSandbox,
+                                    setupCt,
+                                    "git",
+                                    "clone",
+                                    repositoryAccess.CloneUrlInsideSandbox,
+                                    SandboxConventions.WorkDir);
+                                await RunWithCancellation(
+                                    setupSandbox,
+                                    setupCt,
+                                    "git",
+                                    "-C",
+                                    SandboxConventions.WorkDir,
+                                    "checkout",
+                                    ctx.WorkBranch);
+                            },
+                            ct);
                         return prepared;
                     }
                     catch
@@ -6332,7 +6374,10 @@ public sealed class PipelineRunner : IPipelineRunner
                                 isolatedRepoPath = await _gitHost.CreateIsolatedRepositoryCloneAsync(repoId, ctx.WorkItemId, ct);
                                 var isolatedAccess = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
                                 var isolatedSpec = BuildAuditSandboxSpec(isolatedAccess);
-                                await using var isolatedSandbox = await CreatePreparedToolSandboxAsync(isolatedAccess, isolatedSpec);
+                                await using var isolatedSandbox = await CreatePreparedToolSandboxAsync(
+                                    isolatedAccess,
+                                    isolatedSpec,
+                                    auditor.Name);
                                 run = await ExecAuditorAsync(
                                     isolatedSandbox,
                                     auditor,
@@ -6344,7 +6389,7 @@ public sealed class PipelineRunner : IPipelineRunner
                                     ctx,
                                     ct);
                             }
-                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException)
+                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException and not AuditorIdleTimeoutException)
                             {
                                 throw new AuditUnavailableException(
                                     $"could-not-verify: isolated audit repository setup failed for {auditor.Name}: {SingleLineSummary(ex.Message)}",
@@ -6363,7 +6408,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         }
                         else
                         {
-                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync(access, spec);
+                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync(access, spec, auditor.Name);
                             run = await ExecAuditorAsync(
                                 sharedToolSandbox,
                                 auditor,
@@ -6458,10 +6503,30 @@ public sealed class PipelineRunner : IPipelineRunner
                         : null;
                     var candidateSpec = BuildLlmSandboxSpec(candidateCredential);
                     await using var sandbox = await _sandboxes.CreateAsync(candidateSpec, attemptCt);
-                    if (candidateCredential is not null && candidateCredential.Files.Count > 0)
-                        await MaterialiseCredentialFilesAsync(sandbox, candidateCredential, attemptCt);
-                    await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+                    await RunAuditSandboxSetupWithIdleTimeoutAsync(
+                        sandbox,
+                        pair.Auditor.Name,
+                        async (setupSandbox, setupCt) =>
+                        {
+                            if (candidateCredential is not null && candidateCredential.Files.Count > 0)
+                                await MaterialiseCredentialFilesAsync(setupSandbox, candidateCredential, setupCt);
+                            await RunWithCancellation(
+                                setupSandbox,
+                                setupCt,
+                                "git",
+                                "clone",
+                                access.CloneUrlInsideSandbox,
+                                SandboxConventions.WorkDir);
+                            await RunWithCancellation(
+                                setupSandbox,
+                                setupCt,
+                                "git",
+                                "-C",
+                                SandboxConventions.WorkDir,
+                                "checkout",
+                                ctx.WorkBranch);
+                        },
+                        attemptCt);
                     var candidateCtx = ctx with
                     {
                         ModelId = trialItem.ModelId,
@@ -6696,7 +6761,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 }
                 if (firstExhaustion is not null)
                 {
-                    await PublishPartialProgressAsync([], [], ct).ConfigureAwait(false);
+                    await PublishPartialProgressAsync(
+                        [],
+                        [],
+                        ct,
+                        AuditProgressUpdateOperation.Replace).ConfigureAwait(false);
                     throw firstExhaustion;
                 }
 
@@ -6711,6 +6780,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                         if (needsCreds && run.Runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= run.Runner.Kind;
+                        if (detectDeclaredShortCircuit
+                            && run.Auditor.CanShortCircuitOnBlockingFinding
+                            && IsDeclaredShortCircuitBlockingResult(run.Result))
+                        {
+                            declaredShortCircuitBlocking = true;
+                        }
                     }
 
                     var partialFindings = baseFindingsBeforeLlm
@@ -6912,6 +6987,63 @@ public sealed class PipelineRunner : IPipelineRunner
             canCaptureStructuredStream);
     }
 
+    private async Task RunAuditSandboxSetupWithIdleTimeoutAsync(
+        ISandbox sandbox,
+        string auditorName,
+        Func<ISandbox, CancellationToken, Task> setup,
+        CancellationToken ct)
+    {
+        var timeout = _pipelineTuning.Current.AuditorIdleTimeout;
+        if (timeout <= TimeSpan.Zero)
+        {
+            await setup(sandbox, ct).ConfigureAwait(false);
+            return;
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var lastActivityTicks = Stopwatch.GetTimestamp();
+        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+
+        var watchedSandbox = new ActivityTrackingSandbox(sandbox, Touch);
+        var setupTask = setup(watchedSandbox, linkedCts.Token);
+        var timeoutTask = WaitForAuditorIdleTimeoutAsync(
+            linkedCts.Token,
+            () => Volatile.Read(ref lastActivityTicks));
+
+        try
+        {
+            var completed = await Task.WhenAny(setupTask, timeoutTask).ConfigureAwait(false);
+            if (completed == timeoutTask)
+            {
+                var timedOutAfter = await timeoutTask.ConfigureAwait(false);
+                if (timedOutAfter is not null)
+                {
+                    await CancelAndTearDownAfterIdleTimeoutAsync(
+                        linkedCts,
+                        setupTask,
+                        sandbox,
+                        "audit setup",
+                        auditorName).ConfigureAwait(false);
+                    throw new AuditorIdleTimeoutException(auditorName, timedOutAfter.Value);
+                }
+
+                ct.ThrowIfCancellationRequested();
+            }
+
+            await setupTask.ConfigureAwait(false);
+            Touch();
+            ct.ThrowIfCancellationRequested();
+        }
+        finally
+        {
+            try { await linkedCts.CancelAsync().ConfigureAwait(false); }
+            catch (ObjectDisposedException) { }
+
+            try { await timeoutTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+    }
+
     private async Task<AuditResult> RunAuditorWithIdleTimeoutAsync(
         IAuditor auditor,
         ISandbox sandbox,
@@ -7011,15 +7143,40 @@ public sealed class PipelineRunner : IPipelineRunner
         return null;
     }
 
-    private async Task CancelAndTearDownAfterIdleTimeoutAsync<T>(
+    private async Task CancelAndTearDownAfterIdleTimeoutAsync(
         CancellationTokenSource cts,
-        Task<T> task,
+        Task task,
         ISandbox sandbox,
         string operation,
         string auditorName)
     {
         try { await cts.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
+
+        try
+        {
+            using var killCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            await sandbox.KillActiveExecsAsync(killCts.Token)
+                .WaitAsync(TimeSpan.FromSeconds(1))
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _log.LogWarning(
+                "Timed-out {Operation} for auditor {Auditor} did not kill active execs in sandbox {SandboxId} within the teardown grace period",
+                operation,
+                auditorName,
+                sandbox.Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Timed-out {Operation} for auditor {Auditor} failed while killing active execs in sandbox {SandboxId}",
+                operation,
+                auditorName,
+                sandbox.Id);
+        }
 
         try
         {
@@ -7059,7 +7216,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         _log.LogWarning(
-            "Timed-out {Operation} for auditor {Auditor} did not stop within the teardown grace period after cancellation and sandbox disposal",
+            "Timed-out {Operation} for auditor {Auditor} did not stop within the teardown grace period after cancellation, active-exec kill, and sandbox disposal",
             operation,
             auditorName);
         _ = task.ContinueWith(
@@ -7072,11 +7229,11 @@ public sealed class PipelineRunner : IPipelineRunner
             TaskScheduler.Default);
     }
 
-    private void ObserveTimedOutTask<T>(Task<T> task, string operation, string auditorName)
+    private void ObserveTimedOutTask(Task task, string operation, string auditorName)
     {
         try
         {
-            _ = task.GetAwaiter().GetResult();
+            task.GetAwaiter().GetResult();
         }
         catch (OperationCanceledException)
         {
@@ -7193,6 +7350,17 @@ public sealed class PipelineRunner : IPipelineRunner
         bool IncompleteVerdict = false,
         IReadOnlyList<string>? CompletedAuditors = null,
         IReadOnlyList<string>? IncompleteAuditors = null);
+
+    private enum AuditProgressUpdateOperation
+    {
+        Accumulate,
+        Replace,
+    }
+
+    private sealed record AuditProgressUpdate(
+        IReadOnlyList<AuditFinding> Findings,
+        IReadOnlyList<string> CompletedAuditors,
+        AuditProgressUpdateOperation Operation = AuditProgressUpdateOperation.Accumulate);
 
     private async Task PersistAuditReportAsync(
         AuditContext ctx,
@@ -9175,6 +9343,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private static string OutcomeForFailure(Exception ex) => ex switch
     {
         TerminalQuotaError => "failure:quota",
+        AuditorIdleTimeoutException => "failure:timeout",
         AgentAttemptTimeoutException => "failure:timeout",
         OperationCanceledException => "failure:cancelled",
         _ => "failure:agent",
@@ -12095,13 +12264,13 @@ Original merge-phase failure (for context):
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {
-        await Run(sandbox, "mkdir", "-p", SandboxConventions.CredentialsDir);
+        await RunWithCancellation(sandbox, ct, "mkdir", "-p", SandboxConventions.CredentialsDir);
         foreach (var (relativePath, contents) in credential.Files)
         {
             var safePath = SanitiseCredentialFileName(relativePath);
             var fullPath = $"{SandboxConventions.CredentialsDir}/{safePath}";
             var dir = fullPath[..fullPath.LastIndexOf('/')];
-            await Run(sandbox, "mkdir", "-p", dir);
+            await RunWithCancellation(sandbox, ct, "mkdir", "-p", dir);
             var write = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["sh", "-c", "umask 077 && cat > \"$0\"", fullPath],
@@ -13637,6 +13806,9 @@ Original merge-phase failure (for context):
             };
             return _inner.ExecAsync(watchedExec, ct);
         }
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default)
+            => _inner.KillActiveExecsAsync(ct);
 
         public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
             => _inner.GetScreenshotAsync(ct);

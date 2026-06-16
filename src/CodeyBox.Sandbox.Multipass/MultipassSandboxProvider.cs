@@ -5400,10 +5400,18 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
+        _disposed = true;
         if (_preserveOnDispose)
         {
-            _disposed = true;
             return;
+        }
+        try
+        {
+            _onNoLongerTrackedActive?.Invoke(_name);
+        }
+        catch (Exception callbackEx)
+        {
+            _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
         }
         await using var disposeScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "vm.dispose", log: _log);
@@ -5420,24 +5428,42 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
-            _disposed = true;
-            try
-            {
-                _onNoLongerTrackedActive?.Invoke(_name);
-            }
-            catch (Exception callbackEx)
-            {
-                _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
-            }
             if (_ownedByShutdownHandler)
                 throw;
             return;
         }
-        _disposed = true;
         _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name);
         try { Directory.Delete(_sandboxRoot, recursive: true); }
         catch (Exception ex) { _log.LogWarning(ex, "Failed to clean sandbox root {Root}", _sandboxRoot); }
+    }
+
+    public async Task KillActiveExecsAsync(CancellationToken ct = default)
+    {
+        if (_disposed) return;
+        try
+        {
+            var stop = await RunMultipassAsync(
+                [_opts.MultipassBinary, "stop", _name],
+                stdin: null,
+                ct: ct).ConfigureAwait(false);
+            if (stop.ExitCode != 0)
+            {
+                _log.LogWarning(
+                    "Best-effort stop for timed-out multipass sandbox {Name} returned exit {ExitCode}: {Stderr}",
+                    _name,
+                    stop.ExitCode,
+                    stop.Stderr);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Best-effort stop for timed-out multipass sandbox {Name} failed", _name);
+        }
     }
 
     public async Task StopAndPreserveAsync(CancellationToken ct = default)

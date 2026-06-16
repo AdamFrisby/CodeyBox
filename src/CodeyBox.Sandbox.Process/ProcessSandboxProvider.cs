@@ -304,6 +304,17 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         }
     }
 
+    public Task KillActiveExecsAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        System.Diagnostics.Process[] activeProcesses;
+        lock (_processGate)
+            activeProcesses = _processes.ToArray();
+        foreach (var process in activeProcesses)
+            KillProcessTree(process);
+        return Task.CompletedTask;
+    }
+
     private static async Task<LimitedReadResult> ReadLimitedAsync(
         StreamReader reader,
         int? maxBytes,
@@ -403,11 +414,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
         SandboxLiveCounter.Decrement();
-        System.Diagnostics.Process[] activeProcesses;
-        lock (_processGate)
-            activeProcesses = _processes.ToArray();
-        foreach (var process in activeProcesses)
-            KillProcessTree(process);
+        KillActiveExecsAsync().GetAwaiter().GetResult();
         if (_preserved)
             return ValueTask.CompletedTask;
         try

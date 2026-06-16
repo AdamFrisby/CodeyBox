@@ -4,6 +4,7 @@ using CodeyBox.Core;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
 using Serilog;
 using Serilog.Events;
 
@@ -1299,6 +1300,13 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(2, blockerCalls);
         Assert.Equal(3, hangingCalls);
+        Assert.Empty(tp.Agent.WorkPlan);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Contains("real finding", tp.Agent.WorkPrompts[1]);
+        Assert.Contains("fix it", tp.Agent.WorkPrompts[1]);
+        var bareRepo = tp.GitHost.GetRepoPath(await tp.GitHost.EnsureRepositoryAsync(item.Id, seed));
+        var (_, branchFile, _) = await TestSupport.RunGit(bareRepo, "show", $"{final.WorkBranch}:a.txt");
+        Assert.Equal("v2-after-rework", branchFile);
 
         var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
             .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
@@ -1361,6 +1369,52 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(AuditProgressStatuses.Incomplete, firstAudit.Status);
         Assert.Equal(1, firstAudit.BlockingFindings);
         Assert.Contains(firstAudit.BlockingFindingsDetails, f => f.Title == "warning finding");
+    }
+
+    [Fact]
+    public async Task FinalIncompleteAuditWithCompletedFindings_RoutesToReworkBeforeCeiling()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("architecture", AuditSeverity.Error, "last chance blocker", "fix final incomplete")])
+                : new AuditResult(true, []));
+        });
+        var hangingCalls = 0;
+        var sometimesHangs = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            if (hangingCalls <= 2)
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, sometimesHangs],
+            maxAuditIterations: 1,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-final-incomplete-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Contains("last chance blocker", tp.Agent.WorkPrompts[1]);
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(3, hangingCalls);
     }
 
     [Fact]
@@ -1561,6 +1615,43 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditSetupCloneNoOutput_IsKilledWithinIdleBoundAndRetried()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var sandboxProvider = new HangingSecondCloneSandboxProvider();
+        var auditorRuns = 0;
+        var auditor = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            auditorRuns++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning,
+            sandboxProvider: sandboxProvider);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        var sw = Stopwatch.StartNew();
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        sw.Stop();
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(sandboxProvider.ObservedCloneCancellation);
+        Assert.Equal(1, auditorRuns);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"audit setup timeout took {sw.Elapsed}");
+    }
+
+    [Fact]
     public async Task AuditorIdleTimeoutZero_AllowsSilentAuditorToComplete()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1654,6 +1745,60 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    [Fact]
+    public async Task ToolAuditorIdleTimeout_ReturnsIncompleteVerdictWithPriorFindings()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("tool-blocker", "tool", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("tool-blocker", AuditSeverity.Error, "tool blocker", "fix tool issue")])
+                : new AuditResult(true, []));
+        });
+        var hangingCalls = 0;
+        var sometimesHangs = new DelegateAuditor("tool-hang", "tool", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            if (hangingCalls == 1)
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, sometimesHangs],
+            maxAuditIterations: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-tool-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(2, hangingCalls);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Contains("tool blocker", tp.Agent.WorkPrompts[1]);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var firstAudit = Assert.Single(progress, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.Incomplete, firstAudit.Status);
+        Assert.Equal(["tool-blocker"], firstAudit.CompletedAuditors);
+        Assert.Contains(firstAudit.Findings, f => f.Title == "tool blocker");
     }
 
     [Fact]
@@ -1936,6 +2081,78 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 if (Interlocked.CompareExchange(ref _maxConcurrentExecs, active, observed) == observed)
                     return;
             }
+        }
+    }
+
+    private sealed class HangingSecondCloneSandboxProvider : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner =
+            new(NullLogger<ProcessSandboxProvider>.Instance);
+        private int _cloneCalls;
+
+        public string Name => "hanging-second-clone";
+        public bool ObservedCloneCancellation { get; private set; }
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var inner = await _inner.CreateAsync(spec, ct);
+            return new HangingSecondCloneSandbox(inner, this);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+
+        private bool ShouldHangClone()
+            => Interlocked.Increment(ref _cloneCalls) == 2;
+
+        private void MarkObservedCloneCancellation()
+            => ObservedCloneCancellation = true;
+
+        private sealed class HangingSecondCloneSandbox(
+            ISandbox inner,
+            HangingSecondCloneSandboxProvider owner) : ISandbox
+        {
+            public string Id => inner.Id;
+            public SandboxAgentOutputTransportKind AgentOutputTransportKind => inner.AgentOutputTransportKind;
+
+            public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            {
+                if (exec.Argv is ["git", "clone", ..] && owner.ShouldHangClone())
+                {
+                    try
+                    {
+                        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        owner.MarkObservedCloneCancellation();
+                        throw;
+                    }
+                }
+
+                return await inner.ExecAsync(exec, ct);
+            }
+
+            public Task KillActiveExecsAsync(CancellationToken ct = default)
+                => inner.KillActiveExecsAsync(ct);
+
+            public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+                => inner.GetScreenshotAsync(ct);
+
+            public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+                => inner.SynthesizeInputAsync(events, ct);
+
+            public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+                => inner.GetAccessibilityAtPointAsync(x, y, ct);
+
+            public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+                => inner.GetAccessibilityTreeJsonAsync(ct);
+
+            public ValueTask DisposeAsync()
+                => inner.DisposeAsync();
         }
     }
 

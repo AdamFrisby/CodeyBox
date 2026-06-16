@@ -94,6 +94,9 @@ internal sealed class NonDisposingSandbox : ISandbox
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         => _inner.ExecAsync(exec, ct);
 
+    public Task KillActiveExecsAsync(CancellationToken ct = default)
+        => _inner.KillActiveExecsAsync(ct);
+
     public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
         => _inner.GetScreenshotAsync(ct);
 
