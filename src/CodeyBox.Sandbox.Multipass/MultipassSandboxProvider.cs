@@ -3554,21 +3554,21 @@ test "$work" = present && test "$exec_wrapper" = present
         // until the OS default (~2h) before retrying. 30s/5s/3 probes detects
         // a dead conn within ~45s of resume in the worst case.
         sb.AppendLine("  - path: /etc/sysctl.d/99-codeybox-keepalive.conf");
-        sb.AppendLine("    permissions: '0644'");
+        sb.AppendLine("    permissions: '0o644'");
         sb.AppendLine("    content: |");
         sb.AppendLine("      net.ipv4.tcp_keepalive_time = 30");
         sb.AppendLine("      net.ipv4.tcp_keepalive_intvl = 5");
         sb.AppendLine("      net.ipv4.tcp_keepalive_probes = 3");
         sb.AppendLine("  - path: /usr/local/bin/codeybox-exec");
-        sb.AppendLine("    permissions: '0755'");
+        sb.AppendLine("    permissions: '0o755'");
         sb.AppendLine("    content: |");
         sb.Append("      ").AppendLine(wrapperIndented);
         sb.AppendLine("  - path: /usr/local/sbin/codeybox-route");
-        sb.AppendLine("    permissions: '0755'");
+        sb.AppendLine("    permissions: '0o755'");
         sb.AppendLine("    content: |");
         sb.Append("      ").AppendLine(routeScriptIndented);
         sb.AppendLine("  - path: /etc/systemd/system/codeybox-route.service");
-        sb.AppendLine("    permissions: '0644'");
+        sb.AppendLine("    permissions: '0o644'");
         sb.AppendLine("    content: |");
         sb.AppendLine("      [Unit]");
         sb.AppendLine("      Description=CodeyBox default-route swap to profile bridge");
@@ -3583,26 +3583,26 @@ test "$work" = present && test "$exec_wrapper" = present
         if (flavor == SandboxProfileFlavor.Graphical)
         {
             sb.AppendLine("  - path: /etc/systemd/system/codeybox-xvfb.service");
-            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    permissions: '0o644'");
             sb.AppendLine("    content: |");
             sb.Append("      ").AppendLine(graphicalXvfbIndented);
             sb.AppendLine("  - path: /etc/systemd/system/codeybox-xfce.service");
-            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    permissions: '0o644'");
             sb.AppendLine("    content: |");
             sb.Append("      ").AppendLine(graphicalXfceIndented);
             sb.AppendLine("  - path: /etc/systemd/system/codeybox-vnc.service");
-            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    permissions: '0o644'");
             sb.AppendLine("    content: |");
             sb.Append("      ").AppendLine(graphicalVncIndented);
             sb.AppendLine("  - path: /usr/local/sbin/codeybox-vnc");
-            sb.AppendLine("    permissions: '0755'");
+            sb.AppendLine("    permissions: '0o755'");
             sb.AppendLine("    content: |");
             sb.Append("      ").AppendLine(graphicalVncScriptIndented);
         }
         if (installManifestIndented is not null)
         {
             sb.AppendLine("  - path: /var/lib/codeybox/baseline-install-commands.sh");
-            sb.AppendLine("    permissions: '0700'");
+            sb.AppendLine("    permissions: '0o700'");
             sb.AppendLine("    content: |");
             sb.Append("      ").AppendLine(installManifestIndented);
         }
