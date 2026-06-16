@@ -4926,23 +4926,41 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         string? detachedStdinFile = null;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
         var pipeEnvironment = effectiveEnvironment;
-        if (ShouldUseAgentOutputHttpIngest(exec, maxStdoutBytes, maxStderrBytes)
-            && TryResolveAgentOutputBindAddress() is { } bindAddress)
+        var prefersDetachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec)
+            && maxStdoutBytes is null
+            && maxStderrBytes is null;
+        if (ShouldUseAgentOutputHttpIngest(exec, maxStdoutBytes, maxStderrBytes))
         {
-            agentOutputIngest = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
-                bindAddress,
-                Guid.NewGuid().ToString("N"),
-                _log,
-                exec.StdoutChunkCallback,
-                exec.StderrChunkCallback,
-                ct).ConfigureAwait(false);
-            if (agentOutputIngest is not null)
+            if (TryResolveAgentOutputBindAddress() is not { } bindAddress)
             {
-                effectiveEnvironment = MergeExecEnvironment(effectiveEnvironment, agentOutputIngest.BuildEnvironment());
-                stdoutChunkCallback = null;
-                stderrChunkCallback = null;
-                forceEnvironmentFile = true;
-                detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
+                if (prefersDetachedHttpIngest)
+                {
+                    return BuildAgentOutputHttpSetupFailureResult(
+                        "agent output HTTP ingest has no bind address for detached launch");
+                }
+            }
+            else
+            {
+                agentOutputIngest = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+                    bindAddress,
+                    Guid.NewGuid().ToString("N"),
+                    _log,
+                    exec.StdoutChunkCallback,
+                    exec.StderrChunkCallback,
+                    ct).ConfigureAwait(false);
+                if (agentOutputIngest is not null)
+                {
+                    effectiveEnvironment = MergeExecEnvironment(effectiveEnvironment, agentOutputIngest.BuildEnvironment());
+                    stdoutChunkCallback = null;
+                    stderrChunkCallback = null;
+                    forceEnvironmentFile = true;
+                    detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
+                }
+                else if (prefersDetachedHttpIngest)
+                {
+                    return BuildAgentOutputHttpSetupFailureResult(
+                        "agent output HTTP ingest listener could not start for detached launch");
+                }
             }
         }
 
@@ -4971,6 +4989,18 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                if (detachedHttpIngest)
+                {
+                    _log.LogWarning(ex,
+                        "Detached agent output HTTP ingest setup failed before launch for {Name}",
+                        _name);
+                    if (agentOutputIngest is not null)
+                        await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+                    if (transferredVmPaths.Count > 0)
+                        await TryRemoveTransferredFilesAsync(transferredVmPaths).ConfigureAwait(false);
+                    return BuildAgentOutputHttpSetupFailureResult(ex.Message);
+                }
+
                 _log.LogWarning(ex,
                     "Agent output HTTP ingest setup failed before launch for {Name}; falling back to multipass exec pipe",
                     _name);
@@ -5042,6 +5072,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
             if (IsAgentOutputHttpSetupFailure(result, agentOutputIngest))
             {
+                if (detachedHttpIngest)
+                {
+                    _log.LogWarning(
+                        "Detached agent output HTTP ingest was unreachable from sandbox {Name}; refusing attached fallback",
+                        _name);
+                    await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+                    agentOutputIngest = null;
+                    return result;
+                }
+
                 _log.LogWarning(
                     "Agent output HTTP ingest was unreachable from sandbox {Name}; falling back to multipass exec pipe",
                     _name);
@@ -5597,7 +5637,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
         var exitCode = await exitTask.ConfigureAwait(false);
         var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
-        return new DetachedExitResult(reapError is null ? exitCode : 1, reapError);
+        return new DetachedExitResult(exitCode, reapError);
+    }
+
+    private static ProcessRunResult BuildAgentOutputHttpSetupFailureResult(string detail)
+    {
+        var suffix = string.IsNullOrWhiteSpace(detail) ? "" : $": {detail.Trim()}";
+        return new ProcessRunResult(
+            AgentOutputHttpSetupFailedExitCode,
+            "",
+            AgentOutputHttpSetupFailureMarker + suffix + "\n");
     }
 
     private async Task<string?> EnsureDetachedProcessGroupReapedAsync(string processGroupMarker, CancellationToken ct)

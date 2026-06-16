@@ -159,9 +159,31 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     public async Task ReadMethods_WaitBehindSharedConnectionGate()
     {
         var queued = Sample();
-        var working = Sample() with { State = WorkItemState.Working };
+        var now = DateTimeOffset.UtcNow;
+        var attemptStartedAt = now.AddMinutes(-2);
+        var working = Sample() with
+        {
+            State = WorkItemState.Working,
+            StartedAt = now.AddMinutes(-1),
+            SuspendedVmName = "vm-gated-read",
+            SuspendedAt = now,
+        };
         await _store.CreateAsync(queued);
         await _store.CreateAsync(working);
+        await _store.RecordIterationDispatchAsync(working.Id, iteration: 1, promptRevisionAtDispatch: 1, dispatchedAt: now);
+        await _store.RecordAuditProgressAsync(
+            working.Id,
+            attemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 1,
+                MaxIterations: 1,
+                BlockingFindings: 0,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: [],
+                BlockingFindingsDetails: [],
+                Findings: [],
+                WorkBranchTip: null),
+            now);
 
         using var gate = _store.AcquireConnectionGateForTesting();
         var reads = new Dictionary<string, Task>(StringComparer.Ordinal)
@@ -172,6 +194,12 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             ["CountByStateAsync"] = _store.CountByStateAsync(WorkItemState.Queued),
             ["ListDispatchEligibleByPriorityAsync"] = DrainAsync(
                 _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>())),
+            ["CountStartedInWindowAsync"] = _store.CountStartedInWindowAsync(working.ProjectId, now.AddHours(-1)),
+            ["CountInFlightAsync"] = _store.CountInFlightAsync(working.ProjectId),
+            ["CountInFlightSplitByRefactorAsync"] = _store.CountInFlightSplitByRefactorAsync(working.ProjectId),
+            ["ListSuspendedAsync"] = DrainAsync(_store.ListSuspendedAsync()),
+            ["GetIterationsAsync"] = _store.GetIterationsAsync(working.Id),
+            ["GetAuditProgressAsync"] = _store.GetAuditProgressAsync(working.Id, attemptStartedAt),
         };
 
         await Task.Delay(100);
