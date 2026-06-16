@@ -717,7 +717,27 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedMarkerDisappearsAfterHttpExitReturnsCleanupDiagnostic()
+    public async Task ExecAsync_PreferDetachedHttpIngestWithoutBindAddressFailsBeforeAttachedFallback()
+    {
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+            Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+        });
+
+        Assert.False(result.Success);
+        Assert.Equal(MultipassSandbox.AgentOutputHttpSetupFailedExitCode, result.ExitCode);
+        Assert.Contains(MultipassSandbox.AgentOutputHttpSetupFailureMarker, result.Stderr);
+        Assert.Contains("no bind address", result.Stderr);
+        Assert.Empty(runner.Calls);
+    }
+
+    [Fact]
+    public async Task ExecAsync_DetachedMarkerDisappearsAfterHttpExitFailsWithCleanupDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
@@ -757,14 +777,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
         });
 
-        Assert.True(result.Success);
-        Assert.Equal(0, result.ExitCode);
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
         Assert.Contains("detached exec process group marker", result.Stderr);
         Assert.Contains("disappeared before cleanup", result.Stderr);
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedProcessGroupStillAliveAfterTerminationReturnsCleanupDiagnostic()
+    public async Task ExecAsync_DetachedProcessGroupStillAliveAfterTerminationFailsWithCleanupDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
@@ -810,14 +830,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
         });
 
-        Assert.True(result.Success);
-        Assert.Equal(0, result.ExitCode);
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
         Assert.Equal(1, killCalls);
         Assert.Contains("detached exec process group 12345 remained alive after termination", result.Stderr);
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedTerminationFailureWithLiveGroupReturnsCleanupDiagnostic()
+    public async Task ExecAsync_DetachedTerminationFailureWithLiveGroupFailsWithCleanupDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
@@ -863,8 +883,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
         });
 
-        Assert.True(result.Success);
-        Assert.Equal(0, result.ExitCode);
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
         Assert.Equal(1, killCalls);
         Assert.Contains("detached exec process group 12345 remained alive after termination", result.Stderr);
     }

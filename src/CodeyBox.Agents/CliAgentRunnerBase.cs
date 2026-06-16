@@ -508,7 +508,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
-            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+            AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),
         };
 
         SandboxExecResult result;
@@ -528,6 +528,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stdout: result.Stdout,
             Stderr: result.Stderr);
     }
+
+    private static SandboxAgentOutputTransportPreference SelectBatchAgentOutputTransport(ISandbox sandbox)
+        => sandbox.AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
+            ? SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest
+            : SandboxAgentOutputTransportPreference.ExecPipe;
 
     /// <summary>
     /// Buffers stderr chunks up to the next newline and forwards each complete

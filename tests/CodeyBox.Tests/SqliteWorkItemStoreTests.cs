@@ -161,14 +161,25 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         var queued = Sample();
         var now = DateTimeOffset.UtcNow;
         var attemptStartedAt = now.AddMinutes(-2);
+        var releaseId = ReleaseId.New();
+        var source = Sample() with { Title = "source" };
         var working = Sample() with
         {
             State = WorkItemState.Working,
             StartedAt = now.AddMinutes(-1),
             SuspendedVmName = "vm-gated-read",
             SuspendedAt = now,
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["jobtrack"] = "EXT-123",
+                ["legacy"] = "LEG-123",
+            },
+            BaselineImageRef = "cb-baseline-gated-read",
+            ReplayOfWorkItemId = source.Id,
+            ReleaseId = releaseId,
         };
         await _store.CreateAsync(queued);
+        await _store.CreateAsync(source);
         await _store.CreateAsync(working);
         await _store.RecordIterationDispatchAsync(working.Id, iteration: 1, promptRevisionAtDispatch: 1, dispatchedAt: now);
         await _store.RecordAuditProgressAsync(
@@ -197,7 +208,16 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             ["CountStartedInWindowAsync"] = _store.CountStartedInWindowAsync(working.ProjectId, now.AddHours(-1)),
             ["CountInFlightAsync"] = _store.CountInFlightAsync(working.ProjectId),
             ["CountInFlightSplitByRefactorAsync"] = _store.CountInFlightSplitByRefactorAsync(working.ProjectId),
+            ["GetByExternalIdAsync"] = _store.GetByExternalIdAsync(working.ProjectId, "EXT-123"),
+            ["GetByNamespacedExternalIdAsync"] = _store.GetByNamespacedExternalIdAsync(working.ProjectId, "jobtrack", "EXT-123"),
+            ["GetFleetStateCountsAsync"] = _store.GetFleetStateCountsAsync(),
+            ["GetFleetRecentOutcomesAsync"] = _store.GetFleetRecentOutcomesAsync(),
+            ["GetFleetPauseStatesAsync"] = _store.GetFleetPauseStatesAsync(),
             ["ListSuspendedAsync"] = DrainAsync(_store.ListSuspendedAsync()),
+            ["GetActiveBaselineImageRefsAsync"] = _store.GetActiveBaselineImageRefsAsync(),
+            ["ListWorkItemsForBaselineAsync"] = _store.ListWorkItemsForBaselineAsync("cb-baseline-gated-read"),
+            ["ListByReplaySourceAsync"] = DrainAsync(_store.ListByReplaySourceAsync(source.Id)),
+            ["ListByReleaseAsync"] = DrainAsync(_store.ListByReleaseAsync(releaseId)),
             ["GetIterationsAsync"] = _store.GetIterationsAsync(working.Id),
             ["GetAuditProgressAsync"] = _store.GetAuditProgressAsync(working.Id, attemptStartedAt),
         };

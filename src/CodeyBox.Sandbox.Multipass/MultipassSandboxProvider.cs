@@ -5104,9 +5104,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
                 var detachedIngested = agentOutputIngest;
                 agentOutputIngest = null;
+                var detachedExitCode = detachedExit.Error is not null && detachedExit.ExitCode == 0
+                    ? 1
+                    : detachedExit.ExitCode;
                 return result with
                 {
-                    ExitCode = detachedExit.ExitCode,
+                    ExitCode = detachedExitCode,
                     Stdout = detachedIngested.Stdout + result.Stdout,
                     Stderr = detachedIngested.Stderr + AppendDetachedMarkerError(result.Stderr, detachedExit.Error),
                 };

@@ -984,6 +984,7 @@ public sealed class ClaudeAcpTransportTests
         public List<SandboxExec> AllClaudeExecs { get; } = new();
         public SandboxExec? LastClaudeExec => AllClaudeExecs.Count == 0 ? null : AllClaudeExecs[^1];
         public string Id { get; } = "vm-" + Guid.NewGuid().ToString("N")[..8];
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
 
         public RecordingSandbox(params string[] claudeStdouts)
             => _claudeStdouts = new Queue<string>(claudeStdouts);

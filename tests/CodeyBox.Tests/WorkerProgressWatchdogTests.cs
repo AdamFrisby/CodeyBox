@@ -627,6 +627,34 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task DefaultActivitySource_ActiveProcessStateDuringInitialConfirmationCountsAsProgress()
+    {
+        var itemId = WorkItemId.New();
+        var sampleReads = 0;
+        var source = new DefaultWorkerProgressActivitySource(
+            activeSandboxProvider: null,
+            processCpuSampleReader: (WorkItemId _, out DefaultWorkerProgressActivitySource.ProcessCpuSample sample) =>
+            {
+                sampleReads++;
+                sample = new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                    CpuTicks: 42,
+                    ProcessSetSignature: "123:456",
+                    HasActiveProcessState: sampleReads > 1);
+                return true;
+            });
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: true,
+            ActiveSandboxProgressSignalEnabled: false);
+        var worker = WorkerForItem("active-state-confirm-test", itemId);
+
+        var activity = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+
+        Assert.NotNull(activity);
+        Assert.Equal("process-cpu", activity!.Reason);
+        Assert.True(sampleReads >= 2);
+    }
+
+    [Fact]
     public async Task Watchdog_IdleTaggedProcess_Recovers()
     {
         if (!OperatingSystem.IsLinux())

@@ -57,6 +57,17 @@ public sealed class CliAgentLogFileEnvInjectionTests
     }
 
     [Fact]
+    public async Task RunAsync_WithExecPipeSandbox_DoesNotRequestDetachedHttpIngest()
+    {
+        var sandbox = new CapturingSandbox(SandboxAgentOutputTransportKind.ExecPipe);
+        var runner = new TestRunner();
+
+        await runner.RunAsync(sandbox, "/work", "echo ok", credential: null);
+
+        Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, sandbox.LastExec?.AgentOutputTransport);
+    }
+
+    [Fact]
     public async Task RunAsync_WithEmptyLogPath_OmitsAgentLogFileEnv()
     {
         // BeginScope(null) and BeginScope("") both mean "do not capture";
@@ -108,7 +119,16 @@ public sealed class CliAgentLogFileEnvInjectionTests
     /// </summary>
     private sealed class CapturingSandbox : ISandbox
     {
+        private readonly SandboxAgentOutputTransportKind _transportKind;
+
+        public CapturingSandbox(
+            SandboxAgentOutputTransportKind transportKind = SandboxAgentOutputTransportKind.HttpIngest)
+        {
+            _transportKind = transportKind;
+        }
+
         public string Id => "capturing-test-sandbox";
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _transportKind;
         public SandboxExec? LastExec { get; private set; }
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
