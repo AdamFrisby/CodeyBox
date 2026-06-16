@@ -2944,15 +2944,30 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 "Deferred requeue backlog is {Count} items; deferrals may be sustained across many work items",
                 count);
 
+        var delayHook = DeferredRequeueDelayForTest;
+        Task? hookedDelayTask = null;
+        if (delayHook is not null)
+        {
+            // Capture the test hook synchronously so tests observe the scheduled
+            // deferral itself, not when the background timer task gets CPU time.
+            try
+            {
+                hookedDelayTask = delayHook(id, delay, stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                hookedDelayTask = Task.FromException(ex);
+            }
+        }
+
         _ = Task.Run(async () =>
         {
             try
             {
-                var delayHook = DeferredRequeueDelayForTest;
-                if (delayHook is null)
+                if (hookedDelayTask is null)
                     await Task.Delay(delay, stoppingToken);
                 else
-                    await delayHook(id, delay, stoppingToken);
+                    await hookedDelayTask;
 
                 if (RemoveDeferredItem(id, lease))
                 {
