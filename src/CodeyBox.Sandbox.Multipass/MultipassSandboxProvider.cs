@@ -5495,6 +5495,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("    echo \"codeybox-detached: failed to write process group marker\" >&2");
         sb.AppendLine("    exit 88");
         sb.AppendLine("fi");
+        sb.AppendLine("disown \"$codeybox_detached_pid\" 2>/dev/null || true");
         sb.AppendLine("exit 0");
         return sb.ToString();
     }
