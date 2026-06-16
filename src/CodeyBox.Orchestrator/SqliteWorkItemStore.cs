@@ -19,6 +19,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     };
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
+    // Also guards buffered reads on this store instance: Microsoft.Data.Sqlite
+    // connections are not safe for overlapping commands from dispatcher and
+    // worker tasks, even when WAL permits file-level read/write concurrency.
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
@@ -802,15 +805,23 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
     {
-        WorkItem? row;
-        using (var cmd = _conn.CreateCommand())
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
-            cmd.Parameters.AddWithValue("$id", id.ToString());
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            row = await reader.ReadAsync(ct) ? Read(reader) : null;
+            WorkItem? row;
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                cmd.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                row = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+            return await EnrichOneAsync(row, ct);
         }
-        return await EnrichOneAsync(row, ct);
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<PriorityUpdateResult> UpdatePriorityAsync(
@@ -981,13 +992,22 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -995,41 +1015,58 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     public async IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
-            // queue_position = 0 (pre-migration or newly created without explicit pos) sort
-            // last via the CASE sentinel, then by creation time for stable tie-breaking.
-            // Other states: simple creation-time ordering.
-            if (state == WorkItemState.Queued)
+            using (var cmd = _conn.CreateCommand())
             {
-                cmd.CommandText = """
-                    SELECT * FROM work_items WHERE state = $state
-                    ORDER BY
-                        CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
-                        created_at ASC;
-                    """;
+                // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
+                // queue_position = 0 (pre-migration or newly created without explicit pos) sort
+                // last via the CASE sentinel, then by creation time for stable tie-breaking.
+                // Other states: simple creation-time ordering.
+                if (state == WorkItemState.Queued)
+                {
+                    cmd.CommandText = """
+                        SELECT * FROM work_items WHERE state = $state
+                        ORDER BY
+                            CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
+                            created_at ASC;
+                        """;
+                }
+                else
+                {
+                    cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
+                }
+                cmd.Parameters.AddWithValue("$state", (int)state);
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
             }
-            else
-            {
-                cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
-            }
-            cmd.Parameters.AddWithValue("$state", (int)state);
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
     public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(*) FROM work_items WHERE state = $state;";
-        cmd.Parameters.AddWithValue("$state", (int)state);
-        var result = await cmd.ExecuteScalarAsync(ct);
-        return result is long l ? (int)l : 0;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM work_items WHERE state = $state;";
+            cmd.Parameters.AddWithValue("$state", (int)state);
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result is long l ? (int)l : 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
@@ -1037,53 +1074,62 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            // Exclude terminal states and parked states. The remaining set mirrors
-            // what the FIFO dispatcher used to process via the channel: Queued plus
-            // the mid-pipeline resumable states (Working, WorkComplete, Auditing,
-            // Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
-            //
-            // Post-audit finishing phases get a phase-precedence bucket ahead of
-            // fresh Queued work regardless of item priority. These items have already
-            // spent agent/audit time and only need merge/push completion to drain,
-            // so they must not sit behind a high-priority starting backlog.
-            cmd.CommandText = $"""
-                SELECT * FROM work_items
-                WHERE state NOT IN (
-                    {(int)WorkItemState.Done},
-                    {(int)WorkItemState.Failed},
-                    {(int)WorkItemState.Cancelled},
-                    {(int)WorkItemState.AuditFailed},
-                    {(int)WorkItemState.MergeConflictResolutionFailed},
-                    {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                    {(int)WorkItemState.NeedsOperatorInput},
-                    {(int)WorkItemState.WaitingForQuotaReset},
-                    {(int)WorkItemState.WaitingForAgentResume},
-                    {(int)WorkItemState.WaitingForTransientRetry}
-                )
-                ORDER BY
-                    CASE
-                        WHEN state IN (
-                            {(int)WorkItemState.AuditPassed},
-                            {(int)WorkItemState.Merging},
-                            {(int)WorkItemState.Merged},
-                            {(int)WorkItemState.UpstreamPushing}
-                        ) THEN 0
-                        ELSE 1
-                    END ASC,
-                    priority DESC,
-                    created_at ASC;
-                """;
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
+            using (var cmd = _conn.CreateCommand())
             {
-                var item = Read(reader);
-                if (skipIds.Contains(item.Id)) continue;
-                rows.Add(item);
+                // Exclude terminal states and parked states. The remaining set mirrors
+                // what the FIFO dispatcher used to process via the channel: Queued plus
+                // the mid-pipeline resumable states (Working, WorkComplete, Auditing,
+                // Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
+                //
+                // Post-audit finishing phases get a phase-precedence bucket ahead of
+                // fresh Queued work regardless of item priority. These items have already
+                // spent agent/audit time and only need merge/push completion to drain,
+                // so they must not sit behind a high-priority starting backlog.
+                cmd.CommandText = $"""
+                    SELECT * FROM work_items
+                    WHERE state NOT IN (
+                        {(int)WorkItemState.Done},
+                        {(int)WorkItemState.Failed},
+                        {(int)WorkItemState.Cancelled},
+                        {(int)WorkItemState.AuditFailed},
+                        {(int)WorkItemState.MergeConflictResolutionFailed},
+                        {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                        {(int)WorkItemState.NeedsOperatorInput},
+                        {(int)WorkItemState.WaitingForQuotaReset},
+                        {(int)WorkItemState.WaitingForAgentResume},
+                        {(int)WorkItemState.WaitingForTransientRetry}
+                    )
+                    ORDER BY
+                        CASE
+                            WHEN state IN (
+                                {(int)WorkItemState.AuditPassed},
+                                {(int)WorkItemState.Merging},
+                                {(int)WorkItemState.Merged},
+                                {(int)WorkItemState.UpstreamPushing}
+                            ) THEN 0
+                            ELSE 1
+                        END ASC,
+                        priority DESC,
+                        created_at ASC;
+                    """;
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    var item = Read(reader);
+                    if (skipIds.Contains(item.Id)) continue;
+                    rows.Add(item);
+                }
             }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }

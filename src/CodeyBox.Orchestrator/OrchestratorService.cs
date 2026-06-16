@@ -1189,7 +1189,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // Prune completed tasks on every iteration to prevent unbounded growth.
                 inFlight.RemoveAll(t => t.IsCompleted);
 
-                break;
+                blockForFirstSlot = false;
             }
         }
 
