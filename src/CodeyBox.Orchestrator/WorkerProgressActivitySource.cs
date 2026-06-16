@@ -46,7 +46,9 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     public const string WorkItemIdEnvironmentVariable = SandboxConventions.WorkItemIdEnvironmentVariable;
 
     private const int MaxAncestorWalk = 32;
-    private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(50);
+    // First-seen tagged processes need enough wall time to accrue a CPU tick on
+    // loaded hosts; too short a window makes the watchdog recover active workers.
+    private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(250);
     private readonly IActiveSandboxProgressProvider? _activeSandboxProvider;
     private readonly ConcurrentDictionary<WorkItemId, ProcessCpuSample> _processSamples = new();
     private readonly ConcurrentDictionary<WorkItemId, string> _activeSandboxSignatures = new();
