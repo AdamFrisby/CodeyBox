@@ -18,6 +18,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
     private readonly IAgentRegistry? _agents;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentRoutingReadiness? _routingReadiness;
+    private readonly IRefactorProjectDispatchGate _refactorProjectDispatchGate;
     private readonly ILogger<WorkerPoolHealthCoordinator> _log;
 
     public WorkerPoolHealthCoordinator(
@@ -29,7 +30,8 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
         IAgentRoutingReadiness? routingReadiness = null,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        IRefactorProjectDispatchGate? refactorProjectDispatchGate = null)
     {
         _dispatcher = dispatcher;
         _store = store;
@@ -39,6 +41,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         _agents = agents;
         _dispatchAvailability = dispatchAvailability;
         _routingReadiness = routingReadiness;
+        _refactorProjectDispatchGate = refactorProjectDispatchGate ?? dispatcher;
         _log = log;
     }
 
@@ -136,6 +139,12 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         CancellationToken ct)
     {
         if (!await dependenciesSatisfied(candidate))
+            return false;
+
+        var refactorGate = await _refactorProjectDispatchGate.CheckRefactorDispatchGateAsync(
+            RefactorDispatchCandidate.FromWorkItem(candidate),
+            ct);
+        if (refactorGate.IsBlocked)
             return false;
 
         Project? project = null;

@@ -1012,6 +1012,32 @@ Returns the monthly cost budget status for a project.
 
 `thresholdState` is one of `ok | warning | exceeded`. When `monthlyBudgetUsd = 0` the state is always `ok`.
 
+### `GET /queue/status`
+
+Returns global queue pause state plus active refactor project gates.
+
+```json
+{
+  "state": "Running",
+  "pausedAt": null,
+  "pausedReason": null,
+  "refactorGates": [
+    {
+      "projectId": "my-app",
+      "state": "draining",
+      "refactorWorkItemId": "0199...",
+      "refactorInFlight": 0,
+      "otherInFlight": 2,
+      "reason": "refactor drain: queued refactor '0199...' is waiting for project 'my-app' to drain; fresh non-refactor starts are held"
+    }
+  ]
+}
+```
+
+`refactorGates[].state` is `draining` while a queued refactor is holding
+fresh same-project non-refactor starts so existing work can finish, and
+`locked` while the refactor itself is in flight.
+
 ### `POST /projects/{id}/queue/pause`
 
 Manually pause work-item pickup for a single project. In-flight items continue to completion.

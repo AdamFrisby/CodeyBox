@@ -215,6 +215,34 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task DeferredRequeue_DuplicateScheduleKeepsSingleRetryOwner()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        var id = WorkItemId.New();
+        var delay = TimeSpan.FromMilliseconds(75);
+
+        svc.ScheduleInfrastructureDeferredRequeue(id, delay);
+        svc.ScheduleInfrastructureDeferredRequeue(id, delay);
+
+        Assert.True(svc.IsDeferredForTest(id));
+        Assert.True(
+            await WaitUntilAsync(() => queue.EnqueueCount(id) == 1, TimeSpan.FromSeconds(2)),
+            "The first deferral owner should emit the retry wake.");
+        Assert.False(svc.IsDeferredForTest(id));
+
+        Assert.False(
+            await WaitUntilAsync(() => queue.EnqueueCount(id) > 1, TimeSpan.FromMilliseconds(250)),
+            "A duplicate deferral schedule must not create a second retry wake for the same item.");
+    }
+
+    [Fact]
     public async Task SlotReleaseWake_DoesNotDispatchWhileQueuePaused()
     {
         using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);

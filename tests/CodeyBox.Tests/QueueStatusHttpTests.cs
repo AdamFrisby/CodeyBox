@@ -49,6 +49,134 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task GetQueueStatus_IncludesRefactorDrainState()
+    {
+        var projectId = new ProjectId("proj");
+        var normal = MakeWorkItem(projectId) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+        };
+        await _factory.Store.CreateAsync(normal);
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var gate = Assert.Single(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+        Assert.Equal("proj", gate.GetProperty("projectId").GetString());
+        Assert.Equal("draining", gate.GetProperty("state").GetString());
+        Assert.Equal(refactor.Id.ToString(), gate.GetProperty("refactorWorkItemId").GetString());
+        Assert.Equal(1, gate.GetProperty("otherInFlight").GetInt32());
+        Assert.Contains("refactor drain", gate.GetProperty("reason").GetString() ?? "");
+    }
+
+    [Fact]
+    public async Task GetQueueStatus_ExcludesRefactorDrainWhenFreshNormalIsAheadInDispatchOrder()
+    {
+        var projectId = new ProjectId("proj");
+        var createdAt = DateTimeOffset.UtcNow.AddSeconds(-10);
+        var activeNormal = MakeWorkItem(projectId) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var higherPriorityNormal = MakeWorkItem(projectId) with
+        {
+            Priority = 100,
+            CreatedAt = createdAt,
+        };
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+            Priority = 0,
+            CreatedAt = createdAt.AddSeconds(1),
+        };
+        await _factory.Store.CreateAsync(activeNormal);
+        await _factory.Store.CreateAsync(higherPriorityNormal);
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Empty(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+    }
+
+    /// <summary>
+    /// Companion to <see cref="GetQueueStatus_ExcludesRefactorDrainWhenFreshNormalIsAheadInDispatchOrder"/>:
+    /// the suppress-draining-status branch must also fire when the normal item
+    /// ahead has the SAME priority as the refactor but was created earlier
+    /// (priority is the primary tiebreaker, but on a tie the older item still
+    /// wins). Without this case a regression that only honored priority while
+    /// ignoring CreatedAt on tied priorities could still leave the higher
+    /// finding green. The project is intentionally busy (one in-flight normal)
+    /// so the branch's `counts != 0` guard does not short-circuit before the
+    /// dispatch-order check is reached.
+    /// </summary>
+    [Fact]
+    public async Task GetQueueStatus_ExcludesRefactorDrain_WhenBusyProjectHasSamePriorityOlderNormalAheadOfRefactor()
+    {
+        var projectId = new ProjectId("proj-tiebreaker");
+        var createdAt = DateTimeOffset.UtcNow.AddSeconds(-30);
+        var activeNormal = MakeWorkItem(projectId) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var olderSamePriorityNormal = MakeWorkItem(projectId) with
+        {
+            Priority = 50,
+            CreatedAt = createdAt,
+        };
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+            Priority = 50,
+            CreatedAt = createdAt.AddSeconds(5),
+        };
+        await _factory.Store.CreateAsync(activeNormal);
+        await _factory.Store.CreateAsync(olderSamePriorityNormal);
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Empty(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+    }
+
+    [Fact]
+    public async Task GetQueueStatus_IncludesRefactorLockedState()
+    {
+        var projectId = new ProjectId("proj-locked");
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var gate = Assert.Single(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+        Assert.Equal("proj-locked", gate.GetProperty("projectId").GetString());
+        Assert.Equal("locked", gate.GetProperty("state").GetString());
+        Assert.Equal(refactor.Id.ToString(), gate.GetProperty("refactorWorkItemId").GetString());
+        Assert.Equal(1, gate.GetProperty("refactorInFlight").GetInt32());
+        Assert.Equal(0, gate.GetProperty("otherInFlight").GetInt32());
+        Assert.Contains("refactor exclusivity", gate.GetProperty("reason").GetString() ?? "");
+    }
+
+    [Fact]
     public async Task PauseQueue_Returns200_AndStateIsPaused()
     {
         var resp = await _client.PostAsJsonAsync("/queue/pause", new { reason = "test pause" });
@@ -307,6 +435,15 @@ public sealed class QueueStatusHttpTests : IDisposable
         int Last24h,
         int CurrentlyInFlight,
         BudgetLimitsResponse? Limits);
+
+    private static WorkItem MakeWorkItem(ProjectId projectId) => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = projectId,
+        Title = "queue status",
+        Prompt = "do work",
+        State = WorkItemState.Queued,
+    };
 }
 
 /// <summary>

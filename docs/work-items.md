@@ -582,14 +582,19 @@ dispatch-time exclusivity gate.
 
 ### Anti-starvation
 
-A refactor can in principle sit deferred indefinitely if the project
-never drains. Anti-starvation policy (e.g. quiescing new pickups to let
-a refactor through) is intentionally out of scope for the gate itself
-and will be tracked as a separate follow-up. Until that ships,
-operators that want a refactor to land on a busy project should pause
-the project queue (`POST /projects/{id}/pause`) until the in-flight
-items finish, then unpause; the refactor will pick up at the next
-dispatch tick.
+Once a refactor is the highest-priority eligible fresh start for its project
+by the normal dispatch order, the dispatcher opens a project-scoped drain:
+lower-priority fresh starts for that project are deferred while already-started
+work continues through its remaining phases. When the project reaches zero
+in-flight items, the refactor starts; while it is in flight, same-project fresh
+starts remain deferred. Normal dispatch resumes after the refactor completes.
+
+This drain is project-scoped. A refactor drain in project X does not pause
+work in project Y, including another project's refactor.
+
+Operators can see active gates on `GET /queue/status` in the `refactorGates`
+array. Each entry reports the `projectId`, `state` (`draining` or `locked`),
+the refactor work-item ID, current in-flight counts, and the defer reason.
 
 ---
 
