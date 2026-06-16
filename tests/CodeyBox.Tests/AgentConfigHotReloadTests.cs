@@ -2532,6 +2532,66 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_RejectsNegativeAuditorIdleTimeoutAndKeepsPriorSnapshot()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                AuditorIdleTimeout = TimeSpan.FromMinutes(5),
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = initial.PipelineTuning.AuditorIdleTimeout,
+        });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+        var log = new CapturingLogger<AgentConfigHotReload>();
+
+        AgentConfigHotReload? coordinator = null;
+        try
+        {
+            coordinator = new AgentConfigHotReload(
+                monitor, orchFixture.Orchestrator, router, burnEstimator,
+                log,
+                pipelineTuning: snapshot);
+            await coordinator.StartAsync(CancellationToken.None);
+
+            monitor.Fire(new CodeyBoxOptions
+            {
+                PipelineTuning = new PipelineTuningOptions
+                {
+                    AuditorIdleTimeout = TimeSpan.FromSeconds(-1),
+                },
+            });
+
+            Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.AuditorIdleTimeout);
+            Assert.Contains(
+                log.Entries,
+                e => e.Level == LogLevel.Error
+                     && e.Message.Contains("Hot-reload of PipelineTuning rejected", StringComparison.Ordinal));
+
+            await coordinator.StopAsync(CancellationToken.None);
+            coordinator = null;
+        }
+        finally
+        {
+            if (coordinator is not null)
+                await coordinator.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_PipelineTuningDetectsOnlySessionResumeAttemptChange()
     {
         var initialTuning = new PipelineTuningOptions

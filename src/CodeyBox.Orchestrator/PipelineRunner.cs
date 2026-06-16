@@ -178,6 +178,7 @@ public sealed class PipelineRunner : IPipelineRunner
     // CancellationTokenSource timers use a uint millisecond due-time internally;
     // keep computed phase caps inside that runtime ceiling.
     private static readonly TimeSpan MaxCancellationTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
+    private static readonly TimeSpan AuditorTimeoutTeardownGrace = TimeSpan.FromSeconds(1);
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -6351,7 +6352,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     SandboxSpec sandboxSpec,
                     string auditorName)
                 {
-                    var prepared = await _sandboxes.CreateAsync(sandboxSpec, ct);
+                    var prepared = await CreateAuditSandboxWithIdleTimeoutAsync(sandboxSpec, auditorName, ct);
                     try
                     {
                         await RunAuditSandboxSetupWithIdleTimeoutAsync(
@@ -6529,7 +6530,10 @@ public sealed class PipelineRunner : IPipelineRunner
                         ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, trialItem, attemptCt)
                         : null;
                     var candidateSpec = BuildLlmSandboxSpec(candidateCredential);
-                    await using var sandbox = await _sandboxes.CreateAsync(candidateSpec, attemptCt);
+                    await using var sandbox = await CreateAuditSandboxWithIdleTimeoutAsync(
+                        candidateSpec,
+                        pair.Auditor.Name,
+                        attemptCt);
                     await RunAuditSandboxSetupWithIdleTimeoutAsync(
                         sandbox,
                         pair.Auditor.Name,
@@ -6796,6 +6800,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw firstExhaustion;
                 }
 
+                firstOtherException?.Throw();
+
                 if (incompleteAuditors.Count > 0)
                 {
                     var completedSnapshot = completedLlmProgress
@@ -6834,8 +6840,6 @@ public sealed class PipelineRunner : IPipelineRunner
                         CompletedAuditors: partialCompleted,
                         IncompleteAuditors: incompleteAuditors);
                 }
-
-                firstOtherException?.Throw();
 
                 // Every task succeeded — gather results in stable order.
                 var llmRuns = llmTasks.Select(t => t.Result).OrderBy(t => t.Index).ToList();
@@ -7014,6 +7018,58 @@ public sealed class PipelineRunner : IPipelineRunner
             canCaptureStructuredStream);
     }
 
+    private async Task<ISandbox> CreateAuditSandboxWithIdleTimeoutAsync(
+        SandboxSpec spec,
+        string auditorName,
+        CancellationToken ct)
+    {
+        var timeout = _pipelineTuning.Current.AuditorIdleTimeout;
+        if (timeout <= TimeSpan.Zero)
+            return await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var lastActivityTicks = Stopwatch.GetTimestamp();
+        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+
+        var createTask = _sandboxes.CreateAsync(spec, linkedCts.Token);
+        var timeoutTask = WaitForAuditorIdleTimeoutAsync(
+            linkedCts.Token,
+            () => Volatile.Read(ref lastActivityTicks));
+
+        try
+        {
+            var completed = await Task.WhenAny(createTask, timeoutTask).ConfigureAwait(false);
+            if (completed == timeoutTask)
+            {
+                var timedOutAfter = await timeoutTask.ConfigureAwait(false);
+                if (timedOutAfter is not null)
+                {
+                    await CancelAndObserveSandboxCreateAfterIdleTimeoutAsync(
+                        linkedCts,
+                        createTask,
+                        "sandbox launch",
+                        auditorName).ConfigureAwait(false);
+                    throw new AuditorIdleTimeoutException(auditorName, timedOutAfter.Value);
+                }
+
+                ct.ThrowIfCancellationRequested();
+            }
+
+            var sandbox = await createTask.ConfigureAwait(false);
+            Touch();
+            ct.ThrowIfCancellationRequested();
+            return sandbox;
+        }
+        finally
+        {
+            try { await linkedCts.CancelAsync().ConfigureAwait(false); }
+            catch (ObjectDisposedException) { }
+
+            try { await timeoutTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+    }
+
     private async Task RunAuditSandboxSetupWithIdleTimeoutAsync(
         ISandbox sandbox,
         string auditorName,
@@ -7182,9 +7238,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
-            using var killCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            using var killCts = new CancellationTokenSource(AuditorTimeoutTeardownGrace);
             await sandbox.KillActiveExecsAsync(killCts.Token)
-                .WaitAsync(TimeSpan.FromSeconds(1))
+                .WaitAsync(AuditorTimeoutTeardownGrace)
                 .ConfigureAwait(false);
         }
         catch (TimeoutException)
@@ -7208,7 +7264,7 @@ public sealed class PipelineRunner : IPipelineRunner
         try
         {
             await sandbox.DisposeAsync().AsTask()
-                .WaitAsync(TimeSpan.FromSeconds(1))
+                .WaitAsync(AuditorTimeoutTeardownGrace)
                 .ConfigureAwait(false);
         }
         catch (TimeoutException)
@@ -7235,7 +7291,7 @@ public sealed class PipelineRunner : IPipelineRunner
             return;
         }
 
-        var completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false);
+        var completed = await Task.WhenAny(task, Task.Delay(AuditorTimeoutTeardownGrace)).ConfigureAwait(false);
         if (completed == task)
         {
             ObserveTimedOutTask(task, operation, auditorName);
@@ -7254,6 +7310,91 @@ public sealed class PipelineRunner : IPipelineRunner
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
+    }
+
+    private async Task CancelAndObserveSandboxCreateAfterIdleTimeoutAsync(
+        CancellationTokenSource cts,
+        Task<ISandbox> createTask,
+        string operation,
+        string auditorName)
+    {
+        try { await cts.CancelAsync().ConfigureAwait(false); }
+        catch (ObjectDisposedException) { }
+
+        if (createTask.IsCompleted)
+        {
+            await ObserveOrDisposeCreatedSandboxAsync(createTask, operation, auditorName)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var completed = await Task.WhenAny(createTask, Task.Delay(AuditorTimeoutTeardownGrace))
+            .ConfigureAwait(false);
+        if (completed == createTask)
+        {
+            await ObserveOrDisposeCreatedSandboxAsync(createTask, operation, auditorName)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        _log.LogWarning(
+            "Timed-out {Operation} for auditor {Auditor} did not stop within the teardown grace period after cancellation",
+            operation,
+            auditorName);
+        _ = createTask.ContinueWith(
+            completedTask => ObserveOrDisposeCreatedSandboxAsync(completedTask, operation, auditorName),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default).Unwrap();
+    }
+
+    private async Task ObserveOrDisposeCreatedSandboxAsync(
+        Task<ISandbox> createTask,
+        string operation,
+        string auditorName)
+    {
+        ISandbox sandbox;
+        try
+        {
+            sandbox = await createTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                ex,
+                "Timed-out {Operation} for auditor {Auditor} stopped with an exception after launch cancellation",
+                operation,
+                auditorName);
+            return;
+        }
+
+        try
+        {
+            await sandbox.DisposeAsync().AsTask()
+                .WaitAsync(AuditorTimeoutTeardownGrace)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _log.LogWarning(
+                "Timed-out {Operation} for auditor {Auditor} produced sandbox {SandboxId} after cancellation but did not dispose it within the teardown grace period",
+                operation,
+                auditorName,
+                sandbox.Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Timed-out {Operation} for auditor {Auditor} produced sandbox {SandboxId} after cancellation but failed while disposing it",
+                operation,
+                auditorName,
+                sandbox.Id);
+        }
     }
 
     private void ObserveTimedOutTask(Task task, string operation, string auditorName)
@@ -13849,7 +13990,7 @@ Original merge-phase failure (for context):
         public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
             => _inner.GetAccessibilityTreeJsonAsync(ct);
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync() => _inner.DisposeAsync();
     }
 }
 

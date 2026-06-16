@@ -1319,6 +1319,48 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task LlmTimeoutDoesNotMaskSiblingInfrastructureFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+            Task.FromResult(new AuditResult(false,
+            [
+                new AuditFinding("architecture", AuditSeverity.Error, "completed blocker", "fix it"),
+            ])));
+        var unavailable = new DelegateAuditor("security", "llm", (_, _, _) =>
+            throw new AuditUnavailableException("simulated audit infrastructure failure"));
+        var hanging = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, unavailable, hanging],
+            maxAuditIterations: 2,
+            maxLlmAuditorParallelism: 3,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("simulated audit infrastructure failure", final.LastError);
+        Assert.Single(tp.Agent.WorkPrompts);
+        Assert.Single(tp.Agent.WorkPlan);
+    }
+
+    [Fact]
     public async Task IncompleteAuditWithOnlyNonBlockingFinding_RoutesToRework()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1757,6 +1799,43 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.True(sandboxProvider.ObservedCloneCancellation);
         Assert.Equal(1, auditorRuns);
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"audit setup timeout took {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task AuditSandboxLaunchNoOutput_IsCanceledWithinIdleBoundAndRetried()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var sandboxProvider = new HangingSecondCreateSandboxProvider();
+        var auditorRuns = 0;
+        var auditor = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            auditorRuns++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning,
+            sandboxProvider: sandboxProvider);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        var sw = Stopwatch.StartNew();
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        sw.Stop();
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(sandboxProvider.ObservedCreateCancellation);
+        Assert.Equal(1, auditorRuns);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"audit launch timeout took {sw.Elapsed}");
     }
 
     [Fact]
@@ -2266,6 +2345,40 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             public ValueTask DisposeAsync()
                 => inner.DisposeAsync();
         }
+    }
+
+    private sealed class HangingSecondCreateSandboxProvider : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner =
+            new(NullLogger<ProcessSandboxProvider>.Instance);
+        private int _createCalls;
+
+        public string Name => "hanging-second-create";
+        public bool ObservedCreateCancellation { get; private set; }
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _createCalls) == 2)
+            {
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    ObservedCreateCancellation = true;
+                    throw;
+                }
+            }
+
+            return await _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
     }
 
     private sealed class RecordingAuditProgressStore : IAuditProgressStore
