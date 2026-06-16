@@ -70,6 +70,40 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task NotifyTransientFailure_WhenSchedulePersistenceThrows_ReturnsSkippedWithoutArmingRetryTimer()
+    {
+        ThrowingOnceTryUpdateStore? failingStore = null;
+        using var fixture = BuildScheduler(
+            EnabledRetryOptions() with { BaseDelay = TimeSpan.FromSeconds(30) },
+            storeDecorator: inner => failingStore = new ThrowingOnceTryUpdateStore(inner));
+        var item = NewTransientItem();
+        await fixture.Store.CreateAsync(item);
+
+        var result = await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Skipped, result.Status);
+        Assert.Equal("transient schedule write failed", result.Reason);
+        Assert.Equal(1, failingStore!.TryUpdateCalls);
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal("transient", stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+
+        _time.Advance(TimeSpan.FromSeconds(30));
+        await Task.Delay(100);
+
+        stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+        Assert.Equal(1, failingStore.TryUpdateCalls);
+    }
+
+    [Fact]
     public async Task NotifyTransientFailure_AppliesFullJitterSpread()
     {
         var randoms = new Queue<double>([0.10, 0.90]);
@@ -154,6 +188,35 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Contains("attempts=5; max=5", stored.LastError);
         var failed = Assert.Single(webhooks.Events, e => e.Event == "work_item.failed");
         Assert.Equal(stored.Id, failed.WorkItem?.Id);
+    }
+
+    [Fact]
+    public async Task NotifyTransientFailure_AtAttemptCap_WhenFailedWebhookThrows_StillMarksTransientExhausted()
+    {
+        using var fixture = BuildScheduler(
+            new AutoRetryOnTransientFailureOptions
+            {
+                Enabled = true,
+                BaseDelay = TimeSpan.FromSeconds(30),
+                MaxDelay = TimeSpan.FromMinutes(15),
+                Multiplier = 2,
+                MaxAutoRetriesPerWorkItem = 5,
+                MaxElapsedTime = TimeSpan.FromHours(1),
+                JitterMode = TransientRetryJitterMode.None,
+            },
+            webhooks: new ThrowingFailedWebhookDispatcher());
+        var item = NewTransientItem() with { TransientRetryAttempts = 5 };
+        await fixture.Store.CreateAsync(item);
+
+        var result = await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Exhausted, result.Status);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal("transient-exhausted", stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Contains("attempts=5; max=5", stored.LastError);
     }
 
     [Fact]
@@ -679,9 +742,11 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         IProjectRepository? projects = null,
         bool includeProjects = true,
         IWebhookDispatcher? webhooks = null,
-        Func<AutoRetryOnTransientFailureOptions>? transientRetryOptionsAccessor = null)
+        Func<AutoRetryOnTransientFailureOptions>? transientRetryOptionsAccessor = null,
+        Func<SqliteWorkItemStore, IWorkItemStore>? storeDecorator = null)
     {
-        var store = new SqliteWorkItemStore(Path.Combine(_workspace, $"state-{Guid.NewGuid():N}.db"));
+        var sqliteStore = new SqliteWorkItemStore(Path.Combine(_workspace, $"state-{Guid.NewGuid():N}.db"));
+        var store = storeDecorator?.Invoke(sqliteStore) ?? sqliteStore;
         var queue = new InMemoryTaskQueue();
         gitHost ??= new RecordingGitHost();
         var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
@@ -709,7 +774,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             transientRetryOptionsAccessor: transientRetryOptionsAccessor ?? (() => transientOptions),
             jitterRandom: jitterRandom);
 
-        return new SchedulerFixture(store, queue, scheduler);
+        return new SchedulerFixture(sqliteStore, queue, scheduler);
     }
 
     private static async Task RunTransientPeriodicSweepAsync(QuotaRetryScheduler scheduler)
@@ -843,5 +908,82 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         public Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct = default) => Task.CompletedTask;
         public Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct = default)
             => Task.FromResult<ProjectQueueState?>(new ProjectQueueState(projectId, _projectPaused, null, null));
+    }
+
+    private sealed class ThrowingFailedWebhookDispatcher : IWebhookDispatcher
+    {
+        public Task PublishAsync(WebhookEvent evt, CancellationToken ct = default)
+            => evt.Event == "work_item.failed"
+                ? throw new InvalidOperationException("webhook failed")
+                : Task.CompletedTask;
+    }
+
+    private sealed class ThrowingOnceTryUpdateStore : IWorkItemStore
+    {
+        private readonly SqliteWorkItemStore _inner;
+        private int _remainingThrows = 1;
+        private int _tryUpdateCalls;
+
+        public ThrowingOnceTryUpdateStore(SqliteWorkItemStore inner) => _inner = inner;
+
+        public int TryUpdateCalls => Volatile.Read(ref _tryUpdateCalls);
+
+        public Task CreateAsync(WorkItem item, CancellationToken ct = default) => _inner.CreateAsync(item, ct);
+        public Task UpdateAsync(WorkItem item, CancellationToken ct = default) => _inner.UpdateAsync(item, ct);
+
+        public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _tryUpdateCalls);
+            if (Interlocked.Exchange(ref _remainingThrows, 0) == 1)
+                throw new InvalidOperationException("transient schedule write failed");
+            return _inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+        }
+
+        public Task<PriorityUpdateResult> UpdatePriorityAsync(
+            WorkItemId id,
+            int priority,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default)
+            => _inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
+
+        public Task<DependsOnUpdateResult> UpdateDependsOnAsync(
+            WorkItemId id,
+            IReadOnlyList<WorkItemId> dependsOn,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default)
+            => _inner.UpdateDependsOnAsync(id, dependsOn, updatedAt, ct);
+
+        public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(
+            WorkItemId id,
+            int? auditMaxIterations,
+            string? auditComplexity,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default)
+            => _inner.UpdateAuditBudgetAsync(id, auditMaxIterations, auditComplexity, updatedAt, ct);
+
+        public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => _inner.GetAsync(id, ct);
+        public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => _inner.ListAsync(ct);
+        public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.ListByStateAsync(state, ct);
+        public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.CountByStateAsync(state, ct);
+        public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => _inner.ReorderAsync(orderedIds, ct);
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => _inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+        public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => _inner.CountStartedInWindowAsync(projectId, since, ct);
+        public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => _inner.CountInFlightAsync(projectId, ct);
+        public Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(ProjectId projectId, CancellationToken ct = default, WorkItemId? excludeId = null) => _inner.CountInFlightSplitByRefactorAsync(projectId, ct, excludeId);
+        public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => _inner.GetByExternalIdAsync(projectId, externalId, ct);
+        public Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) => _inner.GetByNamespacedExternalIdAsync(projectId, @namespace, externalId, ct);
+        public Task<WorkItem?> ReplaceExternalIdsAsync(WorkItemId id, IReadOnlyDictionary<string, string> externalIds, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.ReplaceExternalIdsAsync(id, externalIds, updatedAt, ct);
+        public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default) => _inner.GetFleetStateCountsAsync(ct);
+        public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default) => _inner.GetFleetRecentOutcomesAsync(perProject, ct);
+        public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) => _inner.GetFleetPauseStatesAsync(ct);
+        public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => _inner.ListByReplaySourceAsync(sourceId, ct);
+        public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => _inner.ListSuspendedAsync(ct);
+        public Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default) => _inner.GetActiveBaselineImageRefsAsync(ct);
+        public Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(string baselineImageRef, CancellationToken ct = default) => _inner.ListWorkItemsForBaselineAsync(baselineImageRef, ct);
+        public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => _inner.OrphanReplaysAsync(sourceId, ct);
+        public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => _inner.ListByReleaseAsync(releaseId, ct);
+        public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.TryReplacePromptAsync(id, newPrompt, updatedAt, ct);
+        public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) => _inner.RecordIterationDispatchAsync(workItemId, iteration, promptRevisionAtDispatch, dispatchedAt, ct);
+        public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) => _inner.GetIterationsAsync(workItemId, ct);
     }
 }
