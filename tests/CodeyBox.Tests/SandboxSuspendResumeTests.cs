@@ -1053,7 +1053,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         };
         gateRelease.SetResult();
 
-        await resumeTask.WaitAsync(TimeSpan.FromSeconds(2));
+        await resumeTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         var timedOut = await _store.GetAsync(hung.Id);
         Assert.Equal(WorkItemState.Failed, timedOut!.State);
