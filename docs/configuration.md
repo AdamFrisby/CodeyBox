@@ -498,11 +498,13 @@ build/test/quality failures are not retried.
 | `MaxElapsedTime` | `01:00:00` (1 h) | Total elapsed cap for one transient retry series. A retry that would fire after this window is not scheduled. |
 | `JitterMode` | `Full` | `None`, `Full`, or `Decorrelated`. Use jitter to spread retries during provider or ISP incidents. |
 
-The scheduler persists `FailureKind="transient"`, `NextTransientRetryAt`,
-`TransientRetryAttempts`, and `TransientRetryFirstFailedAt` on the work item.
-When the timer fires, it calls the shared `WorkItemRetrier` with auto-pick
-enabled, so items with prior work commits resume at audit instead of discarding
-the work branch.
+`TransientRetryScheduler` persists `FailureKind="transient"`,
+`NextTransientRetryAt`, `TransientRetryAttempts`, and
+`TransientRetryFirstFailedAt` on the work item. When the timer fires, it calls
+the shared `WorkItemRetrier` with auto-pick enabled, so items with prior work
+commits resume at audit instead of discarding the work branch. Quota retry
+remains owned by `QuotaRetryScheduler`; `IWorkItemAutoRetryScheduler` is only a
+small notification facade that delegates to the two policy schedulers.
 
 `CodeyBox:TransientNetworkFailurePatterns` appends extra classifier substrings
 without a rebuild. Built-in patterns deliberately avoid bare `timeout` so

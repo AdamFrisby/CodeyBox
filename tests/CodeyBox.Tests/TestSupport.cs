@@ -205,7 +205,9 @@ internal static class TestSupport
             AgentAllowedHosts = [],
             HostGitIdentity = hostGitIdentity,
         };
-        QuotaRetryScheduler? retryScheduler = null;
+        QuotaRetryScheduler? quotaRetryScheduler = null;
+        TransientRetryScheduler? transientRetryScheduler = null;
+        IWorkItemAutoRetryScheduler? retryScheduler = null;
         if (transientRetryOptions is not null)
         {
             var retryOptions = new OrchestratorOptions
@@ -219,16 +221,25 @@ internal static class TestSupport
                 gitHost,
                 NullLogger<WorkItemRetrier>.Instance,
                 projects: projects);
-            retryScheduler = new QuotaRetryScheduler(
+            quotaRetryScheduler = new QuotaRetryScheduler(
                 pipelineStore,
                 retrier,
                 retryOptions,
                 NullLogger<QuotaRetryScheduler>.Instance,
                 projects: projects,
                 webhooks: webhookDispatcher,
+                timeProvider: retryTimeProvider);
+            transientRetryScheduler = new TransientRetryScheduler(
+                pipelineStore,
+                retrier,
+                retryOptions,
+                NullLogger<TransientRetryScheduler>.Instance,
+                terminalTransitions,
+                projects: projects,
+                webhooks: webhookDispatcher,
                 timeProvider: retryTimeProvider,
-                transientRetryOptionsAccessor: () => transientRetryOptions,
-                terminalTransitions: terminalTransitions);
+                transientRetryOptionsAccessor: () => transientRetryOptions);
+            retryScheduler = new WorkItemAutoRetryScheduler(quotaRetryScheduler, transientRetryScheduler);
         }
 
         var pipeline = new PipelineRunner(
@@ -288,7 +299,16 @@ internal static class TestSupport
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
 
-        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement, retryScheduler);
+        return new TestPipeline(
+            pipeline,
+            store,
+            agent,
+            realGitHost,
+            gitRoot,
+            queue,
+            involvement,
+            transientRetryScheduler,
+            quotaRetryScheduler);
     }
 }
 
@@ -302,12 +322,14 @@ internal sealed class TestPipeline : IDisposable
     public string GitRoot { get; }
     public ITaskQueue Queue { get; }
     public IAgentInvolvementStore? Involvement { get; }
-    public QuotaRetryScheduler? RetryScheduler { get; }
+    public TransientRetryScheduler? RetryScheduler { get; }
+    private readonly QuotaRetryScheduler? _quotaRetryScheduler;
 
     public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot,
         ITaskQueue? queue = null,
         IAgentInvolvementStore? involvement = null,
-        QuotaRetryScheduler? retryScheduler = null)
+        TransientRetryScheduler? retryScheduler = null,
+        QuotaRetryScheduler? quotaRetryScheduler = null)
     {
         Pipeline = pipeline;
         Store = store;
@@ -317,11 +339,13 @@ internal sealed class TestPipeline : IDisposable
         Queue = queue ?? new InMemoryTaskQueue();
         Involvement = involvement;
         RetryScheduler = retryScheduler;
+        _quotaRetryScheduler = quotaRetryScheduler;
     }
 
     public void Dispose()
     {
         RetryScheduler?.Dispose();
+        _quotaRetryScheduler?.Dispose();
         Store.Dispose();
     }
 }

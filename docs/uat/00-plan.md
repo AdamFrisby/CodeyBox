@@ -329,7 +329,7 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 
 ### Transient transport auto-retry - Backs off and jitters retry after network/stream failures
 
-**Source**: `src/CodeyBox.Core/AgentFailureClassifier.cs`, `src/CodeyBox.Orchestrator/PipelineRunner.cs`, `src/CodeyBox.Orchestrator/QuotaRetryScheduler.cs`, `src/CodeyBox.Orchestrator/WorkItemRetrier.cs`, `src/CodeyBox.Core/WorkItem.cs`
+**Source**: `src/CodeyBox.Core/AgentFailureClassifier.cs`, `src/CodeyBox.Orchestrator/PipelineRunner.cs`, `src/CodeyBox.Orchestrator/TransientRetryScheduler.cs`, `src/CodeyBox.Orchestrator/WorkItemRetrier.cs`, `src/CodeyBox.Core/WorkItem.cs`
 **Related PRs**: none known
 
 #### Primary user flows

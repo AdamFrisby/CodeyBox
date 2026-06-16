@@ -138,15 +138,14 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             webhooks,
             _time,
-            autoRetryOptionsAccessor: autoRetryOptionsAccessor,
-            terminalTransitions: terminalTransitions);
+            autoRetryOptionsAccessor: autoRetryOptionsAccessor);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, webhooks, new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            retryScheduler: scheduler,
+            retryScheduler: new WorkItemAutoRetryScheduler(scheduler, transient: null),
             quotaClassifier: BuildQuotaClassifier(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,

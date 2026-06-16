@@ -26,9 +26,9 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         var orchestratorOptions = factory.Services.GetRequiredService<OrchestratorOptions>();
         Assert.True(orchestratorOptions.AutoRetryOnTransientFailure.Enabled);
 
-        var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
+        var scheduler = factory.Services.GetRequiredService<TransientRetryScheduler>();
         var accessor = Assert.IsType<Func<AutoRetryOnTransientFailureOptions>>(
-            typeof(QuotaRetryScheduler)
+            typeof(TransientRetryScheduler)
                 .GetField("_transientRetryOptionsAccessor", BindingFlags.NonPublic | BindingFlags.Instance)!
                 .GetValue(scheduler));
 
@@ -46,8 +46,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         using var factory = new QuotaRetrySchedulerWiringFactory(monitor);
 
         var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
-        Assert.Same(
-            scheduler,
+        Assert.IsType<WorkItemAutoRetryScheduler>(
             factory.Services.GetRequiredService<IWorkItemAutoRetryScheduler>());
         var accessor = Assert.IsType<Func<AutoRetryOnQuotaFailureOptions>>(
             typeof(QuotaRetryScheduler)
@@ -75,10 +74,11 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             .GetValue(scheduler);
         Assert.Same(factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(), wiredSignal);
 
+        var transientScheduler = factory.Services.GetRequiredService<TransientRetryScheduler>();
         var transientAccessor = Assert.IsType<Func<AutoRetryOnTransientFailureOptions>>(
-            typeof(QuotaRetryScheduler)
+            typeof(TransientRetryScheduler)
                 .GetField("_transientRetryOptionsAccessor", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .GetValue(scheduler));
+                .GetValue(transientScheduler));
         var transient = transientAccessor();
         Assert.True(transient.Enabled);
         Assert.Equal(TimeSpan.FromSeconds(45), transient.BaseDelay);
@@ -124,7 +124,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             transientJitterMode: "None"));
         using var factory = new QuotaRetrySchedulerWiringFactory(monitor);
 
-        var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
+        var scheduler = factory.Services.GetRequiredService<IWorkItemAutoRetryScheduler>();
         var store = factory.Services.GetRequiredService<IWorkItemStore>();
         var item = NewTransientRetryItem() with { TransientRetryAttempts = 2 };
         await store.CreateAsync(item);

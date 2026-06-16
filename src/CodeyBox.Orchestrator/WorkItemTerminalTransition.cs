@@ -14,7 +14,7 @@ public interface IWorkItemTerminalTransition
 
 public interface IWorkItemTerminalRevisionBuilder
 {
-    Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct);
+    Task<TerminalRevisionAttribution?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct);
 }
 
 public sealed record WorkItemTerminalFailureTransitionOptions
@@ -62,12 +62,12 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
         _log = log;
     }
 
-    async Task<TerminalRevisionDetails?> IWorkItemTerminalRevisionBuilder.BuildTerminalRevisionAsync(
+    async Task<TerminalRevisionAttribution?> IWorkItemTerminalRevisionBuilder.BuildTerminalRevisionAsync(
         WorkItem item,
         CancellationToken ct)
         => await BuildTerminalRevisionCoreAsync(item, ct);
 
-    private async Task<TerminalRevisionDetails?> BuildTerminalRevisionCoreAsync(WorkItem item, CancellationToken ct)
+    private async Task<TerminalRevisionAttribution?> BuildTerminalRevisionCoreAsync(WorkItem item, CancellationToken ct)
     {
         if (!WorkItemDependencies.TerminalStates.Contains(item.State))
             return null;
@@ -77,7 +77,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
             ? null
             : iterations.OrderByDescending(i => i.Iteration).First().PromptRevisionAtDispatch;
 
-        return new TerminalRevisionDetails(
+        return new TerminalRevisionAttribution(
             PromptRevision: item.PromptRevision,
             RevisionAtCompletion: lastDispatched,
             RevisionMatches: lastDispatched is { } r ? r == item.PromptRevision : null);
@@ -210,15 +210,13 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
 }
 
 /// <summary>
-/// Carrier for revision-attribution fields lifted onto webhook
-/// payloads at terminal-state transitions (Done / Failed / Cancelled /
-/// AuditFailed / MergeConflictResolutionFailed). The fields themselves are
-/// serialised at the TOP LEVEL of the webhook payload (see
-/// <see cref="WebhookEvent.PromptRevision"/> et al.) so trackers like
-/// JobTrack can read <c>payload.promptRevision</c> directly; this record is
-/// just the in-process plumbing.
+/// Domain value describing whether a terminal work item completed against the
+/// prompt revision that was current when its last iteration was dispatched.
+/// The values are published as top-level terminal webhook fields (see
+/// <see cref="WebhookEvent.PromptRevision"/> et al.) so external trackers can
+/// distinguish fresh completions from stale-prompt completions.
 /// </summary>
-public sealed record TerminalRevisionDetails(
+public sealed record TerminalRevisionAttribution(
     int PromptRevision,
     int? RevisionAtCompletion,
     bool? RevisionMatches);

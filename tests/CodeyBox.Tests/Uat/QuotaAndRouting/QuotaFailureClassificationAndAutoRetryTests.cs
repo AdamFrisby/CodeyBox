@@ -492,7 +492,7 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            retryScheduler: retryScheduler,
+            retryScheduler: new WorkItemAutoRetryScheduler(retryScheduler, transient: null),
             quotaClassifier: BuildClassifier(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,

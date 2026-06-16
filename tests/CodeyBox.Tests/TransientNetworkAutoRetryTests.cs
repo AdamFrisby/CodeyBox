@@ -877,11 +877,16 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions { Enabled = false },
             AutoRetryOnTransientFailure = transientOptions,
         };
-        var scheduler = new QuotaRetryScheduler(
+        var terminalTransitions = TestSupport.CreateTerminalTransition(
+            store,
+            webhooks,
+            projects);
+        var scheduler = new TransientRetryScheduler(
             store,
             retrier,
             opts,
-            NullLogger<QuotaRetryScheduler>.Instance,
+            NullLogger<TransientRetryScheduler>.Instance,
+            terminalTransitions,
             projects: projects,
             queueController: queueController,
             webhooks: webhooks,
@@ -892,20 +897,20 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         return new SchedulerFixture(sqliteStore, queue, scheduler);
     }
 
-    private static async Task RunTransientPeriodicSweepAsync(QuotaRetryScheduler scheduler)
+    private static async Task RunTransientPeriodicSweepAsync(TransientRetryScheduler scheduler)
     {
-        var method = typeof(QuotaRetryScheduler).GetMethod(
+        var method = typeof(TransientRetryScheduler).GetMethod(
             "RunTransientPeriodicSweepAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         await (Task)method.Invoke(scheduler, [CancellationToken.None])!;
     }
 
     private static async Task InvokeTryTransientRetryAsync(
-        QuotaRetryScheduler scheduler,
+        TransientRetryScheduler scheduler,
         WorkItem item,
         string source)
     {
-        var method = typeof(QuotaRetryScheduler).GetMethod(
+        var method = typeof(TransientRetryScheduler).GetMethod(
             "TryTransientRetryAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         await (Task)method.Invoke(scheduler, [item, source, CancellationToken.None])!;
@@ -951,7 +956,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     private sealed record SchedulerFixture(
         SqliteWorkItemStore Store,
         InMemoryTaskQueue Queue,
-        QuotaRetryScheduler Scheduler) : IDisposable
+        TransientRetryScheduler Scheduler) : IDisposable
     {
         public void Dispose()
         {

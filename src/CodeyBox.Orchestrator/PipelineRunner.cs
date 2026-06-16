@@ -13246,7 +13246,7 @@ Original merge-phase failure (for context):
     /// latest prompt edit was not yet visible". Non-terminal transitions
     /// return null so the existing payload shape is unchanged.
     /// </summary>
-    internal async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
+    internal async Task<TerminalRevisionAttribution?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
         => await _terminalRevisionBuilder.BuildTerminalRevisionAsync(item, ct);
 
     /// <summary>

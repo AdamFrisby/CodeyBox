@@ -869,8 +869,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             projects,
             null,
             webhooks,
-            time,
-            terminalTransitions: terminalTransitions);
+            time);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -887,7 +886,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: auditProbes,
             auditQuotaOptions: sharedQuotaOptions,
-            retryScheduler: scheduler,
+            retryScheduler: new WorkItemAutoRetryScheduler(scheduler, transient: null),
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaFailures: quotaFailures,

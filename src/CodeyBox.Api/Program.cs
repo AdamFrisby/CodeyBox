@@ -2350,6 +2350,17 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.ClockDriftSafetyMargin,
             current.MaxAutoRetriesPerWorkItem);
     },
+    quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
+builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    sp.GetRequiredService<OrchestratorOptions>(),
+    sp.GetRequiredService<ILogger<TransientRetryScheduler>>(),
+    sp.GetRequiredService<IWorkItemTerminalTransition>(),
+    projects: sp.GetRequiredService<IProjectRepository>(),
+    queueController: sp.GetRequiredService<IQueueController>(),
+    webhooks: sp.GetRequiredService<IWebhookDispatcher>(),
+    timeProvider: sp.GetService<TimeProvider>(),
     transientRetryOptionsAccessor: () =>
     {
         var current = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRetryOnTransientFailure;
@@ -2362,14 +2373,15 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.MaxAutoRetriesPerWorkItem,
             current.MaxElapsedTime,
             current.JitterMode);
-    },
-    quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
-    terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>()));
+    }));
 builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
-    sp.GetRequiredService<QuotaRetryScheduler>());
+    new WorkItemAutoRetryScheduler(
+        sp.GetRequiredService<QuotaRetryScheduler>(),
+        sp.GetRequiredService<TransientRetryScheduler>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<WorkItemRetrier>(),

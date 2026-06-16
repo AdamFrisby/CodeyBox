@@ -235,9 +235,10 @@ public static class AgentFailureClassifier
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
+        // Broad substrings are trusted only from runner/sandbox diagnostics.
+        // Model-controlled stdout/summary must use structured turn.failed
+        // metadata to drive automatic transient retries.
         if (ContainsAny(stderr, TransientNetworkPatterns)
-            || ContainsAny(stdout, TransientNetworkPatterns)
-            || ContainsAny(summary, TransientNetworkPatterns)
             || ContainsTurnFailedTransientNetwork(stderr)
             || ContainsTurnFailedTransientNetwork(stdout)
             || ContainsTurnFailedTransientNetwork(summary))

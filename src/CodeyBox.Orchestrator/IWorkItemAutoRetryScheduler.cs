@@ -12,6 +12,28 @@ public interface IWorkItemAutoRetryScheduler
     Task<WorkItemAutoRetryScheduleResult> NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default);
 }
 
+public sealed class WorkItemAutoRetryScheduler : IWorkItemAutoRetryScheduler
+{
+    private readonly QuotaRetryScheduler _quota;
+    private readonly TransientRetryScheduler? _transient;
+
+    public WorkItemAutoRetryScheduler(
+        QuotaRetryScheduler quota,
+        TransientRetryScheduler? transient)
+    {
+        _quota = quota;
+        _transient = transient;
+    }
+
+    public Task NotifyQuotaFailureAsync(WorkItem item, CancellationToken ct = default) =>
+        _quota.NotifyQuotaFailureAsync(item, ct);
+
+    public Task<WorkItemAutoRetryScheduleResult> NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default) =>
+        _transient is null
+            ? Task.FromResult(WorkItemAutoRetryScheduleResult.Skipped(item, "transient-scheduler-unavailable"))
+            : _transient.NotifyTransientFailureAsync(item, ct);
+}
+
 public enum WorkItemAutoRetryScheduleStatus
 {
     Scheduled,

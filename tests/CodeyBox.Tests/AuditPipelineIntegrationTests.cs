@@ -77,14 +77,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditAgentSummaryOnlyTransientFailure_ParksWaitingForTransientRetry()
+    public async Task AuditAgentStderrTransientFailure_ParksWaitingForTransientRetry()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [new LlmSummaryOnlyTransientFailureAuditor()],
+            auditors: [new LlmStderrTransientFailureAuditor()],
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -2409,9 +2409,9 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         }
     }
 
-    private sealed class LlmSummaryOnlyTransientFailureAuditor : IAuditor
+    private sealed class LlmStderrTransientFailureAuditor : IAuditor
     {
-        public string Name => "llm-summary-transient";
+        public string Name => "llm-stderr-transient";
         public string Kind => "llm";
         public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
 
@@ -2430,12 +2430,13 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 Findings:
                 [
                     new AuditFinding(
-                        "llm-summary-transient",
+                        "llm-stderr-transient",
                         AuditSeverity.Error,
                         "review agent failed to run",
-                        "summary-only transient transport failure")
+                        "stderr transient transport failure")
                 ],
-                AgentSummary: "request timed out"));
+                AgentStderr: "request timed out while reading audit stream",
+                AgentSummary: "agent failed"));
         }
     }
 

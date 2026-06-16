@@ -1117,9 +1117,9 @@ public sealed class MergeConflictReworkTests : IDisposable
                 $"sandbox command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}\n{r.Stdout}");
     }
 
-    private static async Task RunTransientPeriodicSweepAsync(QuotaRetryScheduler scheduler)
+    private static async Task RunTransientPeriodicSweepAsync(TransientRetryScheduler scheduler)
     {
-        var method = typeof(QuotaRetryScheduler).GetMethod(
+        var method = typeof(TransientRetryScheduler).GetMethod(
             "RunTransientPeriodicSweepAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         await (Task)method.Invoke(scheduler, [CancellationToken.None])!;
