@@ -1,6 +1,8 @@
-namespace CodeyBox.Core;
+using CodeyBox.Core;
 
-public sealed class TerminalTransientNetworkError : Exception
+namespace CodeyBox.Orchestrator;
+
+internal sealed class TerminalTransientNetworkError : Exception
 {
     public AgentKind Agent { get; }
     public string? Phase { get; }

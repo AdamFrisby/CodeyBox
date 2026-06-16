@@ -373,6 +373,10 @@ public sealed class WorkItemRecoveryPolicyTests
             WorkBranch = "codeybox/work",
             LastError = "prior error",
             FailureKind = "other",
+            NextTransientRetryAt = DateTimeOffset.UtcNow.AddMinutes(5),
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-3),
+            TransientRetryFrom = "merge",
         };
 
         var recovered = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
@@ -386,6 +390,10 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Null(recovered.PreemptCheckpoint);
         Assert.Null(recovered.LastError);
         Assert.Null(recovered.FailureKind);
+        Assert.Null(recovered.NextTransientRetryAt);
+        Assert.Equal(0, recovered.TransientRetryAttempts);
+        Assert.Null(recovered.TransientRetryFirstFailedAt);
+        Assert.Null(recovered.TransientRetryFrom);
     }
 
     [Fact]

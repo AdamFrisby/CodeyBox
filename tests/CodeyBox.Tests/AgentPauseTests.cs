@@ -1011,6 +1011,39 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AgentPauseRetryScheduler_ResumeClearsStaleTransientRetryFields()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var item = Item(classId: null) with
+        {
+            State = WorkItemState.WaitingForAgentResume,
+            LastError = "waiting: agent paused: paused by operator: maintenance",
+            AgentPauseRetryFrom = "work",
+            NextTransientRetryAt = firstFailedAt.AddMinutes(5),
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = firstFailedAt,
+            TransientRetryFrom = "merge",
+        };
+        await store.CreateAsync(item);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
+
+        var retried = await scheduler.RetryWaitingItemsForTestAsync("agent-resumed");
+
+        Assert.Equal(1, retried);
+        var resumed = await store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.Queued, resumed!.State);
+        Assert.Null(resumed.NextTransientRetryAt);
+        Assert.Equal(0, resumed.TransientRetryAttempts);
+        Assert.Null(resumed.TransientRetryFirstFailedAt);
+        Assert.Null(resumed.TransientRetryFrom);
+        Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
     public async Task AgentPauseRetryScheduler_PeriodicExpirySweep_RequeuesExpiredPause()
     {
         var now = new DateTimeOffset(2026, 6, 4, 0, 0, 0, TimeSpan.Zero);

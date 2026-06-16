@@ -42,6 +42,7 @@ internal static class WorkItemAgentPauseParking
             NextTransientRetryAt = null,
             TransientRetryAttempts = 0,
             TransientRetryFirstFailedAt = null,
+            TransientRetryFrom = null,
             AgentPauseRetryFrom = normalizedRetryFrom,
             StartedAt = null,
             AgentPauseTarget = target,

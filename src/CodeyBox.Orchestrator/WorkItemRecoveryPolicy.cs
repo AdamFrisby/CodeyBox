@@ -445,6 +445,7 @@ internal static class WorkItemRecoveryPolicy
         NextTransientRetryAt = null,
         TransientRetryAttempts = 0,
         TransientRetryFirstFailedAt = null,
+        TransientRetryFrom = null,
         CancellationReason = null,
         CancellationSource = null,
         UpdatedAt = now,

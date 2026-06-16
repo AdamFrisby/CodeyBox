@@ -23,6 +23,8 @@ public static class AgentFailureClassifier
     public const string SoftRateLimitReason = "soft rate-limit pattern matched";
 
     private const int MaxStructuredOutputLineChars = 64 * 1024;
+    private const int MaxStructuredOutputCandidateLines = 200;
+    private const int MaxStructuredOutputCandidateChars = 256 * 1024;
 
     /// <summary>
     /// Quota / capacity exhaustion shapes where an immediate same-agent resume
@@ -309,6 +311,8 @@ public static class AgentFailureClassifier
 
         using var reader = new StringReader(output);
         string? rawLine;
+        var candidateLines = 0;
+        var candidateChars = 0;
         while ((rawLine = reader.ReadLine()) is not null)
         {
             var line = rawLine.Trim();
@@ -316,6 +320,14 @@ public static class AgentFailureClassifier
                 || line.Length > MaxStructuredOutputLineChars
                 || line[0] != '{')
                 continue;
+
+            candidateLines++;
+            candidateChars += line.Length;
+            if (candidateLines > MaxStructuredOutputCandidateLines
+                || candidateChars > MaxStructuredOutputCandidateChars)
+            {
+                break;
+            }
 
             try
             {

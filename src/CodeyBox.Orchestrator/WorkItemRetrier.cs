@@ -173,7 +173,9 @@ public sealed class WorkItemRetrier
         // WaitingForQuotaReset, or WaitingForTransientRetry. Eligibility gates
         // that must apply across HTTP, scheduler, and operator paths live in
         // this retrier before the write.
-        var updated = await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
+        var updated = autoRetryKind == WorkItemAutoRetryKind.Transient
+            ? await _store.TryUpdateIfStateAndUpdatedAtAsync(resumed, item.State, item.UpdatedAt, ct)
+            : await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {
             return (false, "work item state changed concurrently; retry aborted", null, null, null);
@@ -358,6 +360,7 @@ public sealed class WorkItemRetrier
             NextTransientRetryAt = null,
             TransientRetryAttempts = 0,
             TransientRetryFirstFailedAt = null,
+            TransientRetryFrom = null,
             AgentPauseRetryFrom = null,
             StartedAt = null,
         };
@@ -552,6 +555,7 @@ public sealed class WorkItemRetrier
             NextTransientRetryAt = null,
             TransientRetryAttempts = 0,
             TransientRetryFirstFailedAt = null,
+            TransientRetryFrom = null,
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             StartedAt = null,

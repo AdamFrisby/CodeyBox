@@ -46,6 +46,47 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(0, stored.TransientRetryAttempts);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Failed, "other")]
+    [InlineData(WorkItemState.Failed, "quota")]
+    [InlineData(WorkItemState.Failed, "auth")]
+    [InlineData(WorkItemState.WaitingForQuotaReset, "quota")]
+    [InlineData(WorkItemState.Queued, null)]
+    public async Task NotifyTransientFailure_NonTransientRows_AreSkippedWithoutSideEffects(
+        WorkItemState state,
+        string? failureKind)
+    {
+        using var fixture = BuildScheduler(EnabledRetryOptions());
+        var item = NewTransientItem() with
+        {
+            State = state,
+            LastError = "non-transient failure",
+            FailureKind = failureKind,
+            NextTransientRetryAt = null,
+            TransientRetryAttempts = 0,
+            TransientRetryFirstFailedAt = null,
+            TransientRetryFrom = null,
+        };
+        await fixture.Store.CreateAsync(item);
+
+        var result = await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemAutoRetryScheduleStatus.Skipped, result.Status);
+        Assert.Equal("not-transient", result.Reason);
+        Assert.Equal(state, stored!.State);
+        Assert.Equal(failureKind, stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Null(stored.TransientRetryFirstFailedAt);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+
+        _time.Advance(TimeSpan.FromHours(1));
+        await Task.Delay(100);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
     [Fact]
     public async Task NotifyTransientFailure_WhenRowLeftTransientState_ReturnsStateChangedWithoutScheduling()
     {
@@ -66,6 +107,39 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Null(stored.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
         Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task TransientRetry_WithStaleDueSnapshot_DoesNotClearNewerFutureBackoff()
+    {
+        using var fixture = BuildScheduler(EnabledRetryOptions());
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryAttempts = 1,
+            TransientRetryFirstFailedAt = _time.GetUtcNow().AddMinutes(-1),
+        };
+        await fixture.Store.CreateAsync(item);
+        var staleDueSnapshot = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(staleDueSnapshot);
+
+        var newerBackoff = staleDueSnapshot! with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddMinutes(5),
+            TransientRetryAttempts = 2,
+            UpdatedAt = staleDueSnapshot.UpdatedAt.AddSeconds(1),
+        };
+        await fixture.Store.UpdateAsync(newerBackoff);
+
+        await InvokeTryTransientRetryAsync(fixture.Scheduler, staleDueSnapshot, "targeted");
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal("transient", stored.FailureKind);
+        Assert.Equal(newerBackoff.NextTransientRetryAt, stored.NextTransientRetryAt);
+        Assert.Equal(2, stored.TransientRetryAttempts);
         Assert.Equal(0, fixture.Queue.Count);
     }
 
@@ -783,6 +857,17 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             "RunTransientPeriodicSweepAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         await (Task)method.Invoke(scheduler, [CancellationToken.None])!;
+    }
+
+    private static async Task InvokeTryTransientRetryAsync(
+        QuotaRetryScheduler scheduler,
+        WorkItem item,
+        string source)
+    {
+        var method = typeof(QuotaRetryScheduler).GetMethod(
+            "TryTransientRetryAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)method.Invoke(scheduler, [item, source, CancellationToken.None])!;
     }
 
     private static WorkItem NewTransientItem() => new()

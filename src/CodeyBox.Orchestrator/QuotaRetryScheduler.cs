@@ -1014,6 +1014,12 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             return new TransientRetryAttemptResult("skipped:auto-retry-disabled");
         }
 
+        var current = await _store.GetAsync(item.Id, ct);
+        if (current is null)
+            return new TransientRetryAttemptResult("skipped:not-found");
+
+        item = current;
+
         if (!IsTransientRetryPending(item))
             return new TransientRetryAttemptResult("skipped:not-transient");
 
@@ -1245,10 +1251,12 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             {
                 NextTransientRetryAt = nextRetryAt,
                 TransientRetryFirstFailedAt = firstFailedAt,
+                UpdatedAt = DateTimeOffset.UtcNow,
             };
-            var updated = await _store.TryUpdateIfStateAsync(
+            var updated = await _store.TryUpdateIfStateAndUpdatedAtAsync(
                 scheduledItem,
                 item.State,
+                item.UpdatedAt,
                 ct);
             if (updated)
             {
