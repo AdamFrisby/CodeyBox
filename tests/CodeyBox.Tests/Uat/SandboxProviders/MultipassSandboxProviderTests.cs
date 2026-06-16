@@ -1151,7 +1151,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             return;
 
         using var cts = new CancellationTokenSource();
-        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
+        var detachedLaunchObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var killAttempted = false;
         var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
@@ -1165,6 +1165,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
+                detachedLaunchObserved.TrySetResult();
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "exec", _, "--", "sh", "-c", var command, "codeybox-detached-kill", var processGroupMarker]
@@ -1186,12 +1187,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["agent-cli", "--json"],
-                AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
-            }, cts.Token));
+        var execTask = sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+        }, cts.Token);
+
+        await detachedLaunchObserved.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => execTask);
 
         Assert.True(killAttempted);
     }
