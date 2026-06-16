@@ -136,7 +136,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
         }
 
         AuditLog.WorkItemFailed(failed.Id, error);
-        await PublishFailedAsync(failed, options);
+        await PublishFailedAsync(failed, options, ct);
 
         return new WorkItemTerminalTransitionResult(
             Updated: true,
@@ -146,20 +146,25 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
 
     private async Task PublishFailedAsync(
         WorkItem failed,
-        WorkItemTerminalFailureTransitionOptions options)
+        WorkItemTerminalFailureTransitionOptions options,
+        CancellationToken ct)
     {
         if (_webhooks is null)
             return;
 
         if (!options.SwallowPublishExceptions)
         {
-            await PublishFailedCoreAsync(failed, options);
+            await PublishFailedCoreAsync(failed, options, ct);
             return;
         }
 
         try
         {
-            await PublishFailedCoreAsync(failed, options);
+            await PublishFailedCoreAsync(failed, options, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -172,10 +177,11 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
 
     private async Task PublishFailedCoreAsync(
         WorkItem failed,
-        WorkItemTerminalFailureTransitionOptions options)
+        WorkItemTerminalFailureTransitionOptions options,
+        CancellationToken ct)
     {
-        var project = await ResolveProjectAsync(failed, options);
-        var revision = await BuildTerminalRevisionCoreAsync(failed, CancellationToken.None);
+        var project = await ResolveProjectAsync(failed, options, ct);
+        var revision = await BuildTerminalRevisionCoreAsync(failed, ct);
         await _webhooks!.PublishAsync(new WebhookEvent
         {
             Event = "work_item.failed",
@@ -185,18 +191,19 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
             RevisionAtCompletion = revision?.RevisionAtCompletion,
             RevisionMatches = revision?.RevisionMatches,
             Details = options.DetailsFactory?.Invoke(failed) ?? options.Details,
-        }, CancellationToken.None);
+        }, ct);
     }
 
     private async Task<Project?> ResolveProjectAsync(
         WorkItem item,
-        WorkItemTerminalFailureTransitionOptions options)
+        WorkItemTerminalFailureTransitionOptions options,
+        CancellationToken ct)
     {
         if (options.Project is not null)
             return options.Project;
 
         if (options.ResolveProjectWhenMissing && _projects is not null)
-            return await _projects.GetAsync(item.ProjectId, CancellationToken.None);
+            return await _projects.GetAsync(item.ProjectId, ct);
 
         return options.FallbackProjectWhenMissing
             ? new Project

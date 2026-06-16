@@ -100,6 +100,21 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Theory]
+    [InlineData("request timed out while reading agent stream")]
+    [InlineData("request_timeout")]
+    [InlineData("Reconnecting... attempt 4")]
+    [InlineData("Transport channel closed")]
+    [InlineData("timeout waiting for child process to exit")]
+    [InlineData("Connection timed out")]
+    [InlineData("i/o timeout")]
+    public void NetworkPatterns_InStdout_Classified_AsTransient(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
+    }
+
+    [Theory]
     [InlineData("agent exited 127", "env: 'agy': No such file or directory")]
     [InlineData("agent exited 127", "bash: codex: command not found")]
     [InlineData("agent exited 127", "")]
@@ -255,8 +270,11 @@ public sealed class AgentFailureClassifierTests
     [InlineData("build timeout after 10 minutes")]
     public void BareTimeout_NotClassified_AsTransient(string snippet)
     {
-        var c = AgentFailureClassifier.Classify(stderr: snippet);
-        Assert.Equal(AgentFailureKind.Normal, c.Kind);
+        var stderr = AgentFailureClassifier.Classify(stderr: snippet);
+        var stdout = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+
+        Assert.Equal(AgentFailureKind.Normal, stderr.Kind);
+        Assert.Equal(AgentFailureKind.Normal, stdout.Kind);
     }
 
     [Fact]

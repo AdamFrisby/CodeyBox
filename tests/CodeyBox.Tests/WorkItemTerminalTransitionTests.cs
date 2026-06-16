@@ -64,6 +64,78 @@ public sealed class WorkItemTerminalTransitionTests : IDisposable
         Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.failed");
     }
 
+    [Fact]
+    public async Task TransitionFailedAsync_WhenWebhookPublishHangs_ObservesCallerCancellation()
+    {
+        using var store = new SqliteWorkItemStore(Path.Combine(_workspace, "publish-timeout.db"));
+        var webhooks = new BlockingWebhookDispatcher();
+        var transition = new WorkItemTerminalTransition(
+            store,
+            webhooks,
+            projects: null,
+            NullLogger<WorkItemTerminalTransition>.Instance);
+        var item = NewTransientItem();
+        await store.CreateAsync(item);
+
+        using var cts = new CancellationTokenSource();
+        var transitionTask = transition.TransitionFailedAsync(
+            item,
+            "post-agent transition timeout",
+            new WorkItemTerminalFailureTransitionOptions
+            {
+                FailureKind = "transient-exhausted",
+            },
+            cts.Token);
+
+        await webhooks.WaitForPublishAsync();
+        await cts.CancelAsync();
+
+        var completed = await Task.WhenAny(transitionTask, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.Same(transitionTask, completed);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transitionTask);
+
+        var stored = await store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+    }
+
+    [Fact]
+    public async Task TransitionFailedAsync_WhenProjectLookupHangs_ObservesCallerCancellation()
+    {
+        using var store = new SqliteWorkItemStore(Path.Combine(_workspace, "project-timeout.db"));
+        var projects = new BlockingProjectRepository();
+        var transition = new WorkItemTerminalTransition(
+            store,
+            new CapturingWebhookDispatcher(),
+            projects,
+            NullLogger<WorkItemTerminalTransition>.Instance);
+        var item = NewTransientItem();
+        await store.CreateAsync(item);
+
+        using var cts = new CancellationTokenSource();
+        var transitionTask = transition.TransitionFailedAsync(
+            item,
+            "post-agent transition timeout",
+            new WorkItemTerminalFailureTransitionOptions
+            {
+                FailureKind = "transient-exhausted",
+                ResolveProjectWhenMissing = true,
+                FallbackProjectWhenMissing = false,
+            },
+            cts.Token);
+
+        await projects.WaitForLookupAsync();
+        await cts.CancelAsync();
+
+        var completed = await Task.WhenAny(transitionTask, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.Same(transitionTask, completed);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transitionTask);
+
+        var stored = await store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+    }
+
     private static WorkItem NewTransientItem() => new()
     {
         Id = WorkItemId.New(),
@@ -75,4 +147,41 @@ public sealed class WorkItemTerminalTransitionTests : IDisposable
         FailureKind = "transient",
         PushUpstream = false,
     };
+
+    private sealed class BlockingWebhookDispatcher : IWebhookDispatcher
+    {
+        private readonly TaskCompletionSource _publishStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task WaitForPublishAsync() => _publishStarted.Task;
+
+        public async Task PublishAsync(WebhookEvent evt, CancellationToken ct)
+        {
+            _ = evt;
+            _publishStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
+    }
+
+    private sealed class BlockingProjectRepository : IProjectRepository
+    {
+        private readonly TaskCompletionSource _lookupStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task WaitForLookupAsync() => _lookupStarted.Task;
+
+        public async Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        {
+            _ = id;
+            _lookupStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return null;
+        }
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
+        {
+            _ = ct;
+            return Task.FromResult<IReadOnlyList<Project>>([]);
+        }
+    }
 }

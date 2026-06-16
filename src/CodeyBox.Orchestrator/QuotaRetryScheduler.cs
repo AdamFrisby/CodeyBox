@@ -121,10 +121,6 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     lastQuotaSweepAt = _time.GetUtcNow();
                     wasQuotaEnabled = true;
                 }
-                else if (!retryOptions.Enabled)
-                {
-                    wasQuotaEnabled = false;
-                }
 
                 var now = _time.GetUtcNow();
                 var quotaInterval = NormalizeInterval("Quota", retryOptions.PeriodicCheckInterval);
