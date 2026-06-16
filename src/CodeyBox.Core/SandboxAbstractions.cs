@@ -116,6 +116,14 @@ public interface ISandbox : IAsyncDisposable
     Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
 
     /// <summary>
+    /// Best-effort termination for commands currently running through
+    /// <see cref="ExecAsync"/>. Used by watchdog paths that must make progress
+    /// even when the command ignores cancellation. Providers with real process
+    /// isolation should override this; the default is for lightweight test fakes.
+    /// </summary>
+    Task KillActiveExecsAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    /// <summary>
     /// Returns a PNG screenshot of the current graphical desktop. Providers
     /// that do not support graphical sandboxes throw <see cref="NotSupportedException"/>.
     /// </summary>

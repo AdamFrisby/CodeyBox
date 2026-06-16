@@ -90,6 +90,7 @@ public sealed class WorkItemRetrier
         var resumeState = requestedFrom switch
         {
             "work" => WorkItemState.Queued,
+            "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
             "merge" => WorkItemState.AuditPassed,
             "upstream" => WorkItemState.Merged,
@@ -247,9 +248,35 @@ public sealed class WorkItemRetrier
 
         var baseBranch = await ResolveBaseBranchAsync(item, repoId, ct);
         var ahead = await _gitHost.BranchHasCommitsAheadAsync(repoId, baseBranch, workBranch, ct);
-        return ahead
-            ? ("audit", "work branch has prior commits ahead of base")
-            : ("work", "work branch has no commits ahead of base");
+        if (!ahead)
+            return ("work", "work branch has no commits ahead of base");
+
+        var interruptedAudit = await TryGetInterruptedAuditProgressAsync(item, ct);
+        if (interruptedAudit is { Findings.Count: > 0 })
+            return ("rework", $"last audit iteration {interruptedAudit.Iteration} was interrupted after partial findings");
+
+        if (interruptedAudit is not null)
+            return ("audit", $"last audit iteration {interruptedAudit.Iteration} was interrupted before findings; restarting audit cleanly");
+
+        return ("audit", "work branch has prior commits ahead of base");
+    }
+
+    private async Task<AuditProgressRecord?> TryGetInterruptedAuditProgressAsync(
+        WorkItem item,
+        CancellationToken ct)
+    {
+        if (_auditProgress is null)
+            return null;
+
+        var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
+        var progress = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
+        var latest = progress
+            .Where(p => p.Iteration > 0)
+            .OrderByDescending(p => p.Iteration)
+            .FirstOrDefault();
+        return latest is not null && !AuditProgressStatuses.IsComplete(latest.Status)
+            ? latest
+            : null;
     }
 
     private async Task<string> ResolveBaseBranchAsync(WorkItem item, string repoId, CancellationToken ct)
@@ -421,6 +448,7 @@ public sealed class WorkItemRetrier
         var resumeState = requestedFrom switch
         {
             "work" => WorkItemState.Queued,
+            "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
             "merge" => WorkItemState.AuditPassed,
             _ => (WorkItemState?)null,
@@ -428,7 +456,7 @@ public sealed class WorkItemRetrier
         if (resumeState is null)
             return new ResumeOutcome(
                 ResumeStatus.BadRequest,
-                $"invalid 'from' value '{from}'; expected one of: work, audit, merge",
+                $"invalid 'from' value '{from}'; expected one of: work, rework, audit, merge",
                 null,
                 null);
 
@@ -459,7 +487,7 @@ public sealed class WorkItemRetrier
         if (!branchPresent)
             return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
 
-        // from=audit / from=merge bypass the work phase, so the existing
+        // from=rework / from=audit / from=merge bypass the work phase, so the existing
         // commits on the work branch must already have durable workflow-owned
         // audit progress. Audit reports are diagnostic rows and may be
         // retention-swept, so they are deliberately not used as a resume

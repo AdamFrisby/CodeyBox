@@ -30,7 +30,20 @@ public sealed record AuditProgressRecord(
     IReadOnlyList<string> BlockingFindingIds,
     IReadOnlyList<AuditProgressFinding> BlockingFindingsDetails,
     IReadOnlyList<AuditProgressFinding> Findings,
-    string? WorkBranchTip);
+    string? WorkBranchTip,
+    string Status = AuditProgressStatuses.Complete,
+    IReadOnlyList<string>? ScheduledAuditors = null,
+    IReadOnlyList<string>? CompletedAuditors = null);
+
+public static class AuditProgressStatuses
+{
+    public const string InProgress = "in_progress";
+    public const string Incomplete = "incomplete";
+    public const string Complete = "complete";
+
+    public static bool IsComplete(string? status)
+        => string.Equals(status ?? Complete, Complete, StringComparison.OrdinalIgnoreCase);
+}
 
 /// <summary>
 /// Workflow-domain snapshot of an audit finding persisted for retry/escalation

@@ -89,6 +89,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         blocking_findings_json TEXT NOT NULL,
                         findings_json TEXT NOT NULL,
                         work_branch_tip TEXT,
+                        status TEXT NOT NULL DEFAULT 'complete',
+                        scheduled_auditors_json TEXT NOT NULL DEFAULT '[]',
+                        completed_auditors_json TEXT NOT NULL DEFAULT '[]',
                         recorded_at TEXT NOT NULL,
                         PRIMARY KEY (work_item_id, work_attempt_started_at, iteration)
                     );
@@ -97,6 +100,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     """;
                 auditProgressCmd.ExecuteNonQuery();
             }
+            RunMigration("ALTER TABLE work_item_audit_progress ADD COLUMN status TEXT NOT NULL DEFAULT 'complete';");
+            RunMigration("ALTER TABLE work_item_audit_progress ADD COLUMN scheduled_auditors_json TEXT NOT NULL DEFAULT '[]';");
+            RunMigration("ALTER TABLE work_item_audit_progress ADD COLUMN completed_auditors_json TEXT NOT NULL DEFAULT '[]';");
 
             // Additive migration: add agent_class_id column for quota-aware routing.
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
@@ -1646,10 +1652,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 INSERT INTO work_item_audit_progress (
                     work_item_id, work_attempt_started_at, iteration, max_iterations,
                     blocking_findings, non_blocking_findings, blocking_finding_ids_json,
-                    blocking_findings_json, findings_json, work_branch_tip, recorded_at)
+                    blocking_findings_json, findings_json, work_branch_tip, status,
+                    scheduled_auditors_json, completed_auditors_json, recorded_at)
                 VALUES (
                     $wi, $attempt, $iter, $max, $blocking, $non_blocking, $blocking_ids,
-                    $blocking_findings, $findings, $tip, $recorded_at)
+                    $blocking_findings, $findings, $tip, $status, $scheduled_auditors,
+                    $completed_auditors, $recorded_at)
                 ON CONFLICT(work_item_id, work_attempt_started_at, iteration) DO UPDATE SET
                     max_iterations = excluded.max_iterations,
                     blocking_findings = excluded.blocking_findings,
@@ -1658,6 +1666,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     blocking_findings_json = excluded.blocking_findings_json,
                     findings_json = excluded.findings_json,
                     work_branch_tip = excluded.work_branch_tip,
+                    status = excluded.status,
+                    scheduled_auditors_json = excluded.scheduled_auditors_json,
+                    completed_auditors_json = excluded.completed_auditors_json,
                     recorded_at = excluded.recorded_at;
                 """;
             cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
@@ -1670,6 +1681,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             cmd.Parameters.AddWithValue("$blocking_findings", JsonSerializer.Serialize(progress.BlockingFindingsDetails, JsonOpts));
             cmd.Parameters.AddWithValue("$findings", JsonSerializer.Serialize(progress.Findings, JsonOpts));
             cmd.Parameters.AddWithValue("$tip", (object?)progress.WorkBranchTip ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$status", progress.Status);
+            cmd.Parameters.AddWithValue("$scheduled_auditors", JsonSerializer.Serialize(progress.ScheduledAuditors ?? [], JsonOpts));
+            cmd.Parameters.AddWithValue("$completed_auditors", JsonSerializer.Serialize(progress.CompletedAuditors ?? [], JsonOpts));
             cmd.Parameters.AddWithValue("$recorded_at", recordedAt.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
         }
@@ -1691,7 +1705,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             SELECT iteration, max_iterations, blocking_findings, non_blocking_findings,
-                   blocking_finding_ids_json, blocking_findings_json, findings_json, work_branch_tip
+                   blocking_finding_ids_json, blocking_findings_json, findings_json, work_branch_tip,
+                   status, scheduled_auditors_json, completed_auditors_json
             FROM work_item_audit_progress
             WHERE work_item_id = $wi AND work_attempt_started_at = $attempt
             ORDER BY iteration ASC;
@@ -1711,7 +1726,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 BlockingFindingIds: DeserializeStringList(reader.GetString(4)),
                 BlockingFindingsDetails: DeserializeAuditProgressFindings(reader.GetString(5)),
                 Findings: DeserializeAuditProgressFindings(reader.GetString(6)),
-                WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7)));
+                WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7),
+                Status: reader.GetString(8),
+                ScheduledAuditors: DeserializeStringList(reader.GetString(9)),
+                CompletedAuditors: DeserializeStringList(reader.GetString(10))));
         }
         return results;
     }

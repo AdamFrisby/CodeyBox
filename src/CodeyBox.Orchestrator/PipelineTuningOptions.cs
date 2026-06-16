@@ -106,6 +106,13 @@ public sealed class PipelineTuningOptions
     public bool AuditShortCircuitEnabled { get; set; } = true;
 
     /// <summary>
+    /// Maximum time a single auditor may run without completing or emitting
+    /// an LLM stdout chunk. A value of zero disables the per-auditor idle
+    /// guard. Default 5 minutes.
+    /// </summary>
+    public TimeSpan AuditorIdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
     /// Whether to build and seed a cross-agent handoff brief on the next
     /// invocation after the orchestrator falls back from one
     /// <c>AgentKind</c> to another mid-iteration. The brief itself is built
@@ -135,6 +142,10 @@ public sealed class PipelineTuningOptions
             || SandboxPressureThreshold > 1.0)
         {
             throw new ArgumentOutOfRangeException(nameof(SandboxPressureThreshold), "SandboxPressureThreshold must be between 0.0 and 1.0 inclusive");
+        }
+        if (AuditorIdleTimeout < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(AuditorIdleTimeout), "AuditorIdleTimeout must be non-negative");
         }
     }
 }

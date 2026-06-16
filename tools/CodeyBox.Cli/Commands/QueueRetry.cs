@@ -14,7 +14,7 @@ internal static class QueueRetry
         var cmd = new Command("retry", "Retry a failed work item");
 
         var idArg = new Argument<string>("id", "Work item ID");
-        var fromOpt = new Option<string?>("--from", "Retry from phase: work, audit, merge, or upstream");
+        var fromOpt = new Option<string?>("--from", "Retry from phase: work, rework, audit, merge, or upstream");
 
         cmd.AddArgument(idArg);
         cmd.AddOption(fromOpt);
@@ -28,11 +28,11 @@ internal static class QueueRetry
             var flagUrl = ctx.ParseResult.GetValueForOption(apiUrlOpt);
             var flagKey = ctx.ParseResult.GetValueForOption(apiKeyOpt);
 
-            string[] validFromValues = ["work", "audit", "merge", "upstream"];
+            string[] validFromValues = ["work", "rework", "audit", "merge", "upstream"];
             if (!string.IsNullOrWhiteSpace(from) && !validFromValues.Contains(from, StringComparer.OrdinalIgnoreCase))
             {
                 await Console.Error.WriteLineAsync(
-                    $"Error: --from must be one of: work, audit, merge, upstream (got '{from}').");
+                    $"Error: --from must be one of: work, rework, audit, merge, upstream (got '{from}').");
                 ctx.ExitCode = 1;
                 return;
             }

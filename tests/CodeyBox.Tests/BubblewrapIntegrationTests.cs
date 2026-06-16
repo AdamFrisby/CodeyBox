@@ -151,6 +151,29 @@ public sealed class BubblewrapIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Bwrap_KillActiveExecsAsync_KillsRunningExec()
+    {
+        if (!_bwrapAvailable) return;
+        await using var sb = await NewProvider().CreateAsync(BasicSpec(_workspace));
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var execTask = sb.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo ready; sleep 30"],
+            StdoutChunkCallback = chunk =>
+            {
+                if (chunk.Contains("ready", StringComparison.Ordinal))
+                    ready.TrySetResult();
+            },
+        }, CancellationToken.None);
+
+        await ready.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sb.KillActiveExecsAsync();
+
+        var result = await execTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(result.Success);
+    }
+
+    [Fact]
     public async Task Bwrap_DisposeRemovesHostState()
     {
         if (!_bwrapAvailable) return;

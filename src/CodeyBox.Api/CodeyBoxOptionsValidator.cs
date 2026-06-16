@@ -142,6 +142,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive");
         }
+        if (options.PipelineTuning.AuditorIdleTimeout < TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:AuditorIdleTimeout must be non-negative");
+        }
 
         try
         {

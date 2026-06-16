@@ -1,6 +1,10 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
 using Serilog;
 using Serilog.Events;
 
@@ -1254,6 +1258,968 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Empty(tp.Agent.WorkPlan);
     }
 
+    [Fact]
+    public async Task IncompleteAuditWithBlockingFinding_RoutesToReworkUsingCompletedFindings()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var hangingCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("architecture", AuditSeverity.Error, "real finding", "fix it")])
+                : new AuditResult(true, []));
+        });
+        var sometimesHangs = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            if (hangingCalls <= 2)
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, sometimesHangs],
+            maxAuditIterations: 2,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(3, hangingCalls);
+        Assert.Empty(tp.Agent.WorkPlan);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Contains("real finding", tp.Agent.WorkPrompts[1]);
+        Assert.Contains("fix it", tp.Agent.WorkPrompts[1]);
+        var bareRepo = tp.GitHost.GetRepoPath(await tp.GitHost.EnsureRepositoryAsync(item.Id, seed));
+        var (_, branchFile, _) = await TestSupport.RunGit(bareRepo, "show", $"{final.WorkBranch}:a.txt");
+        Assert.Equal("v2-after-rework", branchFile);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var firstAudit = Assert.Single(progress, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.Incomplete, firstAudit.Status);
+        Assert.Equal(["architecture"], firstAudit.CompletedAuditors);
+        Assert.Contains(firstAudit.Findings, f => f.Title == "real finding");
+    }
+
+    [Fact]
+    public async Task LlmTimeoutDoesNotMaskSiblingInfrastructureFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+            Task.FromResult(new AuditResult(false,
+            [
+                new AuditFinding("architecture", AuditSeverity.Error, "completed blocker", "fix it"),
+            ])));
+        var unavailable = new DelegateAuditor("security", "llm", (_, _, _) =>
+            throw new AuditUnavailableException("simulated audit infrastructure failure"));
+        var hanging = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, unavailable, hanging],
+            maxAuditIterations: 2,
+            maxLlmAuditorParallelism: 3,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("simulated audit infrastructure failure", final.LastError);
+        Assert.Single(tp.Agent.WorkPrompts);
+        Assert.Single(tp.Agent.WorkPlan);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progressAfterFailure = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var failedAudit = Assert.Single(progressAfterFailure, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.InProgress, failedAudit.Status);
+        Assert.Empty(failedAudit.Findings);
+        Assert.Empty(failedAudit.CompletedAuditors ?? []);
+    }
+
+    [Fact]
+    public async Task ToolAuditorInfrastructureFailure_ClearsPriorPartialProgress()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blocker = new DelegateAuditor("tool-blocker", "tool", (_, _, _) =>
+            Task.FromResult(new AuditResult(false,
+            [
+                new AuditFinding("tool-blocker", AuditSeverity.Error, "completed tool blocker", "fix it"),
+            ])));
+        var unavailable = new DelegateAuditor("tool-infra", "tool", (_, _, _) =>
+            throw new AuditUnavailableException("simulated tool auditor infrastructure failure"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, unavailable],
+            maxAuditIterations: 2);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("simulated tool auditor infrastructure failure", final.LastError);
+        Assert.Single(tp.Agent.WorkPrompts);
+        Assert.Single(tp.Agent.WorkPlan);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progressAfterFailure = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var failedAudit = Assert.Single(progressAfterFailure, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.InProgress, failedAudit.Status);
+        Assert.Empty(failedAudit.Findings);
+        Assert.Empty(failedAudit.CompletedAuditors ?? []);
+    }
+
+    [Fact]
+    public async Task IncompleteAuditWithOnlyNonBlockingFinding_RoutesToRework()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var warningCalls = 0;
+        var hangingCalls = 0;
+        var warning = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            warningCalls++;
+            return Task.FromResult(warningCalls == 1
+                ? new AuditResult(true, [new AuditFinding("quality", AuditSeverity.Warning, "warning finding", "still needs review")])
+                : new AuditResult(true, []));
+        });
+        var sometimesHangs = new DelegateAuditor("completeness", "llm", async (_, _, _) =>
+        {
+            hangingCalls++;
+            if (hangingCalls <= 2)
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [warning, sometimesHangs],
+            maxAuditIterations: 2,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-warning-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, warningCalls);
+        Assert.Equal(3, hangingCalls);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var firstAudit = Assert.Single(progress, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.Incomplete, firstAudit.Status);
+        Assert.Equal(1, firstAudit.BlockingFindings);
+        Assert.Contains(firstAudit.BlockingFindingsDetails, f => f.Title == "warning finding");
+    }
+
+    [Fact]
+    public async Task FinalIncompleteAuditWithCompletedFindings_RoutesToReworkBeforeCeiling()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("architecture", AuditSeverity.Error, "last chance blocker", "fix final incomplete")])
+                : new AuditResult(true, []));
+        });
+        var hangingCalls = 0;
+        var sometimesHangs = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            if (hangingCalls <= 2)
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, sometimesHangs],
+            maxAuditIterations: 1,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-final-incomplete-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Contains("last chance blocker", tp.Agent.WorkPrompts[1]);
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(3, hangingCalls);
+    }
+
+    [Fact]
+    public async Task FinalIncompleteAuditExtension_IsUsedOnlyOnce()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(new AuditResult(false,
+            [
+                new AuditFinding("architecture", AuditSeverity.Error, "still incomplete", "same blocker"),
+            ]));
+        });
+        var hangingCalls = 0;
+        var alwaysHangs = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, alwaysHangs],
+            maxAuditIterations: 1,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-one-extra-rework"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-second-extra-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State is WorkItemState.NeedsOperatorInput or WorkItemState.AuditFailed,
+            $"expected bounded audit stop, got {final.State}");
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(4, hangingCalls);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Single(tp.Agent.WorkPlan);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        Assert.Equal([1, 2], progress.Select(p => p.Iteration).Order().ToArray());
+    }
+
+    [Fact]
+    public async Task IncompleteAudit_SkipsRequiredBuildGateUntilCompleteVerdict()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("architecture", AuditSeverity.Error, "build-gate skip blocker", "fix first")])
+                : new AuditResult(true, []));
+        });
+        var hangingCalls = 0;
+        var sometimesHangs = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            if (hangingCalls <= 2)
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var requiredBuild = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Passed(0, "ok"));
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, sometimesHangs],
+            maxAuditIterations: 2,
+            maxLlmAuditorParallelism: 2,
+            pipelineTuning: tuning,
+            requiredBuildVerifier: requiredBuild);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        var auditBuildRequests = requiredBuild.VerificationRequests
+            .Where(r => r.Phase == "audit")
+            .ToList();
+        var auditBuildRequest = Assert.Single(auditBuildRequests);
+        Assert.Equal(2, auditBuildRequest.Iteration);
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(3, hangingCalls);
+    }
+
+    [Fact]
+    public async Task QuotaParkAfterPartialAuditProgress_RetryRestartsAuditInsteadOfReworkingPartialRow()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var findingCalls = 0;
+        var quotaCalls = 0;
+        var finding = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            findingCalls++;
+            return Task.FromResult(findingCalls == 1
+                ? new AuditResult(false, [new AuditFinding("architecture", AuditSeverity.Error, "partial quota blocker", "rerun audit")])
+                : new AuditResult(true, []));
+        });
+        var quota = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            quotaCalls++;
+            if (quotaCalls == 1)
+            {
+                throw new AgentClassExhaustedException(
+                    "frontier",
+                    "audit",
+                    2,
+                    DateTimeOffset.UtcNow.AddMinutes(5),
+                    "simulated audit quota exhaustion");
+            }
+
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [finding, quota],
+            maxAuditIterations: 1,
+            maxLlmAuditorParallelism: 2);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progressAfterPark = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var parkedAudit = Assert.Single(progressAfterPark, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.InProgress, parkedAudit.Status);
+        Assert.Empty(parkedAudit.Findings);
+
+        var resumed = parked.With(WorkItemState.WorkComplete);
+        await tp.Store.UpdateAsync(resumed);
+
+        await tp.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, findingCalls);
+        Assert.Equal(2, quotaCalls);
+    }
+
+    [Fact]
+    public async Task PartialAuditProgress_IsPersistedBeforeAggregateVerdict()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var progressStore = new RecordingAuditProgressStore();
+        var releaseSlowAuditor = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("architecture", "llm", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("architecture", AuditSeverity.Error, "durable blocker", "fix it")])
+                : new AuditResult(true, []));
+        });
+        var slow = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            await releaseSlowAuditor.Task.WaitAsync(ct);
+            return new AuditResult(true, []);
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, slow],
+            maxAuditIterations: 2,
+            maxLlmAuditorParallelism: 2,
+            auditProgressOverride: progressStore);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        var pipelineTask = tp.Pipeline.RunAsync(item, CancellationToken.None);
+        try
+        {
+            var partial = await WaitForProgressAsync(
+                progressStore,
+                r => r.Progress.Status == AuditProgressStatuses.InProgress
+                     && r.Progress.CompletedAuditors?.SequenceEqual(["architecture"]) == true
+                     && r.Progress.Findings.Any(f => f.Title == "durable blocker"));
+
+            Assert.Equal(["architecture", "quality"], partial.Progress.ScheduledAuditors);
+        }
+        finally
+        {
+            releaseSlowAuditor.TrySetResult();
+        }
+
+        await pipelineTask;
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    [Fact]
+    public async Task AuditorNoOutputIgnoringCancellation_IsKilledWithinIdleBoundAndFailsCleanly()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new SandboxProcessAuditor("quality");
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        var sw = Stopwatch.StartNew();
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        sw.Stop();
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("did not reach a complete verdict", final.LastError);
+        Assert.Equal(2, auditor.CallCount);
+        Assert.Equal(2, auditor.CompletedExecCount);
+        Assert.Equal(1, auditor.MaxConcurrentExecs);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"auditor timeout took {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task StructuredStreamProbeNoOutput_TimesOutBeforeAuditorRuns()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var streamStore = new AgentStreamStore(
+            new AgentStreamsOptions { Path = Path.Combine(_workspace, "streams-probe-timeout") },
+            NullLogger<AgentStreamStore>.Instance);
+        var auditorRuns = 0;
+        var auditor = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            auditorRuns++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning,
+            agentStreams: streamStore);
+        tp.Agent.StructuredStreamSupportHandler = (_, _) => Task.FromResult(true);
+        tp.Agent.BeforeWorkAsync = (_, _, _) =>
+        {
+            tp.Agent.StructuredStreamSupportHandler = async (_, ct) =>
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                return true;
+            };
+            return Task.CompletedTask;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        var sw = Stopwatch.StartNew();
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        sw.Stop();
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("did not reach a complete verdict", final.LastError);
+        Assert.Equal(0, auditorRuns);
+        Assert.True(tp.Agent.StructuredStreamSupportProbeCount >= 3);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"auditor timeout took {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task AuditSetupCloneNoOutput_IsKilledWithinIdleBoundAndRetried()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var sandboxProvider = new HangingSecondCloneSandboxProvider();
+        var auditorRuns = 0;
+        var auditor = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            auditorRuns++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning,
+            sandboxProvider: sandboxProvider);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        var sw = Stopwatch.StartNew();
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        sw.Stop();
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(sandboxProvider.ObservedCloneCancellation);
+        Assert.Equal(1, auditorRuns);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"audit setup timeout took {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task AuditSandboxLaunchNoOutput_IsCanceledWithinIdleBoundAndRetried()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var sandboxProvider = new HangingSecondCreateSandboxProvider();
+        var auditorRuns = 0;
+        var auditor = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            auditorRuns++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning,
+            sandboxProvider: sandboxProvider);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        var sw = Stopwatch.StartNew();
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        sw.Stop();
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(sandboxProvider.ObservedCreateCancellation);
+        Assert.Equal(1, auditorRuns);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"audit launch timeout took {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task AuditorIdleTimeoutZero_AllowsSilentAuditorToComplete()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var slowSilent = new DelegateAuditor("quality", "llm", async (_, _, ct) =>
+        {
+            await Task.Delay(200, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.Zero,
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [slowSilent],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    [Fact]
+    public async Task AuditorStdoutHeartbeat_PreventsIdleTimeout()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var streaming = new DelegateAuditor("quality", "llm", async (_, context, ct) =>
+        {
+            for (var i = 0; i < 4; i++)
+            {
+                context.StdoutChunkCallback?.Invoke($"tick {i}\n");
+                await Task.Delay(60, ct);
+            }
+
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [streaming],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    [Fact]
+    public async Task ToolAuditorSandboxOutput_PreventsIdleTimeout()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var tool = new DelegateAuditor("tool-output", "tool", async (sandbox, _, ct) =>
+        {
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf 'one\\n'; sleep 0.06; printf 'two\\n'; sleep 0.06; printf 'three\\n'"],
+                WorkingDirectory = SandboxConventions.WorkDir,
+            }, ct);
+            return new AuditResult(result.Success, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [tool],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    [Fact]
+    public async Task ToolAuditorIdleTimeout_ReturnsIncompleteVerdictWithPriorFindings()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var blockerCalls = 0;
+        var blocker = new DelegateAuditor("tool-blocker", "tool", (_, _, _) =>
+        {
+            blockerCalls++;
+            return Task.FromResult(blockerCalls == 1
+                ? new AuditResult(false, [new AuditFinding("tool-blocker", AuditSeverity.Error, "tool blocker", "fix tool issue")])
+                : new AuditResult(true, []));
+        });
+        var hangingCalls = 0;
+        var sometimesHangs = new DelegateAuditor("tool-hang", "tool", async (_, _, ct) =>
+        {
+            hangingCalls++;
+            if (hangingCalls == 1)
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new AuditResult(true, []);
+        });
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [blocker, sometimesHangs],
+            maxAuditIterations: 2,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-tool-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, blockerCalls);
+        Assert.Equal(2, hangingCalls);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        Assert.Contains("tool blocker", tp.Agent.WorkPrompts[1]);
+
+        var workAttempt = (await tp.Store.GetIterationsAsync(item.Id))
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
+        var firstAudit = Assert.Single(progress, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.Incomplete, firstAudit.Status);
+        Assert.Equal(["tool-blocker"], firstAudit.CompletedAuditors);
+        Assert.Contains(firstAudit.Findings, f => f.Title == "tool blocker");
+    }
+
+    [Fact]
+    public async Task ShortCircuitRemainingBatchProgress_IncludesGateFindings()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var progressStore = new RecordingAuditProgressStore();
+        var gate = new DelegateAuditor(
+            "gate",
+            "tool",
+            (_, _, _) => Task.FromResult(new AuditResult(true,
+            [
+                new AuditFinding("gate", AuditSeverity.Warning, "gate warning", "gate detail"),
+            ])),
+            canShortCircuitOnBlockingFinding: true);
+        var remaining = new DelegateAuditor(
+            "remaining",
+            "tool",
+            (_, _, _) => Task.FromResult(new AuditResult(true,
+            [
+                new AuditFinding("remaining", AuditSeverity.Warning, "remaining warning", "remaining detail"),
+            ])));
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditShortCircuitEnabled = true,
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [remaining, gate],
+            maxAuditIterations: 1,
+            pipelineTuning: tuning,
+            auditProgressOverride: progressStore);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var combinedProgress = Assert.Single(
+            progressStore.Records,
+            r => r.Progress.Status == AuditProgressStatuses.InProgress
+                 && r.Progress.CompletedAuditors?.SequenceEqual(["gate", "remaining"]) == true);
+        Assert.Equal(["gate warning", "remaining warning"], combinedProgress.Progress.Findings.Select(f => f.Title));
+    }
+
+    [Fact]
+    public async Task EmptyInterruptedAuditProgress_RestartsAuditCleanly()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2);
+
+        var item = NewItem();
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            new AuditProgressRecord(
+                Iteration: 1,
+                MaxIterations: 2,
+                BlockingFindings: 0,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: [],
+                BlockingFindingsDetails: [],
+                Findings: [],
+                WorkBranchTip: null,
+                Status: AuditProgressStatuses.InProgress,
+                ScheduledAuditors: ["AuditorA"],
+                CompletedAuditors: []),
+            DateTimeOffset.UtcNow);
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
+    }
+
+    [Fact]
+    public async Task RecoveredInterruptedAuditWithPartialFindings_RoutesThroughRework()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.Auditing,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        await tp.Store.CreateAsync(item);
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            new AuditProgressRecord(
+                Iteration: 1,
+                MaxIterations: 2,
+                BlockingFindings: 1,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: ["partial-id"],
+                BlockingFindingsDetails:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "persisted blocker", "fix it"),
+                ],
+                Findings:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "persisted blocker", "fix it"),
+                ],
+                WorkBranchTip: null,
+                Status: AuditProgressStatuses.InProgress,
+                ScheduledAuditors: ["architecture", "quality"],
+                CompletedAuditors: ["architecture"]),
+            DateTimeOffset.UtcNow);
+
+        using var registry = new SqliteWorkerRegistry(Path.Combine(_workspace, $"workers-{Guid.NewGuid():N}.db"));
+        var worker = new WorkerRegistration
+        {
+            WorkerId = Guid.NewGuid().ToString("N"),
+            HostName = "host",
+            ProcessId = Environment.ProcessId,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            LastHeartbeatAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            CurrentWorkItemId = item.Id.ToString(),
+        };
+        await registry.RegisterAsync(worker);
+        var reaper = new DeadWorkerReaper(
+            registry,
+            tp.Store,
+            tp.Queue,
+            new DeadWorkerOptions
+            {
+                HeartbeatInterval = TimeSpan.FromSeconds(1),
+                DeadWorkerThreshold = TimeSpan.FromSeconds(1),
+                MaxRecoveryAttempts = 3,
+            },
+            NullLogger<DeadWorkerReaper>.Instance);
+        await reaper.RunOnceAsync(CancellationToken.None);
+
+        var recovered = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, recovered!.State);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "reworked persisted blocker\n"));
+
+        await tp.Pipeline.RunAsync(recovered, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([2], auditor.SeenIterations);
+        var reworkPrompt = Assert.Single(tp.Agent.WorkPrompts);
+        Assert.Contains("architecture", reworkPrompt);
+        Assert.Contains("persisted blocker", reworkPrompt);
+        Assert.Contains("fix it", reworkPrompt);
+    }
+
+    private static async Task<(WorkItemId WorkItemId, AuditProgressRecord Progress)> WaitForProgressAsync(
+        RecordingAuditProgressStore store,
+        Func<(WorkItemId WorkItemId, AuditProgressRecord Progress), bool> predicate)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var match = store.Records.FirstOrDefault(predicate);
+            if (match.Progress is not null)
+                return match;
+            await Task.Delay(25);
+        }
+
+        throw new TimeoutException("Timed out waiting for matching audit progress record.");
+    }
+
     private sealed record AuditOutcome(bool Passed, IReadOnlyList<AuditFinding> Findings);
 
     private sealed class ScriptedAuditor : IAuditor
@@ -1274,6 +2240,240 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             SeenIterations.Add(context.Iteration);
             var outcome = _plan.Dequeue();
             return Task.FromResult(new AuditResult(outcome.Passed, outcome.Findings));
+        }
+    }
+
+    private sealed class DelegateAuditor : IAuditor
+    {
+        private readonly Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> _body;
+
+        public DelegateAuditor(
+            string name,
+            string kind,
+            Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> body,
+            bool canShortCircuitOnBlockingFinding = false)
+        {
+            Name = name;
+            Kind = kind;
+            _body = body;
+            CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding;
+        }
+
+        public string Name { get; }
+        public string Kind { get; }
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public bool CanShortCircuitOnBlockingFinding { get; }
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+            => _body(sandbox, context, ct);
+    }
+
+    private sealed class SandboxProcessAuditor(string name) : IAuditor
+    {
+        private int _activeExecs;
+        private int _maxConcurrentExecs;
+
+        public string Name { get; } = name;
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public int CallCount { get; private set; }
+        public int CompletedExecCount { get; private set; }
+        public int MaxConcurrentExecs => Volatile.Read(ref _maxConcurrentExecs);
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = context;
+            _ = ct;
+            CallCount++;
+            var active = Interlocked.Increment(ref _activeExecs);
+            UpdateMax(active);
+            try
+            {
+                await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", "sleep 30"],
+                    WorkingDirectory = workingDirectory,
+                }, CancellationToken.None);
+                CompletedExecCount++;
+                return new AuditResult(true, []);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeExecs);
+            }
+        }
+
+        private void UpdateMax(int active)
+        {
+            while (true)
+            {
+                var observed = Volatile.Read(ref _maxConcurrentExecs);
+                if (active <= observed)
+                    return;
+                if (Interlocked.CompareExchange(ref _maxConcurrentExecs, active, observed) == observed)
+                    return;
+            }
+        }
+    }
+
+    private sealed class HangingSecondCloneSandboxProvider : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner =
+            new(NullLogger<ProcessSandboxProvider>.Instance);
+        private int _cloneCalls;
+
+        public string Name => "hanging-second-clone";
+        public bool ObservedCloneCancellation { get; private set; }
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var inner = await _inner.CreateAsync(spec, ct);
+            return new HangingSecondCloneSandbox(inner, this);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+
+        private bool ShouldHangClone()
+            => Interlocked.Increment(ref _cloneCalls) == 2;
+
+        private void MarkObservedCloneCancellation()
+            => ObservedCloneCancellation = true;
+
+        private sealed class HangingSecondCloneSandbox(
+            ISandbox inner,
+            HangingSecondCloneSandboxProvider owner) : ISandbox
+        {
+            public string Id => inner.Id;
+            public SandboxAgentOutputTransportKind AgentOutputTransportKind => inner.AgentOutputTransportKind;
+
+            public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            {
+                if (exec.Argv is ["git", "clone", ..] && owner.ShouldHangClone())
+                {
+                    try
+                    {
+                        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        owner.MarkObservedCloneCancellation();
+                        throw;
+                    }
+                }
+
+                return await inner.ExecAsync(exec, ct);
+            }
+
+            public Task KillActiveExecsAsync(CancellationToken ct = default)
+                => inner.KillActiveExecsAsync(ct);
+
+            public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+                => inner.GetScreenshotAsync(ct);
+
+            public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+                => inner.SynthesizeInputAsync(events, ct);
+
+            public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+                => inner.GetAccessibilityAtPointAsync(x, y, ct);
+
+            public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+                => inner.GetAccessibilityTreeJsonAsync(ct);
+
+            public ValueTask DisposeAsync()
+                => inner.DisposeAsync();
+        }
+    }
+
+    private sealed class HangingSecondCreateSandboxProvider : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner =
+            new(NullLogger<ProcessSandboxProvider>.Instance);
+        private int _createCalls;
+
+        public string Name => "hanging-second-create";
+        public bool ObservedCreateCancellation { get; private set; }
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _createCalls) == 2)
+            {
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    ObservedCreateCancellation = true;
+                    throw;
+                }
+            }
+
+            return await _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class RecordingAuditProgressStore : IAuditProgressStore
+    {
+        private readonly object _gate = new();
+        private readonly List<(WorkItemId WorkItemId, AuditProgressRecord Progress)> _records = [];
+
+        public IReadOnlyList<(WorkItemId WorkItemId, AuditProgressRecord Progress)> Records
+        {
+            get
+            {
+                lock (_gate)
+                    return _records.ToList();
+            }
+        }
+
+        public Task RecordAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            AuditProgressRecord progress,
+            DateTimeOffset recordedAt,
+            CancellationToken ct = default)
+        {
+            _ = workAttemptStartedAt;
+            _ = recordedAt;
+            _ = ct;
+            lock (_gate)
+                _records.Add((workItemId, progress));
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<AuditProgressRecord>> GetAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default)
+        {
+            _ = workAttemptStartedAt;
+            _ = ct;
+            lock (_gate)
+            {
+                return Task.FromResult<IReadOnlyList<AuditProgressRecord>>(
+                    _records
+                        .Where(r => r.WorkItemId == workItemId)
+                        .Select(r => r.Progress)
+                        .ToList());
+            }
         }
     }
 

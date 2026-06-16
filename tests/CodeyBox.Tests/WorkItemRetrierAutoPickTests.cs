@@ -89,6 +89,163 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
         Assert.Null(persisted.StartedAt);
     }
 
+    [Fact]
+    public async Task AutoPickInterruptedAuditWithPartialFindings_ResumesAtReworkBoundary()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = new RecordingGitHost { Ahead = true };
+        var item = NewFailedItem(baseBranch: "main");
+        await store.CreateAsync(item);
+        var workAttemptStartedAt = DateTimeOffset.UtcNow.AddMinutes(-10);
+        await store.RecordIterationDispatchAsync(
+            item.Id,
+            AuditProgressIterationNumbers.WorkPhase,
+            item.PromptRevision,
+            workAttemptStartedAt);
+        await store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 5,
+                MaxIterations: 10,
+                BlockingFindings: 1,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: ["partial-id"],
+                BlockingFindingsDetails:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "real finding", "fix it"),
+                ],
+                Findings:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "real finding", "fix it"),
+                ],
+                WorkBranchTip: "abc123",
+                Status: AuditProgressStatuses.InProgress,
+                ScheduledAuditors: ["security", "architecture", "quality"],
+                CompletedAuditors: ["architecture"]),
+            DateTimeOffset.UtcNow);
+        var retrier = NewRetrier(store, queue, gitHost, auditProgress: store);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("rework", result.ActualFrom);
+        Assert.Equal(WorkItemState.WorkComplete, result.ResumeState);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, persisted!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AutoPickIncompleteAuditWithPartialFindings_ResumesAtReworkBoundary()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = new RecordingGitHost { Ahead = true };
+        var item = NewFailedItem(baseBranch: "main");
+        await store.CreateAsync(item);
+        var workAttemptStartedAt = DateTimeOffset.UtcNow.AddMinutes(-10);
+        await store.RecordIterationDispatchAsync(
+            item.Id,
+            AuditProgressIterationNumbers.WorkPhase,
+            item.PromptRevision,
+            workAttemptStartedAt);
+        await store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 5,
+                MaxIterations: 10,
+                BlockingFindings: 1,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: ["partial-id"],
+                BlockingFindingsDetails:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "incomplete finding", "fix it"),
+                ],
+                Findings:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "incomplete finding", "fix it"),
+                ],
+                WorkBranchTip: "abc123",
+                Status: AuditProgressStatuses.Incomplete,
+                ScheduledAuditors: ["security", "architecture", "quality"],
+                CompletedAuditors: ["architecture"]),
+            DateTimeOffset.UtcNow);
+        var retrier = NewRetrier(store, queue, gitHost, auditProgress: store);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("rework", result.ActualFrom);
+        Assert.Equal(WorkItemState.WorkComplete, result.ResumeState);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, persisted!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AutoPickInterruptedAudit_IgnoresOlderInterruptedRowWhenLatestAuditCompleted()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = new RecordingGitHost { Ahead = true };
+        var item = NewFailedItem(baseBranch: "main");
+        await store.CreateAsync(item);
+        var workAttemptStartedAt = DateTimeOffset.UtcNow.AddMinutes(-10);
+        await store.RecordIterationDispatchAsync(
+            item.Id,
+            AuditProgressIterationNumbers.WorkPhase,
+            item.PromptRevision,
+            workAttemptStartedAt);
+        await store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 5,
+                MaxIterations: 10,
+                BlockingFindings: 1,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: ["older-partial-id"],
+                BlockingFindingsDetails:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "older finding", "already superseded"),
+                ],
+                Findings:
+                [
+                    new AuditProgressFinding("architecture", AuditSeverity.Error, "older finding", "already superseded"),
+                ],
+                WorkBranchTip: "abc123",
+                Status: AuditProgressStatuses.InProgress,
+                ScheduledAuditors: ["architecture"],
+                CompletedAuditors: ["architecture"]),
+            DateTimeOffset.UtcNow.AddMinutes(-1));
+        await store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 6,
+                MaxIterations: 10,
+                BlockingFindings: 0,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: [],
+                BlockingFindingsDetails: [],
+                Findings: [],
+                WorkBranchTip: "def456",
+                Status: AuditProgressStatuses.Complete,
+                ScheduledAuditors: ["architecture"],
+                CompletedAuditors: ["architecture"]),
+            DateTimeOffset.UtcNow);
+        var retrier = NewRetrier(store, queue, gitHost, auditProgress: store);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("audit", result.ActualFrom);
+        Assert.Equal(WorkItemState.WorkComplete, result.ResumeState);
+    }
+
     [Theory]
     [InlineData("no-work-branch")]
     [InlineData("missing-repo")]
@@ -268,14 +425,16 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
         ITaskQueue queue,
         IGitHost gitHost,
         IProjectRepository? projects = null,
-        IReleaseStore? releases = null)
+        IReleaseStore? releases = null,
+        IAuditProgressStore? auditProgress = null)
         => new(
             store,
             queue,
             gitHost,
             NullLogger<WorkItemRetrier>.Instance,
             projects: projects,
-            releases: releases);
+            releases: releases,
+            auditProgress: auditProgress);
 
     private static WorkItem NewFailedItem(
         string? workBranch = "codeybox/retry-autopick",

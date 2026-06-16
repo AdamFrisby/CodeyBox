@@ -144,6 +144,8 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
     private readonly SandboxSpec _spec;
     private readonly string[] _mountPaths; // longest-first
     private readonly ILogger _log;
+    private readonly object _processGate = new();
+    private readonly HashSet<System.Diagnostics.Process> _processes = [];
     private bool _disposed;
     private bool _preserved;
 
@@ -211,62 +213,106 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         }
 
         proc.Start();
+        RegisterProcess(proc);
         Task<LimitedReadResult>? limitedStdoutTask = null;
         Task<LimitedReadResult>? limitedStderrTask = null;
-        if (limitOutput)
-        {
-            void KillForLimit()
-            {
-                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-            }
-
-            limitedStdoutTask = ReadLimitedAsync(
-                proc.StandardOutput,
-                exec.MaxStdoutBytes,
-                exec.StdoutChunkCallback,
-                exec.KillOnOutputLimit ? KillForLimit : null,
-                ct);
-            limitedStderrTask = ReadLimitedAsync(
-                proc.StandardError,
-                exec.MaxStderrBytes,
-                exec.StderrChunkCallback,
-                exec.KillOnOutputLimit ? KillForLimit : null,
-                ct);
-        }
-        else
-        {
-            proc.BeginOutputReadLine();
-            proc.BeginErrorReadLine();
-        }
-        if (exec.Stdin is not null)
-        {
-            await proc.StandardInput.WriteAsync(exec.Stdin);
-            proc.StandardInput.Close();
-        }
-
         try
         {
-            await proc.WaitForExitAsync(ct);
-        }
-        catch (OperationCanceledException)
-        {
-            try { proc.Kill(entireProcessTree: true); } catch { /* best-effort */ }
-            throw;
-        }
+            if (limitOutput)
+            {
+                void KillForLimit()
+                {
+                    KillProcessTree(proc);
+                }
 
-        if (limitedStdoutTask is not null && limitedStderrTask is not null)
-        {
-            var stdoutResult = await limitedStdoutTask;
-            var stderrResult = await limitedStderrTask;
-            return new SandboxExecResult(
-                proc.ExitCode,
-                stdoutResult.Text,
-                stderrResult.Text,
-                stdoutResult.LimitExceeded,
-                stderrResult.LimitExceeded);
-        }
+                limitedStdoutTask = ReadLimitedAsync(
+                    proc.StandardOutput,
+                    exec.MaxStdoutBytes,
+                    exec.StdoutChunkCallback,
+                    exec.KillOnOutputLimit ? KillForLimit : null,
+                    ct);
+                limitedStderrTask = ReadLimitedAsync(
+                    proc.StandardError,
+                    exec.MaxStderrBytes,
+                    exec.StderrChunkCallback,
+                    exec.KillOnOutputLimit ? KillForLimit : null,
+                    ct);
+            }
+            else
+            {
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+            }
+            if (exec.Stdin is not null)
+            {
+                await proc.StandardInput.WriteAsync(exec.Stdin);
+                proc.StandardInput.Close();
+            }
 
-        return new SandboxExecResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
+            try
+            {
+                await proc.WaitForExitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                KillProcessTree(proc);
+                throw;
+            }
+
+            if (limitedStdoutTask is not null && limitedStderrTask is not null)
+            {
+                var stdoutResult = await limitedStdoutTask;
+                var stderrResult = await limitedStderrTask;
+                return new SandboxExecResult(
+                    proc.ExitCode,
+                    stdoutResult.Text,
+                    stderrResult.Text,
+                    stdoutResult.LimitExceeded,
+                    stderrResult.LimitExceeded);
+            }
+
+            return new SandboxExecResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
+        }
+        finally
+        {
+            UnregisterProcess(proc);
+        }
+    }
+
+    private void RegisterProcess(System.Diagnostics.Process process)
+    {
+        lock (_processGate)
+            _processes.Add(process);
+    }
+
+    private void UnregisterProcess(System.Diagnostics.Process process)
+    {
+        lock (_processGate)
+            _processes.Remove(process);
+    }
+
+    private static void KillProcessTree(System.Diagnostics.Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // Best-effort teardown path.
+        }
+    }
+
+    public Task KillActiveExecsAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        System.Diagnostics.Process[] activeProcesses;
+        lock (_processGate)
+            activeProcesses = _processes.ToArray();
+        foreach (var process in activeProcesses)
+            KillProcessTree(process);
+        return Task.CompletedTask;
     }
 
     private static async Task<LimitedReadResult> ReadLimitedAsync(
@@ -368,6 +414,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
         SandboxLiveCounter.Decrement();
+        KillActiveExecsAsync().GetAwaiter().GetResult();
         if (_preserved)
             return ValueTask.CompletedTask;
         try

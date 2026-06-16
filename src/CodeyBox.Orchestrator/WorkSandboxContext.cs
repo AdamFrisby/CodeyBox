@@ -195,6 +195,11 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             return _inner.ExecAsync(exec, ct);
         }
 
+        public Task KillActiveExecsAsync(CancellationToken ct = default)
+        {
+            return _inner.KillActiveExecsAsync(ct);
+        }
+
         public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
         {
             return _inner.GetScreenshotAsync(ct);

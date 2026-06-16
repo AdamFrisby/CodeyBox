@@ -297,6 +297,7 @@ internal sealed class TestRequiredBuildVerifier : IRequiredBuildVerifier
 
     public int ProbeCalls { get; private set; }
     public int VerifyCalls { get; private set; }
+    public List<RequiredBuildVerificationRequest> VerificationRequests { get; } = [];
 
     public Task<RequiredBuildProbeResult> ProbeAsync(
         RequiredBuildProbeRequest request,
@@ -312,8 +313,8 @@ internal sealed class TestRequiredBuildVerifier : IRequiredBuildVerifier
         RequiredBuildVerificationRequest request,
         CancellationToken ct)
     {
-        _ = request;
         _ = ct;
+        VerificationRequests.Add(request);
         VerifyCalls++;
         return Task.FromResult(_verificationResult);
     }
@@ -426,6 +427,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// Used to simulate transient text-only failures during resolver cascade.
     /// </summary>
     public Queue<TextOnlyAgentResult> TextOnlyResults { get; } = new();
+    public List<string> WorkPrompts { get; } = new();
 
     /// <summary>
     /// Captured prompts the agentic (in-sandbox) conflict resolver sent to this
@@ -480,10 +482,13 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// summarisation.
     /// </summary>
     public bool StructuredStreamSupportResult { get; set; } = true;
+    public Func<ISandbox, CancellationToken, Task<bool>>? StructuredStreamSupportHandler { get; set; }
 
     public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
         StructuredStreamSupportProbeCount++;
+        if (StructuredStreamSupportHandler is not null)
+            return StructuredStreamSupportHandler(sandbox, ct);
         return Task.FromResult(StructuredStreamSupportResult);
     }
 
@@ -605,7 +610,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         {
             return await HandleCheckAsync(prompt, stdoutChunkCallback, ct);
         }
-        return await HandleWorkAsync(sandbox, workingDirectory, ct);
+        return await HandleWorkAsync(sandbox, workingDirectory, prompt, ct);
     }
 
     private Task<AgentResult> HandleCheckAsync(
@@ -739,8 +744,9 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
             ?? [];
     }
 
-    private async Task<AgentResult> HandleWorkAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct)
+    private async Task<AgentResult> HandleWorkAsync(ISandbox sandbox, string workingDirectory, string prompt, CancellationToken ct)
     {
+        WorkPrompts.Add(prompt);
         if (BeforeWorkAsync is not null)
             await BeforeWorkAsync(sandbox, workingDirectory, ct);
 

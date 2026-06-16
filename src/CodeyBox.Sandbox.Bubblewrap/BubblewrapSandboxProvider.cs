@@ -139,6 +139,8 @@ internal sealed class BubblewrapSandbox : ISandbox
     private readonly ITimingStore? _timings;
     private readonly WorkItemId _timingItemId;
     private readonly string _timingPhase;
+    private readonly object _processGate = new();
+    private readonly HashSet<Process> _processes = [];
     private int _firstExecEmitted;
     private bool _disposed;
 
@@ -215,65 +217,109 @@ internal sealed class BubblewrapSandbox : ISandbox
                 };
             }
             proc.Start();
+            RegisterProcess(proc);
             Task<LimitedReadResult>? limitedStdoutTask = null;
             Task<LimitedReadResult>? limitedStderrTask = null;
-            if (limitOutput)
+            try
             {
-                void KillForLimit()
+                if (limitOutput)
                 {
-                    try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                    void KillForLimit()
+                    {
+                        KillProcessTree(proc);
+                    }
+
+                    limitedStdoutTask = ReadLimitedAsync(
+                        proc.StandardOutput,
+                        exec.MaxStdoutBytes,
+                        exec.StdoutChunkCallback,
+                        exec.KillOnOutputLimit ? KillForLimit : null,
+                        ct);
+                    limitedStderrTask = ReadLimitedAsync(
+                        proc.StandardError,
+                        exec.MaxStderrBytes,
+                        exec.StderrChunkCallback,
+                        exec.KillOnOutputLimit ? KillForLimit : null,
+                        ct);
+                }
+                else
+                {
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+                }
+                if (exec.Stdin is not null)
+                {
+                    await proc.StandardInput.WriteAsync(exec.Stdin);
+                    proc.StandardInput.Close();
                 }
 
-                limitedStdoutTask = ReadLimitedAsync(
-                    proc.StandardOutput,
-                    exec.MaxStdoutBytes,
-                    exec.StdoutChunkCallback,
-                    exec.KillOnOutputLimit ? KillForLimit : null,
-                    ct);
-                limitedStderrTask = ReadLimitedAsync(
-                    proc.StandardError,
-                    exec.MaxStderrBytes,
-                    exec.StderrChunkCallback,
-                    exec.KillOnOutputLimit ? KillForLimit : null,
-                    ct);
-            }
-            else
-            {
-                proc.BeginOutputReadLine();
-                proc.BeginErrorReadLine();
-            }
-            if (exec.Stdin is not null)
-            {
-                await proc.StandardInput.WriteAsync(exec.Stdin);
-                proc.StandardInput.Close();
-            }
+                try { await proc.WaitForExitAsync(ct); }
+                catch (OperationCanceledException)
+                {
+                    KillProcessTree(proc);
+                    throw;
+                }
 
-            try { await proc.WaitForExitAsync(ct); }
-            catch (OperationCanceledException)
-            {
-                try { proc.Kill(entireProcessTree: true); } catch { /* best-effort */ }
-                throw;
-            }
+                if (limitedStdoutTask is not null && limitedStderrTask is not null)
+                {
+                    var stdoutResult = await limitedStdoutTask;
+                    var stderrResult = await limitedStderrTask;
+                    return new SandboxExecResult(
+                        proc.ExitCode,
+                        stdoutResult.Text,
+                        stderrResult.Text,
+                        stdoutResult.LimitExceeded,
+                        stderrResult.LimitExceeded);
+                }
 
-            if (limitedStdoutTask is not null && limitedStderrTask is not null)
-            {
-                var stdoutResult = await limitedStdoutTask;
-                var stderrResult = await limitedStderrTask;
-                return new SandboxExecResult(
-                    proc.ExitCode,
-                    stdoutResult.Text,
-                    stderrResult.Text,
-                    stdoutResult.LimitExceeded,
-                    stderrResult.LimitExceeded);
+                return new SandboxExecResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
             }
-
-            return new SandboxExecResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
+            finally
+            {
+                UnregisterProcess(proc);
+            }
         }
         finally
         {
             if (firstExecScope is not null)
                 await firstExecScope.DisposeAsync();
         }
+    }
+
+    private void RegisterProcess(Process process)
+    {
+        lock (_processGate)
+            _processes.Add(process);
+    }
+
+    private void UnregisterProcess(Process process)
+    {
+        lock (_processGate)
+            _processes.Remove(process);
+    }
+
+    private static void KillProcessTree(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // Best-effort teardown path.
+        }
+    }
+
+    public Task KillActiveExecsAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        Process[] activeProcesses;
+        lock (_processGate)
+            activeProcesses = _processes.ToArray();
+        foreach (var process in activeProcesses)
+            KillProcessTree(process);
+        return Task.CompletedTask;
     }
 
     private static async Task<LimitedReadResult> ReadLimitedAsync(
@@ -434,6 +480,7 @@ internal sealed class BubblewrapSandbox : ISandbox
         if (_disposed) return;
         _disposed = true;
         SandboxLiveCounter.Decrement();
+        await KillActiveExecsAsync();
         await using var teardownScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "bwrap.teardown", log: _log);
         try

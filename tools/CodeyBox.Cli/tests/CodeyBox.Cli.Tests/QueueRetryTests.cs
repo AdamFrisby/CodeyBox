@@ -77,6 +77,7 @@ public sealed class QueueRetryTests
     }
 
     [Theory]
+    [InlineData("rework")]
     [InlineData("merge")]
     [InlineData("upstream")]
     public async Task Retry_AllValidFromValues_Succeed(string fromValue)

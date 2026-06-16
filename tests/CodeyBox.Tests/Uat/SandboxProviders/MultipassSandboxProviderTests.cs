@@ -3930,6 +3930,44 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task KillActiveExecsAsync_StopsMultipassVmWithoutDisposing()
+    {
+        var stopCalls = 0;
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                stopCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        await sandbox.KillActiveExecsAsync();
+
+        Assert.Equal(1, stopCalls);
+        Assert.Equal(0, deleteCalls);
+        Assert.Contains(
+            runner.Calls,
+            call => call.Argv.SequenceEqual(["/bin/true", "stop", "codeybox-test"]));
+
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(1, deleteCalls);
+        Assert.Contains(
+            runner.Calls,
+            call => call.Argv.SequenceEqual(["/bin/true", "delete", "--purge", "codeybox-test"]));
+    }
+
+    [Fact]
     public async Task SuspendAsync_NonZeroExit_ThrowsAndLeavesDisposeActive()
     {
         // Critical safety contract: a failed `multipass suspend` MUST NOT flip
