@@ -443,6 +443,7 @@ internal static class WorkItemRecoveryPolicy
         QuotaRetryFrom = null,
         QuotaRetryPhase = null,
         NextTransientRetryAt = null,
+        TransientRetryAttempts = 0,
         TransientRetryFirstFailedAt = null,
         CancellationReason = null,
         CancellationSource = null,

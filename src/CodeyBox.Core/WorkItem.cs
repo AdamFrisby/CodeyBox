@@ -619,6 +619,7 @@ public sealed record WorkItem
             QuotaRetryFrom = carriesQuotaRetry ? QuotaRetryFrom : null,
             QuotaRetryPhase = carriesQuotaRetry ? QuotaRetryPhase : null,
             NextTransientRetryAt = carriesTransientRetry ? NextTransientRetryAt : null,
+            TransientRetryAttempts = preservesTransientHistory ? TransientRetryAttempts : 0,
             TransientRetryFirstFailedAt = preservesTransientHistory ? TransientRetryFirstFailedAt : null,
             TransientRetryFrom = carriesTransientRetry ? TransientRetryFrom : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
@@ -658,12 +659,9 @@ public sealed record WorkItem
     private static bool ShouldPreserveTransientRetryHistory(WorkItemState state) =>
         state is WorkItemState.Queued
             or WorkItemState.Working
-            or WorkItemState.WorkComplete
             or WorkItemState.Auditing
             or WorkItemState.Reworking
-            or WorkItemState.AuditPassed
             or WorkItemState.Merging
-            or WorkItemState.Merged
             or WorkItemState.UpstreamPushing
             or WorkItemState.ReworkingForConflict
             or WorkItemState.WaitingForTransientRetry

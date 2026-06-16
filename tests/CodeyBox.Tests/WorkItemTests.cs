@@ -117,4 +117,54 @@ public sealed class WorkItemTests
         Assert.Null(queued.QuotaRetryFrom);
         Assert.Null(queued.QuotaRetryPhase);
     }
+
+    [Theory]
+    [InlineData(WorkItemState.Working, WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.Auditing, WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merging, WorkItemState.Merged)]
+    [InlineData(WorkItemState.UpstreamPushing, WorkItemState.Done)]
+    public void With_SuccessfulPhaseBoundaryClearsTransientRetrySeries(
+        WorkItemState from,
+        WorkItemState to)
+    {
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-30);
+        var item = Sample() with
+        {
+            State = from,
+            TransientRetryAttempts = 3,
+            TransientRetryFirstFailedAt = firstFailedAt,
+            NextTransientRetryAt = DateTimeOffset.UtcNow.AddMinutes(5),
+            TransientRetryFrom = "audit",
+        };
+
+        var transitioned = item.With(to);
+
+        Assert.Equal(0, transitioned.TransientRetryAttempts);
+        Assert.Null(transitioned.TransientRetryFirstFailedAt);
+        Assert.Null(transitioned.NextTransientRetryAt);
+        Assert.Null(transitioned.TransientRetryFrom);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Queued, WorkItemState.Working)]
+    [InlineData(WorkItemState.WorkComplete, WorkItemState.Auditing)]
+    [InlineData(WorkItemState.AuditPassed, WorkItemState.Merging)]
+    [InlineData(WorkItemState.Merged, WorkItemState.UpstreamPushing)]
+    public void With_RetryPhaseStartPreservesTransientRetrySeries(
+        WorkItemState from,
+        WorkItemState to)
+    {
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-30);
+        var item = Sample() with
+        {
+            State = from,
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = firstFailedAt,
+        };
+
+        var transitioned = item.With(to);
+
+        Assert.Equal(2, transitioned.TransientRetryAttempts);
+        Assert.Equal(firstFailedAt, transitioned.TransientRetryFirstFailedAt);
+    }
 }
