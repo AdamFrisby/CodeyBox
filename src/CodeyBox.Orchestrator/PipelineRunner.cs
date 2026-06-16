@@ -5092,7 +5092,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 var timedOutAfter = await timeoutTask.ConfigureAwait(false);
                 if (timedOutAfter is not null)
                 {
-                    await CancelAndObserveAfterIdleTimeoutAsync(linkedCts, probeTask).ConfigureAwait(false);
+                    await CancelAndTearDownAfterIdleTimeoutAsync(
+                        linkedCts,
+                        probeTask,
+                        sandbox,
+                        "structured-stream probe",
+                        auditorName).ConfigureAwait(false);
                     throw new AuditorIdleTimeoutException(auditorName, timedOutAfter.Value);
                 }
 
@@ -6690,7 +6695,10 @@ public sealed class PipelineRunner : IPipelineRunner
                         firstOtherException = ExceptionDispatchInfo.Capture(inner);
                 }
                 if (firstExhaustion is not null)
+                {
+                    await PublishPartialProgressAsync([], [], ct).ConfigureAwait(false);
                     throw firstExhaustion;
+                }
 
                 if (incompleteAuditors.Count > 0)
                 {
@@ -6943,7 +6951,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 var timedOutAfter = await timeoutTask.ConfigureAwait(false);
                 if (timedOutAfter is not null)
                 {
-                    await CancelAndObserveAfterIdleTimeoutAsync(linkedCts, auditorTask).ConfigureAwait(false);
+                    await CancelAndTearDownAfterIdleTimeoutAsync(
+                        linkedCts,
+                        auditorTask,
+                        sandbox,
+                        "auditor",
+                        auditor.Name).ConfigureAwait(false);
                     throw new AuditorIdleTimeoutException(auditor.Name, timedOutAfter.Value);
                 }
 
@@ -6998,21 +7011,84 @@ public sealed class PipelineRunner : IPipelineRunner
         return null;
     }
 
-    private static async Task CancelAndObserveAfterIdleTimeoutAsync<T>(
+    private async Task CancelAndTearDownAfterIdleTimeoutAsync<T>(
         CancellationTokenSource cts,
-        Task<T> task)
+        Task<T> task,
+        ISandbox sandbox,
+        string operation,
+        string auditorName)
     {
         try { await cts.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
 
+        try
+        {
+            await sandbox.DisposeAsync().AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(1))
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _log.LogWarning(
+                "Timed-out {Operation} for auditor {Auditor} did not dispose sandbox {SandboxId} within the teardown grace period",
+                operation,
+                auditorName,
+                sandbox.Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Timed-out {Operation} for auditor {Auditor} failed while disposing sandbox {SandboxId}",
+                operation,
+                auditorName,
+                sandbox.Id);
+        }
+
+        if (task.IsCompleted)
+        {
+            ObserveTimedOutTask(task, operation, auditorName);
+            return;
+        }
+
+        var completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false);
+        if (completed == task)
+        {
+            ObserveTimedOutTask(task, operation, auditorName);
+            return;
+        }
+
+        _log.LogWarning(
+            "Timed-out {Operation} for auditor {Auditor} did not stop within the teardown grace period after cancellation and sandbox disposal",
+            operation,
+            auditorName);
         _ = task.ContinueWith(
-            completed =>
+            completedTask =>
             {
-                _ = completed.Exception;
+                _ = completedTask.Exception;
             },
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
+    }
+
+    private void ObserveTimedOutTask<T>(Task<T> task, string operation, string auditorName)
+    {
+        try
+        {
+            _ = task.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                ex,
+                "Timed-out {Operation} for auditor {Auditor} stopped with an exception after teardown",
+                operation,
+                auditorName);
+        }
     }
 
     /// <summary>

@@ -480,10 +480,13 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// summarisation.
     /// </summary>
     public bool StructuredStreamSupportResult { get; set; } = true;
+    public Func<ISandbox, CancellationToken, Task<bool>>? StructuredStreamSupportHandler { get; set; }
 
     public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
         StructuredStreamSupportProbeCount++;
+        if (StructuredStreamSupportHandler is not null)
+            return StructuredStreamSupportHandler(sandbox, ct);
         return Task.FromResult(StructuredStreamSupportResult);
     }
 
