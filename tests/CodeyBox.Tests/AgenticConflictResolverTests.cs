@@ -385,6 +385,41 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_SessionResumeExhausted_RedactsStderrFromSummary()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var lastResult = new AgentResult(
+            false,
+            "agent exited 1",
+            "resume stdout",
+            "Transport channel closed after sk-ant-api03-AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT-0123456");
+        var runner = new FakeAgentResolverRunner(_ =>
+            throw new AgentSessionResumeExhaustedException(
+                new AgentKind("resumable-agent"),
+                maxResumeAttempts: 2,
+                lastResult))
+        { Kind = new AgentKind("resumable-agent") };
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("Transport channel closed", result.Summary);
+        Assert.Contains("***", result.Summary);
+        Assert.DoesNotContain("sk-ant-api03", result.Summary);
+    }
+
+    [Fact]
     public async Task ResolveAsync_FailureClassificationResult_VerificationFails_AssignsMetadata()
     {
         var sandbox = new ConflictSandbox();

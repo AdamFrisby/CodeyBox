@@ -356,7 +356,7 @@ public sealed class AgenticConflictResolver
                         stdoutTail: RedactAuditTail(ex.LastResult.Stdout),
                         stderrTail: RedactAuditTail(ex.LastResult.Stderr));
                     attemptTrail.Add(
-                        $"{runner.Kind.Value}#{attempt}(session resume exhausted: {Truncate(ex.LastResult.Summary, 120)}; stderr: {Truncate(ex.LastResult.Stderr, 200)})");
+                        $"{runner.Kind.Value}#{attempt}(session resume exhausted: {Truncate(ex.LastResult.Summary, 120)}; stderr: {Truncate(RedactAuditTail(ex.LastResult.Stderr), 200)})");
                     lastAgentResult = ex.LastResult;
                     lastFailureRunner = runner;
                     lastFailureCredential = candidate.Credential;

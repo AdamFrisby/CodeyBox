@@ -274,6 +274,44 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task CompositeAutoRetryScheduler_NotifyQuotaFailure_DelegatesToQuotaScheduler()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        using var quotaScheduler = BuildPayPerApiRetryScheduler(
+            store,
+            gitRoot,
+            retryOptions: new AutoRetryOnQuotaFailureOptions
+            {
+                Enabled = true,
+                ClockDriftSafetyMargin = TimeSpan.FromMinutes(2),
+                PeriodicCheckInterval = TimeSpan.FromHours(1),
+                MaxAutoRetriesPerWorkItem = 3,
+            });
+        IWorkItemAutoRetryScheduler scheduler = new WorkItemAutoRetryScheduler(quotaScheduler, transient: null);
+        var resetAt = _time.Now.AddMinutes(13);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "quota delegate",
+            Prompt = "p",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaResetAt = resetAt,
+            NextQuotaRetryAt = null,
+        };
+        await store.CreateAsync(item);
+
+        await scheduler.NotifyQuotaFailureAsync(item);
+
+        var stored = await store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(resetAt.AddMinutes(2), stored!.NextQuotaRetryAt);
+    }
+
+    [Fact]
     public async Task PeriodicSweep_MovesRecoveredButPausedQuotaItemToWaitingForAgentResume()
     {
         var stateDb = Path.Combine(_workspace, $"quota-paused-{Guid.NewGuid():N}.db");

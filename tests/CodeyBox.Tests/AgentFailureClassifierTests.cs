@@ -296,8 +296,10 @@ public sealed class AgentFailureClassifierTests
             AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(["vendor transport marker"]);
 
             var c = AgentFailureClassifier.Classify(stderr: "fatal: vendor transport marker");
+            var builtIn = AgentFailureClassifier.Classify(stderr: "fatal: ECONNRESET while streaming");
 
             Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+            Assert.Equal(AgentFailureKind.TransientNetwork, builtIn.Kind);
         }
         finally
         {
@@ -327,6 +329,9 @@ public sealed class AgentFailureClassifierTests
                 AgentFailureKind.TransientNetwork,
                 AgentFailureClassifier.Classify(stderr: "fatal: operator initial transport marker").Kind);
             Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: ECONNRESET while streaming").Kind);
+            Assert.Equal(
                 AgentFailureKind.Normal,
                 AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
 
@@ -337,6 +342,9 @@ public sealed class AgentFailureClassifierTests
             Assert.Equal(
                 AgentFailureKind.TransientNetwork,
                 AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: Transport channel closed").Kind);
             Assert.Equal(
                 AgentFailureKind.Normal,
                 AgentFailureClassifier.Classify(stderr: "fatal: operator initial transport marker").Kind);

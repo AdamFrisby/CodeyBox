@@ -46,11 +46,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
+        var auditor = new LlmTransientFailureAuditor();
         var involvement = new InMemoryAgentInvolvementStore();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [new LlmTransientFailureAuditor()],
+            auditors: [auditor],
             involvement: involvement,
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
@@ -68,6 +69,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.Equal(1, auditor.InvocationCount);
 
         var auditRows = (await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
             .Where(r => r.Phase == "audit:llm-transient")
@@ -81,10 +83,11 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
+        var auditor = new LlmStderrTransientFailureAuditor();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [new LlmStderrTransientFailureAuditor()],
+            auditors: [auditor],
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -100,6 +103,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal("audit", final.TransientRetryFrom);
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(1, auditor.InvocationCount);
     }
 
     [Fact]
@@ -2380,9 +2384,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
     private sealed class LlmTransientFailureAuditor : IAuditor
     {
+        private int _invocationCount;
+
         public string Name => "llm-transient";
         public string Kind => "llm";
         public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+        public int InvocationCount => _invocationCount;
 
         public Task<AuditResult> RunAsync(
             ISandbox sandbox,
@@ -2390,6 +2397,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             AuditContext context,
             CancellationToken ct = default)
         {
+            Interlocked.Increment(ref _invocationCount);
             _ = sandbox;
             _ = workingDirectory;
             _ = context;
@@ -2411,9 +2419,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
     private sealed class LlmStderrTransientFailureAuditor : IAuditor
     {
+        private int _invocationCount;
+
         public string Name => "llm-stderr-transient";
         public string Kind => "llm";
         public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+        public int InvocationCount => _invocationCount;
 
         public Task<AuditResult> RunAsync(
             ISandbox sandbox,
@@ -2421,6 +2432,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             AuditContext context,
             CancellationToken ct = default)
         {
+            Interlocked.Increment(ref _invocationCount);
             _ = sandbox;
             _ = workingDirectory;
             _ = context;

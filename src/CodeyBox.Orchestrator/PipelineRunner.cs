@@ -6727,15 +6727,18 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
 
                     // A nonzero review-agent exit is audit infrastructure, not a
-                    // source-code finding. Retry once in a fresh sandbox to ride out
-                    // transient CLI/network/process failures. Quota-shaped failures
-                    // are handled by the quota fallback wrapper below.
-                    if (IsLlmAgentExecutionFailure(run.Result)
-                        && _quotaClassifier.Detect(
-                            run.Runner.Kind,
-                            run.Result.AgentStderr,
-                            run.Result.AgentStdout) is null)
+                    // source-code finding. Quota and transient transport shapes must
+                    // leave this attempt immediately so the durable quota/transient
+                    // schedulers own the backoff. Unknown non-quota/non-transient
+                    // execution failures still get one fresh-sandbox retry.
+                    if (IsLlmAgentExecutionFailure(run.Result))
                     {
+                        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
+                        ThrowIfTransientAgentFailure(
+                            run.Runner,
+                            ToAgentResultForAuditFailureClassification(run.Result),
+                            "audit");
+
                         _log.LogWarning(
                             "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
                             run.Auditor.Name);
@@ -6748,7 +6751,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     // a transient execution failure, never as a code-quality finding
                     // or a Pass with a skipped review. The retry above is the one
                     // chance to ride out a transient CLI/network/process flap; if
-                    // the retry's result still carries the
+                    // quota / transient parking has already had first claim.
+                    // If the retry's result still carries the
                     // "review agent failed to run" sentinel and ThrowIfAuditorRunQuotaAsync
                     // did NOT classify it as quota, this is non-quota infrastructure:
                     // throw AuditUnavailableException so the RunAsync catch routes it
@@ -6760,6 +6764,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     // blocking source-code finding the work agent cannot fix).
                     if (IsLlmAgentExecutionFailure(run.Result))
                     {
+                        ThrowIfTransientAgentFailure(
+                            run.Runner,
+                            ToAgentResultForAuditFailureClassification(run.Result),
+                            "audit");
                         var summary = run.Result.AgentSummary ?? run.Result.AgentStderr ?? "agent execution failed";
                         throw new AuditUnavailableException(
                             $"LLM auditor '{run.Auditor.Name}' could not run: agent execution failed after one retry ({SingleLineSummary(summary)})");

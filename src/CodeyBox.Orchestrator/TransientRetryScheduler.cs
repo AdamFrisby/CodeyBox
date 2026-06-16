@@ -586,7 +586,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable
             {
                 NextTransientRetryAt = nextRetryAt,
                 TransientRetryFirstFailedAt = firstFailedAt,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = now,
             };
             var updated = await _store.TryUpdateIfStateAndUpdatedAtAsync(
                 scheduledItem,
