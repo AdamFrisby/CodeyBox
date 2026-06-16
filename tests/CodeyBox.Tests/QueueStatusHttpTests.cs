@@ -108,6 +108,49 @@ public sealed class QueueStatusHttpTests : IDisposable
         Assert.Empty(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
     }
 
+    /// <summary>
+    /// Companion to <see cref="GetQueueStatus_ExcludesRefactorDrainWhenFreshNormalIsAheadInDispatchOrder"/>:
+    /// the suppress-draining-status branch must also fire when the normal item
+    /// ahead has the SAME priority as the refactor but was created earlier
+    /// (priority is the primary tiebreaker, but on a tie the older item still
+    /// wins). Without this case a regression that only honored priority while
+    /// ignoring CreatedAt on tied priorities could still leave the higher
+    /// finding green. The project is intentionally busy (one in-flight normal)
+    /// so the branch's `counts != 0` guard does not short-circuit before the
+    /// dispatch-order check is reached.
+    /// </summary>
+    [Fact]
+    public async Task GetQueueStatus_ExcludesRefactorDrain_WhenBusyProjectHasSamePriorityOlderNormalAheadOfRefactor()
+    {
+        var projectId = new ProjectId("proj-tiebreaker");
+        var createdAt = DateTimeOffset.UtcNow.AddSeconds(-30);
+        var activeNormal = MakeWorkItem(projectId) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var olderSamePriorityNormal = MakeWorkItem(projectId) with
+        {
+            Priority = 50,
+            CreatedAt = createdAt,
+        };
+        var refactor = MakeWorkItem(projectId) with
+        {
+            JobType = JobType.Refactor,
+            Priority = 50,
+            CreatedAt = createdAt.AddSeconds(5),
+        };
+        await _factory.Store.CreateAsync(activeNormal);
+        await _factory.Store.CreateAsync(olderSamePriorityNormal);
+        await _factory.Store.CreateAsync(refactor);
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Empty(doc.RootElement.GetProperty("refactorGates").EnumerateArray());
+    }
+
     [Fact]
     public async Task GetQueueStatus_IncludesRefactorLockedState()
     {

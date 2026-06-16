@@ -667,7 +667,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (projectClaim is not null)
             return RefactorDispatchGateDecision.Block(projectClaim.Reason);
 
-        var queuedRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+        var queuedRefactor = await FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
             candidate,
             ct);
         if (queuedRefactor is null)
@@ -1383,26 +1383,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
                 }
 
-                var olderRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+                var drainOwnerRefactor = await FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
                     RefactorDispatchCandidate.FromWorkItem(candidate),
                     stoppingToken);
-                if (olderRefactor is not null)
+                if (drainOwnerRefactor is not null)
                 {
                     var (claimedRefactorInFlight, claimedOtherInFlight) =
                         await _store.CountInFlightSplitByRefactorAsync(
-                            olderRefactor.ProjectId,
+                            drainOwnerRefactor.ProjectId,
                             stoppingToken,
-                            olderRefactor.Id);
+                            drainOwnerRefactor.Id);
                     if (claimedRefactorInFlight > 0 || claimedOtherInFlight > 0)
                     {
                         var claimReason = RefactorCandidateBlockedReason(
-                            olderRefactor,
+                            drainOwnerRefactor,
                             claimedRefactorInFlight,
                             claimedOtherInFlight);
-                        SetRefactorDrainClaim(olderRefactor, claimReason);
-                        pendingRefactorProjects[candidate.ProjectId.Value] = olderRefactor.Id;
+                        SetRefactorDrainClaim(drainOwnerRefactor, claimReason);
+                        pendingRefactorProjects[candidate.ProjectId.Value] = drainOwnerRefactor.Id;
 
-                        var reason = RefactorDrainHoldReason(candidate.ProjectId, olderRefactor.Id);
+                        var reason = RefactorDrainHoldReason(candidate.ProjectId, drainOwnerRefactor.Id);
                         AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
                         ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
                         continue;
@@ -2602,6 +2602,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             ? 0
             : 1;
 
+    /// <summary>
+    /// Mirrors the SQL ordering of <see cref="IWorkItemStore.ListDispatchEligibleByPriorityAsync"/>:
+    /// phase bucket ASC (finishing phases before fresh queued work), then
+    /// priority DESC, then <c>CreatedAt</c> ASC. Returns true iff
+    /// <paramref name="left"/> would be picked before <paramref name="right"/>
+    /// by the dispatcher. NOTE: priority is the primary tie-breaker —
+    /// <c>CreatedAt</c> only matters when priorities are equal. A lower-priority
+    /// item never precedes a higher-priority one even if it was created earlier.
+    /// </summary>
     private static bool DispatchPrecedes(WorkItem left, RefactorDispatchCandidate right)
     {
         var leftBucket = DispatchPhaseBucket(left);
@@ -2615,7 +2624,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         return left.CreatedAt < right.CreatedAt;
     }
 
-    private async Task<WorkItem?> FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+    /// <summary>
+    /// Returns the queued refactor (if any) for <paramref name="candidate"/>'s
+    /// project that precedes <paramref name="candidate"/> in the dispatcher's
+    /// total order (phase bucket, priority DESC, then <c>CreatedAt</c> ASC —
+    /// see <see cref="DispatchPrecedes"/>). When multiple refactors precede,
+    /// the one that the dispatcher would pick first is returned. This is the
+    /// "drain owner" — the refactor whose turn it is, in front of which the
+    /// candidate non-refactor item must hold. A lower-priority refactor is
+    /// NEVER selected over a higher-priority normal item; the dispatch-order
+    /// gate ensures the drain only fires on refactors that have actually
+    /// earned their turn under the standard priority rules.
+    /// </summary>
+    private async Task<WorkItem?> FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
         RefactorDispatchCandidate candidate,
         CancellationToken ct)
     {
@@ -2631,6 +2652,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
         WorkItem? selected = null;
+        // Iteration is already in dispatch order (priority DESC, then created_at
+        // ASC), so the first eligible refactor is the highest-priority one.
+        // The inner DispatchPrecedes guard handles any reordering nuance and
+        // keeps the selection invariant identical to PickNextEligibleAsync.
         await foreach (var refactorCandidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
         {
             if (refactorCandidate.Id == candidate.Id
@@ -2868,26 +2893,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 return true;
             }
 
-            var olderRefactor = await FindEligibleFreshRefactorForProjectBeforeFreshNormalAsync(
+            var drainOwnerRefactor = await FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
                 RefactorDispatchCandidate.FromWorkItem(item),
                 ct);
-            if (olderRefactor is null)
+            if (drainOwnerRefactor is null)
                 return false;
 
             var (claimedRefactorInFlight, claimedOtherInFlight) =
                 await _store.CountInFlightSplitByRefactorAsync(
-                    olderRefactor.ProjectId,
+                    drainOwnerRefactor.ProjectId,
                     ct,
-                    olderRefactor.Id);
+                    drainOwnerRefactor.Id);
             if (claimedRefactorInFlight == 0 && claimedOtherInFlight == 0)
                 return false;
 
             var claimReason = RefactorCandidateBlockedReason(
-                olderRefactor,
+                drainOwnerRefactor,
                 claimedRefactorInFlight,
                 claimedOtherInFlight);
-            SetRefactorDrainClaim(olderRefactor, claimReason);
-            var reason = RefactorDrainHoldReason(item.ProjectId, olderRefactor.Id);
+            SetRefactorDrainClaim(drainOwnerRefactor, claimReason);
+            var reason = RefactorDrainHoldReason(item.ProjectId, drainOwnerRefactor.Id);
             AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, reason);
             ScheduleRefactorExclusivityRequeue(item.Id, ct);
             return true;
