@@ -156,6 +156,8 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     [InlineData("rework", WorkItemState.WorkComplete, "audit")]
     [InlineData("conflict_rework", WorkItemState.ReworkingForConflict, "conflict_rework")]
     [InlineData("post-act-recheck", WorkItemState.AuditPassed, "merge")]
+    [InlineData("rebase", WorkItemState.Queued, null)]
+    [InlineData("rebase", WorkItemState.WorkComplete, "audit")]
     [InlineData("rebase", WorkItemState.Merging, "merge")]
     [InlineData("merge", WorkItemState.Merging, "merge")]
     [InlineData("upstream", WorkItemState.UpstreamPushing, "upstream")]
@@ -564,6 +566,39 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecuteAsync_PeriodicTick_RetriesDueTransientFailure()
+    {
+        using var fixture = BuildScheduler(EnabledRetryOptions() with
+        {
+            PeriodicCheckInterval = TimeSpan.FromMilliseconds(25),
+        });
+        await fixture.Scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            await Task.Delay(100);
+            var transient = NewTransientItem() with
+            {
+                NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            };
+            await fixture.Store.CreateAsync(transient);
+
+            _time.Advance(TimeSpan.FromMilliseconds(25));
+
+            var retried = await WaitForAsync(
+                async () => (await fixture.Store.GetAsync(transient.Id))?.State == WorkItemState.Queued);
+            Assert.True(retried);
+            var stored = await fixture.Store.GetAsync(transient.Id);
+            Assert.NotNull(stored);
+            Assert.Equal(1, stored!.TransientRetryAttempts);
+            Assert.Equal(transient.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
+        }
+        finally
+        {
+            await fixture.Scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task PeriodicSweep_TransientRetrySuccess_PublishesTransientAutoRetryWebhook()
     {
         var webhooks = new CapturingWebhookDispatcher();
@@ -595,6 +630,32 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal("periodic", root.GetProperty("triggeredBy").GetString());
         Assert.Equal("merge", root.GetProperty("from").GetString());
         Assert.Equal("merge", root.GetProperty("actualFrom").GetString());
+    }
+
+    [Fact]
+    public async Task TryTransientRetry_WhenAutoRetryWebhookFails_StillCompletesRetry()
+    {
+        using var fixture = BuildScheduler(
+            EnabledRetryOptions(),
+            webhooks: new ThrowingAutoRetryWebhookDispatcher());
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryFrom = "merge",
+            WorkBranch = "codeybox/transient-webhook-failure",
+            BaseBranch = "main",
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await InvokeTryTransientRetryAsync(fixture.Scheduler, item, "periodic");
+
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(retried);
+        Assert.Equal(WorkItemState.AuditPassed, retried!.State);
+        Assert.Equal(1, retried.TransientRetryAttempts);
+        Assert.Null(retried.FailureKind);
+        Assert.Null(retried.NextTransientRetryAt);
+        Assert.Equal(item.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -1160,6 +1221,14 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         public Task PublishAsync(WebhookEvent evt, CancellationToken ct = default)
             => evt.Event == "work_item.failed"
                 ? throw new InvalidOperationException("webhook failed")
+                : Task.CompletedTask;
+    }
+
+    private sealed class ThrowingAutoRetryWebhookDispatcher : IWebhookDispatcher
+    {
+        public Task PublishAsync(WebhookEvent evt, CancellationToken ct = default)
+            => evt.Event == "work_item.auto_retry"
+                ? throw new InvalidOperationException("auto-retry webhook failed")
                 : Task.CompletedTask;
     }
 

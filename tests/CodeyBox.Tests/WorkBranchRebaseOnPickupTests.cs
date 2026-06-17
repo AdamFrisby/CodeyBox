@@ -464,7 +464,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
         Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
         Assert.Equal("transient", final.FailureKind);
-        Assert.Equal("merge", final.TransientRetryFrom);
+        Assert.Equal("audit", final.TransientRetryFrom);
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);

@@ -517,6 +517,54 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task ConflictMergeVerificationFailure_WithTransportText_DoesNotParkTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+
+        var item = NewItem("feature/conflict-verification") with
+        {
+            State = WorkItemState.WorkComplete,
+            ConflictReworkAttempts = 1,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        tp.Agent.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "resolver thought it resolved",
+            Stdout: "resolver stdout",
+            Stderr: "Transport channel closed after harmless reconnect"));
+        tp.Agent.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "resolver still thought it resolved",
+            Stdout: "resolver stdout",
+            Stderr: "Transport channel closed after harmless reconnect"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.NotEqual("transient", final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
     public async Task WorkBranchEqualsBaseBranch_FailsBeforeSandbox()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

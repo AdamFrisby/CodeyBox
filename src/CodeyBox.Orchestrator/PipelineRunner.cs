@@ -10162,36 +10162,40 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
-                var detection = _quotaClassifier.Detect(chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout);
+                var classificationResult = agentResultForAvailabilityClassification ?? agentResult;
+                var detection = _quotaClassifier.Detect(
+                    chosenMergeRunner.Kind,
+                    classificationResult.Stderr,
+                    classificationResult.Stdout);
                 if (detection is not null)
                 {
                     await _quotaClassifier.RecordIfQuotaFailureAsync(
                         _quotaFailures,
                         chosenMergeRunner.Kind,
                         observedModelId,
-                        agentResult.Summary,
-                        agentResult.Stderr,
+                        classificationResult.Summary,
+                        classificationResult.Stderr,
                         mergeEndedAt,
                         _auditQuotaOptions.ObservedFailureRetention,
                         ct,
                         projectId: item.ProjectId,
-                        stdout: agentResult.Stdout);
-                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+                        stdout: classificationResult.Stdout);
+                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {classificationResult.Summary}", detection.ResetAt);
                 }
 
-                ThrowIfTransientAgentFailure(chosenMergeRunner, agentResult, "merge");
+                ThrowIfTransientAgentFailure(chosenMergeRunner, classificationResult, "merge");
 
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     chosenMergeRunner.Kind,
                     observedModelId,
-                    agentResult.Summary,
-                    agentResult.Stderr,
+                    classificationResult.Summary,
+                    classificationResult.Stderr,
                     mergeEndedAt,
                     _auditQuotaOptions.ObservedFailureRetention,
                     ct,
                     projectId: item.ProjectId,
-                    stdout: agentResult.Stdout);
+                    stdout: classificationResult.Stdout);
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
@@ -13755,7 +13759,6 @@ Original merge-phase failure (for context):
         "rework" => "audit",
         ConflictReworkPhaseKey => "conflict_rework",
         "post-act-recheck" => "merge",
-        "rebase" => "merge",
         "merge" => "merge",
         "upstream" => "upstream",
         _ => ExplicitTransientRetryFromForState(currentState),

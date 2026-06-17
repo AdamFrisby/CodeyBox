@@ -652,7 +652,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable
     }
 
     private static bool IsTransientRetryPending(WorkItem item) =>
-        item.FailureKind == "transient"
+        string.Equals(item.FailureKind, "transient", StringComparison.OrdinalIgnoreCase)
         && item.State is WorkItemState.WaitingForTransientRetry or WorkItemState.Failed;
 
     private TimeSpan ComputeTransientRetryDelay(

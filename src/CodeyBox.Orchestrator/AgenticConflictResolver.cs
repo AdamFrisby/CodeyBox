@@ -236,7 +236,45 @@ public sealed class AgenticConflictResolver
         IAgentRunner? lastFailureRunner = null;
         AgentCredential? lastFailureCredential = null;
         AgentResult? lastFailureClassificationResult = null;
+        IAgentRunner? transientFailureRunner = null;
+        AgentCredential? transientFailureCredential = null;
+        AgentResult? transientFailureClassificationResult = null;
         string? lastVerificationError = null;
+
+        void RecordFailureForClassification(
+            IAgentRunner failureRunner,
+            AgentCredential? failureCredential,
+            AgentResult classificationResult,
+            bool allowTransientBackoff)
+        {
+            lastFailureRunner = failureRunner;
+            lastFailureCredential = failureCredential;
+            lastFailureClassificationResult = classificationResult;
+
+            if (!allowTransientBackoff || transientFailureClassificationResult is not null)
+                return;
+
+            AgentFailureClassification classification;
+            try
+            {
+                classification = failureRunner.ClassifyFailure(classificationResult);
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex,
+                    "Agentic conflict resolver: failed to classify failure from agent '{Agent}' for {WorkItemId}",
+                    failureRunner.Kind.Value,
+                    workItemId);
+                return;
+            }
+
+            if (classification.Kind != AgentFailureKind.TransientNetwork)
+                return;
+
+            transientFailureRunner = failureRunner;
+            transientFailureCredential = failureCredential;
+            transientFailureClassificationResult = classificationResult;
+        }
 
         foreach (var candidate in candidates)
         {
@@ -358,9 +396,7 @@ public sealed class AgenticConflictResolver
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(session resume exhausted: {Truncate(ex.LastResult.Summary, 120)}; stderr: {Truncate(RedactAuditTail(ex.LastResult.Stderr), 200)})");
                     lastAgentResult = ex.LastResult;
-                    lastFailureRunner = runner;
-                    lastFailureCredential = candidate.Credential;
-                    lastFailureClassificationResult = ex.LastResult;
+                    RecordFailureForClassification(runner, candidate.Credential, ex.LastResult, allowTransientBackoff: true);
                     break;
                 }
                 catch (Exception ex)
@@ -375,13 +411,15 @@ public sealed class AgenticConflictResolver
                         stdoutTail: null,
                         stderrTail: RedactAuditTail(ex.ToString()));
                     attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {ex.Message})");
-                    lastFailureRunner = runner;
-                    lastFailureCredential = candidate.Credential;
-                    lastFailureClassificationResult = new AgentResult(
-                        false,
-                        $"threw {ex.GetType().Name}: {ex.Message}",
-                        Stdout: null,
-                        Stderr: ex.ToString());
+                    RecordFailureForClassification(
+                        runner,
+                        candidate.Credential,
+                        new AgentResult(
+                            false,
+                            $"threw {ex.GetType().Name}: {ex.Message}",
+                            Stdout: null,
+                            Stderr: ex.ToString()),
+                        allowTransientBackoff: true);
                     break;
                 }
                 finally
@@ -419,9 +457,7 @@ public sealed class AgenticConflictResolver
                         stderrTail: RedactAuditTail(agentResult.Stderr));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(agent failed: {Truncate(agentResult.Summary, 120)}; stderr: {Truncate(agentResult.Stderr, 200)})");
-                    lastFailureRunner = runner;
-                    lastFailureCredential = candidate.Credential;
-                    lastFailureClassificationResult = agentResult;
+                    RecordFailureForClassification(runner, candidate.Credential, agentResult, allowTransientBackoff: true);
                     break;
                 }
 
@@ -442,13 +478,15 @@ public sealed class AgenticConflictResolver
 
                 lastVerificationError = verification.Reason;
                 attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(verification.Reason, 200)})");
-                lastFailureRunner = runner;
-                lastFailureCredential = candidate.Credential;
-                lastFailureClassificationResult = new AgentResult(
-                    false,
-                    verification.Reason,
-                    Stdout: null,
-                    Stderr: null);
+                RecordFailureForClassification(
+                    runner,
+                    candidate.Credential,
+                    new AgentResult(
+                        false,
+                        verification.Reason,
+                        Stdout: null,
+                        Stderr: null),
+                    allowTransientBackoff: false);
                 AuditLog.AgenticConflictResolverAttemptFailed(
                     workItemId, runner.Kind, sandbox.Id, workingDirectory,
                     attempt, maxAttemptsPerAgent,
@@ -475,9 +513,9 @@ public sealed class AgenticConflictResolver
             Stdout: lastAgentResult?.Stdout,
             Stderr: lastAgentResult?.Stderr)
         {
-            FailureRunner = lastFailureRunner,
-            FailureCredential = lastFailureCredential,
-            FailureClassificationResult = lastFailureClassificationResult,
+            FailureRunner = transientFailureRunner ?? lastFailureRunner,
+            FailureCredential = transientFailureCredential ?? lastFailureCredential,
+            FailureClassificationResult = transientFailureClassificationResult ?? lastFailureClassificationResult,
         };
     }
 
