@@ -1,0 +1,223 @@
+using System.Buffers;
+using System.Security.Cryptography;
+using CodeyBox.Core;
+using Microsoft.Extensions.Logging;
+
+namespace CodeyBox.Orchestrator;
+
+/// <summary>
+/// Stores attachment blobs on the host filesystem under a content-addressed
+/// layout: <c>&lt;root&gt;/&lt;sha256[..2]&gt;/&lt;sha256&gt;</c>. Uploads are
+/// streamed to a temp file with hashing, size-checked on the fly, then
+/// atomically promoted into their final path. Repeated uploads of the same
+/// bytes (same hash) are deduplicated — only one on-disk copy exists per
+/// distinct blob.
+/// </summary>
+public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBlobStore
+{
+    private readonly Func<string> _rootResolver;
+    private readonly ILogger<HostWorkItemAttachmentBlobStore>? _log;
+
+    public HostWorkItemAttachmentBlobStore(
+        Func<string> rootResolver,
+        ILogger<HostWorkItemAttachmentBlobStore>? log = null)
+    {
+        _rootResolver = rootResolver ?? throw new ArgumentNullException(nameof(rootResolver));
+        _log = log;
+    }
+
+    public string CurrentRoot => Resolve();
+
+    public async Task<AttachmentBlobStageResult> StageAsync(
+        Stream source,
+        long maxBytes,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (maxBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxBytes), "maxBytes must be positive.");
+
+        var root = Resolve();
+        Directory.CreateDirectory(root);
+        var tempDir = Path.Combine(root, ".tmp");
+        Directory.CreateDirectory(tempDir);
+
+        var tempPath = Path.Combine(tempDir, Guid.NewGuid().ToString("N"));
+        long total = 0;
+        byte[]? finalHash = null;
+        var buffer = ArrayPool<byte>.Shared.Rent(81920);
+        try
+        {
+            using (var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            await using (var fs = new FileStream(
+                tempPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 81920,
+                useAsync: true))
+            {
+                while (true)
+                {
+                    var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                    if (read == 0) break;
+                    total += read;
+                    if (total > maxBytes)
+                    {
+                        throw new AttachmentBlobTooLargeException(maxBytes);
+                    }
+                    sha.AppendData(buffer, 0, read);
+                    await fs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                }
+
+                await fs.FlushAsync(ct).ConfigureAwait(false);
+                finalHash = sha.GetHashAndReset();
+            }
+
+            var hashHex = Convert.ToHexString(finalHash).ToLowerInvariant();
+            var finalPath = PathFor(root, hashHex);
+            var finalDir = Path.GetDirectoryName(finalPath)!;
+            Directory.CreateDirectory(finalDir);
+
+            if (File.Exists(finalPath))
+            {
+                TryDeleteTemp(tempPath);
+                return new AttachmentBlobStageResult(hashHex, total, WasDeduplicated: true);
+            }
+
+            try
+            {
+                File.Move(tempPath, finalPath);
+            }
+            catch (IOException) when (File.Exists(finalPath))
+            {
+                // Raced with another upload of the same bytes — the existing
+                // file is already canonical, drop the temp.
+                TryDeleteTemp(tempPath);
+                return new AttachmentBlobStageResult(hashHex, total, WasDeduplicated: true);
+            }
+
+            return new AttachmentBlobStageResult(hashHex, total, WasDeduplicated: false);
+        }
+        catch
+        {
+            TryDeleteTemp(tempPath);
+            throw;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    public Stream? OpenRead(string sha256)
+    {
+        if (!IsValidHash(sha256)) return null;
+        var path = PathFor(Resolve(), sha256);
+        if (!File.Exists(path)) return null;
+        return new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 81920,
+            useAsync: true);
+    }
+
+    public bool Exists(string sha256)
+    {
+        if (!IsValidHash(sha256)) return false;
+        return File.Exists(PathFor(Resolve(), sha256));
+    }
+
+    public bool TryDelete(string sha256)
+    {
+        if (!IsValidHash(sha256)) return false;
+        var path = PathFor(Resolve(), sha256);
+        if (!File.Exists(path)) return false;
+        try
+        {
+            File.Delete(path);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Failed to delete attachment blob {Sha256} at {Path}", sha256, path);
+            return false;
+        }
+    }
+
+    public IReadOnlyCollection<string> EnumerateHashes()
+    {
+        var root = Resolve();
+        if (!Directory.Exists(root)) return Array.Empty<string>();
+
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var shard in Directory.EnumerateDirectories(root))
+        {
+            var shardName = Path.GetFileName(shard);
+            if (shardName is null
+                || shardName.Length != 2
+                || !IsHexShard(shardName))
+                continue;
+            foreach (var file in Directory.EnumerateFiles(shard))
+            {
+                var name = Path.GetFileName(file);
+                if (IsValidHash(name) && name.StartsWith(shardName, StringComparison.Ordinal))
+                    result.Add(name);
+            }
+        }
+        return result;
+    }
+
+    private string Resolve()
+    {
+        var root = _rootResolver();
+        if (string.IsNullOrWhiteSpace(root))
+            throw new InvalidOperationException("Attachment blob root is not configured.");
+        return root;
+    }
+
+    private static string PathFor(string root, string sha256) =>
+        Path.Combine(root, sha256[..2], sha256);
+
+    private static bool IsValidHash(string? s)
+    {
+        if (s is null || s.Length != 64) return false;
+        for (int i = 0; i < s.Length; i++)
+        {
+            var c = s[i];
+            var isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!isHex) return false;
+        }
+        return true;
+    }
+
+    private static bool IsHexShard(string s)
+    {
+        for (int i = 0; i < s.Length; i++)
+        {
+            var c = s[i];
+            var isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!isHex) return false;
+        }
+        return true;
+    }
+
+    private void TryDeleteTemp(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (Exception ex) { _log?.LogDebug(ex, "Failed to delete temp attachment file {Path}", path); }
+    }
+}
+
+/// <summary>
+/// Internal extension of <see cref="IWorkItemAttachmentBlobStore"/> for the
+/// composition root: exposes the live resolved root so admin endpoints and the
+/// orphan sweep can reason about it. Kept separate from the consumer-facing
+/// interface so business code can't poke at filesystem paths directly.
+/// </summary>
+public interface IWorkItemAttachmentAdminBlobStore : IWorkItemAttachmentBlobStore
+{
+    string CurrentRoot { get; }
+}
