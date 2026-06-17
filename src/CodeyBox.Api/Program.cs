@@ -7,6 +7,7 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Antigravity;
+using CodeyBox.Agents.Crock;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
@@ -594,6 +595,11 @@ builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, AntigravityAgentRunner>();
+// Crock: scaffolded and registered, but DISABLED in shipped agent-class config.
+// Operators opt in by adding `crock` to an AgentClass member list once the
+// dependent follow-up (cost/usage accounting, watchdog accommodation,
+// credential/tunnel provisioning) lands. See docs/agents.md (TBD section).
+builder.Services.AddSingleton<IAgentRunner, CrockAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
@@ -1189,6 +1195,11 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 // (UseObservedFailures) for opencode members. Replace with a real
 // HTTP-backed probe once an endpoint is confirmed.
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapLastKnownGood(new OpencodeQuotaProbe(), sp));
+// Crock: ships as Unknown-only. Cost/usage accounting against Anthropic's
+// Message Batches API is part of the dependent follow-up; until then the
+// router falls onto its QuotaUnknownPolicy (UseObservedFailures) for any
+// crock member operators opt in.
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapLastKnownGood(new CrockQuotaProbe(), sp));
 // Antigravity: the agy gateway exposes NO readable per-model quota meter
 // (daily-cloudcode-pa :retrieveUserQuota* return 403), so the probe uses
 // :loadCodeAssist as a free authorization/tier liveness read (200 ⇒ available)
@@ -1425,6 +1436,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CrockInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
