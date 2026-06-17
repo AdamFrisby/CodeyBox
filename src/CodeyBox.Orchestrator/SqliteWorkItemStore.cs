@@ -743,7 +743,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at
+                    next_terminal_retry_at = $next_terminal_retry_at,
+                    knobs_json = $knobs
                 WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
                 """;
             Bind(cmd, item);

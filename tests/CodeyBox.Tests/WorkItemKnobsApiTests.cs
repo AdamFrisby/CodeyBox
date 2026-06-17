@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
+using CodeyBox.Core;
 using CodeyBox.Orchestrator.Knobs;
 
 namespace CodeyBox.Tests;
@@ -138,6 +139,35 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
         Assert.Equal(ChangeScopeKnob.ValueRefactor, body!.Knobs![ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_Knobs_OnNonQueuedItem_Returns409Conflict()
+    {
+        // Knobs is in the queuedOnlyPatch gate: once an item leaves Queued, a
+        // knob edit must surface 409 so the running pipeline isn't perturbed.
+        var create = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "running",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created!.Id))
+            ?? throw new InvalidOperationException("created item missing from store");
+        await _factory.Store.UpdateAsync(stored with { State = WorkItemState.Working });
+
+        var patch = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
+        {
+            Content = JsonContent.Create(new
+            {
+                knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor },
+            }),
+        };
+        var resp = await _client.SendAsync(patch);
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
     }
 
     [Fact]

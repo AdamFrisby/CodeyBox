@@ -121,6 +121,22 @@ public sealed class KnobRegistryTests
         Assert.Equal("round", effective["shape"]);
     }
 
+    [Fact]
+    public void Resolve_StaleItemValue_FallsThroughToProjectDefault_NotKnobDefault()
+    {
+        // Item carries a value that is no longer in AllowedValues. The
+        // documented precedence (item > project default > knob default)
+        // requires the project default to win — the stale item must NOT
+        // short-circuit straight to the knob default.
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
+
+        var effective = registry.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["shape"] = "octagon" },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["shape"] = "square" });
+
+        Assert.Equal("square", effective["shape"]);
+    }
+
     private sealed class TestEnumKnob : IKnob
     {
         public TestEnumKnob(string key, string defaultValue, IReadOnlyList<string> allowedValues)

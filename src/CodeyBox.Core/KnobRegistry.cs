@@ -112,18 +112,14 @@ public sealed class KnobRegistry : IKnobRegistry
         out string? canonical)
     {
         if (source.TryGetValue(knob.Key, out var raw) && !string.IsNullOrWhiteSpace(raw))
-        {
-            canonical = NormaliseValueAgainstAllowedValues(knob, raw);
-            return true;
-        }
+            return TryNormaliseAgainstAllowedValues(knob, raw, out canonical);
 
         foreach (var kv in source)
         {
             if (string.Equals(kv.Key, knob.Key, StringComparison.OrdinalIgnoreCase) &&
                 !string.IsNullOrWhiteSpace(kv.Value))
             {
-                canonical = NormaliseValueAgainstAllowedValues(knob, kv.Value);
-                return true;
+                return TryNormaliseAgainstAllowedValues(knob, kv.Value, out canonical);
             }
         }
 
@@ -131,22 +127,29 @@ public sealed class KnobRegistry : IKnobRegistry
         return false;
     }
 
-    private static string NormaliseValueAgainstAllowedValues(IKnob knob, string value)
+    private static bool TryNormaliseAgainstAllowedValues(IKnob knob, string value, out string? canonical)
     {
         if (knob.AllowedValues.Count == 0)
-            return value;
+        {
+            canonical = value;
+            return true;
+        }
 
         foreach (var allowed in knob.AllowedValues)
         {
             if (string.Equals(allowed, value, StringComparison.OrdinalIgnoreCase))
-                return allowed;
+            {
+                canonical = allowed;
+                return true;
+            }
         }
 
-        // Persisted value is not in AllowedValues — treat as not set so the
-        // pipeline falls back to project default / knob default. The API path
-        // validates at set-time so reaching here means the knob's
-        // AllowedValues changed in code since the value was persisted.
-        return knob.DefaultValue;
+        // Persisted value is not in AllowedValues — signal "not set" so Resolve
+        // falls through to the next precedence tier (project default → knob
+        // default). The API path validates at set-time so reaching here means
+        // the knob's AllowedValues changed in code since the value was persisted.
+        canonical = null;
+        return false;
     }
 
     private string KnownKeysDescription()
