@@ -137,6 +137,42 @@ public sealed class KnobRegistryTests
         Assert.Equal("square", effective["shape"]);
     }
 
+    [Fact]
+    public void EmptyAllowedValues_AcceptsAnyNonEmptyString_AndResolvesVerbatim()
+    {
+        // The IKnob contract documents that an empty AllowedValues list means
+        // "any non-null string accepted" — useful for free-form knobs (numeric
+        // budgets, paths, etc.). Validate accepts arbitrary input and Resolve
+        // returns the persisted casing verbatim (no canonicalisation since
+        // there's no allowed-value list to canonicalise against).
+        var registry = new KnobRegistry([new TestEnumKnob("freeForm", "fallback", [])]);
+
+        Assert.True(registry.Validate("freeForm", "arbitrary-string").Ok);
+        Assert.True(registry.Validate("freeForm", "Another-VALUE").Ok);
+
+        var effective = registry.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["freeForm"] = "Mixed-Case-Verbatim" },
+            projectKnobs: null);
+
+        Assert.Equal("Mixed-Case-Verbatim", effective["freeForm"]);
+    }
+
+    [Fact]
+    public void TryGet_ReturnsRegisteredKnob_AndFalseForUnknownOrEmpty()
+    {
+        var registered = new TestEnumKnob("shape", "round", ["round", "square"]);
+        var registry = new KnobRegistry([registered]);
+
+        Assert.True(registry.TryGet("shape", out var hit));
+        Assert.Same(registered, hit);
+
+        Assert.True(registry.TryGet("SHAPE", out var hitMixedCase));
+        Assert.Same(registered, hitMixedCase);
+
+        Assert.False(registry.TryGet("nope", out _));
+        Assert.False(registry.TryGet(string.Empty, out _));
+    }
+
     private sealed class TestEnumKnob : IKnob
     {
         public TestEnumKnob(string key, string defaultValue, IReadOnlyList<string> allowedValues)
