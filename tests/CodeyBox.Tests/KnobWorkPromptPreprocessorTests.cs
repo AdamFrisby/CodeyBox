@@ -203,6 +203,35 @@ public sealed class KnobWorkPromptPreprocessorTests
         Assert.Equal("stable", result);
     }
 
+    [Fact]
+    public void ChangeScopeKnob_GetWorkPromptFragment_UnmappedValue_ReturnsNull()
+    {
+        // The registry rejects out-of-range values at set-time, but a stale
+        // value can reach the fragment method if the AllowedValues list changes
+        // in code after a value was persisted. Pin the documented "knob with
+        // nothing to say contributes nothing" behaviour for unmapped values so
+        // a future edit that flips to a throw or fallback fragment surfaces here.
+        var knob = new ChangeScopeKnob();
+        Assert.Null(knob.GetWorkPromptFragment("yolo"));
+        Assert.Null(knob.GetWorkPromptFragment(""));
+        Assert.Null(knob.GetWorkPromptFragment("MODERATE"));
+    }
+
+    [Fact]
+    public void ChangeScopeKnob_GetWorkPromptFragment_CanonicalValues_ReturnExpectedFragments()
+    {
+        // Pin the surgical / refactor mapping at the knob level so the
+        // preprocessor tests aren't the only place the value→fragment
+        // contract is verified.
+        var knob = new ChangeScopeKnob();
+        var surgical = knob.GetWorkPromptFragment(ChangeScopeKnob.ValueSurgical);
+        var refactor = knob.GetWorkPromptFragment(ChangeScopeKnob.ValueRefactor);
+        Assert.NotNull(surgical);
+        Assert.NotNull(refactor);
+        Assert.Contains("SURGICAL", surgical);
+        Assert.Contains("REFACTOR", refactor);
+    }
+
     private static WorkItem NewItem(IReadOnlyDictionary<string, string>? knobs = null) => new()
     {
         Id = WorkItemId.New(),

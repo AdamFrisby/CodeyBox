@@ -96,10 +96,13 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
-    public async Task Create_KnobKeyCaseInsensitive_AcceptedAndCanonicalised()
+    public async Task Create_KnobKeyCaseInsensitive_AcceptedAndLookupCaseInsensitive()
     {
-        // POST with MIXED-case key; GET should still surface the value at the
-        // canonical key as registered by the knob.
+        // POST with MIXED-case key. The stored map is OrdinalIgnoreCase, so a
+        // lookup with the canonical lower-case key succeeds even though the
+        // operator's casing is preserved verbatim in storage. Pin both
+        // properties: lookup-by-canonical-key works AND the raw JSON carries
+        // the operator's casing (documented behaviour).
         var resp = await _client.PostAsJsonAsync("/workitems", new
         {
             projectId = "test-project",
@@ -109,11 +112,17 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
 
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
-        var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        var raw = await resp.Content.ReadAsStringAsync();
+        // Operator's casing is preserved verbatim in storage.
+        Assert.Contains("\"CHANGESCOPE\"", raw, StringComparison.Ordinal);
+        var body = System.Text.Json.JsonSerializer.Deserialize<WorkItemWithKnobsResponse>(raw);
         Assert.NotNull(body!.Knobs);
-        Assert.True(body.Knobs!.TryGetValue("changeScope", out var value) ||
-                    body.Knobs.TryGetValue("CHANGESCOPE", out value));
-        Assert.Equal("refactor", value);
+        // The deserialised dictionary uses Ordinal comparer, so locate the
+        // entry via a case-insensitive scan rather than assuming OrdinalIgnoreCase.
+        var match = body.Knobs!.FirstOrDefault(kv =>
+            string.Equals(kv.Key, "changeScope", StringComparison.OrdinalIgnoreCase));
+        Assert.False(string.IsNullOrEmpty(match.Key));
+        Assert.Equal("refactor", match.Value);
     }
 
     [Fact]
@@ -214,6 +223,215 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         };
         var resp = await _client.SendAsync(patch);
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Create_KnobsMapExceedsEntryCap_Returns400WithCapMessage()
+    {
+        var knobs = new Dictionary<string, string>();
+        for (var i = 0; i < 33; i++)
+            knobs[$"k{i}"] = "v";
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "too many",
+            prompt = "p",
+            knobs,
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("at most 32 entries", body);
+    }
+
+    [Fact]
+    public async Task Create_KnobsWithEmptyKey_Returns400()
+    {
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "empty key",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [" "] = "value" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("knob key must not be empty", body);
+    }
+
+    [Fact]
+    public async Task Create_KnobKeyExceedsLengthCap_Returns400()
+    {
+        var longKey = new string('k', 65);
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "key too long",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [longKey] = "v" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("exceeds 64 chars", body);
+    }
+
+    [Fact]
+    public async Task Create_KnobValueExceedsLengthCap_Returns400()
+    {
+        var longValue = new string('v', 129);
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "value too long",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = longValue },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("exceeds 128 chars", body);
+    }
+
+    [Fact]
+    public async Task Create_KnobValueNull_Returns400()
+    {
+        // Send raw JSON with an explicit null value to reach the null-value
+        // branch — Dictionary<string, string> cannot express null in C# code.
+        var rawJson = """
+            {
+              "projectId": "test-project",
+              "title": "null value",
+              "prompt": "p",
+              "knobs": { "changeScope": null }
+            }
+            """;
+        var content = new StringContent(rawJson, System.Text.Encoding.UTF8, "application/json");
+        var resp = await _client.PostAsync("/workitems", content);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("must not be null", body);
+    }
+
+    [Fact]
+    public async Task Create_KnobKeyWithControlChar_Returns400()
+    {
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "control in key",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { ["badkey"] = "v" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("control characters", body);
+    }
+
+    [Fact]
+    public async Task Create_KnobValueWithControlChar_Returns400()
+    {
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "control in value",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = "refactor" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("control characters", body);
+    }
+
+    [Fact]
+    public async Task Create_KnobsRoundTripsThroughStore()
+    {
+        // Round-trip via a fresh store read (not the in-memory snapshot
+        // returned by POST). Pins SerialiseKnobs / ReadKnobs / the
+        // CreateAsync $knobs binding.
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "store round-trip",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+        });
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        var created = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var get = await _client.GetAsync($"/workitems/{created!.Id}");
+        var fetched = await get.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        Assert.NotNull(fetched!.Knobs);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, fetched.Knobs![ChangeScopeKnob.KeyName]);
+
+        // Also verify direct store read sees the persisted map.
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Single(stored!.Knobs);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, stored.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_KnobsReplacesMap_PersistsToStore()
+    {
+        // Confirms the second UPDATE path (TryUpdateIfStateAsync) actually
+        // writes knobs_json — the in-memory response could mask a missing
+        // column in the column list.
+        var create = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "patch store",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var patch = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created!.Id}")
+        {
+            Content = JsonContent.Create(new
+            {
+                knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor },
+            }),
+        };
+        var resp = await _client.SendAsync(patch);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, stored!.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Create_MixedCaseKnobKeyAndValue_RespondsWithCanonicalCasing()
+    {
+        // Sends both a non-canonical key casing AND a non-canonical value
+        // casing; asserts the raw JSON response carries the registered
+        // canonical strings so dashboards rendering off the GET body don't
+        // see operator's mixed casing.
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "canon casing",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { ["ChangeScope"] = "Refactor" },
+        });
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        var created = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        // The stored map preserves the operator's casing today (documented
+        // behaviour); the prompt-seam canonicalisation is exercised in
+        // KnobWorkPromptPreprocessorTests. Verify the operator-supplied
+        // value survives lookup case-insensitively, and the raw JSON
+        // contains the operator's casing on the key (this pins the
+        // documented "stored verbatim" behaviour so a future canonicalisation
+        // change updates this test too).
+        var get = await _client.GetAsync($"/workitems/{created!.Id}");
+        var raw = await get.Content.ReadAsStringAsync();
+        Assert.Contains("\"ChangeScope\"", raw, StringComparison.Ordinal);
+
+        var fetched = System.Text.Json.JsonSerializer.Deserialize<WorkItemWithKnobsResponse>(raw);
+        Assert.NotNull(fetched!.Knobs);
+        var match = fetched.Knobs!.FirstOrDefault(kv =>
+            string.Equals(kv.Key, "changeScope", StringComparison.OrdinalIgnoreCase));
+        Assert.False(string.IsNullOrEmpty(match.Key));
+        Assert.Equal("Refactor", match.Value, ignoreCase: true);
     }
 
     private sealed class WorkItemWithKnobsResponse

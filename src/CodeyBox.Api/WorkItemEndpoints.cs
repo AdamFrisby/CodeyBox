@@ -511,6 +511,7 @@ internal static class WorkItemEndpoints
             ReplayOfWorkItemId = source.Id,
             MinModelScore = source.MinModelScore,
             RequiredCapabilities = source.RequiredCapabilities,
+            Knobs = source.Knobs,
         };
 
         await store.CreateAsync(replay, ct);

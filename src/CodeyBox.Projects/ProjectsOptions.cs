@@ -26,9 +26,10 @@ public sealed class ProjectDefaultsConfig
     /// <summary>
     /// Default knob values applied to every project unless the project carries
     /// its own override for the same key. Keys must match a registered
-    /// <c>IKnob.Key</c>; unknown keys are dropped at prompt-assembly time with
-    /// a warning. Values are case-insensitive matches against the knob's
-    /// <c>AllowedValues</c>.
+    /// <c>IKnob.Key</c>; unknown keys (or values not in the knob's
+    /// <c>AllowedValues</c>) are dropped silently at prompt-assembly time and
+    /// the effective value falls through to the knob's own default. Values
+    /// are case-insensitive matches against the knob's <c>AllowedValues</c>.
     /// </summary>
     public Dictionary<string, string>? Knobs { get; set; }
 }

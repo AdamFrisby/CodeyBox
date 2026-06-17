@@ -59,7 +59,7 @@ knob default**:
 
 ## Validation
 
-Every set-time path validates against the registered `IKnobRegistry`:
+Every API set-time path validates against the registered `IKnobRegistry`:
 
 - Unknown keys are rejected with a clear error naming the key and listing the
   known knobs.
@@ -70,6 +70,14 @@ Every set-time path validates against the registered `IKnobRegistry`:
 
 The PATCH endpoint follows the same Queued-only state machine that other
 queued-only fields use; once an item leaves Queued, knob edits return 409.
+
+Project-default knob maps in `codeybox-extra.json` (both `Defaults.Knobs` and
+`Projects[N].Knobs`) are **not** validated against the registry at config-load
+time. Unknown keys or out-of-range values are dropped silently at
+prompt-assembly time and the effective value falls through to the knob's own
+default. A future hardening pass may add startup validation; today, an
+operator typo in project-default knobs surfaces only as the absence of the
+expected behaviour change.
 
 ## Resolution and prompt injection
 

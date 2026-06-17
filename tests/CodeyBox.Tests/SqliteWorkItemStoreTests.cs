@@ -633,6 +633,66 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         await Assert.ThrowsAsync<InvalidDataException>(() => _store.GetAsync(item.Id));
     }
 
+    [Fact]
+    public async Task TryUpdateIfStateAndUpdatedAtAsync_PersistsKnobsMap()
+    {
+        // The recovery / retry path uses this UPDATE; a regression that drops
+        // knobs_json from the column list would silently wipe the work item's
+        // knob map on every recovery tick.
+        var knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["changeScope"] = "refactor",
+        };
+        var item = Sample() with { Knobs = knobs };
+        await _store.CreateAsync(item);
+        var persisted = await _store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+
+        var updated = persisted! with
+        {
+            State = WorkItemState.WaitingForTransientRetry,
+            UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
+        };
+
+        var wrote = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            updated,
+            WorkItemState.Queued,
+            persisted.UpdatedAt);
+
+        Assert.True(wrote);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Single(read!.Knobs);
+        Assert.Equal("refactor", read.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task ReadKnobs_TolerantOfCaseInsensitiveDuplicatesInPersistedJson()
+    {
+        // Hand-edited / pre-migration rows can carry a knobs_json blob with
+        // two keys that differ only in casing. Read must not crash the whole
+        // row load — last-write-wins should resolve the duplicate.
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE work_items SET knobs_json = $junk WHERE id = $id";
+            cmd.Parameters.AddWithValue("$junk", "{\"changeScope\":\"surgical\",\"CHANGESCOPE\":\"refactor\"}");
+            cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        // Either ordering is acceptable; the contract is "do not throw, do not
+        // strand the row". A non-empty knob map is the proof we survived the
+        // case-insensitive dedup path rather than catching JsonException only.
+        Assert.True(read!.Knobs.ContainsKey("changeScope"));
+    }
+
     private static async Task DrainAsync(IAsyncEnumerable<WorkItem> items)
     {
         await foreach (var _ in items)

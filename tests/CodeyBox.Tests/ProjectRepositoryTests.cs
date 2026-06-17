@@ -1004,6 +1004,171 @@ public sealed class ProjectRepositoryTests
         Assert.NotNull(p);
         Assert.Equal("noop", p!.Upstream.Kind);
     }
+
+    [Fact]
+    public async Task Knobs_DefaultsOnly_FlowToProject()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("surgical", p!.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task Knobs_ProjectOnly_FlowsThroughWithoutDefaults()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "refactor" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task Knobs_ProjectOverridesDefaultOnKeyCollision()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "refactor" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task Knobs_EmptyStringInProject_ClearsInheritedDefault()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.False(p!.Knobs.ContainsKey("changeScope"));
+    }
+
+    [Fact]
+    public async Task Knobs_WhitespaceKeyInProject_IsDropped()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string>
+                    {
+                        ["   "] = "surgical",
+                        ["changeScope"] = "refactor",
+                    },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Single(p!.Knobs);
+        Assert.Equal("refactor", p.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task Knobs_WhitespaceValueInDefaults_IsDroppedFromDefaultsMerge()
+    {
+        // Defaults with a whitespace value should not propagate into the
+        // resolved project knob map — the documented "clear an inherited
+        // default" semantic only applies to project-side empties.
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "  " },
+            },
+            Projects =
+            [
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.False(p!.Knobs.ContainsKey("changeScope"));
+    }
+
+    [Fact]
+    public async Task Knobs_KeyOnlyInDefaults_NotShadowedByProjectKnobsForOtherKey()
+    {
+        // A project that overrides one knob must NOT wipe other inherited
+        // defaults — the merge is per-key, not whole-map replace.
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string>
+                {
+                    ["changeScope"] = "surgical",
+                    ["otherKnob"] = "foo",
+                },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "refactor" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+        Assert.Equal("foo", p.Knobs["otherKnob"]);
+    }
 }
 
 file sealed class NullAgent : IAgentRunner

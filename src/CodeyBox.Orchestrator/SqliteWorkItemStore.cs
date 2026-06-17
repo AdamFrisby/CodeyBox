@@ -2192,7 +2192,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         {
             var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
             if (dict is null || dict.Count == 0) return EmptyKnobs;
-            return new Dictionary<string, string>(dict, StringComparer.OrdinalIgnoreCase);
+            var rebuilt = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in dict)
+            {
+                // Case-insensitive duplicates can only appear on hand-edited or
+                // pre-migration rows (the API path always normalises through an
+                // OrdinalIgnoreCase dictionary). Last-write-wins matches the
+                // dictionary indexer semantics callers expect.
+                rebuilt[k] = v;
+            }
+            return rebuilt;
         }
         catch (JsonException)
         {
