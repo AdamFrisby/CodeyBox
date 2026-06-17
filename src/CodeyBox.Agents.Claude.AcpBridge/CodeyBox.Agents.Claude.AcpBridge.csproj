@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ACP bridge native sidecar. Compiles to a self-contained, statically-linked
+    ELF binary that ships into the sandbox VM and replaces the prior Node.js
+    bridge (see AcpBridgeBinary.cs / AcpClaudeTransport.cs in the parent
+    CodeyBox.Agents.Claude project).
+
+    Build prerequisites for `dotnet publish`:
+      - musl-tools (for the musl static linker the AOT publish step invokes).
+      - The linux-musl-x64 ILCompiler runtime nuget package is restored
+        on demand.
+
+    The default `dotnet build CodeyBox.slnx` does NOT run the AOT publish;
+    it just builds the IL assembly so the solution stays buildable on hosts
+    without musl-tools installed. Operators run scripts/publish-acp-bridge.sh
+    to produce the static binary and refresh the embedded resource carried
+    by CodeyBox.Agents.Claude.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>CodeyBox.Agents.Claude.AcpBridge</RootNamespace>
+    <AssemblyName>CodeyBox.Agents.Claude.AcpBridge</AssemblyName>
+
+    <!-- AOT settings honoured by `dotnet publish` only. -->
+    <PublishAot>true</PublishAot>
+    <StaticallyLinked>true</StaticallyLinked>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <StripSymbols>true</StripSymbols>
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+    <IlcOptimizationPreference>Size</IlcOptimizationPreference>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+
+    <!-- Reflection-free JSON: source-generation only. -->
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+
+    <!-- This binary never references InternalsVisibleTo into CodeyBox.Tests
+         and the solution-wide warnings-as-errors settings come from
+         Directory.Build.props. Keep nullable + analysis on so any port bug
+         that survives the JS → C# rewrite gets caught by the analyser. -->
+  </PropertyGroup>
+
+</Project>

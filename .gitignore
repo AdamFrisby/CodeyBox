@@ -25,3 +25,9 @@ obj/
 # `dotnet test --logger trx` writes per-run result files here; they're
 # time/machine-stamped and not meant to be committed.
 **/TestResults/
+
+# ACP bridge native binary produced by scripts/publish-acp-bridge.sh — not
+# tracked because it's machine-specific. The tracked placeholder under
+# Resources/acp-bridge.placeholder is what ships in dev builds; CI / release
+# overwrites it via the publish script.
+/src/CodeyBox.Agents.Claude/Resources/acp-bridge

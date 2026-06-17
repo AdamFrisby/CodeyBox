@@ -6,7 +6,7 @@ namespace CodeyBox.Agents.Claude;
 
 /// <summary>
 /// Agent Client Protocol transport. Each turn runs the in-sandbox
-/// <see cref="AcpBridgeScript"/> bridge under a single
+/// <see cref="AcpBridgeBinary"/> native bridge under a single
 /// <c>sandbox.ExecAsync</c>: the bridge stands up an IDE-shaped lockfile +
 /// WebSocket, spawns <c>claude --ide</c> (interactive — OFF the
 /// <c>--print</c> metered pool), proxies JSON-RPC 2.0 frames between the
@@ -45,12 +45,6 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     /// </summary>
     public string ClaudeBinary { get; init; } = ClaudeAgentRunner.DefaultBinary;
 
-    /// <summary>
-    /// Node binary used to host the bridge. Overrideable for tests / images
-    /// that install Node under a non-default path.
-    /// </summary>
-    public string NodeBinary { get; init; } = "node";
-
     public string Name => "acp";
     public ClaudeSessionTransport Transport => ClaudeSessionTransport.Acp;
 
@@ -63,11 +57,11 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     internal static int ResolveTurnTimeoutSeconds(int? apiTimeoutMs)
     {
         if (!apiTimeoutMs.HasValue)
-            return AcpBridgeScript.TurnTimeoutSeconds;
+            return AcpBridgeBinary.TurnTimeoutSeconds;
 
         var apiTimeoutSeconds = Math.Max(0, (int)Math.Ceiling(apiTimeoutMs.Value / 1000.0));
         return Math.Max(
-            AcpBridgeScript.TurnTimeoutSeconds,
+            AcpBridgeBinary.TurnTimeoutSeconds,
             apiTimeoutSeconds + ApiTimeoutBridgeMarginSeconds);
     }
 
@@ -78,7 +72,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         ArgumentNullException.ThrowIfNull(request);
         ct.ThrowIfCancellationRequested();
 
-        // Materialise the bridge script inside the sandbox up front. If this
+        // Materialise the bridge binary inside the sandbox up front. If this
         // fails for any reason (filesystem read-only, sandbox dead) the open
         // surfaces an AcpTransportUnavailableException so the worker can
         // degrade to the print transport on the very first turn.
@@ -89,13 +83,19 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
     internal async Task MaterialiseBridgeAsync(ISandbox sandbox, CancellationToken ct)
     {
-        var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(AcpBridgeScript.Source));
+        var bytes = AcpBridgeBinary.LoadBinary();
+        // Base64-encode the ELF and decode inside the sandbox. The exec
+        // command's argv stays well under MAX_ARG_STRLEN because the encoded
+        // string travels through bash heredoc, not argv.
+        var encoded = Convert.ToBase64String(bytes);
         var script =
             "set -eu\n" +
             "mkdir -p \"$HOME/.codeybox\"\n" +
             "chmod 700 \"$HOME/.codeybox\"\n" +
-            "printf '%s' '" + encoded + "' | base64 -d > \"$HOME/.codeybox/claude-acp-bridge.cjs\"\n" +
-            "chmod 700 \"$HOME/.codeybox/claude-acp-bridge.cjs\"\n";
+            "base64 -d > \"$HOME/.codeybox/claude-acp-bridge\" <<'CB_ACP_BRIDGE_EOF'\n" +
+            encoded + "\n" +
+            "CB_ACP_BRIDGE_EOF\n" +
+            "chmod 700 \"$HOME/.codeybox/claude-acp-bridge\"\n";
         SandboxExecResult result;
         try
         {
@@ -106,12 +106,12 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            throw new AcpTransportUnavailableException("failed to write the ACP bridge script", ex);
+            throw new AcpTransportUnavailableException("failed to write the ACP bridge binary", ex);
         }
         if (!result.Success)
         {
             throw new AcpTransportUnavailableException(
-                $"failed to write the ACP bridge script: exit {result.ExitCode}, stderr={result.Stderr}");
+                $"failed to write the ACP bridge binary: exit {result.ExitCode}, stderr={result.Stderr}");
         }
     }
 
@@ -167,7 +167,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
             var exec = new SandboxExec
             {
-                Argv = ["bash", "-lc", "exec " + EscapeForShell(_transport.NodeBinary) + " " + AcpBridgeScript.BridgeScriptPath],
+                Argv = ["bash", "-lc", "exec " + AcpBridgeBinary.BridgeBinaryPath],
                 WorkingDirectory = _open.WorkingDirectory,
                 Stdin = stdin,
                 StdoutChunkCallback = aggregator,
@@ -411,11 +411,6 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 env["API_TIMEOUT_MS"] = apiTimeout.Value.ToString();
             }
             return env;
-        }
-
-        private static string EscapeForShell(string value)
-        {
-            return "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
         }
 
         /// <summary>

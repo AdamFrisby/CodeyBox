@@ -251,7 +251,7 @@ public sealed class AgentNetworkToleranceProgramWiringTests
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
                 && exec.Argv[1] == "-lc"
-                && exec.Argv[2].Contains("claude-acp-bridge.cjs", StringComparison.Ordinal))
+                && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal))
             {
                 BridgeExecs.Add(exec);
                 var stdout = string.Join('\n', new[]

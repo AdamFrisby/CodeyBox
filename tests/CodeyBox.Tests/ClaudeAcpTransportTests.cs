@@ -213,21 +213,6 @@ public sealed class ClaudeAcpTransportTests
     // ── Permission / question auto-handling ───────────────────────────────────
 
     [Fact]
-    public void AcpBridge_ConfigurationDefaults_AutoApproveAndAutoAnswer()
-    {
-        // The bridge script defaults to auto-approve permissions and
-        // auto-answer questions so a headless ACP session never waits on a
-        // human. The script is large; verify the explicit defaults are wired
-        // (the operator could only opt out by writing the hello envelope with
-        // those flags set to false, which CodeyBox never does).
-        Assert.Contains("autoApprovePermissions: true", AcpBridgeScript.Source);
-        Assert.Contains("autoAnswerQuestions: true", AcpBridgeScript.Source);
-        Assert.Contains("<codeybox-question>", AcpBridgeScript.Source);
-        Assert.Contains("session/request_permission", AcpBridgeScript.Source);
-        Assert.Contains("session/request_input", AcpBridgeScript.Source);
-    }
-
-    [Fact]
     public void AcpBridge_ObservesPermissionGrantsAndQuestions()
     {
         var stdout = string.Join("\n", new[]
@@ -616,10 +601,10 @@ public sealed class ClaudeAcpTransportTests
     // ── Real AcpClaudeTransport — bridge materialisation + turn round-trip ───
 
     [Fact]
-    public async Task AcpClaudeTransport_OpenAsync_WritesBridgeScript_ViaBase64Pipe()
+    public async Task AcpClaudeTransport_OpenAsync_WritesBridgeBinary_ViaBase64HereDoc()
     {
         var sandbox = new BridgeSandbox();
-        var transport = new AcpClaudeTransport { NodeBinary = "node" };
+        var transport = new AcpClaudeTransport();
         var request = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-1");
@@ -629,9 +614,14 @@ public sealed class ClaudeAcpTransportTests
         var materialise = sandbox.AllExecs.Single();
         Assert.Equal("bash", materialise.Argv[0]);
         Assert.Equal("-c", materialise.Argv[1]);
-        Assert.Contains("base64 -d > \"$HOME/.codeybox/claude-acp-bridge.cjs\"", materialise.Argv[2]);
-        // The encoded payload is the bridge script verbatim.
-        var encoded = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(AcpBridgeScript.Source));
+        // New path: native binary (no .cjs / no node) materialised via a
+        // base64 heredoc, then chmod 700 to make it executable.
+        Assert.Contains("base64 -d > \"$HOME/.codeybox/claude-acp-bridge\"", materialise.Argv[2]);
+        Assert.Contains("chmod 700 \"$HOME/.codeybox/claude-acp-bridge\"", materialise.Argv[2]);
+        Assert.DoesNotContain(".cjs", materialise.Argv[2]);
+        // Payload is the embedded bridge bytes verbatim — placeholder bytes in
+        // dev/test builds; the real ELF when scripts/publish-acp-bridge.sh ran.
+        var encoded = Convert.ToBase64String(AcpBridgeBinary.LoadBinary());
         Assert.Contains(encoded, materialise.Argv[2]);
     }
 
@@ -663,7 +653,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
 
-        var transport = new AcpClaudeTransport { NodeBinary = "node" };
+        var transport = new AcpClaudeTransport();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-real");
@@ -677,7 +667,10 @@ public sealed class ClaudeAcpTransportTests
         Assert.Equal("acp-real-1", turn.CapturedCliSessionId);
 
         var bridgeExec = sandbox.BridgeExecs.Single();
-        Assert.Contains("$HOME/.codeybox/claude-acp-bridge.cjs", bridgeExec.Argv[2]);
+        // Native bridge — no .cjs extension, no node argv element.
+        Assert.Contains("$HOME/.codeybox/claude-acp-bridge", bridgeExec.Argv[2]);
+        Assert.DoesNotContain(".cjs", bridgeExec.Argv[2]);
+        Assert.DoesNotContain("node", bridgeExec.Argv[2]);
         Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, bridgeExec.AgentOutputTransport);
 
         // Stdin frames the full envelope sequence: hello → initialize → session/new → session/prompt.
@@ -727,7 +720,7 @@ public sealed class ClaudeAcpTransportTests
         var root = hello.RootElement;
         Assert.Equal("1200000", root.GetProperty("claudeEnv").GetProperty("API_TIMEOUT_MS").GetString());
         Assert.Equal(expectedTurnTimeoutSeconds, root.GetProperty("turnTimeoutSeconds").GetInt32());
-        Assert.True(root.GetProperty("turnTimeoutSeconds").GetInt32() > AcpBridgeScript.TurnTimeoutSeconds);
+        Assert.True(root.GetProperty("turnTimeoutSeconds").GetInt32() > AcpBridgeBinary.TurnTimeoutSeconds);
     }
 
     [Fact]
@@ -1160,7 +1153,7 @@ public sealed class ClaudeAcpTransportTests
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
 
             // Bridge materialise: `bash -c "set -eu\n...base64 -d > ..."`.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("claude-acp-bridge.cjs", StringComparison.Ordinal)
+            if (IsBash(exec, "-c") && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal)
                 && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
             {
                 if (FailMaterialise)
@@ -1188,8 +1181,8 @@ public sealed class ClaudeAcpTransportTests
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
-            // Bridge invocation: `bash -lc "exec '<node>' $HOME/.codeybox/...cjs"`.
-            if (IsBash(exec, "-lc") && exec.Argv[2].Contains("claude-acp-bridge.cjs", StringComparison.Ordinal))
+            // Bridge invocation: `bash -lc "exec $HOME/.codeybox/claude-acp-bridge"`.
+            if (IsBash(exec, "-lc") && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal))
             {
                 BridgeExecs.Add(exec);
                 var envelopes = _bridgeOutputs.Count > 0

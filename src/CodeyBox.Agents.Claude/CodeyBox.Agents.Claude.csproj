@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
@@ -14,6 +14,30 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <!--
+    ACP bridge native binary. The bridge is produced by the sibling
+    CodeyBox.Agents.Claude.AcpBridge project as a self-contained, statically-
+    linked NativeAOT ELF and copied into Resources/acp-bridge by
+    scripts/publish-acp-bridge.sh. The Claude orchestrator-side assembly
+    ships the binary as an embedded resource (LogicalName=acp-bridge); the
+    runtime path materialises it inside the sandbox and execs it.
+
+    For build hosts that have not run the publish script, a tracked
+    placeholder under Resources/acp-bridge.placeholder is embedded instead
+    with the same logical name. AcpBridgeBinary detects the placeholder
+    sentinel at runtime and surfaces AcpTransportUnavailableException so
+    the worker degrades to the print transport rather than execing a
+    non-binary inside the VM.
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="Resources/acp-bridge"
+                      LogicalName="acp-bridge"
+                      Condition="Exists('$(MSBuildThisFileDirectory)Resources/acp-bridge')" />
+    <EmbeddedResource Include="Resources/acp-bridge.placeholder"
+                      LogicalName="acp-bridge"
+                      Condition="!Exists('$(MSBuildThisFileDirectory)Resources/acp-bridge')" />
+  </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="CodeyBox.Tests" />

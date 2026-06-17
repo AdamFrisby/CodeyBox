@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/CodeyBox.Cli/CodeyBox.Wizard.csproj" />
     <Project Path="src/CodeyBox.Agents.Claude/CodeyBox.Agents.Claude.csproj" />
+    <Project Path="src/CodeyBox.Agents.Claude.AcpBridge/CodeyBox.Agents.Claude.AcpBridge.csproj" />
     <Project Path="src/CodeyBox.Agents.Codex/CodeyBox.Agents.Codex.csproj" />
     <Project Path="src/CodeyBox.Agents.Gemini/CodeyBox.Agents.Gemini.csproj" />
     <Project Path="src/CodeyBox.Agents.Cursor/CodeyBox.Agents.Cursor.csproj" />
