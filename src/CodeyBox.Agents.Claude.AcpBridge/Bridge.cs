@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -18,8 +19,15 @@ namespace CodeyBox.Agents.Claude.AcpBridge;
 internal sealed class Bridge : IAsyncDisposable
 {
     private readonly CancellationTokenSource _cts = new();
+    // _pendingLock guards three things together so DrainPending can observe a
+    // consistent snapshot: the outbound queue (_pendingPayloads), the current
+    // peer reference (_peer), and the peer-ready flag (_peerReady). Holding
+    // the lock for the entire dequeue + send keeps frame order deterministic
+    // when both the stdin pump and the accept handler call DrainPending
+    // concurrently.
     private readonly object _pendingLock = new();
     private readonly Queue<string> _pendingPayloads = new();
+    private readonly Stream? _stdinOverride;
 
     private BridgeConfig _config = BridgeConfig.Default;
     private TcpListener? _listener;
@@ -29,18 +37,40 @@ internal sealed class Bridge : IAsyncDisposable
     private string? _authToken;
     private bool _peerReady;
     private Process? _claudeProcess;
-    private bool _shutdownStarted;
+    private int _shutdownState; // 0 = running, 1 = shutting down. Updated via Interlocked.Exchange.
     private int _exitCode;
     private Timer? _turnDeadline;
     private Task? _acceptLoopTask;
     private Task? _peerReceiveTask;
+    private PosixSignalRegistration? _sigterm;
+    private PosixSignalRegistration? _sigint;
+    private PosixSignalRegistration? _sighup;
+
+    private bool ShutdownStarted => Volatile.Read(ref _shutdownState) != 0;
+
+    public Bridge() { }
+
+    /// <summary>
+    /// Test-only constructor: pipe a synthetic stdin stream into the bridge
+    /// so an in-process end-to-end fixture can drive RunAsync without a
+    /// real sandbox. Production binary path always uses the parameterless
+    /// constructor which reads from <see cref="Console.OpenStandardInput"/>.
+    /// </summary>
+    internal Bridge(Stream stdinForTests) { _stdinOverride = stdinForTests; }
 
     public async Task<int> RunAsync()
     {
         Emitter.Emit("bridge_started", w => w.WriteNumber("pid", Environment.ProcessId));
 
-        // Posix signal handling — stop politely on SIGTERM/SIGINT.
-        Console.CancelKeyPress += (_, e) => { e.Cancel = true; Shutdown(0); };
+        // Posix signal handling — stop politely on SIGTERM/SIGINT/SIGHUP.
+        // .NET's Console.CancelKeyPress only catches Ctrl+C (SIGINT); SIGTERM
+        // (the sandbox provider's normal stop signal) and SIGHUP need
+        // PosixSignalRegistration to be observed. Without these, an in-VM
+        // tear-down would silently leak the ~/.claude/ide/<port>.lock file
+        // and the claude --ide subprocess tree.
+        _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); });
+        _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); });
+        _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); });
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
 
         try
@@ -59,12 +89,16 @@ internal sealed class Bridge : IAsyncDisposable
         await WaitForBackgroundTasksAsync().ConfigureAwait(false);
         _cts.Dispose();
         _turnDeadline?.Dispose();
+        _sigterm?.Dispose();
+        _sigint?.Dispose();
+        _sighup?.Dispose();
     }
 
     private async Task ReadStdinAsync(CancellationToken ct)
     {
-        using var stdin = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8);
-        while (!ct.IsCancellationRequested && !_shutdownStarted)
+        var inputStream = _stdinOverride ?? Console.OpenStandardInput();
+        using var stdin = new StreamReader(inputStream, Encoding.UTF8);
+        while (!ct.IsCancellationRequested && !ShutdownStarted)
         {
             string? line;
             try { line = await stdin.ReadLineAsync(ct).ConfigureAwait(false); }
@@ -126,7 +160,7 @@ internal sealed class Bridge : IAsyncDisposable
         {
             StartServer();
             WriteLockfile();
-            if (_shutdownStarted) return; // lockfile failure already raised fatal
+            if (ShutdownStarted) return; // lockfile failure already raised fatal
             SpawnClaude();
         }
         catch (Exception ex)
@@ -145,7 +179,7 @@ internal sealed class Bridge : IAsyncDisposable
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested && _listener is not null && !_shutdownStarted)
+        while (!ct.IsCancellationRequested && _listener is not null && !ShutdownStarted)
         {
             TcpClient client;
             try
@@ -184,8 +218,11 @@ internal sealed class Bridge : IAsyncDisposable
             return;
         }
 
-        _peer = conn;
-        _peerReady = true;
+        lock (_pendingLock)
+        {
+            _peer = conn;
+            _peerReady = true;
+        }
         Emitter.Emit("peer_connected");
         DrainPending();
 
@@ -194,8 +231,11 @@ internal sealed class Bridge : IAsyncDisposable
         catch (OperationCanceledException) { }
         finally
         {
-            _peer = null;
-            _peerReady = false;
+            lock (_pendingLock)
+            {
+                _peer = null;
+                _peerReady = false;
+            }
             Emitter.Emit("peer_closed");
             try { client.Dispose(); } catch { }
             MaybeFinish();
@@ -204,116 +244,63 @@ internal sealed class Bridge : IAsyncDisposable
 
     private void OnIncomingFrame(string text)
     {
-        JsonDocument doc;
-        try { doc = JsonDocument.Parse(text); }
-        catch (JsonException) { return; }
-        using (doc)
+        var classification = BridgePayloads.ClassifyIncomingFrame(text, _config,
+            out var idJson, out var methodName, out var stopReason, out var errorJson);
+
+        switch (classification)
         {
-            var root = doc.RootElement;
-            if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("method", out var methodEl)
-                && methodEl.ValueKind == JsonValueKind.String)
-            {
-                var method = methodEl.GetString();
-                if (TryAutoHandle(root, method)) return;
-            }
-
-            Emitter.EmitAcpRecv(text);
-
-            if (root.ValueKind == JsonValueKind.Object)
-            {
-                if (root.TryGetProperty("error", out _))
+            case BridgePayloads.FrameKind.Malformed:
+                return;
+            case BridgePayloads.FrameKind.AutoPermission:
+                if (idJson is not null) SendPeerText(BridgePayloads.BuildPermissionReplyJson(idJson));
+                Emitter.Emit("permission_auto_granted",
+                    w => { if (methodName is not null) w.WriteString("method", methodName); });
+                return;
+            case BridgePayloads.FrameKind.AutoInput:
+                if (idJson is not null) SendPeerText(BridgePayloads.BuildInputReplyJson(idJson));
+                Emitter.Emit("question_auto_answered",
+                    w => { if (methodName is not null) w.WriteString("method", methodName); });
+                return;
+            case BridgePayloads.FrameKind.TurnError:
+                Emitter.EmitAcpRecv(text);
+                Emitter.Emit("turn_error", w =>
                 {
-                    EmitTurnError(root);
-                    Shutdown(0);
-                    return;
-                }
-                if (root.TryGetProperty("result", out var resultEl)
-                    && resultEl.ValueKind == JsonValueKind.Object)
-                {
-                    string? stopReason = null;
-                    if (resultEl.TryGetProperty("stopReason", out var sr) && sr.ValueKind == JsonValueKind.String)
-                        stopReason = sr.GetString();
-                    else if (resultEl.TryGetProperty("stop_reason", out var sr2) && sr2.ValueKind == JsonValueKind.String)
-                        stopReason = sr2.GetString();
-                    if (stopReason is not null)
+                    w.WritePropertyName("error");
+                    if (errorJson is not null)
                     {
-                        Emitter.Emit("turn_complete", w => w.WriteString("stopReason", stopReason));
-                        Shutdown(0);
+                        w.WriteRawValue(errorJson, skipInputValidation: false);
                     }
-                }
-            }
+                    else
+                    {
+                        w.WriteStartObject();
+                        w.WriteEndObject();
+                    }
+                });
+                Shutdown(0);
+                return;
+            case BridgePayloads.FrameKind.TurnComplete:
+                Emitter.EmitAcpRecv(text);
+                if (stopReason is not null)
+                    Emitter.Emit("turn_complete", w => w.WriteString("stopReason", stopReason));
+                Shutdown(0);
+                return;
+            default:
+                Emitter.EmitAcpRecv(text);
+                return;
         }
     }
 
-    private bool TryAutoHandle(JsonElement root, string? method)
+    /// <summary>
+    /// Snapshot the current peer under the lock so a concurrent disconnect
+    /// can't NRE us, and forward the text. SendText itself is internally
+    /// serialised by the WebSocketConnection's write lock, so we don't need
+    /// to hold _pendingLock during the actual byte write.
+    /// </summary>
+    private void SendPeerText(string text)
     {
-        if (_config.AutoApprovePermissions
-            && (method == "session/request_permission" || method == "permission/request"))
-        {
-            if (root.TryGetProperty("id", out var idEl)) ReplyPermission(idEl);
-            Emitter.Emit("permission_auto_granted",
-                w => { if (method is not null) w.WriteString("method", method); });
-            return true;
-        }
-        if (_config.AutoAnswerQuestions
-            && (method == "session/request_input" || method == "input/request"))
-        {
-            if (root.TryGetProperty("id", out var idEl)) ReplyInput(idEl);
-            Emitter.Emit("question_auto_answered",
-                w => { if (method is not null) w.WriteString("method", method); });
-            return true;
-        }
-        return false;
-    }
-
-    private void ReplyPermission(JsonElement idEl)
-    {
-        if (_peer is null) return;
-        using var ms = new MemoryStream();
-        using (var w = new Utf8JsonWriter(ms))
-        {
-            w.WriteStartObject();
-            w.WriteString("jsonrpc", "2.0");
-            w.WritePropertyName("id");
-            idEl.WriteTo(w);
-            w.WriteStartObject("result");
-            w.WriteStartObject("outcome");
-            w.WriteString("outcome", "selected");
-            w.WriteString("optionId", "allow_once");
-            w.WriteEndObject();
-            w.WriteEndObject();
-            w.WriteEndObject();
-        }
-        _peer.SendText(Encoding.UTF8.GetString(ms.ToArray()));
-    }
-
-    private void ReplyInput(JsonElement idEl)
-    {
-        if (_peer is null) return;
-        using var ms = new MemoryStream();
-        using (var w = new Utf8JsonWriter(ms))
-        {
-            w.WriteStartObject();
-            w.WriteString("jsonrpc", "2.0");
-            w.WritePropertyName("id");
-            idEl.WriteTo(w);
-            w.WriteStartObject("result");
-            w.WriteString("value",
-                "<codeybox-question>: agent asked a blocking question; default applied, continuing.");
-            w.WriteEndObject();
-            w.WriteEndObject();
-        }
-        _peer.SendText(Encoding.UTF8.GetString(ms.ToArray()));
-    }
-
-    private void EmitTurnError(JsonElement root)
-    {
-        Emitter.Emit("turn_error", w =>
-        {
-            w.WritePropertyName("error");
-            if (root.TryGetProperty("error", out var errEl)) errEl.WriteTo(w);
-            else w.WriteStartObject();
-        });
+        WebSocketConnection? peer;
+        lock (_pendingLock) { peer = _peer; }
+        peer?.SendText(text);
     }
 
     private void EnqueuePayload(string payloadJson)
@@ -321,20 +308,29 @@ internal sealed class Bridge : IAsyncDisposable
         lock (_pendingLock) _pendingPayloads.Enqueue(payloadJson);
     }
 
+    /// <summary>
+    /// Hold <see cref="_pendingLock"/> for the ENTIRE dequeue + send loop. If
+    /// two drainers raced (stdin pump after acp_send vs. accept handler after
+    /// the peer attaches) and only the dequeue was synchronised, the actual
+    /// SendText calls could overtake each other and deliver ACP frames out
+    /// of order (e.g. session/new ahead of initialize). The lock also gives
+    /// us a single consistent read of <see cref="_peer"/>/<see cref="_peerReady"/>
+    /// so a peer-disconnect can't NRE the send. WebSocketConnection.SendText
+    /// is non-blocking (writes to a NetworkStream) so holding the lock is
+    /// cheap.
+    /// </summary>
     private void DrainPending()
     {
-        while (_peerReady && _peer is not null)
+        lock (_pendingLock)
         {
-            string next;
-            lock (_pendingLock)
+            while (_peerReady && _peer is not null && _pendingPayloads.Count > 0)
             {
-                if (_pendingPayloads.Count == 0) return;
-                next = _pendingPayloads.Dequeue();
-            }
-            _peer.SendText(next);
+                var next = _pendingPayloads.Dequeue();
+                _peer.SendText(next);
 
-            // Mirror the JS bridge's acp_sent envelope (id + method may be absent).
-            EmitAcpSentMeta(next);
+                // Mirror the JS bridge's acp_sent envelope (id + method may be absent).
+                EmitAcpSentMeta(next);
+            }
         }
     }
 
@@ -390,24 +386,11 @@ internal sealed class Bridge : IAsyncDisposable
         // value during a connect/auth race.
         _lockPath = Path.Combine(baseDir, _port + ".lock");
 
-        using var ms = new MemoryStream();
-        using (var w = new Utf8JsonWriter(ms))
-        {
-            w.WriteStartObject();
-            w.WriteNumber("pid", Environment.ProcessId);
-            w.WriteStartArray("workspaceFolders");
-            w.WriteStringValue(_config.WorkingDirectory);
-            w.WriteEndArray();
-            w.WriteString("ideName", "CodeyBox");
-            w.WriteString("transport", "ws");
-            w.WriteBoolean("runningInWindows", false);
-            w.WriteString("authToken", _authToken);
-            w.WriteString("url", "ws://127.0.0.1:" + _port);
-            w.WriteEndObject();
-        }
+        var bytes = BridgePayloads.BuildLockfileBytes(
+            Environment.ProcessId, _config.WorkingDirectory, _authToken ?? string.Empty, _port);
         try
         {
-            File.WriteAllBytes(_lockPath, ms.ToArray());
+            File.WriteAllBytes(_lockPath, bytes);
             try
             {
                 File.SetUnixFileMode(_lockPath,
@@ -461,16 +444,27 @@ internal sealed class Bridge : IAsyncDisposable
             return;
         }
 
-        _claudeProcess.EnableRaisingEvents = true;
-        _claudeProcess.Exited += (_, _) =>
+        // Capture the process locally so the Exited handler can't NRE if a
+        // future shutdown path nulls the field. Subscribe BEFORE flipping
+        // EnableRaisingEvents — otherwise a fast-exiting claude can fire its
+        // internal exit notification before the handler is attached, and
+        // MaybeFinish would never run until the turn-deadline timer fires.
+        var proc = _claudeProcess;
+        proc.Exited += (_, _) =>
         {
+            int exit;
+            try { exit = proc.ExitCode; } catch { exit = -1; }
             Emitter.Emit("claude_exit", w =>
             {
-                w.WriteNumber("code", _claudeProcess.ExitCode);
+                w.WriteNumber("code", exit);
                 w.WriteNull("signal");
             });
             MaybeFinish();
         };
+        proc.EnableRaisingEvents = true;
+        // If claude already exited between Process.Start and the Exited
+        // subscription, the event will never fire — drive MaybeFinish ourselves.
+        if (proc.HasExited) MaybeFinish();
 
         _ = Task.Run(async () =>
         {
@@ -508,9 +502,11 @@ internal sealed class Bridge : IAsyncDisposable
 
     private void MaybeFinish()
     {
-        if (_shutdownStarted) return;
+        if (ShutdownStarted) return;
         var claudeExited = _claudeProcess is not null && _claudeProcess.HasExited;
-        if (claudeExited && !_peerReady) Shutdown(0);
+        bool peerReadySnapshot;
+        lock (_pendingLock) peerReadySnapshot = _peerReady;
+        if (claudeExited && !peerReadySnapshot) Shutdown(0);
     }
 
     private void Fatal(string message, string? detail)
@@ -526,8 +522,11 @@ internal sealed class Bridge : IAsyncDisposable
 
     private void Shutdown(int code)
     {
-        if (_shutdownStarted) return;
-        _shutdownStarted = true;
+        // Atomic check-and-set so multiple Shutdown callers (turn-deadline
+        // timer, posix signal, claude exited, peer closed, OnIncomingFrame
+        // stopReason / error) cannot all run the cleanup body — that would
+        // emit duplicate claude_exit envelopes and double-delete the lockfile.
+        if (Interlocked.Exchange(ref _shutdownState, 1) != 0) return;
         _exitCode = code;
         try { _turnDeadline?.Dispose(); } catch { }
         try
@@ -538,7 +537,9 @@ internal sealed class Bridge : IAsyncDisposable
             }
         }
         catch { }
-        try { _peer?.Close(); } catch { }
+        WebSocketConnection? peerToClose;
+        lock (_pendingLock) peerToClose = _peer;
+        try { peerToClose?.Close(); } catch { }
         try { _listener?.Stop(); } catch { }
         try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
         try { _cts.Cancel(); } catch { }
