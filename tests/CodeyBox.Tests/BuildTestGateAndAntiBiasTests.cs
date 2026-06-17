@@ -52,7 +52,13 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [gate, llm],
-            maxAuditIterations: 3);
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 3,
+                AuditTypes = ["scripted"],
+                StopOnFirstFailure = false,
+            },
+            credentials: AuditCredentials());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
 
@@ -67,6 +73,46 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         Assert.Equal(1, llmRunsSeen);
         Assert.Equal([2], llm.SeenIterations);
         Assert.Equal([1, 2], gate.SeenIterations);
+    }
+
+    [Fact]
+    public async Task BuildTestGateReturnsNonPassingInfoFinding_LlmPanelIsSkipped()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+        [
+            new AuditOutcome(false, [new AuditFinding(
+                "csharp:test-pass", AuditSeverity.Info,
+                "tool not installed in sandbox: dotnet",
+                "The auditor command was not run because 'dotnet' is not available in the audit sandbox.")]),
+        ]);
+
+        var llmRunsSeen = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRunsSeen));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            auditors: [gate, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials());
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        // Missing-tool gate findings are non-blocking by existing policy, but
+        // a non-passing BuildTestGate still cannot allow the CI-passed prompt
+        // claim to reach the LLM panel.
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        Assert.Equal(0, llmRunsSeen);
+        Assert.Empty(llm.SeenIterations);
+        Assert.Equal([1], gate.SeenIterations);
     }
 
     [Fact]
@@ -96,7 +142,8 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [format, gate, llm],
-            maxAuditIterations: 1);
+            maxAuditIterations: 1,
+            credentials: AuditCredentials());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
@@ -128,7 +175,8 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [format, llm],
-            maxAuditIterations: 1);
+            maxAuditIterations: 1,
+            credentials: AuditCredentials());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
@@ -138,6 +186,12 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         // LLM panel still runs even though a non-gate tool auditor blocked.
         Assert.Equal(1, llmRuns);
     }
+
+    private static ConstantCredentialProvider AuditCredentials()
+        => new(new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "test-key" },
+            new Dictionary<string, string>()));
 
     private static WorkItem NewItem() => new()
     {
@@ -180,7 +234,7 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
         "Do NOT run any build or test commands yourself";
 
     [Fact]
-    public async Task LowQualityDiff_ThatBuildsAndPassesTests_StillProducesFindings()
+    public async Task FrameTemplate_AntiBiasDisclaimer_SurvivesPromptRendering_AndFindingsSurface()
     {
         // Frame is the SHIPPED one loaded from the embedded preset catalog —
         // any regression that removes the disclaimer, the CI-note, or the
@@ -217,19 +271,18 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
         Assert.Contains(DoNotRunBuildOrTestsMarker, runner.ObservedPrompt, StringComparison.Ordinal);
         Assert.Contains(AntiBiasMarker, runner.ObservedPrompt, StringComparison.Ordinal);
 
-        // And the simulated reviewer still surfaces blocking findings on the
-        // low-quality diff — the "CI passed" claim must NOT have biased it
-        // into a blanket pass.
+        // The deterministic reviewer is a prompt-wiring simulation: when the
+        // anti-bias disclaimer reaches the prompt, its JSON verdict contains
+        // the blocking findings this regression needs surfaced.
         Assert.False(result.Passed);
         Assert.NotEmpty(result.Findings);
         Assert.Contains(result.Findings, f => f.Severity == AuditSeverity.Error);
     }
 
     /// <summary>
-    /// Stub reviewer that only marks the change as "passed" if the prompt is
-    /// MISSING the anti-bias disclaimer (i.e. the reviewer was biased by the
-    /// CI-passed note). When the disclaimer is present, it emits findings
-    /// describing the low-quality diff's actual problems.
+    /// Stub reviewer for the prompt-frame wiring contract. It emits the
+    /// low-quality-diff findings only when the anti-bias disclaimer survives
+    /// rendering into the prompt; this is not a live-model behaviour test.
     /// </summary>
     private sealed class LowQualityDiffReviewRunner : IAgentRunner
     {
@@ -326,9 +379,9 @@ file sealed class RoleStampedScriptedAuditor : IAuditor
 }
 
 /// <summary>
-/// Stand-in for an LLM auditor (Kind="llm", AgentCredentials required so it
-/// groups separately from tool auditors). Always passes; records each
-/// iteration on which it was invoked, so tests can assert it was skipped.
+/// Stand-in for a production-shaped LLM auditor (Kind="llm" with agent
+/// credentials and network required). Always passes; records each iteration on
+/// which it was invoked, so tests can assert it was skipped.
 /// </summary>
 file sealed class RecordingLlmAuditor : IAuditor
 {
@@ -342,7 +395,7 @@ file sealed class RecordingLlmAuditor : IAuditor
 
     public string Name { get; }
     public string Kind => "llm";
-    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
     public List<int> SeenIterations { get; } = [];
 
     public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)

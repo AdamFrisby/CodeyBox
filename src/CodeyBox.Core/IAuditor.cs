@@ -98,11 +98,10 @@ public enum AuditorRole
     /// Deterministic build/test gate (e.g. <c>csharp:build-WaE</c>,
     /// <c>csharp:test-pass</c>). The pipeline GUARANTEES every auditor with
     /// this role runs to completion and passes before any LLM-driven auditor
-    /// runs in the same audit iteration. If any build/test gate produces a
-    /// blocking finding, the LLM panel is skipped for that iteration — the
-    /// panel's prompt frame says CI built and tested the project with no
-    /// failures, and that claim must never be a lie. Findings still flow to
-    /// rework as normal.
+    /// runs in the same audit iteration. If any build/test gate does not pass,
+    /// the LLM panel is skipped for that iteration — the panel's prompt frame
+    /// says CI built and tested the project with no failures, and that claim
+    /// must never be a lie. Findings still flow to rework as normal.
     /// </summary>
     BuildTestGate,
 }

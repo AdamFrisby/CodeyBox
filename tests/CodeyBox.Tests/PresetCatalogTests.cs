@@ -92,6 +92,22 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void LanguagePresetYamlLoading_WiresBuildTestGateRolesFromBuiltInYaml()
+    {
+        var catalog = new PresetCatalog();
+        var ctx = new PresetContext(new FakeAgent());
+
+        AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:format-check", AuditorRole.None);
+        AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:build-WaE", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:test-pass", AuditorRole.BuildTestGate);
+
+        AssertLanguageAuditorRole(catalog, ctx, "python", "python:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
+    }
+
+    [Fact]
     public void CSharpPreset_DeclaresBuildAndTestAsShortCircuitGates()
     {
         var auditors = new PresetCatalog()
@@ -101,6 +117,34 @@ public sealed class PresetCatalogTests
         Assert.False(auditors["csharp:format-check"].CanShortCircuitOnBlockingFinding);
         Assert.True(auditors["csharp:build-WaE"].CanShortCircuitOnBlockingFinding);
         Assert.True(auditors["csharp:test-pass"].CanShortCircuitOnBlockingFinding);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_WiresBuildTestGateRoleToShellAuditor()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            Role = "build-test-gate",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
     }
 
     [Fact]
@@ -267,6 +311,24 @@ public sealed class PresetCatalogTests
         var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
 
         Assert.Contains("audtors", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SchemaValidation_RejectsInvalidAuditorRole()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "csharp.yaml"), """
+            id: csharp
+            auditors:
+              - name: csharp:bad
+                argv: ["dotnet", "test"]
+                role: build_test_gate
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("role", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -473,6 +535,18 @@ public sealed class PresetCatalogTests
         Assert.Equal(3, catalog.ResolveLanguage("node", ctx).Count);
         Assert.Equal(3, catalog.ResolveLanguage("go", ctx).Count);
         Assert.Equal(3, catalog.ResolveLanguage("rust", ctx).Count);
+    }
+
+    private static void AssertLanguageAuditorRole(
+        PresetCatalog catalog,
+        PresetContext ctx,
+        string language,
+        string auditorName,
+        AuditorRole expected)
+    {
+        var auditor = catalog.ResolveLanguage(language, ctx)
+            .Single(a => a.Name == auditorName);
+        Assert.Equal(expected, auditor.Role);
     }
 
     private static TempDirectory TempProject() => new();

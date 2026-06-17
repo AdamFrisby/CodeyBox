@@ -6439,11 +6439,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     : string.Empty))
             .ToList();
 
-        // Once any BuildTestGate auditor produces a blocking finding, the
-        // LLM panel's prompt-frame claim ("CI built the project and ran the
-        // full test suite with no failures") would be false, so we skip LLM
-        // auditors entirely for this iteration. The build/test findings still
-        // flow to rework as normal.
+        // Once any BuildTestGate auditor does not pass, the LLM panel's
+        // prompt-frame claim ("CI built the project and ran the full test
+        // suite with no failures") would be false, so we skip LLM auditors
+        // entirely for this iteration. The build/test findings still flow to
+        // rework as normal.
         var buildTestGateFailed = false;
 
         foreach (var group in byCaps)
@@ -6604,8 +6604,11 @@ public sealed class PipelineRunner : IPipelineRunner
                             declaredShortCircuitBlocking = true;
                         }
                         var blockingForThisAuditor = HasAuditBlockingFinding(run.Result, project);
-                        if (auditor.Role == AuditorRole.BuildTestGate && blockingForThisAuditor)
+                        if (auditor.Role == AuditorRole.BuildTestGate
+                            && (!run.Result.Passed || blockingForThisAuditor))
+                        {
                             buildTestGateFailed = true;
+                        }
                         if (project.Audit.StopOnFirstFailure && blockingForThisAuditor)
                             return new AuditorBatchResult(
                                 findings.ToList(),

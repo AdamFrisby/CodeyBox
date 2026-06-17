@@ -484,7 +484,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Equal(["tool:later", "gate:build", "llm:review"],
+        Assert.Equal(["gate:build", "tool:later", "llm:review"],
             reports.Reports.Select(r => r.AuditorName).ToArray());
     }
 }
