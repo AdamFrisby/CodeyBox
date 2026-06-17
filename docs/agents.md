@@ -218,13 +218,26 @@ The bridge ships as a `.csproj` in the master solution
 (`src/CodeyBox.Agents.Claude.AcpBridge`); operators produce the native
 binary by running `scripts/publish-acp-bridge.sh` on the build host (which
 needs `musl-tools` installed — the static linker the AOT publish step
-invokes). The script writes the published ELF to
+invokes). The publish settings use the documented NativeAOT `StaticExecutable`
+MSBuild property for fully-static linking against musl on `linux-musl-x64`;
+the script also runs `ldd` after publish and warns if the produced binary
+isn't statically linked. The script writes the published ELF to
 `src/CodeyBox.Agents.Claude/Resources/acp-bridge`, where it is picked up
 as an embedded resource of the orchestrator-side Claude assembly. On hosts
 that have not run the publish script, a tracked placeholder resource is
-embedded instead — the runtime path then fails the first ACP turn cleanly
-and the worker degrades to the `print` transport rather than stranding
-work items.
+embedded instead — `AcpClaudeTransport.MaterialiseBridgeAsync` consults
+`AcpBridgeBinary.IsPlaceholderBuild` and raises
+`AcpTransportUnavailableException` **before touching the sandbox**, so the
+worker degrades to the `print` transport on the first ACP turn rather than
+spending a sandbox roundtrip to exec a non-binary.
+
+The materialised payload travels via `SandboxExec.Stdin` (the bridge ELF
+is base64-encoded on the host and decoded inside the sandbox by `base64 -d`
+reading from stdin). It does NOT travel through argv — Linux
+`MAX_ARG_STRLEN` caps every argv element at 128 KiB regardless of in-shell
+heredoc syntax, which a multi-MB NativeAOT bridge would trip. Keeping the
+script tiny (~200 bytes) means the same materialise step works identically
+across Process / Bubblewrap / Multipass sandbox providers.
 
 If the ACP transport fails to open or any turn raises
 `AcpTransportUnavailableException`, the worker logs

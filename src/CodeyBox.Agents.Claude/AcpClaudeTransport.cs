@@ -45,6 +45,16 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     /// </summary>
     public string ClaudeBinary { get; init; } = ClaudeAgentRunner.DefaultBinary;
 
+    /// <summary>
+    /// Test seam — lets tests inject a non-placeholder byte sequence so the
+    /// materialise path can be exercised without running
+    /// <c>scripts/publish-acp-bridge.sh</c>. When non-null the placeholder
+    /// gate is bypassed and these bytes are base64-encoded into the
+    /// materialisation script's stdin. Settable post-construction so
+    /// DI-resolved instances can be primed in wiring tests.
+    /// </summary>
+    internal byte[]? BridgeBinaryOverride { get; set; }
+
     public string Name => "acp";
     public ClaudeSessionTransport Transport => ClaudeSessionTransport.Acp;
 
@@ -83,18 +93,34 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
     internal async Task MaterialiseBridgeAsync(ISandbox sandbox, CancellationToken ct)
     {
-        var bytes = AcpBridgeBinary.LoadBinary();
-        // Base64-encode the ELF and decode inside the sandbox. The exec
-        // command's argv stays well under MAX_ARG_STRLEN because the encoded
-        // string travels through bash heredoc, not argv.
+        // Placeholder-build guard: when the build host has not run
+        // scripts/publish-acp-bridge.sh, the embedded resource holds the
+        // tracked placeholder rather than a real ELF. Surface the failure
+        // BEFORE touching the sandbox so the worker degrades to the print
+        // transport on the very first turn without spending a roundtrip on
+        // execing a non-binary. Tests can short-circuit the gate by
+        // supplying BridgeBinaryOverride.
+        if (BridgeBinaryOverride is null && AcpBridgeBinary.IsPlaceholderBuild)
+        {
+            throw new AcpTransportUnavailableException(
+                "ACP bridge binary is a placeholder build — run scripts/publish-acp-bridge.sh "
+                + "on the build host to embed a real NativeAOT binary before enabling the ACP transport");
+        }
+
+        var bytes = BridgeBinaryOverride ?? AcpBridgeBinary.LoadBinary();
+        // The base64-encoded payload travels through SandboxExec.Stdin rather
+        // than argv. Linux MAX_ARG_STRLEN caps every argv element at 128 KiB
+        // (PAGE_SIZE * 32) at execve() time, regardless of in-shell heredoc
+        // syntax — a multi-MB NativeAOT bridge would trip that limit if it
+        // were wedged into argv[2]. Keeping the script tiny means the same
+        // path works under Process / Bubblewrap / Multipass sandboxes
+        // identically.
         var encoded = Convert.ToBase64String(bytes);
-        var script =
+        const string script =
             "set -eu\n" +
             "mkdir -p \"$HOME/.codeybox\"\n" +
             "chmod 700 \"$HOME/.codeybox\"\n" +
-            "base64 -d > \"$HOME/.codeybox/claude-acp-bridge\" <<'CB_ACP_BRIDGE_EOF'\n" +
-            encoded + "\n" +
-            "CB_ACP_BRIDGE_EOF\n" +
+            "base64 -d > \"$HOME/.codeybox/claude-acp-bridge\"\n" +
             "chmod 700 \"$HOME/.codeybox/claude-acp-bridge\"\n";
         SandboxExecResult result;
         try
@@ -102,6 +128,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             result = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["bash", "-c", script],
+                Stdin = encoded,
             }, ct).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

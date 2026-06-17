@@ -116,10 +116,17 @@ internal sealed class Bridge : IAsyncDisposable
             Shutdown(0);
         }, null, _config.TurnTimeoutSeconds * 1000, Timeout.Infinite);
 
+        // Generate the auth token BEFORE we accept any inbound connections so
+        // the WebSocket handshake guard can never observe an empty
+        // _authToken (which would short-circuit the check). Cheap, eliminates
+        // the local race window.
+        _authToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
+
         try
         {
             StartServer();
             WriteLockfile();
+            if (_shutdownStarted) return; // lockfile failure already raised fatal
             SpawnClaude();
         }
         catch (Exception ex)
@@ -378,8 +385,9 @@ internal sealed class Bridge : IAsyncDisposable
             return;
         }
 
-        var tokenBytes = RandomNumberGenerator.GetBytes(24);
-        _authToken = Convert.ToHexString(tokenBytes).ToLowerInvariant();
+        // _authToken is assigned in HandleHello BEFORE the listener accepts
+        // any peer so the WebSocket handshake guard cannot see an empty
+        // value during a connect/auth race.
         _lockPath = Path.Combine(baseDir, _port + ".lock");
 
         using var ms = new MemoryStream();

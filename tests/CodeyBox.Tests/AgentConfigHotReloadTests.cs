@@ -27,6 +27,12 @@ public sealed class AgentConfigHotReloadTests
     private static readonly AgentKind Claude = AgentKind.Claude;
     private static readonly AgentKind Codex = AgentKind.Codex;
 
+    // Non-placeholder bridge bytes for tests that drive AcpClaudeTransport.OpenAsync —
+    // the production placeholder gate would otherwise short-circuit before the
+    // assertions get a chance to run.
+    private static readonly byte[] AcpBridgeTestBytes =
+        new byte[] { 0x7f, (byte)'E', (byte)'L', (byte)'F', 0x02, 0x01, 0x01, 0x00, 0xde, 0xad, 0xbe, 0xef };
+
     [Fact]
     public void Constructor_WithCalculatorButWithoutPricingState_Throws()
     {
@@ -2865,6 +2871,7 @@ public sealed class AgentConfigHotReloadTests
         var transport = new AcpClaudeTransport(snapshot)
         {
             ClaudeBinary = "/opt/claude-test/claude",
+            BridgeBinaryOverride = AcpBridgeTestBytes,
         };
 
         var sandbox = new CapturingSandbox();
@@ -2896,7 +2903,7 @@ public sealed class AgentConfigHotReloadTests
     {
         var snapshot = new AgentNetworkToleranceSnapshot(
             new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase));
-        var transport = new AcpClaudeTransport(snapshot);
+        var transport = new AcpClaudeTransport(snapshot) { BridgeBinaryOverride = AcpBridgeTestBytes };
         var sandbox = new CapturingSandbox();
         var openRequest = new ClaudeTransportOpenRequest(
             Sandbox: sandbox,

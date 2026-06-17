@@ -29,7 +29,7 @@ dotnet publish "$BRIDGE_PROJECT" \
     -r "$RID" \
     --self-contained true \
     -p:PublishAot=true \
-    -p:StaticallyLinked=true
+    -p:StaticExecutable=true
 
 PUBLISH_DIR="src/CodeyBox.Agents.Claude.AcpBridge/bin/Release/net10.0/$RID/publish"
 SOURCE_BIN="$PUBLISH_DIR/CodeyBox.Agents.Claude.AcpBridge"
@@ -45,3 +45,20 @@ chmod 644 "$RESOURCE_DIR/$RESOURCE_NAME"
 echo "Embedded resource refreshed:"
 ls -la "$RESOURCE_DIR/$RESOURCE_NAME"
 file "$RESOURCE_DIR/$RESOURCE_NAME" 2>/dev/null || true
+
+# Sanity-check the static-link claim: the binary must NOT advertise a dynamic
+# interpreter. ldd on a static-PIE ELF prints "not a dynamic executable" or
+# "statically linked". Operators verifying against the actual multipass image
+# should additionally copy the resource in and exec `claude-acp-bridge </dev/null`
+# to confirm there are no runtime loader errors (out of scope for this script).
+if command -v ldd >/dev/null 2>&1; then
+    LDD_OUT="$(ldd "$RESOURCE_DIR/$RESOURCE_NAME" 2>&1 || true)"
+    echo "ldd: $LDD_OUT"
+    case "$LDD_OUT" in
+        *"not a dynamic executable"*|*"statically linked"*) ;;
+        *)
+            echo "WARNING: published binary appears dynamically linked — check the" >&2
+            echo "         StaticExecutable property and musl-tools installation." >&2
+            ;;
+    esac
+fi

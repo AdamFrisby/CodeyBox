@@ -17,7 +17,33 @@ namespace CodeyBox.Agents.Claude.AcpBridge;
 internal static class Emitter
 {
     private static readonly object _lock = new();
-    private static readonly Stream _stdout = Console.OpenStandardOutput();
+    private static Stream _stdout = Console.OpenStandardOutput();
+
+    /// <summary>
+    /// Test seam — lets unit tests redirect emitter output into an in-memory
+    /// stream so envelope shape assertions can run in-process. Production
+    /// never calls this; the bridge entrypoint leaves the default
+    /// <see cref="Console.OpenStandardOutput"/> in place.
+    /// </summary>
+    internal static IDisposable OverrideStreamForTests(Stream replacement)
+    {
+        lock (_lock)
+        {
+            var previous = _stdout;
+            _stdout = replacement;
+            return new StreamRestore(previous);
+        }
+    }
+
+    private sealed class StreamRestore : IDisposable
+    {
+        private readonly Stream _previous;
+        public StreamRestore(Stream previous) => _previous = previous;
+        public void Dispose()
+        {
+            lock (_lock) _stdout = _previous;
+        }
+    }
 
     /// <summary>Emit a single envelope with one explicit field.</summary>
     public static void Emit(string type)

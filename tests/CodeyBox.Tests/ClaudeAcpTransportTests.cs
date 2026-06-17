@@ -601,10 +601,10 @@ public sealed class ClaudeAcpTransportTests
     // ── Real AcpClaudeTransport — bridge materialisation + turn round-trip ───
 
     [Fact]
-    public async Task AcpClaudeTransport_OpenAsync_WritesBridgeBinary_ViaBase64HereDoc()
+    public async Task AcpClaudeTransport_OpenAsync_WritesBridgeBinary_ViaStdin()
     {
         var sandbox = new BridgeSandbox();
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var request = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-1");
@@ -614,22 +614,49 @@ public sealed class ClaudeAcpTransportTests
         var materialise = sandbox.AllExecs.Single();
         Assert.Equal("bash", materialise.Argv[0]);
         Assert.Equal("-c", materialise.Argv[1]);
-        // New path: native binary (no .cjs / no node) materialised via a
-        // base64 heredoc, then chmod 700 to make it executable.
         Assert.Contains("base64 -d > \"$HOME/.codeybox/claude-acp-bridge\"", materialise.Argv[2]);
         Assert.Contains("chmod 700 \"$HOME/.codeybox/claude-acp-bridge\"", materialise.Argv[2]);
         Assert.DoesNotContain(".cjs", materialise.Argv[2]);
-        // Payload is the embedded bridge bytes verbatim — placeholder bytes in
-        // dev/test builds; the real ELF when scripts/publish-acp-bridge.sh ran.
-        var encoded = Convert.ToBase64String(AcpBridgeBinary.LoadBinary());
-        Assert.Contains(encoded, materialise.Argv[2]);
+        // The base64 payload must travel via Stdin, NOT argv — Linux
+        // MAX_ARG_STRLEN caps every argv element at 128 KiB regardless of
+        // heredoc syntax, so a multi-MB NativeAOT bridge would fail execve()
+        // if wedged into the script. Production fix asserted here.
+        var encoded = Convert.ToBase64String(TestBridgeBytes);
+        Assert.Equal(encoded, materialise.Stdin);
+        Assert.DoesNotContain(encoded, materialise.Argv[2]);
+        // And the script itself stays well under 1 KiB so MAX_ARG_STRLEN
+        // can never be a concern for the materialise step.
+        Assert.True(materialise.Argv[2].Length < 1024,
+            $"materialise script grew to {materialise.Argv[2].Length} bytes; keep argv tiny");
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_OpenAsync_PlaceholderBuild_RaisesUnavailable_BeforeTouchingSandbox()
+    {
+        // No override → IsPlaceholderBuild gate fires because the test build
+        // embeds the tracked placeholder resource. The transport must throw
+        // BEFORE invoking sandbox.ExecAsync so the worker degrades to print
+        // without spending a roundtrip on a non-binary.
+        Assert.True(AcpBridgeBinary.IsPlaceholderBuild,
+            "test environment expected to be a placeholder build (Resources/acp-bridge.placeholder)");
+        var sandbox = new BridgeSandbox();
+        var placeholderTransport = new AcpClaudeTransport(); // intentionally no override → gate must fire
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-placeholder");
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => placeholderTransport.OpenAsync(request, CancellationToken.None));
+        Assert.Contains("placeholder", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // No sandbox call should have been made.
+        Assert.Empty(sandbox.AllExecs);
     }
 
     [Fact]
     public async Task AcpClaudeTransport_OpenAsync_SandboxFailure_RaisesUnavailable()
     {
         var sandbox = new BridgeSandbox { FailMaterialise = true };
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var request = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-x");
@@ -653,7 +680,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-real");
@@ -702,7 +729,7 @@ public sealed class ClaudeAcpTransportTests
             {
                 ["claude"] = new AgentNetworkToleranceOptions { ApiTimeoutMs = 1_200_000 },
             });
-        var transport = new AcpClaudeTransport(snapshot);
+        var transport = NewAcpTransportWithOverride(snapshot);
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-timeout");
@@ -736,7 +763,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}",
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-timeout-default");
@@ -767,7 +794,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-resume");
@@ -808,7 +835,7 @@ public sealed class ClaudeAcpTransportTests
         });
 
         var sink = new RecordingMetricsSink();
-        var realAcp = new AcpClaudeTransport();
+        var realAcp = NewAcpTransportWithOverride();
         var worker = new ClaudeSessionWorker(
             BuildRunner(),
             metricsSink: sink,
@@ -851,7 +878,7 @@ public sealed class ClaudeAcpTransportTests
             BuildRunner(),
             metricsSink: sink,
             options: new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp },
-            acpTransport: new AcpClaudeTransport());
+            acpTransport: NewAcpTransportWithOverride());
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
         var result = await worker.SendTurnAsync(handle, "first");
@@ -874,7 +901,7 @@ public sealed class ClaudeAcpTransportTests
         });
         sandbox.BridgeExitCode = 2;
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-fatal");
@@ -909,7 +936,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-retry");
@@ -939,7 +966,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
         });
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-saniterr");
@@ -990,6 +1017,22 @@ public sealed class ClaudeAcpTransportTests
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Fake bridge bytes for tests that drive <see cref="AcpClaudeTransport.MaterialiseBridgeAsync"/>
+    /// directly. Production reads from <see cref="AcpBridgeBinary.LoadBinary"/>;
+    /// in CI / dev that resource is the tracked placeholder, which the new
+    /// <c>IsPlaceholderBuild</c> gate rejects up-front. Supplying this override
+    /// gives the transport a non-placeholder byte sequence so the materialise
+    /// path is observable end-to-end without needing
+    /// <c>scripts/publish-acp-bridge.sh</c> to run first.
+    /// </summary>
+    private static readonly byte[] TestBridgeBytes =
+        new byte[] { 0x7f, (byte)'E', (byte)'L', (byte)'F', 0x02, 0x01, 0x01, 0x00, 0xde, 0xad, 0xbe, 0xef };
+
+    private static AcpClaudeTransport NewAcpTransportWithOverride(
+        AgentNetworkToleranceSnapshot? networkTolerance = null)
+        => new(networkTolerance) { BridgeBinaryOverride = TestBridgeBytes };
 
     private static ClaudeAgentRunner BuildRunner() =>
         new(new AgentDefaultsSnapshot(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)

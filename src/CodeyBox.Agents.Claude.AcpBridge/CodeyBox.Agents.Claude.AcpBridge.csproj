@@ -24,9 +24,14 @@
     <RootNamespace>CodeyBox.Agents.Claude.AcpBridge</RootNamespace>
     <AssemblyName>CodeyBox.Agents.Claude.AcpBridge</AssemblyName>
 
-    <!-- AOT settings honoured by `dotnet publish` only. -->
+    <!-- AOT settings honoured by `dotnet publish` only.
+         StaticExecutable is the documented NativeAOT MSBuild property for
+         producing a fully statically-linked binary against musl on the
+         linux-musl-x64 RID. Verify with `file` (advertises "statically linked")
+         and `ldd` ("not a dynamic executable") after running
+         scripts/publish-acp-bridge.sh. -->
     <PublishAot>true</PublishAot>
-    <StaticallyLinked>true</StaticallyLinked>
+    <StaticExecutable>true</StaticExecutable>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
     <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
