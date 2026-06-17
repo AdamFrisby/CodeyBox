@@ -185,7 +185,7 @@
       }
     },
     {
-      "question": "Does the system check submitted passwords against a known-breached-password list and reject matches? (V6.1.2)",
+      "question": "Does the system accept new or reset passwords without checking them against a known-breached-password corpus and rejecting matches? (V6.1.2)",
       "actionableAnswer": true,
       "onYes": {
         "title": "Fix V6.1.2: reject breached passwords during registration and password change",
@@ -409,11 +409,43 @@
       }
     },
     {
+      "question": "Are container/workload manifests running as root, with a writable root filesystem, retaining all Linux capabilities, or using privileged/host-network/host-pid mode in production? (V13.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V13.4.1: harden container/workload runtime to non-root, read-only, least-capability",
+        "prompt": "Problem: Containers running as root with a writable rootfs, full Linux capabilities, or privileged/host namespaces give a compromise the kernel-level blast radius the workload boundary was supposed to contain.\n\nFind all instances: Audit Dockerfiles, Kubernetes Deployments/DaemonSets/StatefulSets, ECS task definitions, Nomad jobs, and any container-runtime config. Look for missing USER root, missing securityContext, privileged: true, hostNetwork/hostPID/hostIPC: true, allowPrivilegeEscalation defaulting to true, capabilities.add lists, and writable rootfs (no readOnlyRootFilesystem: true).\n\nFix correctly: Set USER to a non-zero uid in images. In manifests, set runAsNonRoot: true, runAsUser/runAsGroup to a non-zero id, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true (mount tmpfs/emptyDir for required writable paths), and capabilities.drop: [ALL] (add back only what is genuinely needed). Refuse privileged/hostNetwork/hostPID/hostIPC unless an explicit waiver exists. Enforce via admission control (PodSecurity Admission restricted profile, OPA/Gatekeeper, Kyverno).\n\nAcceptance: All production workloads run non-root with a read-only rootfs, no privilege escalation, and a minimal capability set. Add a CI policy check (kube-score, conftest, or PSA dry-run) that fails the build on any manifest that regresses these settings."
+      }
+    },
+    {
+      "question": "Do cloud-platform identities (IAM roles, service accounts, managed identities) assigned to this workload grant wildcard or broadly-scoped permissions (*:*, AdministratorAccess, Owner, broad data-plane reads) instead of least-privilege resource-scoped grants? (V13.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V13.5.1: scope cloud workload IAM to least-privilege resource-bound grants",
+        "prompt": "Problem: Workloads bound to wildcard or broadly-scoped cloud identities give any compromise the full blast radius of the underlying account/subscription/project, defeating the cloud platform's own segmentation.\n\nFind all instances: Audit cloud IaC (Terraform, Bicep, CloudFormation, Pulumi) and live IAM for the identities this workload assumes. Flag policies containing Action/Resource: '*', AWS managed AdministratorAccess/PowerUserAccess on workloads, Azure Owner/Contributor at subscription scope, GCP roles/owner or roles/editor on the project, and overly broad data-plane grants (s3:*, storage.objects.*, Kusto/BigQuery wide reads).\n\nFix correctly: Replace wildcards with the minimum Action set the code actually calls, scoped to specific resources (bucket/key prefix, table, secret name, queue ARN). Use customer-managed roles, not vendor 'admin' presets, on production workloads. Where dynamic access is needed, use STS/Workload Identity Federation with short-lived credentials over static keys. Capture the principle as a regression test in IaC review.\n\nAcceptance: No production workload identity carries wildcard or account-wide admin permissions. Add an IaC policy check (Checkov, tfsec, KICS, cnspec) that fails the build on wildcard Action/Resource or vendor admin presets attached to workload identities."
+      }
+    },
+    {
       "question": "Is sensitive data (PII, credentials, payment data) stored unencrypted at rest where the threat model requires field-level encryption? (V14.1.1)",
       "actionableAnswer": true,
       "onYes": {
         "title": "Fix V14.1.1: encrypt sensitive fields at rest with managed keys",
         "prompt": "Problem: Sensitive fields stored in cleartext are exposed via any database backup, replica, or read-side compromise.\n\nFind all instances: Identify sensitive columns (PII, payment instruments, credentials, tokens). Check whether encryption-at-rest is provided by the storage layer plus field-level encryption where the threat model demands it.\n\nFix correctly: Apply field-level encryption (envelope/ tokenisation) with keys in a KMS. Limit who can decrypt; log decryption events. Use hashing/tokenisation for searchable identifiers where possible.\n\nAcceptance: Sensitive fields are encrypted at rest with audited decrypt access. Add a test asserting the column at rest is ciphertext."
+      }
+    },
+    {
+      "question": "Does the client persist authentication tokens, session identifiers, refresh tokens, or other secrets in localStorage, sessionStorage, or IndexedDB where any XSS can exfiltrate them? (V14.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V14.2.1: keep auth tokens and secrets out of script-reachable client storage",
+        "prompt": "Problem: localStorage/sessionStorage/IndexedDB are reachable by any script running on the origin, so any XSS, malicious browser extension, or third-party script supply-chain compromise reads the credential directly. There is no isolation in script-reachable storage.\n\nFind all instances: Grep the frontend for localStorage.setItem/getItem, sessionStorage.*, indexedDB.open, persist/rehydrate calls in state libraries (redux-persist, zustand persist, pinia-plugin-persistedstate), and any tracking of access/refresh tokens or session ids in those sinks. Include cookie writes that set tokens without HttpOnly.\n\nFix correctly: Move session/auth material to HttpOnly + Secure + SameSite cookies (or a BFF-issued opaque session cookie). For SPA + API patterns, terminate auth at a backend-for-frontend that holds the real token. For PWAs needing offline secrets, use the Web Crypto API with a non-extractable key bound to the origin. Anything that must live in client storage is non-sensitive identifiers only.\n\nAcceptance: No auth token, refresh token, session id, or comparable secret is written to localStorage/sessionStorage/IndexedDB. Add a lint rule (eslint-plugin-no-unsanitized + custom no-restricted-syntax for the storage APIs on token-shaped keys) and a unit test that fails if the storage shim is called with a token-bearing key."
+      }
+    },
+    {
+      "question": "Are sensitive values (passwords, tokens, payment instruments, government identifiers, full PII records) emitted into logs, error responses, telemetry events, analytics payloads, or external monitoring backends without redaction or masking? (V14.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V14.3.1: redact sensitive fields before they reach logs, telemetry, or external responses",
+        "prompt": "Problem: Sensitive values written into logs/telemetry/analytics flow to many places the production database never reaches (SIEMs, log aggregators, third-party monitoring SaaS, support tools, long-term cold storage), so a cleartext leak there is effectively unrecoverable.\n\nFind all instances: Audit every logger/telemetry/analytics call path for fields named password, token, secret, authorization, cookie, ssn, dob, card_number, cvv, pan, email, phone, address, full_name, and equivalents in the project's domain language. Cover structured log enrichers, exception serialisers, request/response logging middleware, frontend analytics events, and any 'dump the object' code path.\n\nFix correctly: Establish a redaction layer at the emission boundary — Serilog destructuring policies, structlog processors, pino redact, frontend event sanitisers — keyed off a sensitive-field allowlist that fails closed (unknown deeply-nested objects are redacted by default). Mask payment instruments and identifiers to last-4. Strip Authorization/Cookie headers in request/response logging. Add a 'sensitive' marker on domain types that the logger refuses to serialise without redaction.\n\nAcceptance: No sensitive field reaches the log/telemetry/analytics pipeline in cleartext, and the redaction layer fails closed on unknown nested data. Add tests that emit log/telemetry events with each sensitive field populated and assert the rendered output contains only the masked form."
       }
     },
     {
@@ -641,7 +673,7 @@
       }
     },
     {
-      "question": "Do log records contain trustworthy timestamps, source identity, and request correlation IDs sufficient for incident investigation? (V16.1.2)",
+      "question": "Are log records missing trustworthy timestamps, source identity, or request correlation IDs needed for incident investigation? (V16.1.2)",
       "actionableAnswer": true,
       "onYes": {
         "title": "Fix V16.1.2: include high-resolution UTC timestamps, source, and correlation IDs in logs",

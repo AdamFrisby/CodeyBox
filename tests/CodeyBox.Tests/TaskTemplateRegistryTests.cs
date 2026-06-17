@@ -303,6 +303,21 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         var loaded = await registry.LoadAsync("templates/asvs5");
 
         Assert.NotEmpty(loaded.Checks);
+
+        // Hard cap: load would have thrown above this. Repeat the assertion explicitly
+        // so a regression surfaces as a clear comparison rather than an opaque load failure.
+        Assert.True(
+            loaded.Checks.Count < CodeyBoxOptions.DefaultMaxTemplateChecks,
+            $"asvs5 ships {loaded.Checks.Count} checks — must stay strictly under the default cap of {CodeyBoxOptions.DefaultMaxTemplateChecks} entries.");
+
+        // Headroom: the template must leave room for new ASVS controls to be added without
+        // a same-PR cap bump. If this fails, raise CodeyBoxOptions.DefaultMaxTemplateChecks
+        // in the same change that adds the new controls.
+        const int minimumHeadroom = 32;
+        var headroom = CodeyBoxOptions.DefaultMaxTemplateChecks - loaded.Checks.Count;
+        Assert.True(
+            headroom >= minimumHeadroom,
+            $"asvs5 ships {loaded.Checks.Count} checks against default cap {CodeyBoxOptions.DefaultMaxTemplateChecks}; headroom {headroom} is below the required minimum {minimumHeadroom}. Raise DefaultMaxTemplateChecks before merging.");
     }
 
     private static string LocateShippedTemplatesDir()
