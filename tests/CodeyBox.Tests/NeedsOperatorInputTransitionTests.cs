@@ -66,6 +66,7 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var upstreamFactory = new TestUpstreamFactory();
         var webhooks = new CapturingWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -75,7 +76,9 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             questionStore: allowQuestions ? questionStore : null,
             agentStreams: agentStreams,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipelineWithQuestions(pipeline, store, questionStore, agent, gitHost, gitRoot, webhooks);
     }

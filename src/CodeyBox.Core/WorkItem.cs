@@ -104,8 +104,9 @@ public sealed record WorkItem
     public string? LastError { get; init; }
 
     /// <summary>
-    /// Informational category of the failure. Set when transitioning to Failed.
-    /// Values: "quota", "timeout", "agent", "infrastructure", "other".
+    /// Informational category for failed or scheduler-parked rows. Values
+    /// include "quota", "transient", "transient-exhausted", "timeout",
+    /// "agent", "infrastructure", and "other".
     /// </summary>
     public string? FailureKind { get; init; }
 
@@ -144,6 +145,32 @@ public sealed record WorkItem
     /// Null for rows written before this metadata existed.
     /// </summary>
     public string? QuotaRetryPhase { get; init; }
+
+    /// <summary>
+    /// UTC timestamp for the next scheduled auto-retry attempt after a
+    /// transient transport/network failure. Null when no transient retry is
+    /// scheduled or the item exhausted its transient retry budget.
+    /// </summary>
+    public DateTimeOffset? NextTransientRetryAt { get; init; }
+
+    /// <summary>
+    /// Number of times this work item has been automatically retried after a
+    /// transient transport/network failure.
+    /// </summary>
+    public int TransientRetryAttempts { get; init; }
+
+    /// <summary>
+    /// First failure timestamp in the current transient transport retry series.
+    /// Used to cap total elapsed retry time across orchestrator restarts.
+    /// </summary>
+    public DateTimeOffset? TransientRetryFirstFailedAt { get; init; }
+
+    /// <summary>
+    /// Pipeline entry point the transient retry scheduler should use when the
+    /// backoff delay expires. Values match the manual retry API plus
+    /// "conflict_rework" for merge-conflict repair retries.
+    /// </summary>
+    public string? TransientRetryFrom { get; init; }
 
     /// <summary>
     /// Agent kind whose operator pause parked this item in
@@ -564,19 +591,37 @@ public sealed record WorkItem
             && PreserveWorkBranchOnQueuedPickup
             && !string.IsNullOrWhiteSpace(WorkBranch);
 
+        var nextFailureKind = IsFailureKindCarryingState(state)
+            ? (failureKind ?? FailureKind)
+            : null;
+        var carriesQuotaRetry = IsQuotaShapedState(state);
+        var carriesTransientRetry =
+            state == WorkItemState.WaitingForTransientRetry
+            && string.Equals(nextFailureKind, "transient", StringComparison.OrdinalIgnoreCase);
+        var carriesTransientHistory =
+            (state == WorkItemState.WaitingForTransientRetry
+                && string.Equals(nextFailureKind, "transient", StringComparison.OrdinalIgnoreCase))
+            || (state == WorkItemState.Failed
+                && string.Equals(nextFailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase));
+        var preservesTransientHistory = carriesTransientHistory || ShouldPreserveTransientRetryHistory(state);
+
         return this with
         {
             State = state,
             LastError = error,
-            // Both Failed("quota") and WaitingForQuotaReset are quota-shaped
+            // Failed("quota") and WaitingForQuotaReset are quota-shaped
             // states that must preserve FailureKind / QuotaResetAt /
             // NextQuotaRetryAt so the retry scheduler can re-arm timers
             // across host restarts.
-            FailureKind = IsQuotaShapedState(state) ? (failureKind ?? FailureKind) : null,
-            QuotaResetAt = IsQuotaShapedState(state) ? (quotaResetAt ?? QuotaResetAt) : null,
-            NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
-            QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
-            QuotaRetryPhase = IsQuotaShapedState(state) ? QuotaRetryPhase : null,
+            FailureKind = nextFailureKind,
+            QuotaResetAt = carriesQuotaRetry ? (quotaResetAt ?? QuotaResetAt) : null,
+            NextQuotaRetryAt = carriesQuotaRetry ? NextQuotaRetryAt : null,
+            QuotaRetryFrom = carriesQuotaRetry ? QuotaRetryFrom : null,
+            QuotaRetryPhase = carriesQuotaRetry ? QuotaRetryPhase : null,
+            NextTransientRetryAt = carriesTransientRetry ? NextTransientRetryAt : null,
+            TransientRetryAttempts = preservesTransientHistory ? TransientRetryAttempts : 0,
+            TransientRetryFirstFailedAt = preservesTransientHistory ? TransientRetryFirstFailedAt : null,
+            TransientRetryFrom = carriesTransientRetry ? TransientRetryFrom : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
@@ -603,6 +648,22 @@ public sealed record WorkItem
     private static bool IsQuotaShapedState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
 
+    private static bool IsFailureKindCarryingState(WorkItemState state) =>
+        state is WorkItemState.Failed
+            or WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForTransientRetry;
+
     private static bool IsCancellationSourceCarryingState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.Cancelled;
+
+    private static bool ShouldPreserveTransientRetryHistory(WorkItemState state) =>
+        state is WorkItemState.Queued
+            or WorkItemState.Working
+            or WorkItemState.Auditing
+            or WorkItemState.Reworking
+            or WorkItemState.Merging
+            or WorkItemState.UpstreamPushing
+            or WorkItemState.ReworkingForConflict
+            or WorkItemState.WaitingForTransientRetry
+            or WorkItemState.NeedsOperatorInput;
 }

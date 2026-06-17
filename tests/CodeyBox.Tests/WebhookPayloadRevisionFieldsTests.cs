@@ -136,7 +136,7 @@ public sealed class WebhookPayloadRevisionFieldsTests
     public void RevisionFields_AreNotNestedUnderDetails()
     {
         // Explicit pin: if a future refactor reverts to carrying the fields on
-        // a TerminalRevisionDetails object inside Details, this test fails so
+        // a TerminalRevisionAttribution object inside Details, this test fails so
         // the JT-2 contract regression is caught at CI rather than at the
         // tracker.
         var evt = new WebhookEvent

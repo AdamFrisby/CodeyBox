@@ -241,6 +241,45 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
             string.Equals(e.Event, "work_item.cancelled", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task OperatorCancel_RacingTransientAgentFailure_CancelsInsteadOfParkingTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var webhooks = new RecordingWebhookDispatcher();
+        var agent = new TransientAfterCancellationAgentRunner();
+        using var harness = BuildPipeline(seed, agent, registry, webhooks);
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        using var registration = registry.Register(item.Id);
+        using var hostShutdownCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, registration.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await agent.Started.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.True(registry.Cancel(item.Id));
+        Assert.Equal(CancellationRequestKind.Operator, registry.GetRequestKind(item.Id));
+
+        await pipelineTask;
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Cancelled, final!.State);
+        Assert.Equal(WorkItemCancellationReason.OperatorRequested, final.CancellationReason);
+        Assert.Equal(CancellationSources.Operator, final.CancellationSource);
+        Assert.NotEqual("transient", final.FailureKind);
+
+        Assert.Contains(webhooks.Events, e =>
+            string.Equals(e.Event, "work_item.cancelled", StringComparison.Ordinal));
+        Assert.DoesNotContain(webhooks.Events, e =>
+            string.Equals(e.Event, "work_item.waiting_for_transient_retry", StringComparison.Ordinal));
+    }
+
     // ── Harness ───────────────────────────────────────────────────────────────
 
     private RecoveryCancelTestHarness BuildPipeline(
@@ -273,6 +312,7 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
             DefaultAgent = AgentKind.Claude,
             Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
         });
+        var terminalTransitions = TestSupport.CreateTerminalTransition(pipelineStore, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registryOfAgents, new StaticCredentialProvider(), prs,
@@ -283,7 +323,9 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            cancellationRegistry: registry);
+            cancellationRegistry: registry,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new RecoveryCancelTestHarness(pipeline, store, pipelineStore);
     }
@@ -489,4 +531,35 @@ internal sealed class RaceAdvancingStore : IWorkItemStore
         _inner.RecordIterationDispatchAsync(workItemId, iteration, promptRevisionAtDispatch, dispatchedAt, ct);
     public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) =>
         _inner.GetIterationsAsync(workItemId, ct);
+}
+
+internal sealed class TransientAfterCancellationAgentRunner : IAgentRunner
+{
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public AgentKind Kind { get; init; } = AgentKind.Claude;
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        Started.TrySetResult();
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(10).ConfigureAwait(false);
+        }
+
+        return new AgentResult(
+            false,
+            "agent exited 1",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream");
+    }
 }

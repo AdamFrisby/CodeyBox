@@ -178,6 +178,7 @@ public sealed class PipelineRunnerUsagePublishTests : IDisposable
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var upstreamFactory = new TestUpstreamFactory();
         var calculator = new AgentCostCalculator(new AgentPricingOptions());
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null;
         if (registerExtractor)
@@ -197,7 +198,9 @@ public sealed class PipelineRunnerUsagePublishTests : IDisposable
             costStore: costStore,
             costExtractors: extractors,
             costCalculator: calculator,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

@@ -137,7 +137,8 @@ internal static class AgentSuspendSmokeHarness
 
         var classification = AgentFailureClassifier.Classify(result.Stderr, result.Stdout);
         var exitCode = ParseExitCodeFromSummary(result.Summary);
-        if (global::CodeyBox.Agents.AgentSuspendResilience.ShouldRetry(agent, classification, exitCode))
+        if (classification.Kind == AgentFailureKind.TransientNetwork
+            || global::CodeyBox.Agents.AgentSuspendResilience.ShouldRetry(agent, classification, exitCode))
             return AgentSuspendSmokeOutcome.RecoverableFailure;
 
         return AgentSuspendSmokeOutcome.Failed;

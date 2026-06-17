@@ -43,6 +43,12 @@ public enum WorkItemState
     /// so operator intent is visible and quota auto-retry accounting is not used.
     /// </summary>
     WaitingForAgentResume = 13,
+    /// <summary>
+    /// The last agent attempt failed due to a transient transport/network
+    /// condition. The item is parked, not terminal, and the transient retry
+    /// scheduler re-enqueues it after the configured backoff+jitter delay.
+    /// </summary>
+    WaitingForTransientRetry = 14,
     Failed = 100,
     Cancelled = 101,
     AuditFailed = 102,

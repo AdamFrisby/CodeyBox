@@ -212,8 +212,9 @@ public interface IWorkItemStore
     /// work the caller is tracking). Implementations may buffer candidates to hydrate
     /// related data before yielding; callers must not rely on partial reads avoiding
     /// the cost of finding the eligible set. Terminal states plus parked
-    /// <c>NeedsOperatorInput</c>, <c>WaitingForQuotaReset</c>, and
-    /// <c>WaitingForAgentResume</c> rows are excluded.
+    /// <c>NeedsOperatorInput</c>, <c>WaitingForQuotaReset</c>,
+    /// <c>WaitingForAgentResume</c>, and <c>WaitingForTransientRetry</c> rows
+    /// are excluded.
     /// </summary>
     IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default);
 

@@ -149,6 +149,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_from TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_phase TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN next_transient_retry_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_attempts INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_first_failed_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_from TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_pause_target TEXT;");
             // Resume entry-point for WaitingForAgentResume rows. Separate from
             // quota_retry_from so agent-pause parking does not have to overload
@@ -418,7 +422,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                         min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
-                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, quota_retry_phase, agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
+                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
+                        quota_retry_phase,
+                        next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
+                        agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
                         required_capabilities_json,
@@ -430,7 +437,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
-                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $quota_retry_phase, $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
+                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
+                        $quota_retry_phase,
+                        $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
+                        $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
                         $required_capabilities,
@@ -548,6 +558,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     quota_retry_phase = $quota_retry_phase,
+                    next_transient_retry_at = $next_transient_retry_at,
+                    transient_retry_attempts = $transient_retry_attempts,
+                    transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                    transient_retry_from = $transient_retry_from,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -617,6 +631,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     quota_retry_phase = $quota_retry_phase,
+                    next_transient_retry_at = $next_transient_retry_at,
+                    transient_retry_attempts = $transient_retry_attempts,
+                    transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                    transient_retry_from = $transient_retry_from,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -691,6 +709,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     quota_retry_phase = $quota_retry_phase,
+                    next_transient_retry_at = $next_transient_retry_at,
+                    transient_retry_attempts = $transient_retry_attempts,
+                    transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                    transient_retry_from = $transient_retry_from,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -1037,7 +1059,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
                     {(int)WorkItemState.NeedsOperatorInput},
                     {(int)WorkItemState.WaitingForQuotaReset},
-                    {(int)WorkItemState.WaitingForAgentResume}
+                    {(int)WorkItemState.WaitingForAgentResume},
+                    {(int)WorkItemState.WaitingForTransientRetry}
                 )
                 ORDER BY
                     CASE
@@ -1135,6 +1158,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                   $inflight_needs_operator_input,
                   $inflight_waiting_for_quota_reset,
                   $inflight_waiting_for_agent_resume,
+                  $inflight_waiting_for_transient_retry,
                   $inflight_abandoned_after_recovery_attempts
               );
             """;
@@ -1173,6 +1197,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                   $inflight_needs_operator_input,
                   $inflight_waiting_for_quota_reset,
                   $inflight_waiting_for_agent_resume,
+                  $inflight_waiting_for_transient_retry,
                   $inflight_abandoned_after_recovery_attempts
               );
             """;
@@ -1197,6 +1222,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$inflight_needs_operator_input", (int)WorkItemState.NeedsOperatorInput);
         cmd.Parameters.AddWithValue("$inflight_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
         cmd.Parameters.AddWithValue("$inflight_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
+        cmd.Parameters.AddWithValue("$inflight_waiting_for_transient_retry", (int)WorkItemState.WaitingForTransientRetry);
         cmd.Parameters.AddWithValue("$inflight_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
     }
 
@@ -1900,6 +1926,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
         cmd.Parameters.AddWithValue("$quota_retry_from", (object?)item.QuotaRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_phase", (object?)item.QuotaRetryPhase ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$next_transient_retry_at", (object?)item.NextTransientRetryAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$transient_retry_attempts", item.TransientRetryAttempts);
+        cmd.Parameters.AddWithValue("$transient_retry_first_failed_at", (object?)item.TransientRetryFirstFailedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$transient_retry_from", (object?)item.TransientRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_target", (object?)item.AgentPauseTarget?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_retry_from", (object?)item.AgentPauseRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
@@ -1977,6 +2007,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
         QuotaRetryFrom = ReadNullableString(r, "quota_retry_from"),
         QuotaRetryPhase = ReadNullableString(r, "quota_retry_phase"),
+        NextTransientRetryAt = ReadNullableDateTimeOffset(r, "next_transient_retry_at"),
+        TransientRetryAttempts = ReadInt32OrDefault(r, "transient_retry_attempts", defaultValue: 0),
+        TransientRetryFirstFailedAt = ReadNullableDateTimeOffset(r, "transient_retry_first_failed_at"),
+        TransientRetryFrom = ReadNullableString(r, "transient_retry_from"),
         AgentPauseTarget = ReadNullableAgentKind(r, "agent_pause_target"),
         AgentPauseRetryFrom = ReadNullableString(r, "agent_pause_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),

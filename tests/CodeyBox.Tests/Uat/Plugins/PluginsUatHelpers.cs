@@ -63,6 +63,8 @@ internal static class PluginsUatHelpers
             new PresetCatalog(),
             [pluginAuditor],
             NullLogger<ProjectAuditorComposer>.Instance);
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -74,11 +76,13 @@ internal static class PluginsUatHelpers
             new TestUpstreamFactory(),
             composer,
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditReports: auditReportStore,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new PluginPipelineContext(pipeline, store, agent, gitHost, gitRoot);
     }

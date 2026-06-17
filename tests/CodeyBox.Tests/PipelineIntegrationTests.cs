@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -273,6 +274,297 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkPhaseTransientAgentFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        const string Secret = "ghp_XYZabc789012345678901234567890";
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: $"agent transport failed {Secret}",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        var item = NewItem("feature/transient-transport");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Null(final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.DoesNotContain(Secret, final.LastError, StringComparison.Ordinal);
+        Assert.Contains("***", final.LastError, StringComparison.Ordinal);
+
+        var waiting = Assert.Single(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
+        Assert.Equal(item.Id, waiting.WorkItem?.Id);
+        using var details = JsonDocument.Parse(JsonSerializer.Serialize(waiting.Details));
+        var root = details.RootElement;
+        Assert.Equal("work", root.GetProperty("phase").GetString());
+        Assert.Equal("claude", root.GetProperty("agent").GetString());
+        Assert.Equal(final.NextTransientRetryAt, root.GetProperty("nextRetryAt").GetDateTimeOffset());
+        Assert.Equal(final.TransientRetryAttempts, root.GetProperty("attempts").GetInt32());
+        var reason = root.GetProperty("reason").GetString();
+        Assert.NotNull(reason);
+        Assert.DoesNotContain(Secret, reason, StringComparison.Ordinal);
+        Assert.Contains("***", reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WorkPhaseTransientAgentFailure_WithOperatorCancellation_CancelsInsteadOfSchedulingRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var cancellations = new CancellationRegistry(CancellationToken.None);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time,
+            cancellationRegistry: cancellations);
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        var item = NewItem("feature/transient-operator-cancel");
+        await tp.Store.CreateAsync(item);
+        using var registration = cancellations.Register(item.Id);
+        Assert.True(cancellations.Cancel(item.Id));
+        Assert.Equal(CancellationRequestKind.Operator, cancellations.GetRequestKind(item.Id));
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Cancelled, final!.State);
+        Assert.Equal(WorkItemCancellationReason.OperatorRequested, final.CancellationReason);
+        Assert.Equal(CancellationSources.Operator, final.CancellationSource);
+        Assert.NotEqual("transient", final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.Contains(webhooks.Events, e => e.Event == "work_item.cancelled" && e.WorkItem?.Id == item.Id);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
+    }
+
+    [Fact]
+    public async Task WaitingForTransientRetryTransition_CurrentNeedsOperatorInput_DoesNotOverwrite()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+
+        var stale = NewItem("feature/transient-operator-race") with
+        {
+            State = WorkItemState.Working,
+            LastError = "stale transient snapshot",
+        };
+        var needsOperatorInput = stale.With(
+            WorkItemState.NeedsOperatorInput,
+            "operator answer required");
+        await tp.Store.CreateAsync(needsOperatorInput);
+
+        var method = typeof(PipelineRunner).GetMethod(
+            "TransitionWaitingForTransientRetryAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance,
+            binder: null,
+            types: [typeof(WorkItem), typeof(string), typeof(Project), typeof(string), typeof(AgentKind?)],
+            modifiers: null);
+        Assert.NotNull(method);
+
+        await (Task)method!.Invoke(
+            tp.Pipeline,
+            [stale, "Transport channel closed", null, "work", AgentKind.Claude])!;
+
+        var final = await tp.Store.GetAsync(stale.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Equal("operator answer required", final.LastError);
+        Assert.Null(final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Null(final.TransientRetryFirstFailedAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
+    }
+
+    [Fact]
+    public async Task WorkPhaseTransientRetry_WithExistingWorkBranch_AutoPicksAudit()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+
+        var item = NewItem("feature/transient-prior-work");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "prior.txt",
+            "prior progress\n",
+            "prior progress");
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, parked!.State);
+        Assert.Null(parked.TransientRetryFrom);
+
+        time.Advance(TimeSpan.FromSeconds(31));
+        await RunTransientPeriodicSweepAsync(tp.RetryScheduler!);
+
+        var resumed = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+        Assert.Equal(1, resumed.TransientRetryAttempts);
+        Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task WorkPhaseTransientAgentFailure_AtRetryCap_PublishesFailedNotWaiting()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            transientRetryOptions: TransientRetryOptions() with { MaxAutoRetriesPerWorkItem = 0 },
+            retryTimeProvider: time);
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        var item = NewItem("feature/transient-cap");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("transient-exhausted", final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Contains("attempts=0; max=0", final.LastError);
+        Assert.Contains(webhooks.Events, e => e.Event == "work_item.failed" && e.WorkItem?.Id == item.Id);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
+    }
+
+    [Fact]
+    public async Task MergePhaseTransientAgentFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "work complete\n"));
+        tp.Agent.MergeResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "merge transport failed",
+            Stdout: null,
+            Stderr: "Transport channel closed"));
+
+        var item = NewItem("feature/transient-merge");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("merge", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
+    public async Task ConflictMergeVerificationFailure_WithTransportText_DoesNotParkTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+
+        var item = NewItem("feature/conflict-verification") with
+        {
+            State = WorkItemState.WorkComplete,
+            ConflictReworkAttempts = 1,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        tp.Agent.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "resolver thought it resolved",
+            Stdout: "resolver stdout",
+            Stderr: "Transport channel closed after harmless reconnect"));
+        tp.Agent.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "resolver still thought it resolved",
+            Stdout: "resolver stdout",
+            Stderr: "Transport channel closed after harmless reconnect"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.NotEqual("transient", final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
     public async Task WorkBranchEqualsBaseBranch_FailsBeforeSandbox()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -361,6 +653,25 @@ public sealed class PipelineIntegrationTests : IDisposable
         var (_, stdout, _) = await TestSupport.RunGit(repoPath, "rev-parse", rev);
         return stdout.Trim();
     }
+
+    private static async Task RunTransientPeriodicSweepAsync(TransientRetryScheduler scheduler)
+    {
+        var method = typeof(TransientRetryScheduler).GetMethod(
+            "RunTransientPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)method.Invoke(scheduler, [CancellationToken.None])!;
+    }
+
+    private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
+    };
 
     private static WorkItem NewItem(string workBranch) => new()
     {

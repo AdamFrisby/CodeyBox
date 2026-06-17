@@ -264,6 +264,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
 
         var credentials = new SelectiveCredentialProvider(
             credentialsForGemini ? AgentKind.Gemini : null);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials, prs,
@@ -275,7 +276,9 @@ public sealed class AuditAgentResolutionTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: availability is null && inVmSmokeGate is null
                 ? null
-                : new AgentDispatchAvailability(availability, inVmSmokeGate));
+                : new AgentDispatchAvailability(availability, inVmSmokeGate),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipelineWithCapture(pipeline, store, claudeAgent, webhooks);
     }

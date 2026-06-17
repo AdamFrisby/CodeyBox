@@ -215,13 +215,19 @@ public sealed class RefactorJobTypeTests : IDisposable
             StartedAt = DateTimeOffset.UtcNow,
             PreemptCheckpoint = "checkpoint",
         };
+        var transientParked = MakeQueued(pid.Value, JobType.Refactor) with
+        {
+            State = WorkItemState.WaitingForTransientRetry,
+            FailureKind = "transient",
+            StartedAt = DateTimeOffset.UtcNow,
+        };
         var otherProject = MakeQueued("other-project", JobType.Refactor) with
         {
             State = WorkItemState.Working,
             StartedAt = DateTimeOffset.UtcNow,
         };
         var store = new StubWorkItemStore();
-        store.Items.AddRange([refactor, normal, preempted, otherProject]);
+        store.Items.AddRange([refactor, normal, preempted, transientParked, otherProject]);
 
         var counts = await ((IWorkItemStore)store).CountInFlightSplitByRefactorAsync(
             pid,

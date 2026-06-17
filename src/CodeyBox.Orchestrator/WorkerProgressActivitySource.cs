@@ -133,8 +133,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
             return false;
         }
 
-        if (!_processSamples.TryGetValue(itemId, out var previous)
-            || !string.Equals(sample.ProcessSetSignature, previous.ProcessSetSignature, StringComparison.Ordinal))
+        if (!_processSamples.TryGetValue(itemId, out var previous))
         {
             if (TryConfirmImmediateCpuProgress(itemId, sample, out var observedSample))
             {
@@ -147,13 +146,36 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
             return false;
         }
 
-        _processSamples[itemId] = sample;
+        if (!string.Equals(sample.ProcessSetSignature, previous.ProcessSetSignature, StringComparison.Ordinal))
+        {
+            // A replacement of an already-active process set is itself progress;
+            // do not require the new process to win a CPU tick inside the sample window.
+            if (previous.HasConfirmedProgress)
+            {
+                _processSamples[itemId] = sample with { HasConfirmedProgress = true };
+                reason = "process-cpu";
+                return true;
+            }
+
+            if (TryConfirmImmediateCpuProgress(itemId, sample, out var observedSample))
+            {
+                _processSamples[itemId] = observedSample;
+                reason = "process-cpu";
+                return true;
+            }
+
+            _processSamples[itemId] = observedSample;
+            return false;
+        }
+
         if (sample.CpuTicks > previous.CpuTicks)
         {
+            _processSamples[itemId] = sample with { HasConfirmedProgress = true };
             reason = "process-cpu";
             return true;
         }
 
+        _processSamples[itemId] = sample with { HasConfirmedProgress = previous.HasConfirmedProgress };
         return false;
     }
 
@@ -172,9 +194,12 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         if (!TryReadWorkItemCpuTicks(itemId, out var next))
             return false;
 
-        observedSample = next;
-        return string.Equals(next.ProcessSetSignature, baseline.ProcessSetSignature, StringComparison.Ordinal)
+        var progressed = string.Equals(next.ProcessSetSignature, baseline.ProcessSetSignature, StringComparison.Ordinal)
             && next.CpuTicks > baseline.CpuTicks;
+        observedSample = progressed
+            ? next with { HasConfirmedProgress = true }
+            : next;
+        return progressed;
     }
 
     private static bool TryReadWorkItemCpuTicks(WorkItemId itemId, out ProcessCpuSample sample)
@@ -223,7 +248,8 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         processIdentities.Sort(StringComparer.Ordinal);
         sample = new ProcessCpuSample(
             totalCpuTicks,
-            string.Join("\0", processIdentities));
+            string.Join("\0", processIdentities),
+            HasConfirmedProgress: false);
         return true;
     }
 
@@ -294,5 +320,8 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         return true;
     }
 
-    private readonly record struct ProcessCpuSample(long CpuTicks, string ProcessSetSignature);
+    private readonly record struct ProcessCpuSample(
+        long CpuTicks,
+        string ProcessSetSignature,
+        bool HasConfirmedProgress);
 }

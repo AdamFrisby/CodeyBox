@@ -19,6 +19,7 @@ public static class WorkItemInFlight
         WorkItemState.NeedsOperatorInput,
         WorkItemState.WaitingForQuotaReset,
         WorkItemState.WaitingForAgentResume,
+        WorkItemState.WaitingForTransientRetry,
         WorkItemState.AbandonedAfterRecoveryAttempts,
     ];
 

@@ -1,4 +1,14 @@
+using System.Text;
+using CodeyBox.Api;
 using CodeyBox.Core;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
@@ -10,6 +20,7 @@ namespace CodeyBox.Tests;
 /// every class member on a task no agent can complete; the inverse would
 /// silently fail items that a fallback could have rescued.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AgentFailureClassifierTests
 {
     [Theory]
@@ -74,9 +85,31 @@ public sealed class AgentFailureClassifierTests
     [InlineData("503 Service Unavailable")]
     [InlineData("socket hang up")]
     [InlineData("fetch failed")]
+    [InlineData("request timed out while reading agent stream")]
+    [InlineData("request_timeout")]
+    [InlineData("Reconnecting... attempt 4")]
+    [InlineData("Transport channel closed")]
+    [InlineData("timeout waiting for child process to exit")]
+    [InlineData("Connection timed out")]
+    [InlineData("i/o timeout")]
     public void NetworkPatterns_Classified_AsTransient(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
+    }
+
+    [Theory]
+    [InlineData("request timed out while reading agent stream")]
+    [InlineData("request_timeout")]
+    [InlineData("Reconnecting... attempt 4")]
+    [InlineData("Transport channel closed")]
+    [InlineData("timeout waiting for child process to exit")]
+    [InlineData("Connection timed out")]
+    [InlineData("i/o timeout")]
+    public void NetworkPatterns_InStdout_Classified_AsTransient(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
@@ -182,6 +215,195 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(5, (int)AgentFailureKind.Infrastructure);
     }
 
+    [Theory]
+    [InlineData("""{"type":"turn.failed","error":"request\u0020timed\u0020out while reading stream"}""")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"request\u005ftimeout"}}""")]
+    [InlineData("""{"type":"turn.failed","result":{"error":{"message":"Transport\u0020channel\u0020closed"}}}""")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"stream timeout after 60s"}}""")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"provider timeout while waiting"}}""")]
+    public void TurnFailed_WithStructuredTransientMessage_Classified_AsTransient(string payload)
+    {
+        Assert.DoesNotContain("request timed out", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("request_timeout", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Transport channel closed", payload, StringComparison.OrdinalIgnoreCase);
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Fact]
+    public void SummaryTurnFailed_WithStructuredTransientMessage_Classified_AsTransient()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: null,
+            summary: """{"type":"turn.failed","error":{"message":"provider timeout while waiting"}}""");
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("""{"type":"turn.failed","error":{"message":"timeout"}}""")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"Timeout"}}""")]
+    public void TurnFailed_WithExactStructuredTimeout_Classified_AsTransient(string payload)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Fact]
+    public void TurnFailed_WithExactStructuredTimeout_AfterLongStream_Classified_AsTransient()
+    {
+        var stream = new StringBuilder();
+        for (var i = 0; i < 250; i++)
+        {
+            stream.AppendLine("""{"type":"turn.update","event":"delta"}""");
+        }
+        stream.AppendLine("""{"type":"turn.failed","error":{"message":"timeout"}}""");
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: stream.ToString());
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Fact]
+    public void TurnFailed_WithStructuredBuildTimeout_NotClassified_AsTransient()
+    {
+        var payload = """{"type":"turn.failed","error":{"message":"build timeout after 10 minutes"}}""";
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
+
+        Assert.Equal(AgentFailureKind.Normal, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("timeout")]
+    [InlineData("Timeout")]
+    [InlineData("build timeout after 10 minutes")]
+    public void BareTimeout_NotClassified_AsTransient(string snippet)
+    {
+        var stderr = AgentFailureClassifier.Classify(stderr: snippet);
+        var stdout = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+
+        Assert.Equal(AgentFailureKind.Normal, stderr.Kind);
+        Assert.Equal(AgentFailureKind.Normal, stdout.Kind);
+    }
+
+    [Fact]
+    public void SummaryOnlyTransientNetworkPattern_RemainsUnknown()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: null,
+            summary: "agent stream failed: request timed out while waiting for provider");
+
+        Assert.Equal(AgentFailureKind.Unknown, c.Kind);
+    }
+
+    [Fact]
+    public void AdditionalTransientNetworkPatterns_AreOperatorTunable()
+    {
+        try
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(["vendor transport marker"]);
+
+            var c = AgentFailureClassifier.Classify(stderr: "fatal: vendor transport marker");
+            var builtIn = AgentFailureClassifier.Classify(stderr: "fatal: ECONNRESET while streaming");
+
+            Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+            Assert.Equal(AgentFailureKind.TransientNetwork, builtIn.Kind);
+        }
+        finally
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+        }
+    }
+
+    [Fact]
+    public void AdditionalTransientNetworkPatterns_IgnoreWhitespaceEntries()
+    {
+        try
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(["", " ", "\t"]);
+
+            var c = AgentFailureClassifier.Classify(stderr: "compile error: missing semicolon");
+
+            Assert.Equal(AgentFailureKind.Normal, c.Kind);
+        }
+        finally
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+        }
+    }
+
+    [Fact]
+    public void ProgramWiresTransientNetworkFailurePatternsFromConfigAndReload()
+    {
+        var root = Directory.CreateTempSubdirectory("codeybox-transient-patterns-").FullName;
+        var source = new ReloadableMemorySource
+        {
+            Data = BuildProgramConfig(root, "operator initial transport marker"),
+        };
+
+        try
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+            using var factory = new TransientPatternWiringFactory(source);
+            var monitor = factory.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+
+            Assert.Contains(
+                "operator initial transport marker",
+                monitor.CurrentValue.TransientNetworkFailurePatterns);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator initial transport marker").Kind);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: ECONNRESET while streaming").Kind);
+            Assert.Equal(
+                AgentFailureKind.Normal,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
+
+            source.TriggerReload(BuildProgramConfig(root, "operator reloaded transport marker"));
+            Assert.Contains(
+                "operator reloaded transport marker",
+                monitor.CurrentValue.TransientNetworkFailurePatterns);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: Transport channel closed").Kind);
+            Assert.Equal(
+                AgentFailureKind.Normal,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator initial transport marker").Kind);
+
+            var rejected = BuildProgramConfig(root, "operator rejected transport marker");
+            rejected["CodeyBox:StateDatabasePath"] = Path.Combine(root, "different-state.db");
+            var reloadException = Record.Exception(() => source.TriggerReload(rejected));
+            var currentValueException = Record.Exception(() => _ = monitor.CurrentValue);
+
+            Assert.True(
+                reloadException is not null || currentValueException is not null,
+                "invalid reload should be rejected by options validation");
+            Assert.Contains(
+                "operator reloaded transport marker",
+                monitor.CurrentValue.TransientNetworkFailurePatterns);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
+            Assert.Equal(
+                AgentFailureKind.Normal,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator rejected transport marker").Kind);
+        }
+        finally
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     [Fact]
     public void Quota_BeatsNetwork_WhenBothPatternsPresent()
     {
@@ -275,5 +497,72 @@ public sealed class AgentFailureClassifierTests
             Action<string>? stdoutChunkCallback = null,
             bool captureStructuredStream = false)
             => throw new NotSupportedException("test fixture only");
+    }
+
+    private static Dictionary<string, string?> BuildProgramConfig(string root, string pattern) => new()
+    {
+        ["CodeyBox:DangerouslyDisableAuth"] = "true",
+        ["CodeyBox:StateDatabasePath"] = Path.Combine(root, "state.db"),
+        ["CodeyBox:GitRootDirectory"] = Path.Combine(root, "git"),
+        ["CodeyBox:AuditLog:Path"] = Path.Combine(root, "logs", "api-.json"),
+        ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(root, "logs", "audit-.json"),
+        ["CodeyBox:AgentStreams:Path"] = Path.Combine(root, "agent-streams"),
+        ["CodeyBox:TransientNetworkFailurePatterns:0"] = pattern,
+    };
+
+    private sealed class TransientPatternWiringFactory : WebApplicationFactory<Program>
+    {
+        private readonly ReloadableMemorySource _source;
+
+        public TransientPatternWiringFactory(ReloadableMemorySource source) => _source = source;
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                cfg.Add(_source);
+            });
+            builder.ConfigureTestServices(services => services.RemoveAll<IHostedService>());
+        }
+    }
+
+    private sealed class ReloadableMemorySource : IConfigurationSource
+    {
+        public Dictionary<string, string?> Data { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+        public ReloadableMemoryProvider? Provider { get; private set; }
+
+        public IConfigurationProvider Build(IConfigurationBuilder builder)
+        {
+            Provider = new ReloadableMemoryProvider(this);
+            return Provider;
+        }
+
+        public void TriggerReload(Dictionary<string, string?> next)
+        {
+            Data = new Dictionary<string, string?>(next, StringComparer.OrdinalIgnoreCase);
+            Provider!.ReloadFromSource();
+        }
+    }
+
+    private sealed class ReloadableMemoryProvider : ConfigurationProvider
+    {
+        private readonly ReloadableMemorySource _source;
+
+        public ReloadableMemoryProvider(ReloadableMemorySource source)
+        {
+            _source = source;
+            ReloadFromSource();
+        }
+
+        public override void Load() { }
+
+        public void ReloadFromSource()
+        {
+            Data = new Dictionary<string, string?>(_source.Data, StringComparer.OrdinalIgnoreCase);
+            OnReload();
+        }
     }
 }

@@ -152,7 +152,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
                 AgentKind.Codex,
                 maxResumeAttempts: 2,
-                new AgentResult(false, "agent exited 1", null, "ECONNRESET")));
+                new AgentResult(false, "agent exited 1", null, "fatal resume state rejected")));
             fix.Claude.WorkPlan.Enqueue(new FileWrite("resume.txt", "recovered by fallback"));
 
             using var metrics = new MetricCapture("codeybox.agent.fallbacks");
@@ -202,6 +202,32 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             Log.CloseAndFlush();
             Log.Logger = previousLogger;
         }
+    }
+
+    [Fact]
+    public async Task Codex_ExhaustsSessionResumeWithTransientLastResult_ParksForTransientRetryWithoutFallback()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+            AgentKind.Codex,
+            maxResumeAttempts: 2,
+            new AgentResult(false, "agent exited 1", null, "ECONNRESET")));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("should-not-run.txt", "fallback should not run"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, finalItem!.State);
+        Assert.Equal("transient", finalItem.FailureKind);
+        Assert.Contains("transient transport failure after exhausting session resume", finalItem.LastError);
+        Assert.True(fix.Codex.CallCount >= 1);
+        Assert.Equal(0, fix.Claude.CallCount);
+        Assert.Empty(await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None));
     }
 
     [Fact]
@@ -264,7 +290,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
             AgentKind.Codex,
             maxResumeAttempts: 2,
-            new AgentResult(false, "agent exited 1", null, "ECONNRESET")));
+            new AgentResult(false, "agent exited 1", null, "fatal resume state rejected")));
 
         var item = NewItem(initialAgent: AgentKind.Codex);
         await fix.Store.CreateAsync(item);
@@ -1929,6 +1955,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         // Tests assert against the inner InMemory store; an optional wrapper lets a
         // test inject store faults while still reading the rows that landed.
         IAgentInvolvementStore involvementForPipeline = wrapInvolvement?.Invoke(involvement) ?? involvement;
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -1953,7 +1980,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: inVmSmokeGate is null
                 ? null
-                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
+                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
@@ -2018,6 +2047,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             [AgentKind.Codex] = new FakeFallbackExtractor(AgentKind.Codex),
             [AgentKind.Claude] = new FakeFallbackExtractor(AgentKind.Claude),
         };
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -2034,7 +2064,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
             involvement: involvement,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
@@ -2119,6 +2151,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -2137,7 +2170,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector(), new GeminiQuotaFailureDetector() }),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new ThreeMemberFixture(
             pipeline,

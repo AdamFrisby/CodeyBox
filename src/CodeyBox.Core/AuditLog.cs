@@ -1120,6 +1120,22 @@ public static class AuditLog
                 id.ToString(), source, outcome, state, reason ?? "");
 
     /// <summary>
+    /// Emitted by the retry scheduler for every transient-network item it
+    /// evaluates, including no-op outcomes.
+    /// </summary>
+    public static void TransientRetryAttempted(
+        WorkItemId id,
+        string source,
+        string outcome,
+        string state,
+        string? reason = null) =>
+        Audit("transient_retry_attempted")
+            .ForContext("Reason", reason ?? "")
+            .Information(
+                "Transient retry attempted for work item {WorkItemId}: source={Source} outcome={Outcome} state={State} reason={Reason}",
+                id.ToString(), source, outcome, state, reason ?? "");
+
+    /// <summary>
     /// Emitted when all class members fail the MinModelScore floor check. Records
     /// the rejected members and their below-floor reasons so the audit log captures
     /// the failure detail even though no member was chosen.

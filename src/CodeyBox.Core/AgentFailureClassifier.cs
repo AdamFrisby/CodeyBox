@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -19,6 +21,21 @@ public static class AgentFailureClassifier
 {
     public const string HardQuotaReason = "hard quota pattern matched";
     public const string SoftRateLimitReason = "soft rate-limit pattern matched";
+
+    private const int MaxStructuredOutputLineChars = 64 * 1024;
+
+    private static readonly IReadOnlyList<string> StructuredTurnFailedTimeoutPatterns = new[]
+    {
+        "stream timeout",
+        "provider timeout",
+        "request timeout",
+        "request timed out",
+        "connection timeout",
+        "connection timed out",
+        "network timeout",
+        "transport timeout",
+        "i/o timeout",
+    };
 
     /// <summary>
     /// Quota / capacity exhaustion shapes where an immediate same-agent resume
@@ -88,7 +105,7 @@ public static class AgentFailureClassifier
     /// Substrings that signal a transient connectivity failure where a retry
     /// (against the same agent or another) may succeed without operator action.
     /// </summary>
-    public static readonly IReadOnlyList<string> TransientNetworkPatterns = new[]
+    public static readonly IReadOnlyList<string> DefaultTransientNetworkPatterns = new[]
     {
         "ECONNRESET",
         "ETIMEDOUT",
@@ -110,7 +127,47 @@ public static class AgentFailureClassifier
         "Network request failed",
         "Client network socket disconnected",
         "read ECONNRESET",
+        // Conservative transport-timeout shapes. Do not add bare "timeout";
+        // build/test/phase timeouts are real failures, not retryable transport blips.
+        "request timed out",
+        "request_timeout",
+        "Reconnecting...",
+        "Transport channel closed",
+        "timeout waiting for child process to exit",
+        "Connection timed out",
+        "i/o timeout",
     };
+
+    private static string[] _transientNetworkPatterns = DefaultTransientNetworkPatterns.ToArray();
+
+    /// <summary>
+    /// Active transient-network substring list. Defaults plus any operator
+    /// additions supplied via <see cref="SetAdditionalTransientNetworkPatterns"/>.
+    /// </summary>
+    public static IReadOnlyList<string> TransientNetworkPatterns =>
+        System.Threading.Volatile.Read(ref _transientNetworkPatterns);
+
+    /// <summary>
+    /// Appends operator-configured transient network patterns to the built-in
+    /// defaults. Empty entries are ignored; matching stays case-insensitive.
+    /// </summary>
+    public static void SetAdditionalTransientNetworkPatterns(IEnumerable<string>? additionalPatterns)
+    {
+        var merged = new List<string>(DefaultTransientNetworkPatterns);
+        if (additionalPatterns is not null)
+        {
+            foreach (var pattern in additionalPatterns)
+            {
+                if (string.IsNullOrWhiteSpace(pattern))
+                    continue;
+                if (merged.Any(existing => string.Equals(existing, pattern.Trim(), StringComparison.OrdinalIgnoreCase)))
+                    continue;
+                merged.Add(pattern.Trim());
+            }
+        }
+
+        System.Threading.Volatile.Write(ref _transientNetworkPatterns, merged.ToArray());
+    }
 
     /// <summary>
     /// Substrings that only become an infrastructure failure when paired with
@@ -174,8 +231,7 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent binary was not found in the sandbox");
         }
 
-        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
-            return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
+        var noCapturedOutput = string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout);
 
         if (ContainsAny(stderr, HardQuotaPatterns) || ContainsAny(stdout, HardQuotaPatterns))
             return new AgentFailureClassification(
@@ -192,8 +248,19 @@ public static class AgentFailureClassifier
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
-        if (ContainsAny(stderr, TransientNetworkPatterns) || ContainsAny(stdout, TransientNetworkPatterns))
+        // The transient list is intentionally conservative; apply it to the
+        // captured CLI streams so stdout-only transport diagnostics still park
+        // for durable retry. Summary text remains limited to structured
+        // turn.failed metadata to avoid classifying synthesized explanations.
+        if (ContainsAny(stderr, TransientNetworkPatterns)
+            || ContainsAny(stdout, TransientNetworkPatterns)
+            || ContainsTurnFailedTransientNetwork(stderr)
+            || ContainsTurnFailedTransientNetwork(stdout)
+            || ContainsTurnFailedTransientNetwork(summary))
             return new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "network pattern matched");
+
+        if (noCapturedOutput)
+            return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
         return new AgentFailureClassification(AgentFailureKind.Normal);
     }
@@ -249,5 +316,87 @@ public static class AgentFailureClassifier
                 return true;
         }
         return false;
+    }
+
+    private static bool ContainsTurnFailedTransientNetwork(string? output)
+    {
+        if (string.IsNullOrWhiteSpace(output))
+            return false;
+
+        using var reader = new StringReader(output);
+        string? rawLine;
+        while ((rawLine = reader.ReadLine()) is not null)
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0
+                || line.Length > MaxStructuredOutputLineChars
+                || line[0] != '{'
+                || !line.Contains("turn.failed", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("type", out var type)
+                    || type.ValueKind != JsonValueKind.String
+                    || !string.Equals(type.GetString(), "turn.failed", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var message = ExtractTurnFailedMessage(root);
+                if (IsTurnFailedTransientNetworkMessage(message))
+                    return true;
+            }
+            catch (JsonException)
+            {
+                // Non-JSON lines are covered by the substring matcher above.
+            }
+        }
+
+        return false;
+    }
+
+    private static string? ExtractTurnFailedMessage(JsonElement root)
+    {
+        if (root.TryGetProperty("error", out var error))
+        {
+            if (error.ValueKind == JsonValueKind.String)
+                return error.GetString();
+            if (error.ValueKind == JsonValueKind.Object
+                && error.TryGetProperty("message", out var message)
+                && message.ValueKind == JsonValueKind.String)
+            {
+                return message.GetString();
+            }
+        }
+
+        if (root.TryGetProperty("result", out var result)
+            && result.ValueKind == JsonValueKind.Object
+            && result.TryGetProperty("error", out var resultError)
+            && resultError.ValueKind == JsonValueKind.Object
+            && resultError.TryGetProperty("message", out var resultMessage)
+            && resultMessage.ValueKind == JsonValueKind.String)
+        {
+            return resultMessage.GetString();
+        }
+
+        return null;
+    }
+
+    private static bool IsTurnFailedTransientNetworkMessage(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        // A structured turn.failed "timeout" is provider transport metadata.
+        // Keep bare timeout out of the general substring list so build/test
+        // timeouts in ordinary logs remain non-retryable.
+        if (string.Equals(message.Trim(), "timeout", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return ContainsAny(message, TransientNetworkPatterns)
+            || ContainsAny(message, StructuredTurnFailedTimeoutPatterns);
     }
 }

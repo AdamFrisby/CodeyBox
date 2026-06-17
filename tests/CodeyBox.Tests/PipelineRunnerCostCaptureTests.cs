@@ -975,6 +975,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var upstreamFactory = new TestUpstreamFactory();
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null;
         if (registerExtractor)
@@ -995,7 +997,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, upstreamFactory, composer,
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             timingStore: null,
@@ -1004,7 +1006,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             costCalculator: calculator,
             usageStore: usageStore,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            checkCompletionRunner: checkCompletionRunner);
+            checkCompletionRunner: checkCompletionRunner,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

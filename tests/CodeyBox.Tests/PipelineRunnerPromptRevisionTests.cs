@@ -427,13 +427,16 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
         });
 
         var composer = new CodeyBox.Projects.ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

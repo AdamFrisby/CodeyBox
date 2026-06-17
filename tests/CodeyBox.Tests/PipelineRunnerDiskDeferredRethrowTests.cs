@@ -138,6 +138,8 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
             DefaultAgent = AgentKind.Claude,
             Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
         });
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             sandboxes,
             gitHost,
@@ -148,10 +150,12 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = new WorkItem
         {

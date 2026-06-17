@@ -309,6 +309,42 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_FailureClassificationResult_PreservesEarlierTransientCandidate()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 2, MaxAttemptsPerAgent = 1 }));
+
+        var first = new FakeAgentResolverRunner(_ =>
+            new AgentResult(false, "agent transport failed", null, "Transport channel closed"))
+        { Kind = new AgentKind("codex") };
+        var second = new FakeAgentResolverRunner(_ =>
+            new AgentResult(false, "agent exited 2", null, "ordinary resolver failure"))
+        { Kind = new AgentKind("claude") };
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [
+                new AgenticConflictResolverCandidate(first, Credential: null),
+                new AgenticConflictResolverCandidate(second, Credential: null),
+            ],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Same(first, result.FailureRunner);
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        Assert.Equal("agent transport failed", classificationResult.Summary);
+
+        var classification = ((IAgentRunner)first).ClassifyFailure(classificationResult);
+        Assert.Equal(AgentFailureKind.TransientNetwork, classification.Kind);
+    }
+
+    [Fact]
     public async Task ResolveAsync_FailureClassificationResult_RunnerThrows_AssignsMetadata()
     {
         var sandbox = new ConflictSandbox();
@@ -342,6 +378,84 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_FailureClassificationResult_SessionResumeExhausted_PreservesLastResult()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var lastResult = new AgentResult(
+            false,
+            "agent exited 1",
+            "resume stdout",
+            "Transport channel closed");
+        var runner = new FakeAgentResolverRunner(_ =>
+            throw new AgentSessionResumeExhaustedException(
+                new AgentKind("resumable-agent"),
+                maxResumeAttempts: 2,
+                lastResult))
+        { Kind = new AgentKind("resumable-agent") };
+        var cred = new AgentCredential(new AgentKind("resumable-agent"), new Dictionary<string, string>(), new Dictionary<string, string>());
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, cred)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Same(runner, result.FailureRunner);
+        Assert.Same(cred, result.FailureCredential);
+        Assert.Same(lastResult, result.FailureClassificationResult);
+        Assert.Equal("resume stdout", result.Stdout);
+        Assert.Equal("Transport channel closed", result.Stderr);
+        Assert.Contains("session resume exhausted", result.Summary);
+
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        var classification = ((IAgentRunner)runner).ClassifyFailure(classificationResult);
+        Assert.Equal(AgentFailureKind.TransientNetwork, classification.Kind);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_SessionResumeExhausted_RedactsStderrFromSummary()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var lastResult = new AgentResult(
+            false,
+            "agent exited 1",
+            "resume stdout",
+            "Transport channel closed after sk-ant-api03-AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT-0123456");
+        var runner = new FakeAgentResolverRunner(_ =>
+            throw new AgentSessionResumeExhaustedException(
+                new AgentKind("resumable-agent"),
+                maxResumeAttempts: 2,
+                lastResult))
+        { Kind = new AgentKind("resumable-agent") };
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("Transport channel closed", result.Summary);
+        Assert.Contains("***", result.Summary);
+        Assert.DoesNotContain("sk-ant-api03", result.Summary);
+    }
+
+    [Fact]
     public async Task ResolveAsync_FailureClassificationResult_VerificationFails_AssignsMetadata()
     {
         var sandbox = new ConflictSandbox();
@@ -354,7 +468,11 @@ public sealed class AgenticConflictResolverTests
         {
             // Agent claims success, but leaves conflict markers in the file so verification fails.
             sb.GitAdd("src/a.txt");
-            return new AgentResult(true, "agent thought it resolved", "stdout text", "stderr text");
+            return new AgentResult(
+                true,
+                "agent thought it resolved",
+                "stdout text",
+                "Transport channel closed after a harmless reconnect");
         })
         { Kind = new AgentKind("lying-agent") };
         var cred = new AgentCredential(new AgentKind("lying-agent"), new Dictionary<string, string>(), new Dictionary<string, string>());
@@ -373,8 +491,13 @@ public sealed class AgenticConflictResolverTests
         var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
         Assert.False(classificationResult.Success);
         Assert.Contains("conflict markers remain", classificationResult.Summary);
-        Assert.Equal("stdout text", classificationResult.Stdout);
-        Assert.Equal("stderr text", classificationResult.Stderr);
+        Assert.Null(classificationResult.Stdout);
+        Assert.Null(classificationResult.Stderr);
+        Assert.Equal("stdout text", result.Stdout);
+        Assert.Equal("Transport channel closed after a harmless reconnect", result.Stderr);
+
+        var classification = ((IAgentRunner)runner).ClassifyFailure(classificationResult);
+        Assert.NotEqual(AgentFailureKind.TransientNetwork, classification.Kind);
     }
 
     [Fact]

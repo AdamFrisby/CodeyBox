@@ -1420,21 +1420,27 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             DefaultAgent = AgentKind.Claude,
             Audit = new ProjectAudit(),
         };
+        var store = new SqliteWorkItemStore(stateDb);
+        var webhooks = new NullWebhookDispatcher();
+        var projects = new InMemoryProjectRepository(project);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         return new PipelineRunner(
             sandboxProvider,
             gitHost,
             new AgentRegistry([new ScriptedAgent([])]),
             new StaticCredentialProvider(),
             new InMemoryPullRequestService(),
-            new InMemoryProjectRepository(project),
+            projects,
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            new SqliteWorkItemStore(stateDb),
-            new NullWebhookDispatcher(),
+            store,
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
             pipelineTuning: pipelineTuning,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
     }
 
     /// <summary>

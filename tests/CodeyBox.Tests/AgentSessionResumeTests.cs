@@ -344,7 +344,7 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_PlainStdoutRun_DoesNotUseModelControlledSessionIdForResume()
+    public async Task ClaudeRunner_PlainStdoutRun_DoesNotUseModelControlledSessionIdOrLegacyRetry()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
@@ -357,15 +357,11 @@ public sealed class AgentSessionResumeTests : IDisposable
         var result = await new ClaudeAgentRunner().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: false);
 
-        Assert.True(result.Success);
-        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
         Assert.DoesNotContain("--output-format", sandbox.ClaudeInvocations[0]);
         Assert.DoesNotContain("stream-json", sandbox.ClaudeInvocations[0]);
         Assert.DoesNotContain("--verbose", sandbox.ClaudeInvocations[0]);
-        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[1]);
-        Assert.DoesNotContain("--output-format", sandbox.ClaudeInvocations[1]);
-        Assert.DoesNotContain("stream-json", sandbox.ClaudeInvocations[1]);
-        Assert.DoesNotContain("--verbose", sandbox.ClaudeInvocations[1]);
     }
 
     [Fact]
@@ -709,12 +705,11 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_MaxResumeZero_FallsBackToLegacyRetryOnly()
+    public async Task ClaudeRunner_MaxResumeZero_DoesNotFallbackToLegacyTransientRetry()
     {
         SessionResumeOptions.SetMaxResumeAttempts(0);
-        // AgentSuspendResilience.MaxRetries is left at its default of 1; the
-        // ECONNRESET shape below classifies as TransientNetwork and triggers
-        // exactly one legacy retry, which is the behaviour this test pins.
+        // Classified transient-network failures are now owned by the durable
+        // work-item scheduler, not an immediate same-process retry.
 
         var sandbox = new ResumeRecordingSandbox(call => call == 1
             ? new SandboxExecResult(1, """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
@@ -724,12 +719,9 @@ public sealed class AgentSessionResumeTests : IDisposable
         var result = await new ClaudeAgentRunner().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
-        Assert.True(result.Success);
-        // No --resume because the resume budget is 0; the legacy
-        // suspend-resilience path takes over on the transient-network shape.
-        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
         Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
-        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[1]);
     }
 
     [Fact]
@@ -790,10 +782,11 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task NonResumableRunner_KeepsLegacyRetryBehaviour()
+    public async Task NonResumableRunner_DoesNotUseLegacyTransientRetry()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
-        // Legacy MaxRetries left at its default of 1.
+        // Classified transient-network failures are returned to the orchestrator
+        // for durable backoff+jitter retry.
 
         var sandbox = new ResumeRecordingSandbox(call => call == 1
             ? new SandboxExecResult(1,
@@ -802,15 +795,14 @@ public sealed class AgentSessionResumeTests : IDisposable
             : new SandboxExecResult(0, "ok", ""));
 
         // FakeRunner does not implement ICliSessionResumableAgentRunner, so the
-        // captured session id MUST be ignored and the legacy single-shot
-        // re-invocation path takes over as before — argv unchanged on retry.
+        // captured session id MUST be ignored. The legacy in-process retry also
+        // stays off for recognised transient-network failures.
         var runner = new NonResumableTestRunner();
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
-        Assert.True(result.Success);
-        Assert.Equal(2, sandbox.AllExecs.Count);
+        Assert.False(result.Success);
+        Assert.Single(sandbox.AllExecs);
         Assert.DoesNotContain("--resume", sandbox.AllExecs[0].Argv);
-        Assert.DoesNotContain("--resume", sandbox.AllExecs[1].Argv);
     }
 
     [Fact]
@@ -976,11 +968,8 @@ public sealed class AgentSessionResumeTests : IDisposable
 
     /// <summary>
     /// CLI-base subclass that does NOT opt into session resume — used to prove
-    /// the legacy retry path is preserved for runners whose CLI has no
-    /// <c>--resume</c> mode. Reuses an AgentKind that the legacy
-    /// <see cref="AgentSuspendResilience"/> already opted into so the
-    /// transient-network retry path engages and we can observe argv stability
-    /// across attempts.
+    /// recognised transient-network failures return to the orchestrator instead
+    /// of taking an immediate same-process retry.
     /// </summary>
     private sealed class NonResumableTestRunner : CliAgentRunnerBase
     {

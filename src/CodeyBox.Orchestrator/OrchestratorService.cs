@@ -1498,6 +1498,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal long? DeferredGenerationForTest(WorkItemId id) =>
         _deferredItems.TryGetValue(id, out var lease) ? lease.Generation : null;
     internal bool IsActiveForTest(WorkItemId id) => _activeItems.ContainsKey(id);
+    internal Func<WorkItemId, TimeSpan, CancellationToken, Task>? DeferredRequeueDelayForTest { get; set; }
     internal void SetLastSpawnAtForTest(DateTimeOffset at)
     {
         lock (_spawnTimeLock) { _lastSpawnAtTicks = at.Ticks; }
@@ -1745,11 +1746,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
 
-        // WaitingForQuotaReset is owned by QuotaRetryScheduler; the periodic
-        // sweep re-enqueues when any member becomes available. Treat it as a
-        // resting point on startup so a routine restart doesn't burn a recovery
-        // credit or jump the queue.
-        if (item.State is WorkItemState.WaitingForQuotaReset or WorkItemState.WaitingForAgentResume)
+        // Scheduler/operator parked states are resting points on startup:
+        // a routine restart must not burn a recovery credit or jump the queue.
+        // Parked items are resumed by their scheduler or operator path; running
+        // them here would repeat the condition that parked them.
+        if (item.State is WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForAgentResume
+            or WorkItemState.WaitingForTransientRetry)
             return null;
 
         WorkItemState? targetState = WorkItemRecoveryPolicy.MapToRecoveryState(item.State);
@@ -1813,20 +1816,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return;
         }
 
-        // Items parked waiting for quota to reset must not be processed.
-        // The quota retry scheduler will re-enqueue when any class member becomes
-        // available again; running here would just repeat the exhaustion that
-        // got us into this state.
-        if (item.State is WorkItemState.WaitingForQuotaReset)
+        if (item.State is WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForAgentResume
+            or WorkItemState.WaitingForTransientRetry)
         {
-            _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForQuotaReset", workerIndex, id);
+            _log.LogInformation("Worker {WorkerId} skipping {Id}: parked state {State}", workerIndex, id, item.State);
             ClearPreStartRefactorDrainClaim(item);
-            return;
-        }
-        if (item.State is WorkItemState.WaitingForAgentResume)
-        {
-            _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForAgentResume", workerIndex, id);
-            ClearPreStartRefactorDrainClaim(item);
+            _activeItems.TryRemove(id, out _);
             return;
         }
 
@@ -1897,7 +1893,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             item = current;
 
-            if (item.State is WorkItemState.WaitingForQuotaReset or WorkItemState.WaitingForAgentResume)
+            if (item.State is WorkItemState.WaitingForQuotaReset
+                or WorkItemState.WaitingForAgentResume
+                or WorkItemState.WaitingForTransientRetry)
             {
                 _log.LogInformation(
                     "Worker {WorkerId} skipping {Id} after active claim: parked state {State}",
@@ -2946,11 +2944,31 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 "Deferred requeue backlog is {Count} items; deferrals may be sustained across many work items",
                 count);
 
+        var delayHook = DeferredRequeueDelayForTest;
+        Task? hookedDelayTask = null;
+        if (delayHook is not null)
+        {
+            // Capture the test hook synchronously so tests observe the scheduled
+            // deferral itself, not when the background timer task gets CPU time.
+            try
+            {
+                hookedDelayTask = delayHook(id, delay, stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                hookedDelayTask = Task.FromException(ex);
+            }
+        }
+
         _ = Task.Run(async () =>
         {
             try
             {
-                await Task.Delay(delay, stoppingToken);
+                if (hookedDelayTask is null)
+                    await Task.Delay(delay, stoppingToken);
+                else
+                    await hookedDelayTask;
+
                 if (RemoveDeferredItem(id, lease))
                 {
                     _log.LogInformation("Re-enqueueing deferred work item {Id} after defer interval", id);
@@ -3050,6 +3068,7 @@ public sealed record OrchestratorOptions
     public int MaxTransientCancelRetries { get; init; } = 3;
 
     public AutoRetryOnQuotaFailureOptions AutoRetryOnQuotaFailure { get; init; } = new();
+    public AutoRetryOnTransientFailureOptions AutoRetryOnTransientFailure { get; init; } = new();
 
     /// <summary>
     /// Failure-class recovery policy: classifies every terminal failure
@@ -3092,6 +3111,25 @@ public sealed record AutoRetryOnQuotaFailureOptions
     public TimeSpan PeriodicCheckInterval { get; init; } = TimeSpan.FromMinutes(5);
     public TimeSpan ClockDriftSafetyMargin { get; init; } = TimeSpan.FromMinutes(2);
     public int MaxAutoRetriesPerWorkItem { get; init; } = 3;
+}
+
+public enum TransientRetryJitterMode
+{
+    None,
+    Full,
+    Decorrelated,
+}
+
+public sealed record AutoRetryOnTransientFailureOptions
+{
+    public bool Enabled { get; init; } = true;
+    public TimeSpan PeriodicCheckInterval { get; init; } = TimeSpan.FromMinutes(1);
+    public TimeSpan BaseDelay { get; init; } = TimeSpan.FromSeconds(30);
+    public double Multiplier { get; init; } = 2.0;
+    public TimeSpan MaxDelay { get; init; } = TimeSpan.FromMinutes(15);
+    public int MaxAutoRetriesPerWorkItem { get; init; } = 5;
+    public TimeSpan MaxElapsedTime { get; init; } = TimeSpan.FromHours(1);
+    public TransientRetryJitterMode JitterMode { get; init; } = TransientRetryJitterMode.Full;
 }
 
 /// <summary>Snapshot of worker pool state for the /workers/status endpoint.</summary>

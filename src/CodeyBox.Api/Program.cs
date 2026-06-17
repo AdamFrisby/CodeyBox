@@ -274,11 +274,13 @@ builder.Services.AddSingleton(sp =>
     var config = sp.GetRequiredService<IConfiguration>();
     var snapshot = config.GetSection("CodeyBox").Get<CodeyBoxOptions>() ?? new CodeyBoxOptions();
     AgentClassesOverrideResolver.ApplyTo(snapshot, config);
+    AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(snapshot.TransientNetworkFailurePatterns);
     return new CodeyBoxOptionsStartupSnapshot(snapshot);
 });
 builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
     sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
-        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
+        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value,
+        opts => AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns)));
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new ImmutableCodeyBoxOptionsValidator(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
@@ -2247,6 +2249,16 @@ builder.Services.AddSingleton<ICheckAndActCompletionRunner>(sp =>
         sp.GetRequiredService<CheckAndActCompletionOptions>(),
         sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>()));
 
+builder.Services.AddSingleton<WorkItemTerminalTransition>(sp => new WorkItemTerminalTransition(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<ILogger<WorkItemTerminalTransition>>()));
+builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
+    sp.GetRequiredService<WorkItemTerminalTransition>());
+builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
+    sp.GetRequiredService<WorkItemTerminalTransition>());
+
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -2273,7 +2285,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IStdoutBroadcaster>(),
     sp.GetService<IAgentStreamStore>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRetryScheduler>(),
+    sp.GetRequiredService<IWorkItemAutoRetryScheduler>(),
     sp.GetService<AgentClassRouter>(),
     sp.GetService<IAgentFallbackHistoryStore>(),
     sp.GetRequiredService<IQuotaFailureClassifier>(),
@@ -2313,7 +2325,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sessionHandleSnapshot: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>() is { } worker
         ? worker.SnapshotPersistedHandle
         : null,
-    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>()));
+    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>(),
+    terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>(),
+    terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2337,9 +2351,41 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.MaxAutoRetriesPerWorkItem);
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
+builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    sp.GetRequiredService<OrchestratorOptions>(),
+    sp.GetRequiredService<ILogger<TransientRetryScheduler>>(),
+    sp.GetRequiredService<IWorkItemTerminalTransition>(),
+    projects: sp.GetRequiredService<IProjectRepository>(),
+    queueController: sp.GetRequiredService<IQueueController>(),
+    webhooks: sp.GetRequiredService<IWebhookDispatcher>(),
+    timeProvider: sp.GetService<TimeProvider>(),
+    transientRetryOptionsAccessor: () =>
+    {
+        var current = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRetryOnTransientFailure;
+        return OrchestratorOptionsFactory.BuildTransientRetryOptions(
+            current.Enabled,
+            current.PeriodicCheckInterval,
+            current.BaseDelay,
+            current.Multiplier,
+            current.MaxDelay,
+            current.MaxAutoRetriesPerWorkItem,
+            current.MaxElapsedTime,
+            current.JitterMode);
+    }));
 builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<IQuotaFailureAutoRetryScheduler>(sp =>
+    sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<ITransientFailureAutoRetryScheduler>(sp =>
+    sp.GetRequiredService<TransientRetryScheduler>());
+builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
+    new WorkItemAutoRetryScheduler(
+        sp.GetRequiredService<IQuotaFailureAutoRetryScheduler>(),
+        sp.GetRequiredService<ITransientFailureAutoRetryScheduler>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<WorkItemRetrier>(),
@@ -2384,6 +2430,15 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
         startupLog) with
     {
+        AutoRetryOnTransientFailure = OrchestratorOptionsFactory.BuildTransientRetryOptions(
+            cbOpts.AutoRetryOnTransientFailure.Enabled,
+            cbOpts.AutoRetryOnTransientFailure.PeriodicCheckInterval,
+            cbOpts.AutoRetryOnTransientFailure.BaseDelay,
+            cbOpts.AutoRetryOnTransientFailure.Multiplier,
+            cbOpts.AutoRetryOnTransientFailure.MaxDelay,
+            cbOpts.AutoRetryOnTransientFailure.MaxAutoRetriesPerWorkItem,
+            cbOpts.AutoRetryOnTransientFailure.MaxElapsedTime,
+            cbOpts.AutoRetryOnTransientFailure.JitterMode),
         ShutdownDrainTimeout = Program.ComputeOrchestratorShutdownDrainTimeout(cbOpts.Shutdown.GraceSeconds),
         TerminalFailureRecovery = OrchestratorOptionsFactory.BuildTerminalFailureRecoveryOptions(
             cbOpts.TerminalFailureRecovery.Enabled,
@@ -3616,6 +3671,16 @@ namespace CodeyBox.Api
         /// <summary>Automatic retry for quota-failed items.</summary>
         public AutoRetryOnQuotaFailureConfig AutoRetryOnQuotaFailure { get; set; } = new();
 
+        /// <summary>Automatic retry for transient transport/network failed items.</summary>
+        public AutoRetryOnTransientFailureConfig AutoRetryOnTransientFailure { get; set; } = new();
+
+        /// <summary>
+        /// Operator-extensible transient transport/network stderr/stdout
+        /// patterns appended to <see cref="AgentFailureClassifier"/>'s built-in
+        /// conservative defaults.
+        /// </summary>
+        public List<string> TransientNetworkFailurePatterns { get; set; } = [];
+
         /// <summary>
         /// Failure-class recovery policy. Classifies every terminal failure
         /// (Failed, AuditFailed, MergeConflictResolutionFailed) and routes by
@@ -3814,6 +3879,18 @@ namespace CodeyBox.Api
         public string PeriodicCheckInterval { get; set; } = "00:05:00";
         public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+    }
+
+    public sealed class AutoRetryOnTransientFailureConfig
+    {
+        public bool Enabled { get; set; } = true;
+        public string PeriodicCheckInterval { get; set; } = "00:01:00";
+        public string BaseDelay { get; set; } = "00:00:30";
+        public double Multiplier { get; set; } = 2.0;
+        public string MaxDelay { get; set; } = "00:15:00";
+        public int MaxAutoRetriesPerWorkItem { get; set; } = 5;
+        public string MaxElapsedTime { get; set; } = "01:00:00";
+        public string JitterMode { get; set; } = "Full";
     }
 
     /// <summary>

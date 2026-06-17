@@ -161,6 +161,7 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
             },
             TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -175,7 +176,9 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestFixture(pipeline, store, codex, webhooks, availability);
     }

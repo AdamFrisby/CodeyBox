@@ -38,10 +38,11 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `project.queue_paused` | Per-project queue was paused (manual or auto) |
 | `project.queue_resumed` | Per-project queue was resumed |
 | `work_item.recovered` | Dead-worker reaper recovered a work item with a state-changing crash recovery transition (see [Details](#recovered-details)) |
-| `work_item.auto_retry` | Quota auto-retry scheduler re-queued a Failed work item once its quota window reopened (see [Details](#auto_retry-details)) |
+| `work_item.auto_retry` | Auto-retry scheduler re-queued a work item after quota reset or transient retry backoff (see [Details](#auto_retry-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
 | `work_item.waiting_for_agent_resume` | Work item parked because its only eligible agent is paused |
+| `work_item.waiting_for_transient_retry` | Work item parked for durable transient transport/network retry (see [Details](#waiting_for_transient_retry-details)) |
 | `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
 | `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` (see [Details](#question_answered-details)) |
 | `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` (see [Details](#question_dismissed-details)) |
@@ -269,6 +270,29 @@ carry the affected item and its project:
 `retryFrom` identifies the phase the item should re-enter after the agent is
 resumed, such as `"work"`, `"audit"`, `"merge"`, or `"upstream"`.
 
+### `waiting_for_transient_retry` details
+
+When `event` is `work_item.waiting_for_transient_retry`, `workItem` and
+`project` carry the affected item and its project:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "phase": "work",
+    "agent": "claude",
+    "reason": "Agent claude reported transient transport failure during work",
+    "nextRetryAt": "2026-06-04T02:03:30.000+00:00",
+    "attempts": 0
+  }
+}
+```
+
+`nextRetryAt` is computed from `AutoRetryOnTransientFailure` backoff and
+jitter settings. Work-like failures leave the resume point unset internally so
+the retry path can auto-pick `audit` when the existing work branch already has
+commits ahead of base.
+
 ### `budget_deferred` details
 
 When `event` is `budget.deferred`, `workItem` and `project` carry the affected
@@ -409,9 +433,9 @@ When `event` is `work_item.auto_retry`, the `details` field is populated:
 | Field | Type | Description |
 |---|---|---|
 | `workItemId` | string | UUID of the work item that was auto-retried |
-| `reason` | string | Why the retry was scheduled. Currently always `"quota"`. |
-| `attemptNumber` | int | Which auto-retry attempt this is (1-indexed). Capped at `AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem`. |
-| `triggeredBy` | string | `"targeted"` if fired by the per-item timer at `QuotaResetAt + ClockDriftSafetyMargin`; `"periodic"` if fired by the safety-net sweep; `"rearm-overdue"` if fired immediately during startup re-arm because `nextQuotaRetryAt` was already in the past. |
+| `reason` | string | Why the retry was scheduled: `"quota"` or `"transient"`. |
+| `attemptNumber` | int | Which auto-retry attempt this is (1-indexed). Capped by the matching `AutoRetryOnQuotaFailure` or `AutoRetryOnTransientFailure` max-attempt setting. |
+| `triggeredBy` | string | `"targeted"` if fired by a per-item timer, `"periodic"` if fired by the safety-net sweep, `"rearm-overdue"` if fired immediately during startup re-arm because the persisted retry timestamp was already in the past, or `"startup"` for quota waiting rows requeued during startup. |
 
 ### `cancelled` details
 

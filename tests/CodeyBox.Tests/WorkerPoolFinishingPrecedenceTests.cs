@@ -5,6 +5,7 @@ using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
+[Collection("Background service timing")]
 public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
 {
     // Per-wait timeout for dispatch-pipeline signals. The happy path lands in
@@ -72,6 +73,39 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
 
         Assert.Equal(ready.Id, picked);
+    }
+
+    [Fact]
+    public async Task QueuedKick_WaitingForTransientRetry_DoesNotRunPipelineBeforeRetryAt()
+    {
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new FinishingPrecedencePipeline(_store);
+        var parked = Item(WorkItemState.WaitingForTransientRetry, priority: 100) with
+        {
+            FailureKind = "transient",
+            NextTransientRetryAt = DateTimeOffset.UtcNow.AddMinutes(30),
+        };
+        await _store.CreateAsync(parked);
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.EnqueueAsync(parked.Id);
+
+        var entered = await pipeline.WaitForEnteredAsync(parked.Id, TimeSpan.FromMilliseconds(500));
+        if (entered)
+            pipeline.Release(parked.Id);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.False(entered);
+        var stored = await _store.GetAsync(parked.Id);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored?.State);
+        Assert.Equal(parked.NextTransientRetryAt, stored?.NextTransientRetryAt);
     }
 
     [Theory]

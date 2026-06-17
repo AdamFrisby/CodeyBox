@@ -327,6 +327,30 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 - **Automatable**: detector phrase table, reset parsing, stream-json shapes, persistence columns, targeted timer rearm, max retry, paused queue behavior, webhook emission.
 - **Manual / spec-only**: real quota exhaustion event from a vendor CLI.
 
+### Transient transport auto-retry - Backs off and jitters retry after network/stream failures
+
+**Source**: `src/CodeyBox.Core/AgentFailureClassifier.cs`, `src/CodeyBox.Orchestrator/PipelineRunner.cs`, `src/CodeyBox.Orchestrator/TransientRetryScheduler.cs`, `src/CodeyBox.Orchestrator/WorkItemRetrier.cs`, `src/CodeyBox.Core/WorkItem.cs`
+**Related PRs**: none known
+
+#### Primary user flows
+1. Agent stderr, stdout, or stream-json reports a conservative transport shape - classifier marks the work-item failure as `transient`.
+2. Failure is persisted - `NextTransientRetryAt`, `TransientRetryAttempts`, and `TransientRetryFirstFailedAt` are stored on the failed item.
+3. Auto-retry is due - scheduler requeues through `WorkItemRetrier` with auto-pick so an existing work branch resumes at audit when possible.
+
+#### Edge cases
+- Several items fail during one provider incident - jitter spreads retry timestamps instead of retrying all at once.
+- Bare `timeout` appears in a build/test failure - classifier leaves it as normal, not transient.
+- Queue or project is paused - auto-retry skips without consuming the retry budget.
+
+#### Failure modes
+- Attempt or elapsed cap is reached - item stays `Failed` with `FailureKind="transient-exhausted"`.
+- Retry timestamp is missed during restart - startup re-arm and periodic sweep recover the due item.
+- Auth or quota failure is observed - auth remains excluded and quota stays on the quota-reset path.
+
+#### Test approach
+- **Automatable**: classifier positive/negative patterns, JSON `turn.failed` parsing, backoff schedule, jitter spread, attempt cap, elapsed cap, only-transient gate, auto-pick resume.
+- **Manual / spec-only**: provider-side incident or local egress fault with multiple parked items to inspect retry spread.
+
 ## Agent Runners And Credentials
 
 ### CLI runner base and preemption - Shared one-shot CLI execution, stream capture, and scratchpad resume
@@ -743,7 +767,7 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 
 #### Primary user flows
 1. Operator creates a work item - API validates project, title, prompt, branches, agent, timeouts, routing fields, and enqueues it.
-2. Operator lists or gets work items - DTO includes state, dependencies, replay, agent class, failure kind, quota retry, and release fields.
+2. Operator lists or gets work items - DTO includes state, dependencies, replay, agent class, failure kind, quota/transient retry, and release fields.
 3. Operator patches a queued item - title, prompt, or agent can be changed before pickup.
 4. Operator cancels or uncancels - cancellation cascades to queued dependents and uncancel resets to queued.
 

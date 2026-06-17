@@ -220,6 +220,7 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
             DefaultAgent = AgentKind.Claude,
         });
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -228,7 +229,9 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             suggestions: suggestionStore,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new SuggestionTestSetup(pipeline, store, suggestionStore, webhooks, gitRoot);
     }

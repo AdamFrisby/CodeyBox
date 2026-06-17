@@ -11,7 +11,7 @@ namespace CodeyBox.Tests;
 public sealed class AgentSuspendResilienceRetryTests
 {
     [Fact]
-    public async Task RunAsync_TransientNetworkError_RetriesOnceAndSucceeds()
+    public async Task RunAsync_TransientNetworkError_DoesNotRetryInProcess()
     {
         var calls = 0;
         var sandbox = new RetryRecordingSandbox(() =>
@@ -28,12 +28,12 @@ public sealed class AgentSuspendResilienceRetryTests
             "hi",
             credential: null);
 
-        Assert.True(result.Success);
-        Assert.Equal(2, calls);
+        Assert.False(result.Success);
+        Assert.Equal(1, calls);
     }
 
     [Fact]
-    public async Task RunAsync_TransientNetworkErrorTwice_DoesNotRetryBeyondMax()
+    public async Task RunAsync_TransientNetworkError_DoesNotUseLegacyRetryBudget()
     {
         var calls = 0;
         var sandbox = new RetryRecordingSandbox(() =>
@@ -49,7 +49,7 @@ public sealed class AgentSuspendResilienceRetryTests
             credential: null);
 
         Assert.False(result.Success);
-        Assert.Equal(2, calls);
+        Assert.Equal(1, calls);
     }
 
     [Fact]
@@ -73,16 +73,16 @@ public sealed class AgentSuspendResilienceRetryTests
     }
 
     [Theory]
-    [InlineData("claude", true)]
-    [InlineData("codex", true)]
-    [InlineData("gemini", true)]
-    [InlineData("cursor", true)]
-    [InlineData("opencode", true)]
-    [InlineData("copilot", false)]
-    public void ShouldRetry_TransientNetwork_OnlySupportedAgents(string agent, bool expected)
+    [InlineData("claude")]
+    [InlineData("codex")]
+    [InlineData("gemini")]
+    [InlineData("cursor")]
+    [InlineData("opencode")]
+    [InlineData("copilot")]
+    public void ShouldRetry_TransientNetwork_ReturnsFalse_ForAllAgents(string agent)
     {
         var classification = new AgentFailureClassification(AgentFailureKind.TransientNetwork);
-        Assert.Equal(expected, AgentSuspendResilience.ShouldRetry(new AgentKind(agent), classification, exitCode: 1));
+        Assert.False(AgentSuspendResilience.ShouldRetry(new AgentKind(agent), classification, exitCode: 1));
     }
 
     [Theory]

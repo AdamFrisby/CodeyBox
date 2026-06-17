@@ -515,21 +515,22 @@ public sealed class MultipassAdoptionTests
         // ReadLogTailAsync returns offset+empty on non-zero exit so the next
         // poll re-issues the same tail.
         var calls = new List<IReadOnlyList<string>>();
-        var ticks = 0;
+        var tailAttempts = 0;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             calls.Add(argv.ToArray());
-            // First two ticks fail; then we observe the agent's output and exit.
-            ticks++;
             if (IsTailCall(argv))
             {
-                if (ticks <= 2)
+                tailAttempts++;
+                if (tailAttempts <= 2)
                     return Task.FromResult(new ProcessRunResult(1, "", "transient failure"));
-                return Task.FromResult(new ProcessRunResult(0, "agent output\n", ""));
+                return Task.FromResult(tailAttempts == 3
+                    ? new ProcessRunResult(0, "agent output\n", "")
+                    : new ProcessRunResult(0, "", ""));
             }
             if (IsExitCall(argv))
             {
-                return ticks >= 4
+                return tailAttempts >= 3
                     ? Task.FromResult(new ProcessRunResult(0, "0\n", ""))
                     : Task.FromResult(new ProcessRunResult(1, "", ""));
             }
@@ -538,14 +539,16 @@ public sealed class MultipassAdoptionTests
 
         var provider = NewProviderWithRunner(runner);
         var emitted = new List<string>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var exit = await provider.WaitForAdoptedAgentCompletionAsync(
             "codeybox-test", ValidLogPath,
             chunk => emitted.Add(chunk),
-            deadline: TimeSpan.FromSeconds(10),
-            ct: CancellationToken.None);
+            deadline: null,
+            ct: cts.Token);
 
         Assert.Equal(0, exit);
         Assert.Contains("agent output\n", emitted);
+        AssertTailOffsets(runner, 1, 1, 1, 14);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

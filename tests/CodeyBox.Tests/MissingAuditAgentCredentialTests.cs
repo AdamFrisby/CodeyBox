@@ -234,6 +234,7 @@ public sealed class MissingAuditAgentCredentialTests : IDisposable
         var composer = new ProjectAuditorComposer(presetCatalog);
         var credentials = new SelectiveCredentialProvider(
             credentialsForGemini ? AgentKind.Gemini : null);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials, prs,
@@ -241,7 +242,9 @@ public sealed class MissingAuditAgentCredentialTests : IDisposable
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new CredTestPipeline(pipeline, store, claudeAgent, webhooks);
     }

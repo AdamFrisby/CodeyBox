@@ -15,12 +15,13 @@ keep work-phase LLM calls dependable without operator intervention.
 | Layer | Mechanism |
 |-------|-----------|
 | R8-core | `CODEYBOX_AGENT_LOG_FILE` + `.exit` sidecar so `SandboxResumeOnStartupService` can re-tail and adopt the in-VM agent after `multipass start`. |
-| R8-resilience (shim) | `CliAgentRunnerBase` re-invokes the agent **once** when stderr matches `AgentFailureClassifier.TransientNetworkPatterns` (or a small set of generic exit codes). See `AgentSuspendResilience` in `CodeyBox.Agents`. |
-| Orchestrator | Stranded-item recovery + transient-cancellation auto-retry when adoption times out or the agent exits with a recoverable classification. |
+| R8-resilience (shim) | `CliAgentRunnerBase` re-invokes the agent **once** only for unknown failures with a small suspend-related exit-code allowlist. See `AgentSuspendResilience` in `CodeyBox.Agents`. |
+| Orchestrator | Stranded-item recovery, transient-cancellation auto-retry, and durable transient-network auto-retry when adoption times out or the agent exits with a recoverable classification such as `AgentFailureClassifier.TransientNetworkPatterns`. |
 
-The shim retry is the preferred single point of intervention: it covers all
-five built-in CLIs (`claude`, `codex`, `gemini`, `cursor`, `opencode`) without
-per-binary wrapper scripts.
+The durable orchestrator retry is the preferred path for recognised transport
+failures because it persists state and applies backoff+jitter across common
+provider or network incidents. The shim stays narrow so it does not create a
+synchronised second request herd before durable scheduling takes over.
 
 ## Behaviour matrix
 
@@ -47,7 +48,7 @@ matrix** below). Until then, treat the table as a template — not evidence of
 | Outcome | Meaning |
 |---------|---------|
 | **Completed** | CLI exited 0; response finished (possibly after internal CLI retry). |
-| **Recoverable** | Non-zero exit but `AgentFailureClassifier` → `TransientNetwork`; shim retry or orchestrator recovery handles it. |
+| **Recoverable** | Non-zero exit but `AgentFailureClassifier` → `TransientNetwork` or an unknown suspend exit-code shape; orchestrator recovery or the narrow shim handles it. |
 | **Failed** | Non-recoverable exit or harness timeout — needs investigation or a stronger wrapper. |
 
 Update the table after a CI or local matrix run. The workflow uploads
@@ -55,10 +56,11 @@ per-scenario log snippets under the job artifacts directory on the runner.
 
 ### Expected behaviour (design target)
 
-With the shim retry enabled, all five agents should show **Completed** or
-**Recoverable** for **N ≤ 60 s** without operator action. **N ≤ 300 s** is
-the ideal bar; longer freezes increase the chance of provider-side idle
-timeouts that only the orchestrator recovery path can salvage.
+With the shim plus durable orchestrator recovery enabled, all five agents should
+show **Completed** or **Recoverable** for **N ≤ 60 s** without operator action.
+**N ≤ 300 s** is the ideal bar; longer freezes increase the chance of
+provider-side idle timeouts that only the orchestrator recovery path can
+salvage.
 
 ## Running the smoke matrix
 
@@ -95,9 +97,9 @@ workflow runs the same filter on a **self-hosted runner labeled `multipass`**
 
 ## When to add a stronger wrapper
 
-If an agent shows **Failed** at **N ≤ 60 s** even after the shim retry:
+If an agent shows **Failed** at **N ≤ 60 s** even after durable recovery:
 
-1. Confirm the failure stderr — extend `AgentFailureClassifier.TransientNetworkPatterns` if it is a novel transient shape.
+1. Confirm the failure stderr — add the novel transient shape to `CodeyBox:TransientNetworkFailurePatterns` if it should be treated as retryable.
 2. If the CLI supports an internal `--retry` flag, add it in that agent's `BuildInvocation` for the work phase only.
 3. As a last resort, bundle a per-CLI wrapper in the baseline image or use `LD_PRELOAD` to tune `TCP_USER_TIMEOUT` for that process only.
 

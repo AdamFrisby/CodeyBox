@@ -79,6 +79,7 @@ public sealed class AutoRetryOnStuckTests : IDisposable
 
         var presetCatalog = new ScriptedAuditorCatalog([]);
         var composer = new ProjectAuditorComposer(presetCatalog);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -86,7 +87,9 @@ public sealed class AutoRetryOnStuckTests : IDisposable
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         pipeline.ActivitySourceFactory = () => new ZeroActivity();
         pipeline.StuckProbePollInterval = TimeSpan.FromMilliseconds(1);

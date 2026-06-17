@@ -96,6 +96,7 @@ public sealed class StuckRecoveryTests : IDisposable
         var presetCatalog = new ScriptedAuditorCatalog([]);
         var composer = new ProjectAuditorComposer(presetCatalog);
         var upstreamFactory = new TestUpstreamFactory();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -104,7 +105,9 @@ public sealed class StuckRecoveryTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         // Inject fast probe: zero-activity source + instant poll so the
         // threshold is hit after thresholdSamples polls (each ~1ms).
@@ -207,13 +210,17 @@ public sealed class StuckRecoveryTests : IDisposable
 
         var presetCatalog = new ScriptedAuditorCatalog([]);
         var composer = new ProjectAuditorComposer(presetCatalog);
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
-            store, new NullWebhookDispatcher(),
+            store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         var item = new WorkItem
         {

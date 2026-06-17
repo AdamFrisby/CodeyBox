@@ -109,6 +109,7 @@ Audit-tier events additionally carry:
 | `EventName` | Level | Emitted by | Properties |
 |-------------|-------|-----------|------------|
 | `quota_retry_attempted` | Info | `QuotaRetryScheduler.TryRetryAsync` | `WorkItemId`, `Source` (`periodic`, `targeted`, or `rearm-overdue`), `Outcome`, `State`, `Reason` |
+| `transient_retry_attempted` | Info | `TransientRetryScheduler.TryTransientRetryAsync` | `WorkItemId`, `Source` (`periodic`, `targeted`, or `rearm-overdue`), `Outcome`, `State`, `Reason` |
 
 ### Upstream remote
 

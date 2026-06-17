@@ -1362,6 +1362,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
 
         var projects = new InMemoryProjectRepository(project);
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -1387,7 +1388,9 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             ]),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            dispatchAvailability: dispatchAvailability);
+            dispatchAvailability: dispatchAvailability,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new RoutingFixture(pipeline, store, webhooks, codex, gemini, claude, router, frontier);
     }

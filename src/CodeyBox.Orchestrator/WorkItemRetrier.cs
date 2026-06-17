@@ -10,6 +10,13 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class WorkItemRetrier
 {
+    private enum RetryAccounting
+    {
+        None,
+        QuotaAutoRetry,
+        TransientAutoRetry,
+    }
+
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
     private readonly IGitHost _gitHost;
@@ -49,6 +56,28 @@ public sealed class WorkItemRetrier
         string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.None, ct);
+
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryQuotaAutoAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct = default)
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, ct);
+
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryTransientAutoAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct = default)
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, ct);
+
+    private async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryCoreAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        RetryAccounting accounting,
+        CancellationToken ct)
     {
         if (item.State == WorkItemState.NeedsOperatorInput && _questions is not null)
         {
@@ -92,6 +121,7 @@ public sealed class WorkItemRetrier
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
+            "conflict_rework" => WorkItemState.ReworkingForConflict,
             "merge" => WorkItemState.AuditPassed,
             "upstream" => WorkItemState.Merged,
             _ => (WorkItemState?)null,
@@ -130,20 +160,29 @@ public sealed class WorkItemRetrier
             }
         }
 
-        // Reset RecoveryAttempts and increment QuotaRetryAttempts if this is a
-        // quota-scheduler auto-retry. Terminal-failure-recovery and manual
-        // retries do NOT bump QuotaRetryAttempts — those use their own
-        // counters (TerminalRetryAttempts; n/a respectively). On any retry
-        // we clear NextTerminalRetryAt so a stale backoff schedule does not
-        // gate the next sweep. A manual retry also clears
-        // TerminalRetryAttempts — operator-forgiveness lets the cap reset.
-        var bumpsQuotaCounter = trigger != "manual" && trigger != "terminal-failure-recovery";
+        // Reset RecoveryAttempts and increment only the counter owned by the
+        // auto-retry path that invoked us. Terminal-failure-recovery and manual
+        // retries do not bump quota/transient counters. On any retry we clear
+        // NextTerminalRetryAt so a stale backoff schedule does not gate the
+        // next sweep. A manual retry also clears TerminalRetryAttempts:
+        // operator-forgiveness lets the cap reset.
         var resetsTerminalRetries = trigger == "manual";
         var resumed = item.With(resumeState.Value, error: null) with
         {
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
-            QuotaRetryAttempts = bumpsQuotaCounter ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts,
+            QuotaRetryAttempts = accounting == RetryAccounting.QuotaAutoRetry
+                ? item.QuotaRetryAttempts + 1
+                : item.QuotaRetryAttempts,
+            TransientRetryAttempts = accounting == RetryAccounting.TransientAutoRetry
+                ? item.TransientRetryAttempts + 1
+                : 0,
+            TransientRetryFirstFailedAt = accounting == RetryAccounting.TransientAutoRetry
+                ? item.TransientRetryFirstFailedAt
+                : null,
+            TransientRetryFrom = accounting == RetryAccounting.TransientAutoRetry
+                ? item.TransientRetryFrom
+                : null,
             TerminalRetryAttempts = resetsTerminalRetries ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
             StartedAt = null
@@ -152,9 +191,12 @@ public sealed class WorkItemRetrier
         // Atomic conditional update to prevent race conditions.
         // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
         // Cancelled, AbandonedAfterRecoveryAttempts, NeedsOperatorInput, or
-        // WaitingForQuotaReset. Eligibility gates that must apply across HTTP,
-        // scheduler, and operator paths live in this retrier before the write.
-        var updated = await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
+        // WaitingForQuotaReset, or WaitingForTransientRetry. Eligibility gates
+        // that must apply across HTTP, scheduler, and operator paths live in
+        // this retrier before the write.
+        var updated = accounting == RetryAccounting.TransientAutoRetry
+            ? await _store.TryUpdateIfStateAndUpdatedAtAsync(resumed, item.State, item.UpdatedAt, ct)
+            : await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {
             return (false, "work item state changed concurrently; retry aborted", null, null, null);
@@ -329,6 +371,10 @@ public sealed class WorkItemRetrier
             NextQuotaRetryAt = null,
             QuotaRetryFrom = null,
             QuotaRetryPhase = null,
+            NextTransientRetryAt = null,
+            TransientRetryAttempts = 0,
+            TransientRetryFirstFailedAt = null,
+            TransientRetryFrom = null,
             AgentPauseRetryFrom = null,
             StartedAt = null,
         };
@@ -520,6 +566,10 @@ public sealed class WorkItemRetrier
             CancellationReason = null,
             CancellationSource = null,
             FailureKind = null,
+            NextTransientRetryAt = null,
+            TransientRetryAttempts = 0,
+            TransientRetryFirstFailedAt = null,
+            TransientRetryFrom = null,
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             StartedAt = null,

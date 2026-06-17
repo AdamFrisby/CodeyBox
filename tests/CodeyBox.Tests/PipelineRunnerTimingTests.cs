@@ -239,12 +239,14 @@ public sealed class PipelineRunnerTimingTests : IDisposable
 
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
         var upstreamFactory = new TestUpstreamFactory();
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, upstreamFactory, composer,
             store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions
             {
                 SandboxImageReference = "ignored",
@@ -252,7 +254,9 @@ public sealed class PipelineRunnerTimingTests : IDisposable
             },
             NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

@@ -195,16 +195,20 @@ public sealed class TransientCancellationRetryTests : IDisposable
         });
 
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var webhooks = new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer, store,
-            new NullWebhookDispatcher(),
+            webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             taskQueue: queue,
             orchestratorOptions: new OrchestratorOptions { MaxTransientCancelRetries = maxRetries },
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new TransientHarness(pipeline, store, gitHost, agent, queue);
     }

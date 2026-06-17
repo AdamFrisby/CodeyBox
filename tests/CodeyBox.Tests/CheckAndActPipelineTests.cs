@@ -384,6 +384,37 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task TransientAgentFailureDuringCheck_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        tp.Agent.CheckResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "check transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading check stream"));
+
+        var check = NewCheckItem("codeybox/checkact-transient-check");
+        await tp.Store.CreateAsync(check);
+
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Null(final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
     public async Task YesVerdict_PublishesCheckFollowupEnqueuedWebhook()
     {
         // The orchestrator publishes work_item.check_followup_enqueued whenever
@@ -970,6 +1001,45 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PostActReValidation_TransientReCheckFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "initial issue present", "high"));
+        var check = NewCheckItem("codeybox/checkact-transient-post");
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fix.cs", "parameterised"));
+        tp.Agent.CheckResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "post-act check transport failed",
+            Stdout: null,
+            Stderr: "Transport channel closed"));
+
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(followup.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("merge", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
     public async Task PostActReValidation_AgentPausedAfterWork_ParksWithoutDispatchingRecheck()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1402,6 +1472,35 @@ public sealed class CheckAndActPipelineTests : IDisposable
             $"completion output\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\", \"confidence\": \"high\"}}\n{CheckAndActPipeline.EndSentinel}\n",
             new CheckAndActCompletionUsage(20, cacheHit ? 100 : 0, 4, cacheHit));
     }
+
+    private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
+    };
+
+    private static WorkItem NewCheckItem(string workBranch) => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test-project"),
+        Title = "Check for SQL injection",
+        Prompt = "evaluate the repo",
+        BaseBranch = "main",
+        WorkBranch = workBranch,
+        PushUpstream = false,
+        JobType = JobType.CheckAndAct,
+        Check = new CheckAndActSpec
+        {
+            Question = "Is any user-facing SQL built via string concatenation?",
+            ActionableAnswer = true,
+            OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+        },
+    };
 
     private sealed class ScriptedCompletionRunner : ICheckAndActCompletionRunner
     {

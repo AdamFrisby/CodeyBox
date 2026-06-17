@@ -55,6 +55,8 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly ProjectAuditorComposer _auditorComposer;
     private readonly IWorkItemStore _store;
     private readonly IWebhookDispatcher _webhooks;
+    private readonly IWorkItemTerminalTransition _terminalTransitions;
+    private readonly IWorkItemTerminalRevisionBuilder _terminalRevisionBuilder;
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
     private readonly CredentialSmokeGate? _smokeGate;
@@ -75,7 +77,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentCostCalculator? _costCalculator;
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
-    private readonly QuotaRetryScheduler? _retryScheduler;
+    private readonly IWorkItemAutoRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
@@ -224,7 +226,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IStdoutBroadcaster? stdoutBroadcaster = null,
         IAgentStreamStore? agentStreams = null,
         IQuotaFailureStore? quotaFailures = null,
-        QuotaRetryScheduler? retryScheduler = null,
+        IWorkItemAutoRetryScheduler? retryScheduler = null,
         AgentClassRouter? classRouter = null,
         IAgentFallbackHistoryStore? fallbackHistory = null,
         IQuotaFailureClassifier? quotaClassifier = null,
@@ -271,7 +273,9 @@ public sealed class PipelineRunner : IPipelineRunner
         // when no snapshotting is needed (or in tests that don't assert on
         // the persisted shape).
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null,
-        CancellationRegistry? cancellationRegistry = null)
+        CancellationRegistry? cancellationRegistry = null,
+        IWorkItemTerminalTransition? terminalTransitions = null,
+        IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -358,6 +362,14 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? throw new ArgumentNullException(
                 nameof(requiredBuildVerifier),
                 "PipelineRunner requires an IRequiredBuildVerifier supplied by the composition root.");
+        _terminalTransitions = terminalTransitions
+            ?? throw new ArgumentNullException(
+                nameof(terminalTransitions),
+                "PipelineRunner requires an IWorkItemTerminalTransition supplied by the composition root.");
+        _terminalRevisionBuilder = terminalRevisionBuilder
+            ?? throw new ArgumentNullException(
+                nameof(terminalRevisionBuilder),
+                "PipelineRunner requires an IWorkItemTerminalRevisionBuilder supplied by the composition root.");
         _checkCompletionRunner = checkCompletionRunner;
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
@@ -1569,6 +1581,41 @@ public sealed class PipelineRunner : IPipelineRunner
                 project: project,
                 iteration: null);
         }
+        catch (AgentSessionResumeExhaustedException ex)
+        {
+            var exhaustedRunner = _agents.TryGet(ex.Agent, out var resolvedRunner)
+                ? resolvedRunner
+                : agentRunner;
+            var transient = TryBuildTransientAgentFailure(
+                exhaustedRunner,
+                ex.LastResult,
+                phase: null,
+                failureContext: "after exhausting session resume");
+            if (transient is not null)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Work item {Id} hit transient transport failure after session resume exhaustion: agent={Agent} error={Error}",
+                    item.Id,
+                    ex.Agent.Value,
+                    transient.Message);
+                await TransitionWaitingForTransientRetryAsync(item, transient, project);
+                return;
+            }
+
+            _log.LogError(ex, "Work item {Id} failed after session resume exhaustion", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "other");
+        }
+        catch (TerminalTransientNetworkError ex)
+        {
+            _log.LogWarning(
+                "Work item {Id} hit transient transport failure: phase={Phase} agent={Agent} error={Error}",
+                item.Id,
+                ex.Phase ?? "(unknown)",
+                ex.Agent.Value,
+                ex.Message);
+            await TransitionWaitingForTransientRetryAsync(item, ex, project);
+        }
         catch (SandboxDiskDeferredException)
         {
             // Disk-guard preflight refused a sandbox launch. Re-throw so
@@ -2352,6 +2399,14 @@ public sealed class PipelineRunner : IPipelineRunner
                             candidateResult.EarliestResetAt,
                             candidateResult.DeferReason ?? "stronger agent(s) transiently unavailable");
                     }
+                    if (resolveResult.FailureRunner is not null
+                        && resolveResult.FailureClassificationResult is not null)
+                    {
+                        ThrowIfTransientAgentFailure(
+                            resolveResult.FailureRunner,
+                            resolveResult.FailureClassificationResult,
+                            "rebase");
+                    }
                     throw new MergeConflictResolutionFailedException(
                         $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}");
                 }
@@ -2381,11 +2436,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
                 }, CancellationToken.None);
-                // AgentUnavailableException is a routing failure, not a merge
-                // conflict failure — let it propagate so the catch in RunAsync
-                // surfaces failureKind=agent_unavailable instead of overwriting
-                // it as MergeConflictResolutionFailed.
-                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException or AgentPausedException or AgentClassExhaustedException)
+                // Routing, pause, quota, and transient failures are not merge
+                // conflict failures — let them propagate so the catch in
+                // RunAsync preserves the classified work-item outcome.
+                if (ex is MergeConflictResolutionFailedException
+                    or AgentUnavailableException
+                    or AgentPausedException
+                    or AgentClassExhaustedException
+                    or TerminalTransientNetworkError)
                     throw;
                 throw new MergeConflictResolutionFailedException(
                     $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}: {ex.Message}",
@@ -3403,6 +3461,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         detection?.ResetAt);
                 }
 
+                ThrowIfTransientAgentFailure(runner, agentResult, agentPhase);
+
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     runner.Kind,
@@ -3872,6 +3932,11 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             throw;
         }
+        catch (TerminalTransientNetworkError ex)
+        {
+            _log.LogWarning("Work item {Id} check-and-act hit transient transport failure: {Error}", item.Id, ex.Message);
+            await TransitionWaitingForTransientRetryAsync(item, ex, project);
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} check-and-act failed", item.Id);
@@ -4233,11 +4298,58 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (!result.Success)
         {
+            ThrowIfTransientAgentFailure(agentRunner, result, "check");
             var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
             throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
         }
 
         return aggregatedStdout;
+    }
+
+    private static void ThrowIfTransientAgentFailure(
+        IAgentRunner runner,
+        AgentResult result,
+        string phase)
+    {
+        if (TryBuildTransientAgentFailure(runner, result, phase, "during") is { } transient)
+            throw transient;
+    }
+
+    private static void ThrowIfTransientAgentFailure(
+        IAgentRunner runner,
+        AgentSessionResumeExhaustedException resumeEx,
+        string phase)
+    {
+        if (TryBuildTransientAgentFailure(
+                runner,
+                resumeEx.LastResult,
+                phase,
+                "after exhausting session resume during") is { } transient)
+        {
+            throw transient;
+        }
+    }
+
+    private static TerminalTransientNetworkError? TryBuildTransientAgentFailure(
+        IAgentRunner runner,
+        AgentResult result,
+        string? phase,
+        string failureContext)
+    {
+        var classification = runner.ClassifyFailure(result);
+        if (classification.Kind != AgentFailureKind.TransientNetwork)
+            return null;
+
+        var reason = string.IsNullOrWhiteSpace(classification.Reason)
+            ? "transient transport/network failure"
+            : RedactAndTruncateAgentDetail(classification.Reason);
+        var summary = RedactAndTruncateAgentDetail(result.Summary);
+        var phaseSuffix = string.IsNullOrWhiteSpace(phase) ? "" : $" {phase}";
+        return new TerminalTransientNetworkError(
+            runner.Kind,
+            phase,
+            classification,
+            $"Agent {runner.Kind} reported transient transport failure {failureContext}{phaseSuffix}: {summary} ({reason})");
     }
 
     /// <summary>
@@ -4678,6 +4790,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (!result.Success)
         {
+            ThrowIfTransientAgentFailure(agentRunner, result, "post-act-recheck");
             var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
             throw new InvalidOperationException($"post-act re-check agent failed: {result.Summary}{stderrTail}");
         }
@@ -4907,18 +5020,23 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!result.Success)
         {
             var classification = runner.ClassifyFailure(classificationResult ?? result);
-            if (classification.Kind == AgentFailureKind.Infrastructure)
+            if (classification.Kind is AgentFailureKind.Infrastructure or AgentFailureKind.TransientNetwork)
             {
-                AuditLog.SandboxAgentInfrastructureFailure(
-                    item.Id,
-                    runner.Kind,
-                    sandboxId,
-                    phase,
-                    result.Summary,
-                    classification.Reason);
+                if (classification.Kind == AgentFailureKind.Infrastructure)
+                {
+                    AuditLog.SandboxAgentInfrastructureFailure(
+                        item.Id,
+                        runner.Kind,
+                        sandboxId,
+                        phase,
+                        result.Summary,
+                        classification.Reason);
+                }
+
                 _log.LogWarning(
-                    "Agent {Agent} infrastructure failure in sandbox {Sandbox} during {Phase}; skipping fast-fail breaker: {Summary} ({Reason})",
+                    "Agent {Agent} {Kind} failure in sandbox {Sandbox} during {Phase}; skipping fast-fail breaker: {Summary} ({Reason})",
                     runner.Kind.Value,
+                    classification.Kind,
                     sandboxId,
                     phase,
                     result.Summary,
@@ -6609,15 +6727,18 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
 
                     // A nonzero review-agent exit is audit infrastructure, not a
-                    // source-code finding. Retry once in a fresh sandbox to ride out
-                    // transient CLI/network/process failures. Quota-shaped failures
-                    // are handled by the quota fallback wrapper below.
-                    if (IsLlmAgentExecutionFailure(run.Result)
-                        && _quotaClassifier.Detect(
-                            run.Runner.Kind,
-                            run.Result.AgentStderr,
-                            run.Result.AgentStdout) is null)
+                    // source-code finding. Quota and transient transport shapes must
+                    // leave this attempt immediately so the durable quota/transient
+                    // schedulers own the backoff. Unknown non-quota/non-transient
+                    // execution failures still get one fresh-sandbox retry.
+                    if (IsLlmAgentExecutionFailure(run.Result))
                     {
+                        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
+                        ThrowIfTransientAgentFailure(
+                            run.Runner,
+                            ToAgentResultForAuditFailureClassification(run.Result),
+                            "audit");
+
                         _log.LogWarning(
                             "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
                             run.Auditor.Name);
@@ -6630,7 +6751,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     // a transient execution failure, never as a code-quality finding
                     // or a Pass with a skipped review. The retry above is the one
                     // chance to ride out a transient CLI/network/process flap; if
-                    // the retry's result still carries the
+                    // quota / transient parking has already had first claim.
+                    // If the retry's result still carries the
                     // "review agent failed to run" sentinel and ThrowIfAuditorRunQuotaAsync
                     // did NOT classify it as quota, this is non-quota infrastructure:
                     // throw AuditUnavailableException so the RunAsync catch routes it
@@ -6642,6 +6764,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     // blocking source-code finding the work agent cannot fix).
                     if (IsLlmAgentExecutionFailure(run.Result))
                     {
+                        ThrowIfTransientAgentFailure(
+                            run.Runner,
+                            ToAgentResultForAuditFailureClassification(run.Result),
+                            "audit");
                         var summary = run.Result.AgentSummary ?? run.Result.AgentStderr ?? "agent execution failed";
                         throw new AuditUnavailableException(
                             $"LLM auditor '{run.Auditor.Name}' could not run: agent execution failed after one retry ({SingleLineSummary(summary)})");
@@ -7018,7 +7144,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 await streamCapture.DisposeAsync();
         }
         sw.Stop();
-        await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner.Kind, result));
+        await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner, result));
         CodeyBoxMeters.AuditorDuration.Record(
             (long)sw.Elapsed.TotalMilliseconds,
             new KeyValuePair<string, object?>("auditor.name", auditor.Name),
@@ -7484,31 +7610,42 @@ public sealed class PipelineRunner : IPipelineRunner
         ProjectId projectId,
         CancellationToken ct)
     {
-        if (!needsCreds || (run.Result.AgentStderr is null && run.Result.AgentStdout is null))
+        if (!needsCreds)
             return;
 
-        _quotaAuditEmitter.EmitAdvisoryAuditEvents(
-            run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
-        var quotaDetection = _quotaClassifier.Detect(
-            run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
-        await _quotaClassifier.RecordIfQuotaFailureAsync(
-            _quotaFailures,
-            run.Runner.Kind,
-            ResolveObservedModelId(run.Runner, modelId: null),
-            run.Result.AgentSummary,
-            run.Result.AgentStderr,
-            DateTimeOffset.UtcNow,
-            _auditQuotaOptions.ObservedFailureRetention,
-            ct,
-            projectId: projectId,
-            stdout: run.Result.AgentStdout);
-
-        if (quotaDetection is not null)
+        if (run.Result.AgentStderr is not null || run.Result.AgentStdout is not null)
         {
-            throw new TerminalQuotaError(
-                quotaDetection.Kind,
-                $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
-                quotaDetection.ResetAt);
+            _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
+            var quotaDetection = _quotaClassifier.Detect(
+                run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                run.Runner.Kind,
+                ResolveObservedModelId(run.Runner, modelId: null),
+                run.Result.AgentSummary,
+                run.Result.AgentStderr,
+                DateTimeOffset.UtcNow,
+                _auditQuotaOptions.ObservedFailureRetention,
+                ct,
+                projectId: projectId,
+                stdout: run.Result.AgentStdout);
+
+            if (quotaDetection is not null)
+            {
+                throw new TerminalQuotaError(
+                    quotaDetection.Kind,
+                    $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
+                    quotaDetection.ResetAt);
+            }
+        }
+
+        if (IsLlmAgentExecutionFailure(run.Result))
+        {
+            ThrowIfTransientAgentFailure(
+                run.Runner,
+                ToAgentResultForAuditFailureClassification(run.Result),
+                "audit");
         }
     }
 
@@ -8857,6 +8994,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw quotaEx;
                 }
 
+                if (TryConvertResumeExhaustionToTransient(runner, ex) is { } transientEx)
+                {
+                    await FinalizeInvolvementAsync(involvementId, "failure:transient");
+                    throw transientEx;
+                }
+
                 await FinalizeInvolvementAsync(involvementId, "failure:agent");
                 throw;
             }
@@ -8914,6 +9057,26 @@ public sealed class PipelineRunner : IPipelineRunner
                 detection.Kind,
                 $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}",
                 detection.ResetAt);
+        }
+
+        TerminalTransientNetworkError? TryConvertResumeExhaustionToTransient(
+            IAgentRunner runner,
+            AgentSessionResumeExhaustedException resumeEx)
+        {
+            var last = resumeEx.LastResult;
+            var classification = runner.ClassifyFailure(last);
+            if (classification.Kind != AgentFailureKind.TransientNetwork)
+                return null;
+
+            var reason = string.IsNullOrWhiteSpace(classification.Reason)
+                ? "transient transport/network failure"
+                : RedactAndTruncateAgentDetail(classification.Reason);
+            var summary = RedactAndTruncateAgentDetail(last.Summary);
+            return new TerminalTransientNetworkError(
+                runner.Kind,
+                phase,
+                classification,
+                $"Agent {runner.Kind} reported transient transport failure after exhausting session resume during {phase}: {summary} ({reason})");
         }
 
         // Resolve the initial member from the work item's currently-selected agent.
@@ -9529,6 +9692,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         TerminalQuotaError => "failure:quota",
         AuditorIdleTimeoutException => "failure:timeout",
+        TerminalTransientNetworkError => "failure:transient",
         AgentAttemptTimeoutException => "failure:timeout",
         OperationCanceledException => "failure:cancelled",
         _ => "failure:agent",
@@ -9542,14 +9706,27 @@ public sealed class PipelineRunner : IPipelineRunner
     /// that merely reported findings — is <c>success</c> (the agent ran fine; the
     /// findings are the work product, not a run failure).
     /// </summary>
-    private string AuditorRunOutcome(AgentKind kind, AuditResult result)
+    private string AuditorRunOutcome(IAgentRunner runner, AuditResult result)
     {
-        if (_quotaClassifier.Detect(kind, result.AgentStderr, result.AgentStdout) is not null)
+        if (_quotaClassifier.Detect(runner.Kind, result.AgentStderr, result.AgentStdout) is not null)
             return "failure:quota";
+
+        var classification = runner.ClassifyFailure(ToAgentResultForAuditFailureClassification(result));
+        if (classification.Kind == AgentFailureKind.QuotaExhausted)
+            return "failure:quota";
+        if (classification.Kind == AgentFailureKind.TransientNetwork)
+            return "failure:transient";
         if (IsLlmAgentExecutionFailure(result))
             return "failure:agent";
         return "success";
     }
+
+    private static AgentResult ToAgentResultForAuditFailureClassification(AuditResult result) =>
+        new(
+            Success: !IsLlmAgentExecutionFailure(result),
+            Summary: result.AgentSummary ?? "agent failed",
+            Stdout: result.AgentStdout,
+            Stderr: result.AgentStderr);
 
     private sealed class AgentAttemptTimeoutException : OperationCanceledException
     {
@@ -9985,34 +10162,40 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
-                var detection = _quotaClassifier.Detect(chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout);
+                var classificationResult = agentResultForAvailabilityClassification ?? agentResult;
+                var detection = _quotaClassifier.Detect(
+                    chosenMergeRunner.Kind,
+                    classificationResult.Stderr,
+                    classificationResult.Stdout);
                 if (detection is not null)
                 {
                     await _quotaClassifier.RecordIfQuotaFailureAsync(
                         _quotaFailures,
                         chosenMergeRunner.Kind,
                         observedModelId,
-                        agentResult.Summary,
-                        agentResult.Stderr,
+                        classificationResult.Summary,
+                        classificationResult.Stderr,
                         mergeEndedAt,
                         _auditQuotaOptions.ObservedFailureRetention,
                         ct,
                         projectId: item.ProjectId,
-                        stdout: agentResult.Stdout);
-                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+                        stdout: classificationResult.Stdout);
+                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {classificationResult.Summary}", detection.ResetAt);
                 }
+
+                ThrowIfTransientAgentFailure(chosenMergeRunner, classificationResult, "merge");
 
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     chosenMergeRunner.Kind,
                     observedModelId,
-                    agentResult.Summary,
-                    agentResult.Stderr,
+                    classificationResult.Summary,
+                    classificationResult.Stderr,
                     mergeEndedAt,
                     _auditQuotaOptions.ObservedFailureRetention,
                     ct,
                     projectId: item.ProjectId,
-                    stdout: agentResult.Stdout);
+                    stdout: classificationResult.Stdout);
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
@@ -11034,6 +11217,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // orchestrator requeue path; retrying them here would hard-fail
                 // infrastructure flaps after the upstream attempt budget.
                 catch (Exception ex) when (ex is not MergeConflictResolutionFailedException
+                    && ex is not TerminalTransientNetworkError
                     && ex is not SandboxProvisioningDeferredException
                     && ex is not AgentPausedException)
                 {
@@ -11436,6 +11620,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 priorWorkTip, baseTip, conflictFiles, originalFailure,
                 ct, hostShutdownToken);
         }
+        catch (TerminalTransientNetworkError ex)
+        {
+            _log.LogWarning(ex,
+                "Conflict rework agent invocation hit transient transport failure for work item {Id}: {Message}",
+                item.Id, ex.Message);
+            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                success: false, newTip: null, filesChanged: null,
+                insertions: null, deletions: null, semanticIncompatible: null,
+                parkReason: ex.Message, ct);
+            throw;
+        }
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not SandboxProvisioningDeferredException
             && ex is not AgentPausedException)
@@ -11730,6 +11925,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 await FinalizeInvolvementAsync(conflictInvolvementId, "failure:cancelled");
                 throw phase.Wrap(oce);
             }
+            catch (AgentSessionResumeExhaustedException ex)
+            {
+                var classification = runner.ClassifyFailure(ex.LastResult);
+                await FinalizeInvolvementAsync(
+                    conflictInvolvementId,
+                    classification.Kind == AgentFailureKind.TransientNetwork
+                        ? "failure:transient"
+                        : "failure:agent");
+                ThrowIfTransientAgentFailure(runner, ex, ConflictReworkPhaseKey);
+                throw;
+            }
             catch (Exception ex)
             {
                 // A phase timeout (PhaseCancellationException) or any other
@@ -11760,8 +11966,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // legitimately exits non-zero to signal it — so it must be checked
             // before the generic !Success → failure:agent fallback, otherwise the
             // involvement outcome would mislabel it as a plain agent failure.
+            var transientFailure = !agentResult.Success
+                && runner.ClassifyFailure(agentResult).Kind == AgentFailureKind.TransientNetwork;
             await FinalizeInvolvementAsync(conflictInvolvementId,
                 semanticIncompatible is not null ? "failure:semantic-incompatible"
+                : transientFailure ? "failure:transient"
                 : !agentResult.Success ? "failure:agent"
                 : "success");
             if (semanticIncompatible is not null)
@@ -11776,6 +11985,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (!agentResult.Success)
             {
+                ThrowIfTransientAgentFailure(runner, agentResult, ConflictReworkPhaseKey);
                 return new ConflictReworkAgentOutcome(
                     AgentSucceeded: false,
                     NewTip: null,
@@ -13058,29 +13268,8 @@ Original merge-phase failure (for context):
     /// latest prompt edit was not yet visible". Non-terminal transitions
     /// return null so the existing payload shape is unchanged.
     /// </summary>
-    internal async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
-    {
-        if (!WorkItemDependencies.TerminalStates.Contains(item.State)) return null;
-        var iterations = await _store.GetIterationsAsync(item.Id, ct);
-        // Pick the row with the largest iteration number — i.e. the last
-        // iteration that actually ran. Using .Max(i => i.PromptRevisionAtDispatch)
-        // would only agree when iteration numbers and recorded revisions are
-        // monotonic; future out-of-order or backfilled dispatch rows could
-        // diverge from "the revision attributed to the LAST iteration."
-        int? lastDispatched = iterations.Count == 0
-            ? null
-            : iterations.OrderByDescending(i => i.Iteration).First().PromptRevisionAtDispatch;
-        // RevisionMatches is null when no iteration was ever dispatched (e.g.
-        // the item failed during dependency resolution before any work began).
-        // Returning `false` here would tell a tracker like JobTrack that the
-        // agent finished against a stale prompt, prompting a spurious one-click
-        // re-run for an item that never actually ran. The contract is:
-        // null ↔ RevisionAtCompletion null.
-        return new TerminalRevisionDetails(
-            PromptRevision: item.PromptRevision,
-            RevisionAtCompletion: lastDispatched,
-            RevisionMatches: lastDispatched is { } r ? r == item.PromptRevision : null);
-    }
+    internal async Task<TerminalRevisionAttribution?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
+        => await _terminalRevisionBuilder.BuildTerminalRevisionAsync(item, ct);
 
     /// <summary>
     /// Best-effort cost summary lookup for webhook usage blocks. Returns null
@@ -13101,38 +13290,38 @@ Original merge-phase failure (for context):
 
     private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null, string? cancellationSource = null)
     {
+        if (string.Equals(failureKind, "transient", StringComparison.OrdinalIgnoreCase))
+        {
+            await TransitionWaitingForTransientRetryAsync(item, error, project, phase: null, agent: item.Agent);
+            return;
+        }
+
         await RunBoundedPostAgentAsync(item.Id, "transition-failed", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
-            WorkItem next;
+            DateTimeOffset? effectiveQuotaResetAt = quotaResetAt;
             if (failureKind == "quota")
             {
                 var phase = PhaseForQuotaPark(current.State);
-                var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(
+                effectiveQuotaResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(
                     current,
                     project,
                     quotaResetAt,
                     phase,
                     transitionCt);
-                next = current.With(WorkItemState.Failed, error,
-                    failureKind: failureKind,
-                    quotaResetAt: effectiveResetAt,
-                    cancellationSource: cancellationSource) with
-                {
-                    NextQuotaRetryAt = effectiveResetAt,
-                };
-            }
-            else
-            {
-                next = current.With(WorkItemState.Failed, error,
-                    failureKind: failureKind,
-                    quotaResetAt: quotaResetAt,
-                    cancellationSource: cancellationSource);
             }
 
-            // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
-            var updated = await _store.TryUpdateIfStateAsync(next, current.State, transitionCt);
-            if (!updated)
+            var transition = await _terminalTransitions.TransitionFailedAsync(
+                current,
+                error,
+                new WorkItemTerminalFailureTransitionCommand
+                {
+                    FailureKind = failureKind,
+                    QuotaResetAt = effectiveQuotaResetAt,
+                    CancellationSource = cancellationSource,
+                },
+            transitionCt);
+            if (!transition.Updated || transition.FailedWorkItem is not { } next)
             {
                 _log.LogInformation("Work item {Id} state changed concurrently; skipping Failed transition", item.Id);
                 return;
@@ -13142,25 +13331,7 @@ Original merge-phase failure (for context):
             {
                 await _retryScheduler.NotifyQuotaFailureAsync(next);
             }
-
             _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
-            AuditLog.WorkItemFailed(item.Id, error);
-            var effectiveProject = project ?? new Project
-            {
-                Id = item.ProjectId,
-                DisplayName = item.ProjectId.Value,
-                RepositoryUrl = string.Empty,
-            };
-            var failedRevision = await BuildTerminalRevisionAsync(next, CancellationToken.None);
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.failed",
-                WorkItem = next,
-                Project = effectiveProject,
-                PromptRevision = failedRevision?.PromptRevision,
-                RevisionAtCompletion = failedRevision?.RevisionAtCompletion,
-                RevisionMatches = failedRevision?.RevisionMatches,
-            }, CancellationToken.None);
         });
     }
 
@@ -13380,6 +13551,115 @@ Original merge-phase failure (for context):
             pausedAgent,
             CancellationToken.None);
 
+    private Task TransitionWaitingForTransientRetryAsync(
+        WorkItem item,
+        TerminalTransientNetworkError ex,
+        Project? project)
+        => TransitionWaitingForTransientRetryAsync(item, ex.Message, project, ex.Phase, ex.Agent);
+
+    private async Task TransitionWaitingForTransientRetryAsync(
+        WorkItem item,
+        string error,
+        Project? project,
+        string? phase,
+        AgentKind? agent)
+    {
+        var ct = CancellationToken.None;
+        var safeError = RedactAndTruncateAgentDetail(error);
+        if (IsOperatorCancellationRequested(item.Id))
+        {
+            _log.LogInformation(
+                "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
+                item.Id);
+            await HandleOperatorCancelAsync(item, project);
+            return;
+        }
+
+        await RunBoundedPostAgentAsync(item.Id, "transition-waiting-for-transient-retry", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            if (ShouldRejectTransientRetryParking(current))
+            {
+                _log.LogInformation(
+                    "Work item {Id} is already in state {State}; skipping WaitingForTransientRetry transition",
+                    item.Id,
+                    current.State);
+                return;
+            }
+
+            if (IsOperatorCancellationRequested(item.Id))
+            {
+                _log.LogInformation(
+                    "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
+                    item.Id);
+                await HandleOperatorCancelAsync(current, project);
+                return;
+            }
+
+            var next = current.With(
+                WorkItemState.WaitingForTransientRetry,
+                safeError,
+                failureKind: "transient") with
+            {
+                TransientRetryFrom = RetryFromForTransientPhase(phase, current.State),
+            };
+
+            var updated = await _store.TryUpdateIfStateAsync(next, current.State, transitionCt);
+            if (!updated)
+            {
+                _log.LogInformation(
+                    "Work item {Id} state changed concurrently; skipping WaitingForTransientRetry transition",
+                    item.Id);
+                return;
+            }
+
+            var scheduled = next;
+            if (_retryScheduler is not null)
+            {
+                var scheduling = await _retryScheduler.NotifyTransientFailureAsync(next, transitionCt);
+                scheduled = scheduling.UpdatedItem;
+                if (scheduling.Status == WorkItemAutoRetryScheduleStatus.Exhausted)
+                {
+                    _log.LogWarning(
+                        "Work item {Id} exhausted transient retry budget during WaitingForTransientRetry scheduling: {Reason}",
+                        item.Id,
+                        scheduling.Reason);
+                    return;
+                }
+            }
+
+            AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForTransientRetry.ToString());
+            var effectiveProject = project ?? new Project
+            {
+                Id = item.ProjectId,
+                DisplayName = item.ProjectId.Value,
+                RepositoryUrl = string.Empty,
+            };
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.waiting_for_transient_retry",
+                WorkItem = scheduled,
+                Project = effectiveProject,
+                Details = new
+                {
+                    workItemId = item.Id.ToString(),
+                    phase,
+                    agent = agent?.Value,
+                    reason = safeError,
+                    nextRetryAt = scheduled.NextTransientRetryAt,
+                    attempts = scheduled.TransientRetryAttempts,
+                },
+            }, CancellationToken.None);
+        });
+    }
+
+    private bool IsOperatorCancellationRequested(WorkItemId itemId) =>
+        _cancellations?.GetRequestKind(itemId) == CancellationRequestKind.Operator;
+
+    private static bool ShouldRejectTransientRetryParking(WorkItem item) =>
+        item.State == WorkItemState.NeedsOperatorInput
+        || WorkItemDependencies.TerminalStates.Contains(item.State);
+
     private async Task TransitionWaitingForQuotaResetAsync(
         WorkItem item,
         string error,
@@ -13472,6 +13752,25 @@ Original merge-phase failure (for context):
             ? WellKnownCapabilities.Audit
             : null;
 
+    internal static string? RetryFromForTransientPhase(string? phase, WorkItemState currentState) => phase switch
+    {
+        "audit" => "audit",
+        "rework" => "audit",
+        ConflictReworkPhaseKey => "conflict_rework",
+        "post-act-recheck" => "merge",
+        "merge" => "merge",
+        "upstream" => "upstream",
+        _ => ExplicitTransientRetryFromForState(currentState),
+    };
+
+    private static string? ExplicitTransientRetryFromForState(WorkItemState currentState)
+    {
+        var retryFrom = AgentPauseResumeMapper.RetryFromForState(currentState);
+        return string.Equals(retryFrom, "work", StringComparison.Ordinal)
+            ? null
+            : retryFrom;
+    }
+
     /// <summary>
     /// Maps the work item's current state to the phase string used when parking
     /// a quota rejection as <see cref="WorkItemState.WaitingForQuotaReset"/>. The
@@ -13508,6 +13807,7 @@ Original merge-phase failure (for context):
         WorkItemState.Cancelled => "work_item.cancelled",
         WorkItemState.NeedsOperatorInput => "work_item.needs_operator_input",
         WorkItemState.WaitingForQuotaReset => "work_item.waiting_for_quota_reset",
+        WorkItemState.WaitingForTransientRetry => "work_item.waiting_for_transient_retry",
         _ => $"work_item.{state.ToString().ToLowerInvariant()}",
     };
 
@@ -14100,20 +14400,6 @@ public sealed record AgentFallbackDetails(
     string? ToAgent,
     string? ToModel,
     string Reason);
-
-/// <summary>
-/// Internal carrier for revision-attribution fields lifted onto webhook
-/// payloads at terminal-state transitions (Done / Failed / Cancelled /
-/// AuditFailed / MergeConflictResolutionFailed). The fields themselves are
-/// serialised at the TOP LEVEL of the webhook payload (see
-/// <see cref="WebhookEvent.PromptRevision"/> et al.) so trackers like
-/// JobTrack can read <c>payload.promptRevision</c> directly; this record is
-/// just the in-process plumbing.
-/// </summary>
-internal sealed record TerminalRevisionDetails(
-    int PromptRevision,
-    int? RevisionAtCompletion,
-    bool? RevisionMatches);
 
 internal sealed record AuditIterationDetails(
     int Iteration,

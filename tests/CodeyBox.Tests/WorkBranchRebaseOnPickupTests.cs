@@ -430,6 +430,50 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     }
 
     [Fact]
+    public async Task RebaseConflictTransientResolverFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var originalTip = await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+        tp.Agent.AgenticConflictResults.Enqueue(new AgentResult(
+            false,
+            "transport closed",
+            Stdout: null,
+            Stderr: "Transport channel closed"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("audit", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.Contains("transient transport failure", final.LastError);
+        Assert.Equal(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
+        Assert.Equal("work branch change\n", await ShowAsync(barePath, $"{item.WorkBranch}:README.md"));
+    }
+
+    [Fact]
     public async Task NoBaseAdvanceIsNoop()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -878,4 +922,15 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
             PushUpstream = false,
         };
     }
+
+    private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
+    };
 }

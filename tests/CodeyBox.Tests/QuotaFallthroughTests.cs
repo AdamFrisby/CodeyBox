@@ -177,6 +177,7 @@ public sealed class QuotaFallthroughTests : IDisposable
         var composer = new ProjectAuditorComposer(presetCatalog);
         // Gemini always has credentials so we reach the quota check.
         var credentials = new SelectiveCredentialProvider(AgentKind.Gemini);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials, prs,
@@ -188,7 +189,9 @@ public sealed class QuotaFallthroughTests : IDisposable
             suggestions: null,
             auditQuotaProbes: auditProbes,
             auditQuotaOptions: quotaOptions,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
 
         return new QuotaTestPipeline(pipeline, store, claudeAgent, webhooks);
     }

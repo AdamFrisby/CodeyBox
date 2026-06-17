@@ -357,6 +357,23 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void TransientRetryAttempted_emits_transient_retry_attempted_event()
+    {
+        var workItemId = WorkItemId.New();
+
+        AuditLog.TransientRetryAttempted(workItemId, "periodic", "retried", "WaitingForTransientRetry", "actualFrom=merge");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("transient_retry_attempted", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("periodic", GetScalar<string>(evt, "Source"));
+        Assert.Equal("retried", GetScalar<string>(evt, "Outcome"));
+        Assert.Equal("WaitingForTransientRetry", GetScalar<string>(evt, "State"));
+        Assert.Equal("actualFrom=merge", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public void AuditPassed_emits_audit_passed_event()
     {
         AuditLog.AuditPassed(2);

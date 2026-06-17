@@ -15,7 +15,7 @@ without the other, CI fails.
 ## Current version
 
 ```
-eventSchemaVersion = "1.3"
+eventSchemaVersion = "1.4"
 ```
 
 The `eventSchemaVersion` string is semver (`major.minor`). Trackers should
@@ -37,7 +37,7 @@ Every webhook + SSE payload is a JSON object with this shape:
 ```jsonc
 {
   // ── Required (since 1.0) ─────────────────────────────────────
-  "eventSchemaVersion": "1.3",                  // semver string
+  "eventSchemaVersion": "1.4",                  // semver string
   "eventType":          "work_item.done",       // stable identifier
   "emittedAt":          "2026-05-18T12:34:56.789+00:00",
 
@@ -123,6 +123,7 @@ subscribe to.
 | `work_item.needs_operator_input` | 1.0 | Work item parked awaiting operator answers. |
 | `work_item.waiting_for_quota_reset` | 1.0 | Work item parked until quota reset window. |
 | `work_item.waiting_for_agent_resume` | 1.3 | Work item parked because its only eligible agent is paused. |
+| `work_item.waiting_for_transient_retry` | 1.4 | Work item parked until the transient transport/network retry backoff expires. |
 | `work_item.agent_stuck` | 1.0 | Stuck-agent probe killed a hung agent. |
 | `work_item.auto_retry` | 1.0 | Quota auto-retry re-queued a failed item. |
 | `work_item.recovered` | 1.0 | Dead-worker reaper recovered an item with a state-changing transition. |
@@ -149,7 +150,7 @@ See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes.
 Schema 1.1 adds the sandbox leak `reason` details field. Schema 1.2 adds
 worker-pool health watchdog events for dispatcher stalls and restart
 escalation. Schema 1.3 adds per-agent pause/resume and agent-pause waiting
-events.
+events. Schema 1.4 adds transient transport retry waiting events.
 
 ---
 

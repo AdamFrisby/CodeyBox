@@ -212,7 +212,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count after suspend-related transient exits. |
+| `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count for unknown failures with suspend-related exit codes. Classified transient-network failures use the durable scheduler instead. |
 | `AgentSessionResumeMaxAttempts` | `2` | CLI-native same-session resume attempts after a transient non-zero agent crash with a captured session id and a live sandbox including `/repo`. Set to `0` to disable session resume. |
 
 ---
@@ -464,6 +464,54 @@ pause queues for a reason. Each scheduler evaluation emits a
 `quota_retry_attempted` audit-log event with `Source` and `Outcome`, including
 no-op skips. Each successful auto-retry emits a `work_item.auto_retry` webhook
 (see [docs/webhooks.md](webhooks.md#auto_retry-details)).
+
+---
+
+## `AutoRetryOnTransientFailure`
+
+Automatic re-queue of Failed work items whose agent failure was classified as
+a transient transport/network failure. This is distinct from quota retry:
+quota still waits for quota reset, auth failures stay excluded, and normal
+build/test/quality failures are not retried.
+
+```json
+"AutoRetryOnTransientFailure": {
+  "Enabled": true,
+  "PeriodicCheckInterval": "00:01:00",
+  "BaseDelay": "00:00:30",
+  "Multiplier": 2.0,
+  "MaxDelay": "00:15:00",
+  "MaxAutoRetriesPerWorkItem": 5,
+  "MaxElapsedTime": "01:00:00",
+  "JitterMode": "Full"
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Enabled` | `true` | Master switch for durable transient-network retry. Manual retry is unaffected. |
+| `PeriodicCheckInterval` | `00:01:00` (1 min) | Safety-net sweep cadence for missed timers and restart recovery. |
+| `BaseDelay` | `00:00:30` (30 s) | First retry delay before jitter. |
+| `Multiplier` | `2.0` | Exponential backoff multiplier applied per retry attempt. |
+| `MaxDelay` | `00:15:00` (15 min) | Per-attempt backoff cap before jitter. |
+| `MaxAutoRetriesPerWorkItem` | `5` | Per-item cap. After this, the item remains `Failed` with `FailureKind="transient-exhausted"`. |
+| `MaxElapsedTime` | `01:00:00` (1 h) | Total elapsed cap for one transient retry series. A retry that would fire after this window is not scheduled. |
+| `JitterMode` | `Full` | `None`, `Full`, or `Decorrelated`. Use jitter to spread retries during provider or ISP incidents. |
+
+`TransientRetryScheduler` persists `FailureKind="transient"`,
+`NextTransientRetryAt`, `TransientRetryAttempts`, and
+`TransientRetryFirstFailedAt` on the work item. When the timer fires, it calls
+the shared `WorkItemRetrier` with auto-pick enabled, so items with prior work
+commits resume at audit instead of discarding the work branch. Quota retry
+remains owned by `QuotaRetryScheduler`; `IWorkItemAutoRetryScheduler` is only a
+small notification facade that delegates to the two policy schedulers.
+
+`CodeyBox:TransientNetworkFailurePatterns` appends extra classifier substrings
+without a rebuild. Built-in patterns deliberately avoid bare `timeout` so
+genuine build/test timeouts are not misclassified as retryable transport
+incidents. A parsed stream-json `turn.failed` event whose `error.message` is
+exactly `timeout` is the exception because that is provider transport metadata,
+not free-form build output.
 
 ---
 

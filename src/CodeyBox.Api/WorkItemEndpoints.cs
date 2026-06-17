@@ -364,9 +364,10 @@ internal static class WorkItemEndpoints
         if (err is not null) return err;
 
         // Only resume from terminal-failed states or parked states
-        // (NeedsOperatorInput for operator triage, WaitingForQuotaReset for
-        // operator override of the scheduler, WaitingForAgentResume for
-        // operator override of per-agent runtime pause controls).
+        // (NeedsOperatorInput for operator triage, WaitingForQuotaReset /
+        // WaitingForTransientRetry for operator override of the schedulers,
+        // WaitingForAgentResume for operator override of per-agent runtime
+        // pause controls).
         // Done items have nothing to retry; other non-terminal states would
         // race the pipeline.
         if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
@@ -374,7 +375,8 @@ internal static class WorkItemEndpoints
             or WorkItemState.AbandonedAfterRecoveryAttempts
             or WorkItemState.NeedsOperatorInput
             or WorkItemState.WaitingForQuotaReset
-            or WorkItemState.WaitingForAgentResume))
+            or WorkItemState.WaitingForAgentResume
+            or WorkItemState.WaitingForTransientRetry))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
 
         // Pass body.From through verbatim (including null) so the retrier can
@@ -386,7 +388,11 @@ internal static class WorkItemEndpoints
         var requestedFrom = string.IsNullOrWhiteSpace(body?.From)
             ? null
             : body!.From!.Trim().ToLowerInvariant();
-        var (success, error, resumeState, actualFrom, openQuestions) = await retrier.RetryAsync(item, requestedFrom, trigger: "manual", ct);
+        var (success, error, resumeState, actualFrom, openQuestions) = await retrier.RetryAsync(
+            item,
+            requestedFrom,
+            trigger: "manual",
+            ct: ct);
 
         if (!success)
         {
@@ -1938,6 +1944,10 @@ internal static class WorkItemEndpoints
             QuotaRetryAttempts: item.QuotaRetryAttempts,
             QuotaRetryFrom: item.QuotaRetryFrom,
             QuotaRetryPhase: item.QuotaRetryPhase,
+            NextTransientRetryAt: item.NextTransientRetryAt,
+            TransientRetryAttempts: item.TransientRetryAttempts,
+            TransientRetryFirstFailedAt: item.TransientRetryFirstFailedAt,
+            TransientRetryFrom: item.TransientRetryFrom,
             AgentPauseTarget: item.AgentPauseTarget?.Value,
             AgentPauseRetryFrom: item.AgentPauseRetryFrom,
             Usage: usage?.Iteration,
@@ -2334,6 +2344,10 @@ public sealed record WorkItemDto(
     int QuotaRetryAttempts = 0,
     string? QuotaRetryFrom = null,
     string? QuotaRetryPhase = null,
+    DateTimeOffset? NextTransientRetryAt = null,
+    int TransientRetryAttempts = 0,
+    DateTimeOffset? TransientRetryFirstFailedAt = null,
+    string? TransientRetryFrom = null,
     string? AgentPauseTarget = null,
     string? AgentPauseRetryFrom = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
