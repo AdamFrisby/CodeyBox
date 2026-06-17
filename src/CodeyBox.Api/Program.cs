@@ -99,7 +99,27 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
         .Enrich.WithThreadId()
         .Enrich.WithProperty("Application", "CodeyBox")
         .Enrich.With<SensitiveDataRedactionEnricher>()
-        .WriteTo.Console()
+        .WriteTo.Console();
+
+    // Rolling plain-text mirror of the console stream. Replaces the
+    // historical `>>` shell-redirect of stdout to codeybox-orchestrator.run.log,
+    // which grew without bound (22 M+ lines / multi-GB by 2026-06) and made
+    // operator tail/grep return weeks-old lines. Bound by both date and size,
+    // capped by RetainedFileCountLimit. Disable via
+    // CodeyBox:AuditLog:ConsoleLog:Enabled=false if the operator manages
+    // run-log capture out of process.
+    if (auditOpts.ConsoleLog.Enabled)
+    {
+        serilogConfig = serilogConfig.WriteTo.File(
+            path: auditOpts.ConsoleLog.Path,
+            rollingInterval: RollingInterval.Day,
+            retainedFileCountLimit: auditOpts.ConsoleLog.RetainedFileCountLimit,
+            fileSizeLimitBytes: auditOpts.ConsoleLog.MaxFileSizeBytes,
+            rollOnFileSizeLimit: true,
+            shared: false);
+    }
+
+    serilogConfig = serilogConfig
         .WriteTo.File(
             formatter: new CompactJsonFormatter(),
             path: auditOpts.Path,
@@ -4704,6 +4724,53 @@ namespace CodeyBox.Api
         public int RetainedDays { get; set; } = 30;
 
         /// <summary>Per-file size cap before rolling. Default: 100 MiB.</summary>
+        public long MaxFileSizeBytes { get; set; } = 100 * 1024 * 1024;
+
+        /// <summary>
+        /// Rolling file sink for the orchestrator's plain-text console stream
+        /// (the same lines Serilog writes to stdout). Enabled by default so the
+        /// process bounds its own run-log retention instead of relying on an
+        /// external shell-redirect (which historically grew without bound).
+        /// </summary>
+        public ConsoleLogOptions ConsoleLog { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Configuration for the rolling console / run-log sink. The default
+    /// settings keep ~14 rolled files of up to 100 MiB each (≈ 1.4 GiB peak
+    /// disk) and roll on both calendar day and size; disable by setting
+    /// <c>Enabled=false</c> if the operator manages run-log capture out of
+    /// process.
+    /// </summary>
+    public sealed class ConsoleLogOptions
+    {
+        /// <summary>
+        /// Toggle for the rolling run-log file sink. Stdout/console output is
+        /// unaffected — turning this off only stops writing the duplicate
+        /// rolling file.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Path template for the rolling run log. Serilog inserts the date
+        /// before the trailing dot (e.g. <c>codeybox-console-20260618.log</c>).
+        /// Relative paths resolve from the process working directory.
+        /// </summary>
+        public string Path { get; set; } = "logs/codeybox-console-.log";
+
+        /// <summary>
+        /// Total number of rolled files to retain across all dates / size
+        /// segments. Counted-by-file (not by day) so the cap holds even when
+        /// size rolling produces several segments in a single day. Must be
+        /// >= 1. Default: 14.
+        /// </summary>
+        public int RetainedFileCountLimit { get; set; } = 14;
+
+        /// <summary>
+        /// Per-file size cap before rolling to a new segment. Combined with
+        /// the day boundary, this is what actually keeps individual files
+        /// readable with tail / less. Must be >= 1 MiB. Default: 100 MiB.
+        /// </summary>
         public long MaxFileSizeBytes { get; set; } = 100 * 1024 * 1024;
     }
 }

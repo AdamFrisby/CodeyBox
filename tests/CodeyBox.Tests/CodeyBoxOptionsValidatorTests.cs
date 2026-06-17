@@ -39,6 +39,112 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains(expectedFailure, ex.Message);
     }
 
+    [Theory]
+    [InlineData("null", "CodeyBox:AuditLog:ConsoleLog must not be null")]
+    [InlineData("path", "CodeyBox:AuditLog:ConsoleLog:Path must be non-empty")]
+    [InlineData("retention", "CodeyBox:AuditLog:ConsoleLog:RetainedFileCountLimit must be >= 1")]
+    [InlineData("size", "CodeyBox:AuditLog:ConsoleLog:MaxFileSizeBytes must be >= 1048576")]
+    public void Validate_RejectsInvalidConsoleLogOptions(string scenario, string expected)
+    {
+        var options = ValidCodeyBoxOptions();
+        ApplyInvalidConsoleLogScenario(options.AuditLog, scenario);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expected, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AllowsInvalidConsoleLogFieldsWhenDisabled()
+    {
+        // The Enabled flag short-circuits ConsoleLog field validation:
+        // operators who keep their own out-of-process run-log capture should
+        // not have to set Path / RetainedFileCountLimit / MaxFileSizeBytes
+        // away from sentinel-zero values just to satisfy the validator.
+        var options = ValidCodeyBoxOptions();
+        options.AuditLog.ConsoleLog.Enabled = false;
+        options.AuditLog.ConsoleLog.Path = "";
+        options.AuditLog.ConsoleLog.RetainedFileCountLimit = 0;
+        options.AuditLog.ConsoleLog.MaxFileSizeBytes = 0;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Fact]
+    public void ValidateAndPrepare_CreatesConsoleLogDirectoryWhenEnabled()
+    {
+        var root = Directory.CreateTempSubdirectory("codeybox-console-log-prepare-").FullName;
+        try
+        {
+            var consoleLogDir = Path.Combine(root, "console-logs", "nested");
+            Assert.False(Directory.Exists(consoleLogDir));
+
+            var options = ValidAuditLogOptions();
+            options.Path = Path.Combine(root, "codeybox-.json");
+            options.AuditPath = Path.Combine(root, "audit-.json");
+            options.ConsoleLog.Enabled = true;
+            options.ConsoleLog.Path = Path.Combine(consoleLogDir, "codeybox-console-.log");
+
+            AuditLogStartup.ValidateAndPrepare(options);
+
+            Assert.True(Directory.Exists(consoleLogDir));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ValidateAndPrepare_SkipsConsoleLogDirectoryWhenDisabled()
+    {
+        // Mirror image of the previous test: when ConsoleLog is off, the
+        // operator's blank/bogus Path must not be touched. This is the
+        // contract that lets an operator turn the rolling run-log off and
+        // forget about the field entirely.
+        var root = Directory.CreateTempSubdirectory("codeybox-console-log-skip-").FullName;
+        try
+        {
+            var blocker = Path.Combine(root, "not-a-directory");
+            File.WriteAllText(blocker, "x");
+
+            var options = ValidAuditLogOptions();
+            options.Path = Path.Combine(root, "codeybox-.json");
+            options.AuditPath = Path.Combine(root, "audit-.json");
+            options.ConsoleLog.Enabled = false;
+            // A path that would fail PrepareDirectory if visited.
+            options.ConsoleLog.Path = Path.Combine(blocker, "console-.log");
+
+            AuditLogStartup.ValidateAndPrepare(options); // must not throw
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ConsoleLogOptions_HasBoundedDefaults()
+    {
+        var defaults = new ConsoleLogOptions();
+
+        Assert.True(defaults.Enabled);
+        Assert.False(string.IsNullOrWhiteSpace(defaults.Path));
+        Assert.True(defaults.RetainedFileCountLimit >= 1);
+        Assert.True(defaults.MaxFileSizeBytes >= 1L * 1024 * 1024);
+
+        // Peak disk = RetainedFileCountLimit * MaxFileSizeBytes. The point of
+        // the rotation work is that this product is bounded — pin a sanity
+        // ceiling so a future bump to either default that breaches multi-GiB
+        // shows up here, not in production storage exhaustion.
+        var peakBytes = (long)defaults.RetainedFileCountLimit * defaults.MaxFileSizeBytes;
+        Assert.True(peakBytes <= 10L * 1024 * 1024 * 1024,
+            $"Default ConsoleLog peak disk {peakBytes} bytes exceeds 10 GiB sanity ceiling.");
+    }
+
     [Fact]
     public void ValidateAndPrepare_RejectsLogPathWhoseDirectoryCannotBeCreated()
     {
@@ -593,6 +699,30 @@ public sealed class CodeyBoxOptionsValidatorTests
                 break;
             case "audit-path":
                 options.AuditPath = " ";
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+        }
+    }
+
+    private static void ApplyInvalidConsoleLogScenario(AuditLogOptions options, string scenario)
+    {
+        switch (scenario)
+        {
+            case "null":
+                options.ConsoleLog = null!;
+                break;
+            case "path":
+                options.ConsoleLog.Enabled = true;
+                options.ConsoleLog.Path = " ";
+                break;
+            case "retention":
+                options.ConsoleLog.Enabled = true;
+                options.ConsoleLog.RetainedFileCountLimit = 0;
+                break;
+            case "size":
+                options.ConsoleLog.Enabled = true;
+                options.ConsoleLog.MaxFileSizeBytes = 1024;
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);

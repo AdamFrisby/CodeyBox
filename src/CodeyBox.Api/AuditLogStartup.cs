@@ -2,6 +2,8 @@ namespace CodeyBox.Api;
 
 internal static class AuditLogStartup
 {
+    private const long MinConsoleLogMaxFileSize = 1L * 1024 * 1024;
+
     public static IReadOnlyList<string> Validate(AuditLogOptions options)
     {
         var failures = new List<string>();
@@ -11,6 +13,23 @@ internal static class AuditLogStartup
             failures.Add("CodeyBox:AuditLog:Path must be non-empty");
         if (string.IsNullOrWhiteSpace(options.AuditPath))
             failures.Add("CodeyBox:AuditLog:AuditPath must be non-empty");
+
+        var consoleLog = options.ConsoleLog;
+        if (consoleLog is null)
+        {
+            failures.Add("CodeyBox:AuditLog:ConsoleLog must not be null");
+        }
+        else if (consoleLog.Enabled)
+        {
+            if (string.IsNullOrWhiteSpace(consoleLog.Path))
+                failures.Add("CodeyBox:AuditLog:ConsoleLog:Path must be non-empty");
+            if (consoleLog.RetainedFileCountLimit < 1)
+                failures.Add("CodeyBox:AuditLog:ConsoleLog:RetainedFileCountLimit must be >= 1");
+            if (consoleLog.MaxFileSizeBytes < MinConsoleLogMaxFileSize)
+                failures.Add(
+                    "CodeyBox:AuditLog:ConsoleLog:MaxFileSizeBytes must be >= 1048576 (1 MiB)");
+        }
+
         return failures;
     }
 
@@ -22,7 +41,10 @@ internal static class AuditLogStartup
 
         // Ensure log directories exist and are writable before handing control
         // to Serilog, so misconfigured paths surface at startup.
-        foreach (var logPath in new[] { options.Path, options.AuditPath })
+        var pathsToPrepare = new List<string> { options.Path, options.AuditPath };
+        if (options.ConsoleLog.Enabled)
+            pathsToPrepare.Add(options.ConsoleLog.Path);
+        foreach (var logPath in pathsToPrepare)
             PrepareDirectory(logPath);
     }
 
