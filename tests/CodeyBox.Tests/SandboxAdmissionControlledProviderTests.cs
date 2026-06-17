@@ -709,6 +709,82 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.False(provider is ISuspendingSandboxProvider);
     }
 
+    /// <summary>
+    /// Production sandboxes go through <see cref="SandboxAdmissionControlledProvider"/>.
+    /// If that wrapper drops <see cref="ISandbox.AgentOutputTransportKind"/> or stops
+    /// forwarding <see cref="SandboxExec.AgentOutputTransport"/>, batch runners
+    /// silently fall back to the attached ExecPipe in production while the runner-
+    /// level transport-selection tests continue to pass against fakes. Cover the
+    /// wrapper directly: an HttpIngest-capable inner sandbox must still report
+    /// HttpIngest after wrap, and a PreferDetachedHttpIngest request on the wrapped
+    /// sandbox must reach the inner ExecAsync with that preference intact.
+    /// </summary>
+    [Fact]
+    public async Task Wrap_HttpIngestInnerSandbox_PreservesTransportKindAndForwardsBatchExecPreference()
+    {
+        var inner = new HttpIngestCapableProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+
+        Assert.Equal(SandboxAgentOutputTransportKind.HttpIngest, provider.AgentOutputTransportKind);
+
+        await using var wrapped = await provider.CreateAsync(Spec(), CancellationToken.None);
+        Assert.Equal(SandboxAgentOutputTransportKind.HttpIngest, wrapped.AgentOutputTransportKind);
+
+        var batchPreference = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest;
+        await wrapped.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            WorkingDirectory = "/work",
+            AgentOutputTransport = batchPreference,
+        }, CancellationToken.None);
+
+        var recorded = inner.LastExec;
+        Assert.NotNull(recorded);
+        Assert.Equal(batchPreference, recorded!.AgentOutputTransport);
+        Assert.Equal(new[] { "agent-cli", "--json" }, recorded.Argv);
+    }
+
+    private sealed class HttpIngestCapableProvider : PlainCountingProvider, ISandboxProvider
+    {
+        public SandboxExec? LastExec { get; set; }
+
+        SandboxAgentOutputTransportKind ISandboxProvider.AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+
+        public override Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => Task.FromResult<ISandbox>(new HttpIngestCapableSandbox(this));
+
+        private sealed class HttpIngestCapableSandbox(HttpIngestCapableProvider provider) : ISandbox
+        {
+            public string Id => "http-ingest-sandbox";
+            public long? MemoryBytes => null;
+            public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+
+            public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            {
+                provider.LastExec = exec;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+                => Task.FromResult(Array.Empty<byte>());
+
+            public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+                => Task.CompletedTask;
+
+            public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+                => Task.FromResult<SandboxAccessibilitySnapshot?>(null);
+
+            public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+                => Task.FromResult<string?>(null);
+
+            public ValueTask DisposeAsync()
+            {
+                provider.Release();
+                return ValueTask.CompletedTask;
+            }
+        }
+    }
+
     public static IEnumerable<object[]> ProviderCapabilityCases()
     {
         for (var value = 0; value < 32; value++)

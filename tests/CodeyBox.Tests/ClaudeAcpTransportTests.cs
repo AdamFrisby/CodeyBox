@@ -34,6 +34,35 @@ public sealed class ClaudeAcpTransportTests
         Assert.Equal("print", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
     }
 
+    /// <summary>
+    /// Print-mode session turns share a separate transport-selection branch
+    /// from the base CLI runner's batch path. The HttpIngest case is covered
+    /// in <see cref="Transport_DefaultsToPrint_AndUsesClaudePrintArgv"/>; this
+    /// fixture exercises the ExecPipe fallback so a regression that always
+    /// requested detached HTTP (and therefore broke Claude sessions on
+    /// sandboxes without the host listener) cannot slip through the
+    /// HttpIngest-only assertions.
+    /// </summary>
+    [Fact]
+    public async Task Transport_PrintFallsBackToExecPipeOnSandboxesWithoutHttpIngest()
+    {
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-execpipe"))
+        {
+            AgentOutputTransportKind = SandboxAgentOutputTransportKind.ExecPipe,
+        };
+        var worker = new ClaudeSessionWorker(BuildRunner());
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        await worker.SendTurnAsync(handle, "first");
+
+        var argv = sandbox.LastClaudeExec!.Argv.ToList();
+        Assert.Contains("--print", argv);
+        Assert.Equal(
+            SandboxAgentOutputTransportPreference.ExecPipe,
+            sandbox.LastClaudeExec.AgentOutputTransport);
+        Assert.Equal("print", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
+    }
+
     [Fact]
     public async Task Transport_AcpSelected_UsesAcpTransportInsteadOfPrint()
     {
@@ -984,7 +1013,7 @@ public sealed class ClaudeAcpTransportTests
         public List<SandboxExec> AllClaudeExecs { get; } = new();
         public SandboxExec? LastClaudeExec => AllClaudeExecs.Count == 0 ? null : AllClaudeExecs[^1];
         public string Id { get; } = "vm-" + Guid.NewGuid().ToString("N")[..8];
-        public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; init; } = SandboxAgentOutputTransportKind.HttpIngest;
 
         public RecordingSandbox(params string[] claudeStdouts)
             => _claudeStdouts = new Queue<string>(claudeStdouts);

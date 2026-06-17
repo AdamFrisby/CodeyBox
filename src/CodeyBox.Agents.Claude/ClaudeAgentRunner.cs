@@ -591,11 +591,6 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             Stderr: execResult.Stderr);
     }
 
-    private static SandboxAgentOutputTransportPreference SelectBatchAgentOutputTransport(ISandbox sandbox)
-        => sandbox.AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
-            ? SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest
-            : SandboxAgentOutputTransportPreference.ExecPipe;
-
     private static bool ContainsUnsupportedFlagMessage(string output) =>
         output.Contains("unknown option", StringComparison.OrdinalIgnoreCase)
         || output.Contains("unknown argument", StringComparison.OrdinalIgnoreCase)

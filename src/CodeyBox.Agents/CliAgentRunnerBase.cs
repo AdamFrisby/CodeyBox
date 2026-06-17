@@ -529,7 +529,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stderr: result.Stderr);
     }
 
-    private static SandboxAgentOutputTransportPreference SelectBatchAgentOutputTransport(ISandbox sandbox)
+    // Centralised batch-runner transport policy: keep detached-HTTP for
+    // sandboxes that expose the host-listener data plane, fall back to the
+    // attached exec pipe everywhere else. Both this base class and Claude's
+    // session runner consume it so the print-mode / batch-CLI paths stay in
+    // lockstep — diverging copies are what the audit flagged.
+    protected internal static SandboxAgentOutputTransportPreference SelectBatchAgentOutputTransport(ISandbox sandbox)
         => sandbox.AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
             ? SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest
             : SandboxAgentOutputTransportPreference.ExecPipe;
@@ -726,6 +731,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
             Stdin = invocation.Stdin,
+            // Text-only CLI calls are also one-shot stdin-driven agent CLI
+            // runs (cursor/opencode text resolvers, review hooks) — give them
+            // the same detached HTTP transport as the main batch path so the
+            // host-side multipass exec returns immediately rather than
+            // busy-looping its SSH/gRPC pump for the call's full lifetime.
+            AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),
         }, ct);
 
         if (!result.Success)

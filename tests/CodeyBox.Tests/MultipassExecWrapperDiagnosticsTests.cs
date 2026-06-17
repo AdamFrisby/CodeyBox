@@ -273,9 +273,10 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             var stderrRequest = Assert.Single(requests, r => r.Stream == "stderr");
             Assert.Equal(0, stderrRequest.Seq);
             Assert.Equal("err-1\n", stderrRequest.BodyText);
-            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
-            Assert.Equal(0, exitRequest.Seq);
-            Assert.Equal("0\n", exitRequest.BodyText);
+            // Completion no longer travels over HTTP — the wrapper writes the
+            // exit code to CODEYBOX_AGENT_EXIT_FILE (when set), which the host
+            // reads alongside the process-group probe.
+            Assert.DoesNotContain(requests, r => r.Stream == "exit");
             Assert.DoesNotContain(requests, r => r.BodyText.Contains(token, StringComparison.Ordinal));
             Assert.DoesNotContain(requests, r => r.BodyText.Contains(exitToken, StringComparison.Ordinal));
         }
@@ -287,7 +288,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     }
 
     [Fact]
-    public async Task ExecWrapper_HttpOutputTransportWithLogFileTeesOutputAndPostsExit()
+    public async Task ExecWrapper_HttpOutputTransportWithLogFileTeesOutputAndWritesExitSidecar()
     {
         if (OperatingSystem.IsWindows()) return;
         if (!await CommandAvailableAsync("python3")) return;
@@ -298,13 +299,14 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         var wrapperPath = await CreateExecutableWrapperAsync();
         Directory.CreateDirectory(workDir);
         var logPath = Path.Combine(workDir, "agent.log");
+        var exitFile = Path.Combine(workDir, "agent.host.exit");
         var env = new Dictionary<string, string?>
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
-            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-log",
             ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
+            ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
         };
 
         try
@@ -324,17 +326,18 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             Assert.Equal("", stdout);
             Assert.Equal("", stderr);
             Assert.Equal("out-log\nerr-log\n", await File.ReadAllTextAsync(logPath));
+            // The log-file sidecar stays for the suspend/resume recovery path.
             Assert.Equal("5\n", await File.ReadAllTextAsync(logPath + ".exit"));
+            // The host-trusted sidecar is what the detached supervisor reads.
+            Assert.Equal("5", (await File.ReadAllTextAsync(exitFile)).Trim());
 
             var requests = server.Requests.ToArray();
             Assert.Contains(requests, r => r.Stream == "ready" && r.RunId == "run-wrapper-log" && r.Seq == 0);
             Assert.DoesNotContain(requests, r => r.Stream == "stderr");
             Assert.Equal("out-log\nerr-log\n", string.Concat(
                 requests.Where(r => r.Stream == "stdout").OrderBy(r => r.Seq).Select(r => r.BodyText)));
-
-            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
-            Assert.Equal(0, exitRequest.Seq);
-            Assert.Equal("5\n", exitRequest.BodyText);
+            // Completion left HTTP — the supervisor reads the sidecar, not /exit.
+            Assert.DoesNotContain(requests, r => r.Stream == "exit");
         }
         finally
         {
@@ -386,26 +389,28 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     }
 
     [Fact]
-    public async Task ExecWrapper_HttpOutputTransportTerminalExitStatusFailsRunAfterStreamsSucceed()
+    public async Task ExecWrapper_HttpOutputTransportWritesExitSidecarAndReturnsAgentExitCode()
     {
         if (OperatingSystem.IsWindows()) return;
         if (!await CommandAvailableAsync("python3")) return;
 
-        await using var server = StubHttpIngestServer.Start(request => request.Stream switch
-        {
-            "ready" => 204,
-            "exit" => 409,
-            _ => 200,
-        });
+        // The wrapper used to POST /exit and surface 87 on HTTP failure. That
+        // path was removed: completion now travels through the host-trusted
+        // CODEYBOX_AGENT_EXIT_FILE sidecar. The wrapper writes the agent's
+        // exit code there and the supervisor reads it after the process-group
+        // probe reports exited.
+        await using var server = StubHttpIngestServer.Start(request =>
+            request.Stream == "ready" ? 204 : 200);
         var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
         var wrapperPath = await CreateExecutableWrapperAsync();
         Directory.CreateDirectory(workDir);
+        var exitFile = Path.Combine(workDir, "agent.exit");
         var env = new Dictionary<string, string?>
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
-            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
-            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-exit-conflict",
+            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-exit-sidecar",
+            ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
         };
 
@@ -422,16 +427,15 @@ public sealed class MultipassExecWrapperDiagnosticsTests
                 [wrapperPath, workDir, "sh", "-c", agentScript],
                 env);
 
-            Assert.Equal(87, exit);
+            Assert.Equal(4, exit);
             Assert.Equal("", stdout);
-            Assert.Contains("agent output HTTP ingest failed during run", stderr, StringComparison.Ordinal);
+            Assert.Equal("", stderr);
+            Assert.Equal("4", (await File.ReadAllTextAsync(exitFile)).Trim());
 
             var requests = server.Requests.ToArray();
             Assert.Contains(requests, r => r.Stream == "stdout" && r.BodyText == "out-before-exit\n");
             Assert.Contains(requests, r => r.Stream == "stderr" && r.BodyText == "err-before-exit\n");
-            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
-            Assert.Equal(0, exitRequest.Seq);
-            Assert.Equal("4\n", exitRequest.BodyText);
+            Assert.DoesNotContain(requests, r => r.Stream == "exit");
         }
         finally
         {

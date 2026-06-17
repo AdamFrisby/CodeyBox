@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -737,37 +738,31 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedMarkerDisappearsAfterHttpExitFailsWithCleanupDiagnostic()
+    public async Task ExecAsync_DetachedMarkerMissingAtPollTimeFailsWithCleanupDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        string? transferredEnvContent = null;
-        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return new ProcessRunResult(0, "", "");
-            if (argv is [_, "transfer", var hostPath, var destination])
-            {
-                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
-                return new ProcessRunResult(0, "", "");
-            }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                await PostExitFromEnvironmentAsync(transferredEnvContent, 0, ct);
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
-                return new ProcessRunResult(0, "missing\n", "");
+                return Task.FromResult(new ProcessRunResult(0, "missing\n", ""));
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -780,47 +775,53 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.False(result.Success);
         Assert.Equal(1, result.ExitCode);
         Assert.Contains("detached exec process group marker", result.Stderr);
-        Assert.Contains("disappeared before cleanup", result.Stderr);
+        Assert.Contains("was not written", result.Stderr);
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedProcessGroupStillAliveAfterTerminationFailsWithCleanupDiagnostic()
+    public async Task ExecAsync_DetachedProcessGroupStaysAliveBeyondReapWindowIsTerminated()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        string? transferredEnvContent = null;
+        // Once the sidecar reports exit, EnsureDetachedProcessGroupReapedAsync
+        // verifies the process group has actually wound down. If it does not,
+        // the supervisor escalates to TERM and surfaces the failure if the
+        // group still appears alive after that escalation.
+        var pollCalls = 0;
         var killCalls = 0;
-        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return new ProcessRunResult(0, "", "");
-            if (argv is [_, "transfer", var hostPath, var destination])
-            {
-                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
-                return new ProcessRunResult(0, "", "");
-            }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                await PostExitFromEnvironmentAsync(transferredEnvContent, 0, ct);
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupKill(argv))
             {
                 killCalls++;
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
-                return new ProcessRunResult(0, "alive 12345\n", "");
+            {
+                pollCalls++;
+                // Report exit with code 0 first so the supervisor enters the
+                // reap loop; from then on report alive so reap escalates.
+                return Task.FromResult(pollCalls == 1
+                    ? new ProcessRunResult(0, "exited 12345 0\n", "")
+                    : new ProcessRunResult(0, "alive 12345\n", ""));
+            }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -837,43 +838,45 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedTerminationFailureWithLiveGroupFailsWithCleanupDiagnostic()
+    public async Task ExecAsync_DetachedTerminationTransportFailureWithLiveGroupFailsWithCleanupDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        string? transferredEnvContent = null;
+        // Same shape as the sibling test above, but the TERM escalation itself
+        // fails — the diagnostic must still surface the live process group.
+        var pollCalls = 0;
         var killCalls = 0;
-        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return new ProcessRunResult(0, "", "");
-            if (argv is [_, "transfer", var hostPath, var destination])
-            {
-                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
-                return new ProcessRunResult(0, "", "");
-            }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                await PostExitFromEnvironmentAsync(transferredEnvContent, 0, ct);
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupKill(argv))
             {
                 killCalls++;
-                return new ProcessRunResult(42, "", "kill transport failed");
+                return Task.FromResult(new ProcessRunResult(42, "", "kill transport failed"));
             }
             if (IsDetachedProcessGroupPoll(argv))
-                return new ProcessRunResult(0, "alive 12345\n", "");
+            {
+                pollCalls++;
+                return Task.FromResult(pollCalls == 1
+                    ? new ProcessRunResult(0, "exited 12345 0\n", "")
+                    : new ProcessRunResult(0, "alive 12345\n", ""));
+            }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -1091,54 +1094,43 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedTransientPollFailureAfterHttpExitPreservesAgentExit()
+    public async Task ExecAsync_DetachedTransientPollFailureIsToleratedAndExitSidecarPreservesAgentExit()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        string? transferredEnvContent = null;
         var pollCalls = 0;
         var killCalls = 0;
-        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return new ProcessRunResult(0, "", "");
-            if (argv is [_, "transfer", var hostPath, var destination])
-            {
-                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
-                return new ProcessRunResult(0, "", "");
-            }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                Assert.NotNull(transferredEnvContent);
-                var url = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
-                var token = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable);
-                var runId = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
-                using var client = new HttpClient();
-                await PostAgentOutputAsync(client, url, runId, "exit", 0, token, "0\n", ct);
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
             {
                 pollCalls++;
-                return pollCalls == 1
+                return Task.FromResult(pollCalls == 1
                     ? new ProcessRunResult(1, "", "instance \"codeybox-test\" does not exist")
-                    : new ProcessRunResult(0, "exited 12345\n", "");
+                    : new ProcessRunResult(0, "exited 12345 0\n", ""));
             }
             if (IsDetachedProcessGroupKill(argv))
             {
                 killCalls++;
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -1156,47 +1148,47 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedPersistentPollFailureAfterHttpExitPreservesAgentExitAndReturnsCleanupDiagnostic()
+    public async Task ExecAsync_DetachedPersistentPollFailureAfterExitSidecarPreservesAgentExitAndReturnsCleanupDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        string? transferredEnvContent = null;
         var pollCalls = 0;
         var killCalls = 0;
-        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return new ProcessRunResult(0, "", "");
-            if (argv is [_, "transfer", var hostPath, var destination])
-            {
-                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
-                return new ProcessRunResult(0, "", "");
-            }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                await PostExitFromEnvironmentAsync(transferredEnvContent, 23, ct);
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
             {
                 pollCalls++;
-                return new ProcessRunResult(42, "", "multipass control plane unavailable");
+                // The first poll surfaces the exit-code sidecar so the
+                // supervisor pins exit code 23, then all subsequent reap-loop
+                // polls fail to reach the daemon — exit code stays 23 and the
+                // cleanup diagnostic is surfaced.
+                return Task.FromResult(pollCalls == 1
+                    ? new ProcessRunResult(0, "exited 12345 23\n", "")
+                    : new ProcessRunResult(42, "", "multipass control plane unavailable"));
             }
             if (IsDetachedProcessGroupKill(argv))
             {
                 killCalls++;
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -1208,58 +1200,52 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Equal(23, result.ExitCode);
-        Assert.Equal(13, pollCalls);
+        Assert.True(pollCalls >= 2);
         Assert.Equal(1, killCalls);
         Assert.Contains("detached exec process group poll failed (exit 42): multipass control plane unavailable", result.Stderr);
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedProcessGroupPollFailureBeforeHttpExitDoesNotTerminateProcessGroup()
+    public async Task ExecAsync_DetachedTransientPollFailureBeforeExitSidecarDoesNotTerminateProcessGroup()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        string? transferredEnvContent = null;
         var killCalls = 0;
         var pollCalls = 0;
-        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return new ProcessRunResult(0, "", "");
-            if (argv is [_, "transfer", var hostPath, var destination])
-            {
-                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
-                return new ProcessRunResult(0, "", "");
-            }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupKill(argv))
             {
                 killCalls++;
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
             {
                 pollCalls++;
-                if (pollCalls == 1)
-                {
-                    await PostExitFromEnvironmentAsync(transferredEnvContent, 0, ct);
-                    return new ProcessRunResult(1, "", "multipass control plane unavailable");
-                }
-
-                return new ProcessRunResult(0, "exited 12345\n", "");
+                // First poll fails transiently; subsequent polls report the
+                // exit-code sidecar so the supervisor reaches exit 0 without
+                // ever escalating to TERM.
+                return Task.FromResult(pollCalls == 1
+                    ? new ProcessRunResult(1, "", "multipass control plane unavailable")
+                    : new ProcessRunResult(0, "exited 12345 0\n", ""));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -1321,37 +1307,33 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedMalformedProcessGroupPollStdoutAfterHttpExitPreservesAgentExitAndReturnsDiagnostic()
+    public async Task ExecAsync_DetachedMalformedProcessGroupPollStdoutReturnsDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
 
-        string? transferredEnvContent = null;
-        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
-                return new ProcessRunResult(0, "", "");
-            if (argv is [_, "transfer", var hostPath, var destination])
-            {
-                if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = await File.ReadAllTextAsync(hostPath, ct);
-                return new ProcessRunResult(0, "", "");
-            }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", _, _])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                await PostExitFromEnvironmentAsync(transferredEnvContent, 17, ct);
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
-                return new ProcessRunResult(0, "garbage marker state\n", "");
+                return Task.FromResult(new ProcessRunResult(0, "garbage marker state\n", ""));
+            if (IsDetachedProcessGroupKill(argv))
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
-                return new ProcessRunResult(0, "", "");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = NewLoopbackHttpIngestSandbox(runner);
 
@@ -1362,12 +1344,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         });
 
         Assert.False(result.Success);
-        Assert.Equal(17, result.ExitCode);
+        Assert.Equal(1, result.ExitCode);
         Assert.Contains("detached exec process group poll returned malformed output: garbage marker state", result.Stderr);
     }
 
     [Fact]
-    public async Task ExecAsync_DetachedProcessGroupExitedBeforeHttpExitReturnsDiagnostic()
+    public async Task ExecAsync_DetachedProcessGroupExitedWithoutExitSidecarReturnsDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
@@ -1388,6 +1370,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
             if (IsDetachedProcessGroupPoll(argv))
             {
+                // "exited <pgid>" with no exit code means the PG is gone but
+                // the wrapper never wrote the sidecar — the supervisor must
+                // surface a diagnostic rather than guess success.
                 return Task.FromResult(new ProcessRunResult(0, "exited 12345\n", ""));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
@@ -1405,7 +1390,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("detached exec process group 12345 exited before HTTP exit notification", result.Stderr);
+        Assert.Contains("detached exec process group 12345 exited without writing the exit-code sidecar", result.Stderr);
     }
 
     [Fact]
@@ -4166,18 +4151,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         response.EnsureSuccessStatusCode();
     }
 
-    private static async Task PostExitFromEnvironmentAsync(
-        string? envFileContent,
-        int exitCode,
-        CancellationToken ct)
-    {
-        Assert.NotNull(envFileContent);
-        var url = ExtractShellEnvValue(envFileContent!, MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
-        var token = ExtractShellEnvValue(envFileContent!, MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable);
-        var runId = ExtractShellEnvValue(envFileContent!, MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
-        using var client = new HttpClient();
-        await PostAgentOutputAsync(client, url, runId, "exit", 0, token, $"{exitCode}\n", ct);
-    }
+    private static string BuildPollOutput(int pgid, int? exitCode) =>
+        exitCode is { } code
+            ? $"exited {pgid} {code}\n"
+            : $"exited {pgid}\n";
 
     private static async Task<(int Exit, string Stdout, string Stderr)> RunLocalProcessAsync(
         string fileName,
@@ -4340,7 +4317,21 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 "/bin/sh",
                 ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-local-poll", text],
                 ct);
-            return new ProcessRunResult(0, exit == 0 ? $"alive {pgid}\n" : $"exited {pgid}\n", "");
+            if (exit == 0)
+                return new ProcessRunResult(0, $"alive {pgid}\n", "");
+
+            // Process group is gone. Mirror the real poll script: if the
+            // exit-code sidecar exists, include the code so the supervisor
+            // sees the host-trusted completion value.
+            var exitFile = MapVmPath(vmProcessGroupMarker + ".exit");
+            if (File.Exists(exitFile))
+            {
+                var exitCodeText = (await File.ReadAllTextAsync(exitFile, ct)).Trim();
+                if (int.TryParse(exitCodeText, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
+                    return new ProcessRunResult(0, $"exited {pgid} {exitCodeText}\n", "");
+            }
+
+            return new ProcessRunResult(0, $"exited {pgid}\n", "");
         }
 
         public void RemoveVmPaths(IEnumerable<string> vmPaths)
@@ -5957,72 +5948,116 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecWrapper_MissingHttpExitTokenFailsBeforeAgentLaunch()
+    public async Task ExecWrapper_DoesNotRequireExitTokenForHttpTransport()
     {
         if (OperatingSystem.IsWindows())
             return;
 
-        var wrapper = Path.Combine(_workspace, "codeybox-exec-missing-exit-token");
-        var sentinel = Path.Combine(_workspace, "missing-exit-token-agent-started");
+        // The wrapper no longer requires CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN.
+        // Completion travels through the host-trusted CODEYBOX_AGENT_EXIT_FILE
+        // sidecar instead of a bearer-token HTTP POST. The wrapper still
+        // refuses to launch if the stream channel is unreachable, but the
+        // missing exit token alone must not block the agent.
+        var wrapper = Path.Combine(_workspace, "codeybox-exec-no-exit-token");
+        var sentinel = Path.Combine(_workspace, "no-exit-token-agent-started");
+        var exitFile = Path.Combine(_workspace, "no-exit-token-agent.exit");
         await File.WriteAllTextAsync(wrapper, MultipassSandboxProvider.ExecWrapperScript);
         File.SetUnixFileMode(wrapper, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "exit-token-not-required",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
         var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = "http://127.0.0.1:9/codeybox-agent-output",
-            [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "stream-token",
-            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-id",
+            [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = session.BaseUrl,
+            [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = session.Token,
+            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = session.RunId,
+            ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
         };
 
-        var (exit, stdout, stderr) = await RunLocalProcessAsync(
+        var (exit, stdout, _) = await RunLocalProcessAsync(
             "/bin/bash",
-            [wrapper, _workspace, "/bin/sh", "-c", "printf launched > \"$1\"", "codeybox-missing-exit-token", sentinel],
+            [wrapper, _workspace, "/bin/sh", "-c", "printf launched > \"$1\"; exit 4", "codeybox-no-exit-token", sentinel],
             environmentKeysToRemove:
             [
                 MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable,
             ],
             environmentOverrides: environment);
 
-        Assert.Equal(MultipassSandbox.AgentOutputHttpSetupFailedExitCode, exit);
+        Assert.Equal(4, exit);
         Assert.Equal("", stdout);
-        Assert.Contains(MultipassSandbox.AgentOutputHttpSetupFailureMarker, stderr);
-        Assert.False(File.Exists(sentinel));
+        Assert.True(File.Exists(sentinel));
+        Assert.True(File.Exists(exitFile));
+        Assert.Equal("4", (await File.ReadAllTextAsync(exitFile)).Trim());
     }
 
     [Fact]
-    public async Task DetachedLaunchScript_MissingHttpExitTokenFailsBeforeAgentLaunch()
+    public async Task DetachedLaunchScript_DoesNotRequireExitTokenForHttpTransport()
     {
         if (OperatingSystem.IsWindows())
             return;
 
-        var envFile = Path.Combine(_workspace, "detached-missing-exit-token.env");
-        var launchScript = Path.Combine(_workspace, "detached-missing-exit-token.sh");
-        var processGroupMarker = Path.Combine(_workspace, "detached-missing-exit-token.pgid");
-        var sentinel = Path.Combine(_workspace, "detached-missing-exit-token-agent-started");
-        await File.WriteAllTextAsync(
-            envFile,
-            string.Join('\n',
-            [
-                $"{MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable}={MultipassSandboxProvider.ShellSingleQuote("http://127.0.0.1:9/codeybox-agent-output")}",
-                $"{MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable}={MultipassSandboxProvider.ShellSingleQuote("stream-token")}",
-                $"{MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable}={MultipassSandboxProvider.ShellSingleQuote("run-id")}",
-                "",
-            ]));
+        // The launch script also stopped gating on CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN.
+        // With a reachable stream channel and a sidecar path, the detached
+        // agent must launch and the wrapper must write the exit file.
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "launch-script-no-exit-token",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var wrapper = Path.Combine(_workspace, "codeybox-exec-launch-no-exit-token");
+        var envFile = Path.Combine(_workspace, "detached-no-exit-token.env");
+        var launchScript = Path.Combine(_workspace, "detached-no-exit-token.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-no-exit-token.pgid");
+        var sentinel = Path.Combine(_workspace, "detached-no-exit-token-agent-started");
+        var exitFile = processGroupMarker + ".exit";
+
+        await File.WriteAllTextAsync(wrapper, MultipassSandboxProvider.ExecWrapperScript);
+        File.SetUnixFileMode(wrapper, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var sessionEnvironment = session.BuildEnvironment();
+        Assert.DoesNotContain(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable, sessionEnvironment.Keys);
+        var lines = new List<string>();
+        foreach (var (k, v) in sessionEnvironment)
+            lines.Add($"{k}={MultipassSandboxProvider.ShellSingleQuote(v)}");
+        lines.Add($"CODEYBOX_AGENT_EXIT_FILE={MultipassSandboxProvider.ShellSingleQuote(exitFile)}");
+        lines.Add("");
+        await File.WriteAllTextAsync(envFile, string.Join('\n', lines));
+
         await File.WriteAllTextAsync(
             launchScript,
             MultipassSandbox.BuildDetachedLaunchScript(
                 envFile,
                 processGroupMarker,
-                ["/bin/sh", "-c", "printf launched > \"$1\"", "codeybox-detached-missing-exit-token", sentinel]));
+                [wrapper, _workspace, "/bin/sh", "-c", "printf launched > \"$1\"; exit 2", "codeybox-detached-no-exit-token", sentinel]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        var (exit, stdout, stderr) = await RunLocalProcessAsync("/bin/bash", [launchScript]);
+        var (exit, stdout, _) = await RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            environmentKeysToRemove:
+            [
+                MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable,
+            ]);
+        await WaitForFileAsync(exitFile, TimeSpan.FromSeconds(6));
 
-        Assert.Equal(MultipassSandbox.AgentOutputHttpSetupFailedExitCode, exit);
+        Assert.Equal(0, exit);
         Assert.Equal("", stdout);
-        Assert.Contains(MultipassSandbox.AgentOutputHttpSetupFailureMarker, stderr);
-        Assert.False(File.Exists(processGroupMarker));
-        Assert.False(File.Exists(sentinel));
+        Assert.True(File.Exists(processGroupMarker));
+        Assert.True(File.Exists(sentinel));
+        Assert.Equal("2", (await File.ReadAllTextAsync(exitFile)).Trim());
     }
 
     /// <summary>

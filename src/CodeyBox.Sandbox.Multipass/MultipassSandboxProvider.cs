@@ -3198,15 +3198,17 @@ test "$work" = present && test "$exec_wrapper" = present
         # Optional agent-output HTTP transport. The host injects these
         # variables only for agent CLI invocations that opted into the
         # transport. Copy them into shell locals and remove them from the
-        # exported environment before launching the agent. Long-lived streamer
-        # subprocesses receive only the stream token; the exit token remains
-        # shell-local until the one-shot completion post, and the agent process
-        # inherits neither token.
+        # exported environment before launching the agent. The agent process
+        # inherits neither the stream token nor the run id. Completion no
+        # longer flows over HTTP — the host polls the detached process group
+        # and reads CODEYBOX_AGENT_EXIT_FILE for the exit code, so any legacy
+        # CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN is scrubbed defensively even though
+        # it is no longer trusted.
         codeybox_output_url="${CODEYBOX_AGENT_OUTPUT_URL:-}"
         codeybox_output_token="${CODEYBOX_AGENT_OUTPUT_TOKEN:-}"
-        codeybox_output_exit_token="${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}"
         codeybox_output_run_id="${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}"
-        unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID
+        codeybox_exit_file_path="${CODEYBOX_AGENT_EXIT_FILE:-}"
+        unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_EXIT_FILE
         codeybox_http_post() {
             local codeybox_stream_name="$1"
             local codeybox_stream_seq="$2"
@@ -3309,8 +3311,20 @@ test "$work" = present && test "$exec_wrapper" = present
         codeybox_http_ready() {
             codeybox_http_post ready 0 "$codeybox_output_token" </dev/null
         }
-        codeybox_http_exit() {
-            printf '%s\n' "$1" | codeybox_http_post exit 0 "$codeybox_output_exit_token"
+        # Best-effort sidecar write. The host polls the detached process group
+        # and, once the group has exited, reads the exit code from this file.
+        # The host treats a missing or malformed file as "exit code unknown",
+        # so a failed write surfaces as a diagnostic rather than a silently
+        # forged success.
+        codeybox_write_exit_file() {
+            if [ -z "$codeybox_exit_file_path" ]; then
+                return 0
+            fi
+            codeybox_exit_dir=$(dirname "$codeybox_exit_file_path")
+            mkdir -p "$codeybox_exit_dir" 2>/dev/null || true
+            codeybox_exit_tmp="${codeybox_exit_file_path}.tmp"
+            { umask 077; printf '%s\n' "$1" > "$codeybox_exit_tmp"; } 2>/dev/null
+            mv -f "$codeybox_exit_tmp" "$codeybox_exit_file_path" 2>/dev/null || true
         }
         codeybox_run_user_command() {
             if [ "$keep_stdin" = "1" ]; then
@@ -3321,8 +3335,8 @@ test "$work" = present && test "$exec_wrapper" = present
                 "$@" </dev/null
             fi
         }
-        if [ -n "$codeybox_output_url$codeybox_output_token$codeybox_output_exit_token$codeybox_output_run_id" ]; then
-            if [ -z "$codeybox_output_url" ] || [ -z "$codeybox_output_token" ] || [ -z "$codeybox_output_exit_token" ] || [ -z "$codeybox_output_run_id" ]; then
+        if [ -n "$codeybox_output_url$codeybox_output_token$codeybox_output_run_id" ]; then
+            if [ -z "$codeybox_output_url" ] || [ -z "$codeybox_output_token" ] || [ -z "$codeybox_output_run_id" ]; then
                 echo "codeybox-exec: agent output HTTP ingest unavailable before launch" >&2
                 exit 86
             fi
@@ -3341,11 +3355,8 @@ test "$work" = present && test "$exec_wrapper" = present
                 codeybox_user_rc=${codeybox_status[0]}
                 codeybox_stream_rc=${codeybox_status[2]}
                 printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
+                codeybox_write_exit_file "$codeybox_user_rc"
                 if [ "$codeybox_stream_rc" -ne 0 ]; then
-                    echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
-                    exit 87
-                fi
-                if ! codeybox_http_exit "$codeybox_user_rc"; then
                     echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
                     exit 87
                 fi
@@ -3368,11 +3379,8 @@ test "$work" = present && test "$exec_wrapper" = present
             codeybox_user_rc=$?
             wait "$codeybox_out_stream_pid"; codeybox_out_stream_rc=$?
             wait "$codeybox_err_stream_pid"; codeybox_err_stream_rc=$?
+            codeybox_write_exit_file "$codeybox_user_rc"
             if [ "$codeybox_out_stream_rc" -ne 0 ] || [ "$codeybox_err_stream_rc" -ne 0 ]; then
-                echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
-                exit 87
-            fi
-            if ! codeybox_http_exit "$codeybox_user_rc"; then
                 echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
                 exit 87
             fi
@@ -3401,6 +3409,13 @@ test "$work" = present && test "$exec_wrapper" = present
             # Best-effort sidecar; the orchestrator treats missing file as
             # "not yet finished" so we never silently swallow a write error.
             printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
+            codeybox_write_exit_file "$codeybox_user_rc"
+            exit "$codeybox_user_rc"
+        fi
+        if [ -n "$codeybox_exit_file_path" ]; then
+            codeybox_run_user_command "$@"
+            codeybox_user_rc=$?
+            codeybox_write_exit_file "$codeybox_user_rc"
             exit "$codeybox_user_rc"
         fi
         if [ "$keep_stdin" = "1" ]; then
@@ -4955,6 +4970,23 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                     stderrChunkCallback = null;
                     forceEnvironmentFile = true;
                     detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
+                    if (detachedHttpIngest)
+                    {
+                        // Pin the process-group marker (and its companion exit-code
+                        // sidecar) up front so the env file we transfer to the VM
+                        // already carries CODEYBOX_AGENT_EXIT_FILE. The wrapper
+                        // writes the agent's exit code to that file; the orchestrator
+                        // reads it after polling the process group as exited. This is
+                        // the host-trusted supervisor channel that replaces the
+                        // forgeable HTTP exit-token notification.
+                        detachedProcessGroupMarker = $"/home/ubuntu/.codeybox-exec/detached-{Guid.NewGuid():N}.pgid";
+                        effectiveEnvironment = MergeExecEnvironment(
+                            effectiveEnvironment,
+                            new Dictionary<string, string>(StringComparer.Ordinal)
+                            {
+                                ["CODEYBOX_AGENT_EXIT_FILE"] = detachedProcessGroupMarker + ".exit",
+                            });
+                    }
                 }
                 else if (prefersDetachedHttpIngest)
                 {
@@ -4974,7 +5006,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 transferredVmPaths.Add(envFile);
                 if (detachedHttpIngest)
                 {
-                    detachedProcessGroupMarker = $"/home/ubuntu/.codeybox-exec/detached-{Guid.NewGuid():N}.pgid";
+                    // The process-group marker was pinned earlier so the
+                    // CODEYBOX_AGENT_EXIT_FILE env var could ride into the
+                    // transferred env file. Also schedule the sidecar exit
+                    // file for cleanup on the same teardown sweep.
+                    transferredVmPaths.Add(detachedProcessGroupMarker + ".exit");
                     if (exec.Stdin is not null)
                     {
                         detachedStdinFile = await TransferExecStdinAsync(exec.Stdin, ct);
@@ -5511,8 +5547,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("set +a");
         sb.AppendLine("codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
         sb.AppendLine("codeybox_output_token=\"${CODEYBOX_AGENT_OUTPUT_TOKEN:-}\"");
-        sb.AppendLine("codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"");
         sb.AppendLine("codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
+        // CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN is no longer trusted as a
+        // completion signal — the host polls the detached process group and
+        // reads CODEYBOX_AGENT_EXIT_FILE — but stale values from a prior
+        // turn are scrubbed defensively so the wrapper / agent never sees
+        // them.
         sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_RUN_ID");
         sb.AppendLine("codeybox_http_ready() {");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
@@ -5534,7 +5574,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("    sys.exit(1)");
         sb.AppendLine("PY");
         sb.AppendLine("}");
-        sb.AppendLine("if [ -z \"$codeybox_output_url\" ] || [ -z \"$codeybox_output_token\" ] || [ -z \"$codeybox_output_exit_token\" ] || [ -z \"$codeybox_output_run_id\" ]; then");
+        sb.AppendLine("if [ -z \"$codeybox_output_url\" ] || [ -z \"$codeybox_output_token\" ] || [ -z \"$codeybox_output_run_id\" ]; then");
         sb.Append("    echo ")
             .Append(MultipassSandboxProvider.ShellSingleQuote(AgentOutputHttpSetupFailureMarker))
             .AppendLine(" >&2");
@@ -5604,21 +5644,22 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         string processGroupMarker,
         CancellationToken ct)
     {
-        var exitTask = ingest.WaitForExitAsync(ct);
+        _ = ingest;
+        // Trust only the host-controlled process-group probe and the exit-code
+        // sidecar that the wrapper writes alongside the marker. The HTTP exit
+        // notification is intentionally not awaited here — a same-UID prior-
+        // turn process could forge it, and host-trusted state is the only
+        // reliable completion signal.
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var completed = await Task.WhenAny(exitTask, Task.Delay(TimeSpan.FromSeconds(2), ct)).ConfigureAwait(false);
-            if (completed == exitTask)
-                break;
+            await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
 
             var state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
-            if (exitTask.IsCompleted)
-                break;
             if (state.Status == DetachedProcessGroupStatus.PollFailed)
             {
                 _log.LogDebug(
-                    "Detached exec process group poll for {Name} failed while waiting for HTTP exit; keeping detached run alive: {Error}",
+                    "Detached exec process group poll for {Name} failed while waiting for completion; keeping detached run alive: {Error}",
                     _name,
                     state.Error?.Trim());
                 continue;
@@ -5632,15 +5673,24 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 return new DetachedExitResult(
                     1,
                     $"detached exec process group marker {processGroupMarker} was not written\n");
+            if (state.Status == DetachedProcessGroupStatus.Alive)
+                continue;
             if (state.Status == DetachedProcessGroupStatus.Exited)
+            {
+                if (state.ExitCode is { } exitCode)
+                {
+                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    return new DetachedExitResult(exitCode, reapError);
+                }
+
+                // PG is gone but the wrapper did not write the exit sidecar.
+                // The wrapper crashed, was killed, or never reached the sidecar
+                // write — surface a diagnostic rather than guessing success.
                 return new DetachedExitResult(
                     1,
-                    $"detached exec process group {state.ProcessGroupId} exited before HTTP exit notification was received\n");
+                    $"detached exec process group {state.ProcessGroupId} exited without writing the exit-code sidecar\n");
+            }
         }
-
-        var exitCode = await exitTask.ConfigureAwait(false);
-        var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
-        return new DetachedExitResult(exitCode, reapError);
     }
 
     private static ProcessRunResult BuildAgentOutputHttpSetupFailureResult(string detail)
@@ -5700,6 +5750,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         string processGroupMarker,
         CancellationToken ct)
     {
+        // The exit sidecar lives at <marker>.exit. We read it inline so a
+        // single multipass exec yields both liveness and (when available)
+        // the wrapper-written exit code — no separate `cat` round-trip and no
+        // additional host-side multipass spin.
         const string pollCommand = """
             codeybox_pgid_marker=$1
             if ! test -f "$codeybox_pgid_marker"; then
@@ -5716,7 +5770,20 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             if kill -0 "-$codeybox_pgid" 2>/dev/null; then
                 printf 'alive %s\n' "$codeybox_pgid"
             else
-                printf 'exited %s\n' "$codeybox_pgid"
+                codeybox_exit_file="${codeybox_pgid_marker}.exit"
+                if test -f "$codeybox_exit_file"; then
+                    codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
+                    case "$codeybox_exit_code" in
+                        ''|*[!0-9-]*)
+                            printf 'exited %s\n' "$codeybox_pgid"
+                            ;;
+                        *)
+                            printf 'exited %s %s\n' "$codeybox_pgid" "$codeybox_exit_code"
+                            ;;
+                    esac
+                else
+                    printf 'exited %s\n' "$codeybox_pgid"
+                fi
             fi
             exit 0
             """;
@@ -5732,27 +5799,51 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             return new DetachedProcessGroupProbe(
                 DetachedProcessGroupStatus.Malformed,
                 ProcessGroupId: null,
+                ExitCode: null,
                 Error: result.Stderr.TrimEnd() + "\n");
 
         if (result.ExitCode != 0)
             return new DetachedProcessGroupProbe(
                 DetachedProcessGroupStatus.PollFailed,
                 ProcessGroupId: null,
+                ExitCode: null,
                 Error: $"detached exec process group poll failed (exit {result.ExitCode}): {result.Stderr.TrimEnd()}\n");
 
         var text = result.Stdout.Trim();
         if (string.Equals(text, "missing", StringComparison.Ordinal))
-            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Missing, ProcessGroupId: null, Error: null);
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Missing, ProcessGroupId: null, ExitCode: null, Error: null);
         if (text.StartsWith("alive ", StringComparison.Ordinal)
             && int.TryParse(text["alive ".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var alivePgid))
-            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Alive, alivePgid, Error: null);
-        if (text.StartsWith("exited ", StringComparison.Ordinal)
-            && int.TryParse(text["exited ".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid))
-            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Exited, exitedPgid, Error: null);
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Alive, alivePgid, ExitCode: null, Error: null);
+        if (text.StartsWith("exited ", StringComparison.Ordinal))
+        {
+            var rest = text["exited ".Length..];
+            var spaceIdx = rest.IndexOf(' ', StringComparison.Ordinal);
+            if (spaceIdx < 0)
+            {
+                if (int.TryParse(rest, NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid))
+                    return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Exited, exitedPgid, ExitCode: null, Error: null);
+            }
+            else
+            {
+                var pgidText = rest[..spaceIdx];
+                var exitCodeText = rest[(spaceIdx + 1)..];
+                if (int.TryParse(pgidText, NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid)
+                    && int.TryParse(exitCodeText, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var exitCode))
+                {
+                    return new DetachedProcessGroupProbe(
+                        DetachedProcessGroupStatus.Exited,
+                        exitedPgid,
+                        ExitCode: exitCode,
+                        Error: null);
+                }
+            }
+        }
 
         return new DetachedProcessGroupProbe(
             DetachedProcessGroupStatus.Malformed,
             ProcessGroupId: null,
+            ExitCode: null,
             Error: $"detached exec process group poll returned malformed output: {text}\n");
     }
 
@@ -5818,6 +5909,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly record struct DetachedProcessGroupProbe(
         DetachedProcessGroupStatus Status,
         int? ProcessGroupId,
+        int? ExitCode,
         string? Error);
 
     private enum DetachedProcessGroupStatus

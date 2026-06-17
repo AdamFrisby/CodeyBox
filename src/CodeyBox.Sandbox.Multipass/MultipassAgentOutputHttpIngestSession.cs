@@ -153,7 +153,6 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         {
             [UrlEnvironmentVariable] = BaseUrl,
             [TokenEnvironmentVariable] = Token,
-            [ExitTokenEnvironmentVariable] = ExitToken,
             [RunIdEnvironmentVariable] = RunId,
         };
 

@@ -191,7 +191,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
                 return true;
             }
 
-            if (TryConfirmImmediateCpuProgress(itemId, sample, out var observedSample))
+            if (TryConfirmImmediateCpuProgress(itemId, sample, _processCpuSampleReader, out var observedSample))
             {
                 _processSamples[itemId] = observedSample;
                 reason = "process-cpu";

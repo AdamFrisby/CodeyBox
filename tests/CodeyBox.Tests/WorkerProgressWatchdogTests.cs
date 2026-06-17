@@ -606,7 +606,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
                 sample = new DefaultWorkerProgressActivitySource.ProcessCpuSample(
                     CpuTicks: 42,
                     ProcessSetSignature: "123:456",
-                    HasActiveProcessState: active);
+                    HasActiveProcessState: active,
+                    HasConfirmedProgress: false);
                 return true;
             });
         var probe = new WorkerProgressActivityProbe(
@@ -639,7 +640,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
                 sample = new DefaultWorkerProgressActivitySource.ProcessCpuSample(
                     CpuTicks: 42,
                     ProcessSetSignature: "123:456",
-                    HasActiveProcessState: sampleReads > 1);
+                    HasActiveProcessState: sampleReads > 1,
+                    HasConfirmedProgress: false);
                 return true;
             });
         var probe = new WorkerProgressActivityProbe(
