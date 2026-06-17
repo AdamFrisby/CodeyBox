@@ -9,6 +9,7 @@ namespace CodeyBox.Tests;
 /// Store-level tests validate the query logic; the OrchestratorService
 /// integration test validates that CheckBudgetAsync gates real pickups.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class BudgetEnforcementTests : IDisposable
 {
     private readonly string _dbPath =
