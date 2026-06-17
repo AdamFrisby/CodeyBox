@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CodeyBox.Api;
 
 namespace CodeyBox.Tests;
@@ -256,4 +257,62 @@ public sealed class TaskTemplateRegistryTests : IDisposable
     private static string TemplateWithCheck(string checkJson) => "{\"checks\":[" + checkJson + "]}";
 
     private static string JsonString(string value) => JsonSerializer.Serialize(value);
+
+    [Fact]
+    public async Task LoadAsync_ShippedAsvs5Template_ValidatesEveryEntryAgainstSchema()
+    {
+        var templatesDir = LocateShippedTemplatesDir();
+        var registry = new FileTaskTemplateRegistry(templatesDir, maxCheckCount: 1000);
+
+        var loaded = await registry.LoadAsync("templates/asvs5");
+
+        Assert.Equal("asvs5", loaded.Name);
+        Assert.NotEmpty(loaded.Checks);
+
+        var controlIdPattern = new Regex(@"\(V\d+\.\d+\.\d+\)", RegexOptions.Compiled);
+        var titleControlIdPattern = new Regex(@"^Fix V\d+\.\d+\.\d+:", RegexOptions.Compiled);
+        var seenControlIds = new HashSet<string>(StringComparer.Ordinal);
+
+        for (var i = 0; i < loaded.Checks.Count; i++)
+        {
+            var check = loaded.Checks[i];
+            var locus = $"checks[{i}]";
+
+            var idMatch = controlIdPattern.Match(check.Question);
+            Assert.True(idMatch.Success, $"{locus}.question must cite an ASVS v5 control id like (V1.2.3): {check.Question}");
+            Assert.True(seenControlIds.Add(idMatch.Value), $"{locus} cites a duplicate control id {idMatch.Value}");
+
+            Assert.True(check.ActionableAnswer ?? true, $"{locus}.actionableAnswer must be true so 'yes' triggers remediation");
+            Assert.Equal("agentic", check.Mode);
+
+            Assert.NotNull(check.OnYes);
+            Assert.True(titleControlIdPattern.IsMatch(check.OnYes.Title),
+                $"{locus}.onYes.title must lead with 'Fix V<chapter>.<section>.<control>:' so the queued job is self-identifying: {check.OnYes.Title}");
+            Assert.True(check.OnYes.Title.Length <= 200);
+            Assert.False(string.IsNullOrWhiteSpace(check.OnYes.Prompt));
+            Assert.True(check.OnYes.Prompt.Length <= 64 * 1024);
+        }
+    }
+
+    [Fact]
+    public async Task LoadAsync_ShippedAsvs5Template_FitsWithinDefaultMaxCheckCap()
+    {
+        var templatesDir = LocateShippedTemplatesDir();
+        var registry = new FileTaskTemplateRegistry(templatesDir);
+
+        var loaded = await registry.LoadAsync("templates/asvs5");
+
+        Assert.NotEmpty(loaded.Checks);
+    }
+
+    private static string LocateShippedTemplatesDir()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "CodeyBox.slnx")))
+            dir = dir.Parent;
+        Assert.NotNull(dir);
+        var templatesDir = Path.Combine(dir!.FullName, "src", "CodeyBox.Api", "templates");
+        Assert.True(Directory.Exists(templatesDir), $"shipped templates directory not found at {templatesDir}");
+        return templatesDir;
+    }
 }

@@ -1,0 +1,804 @@
+{
+  "checks": [
+    {
+      "question": "Does the codebase render untrusted data into HTML, JavaScript, CSS, URL, or other browser contexts without applying context-aware output encoding for that exact sink? (V1.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.1.1: apply context-aware output encoding at every untrusted-to-browser sink",
+        "prompt": "Problem: Untrusted data reaches an HTML/JS/CSS/URL sink without context-appropriate encoding, enabling XSS or DOM-based injection.\n\nFind all instances: Locate every place untrusted values are interpolated into HTML body, attribute, JavaScript, CSS, or URL contexts (innerHTML, dangerouslySetInnerHTML, document.write, template raw output, attribute-binding helpers, URL builders).\n\nFix correctly: Use the framework's context-aware encoder for the exact sink (HTML-body, attribute, JS, CSS, URL). Prefer auto-escaping templates and safe DOM APIs; avoid raw-HTML sinks. For URL contexts, reject non-http(s) schemes (block javascript:, data: where unsafe).\n\nAcceptance: Every untrusted value reaching a browser sink is encoded for that sink's context. Add a test rendering a script-like payload in each context and asserting it is rendered as inert text."
+      }
+    },
+    {
+      "question": "Is untrusted rich content (HTML, Markdown, SVG) accepted from users and rendered without passing through a vetted, allowlist-based sanitizer kept up to date? (V1.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.2.1: sanitize untrusted rich content with a maintained allowlist sanitizer",
+        "prompt": "Problem: Rich content from users is rendered without an allowlist-based sanitizer, so attackers can smuggle scripts, dangerous attributes, or unsafe URLs.\n\nFind all instances: Locate inputs that accept HTML/Markdown/SVG/rich text and the code paths that render them.\n\nFix correctly: Sanitize on the server with a maintained allowlist library (DOMPurify, ammonia, html-sanitizer-Java, OWASP Java HTML Sanitizer, etc.). Drop event handlers, scripts, unsafe attributes, foreign objects in SVG, and disallowed URL schemes. Pin the library to a current version and review the allowlist.\n\nAcceptance: All untrusted rich content passes through a vetted sanitizer before storage or rendering. Add tests with <script>, on*= handlers, javascript: URLs, and SVG <foreignObject> payloads asserting they are stripped."
+      }
+    },
+    {
+      "question": "Does the codebase build SQL/NoSQL/LDAP/XPath/OS-command/expression-language strings by concatenating or interpolating untrusted input instead of using parameterised queries or safe APIs? (V1.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.3.1: parameterise queries and use no-shell APIs for untrusted inputs",
+        "prompt": "Problem: Untrusted input is concatenated/interpolated into interpreter contexts (SQL, NoSQL, LDAP, XPath, OS command, expression languages), enabling injection.\n\nFind all instances: Search across each interpreter family for string-built queries/commands whose inputs trace to untrusted sources (request body, headers, cookies, route/query params, fetched content, or data previously stored from untrusted sources). Cover ORM raw-query escape hatches and shell-via-string spawn calls.\n\nFix correctly: Use parameterised queries, prepared statements, bind variables, or the platform's safe builder. For OS commands, invoke a fixed executable with an argument array (no shell). For LDAP filters, escape via the library's helper. Allowlist any identifier that cannot be parameterised (table/column names, sort keys).\n\nAcceptance: No untrusted value reaches an interpreter via concatenation; all such paths use parameters/argument arrays or strict allowlists. Add tests with metacharacters for each interpreter family proving they are treated as data."
+      }
+    },
+    {
+      "question": "Does the application deserialise untrusted data using a mechanism that can instantiate arbitrary types, invoke constructors/callbacks, or resolve polymorphic targets from the payload (unsafe deserialisation)? (V1.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.4.1: deserialise untrusted data only into fixed DTOs without type handling",
+        "prompt": "Problem: Untrusted payloads drive object-graph reconstruction with type handling enabled, allowing gadget chains and RCE.\n\nFind all instances: Locate native binary deserialisers, polymorphic JSON/XML readers that read the target type from the payload, BinaryFormatter/ObjectInputStream/pickle/yaml.load/JSON.NET TypeNameHandling, and any deserialisation of untrusted data into rich domain objects.\n\nFix correctly: Deserialise only into explicit DTOs with type handling disabled. If polymorphism is genuinely required, bind a small fixed set of types via a discriminator the server controls. Validate against a schema before mapping into domain types.\n\nAcceptance: No untrusted payload can choose its own concrete type. Add a malicious-discriminator test proving the parser refuses it."
+      }
+    },
+    {
+      "question": "Does the codebase pass untrusted input into eval, dynamic compilation, dynamic require/import, or runtime expression evaluation without a constrained grammar and host-escape-free sandbox? (V1.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.5.1: remove dynamic execution of untrusted input or constrain it strictly",
+        "prompt": "Problem: Feeding untrusted input into eval/dynamic execution lets attackers run arbitrary code in the application's context.\n\nFind all instances: Locate eval, Function constructors, dynamic compile/execute APIs, reflective method invocation by user-supplied name, dynamic import()/require() of computed names, and rules/formula engines that evaluate untrusted expressions with host-object access.\n\nFix correctly: Remove dynamic execution. Replace with an allowlisted dispatch table, a real parser for the data being interpreted, or a constrained sandbox with no host escape and no I/O.\n\nAcceptance: No untrusted input reaches a code-execution sink. Add a test proving an injection payload cannot execute code or call host functions."
+      }
+    },
+    {
+      "question": "Does any request input bypass type-and-range/length/format validation at the trust boundary (Numeric overflow, sign flips, negative quantities, oversized strings, non-canonical Unicode) before being acted on? (V2.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V2.1.1: validate type, length, range, and format at the trust boundary",
+        "prompt": "Problem: Inputs reach business logic without validation, allowing negative quantities, integer overflow/sign-flip, oversized payloads, and malformed Unicode to corrupt state.\n\nFind all instances: For each external endpoint/message handler, identify inputs that flow into arithmetic, storage, or downstream sinks without a validation step.\n\nFix correctly: Validate at the trust boundary using a schema (JSON Schema, Pydantic, FluentValidation, etc.) that enforces type, length, value range, and format. Reject rather than coerce. Normalise Unicode to NFC before length checks where text comparisons occur.\n\nAcceptance: All boundary inputs are schema-validated; arithmetic on user values is in checked/range-bounded form. Add tests for negative, oversized, overflow, and non-canonical Unicode inputs proving they are rejected or correctly bounded."
+      }
+    },
+    {
+      "question": "Are state-changing business actions vulnerable to TOCTOU/race conditions because they check-then-act without holding a transactional or locking guarantee across the window? (V2.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V2.2.1: close TOCTOU windows with transactions, locks, or atomic primitives",
+        "prompt": "Problem: A check (\"can this transfer happen?\") is performed before an act (\"perform the transfer\") without atomicity, so concurrent calls can both succeed (double-spend, replay, balance-go-negative).\n\nFind all instances: Locate flows that read state, decide, then write — particularly transfers, redemptions, quota usage, inventory adjustments, and uniqueness checks.\n\nFix correctly: Move the check inside a transaction with appropriate isolation, use SELECT ... FOR UPDATE / pessimistic locking, optimistic concurrency tokens, or atomic compare-and-swap. Where the check involves an external service, design idempotency keys to make replays safe.\n\nAcceptance: Critical state-changing flows cannot interleave to violate invariants. Add a concurrency test (two parallel requests sharing the same input) asserting only one succeeds."
+      }
+    },
+    {
+      "question": "Do business workflows allow steps to be skipped, repeated, or executed out of order because each request does not verify the caller's current workflow state on the server? (V2.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V2.3.1: gate multi-step workflows on server-tracked state",
+        "prompt": "Problem: Multi-step flows (checkout, signup, password reset, multi-factor enrolment) trust the client to follow steps in order, so an attacker can post directly to the final step and skip prerequisites.\n\nFind all instances: Locate endpoints that complete or finalise a workflow without re-checking that prior steps were completed by this caller in this session.\n\nFix correctly: Track workflow state server-side keyed to the session/user; each step asserts the prior state. Reject out-of-order, replayed, or skipped steps.\n\nAcceptance: Every workflow finaliser refuses to run unless the caller's server-tracked state is exactly the expected predecessor. Add tests that POST directly to later steps and assert they are refused."
+      }
+    },
+    {
+      "question": "Are business limits (rate, frequency, monetary caps, free-tier quotas, anti-automation throttles) enforced only client-side or not at all on sensitive actions? (V2.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V2.4.1: enforce business and anti-automation limits server-side",
+        "prompt": "Problem: Sensitive actions (login, password reset, signup, transfer, vote, message-send) lack server-side rate/quota enforcement, so attackers can brute force, spam, or drain quota.\n\nFind all instances: Identify sensitive endpoints; check whether each has per-account, per-IP, per-device, or per-API-key throttling enforced server-side, with backoff on repeated failures.\n\nFix correctly: Implement server-side rate limits and exponential backoff on the relevant identity dimension. Cap monetary/quota actions per account/window. Apply CAPTCHA or proof-of-work after threshold breach where appropriate.\n\nAcceptance: Every sensitive action has a server-side limit with verified backoff behaviour. Add tests that exceed the limit and assert subsequent calls are blocked."
+      }
+    },
+    {
+      "question": "Are anti-automation defences absent on endpoints prone to automated abuse (account enumeration, credential stuffing, scraping, gift-card cracking)? (V2.4.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V2.4.2: add anti-automation defences on abuse-prone endpoints",
+        "prompt": "Problem: Endpoints that bots target lack defences (CAPTCHA, device fingerprinting, IP/ASN reputation, behavioural risk scoring), enabling enumeration and credential stuffing.\n\nFind all instances: Enumerate endpoints that respond differently for valid vs invalid identifiers (login, password reset, signup, gift-card redemption, public search) and review their anti-automation posture.\n\nFix correctly: Add per-identity-and-IP throttles, deploy CAPTCHA after a threshold, return uniform responses regardless of identifier validity, and feed a risk engine for high-value actions.\n\nAcceptance: Sensitive endpoints behave uniformly for valid/invalid identifiers and apply progressive anti-automation. Add tests asserting responses do not reveal whether an account exists."
+      }
+    },
+    {
+      "question": "Does the frontend lack a strict Content-Security-Policy that disables inline scripts/styles and forbids dangerous sources, leaving XSS without a defence-in-depth backstop? (V3.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.1.1: deploy a strict CSP with nonces/hashes and no 'unsafe-inline'",
+        "prompt": "Problem: A missing or permissive CSP means an XSS bug becomes an immediate compromise; with a strict CSP, exploitation is markedly harder.\n\nFind all instances: Inspect HTTP response headers and meta tags for Content-Security-Policy; identify pages that allow 'unsafe-inline', 'unsafe-eval', wildcard sources, or have no policy.\n\nFix correctly: Move inline scripts/styles to external files or apply per-response nonces/hashes; restrict script-src/style-src/connect-src/img-src to the minimum required sources; set object-src 'none', base-uri 'none', frame-ancestors as needed. Run a report-only pass before enforcement.\n\nAcceptance: Every page serves a strict CSP without 'unsafe-inline'/'unsafe-eval'. Add a test asserting the header is present and matches the policy."
+      }
+    },
+    {
+      "question": "Are sensitive pages missing essential security headers (X-Content-Type-Options, Referrer-Policy, Permissions-Policy, Cross-Origin-Resource-Policy, Cross-Origin-Opener-Policy, X-Frame-Options or frame-ancestors)? (V3.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.2.1: set the essential browser security headers globally",
+        "prompt": "Problem: Missing security headers leave browsers vulnerable to clickjacking, MIME sniffing, cross-origin leaks, and referrer exposure.\n\nFind all instances: For each route or via global middleware, audit response headers for X-Content-Type-Options: nosniff, Referrer-Policy (strict-origin-when-cross-origin or stricter), Permissions-Policy, Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Resource-Policy: same-origin or same-site, and frame-ancestors/X-Frame-Options.\n\nFix correctly: Apply the headers globally via middleware. Tune Permissions-Policy to the features the app actually uses. Verify with securityheaders.com or equivalent.\n\nAcceptance: All responses include the essential headers. Add tests asserting each header value on a representative endpoint."
+      }
+    },
+    {
+      "question": "Are authentication cookies missing Secure, HttpOnly, SameSite=Lax/Strict, and an appropriate __Host-/__Secure- prefix when applicable? (V3.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.3.1: harden auth/session cookies with Secure, HttpOnly, SameSite, prefixes",
+        "prompt": "Problem: Auth cookies without Secure/HttpOnly/SameSite are exposed to network attackers, JavaScript theft, and CSRF.\n\nFind all instances: Locate every Set-Cookie for session, auth, CSRF, or other security-relevant cookies.\n\nFix correctly: Set Secure (HTTPS-only), HttpOnly (no JS access), SameSite=Lax or Strict (Lax for top-level navigations, Strict where possible), and the __Host- prefix when the cookie is path=/ and has no Domain. Constrain Path and lifetime.\n\nAcceptance: All security-relevant cookies carry the full attribute set. Add tests asserting Set-Cookie attributes on login/session endpoints."
+      }
+    },
+    {
+      "question": "Are state-changing requests not protected against CSRF (no SameSite enforcement, no anti-CSRF token, no origin/referrer check for cross-origin POSTs)? (V3.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.4.1: enforce CSRF protection on every state-changing request",
+        "prompt": "Problem: State-changing endpoints accept cross-site requests because there is no SameSite cookie, no anti-CSRF token, and no origin/referer check.\n\nFind all instances: Enumerate every POST/PUT/PATCH/DELETE (and any state-changing GET — which is itself a separate bug) and check the CSRF defence path.\n\nFix correctly: Require SameSite=Lax/Strict on session cookies AND a synchroniser token (or double-submit cookie) on state-changing requests; verify Origin/Referer for cross-origin requests on the API. For SPAs that use Authorization headers, ensure they are not echoed by the browser (no ambient credentials).\n\nAcceptance: State-changing requests fail when the CSRF token is missing/wrong or when the Origin is foreign. Add tests issuing cross-origin POSTs without the token and assert rejection."
+      }
+    },
+    {
+      "question": "Are state-changing operations exposed via HTTP GET (or another safe method), making them executable by simple link clicks or browser prefetch? (V4.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V4.1.1: state-changing operations must not be reachable via GET",
+        "prompt": "Problem: Routes mutate state in response to GET (or HEAD), so link-clicks, prefetch, image previews, or crawlers can trigger them.\n\nFind all instances: Audit routes/handlers for mutation logic invoked under a safe HTTP method (GET, HEAD, OPTIONS).\n\nFix correctly: Move mutation to POST/PUT/PATCH/DELETE. Keep GET idempotent and read-only. Update API clients and tests accordingly.\n\nAcceptance: No state change occurs on a safe HTTP method. Add tests asserting GET to formerly-mutating endpoints returns 405."
+      }
+    },
+    {
+      "question": "Do API handlers accept and bind entire request objects directly to internal models, allowing mass assignment of fields the client should not control (admin flag, owner id, status)? (V4.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V4.2.1: bind requests to DTOs that allowlist the writable fields",
+        "prompt": "Problem: Wide model binding lets clients set fields they should not control (isAdmin, ownerId, accountStatus), leading to privilege escalation and data tampering.\n\nFind all instances: Locate request-binding code that binds raw bodies into ORM/domain entities, or DTOs that mirror entities without an allowlist.\n\nFix correctly: Bind requests to narrow DTOs containing only the fields the caller may set. Map DTO -> domain entity explicitly. Reject unknown properties.\n\nAcceptance: No request can set non-allowlisted fields. Add a test posting extra fields and assert they do not affect server state."
+      }
+    },
+    {
+      "question": "Do API responses include fields the caller is not authorised to see (PII, internal IDs, audit timestamps, soft-deleted rows) because the serializer dumps the full domain model? (V4.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V4.3.1: project responses through DTOs that allowlist visible fields",
+        "prompt": "Problem: Responses include fields the caller should not see (other users' PII, internal flags, soft-deleted markers) because the serializer mirrors the domain model.\n\nFind all instances: Audit response shapes for leakage of internal IDs, foreign-key references to other users' resources, audit metadata, password/hash fields, or fields conditional on role.\n\nFix correctly: Define response DTOs per role/scope and map domain -> DTO explicitly. Exclude unconditionally hidden fields; conditionally include role-specific fields after an authorization check.\n\nAcceptance: No response carries non-allowlisted fields. Add tests asserting low-privilege callers do not receive privileged fields."
+      }
+    },
+    {
+      "question": "Are CORS rules permissive (wildcards, reflected Origin, Access-Control-Allow-Credentials with broad origins), exposing the API to cross-origin abuse? (V4.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V4.4.1: restrict CORS to an explicit allowlist of trusted origins",
+        "prompt": "Problem: Permissive or reflective CORS lets attacker-controlled sites read responses from the API on behalf of authenticated users.\n\nFind all instances: Locate the CORS configuration (middleware, gateway, framework option). Identify wildcard Access-Control-Allow-Origin, Origin-reflection, and combinations of credentials=true with broad origins.\n\nFix correctly: Set Access-Control-Allow-Origin to an explicit allowlist (per environment). Never combine credentials with wildcard or reflected origins. Allow only the methods/headers actually required. Validate the request's Origin against the allowlist instead of echoing it.\n\nAcceptance: CORS responses match the allowlist exactly. Add tests asserting unknown origins do not receive CORS approval."
+      }
+    },
+    {
+      "question": "Do file uploads accept content without validating type by signature, enforcing a size cap, or normalising the filename, allowing dangerous formats and oversized payloads? (V5.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V5.1.1: validate uploads by signature, cap size, sanitise filenames",
+        "prompt": "Problem: Uploads trust the Content-Type header and the original filename, accept unbounded sizes, and store under attacker-controlled names — enabling RCE via executable types, path traversal, and resource exhaustion.\n\nFind all instances: Locate upload handlers; check size limits, allowlisted MIME types, content-sniffing (magic bytes), and filename handling.\n\nFix correctly: Cap request body size at the framework level; validate type by reading magic bytes (not by header); reject anything outside the allowlist; generate a server-side storage name (UUID) rather than reusing the client's; preserve original name only as metadata.\n\nAcceptance: Uploads outside the allowlist or over the size cap are rejected. Add tests with mismatched extension/Content-Type/magic and oversized uploads."
+      }
+    },
+    {
+      "question": "Are uploaded files stored under client-supplied paths/names, allowing path traversal or arbitrary placement on the filesystem? (V5.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V5.2.1: containerise upload paths; reject traversal",
+        "prompt": "Problem: Uploads or file operations build server paths from client input, allowing ../ traversal or writes outside the upload root.\n\nFind all instances: Locate code that joins client-supplied names/paths with a server base directory or invokes Path.Combine / os.path.join with untrusted segments.\n\nFix correctly: Normalise/canonicalise the joined path (realpath/Path.GetFullPath) and verify it starts with the canonical upload root + directory separator before any I/O. Reject ../, absolute paths, NUL bytes, and Windows alternate streams. Prefer storing under a server-generated UUID and tracking the original name in metadata.\n\nAcceptance: No client input can escape the configured upload root. Add tests with ../, absolute paths, and NUL-byte payloads asserting rejection."
+      }
+    },
+    {
+      "question": "Are uploaded files served from the application's own origin without Content-Disposition: attachment, X-Content-Type-Options: nosniff, and a strict Content-Type, allowing HTML/script execution against users? (V5.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V5.3.1: serve user uploads with safe headers from a separate origin",
+        "prompt": "Problem: Uploads served from the same origin without nosniff and an explicit Content-Type can execute as HTML/JavaScript in user browsers (stored XSS, malware-via-MIME).\n\nFind all instances: Locate download/serve routes for user uploads.\n\nFix correctly: Serve uploads from a sandboxed/separate origin (e.g. user-content.<domain>) when feasible. Always set Content-Type from server-side detection, X-Content-Type-Options: nosniff, Content-Disposition: attachment for non-rendered types, and a Content-Security-Policy that blocks active content for the origin.\n\nAcceptance: Uploaded HTML/JS does not execute in user browsers. Add a test serving a crafted HTML upload and asserting it downloads or renders inert."
+      }
+    },
+    {
+      "question": "Are user-supplied URLs followed by the server (image proxy, webhook caller, link preview, PDF/HTML renderer) without an allowlist and without blocking private/loopback/link-local/metadata IP ranges across redirects (SSRF)? (V5.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V5.4.1: allowlist outbound destinations and block internal ranges",
+        "prompt": "Problem: Server-side fetches to user-controlled URLs let attackers reach internal services, cloud metadata endpoints, and private networks (SSRF) or perform port scanning.\n\nFind all instances: Locate outbound HTTP/file/network calls (link previews, image fetchers, webhook senders, PDF/HTML renderers, URL imports).\n\nFix correctly: Allowlist scheme+host (and port where relevant). Resolve the target IP; reject private/loopback/link-local/metadata ranges (169.254.169.254, fd00::/8, fe80::/10, 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). Re-validate after redirects or disable redirects. Where possible, route via a dedicated egress with network-level controls. Guard against DNS rebinding by validating the IP actually connected to.\n\nAcceptance: User-controlled outbound calls reach only allowlisted destinations. Add tests for an internal IP and a redirect-to-internal payload, both blocked."
+      }
+    },
+    {
+      "question": "Does the application accept passwords shorter than 8 chars, restrict to a small character set, or trim/lowercase passwords before hashing? (V6.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.1.1: accept passwords 8+ chars across the full Unicode range without truncation",
+        "prompt": "Problem: Password policies that block long, multi-script, or special-character passwords or that silently truncate/normalise reduce entropy and frustrate users.\n\nFind all instances: Locate password validators and hashing call sites; check minimum/maximum length, allowed character classes, and any pre-hash normalisation.\n\nFix correctly: Require at least 8 characters; allow up to 64+ (do not silently cap below the hash's safe input length). Permit Unicode/spaces/special characters. Do not trim or change case. Normalise to NFKC for consistency but do not strip.\n\nAcceptance: Long, multi-script, special-character passwords are accepted and verifiable. Add tests creating such a password and signing in successfully."
+      }
+    },
+    {
+      "question": "Does the system check submitted passwords against a known-breached-password list and reject matches? (V6.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.1.2: reject breached passwords during registration and password change",
+        "prompt": "Problem: Users can choose passwords that appear in known breach lists, making credential-stuffing easy.\n\nFind all instances: Audit registration, password change, and reset flows for a breach-list check.\n\nFix correctly: Integrate a breach-corpus check (HaveIBeenPwned k-anonymous API or a local list) at registration and change. Reject and prompt for a non-breached choice. Do not leak the count.\n\nAcceptance: Breached passwords are refused on signup/change. Add a test using a known-breached value and asserting rejection."
+      }
+    },
+    {
+      "question": "Are passwords stored using a fast/general-purpose hash (MD5, SHA-1, SHA-2 unsalted) instead of a memory-hard password hash (argon2id, scrypt, bcrypt) with tuned parameters and a per-user salt? (V6.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.2.1: store passwords with argon2id/scrypt/bcrypt and tuned cost",
+        "prompt": "Problem: Fast hashes (or unsalted hashes) make offline cracking trivial after a breach.\n\nFind all instances: Locate password verification/storage; check the algorithm, salt, and cost parameters.\n\nFix correctly: Migrate to argon2id (preferred), scrypt, or bcrypt with per-user salt and parameters tuned to the hardware (target ≥0.5–1.0s per hash). Verify by re-hashing on successful login if parameters or algorithm change.\n\nAcceptance: All new passwords use a memory-hard hash; legacy hashes are upgraded on next login. Add a test asserting stored verifier prefix is the chosen algorithm with strong parameters."
+      }
+    },
+    {
+      "question": "Does the password reset flow leak whether an email/username exists (different responses, response times, or status codes for known vs unknown identifiers)? (V6.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.3.1: make password-reset responses uniform for known and unknown identifiers",
+        "prompt": "Problem: Different responses for known vs unknown accounts let attackers enumerate user identifiers.\n\nFind all instances: Inspect password-reset and signup-collision endpoints; compare status code, body, and timing for valid vs invalid identifiers.\n\nFix correctly: Always return the same response (e.g. \"If an account exists, an email has been sent\"); send the actual email asynchronously. Pad processing time to match the worst-case path. Apply per-identifier rate limits.\n\nAcceptance: Responses are indistinguishable for known/unknown identifiers. Add tests asserting status/body/timing parity within tolerance."
+      }
+    },
+    {
+      "question": "Does multi-factor authentication rely on SMS or email codes as the primary second factor for high-risk operations instead of supporting at least one phishing-resistant authenticator (WebAuthn/passkeys, hardware token)? (V6.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.4.1: offer a phishing-resistant authenticator (WebAuthn/passkeys) for MFA",
+        "prompt": "Problem: SMS/email codes are not phishing-resistant — attackers can intercept, SIM-swap, or relay them via reverse-proxy phish kits.\n\nFind all instances: Enumerate MFA flows; identify whether WebAuthn/passkeys are supported, especially for admin and high-value accounts.\n\nFix correctly: Add WebAuthn/passkey enrolment as a first-class second-factor option. Offer TOTP as a fallback. Phase out SMS for high-risk operations. For administrative access, require phishing-resistant MFA.\n\nAcceptance: Users can register a WebAuthn authenticator and use it to satisfy MFA. Add a registration + sign-in test using WebAuthn."
+      }
+    },
+    {
+      "question": "Are TOTP codes accepted with no replay protection (the same code accepted twice in its window) or with a wide drift window? (V6.4.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.4.2: tie TOTP verification to one-time use and tight drift",
+        "prompt": "Problem: A TOTP code accepted more than once, or with a too-wide drift, weakens the time-based property and enables replay.\n\nFind all instances: Locate TOTP verification; check whether previously-used codes are recorded and whether the drift window is bounded to ±1 step.\n\nFix correctly: Persist the last successfully-used step per secret and reject codes at or before it. Allow drift no greater than ±1 step. Lock out after a small number of consecutive failures.\n\nAcceptance: A code cannot be used twice; drift is ±1 step. Add tests replaying a code and submitting a code outside the window."
+      }
+    },
+    {
+      "question": "Are credential-handling endpoints (login, MFA verify, password reset) missing per-account and per-IP rate limits with progressive lockout? (V6.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.5.1: throttle credential endpoints per account and per IP",
+        "prompt": "Problem: Without throttling, brute-force and credential-stuffing attacks proceed unimpeded.\n\nFind all instances: Locate login, MFA verify, and password reset endpoints; check whether each is protected by per-account and per-source rate limits with exponential backoff and lockout.\n\nFix correctly: Apply per-account, per-IP/ASN throttling with progressive delay and temporary lockout (with safe unlock paths). Use a shared store (Redis/database) so distributed traffic is counted.\n\nAcceptance: Sustained failure attempts trigger lockout/backoff. Add a test driving repeated failures and asserting subsequent attempts are blocked."
+      }
+    },
+    {
+      "question": "Are session identifiers predictable or generated by anything other than a cryptographically secure RNG with at least 128 bits of entropy? (V7.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V7.1.1: generate session IDs from a CSPRNG with ≥128 bits of entropy",
+        "prompt": "Problem: Predictable or low-entropy session IDs can be guessed or brute-forced.\n\nFind all instances: Locate session-ID generation; verify the RNG source and the encoded entropy.\n\nFix correctly: Use the platform's CSPRNG (crypto.randomBytes, secrets.token_urlsafe, RandomNumberGenerator) producing ≥128 bits of entropy; encode with base64url or hex.\n\nAcceptance: Session IDs are CSPRNG-derived with ≥128 bits. Add a test asserting the encoded length and source."
+      }
+    },
+    {
+      "question": "Is the session identifier left unchanged across the authentication boundary (no rotation on login/elevation), permitting session fixation? (V7.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V7.2.1: rotate session on login, privilege elevation, and re-auth",
+        "prompt": "Problem: Not rotating the session ID on login lets an attacker plant a known ID before authentication and inherit it after (session fixation).\n\nFind all instances: Inspect login, MFA-step-up, and privilege-elevation flows for explicit session regeneration.\n\nFix correctly: Regenerate the session ID at every authentication boundary; invalidate the prior ID server-side. Re-issue the cookie with secure attributes.\n\nAcceptance: The session ID before login is invalidated and a new ID issued after. Add a test capturing the ID before/after login and asserting it changed."
+      }
+    },
+    {
+      "question": "Are sessions kept alive indefinitely, lacking absolute and idle timeouts and server-side revocation on logout? (V7.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V7.3.1: enforce absolute+idle session timeouts and revocation on logout",
+        "prompt": "Problem: Sessions without absolute/idle limits or server-side revocation leak access for long after intended.\n\nFind all instances: Locate session lifetime configuration; confirm both absolute and idle timeouts exist and that logout revokes server-side state (not just the client cookie).\n\nFix correctly: Apply an absolute timeout (e.g. 24h-7d depending on sensitivity) and an idle timeout. On logout, delete the server-side session record so the cookie is useless even if exfiltrated.\n\nAcceptance: Idle/absolute timeouts expire the session; logout invalidates server-side state. Add tests asserting requests fail after each timeout and after logout."
+      }
+    },
+    {
+      "question": "Are authorization checks omitted at endpoints that read or modify objects keyed by ID, allowing Insecure Direct Object References (IDOR)? (V8.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V8.1.1: enforce ownership/role check at every object-keyed endpoint",
+        "prompt": "Problem: Endpoints that take an object ID and act on it without verifying the caller has access permit IDOR — \"change your /orders/123 to /orders/124\" attacks.\n\nFind all instances: Enumerate routes whose path or body references an object ID. For each, locate the authorization check that ties the object to the current principal.\n\nFix correctly: Centralise object access via a permission service (\"can principal P perform action A on object O?\"). Refuse the operation if the caller is not the owner or does not hold the required role. Avoid using IDs as ambient permission proof.\n\nAcceptance: Cross-tenant/cross-user access is refused at every object-keyed endpoint. Add tests as a low-privilege user calling another user's object IDs and asserting 403/404."
+      }
+    },
+    {
+      "question": "Is the application missing centralized authorization, so each handler re-implements access checks ad hoc and some forget? (V8.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V8.2.1: centralise authorization through a policy/permission service",
+        "prompt": "Problem: Per-handler ad hoc authorization checks are easy to forget and inconsistent between routes.\n\nFind all instances: Audit handlers for inline authorization logic; identify routes that lack explicit checks or rely on filtering responses to hide unauthorised data.\n\nFix correctly: Introduce or use a centralised authorization service (policy/attribute-based, RBAC, or ReBAC). Require every protected handler to call it explicitly with action+resource. Default-deny if no policy decision is made.\n\nAcceptance: Every protected route routes through the central service. Add a test that disables the service and asserts protected routes refuse access."
+      }
+    },
+    {
+      "question": "Are administrative or other elevated-privilege actions reachable via the same authentication context as ordinary actions, without step-up authentication or extra scopes? (V8.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V8.3.1: require step-up authentication for sensitive operations",
+        "prompt": "Problem: Sensitive actions (password change, admin operations, financial transfers) run under the same session as login, so any session theft or open browser is enough.\n\nFind all instances: Enumerate sensitive operations and check whether each requires a recent re-authentication, a step-up factor, or a scoped token.\n\nFix correctly: Re-prompt for password/WebAuthn for sensitive operations; require recent authentication (e.g. within 5–15 minutes); issue scoped tokens for admin actions where applicable.\n\nAcceptance: Sensitive operations refuse stale sessions. Add a test attempting a sensitive change long after login and asserting step-up is required."
+      }
+    },
+    {
+      "question": "Does the application accept self-contained tokens (JWT/JWS) without verifying the signature, accepting alg=none, or accepting tokens signed by unexpected algorithms or keys? (V9.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V9.1.1: verify token signatures and pin alg/kid",
+        "prompt": "Problem: JWT libraries that trust the header to choose algorithm/key enable alg=none, alg confusion (RS256→HS256), and unsigned-token forgery.\n\nFind all instances: Locate JWT/JWS decode/verify call sites; check whether the algorithm and key are taken from the header or pinned by the verifier.\n\nFix correctly: Configure the verifier with a fixed expected algorithm (e.g. RS256 or EdDSA) and a JWKS/key set keyed by kid. Reject alg=none. Reject tokens whose alg or kid is not on the accepted list.\n\nAcceptance: Tokens with unexpected alg/kid or none are refused. Add tests with alg=none, mismatched alg, and unknown-kid tokens asserting rejection."
+      }
+    },
+    {
+      "question": "Are JWTs accepted without iss/aud/exp/nbf validation, or with very long lifetimes that make revocation impractical? (V9.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V9.2.1: validate iss/aud/exp/nbf and keep token lifetimes short",
+        "prompt": "Problem: Skipping iss/aud/exp/nbf checks allows cross-service token reuse and expired tokens. Long-lived tokens cannot be revoked between expiries.\n\nFind all instances: Inspect JWT validation configuration; check that issuer, audience, expiry, and not-before are enforced.\n\nFix correctly: Configure the validator to require iss=<expected>, aud=<this service>, exp in the future, nbf in the past (with small clock skew). Keep access-token lifetimes short (≤15 min); use refresh tokens with rotation for longer sessions.\n\nAcceptance: Tokens missing or violating these claims are rejected. Add tests with wrong iss, wrong aud, expired, and future-nbf tokens."
+      }
+    },
+    {
+      "question": "Are signed/encrypted tokens stored or transmitted without protection (e.g. in localStorage accessible to XSS, in URL query strings logged by intermediaries)? (V9.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V9.3.1: protect token storage and transmission",
+        "prompt": "Problem: Tokens in localStorage are accessible to XSS; tokens in URLs are written to access logs and Referer.\n\nFind all instances: Audit token storage and transmission paths for the access/refresh tokens used by the app.\n\nFix correctly: Prefer HttpOnly, Secure, SameSite cookies for session tokens. If localStorage is unavoidable, ensure CSP and XSS defences are airtight. Never send sensitive tokens in URL query strings.\n\nAcceptance: Tokens are not exposed to JavaScript or written to URLs/logs. Add a test asserting the token does not appear in localStorage or URL params."
+      }
+    },
+    {
+      "question": "Does the OAuth/OIDC flow use the Implicit grant or password grant, or use Authorization Code without PKCE for public clients? (V10.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V10.1.1: use Authorization Code + PKCE for public clients",
+        "prompt": "Problem: Implicit and password grants are deprecated. Public clients (SPAs, native apps) without PKCE are vulnerable to authorization-code interception.\n\nFind all instances: Locate OAuth client configuration and grant types in use.\n\nFix correctly: Use Authorization Code with PKCE (S256 method) for all public clients. Use client_credentials for service-to-service. Remove implicit/password grants. Confirm the IdP enforces PKCE.\n\nAcceptance: All client flows use Authorization Code + PKCE or client_credentials. Add a test asserting the flow fails without a valid code_verifier."
+      }
+    },
+    {
+      "question": "Are OAuth redirect_uri values not strictly compared (substring/wildcard match), allowing redirect-URI manipulation? (V10.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V10.2.1: exact-match registered redirect_uri values",
+        "prompt": "Problem: Substring or wildcard matching of redirect_uri enables open-redirect within the OAuth flow and code-exfiltration to attacker-controlled subdomains.\n\nFind all instances: Locate the IdP/client configuration where allowed redirect_uri values are listed; check the match algorithm.\n\nFix correctly: Use exact-string match (scheme, host, port, path, query). Disallow wildcards. Register only the canonical production redirect URIs.\n\nAcceptance: A redirect to a near-match URI fails. Add a test asserting an unregistered redirect_uri is refused."
+      }
+    },
+    {
+      "question": "Is the OAuth state parameter missing, weak, or unverified, leaving the flow open to CSRF/code-injection? (V10.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V10.3.1: bind a CSPRNG state to the user session and verify on callback",
+        "prompt": "Problem: Without a verified state parameter, an attacker can splice their authorization code into a victim's session.\n\nFind all instances: Inspect OAuth initiation and callback handlers; verify that state is generated, bound to the user's session, and validated on return.\n\nFix correctly: Generate state from a CSPRNG, store with the session (or in an encrypted cookie), require it on callback, and reject mismatched/missing values.\n\nAcceptance: A callback with missing/wrong state is rejected. Add a test asserting rejection."
+      }
+    },
+    {
+      "question": "Are OIDC ID tokens accepted without validating signature, iss, aud, exp, and nonce? (V10.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V10.4.1: validate id_token signature + iss/aud/exp/nonce",
+        "prompt": "Problem: Skipping ID-token validation lets attackers forge or replay identity assertions.\n\nFind all instances: Locate OIDC ID-token handling; verify signature, iss, aud, exp, and nonce checks.\n\nFix correctly: Use the IdP's published JWKS to verify the signature; check iss matches the configured issuer; aud matches the client ID; exp is in the future; nonce equals the value generated at /authorize.\n\nAcceptance: Tokens failing any of these checks are rejected. Add tests for each failure mode."
+      }
+    },
+    {
+      "question": "Does the codebase use weak/legacy cryptographic algorithms (MD5, SHA-1, DES, 3DES, RC4, ECB block mode, PKCS1v15 for RSA-OAEP) anywhere they affect security? (V11.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.1.1: replace weak algorithms with modern primitives",
+        "prompt": "Problem: Weak/legacy algorithms (MD5, SHA-1, DES, 3DES, RC4, ECB, PKCS1v1.5) can be broken, forged, or distinguished.\n\nFind all instances: Search for these primitives in code (including transitive uses inside crypto wrappers). Distinguish security-relevant uses from incidental non-security uses (HMAC-SHA1 with sufficient key length is acceptable in some legacy contexts but should be migrated; MD5 as a non-security checksum is acceptable but should be commented).\n\nFix correctly: Replace with SHA-256/SHA-3, AES-GCM/ChaCha20-Poly1305 (AEAD), RSA-OAEP with SHA-256 (or ECDSA/Ed25519). Use the platform's high-level crypto APIs.\n\nAcceptance: No weak algorithm is used in a security-sensitive context. Add a test or static analyser rule that fails the build on reintroduction."
+      }
+    },
+    {
+      "question": "Is authenticated encryption (AEAD: AES-GCM, ChaCha20-Poly1305) missing where confidentiality+integrity are required, with the codebase instead using unauthenticated modes (CBC without HMAC, CTR without HMAC)? (V11.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.1.2: use AEAD (AES-GCM / ChaCha20-Poly1305) for confidentiality+integrity",
+        "prompt": "Problem: Encryption without integrity (CBC/CTR alone) is malleable — attackers can flip bits, leading to padding-oracle and data-tampering attacks.\n\nFind all instances: Locate symmetric encryption calls; check whether AEAD modes are used or whether HMAC is correctly applied over the ciphertext.\n\nFix correctly: Use AES-GCM or ChaCha20-Poly1305 via the platform's AEAD API. Generate a fresh nonce per message (never reused with the same key). Encode the AAD where the message context matters.\n\nAcceptance: All encryption-at-rest/in-transit-at-app-layer uses AEAD. Add a test asserting decryption fails on tampered ciphertext."
+      }
+    },
+    {
+      "question": "Are cryptographic keys generated, stored, or rotated insecurely (hardcoded keys, source-control storage, no key vault, no rotation)? (V11.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.2.1: manage keys via a vault/KMS with rotation and access logs",
+        "prompt": "Problem: Keys in source/config files leak to anyone with repository access and cannot be rotated without a deploy.\n\nFind all instances: Grep for hardcoded keys, base64 secrets, and key-file paths in config; inspect how keys are loaded at startup.\n\nFix correctly: Generate keys with the platform's CSPRNG; store in a KMS / secrets manager / HSM; access via the runtime's identity. Rotate on a schedule and on suspected compromise. Audit access.\n\nAcceptance: No long-lived key material is in source/config. Add a test or scanner that fails on repo-checked-in key material."
+      }
+    },
+    {
+      "question": "Is randomness for security purposes (tokens, salts, IVs, session IDs, password-reset codes) drawn from a non-CSPRNG source (Math.random, std::rand, time-seeded RNG)? (V11.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.3.1: use a CSPRNG for all security-relevant randomness",
+        "prompt": "Problem: Non-CSPRNG output (Math.random, rand) is predictable and unsuitable for tokens, salts, IVs, or codes.\n\nFind all instances: Search for non-CSPRNG calls used in security paths; trace their outputs.\n\nFix correctly: Use crypto.randomBytes / secrets / RandomNumberGenerator / SecureRandom. Document the chosen API.\n\nAcceptance: No security-relevant randomness traces back to a non-CSPRNG. Add a test asserting tokens are derived from the CSPRNG."
+      }
+    },
+    {
+      "question": "Are TLS connections allowed to negotiate weak protocol versions (TLS 1.0/1.1, SSLv3) or weak cipher suites? (V12.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V12.1.1: TLS 1.2+ only, strong ciphers, no fallback",
+        "prompt": "Problem: Weak TLS versions and ciphers permit downgrade, BEAST/POODLE, and CBC issues.\n\nFind all instances: Inspect TLS configuration on listeners, reverse proxies, and outbound clients. Verify minimum protocol and cipher suites.\n\nFix correctly: Disable TLS 1.0/1.1 and SSL. Allow only TLS 1.2 with strong AEAD ciphers and TLS 1.3 (preferred). Configure HSTS on browser-facing endpoints.\n\nAcceptance: Servers/clients refuse TLS <1.2. Add a test/scan asserting protocols and ciphers."
+      }
+    },
+    {
+      "question": "Does the application accept invalid/self-signed certificates by disabling certificate validation on outbound HTTPS or message-broker connections? (V12.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V12.2.1: enable strict certificate validation for outbound TLS",
+        "prompt": "Problem: Disabling certificate validation (TrustAll, verify=false, NODE_TLS_REJECT_UNAUTHORIZED=0) defeats TLS's authentication property and allows MITM.\n\nFind all instances: Locate HTTPS/TLS client configuration; flag any code or env that disables validation, accepts all certs, or installs an all-trusting trust manager.\n\nFix correctly: Use the platform default trust store; validate hostname; pin where appropriate. Remove all-trust shortcuts (including \"only in dev\" — they leak to prod).\n\nAcceptance: No outbound TLS client accepts invalid certificates. Add a test asserting connection to a server with a self-signed cert fails."
+      }
+    },
+    {
+      "question": "Are configuration secrets (database credentials, API keys, signing keys) stored in source control, container images, or environment files distributed with the artifact? (V13.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V13.1.1: keep secrets out of source/images; load from a secrets manager",
+        "prompt": "Problem: Secrets baked into the repository, image layers, or shipped env files leak to anyone with read access.\n\nFind all instances: Run gitleaks / trufflehog; audit Dockerfiles and CI pipelines for embedded secrets; inspect committed .env / config files.\n\nFix correctly: Move secrets to a secrets manager (Vault, AWS/GCP/Azure Secrets Manager, k8s External Secrets). Inject at runtime via the platform identity. Add gitleaks to CI and pre-commit.\n\nAcceptance: gitleaks reports a clean repo and image scans find no secrets. Add a CI step enforcing this."
+      }
+    },
+    {
+      "question": "Are debug/diagnostic features (verbose error pages, profilers, admin panels, /actuator, /metrics, swagger UI on prod) exposed publicly in production? (V13.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V13.2.1: disable debug/diagnostics in production or gate them behind auth",
+        "prompt": "Problem: Public debug surfaces leak stack traces, configuration, and internal endpoints, simplifying further exploitation.\n\nFind all instances: Enumerate diagnostic/management endpoints; inspect ingress/gateway rules; check whether they are unauthenticated and reachable from the internet.\n\nFix correctly: Disable in production builds, or require authenticated/internal-network-only access. Move metrics/health-checks to a separate management port not exposed externally.\n\nAcceptance: Diagnostic endpoints are not reachable unauthenticated from outside. Add a test asserting they return 401/404 in production configuration."
+      }
+    },
+    {
+      "question": "Do error responses leak stack traces, framework versions, library versions, or other internal details to untrusted callers? (V13.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V13.3.1: return generic errors externally; keep details server-side",
+        "prompt": "Problem: Stack traces and internal version strings in client responses speed up exploitation.\n\nFind all instances: Inspect global error handlers, debug pages, and developer-mode toggles in production.\n\nFix correctly: Return a generic error code/correlation ID to clients; log the detail internally tied to that ID. Strip Server/X-Powered-By headers.\n\nAcceptance: External error responses contain no stack traces or version info. Add a test triggering an error and asserting the response is generic."
+      }
+    },
+    {
+      "question": "Is sensitive data (PII, credentials, payment data) stored unencrypted at rest where the threat model requires field-level encryption? (V14.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V14.1.1: encrypt sensitive fields at rest with managed keys",
+        "prompt": "Problem: Sensitive fields stored in cleartext are exposed via any database backup, replica, or read-side compromise.\n\nFind all instances: Identify sensitive columns (PII, payment instruments, credentials, tokens). Check whether encryption-at-rest is provided by the storage layer plus field-level encryption where the threat model demands it.\n\nFix correctly: Apply field-level encryption (envelope/ tokenisation) with keys in a KMS. Limit who can decrypt; log decryption events. Use hashing/tokenisation for searchable identifiers where possible.\n\nAcceptance: Sensitive fields are encrypted at rest with audited decrypt access. Add a test asserting the column at rest is ciphertext."
+      }
+    },
+    {
+      "question": "Do third-party dependencies have known critical/high CVEs that have not been triaged or upgraded, with no SCA running in CI? (V15.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V15.1.1: SCA in CI; triage and upgrade vulnerable dependencies",
+        "prompt": "Problem: Outdated/vulnerable dependencies are the #1 cause of breach in modern apps.\n\nFind all instances: Run an SCA scan (npm audit, pip-audit, dependabot/renovate, snyk, grype) against current dependencies; list outstanding critical/high CVEs.\n\nFix correctly: Patch or upgrade the affected versions; if no fix exists, document mitigation. Wire SCA into CI to block PRs that introduce known vulnerabilities.\n\nAcceptance: SCA passes cleanly or has documented suppressions. Add the SCA step to CI."
+      }
+    },
+    {
+      "question": "Are build/release artifacts unsigned and not produced via reproducible, attested builds, allowing supply-chain tampering? (V15.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V15.2.1: sign artifacts and emit build provenance (SLSA/SBOM)",
+        "prompt": "Problem: Unsigned artifacts without provenance can be silently replaced anywhere between build and deploy.\n\nFind all instances: Inspect CI to see whether artifacts are signed (cosign, sigstore), whether an SBOM is generated, and whether a SLSA-style provenance is attached.\n\nFix correctly: Sign artifacts in CI; emit SBOM (CycloneDX/SPDX); produce a provenance attestation; verify signatures at deploy time.\n\nAcceptance: Deploys refuse unsigned artifacts; SBOM/provenance ride with each artifact. Add a verification step at deploy."
+      }
+    },
+    {
+      "question": "Does the application run with excessive runtime privileges (root in container, unrestricted egress, broad cloud IAM) when least privilege would suffice? (V15.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V15.3.1: run with least privilege at OS, network, and cloud-IAM layers",
+        "prompt": "Problem: Running with privileges beyond what the workload needs turns small bugs into large incidents.\n\nFind all instances: Inspect container runAsUser/runAsNonRoot, capability drops, network policies, and cloud IAM bindings. Identify excessive privileges.\n\nFix correctly: Run as non-root, drop all capabilities and add only needed ones, restrict egress to required destinations, scope IAM roles narrowly per workload. Use ephemeral credentials over long-lived keys.\n\nAcceptance: Each workload runs with least privilege. Add CI checks (kubeval / OPA) enforcing the policy."
+      }
+    },
+    {
+      "question": "Are security-relevant events (login success/failure, MFA, privilege change, access to sensitive data, administrative actions, security configuration changes) not logged with a consistent structured schema? (V16.1.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V16.1.1: log security-relevant events in a structured, queryable schema",
+        "prompt": "Problem: Without structured security logs, detection, IR, and forensic review are impossible.\n\nFind all instances: Enumerate the security event types ASVS calls out; check whether each is logged with actor, action, target, outcome, source IP, user agent, and correlation ID.\n\nFix correctly: Emit structured (JSON) audit events to a tamper-evident store separate from application logs. Standardise field names. Ensure clocks are synchronised.\n\nAcceptance: Each security event type appears in the audit log with the expected fields. Add tests asserting representative events are emitted."
+      }
+    },
+    {
+      "question": "Do logs contain sensitive values (passwords, tokens, PANs, full PII) because logging is interpolated without redaction filters? (V16.2.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V16.2.1: redact secrets and PII in logs at the logger level",
+        "prompt": "Problem: Logs containing secrets and PII broaden the breach radius — anyone with log access has the data.\n\nFind all instances: Grep for log statements that interpolate password/token/secret/PAN/email/SSN-shaped values. Inspect logger configuration for redaction filters.\n\nFix correctly: Configure logger redaction (allowlisted field names, regex for token-shaped values, masking for PANs/SSNs). Use structured logging so sensitive fields can be selectively dropped.\n\nAcceptance: No sensitive value appears in logs. Add tests asserting redaction works for representative payloads."
+      }
+    },
+    {
+      "question": "Are logs unprotected against tampering or unauthorised access (no append-only/immutable store, no integrity controls, broad read access)? (V16.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V16.3.1: store audit logs immutably with restricted access",
+        "prompt": "Problem: If attackers can edit or delete logs, the audit trail of their actions disappears.\n\nFind all instances: Inspect log storage; check write-once/append-only properties, access controls, and retention.\n\nFix correctly: Ship audit logs to an append-only or WORM-backed store (CloudWatch+SCP, GCP Log Sink to immutable bucket, Splunk frozen+S3 Object Lock). Restrict read/write IAM. Configure retention per policy.\n\nAcceptance: Logs cannot be edited or deleted by the workload identity. Add a test asserting the workload cannot modify a written log."
+      }
+    },
+    {
+      "question": "Does the application lack monitoring/alerting on the security events that would indicate active attack (auth failure spikes, privilege escalations, unusual data access, SSRF/exfil patterns)? (V16.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V16.4.1: alert on the leading indicators of attack",
+        "prompt": "Problem: Without alerts, attacks proceed undetected until effects surface elsewhere.\n\nFind all instances: List the security signals worth alerting on (auth-failure spikes, privilege grants outside change windows, exports above thresholds, outbound traffic to new destinations).\n\nFix correctly: Add monitoring rules with thresholds and on-call routing. Tune to keep false-positive rate manageable. Include runbooks.\n\nAcceptance: Each rule fires on a synthetic test event and reaches the on-call channel. Add an alerting-test workflow."
+      }
+    },
+    {
+      "question": "Does any HTTP cookie/session/token live longer than the threat model justifies, with no revocation list and no logout-everywhere capability? (V7.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V7.4.1: support session revocation and \"log out everywhere\"",
+        "prompt": "Problem: Without server-side revocation, a leaked token remains valid until expiry; users cannot recover from compromise.\n\nFind all instances: Check whether session tokens are validated against a server-side store and whether the user can terminate all sessions.\n\nFix correctly: Keep an authoritative server-side session record; verify on each request (or via a short-lived token + refresh). Provide a \"sign out of all devices\" action that invalidates all sessions for the principal.\n\nAcceptance: A user can revoke all sessions; revoked tokens fail immediately. Add a test asserting an in-flight token fails after revocation."
+      }
+    },
+    {
+      "question": "Is the application's TLS-terminating layer missing HSTS (Strict-Transport-Security) with a non-trivial max-age, allowing protocol downgrade for first-time visitors? (V12.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V12.1.2: enable HSTS with a long max-age (and preload where applicable)",
+        "prompt": "Problem: Without HSTS, browsers can be coaxed onto plaintext HTTP, exposing credentials and cookies.\n\nFind all instances: Inspect responses for Strict-Transport-Security header.\n\nFix correctly: Set HSTS with max-age ≥ 31536000 (1 year), includeSubDomains where the entire domain is HTTPS, preload when ready. Roll out gradually with a lower max-age first.\n\nAcceptance: All HTTPS responses include HSTS. Add a test asserting the header value."
+      }
+    },
+    {
+      "question": "Do XML parsers used on untrusted input have DTD processing, external entity resolution, or unbounded entity expansion enabled (XXE / billion laughs)? (V1.3.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.3.2: harden XML parsers against XXE and entity expansion",
+        "prompt": "Problem: XML parsers with default settings often resolve external entities, allowing file read, SSRF, and DoS via entity expansion.\n\nFind all instances: Locate XML parser/reader creation handling untrusted input; verify DTD/external-entity/network access are disabled.\n\nFix correctly: Configure parsers to prohibit DTDs, disable external entities, disable external resource resolution, and bound expansion. Use the platform's secure-processing flag.\n\nAcceptance: XXE/expansion payloads are refused. Add tests with an external-entity payload and a billion-laughs payload."
+      }
+    },
+    {
+      "question": "Are templates loaded by name from untrusted input or built by concatenating untrusted content into template syntax (server-side template injection)? (V1.3.3)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.3.3: templates are trusted code; data flows only as bound variables",
+        "prompt": "Problem: Choosing a template by user input or concatenating user content into a template lets the engine evaluate attacker expressions (SSTI → RCE).\n\nFind all instances: Locate template selection by name and template-text assembly; trace user input.\n\nFix correctly: Treat templates as trusted code authored by developers. Pass user data only as escaped variables into a fixed template. Select templates from an allowlist.\n\nAcceptance: No template path or template body is influenced by user input. Add a test with template-syntax payloads asserting they render inert."
+      }
+    },
+    {
+      "question": "Do redirect destinations come from request parameters/headers without restriction to relative paths or an allowlist (open redirect)? (V3.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.5.1: open-redirect — allow only relative paths or an approved-domain allowlist",
+        "prompt": "Problem: Redirects to user-controlled absolute URLs enable phishing and OAuth-token theft.\n\nFind all instances: Locate redirect responses whose Location/returnUrl is derived from request input (returnUrl, next, redirect, callback, Referer).\n\nFix correctly: Accept only relative paths (rooted to the app, reject //evil.com and backslash tricks) or match against an allowlist. Canonicalise before checking.\n\nAcceptance: //evil.com, https://evil.com, and \\\\evil.com are refused. Add tests asserting each."
+      }
+    },
+    {
+      "question": "Is downloadable content served with permissive Content-Disposition or wrong Content-Type, enabling MIME confusion and same-origin script execution? (V3.5.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.5.2: serve downloads with explicit Content-Type and nosniff",
+        "prompt": "Problem: Wrong/missing Content-Type with no X-Content-Type-Options lets the browser sniff and execute uploaded HTML/JS.\n\nFind all instances: Audit download endpoints; check Content-Type, Content-Disposition, and nosniff header.\n\nFix correctly: Determine Content-Type server-side from the file (not the client's claim); set X-Content-Type-Options: nosniff; use Content-Disposition: attachment for non-rendered types.\n\nAcceptance: Uploaded HTML cannot execute as same-origin script. Add a test serving a crafted HTML file and asserting safe handling."
+      }
+    },
+    {
+      "question": "Is the application's API documentation/OpenAPI definition out of sync with the actual implementation, masking endpoints or auth requirements? (V4.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V4.5.1: keep API documentation in lock-step with implementation",
+        "prompt": "Problem: Drift between docs and code means undocumented endpoints exist (often forgotten/insecure) and reviewers can't audit auth requirements.\n\nFind all instances: Enumerate routes; compare to OpenAPI/Swagger; identify undocumented endpoints and undeclared auth/scope.\n\nFix correctly: Generate OpenAPI from code (or vice versa) and gate CI on the diff. Declare auth schemes per endpoint. Remove or document any \"forgotten\" routes.\n\nAcceptance: Every endpoint appears in the API doc with its real auth requirements. Add a CI step asserting no drift."
+      }
+    },
+    {
+      "question": "Does the application not enforce HTTPS-only at the edge (allowing plaintext HTTP listening) or fail to redirect plain HTTP to HTTPS? (V12.1.3)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V12.1.3: HTTPS-only at the edge; redirect HTTP to HTTPS",
+        "prompt": "Problem: Plaintext HTTP listening exposes credentials, cookies, and content to network attackers.\n\nFind all instances: Inspect the edge/load-balancer/ingress for HTTP listeners and redirect rules.\n\nFix correctly: Either disable HTTP entirely (recommended for APIs) or have HTTP return 308 to the HTTPS URL. Combine with HSTS.\n\nAcceptance: Plain HTTP requests either fail or are redirected. Add a test asserting redirect/refusal."
+      }
+    },
+    {
+      "question": "Are signed URLs / pre-signed URLs / capability tokens issued with unbounded scope, long lifetimes, or no per-resource binding? (V8.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V8.4.1: scope pre-signed URLs tightly; short lifetimes; resource-bound",
+        "prompt": "Problem: Broad pre-signed URLs let recipients access more than intended, and long lifetimes let URLs leak to logs and be reused.\n\nFind all instances: Locate code that mints pre-signed URLs/capability tokens; review scope, method, lifetime, and binding.\n\nFix correctly: Restrict each pre-signed URL to one method (GET or PUT) on one resource path. Set lifetime to the shortest needed (often ≤15 min). Encode integrity-check parameters where supported.\n\nAcceptance: Pre-signed URLs are minimum-scope, short-lived, single-resource. Add a test asserting expired and wrong-method requests fail."
+      }
+    },
+    {
+      "question": "Are server-to-server calls (microservices, background jobs) authenticated only by IP/network position rather than mutual TLS or signed tokens? (V8.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V8.5.1: authenticate service-to-service traffic with mTLS or signed tokens",
+        "prompt": "Problem: Network-position-only trust collapses once any host on the network is compromised.\n\nFind all instances: Map internal service calls; identify which are authenticated by IP/network only.\n\nFix correctly: Issue per-service identities (SPIFFE/SPIRE, k8s service accounts, mTLS certs from a service mesh) and require them on every call. For one-shot RPCs, sign with short-lived service tokens.\n\nAcceptance: Internal calls fail without a valid identity. Add a test asserting unauthenticated internal calls are refused."
+      }
+    },
+    {
+      "question": "Does the application accept Authorization headers, cookies, or query tokens for elevated actions over plaintext channels (HTTP) anywhere in the stack? (V12.3.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V12.3.1: never accept credentials over plaintext",
+        "prompt": "Problem: Any endpoint that accepts credentials over HTTP exposes them to passive network attackers.\n\nFind all instances: Enumerate listeners and middleware; check whether credentials are accepted on plaintext channels.\n\nFix correctly: Disable plaintext listening, or refuse requests that carry credentials on plaintext. Ensure clients are configured for HTTPS-only.\n\nAcceptance: Credentials over HTTP are refused. Add a test asserting refusal."
+      }
+    },
+    {
+      "question": "Are background jobs / message handlers running without ownership or message-source validation, allowing forged messages from anyone with queue access? (V4.6.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V4.6.1: validate authenticity of queue/message inputs",
+        "prompt": "Problem: Background handlers often assume queue messages are trusted, but any compromise of producers or the broker can inject forged messages.\n\nFind all instances: Locate message consumers; check whether they verify the producer's identity (signature, mTLS, broker ACLs) and validate the message schema.\n\nFix correctly: Require signed messages or producer-side mTLS. Validate the schema before acting. Apply per-producer authorization on actions.\n\nAcceptance: Forged or schema-invalid messages are refused. Add a test injecting a malformed/unsigned message and asserting refusal."
+      }
+    },
+    {
+      "question": "Are GraphQL APIs vulnerable to query-depth/complexity attacks because there's no depth limit, no complexity cost budget, and no per-operation rate limiting? (V4.7.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V4.7.1: bound GraphQL depth, complexity, and per-operation rate",
+        "prompt": "Problem: Without limits, attackers craft nested queries that exhaust CPU/DB resources.\n\nFind all instances: Inspect GraphQL server config for depth limits, query-complexity analysis, and rate limiting.\n\nFix correctly: Configure max query depth (e.g. 10), a complexity budget per request, persisted queries for public clients, and per-operation rate limits.\n\nAcceptance: Deep/complex queries are rejected. Add a test asserting a deeply-nested query is refused."
+      }
+    },
+    {
+      "question": "Does the cache (CDN, reverse proxy, browser) store authenticated/private responses publicly because Cache-Control headers are missing or wrong? (V3.6.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.6.1: set Cache-Control: no-store on private/authenticated responses",
+        "prompt": "Problem: Without Cache-Control: no-store (or private), shared caches serve private responses to other users.\n\nFind all instances: Audit responses for cache directives, particularly on authenticated endpoints and dynamic personalisation.\n\nFix correctly: Set Cache-Control: no-store on authenticated responses; use private + must-revalidate when intermediate caching is undesired but client caching is okay; omit Vary footguns.\n\nAcceptance: Authenticated responses carry the right directives. Add tests asserting Cache-Control on representative endpoints."
+      }
+    },
+    {
+      "question": "Are public assets / static resources serving any privileged content (admin scripts, backups, .git, .env, source maps with sensitive comments) because the web root is not constrained? (V5.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V5.5.1: constrain the public web root; never serve dotfiles or backups",
+        "prompt": "Problem: Loose static-file handlers expose .git, .env, *.bak, source maps, and admin tooling.\n\nFind all instances: Inspect static-file middleware roots and ignore patterns. Probe paths like /.git/HEAD, /.env, /backup.zip.\n\nFix correctly: Constrain the static root to a dedicated directory containing only public assets; configure deny-list of dotfile/backup patterns at the proxy. Disable source map serving in production.\n\nAcceptance: Probes return 404. Add a test probing dotfile/backup paths."
+      }
+    },
+    {
+      "question": "Are JWT or token signing keys reused across environments (dev/staging/prod) or across services that should be isolated trust domains? (V11.2.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.2.2: per-environment, per-trust-domain signing keys",
+        "prompt": "Problem: Shared keys across environments/services collapse the trust boundary — a dev key leak grants prod access.\n\nFind all instances: Inventory signing keys per environment and service.\n\nFix correctly: Generate distinct keys per environment and per logical trust domain. Rotate independently. Verify the iss/aud claims tie tokens to the issuing domain.\n\nAcceptance: A dev token cannot validate against prod. Add a test asserting cross-environment validation fails."
+      }
+    },
+    {
+      "question": "Are nonces or IVs for AEAD reused (counter not advanced; random nonce too short; deterministic IV for the same key), undermining the AEAD's security? (V11.1.3)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.1.3: never reuse (key, nonce) pairs with AEAD",
+        "prompt": "Problem: AES-GCM with a reused (key, nonce) catastrophically loses confidentiality and integrity. ChaCha20-Poly1305 has similar requirements.\n\nFind all instances: Locate AEAD calls; check nonce generation strategy (counter vs random) and width.\n\nFix correctly: Use a fresh random nonce of the right size (96 bits for AES-GCM) per message, or a counter that strictly advances and is persisted. Rotate keys before the counter could wrap.\n\nAcceptance: No (key, nonce) is ever reused. Add a test verifying nonce uniqueness over a large run."
+      }
+    },
+    {
+      "question": "Is HTTP Basic auth used over the public network for any production endpoint? (V6.6.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.6.1: replace HTTP Basic on public endpoints with modern auth",
+        "prompt": "Problem: HTTP Basic transmits credentials on every request, even over TLS, and is awkward to revoke and rate-limit.\n\nFind all instances: Locate Basic-auth-protected routes in the app and proxies.\n\nFix correctly: Replace with OAuth2/OIDC, signed tokens, or session-based auth. If Basic must remain, restrict to internal networks and apply rate limits / monitoring.\n\nAcceptance: No public route uses Basic. Add a test asserting Basic is refused on public routes."
+      }
+    },
+    {
+      "question": "Does the password reset link rely on a token that is long-lived, reusable, or sent over insecure email-side channels (e.g. as a query string indexed by analytics)? (V6.3.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V6.3.2: short-lived single-use reset tokens with secure transport",
+        "prompt": "Problem: Long-lived or reusable reset tokens can be replayed. Tokens in URLs leak via Referer and analytics.\n\nFind all instances: Inspect reset-token generation, lifetime, single-use enforcement, and how the link is delivered.\n\nFix correctly: Generate a CSPRNG-derived single-use token with a short TTL (≤15 min for high-risk; ≤1h max). Store its hash server-side; mark used on success. Strip Referer where the link page is opened, or use POST.\n\nAcceptance: A used token fails; expired tokens fail. Add tests for both."
+      }
+    },
+    {
+      "question": "Are background workers / scheduled jobs assigned cloud IAM permissions far beyond their needs (e.g. *:*), violating least privilege? (V15.3.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V15.3.2: trim worker IAM to minimum required actions and resources",
+        "prompt": "Problem: Overprivileged workers turn small bugs into widespread cloud-resource compromise.\n\nFind all instances: Inventory IAM roles bound to workers; flag wildcards and over-broad resource patterns.\n\nFix correctly: Use access analyser/policy advisor to derive minimum-needed permissions. Switch to least-privilege resource-scoped policies. Re-evaluate quarterly.\n\nAcceptance: Each worker's role contains no wildcard actions or resources. Add a CI policy check."
+      }
+    },
+    {
+      "question": "Are user-uploaded files served from the same origin as the application, allowing same-origin XSS via served HTML/SVG? (V5.3.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V5.3.2: serve user content from a sandboxed/separate origin",
+        "prompt": "Problem: Same-origin serving of user content means a single MIME-confusion or rendering bug becomes a full account-takeover XSS.\n\nFind all instances: Identify the origin used to serve user uploads and downloads.\n\nFix correctly: Use a distinct origin (user-content.<domain>) with its own restrictive CSP and no auth cookies. Render previews in cross-origin iframes.\n\nAcceptance: Scripts in uploaded content cannot reach the main app's origin. Add a test asserting cross-origin isolation."
+      }
+    },
+    {
+      "question": "Do log records contain trustworthy timestamps, source identity, and request correlation IDs sufficient for incident investigation? (V16.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V16.1.2: include high-resolution UTC timestamps, source, and correlation IDs in logs",
+        "prompt": "Problem: Logs without consistent timestamps/correlation make incident reconstruction impossible.\n\nFind all instances: Inspect log emitter configuration; check for ISO-8601/UTC timestamps with milliseconds, hostname/pod identity, and a per-request correlation ID propagated across services.\n\nFix correctly: Configure structured logging with these fields. Propagate trace/correlation IDs via headers across service hops.\n\nAcceptance: A single trace ID joins logs across services. Add a test asserting the field is present and propagated."
+      }
+    },
+    {
+      "question": "Are administrative panels or internal-only endpoints reachable from the public internet without IP/VPN restriction or explicit re-authentication? (V13.6.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V13.6.1: confine admin surfaces to internal networks with re-auth",
+        "prompt": "Problem: Public exposure of admin endpoints lets attackers brute-force or exploit them with no network hurdle.\n\nFind all instances: Enumerate admin-flagged routes; check ingress rules.\n\nFix correctly: Bind admin to internal networks (VPN/zero-trust), require re-authentication for sensitive actions, and require phishing-resistant MFA.\n\nAcceptance: Admin routes are unreachable from the public internet. Add a test from an outside-network identity asserting refusal."
+      }
+    },
+    {
+      "question": "Are dependency download/install scripts run with elevated privileges or fetched without integrity verification (no checksum, no signature, no lockfile)? (V15.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V15.4.1: lock and integrity-verify dependencies during build",
+        "prompt": "Problem: Without lockfile + checksum/signature verification, a compromised registry or transient mirror can swap dependencies under the build.\n\nFind all instances: Inspect package manager configuration; verify lockfile usage, integrity checks (npm package-lock+integrity, pip --require-hashes, cargo Cargo.lock).\n\nFix correctly: Enable lockfile + integrity verification. Pin registries. Mirror critical dependencies into an internal repository.\n\nAcceptance: Builds fail on lockfile mismatch or hash mismatch. Add a CI step enforcing this."
+      }
+    },
+    {
+      "question": "Are tokens / cookies / secrets emitted in URLs (query string or fragment), making them appear in browser history, Referer, and access logs? (V9.3.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V9.3.2: never carry credentials in URLs",
+        "prompt": "Problem: Credentials in URLs leak via browser history, Referer headers, proxy logs, and analytics.\n\nFind all instances: Grep for query-string parameters carrying tokens (token=, key=, password=). Inspect OAuth flows for implicit-grant residue.\n\nFix correctly: Carry credentials only in headers (Authorization) or POST bodies. For one-time URLs, use a short-lived single-use token bound to a session, then redirect to a clean URL.\n\nAcceptance: Credentials no longer appear in URLs. Add a test asserting query strings carry no credential-shaped values."
+      }
+    },
+    {
+      "question": "Do error-handling paths use overly broad catch blocks that swallow security-relevant exceptions (authentication, authorisation, validation failures) without logging? (V16.2.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V16.2.2: do not swallow security-relevant exceptions",
+        "prompt": "Problem: Catch-all blocks that ignore exceptions hide attacks and bugs alike.\n\nFind all instances: Search for broad catch (catch Exception, except:, catch (Throwable)) without logging or rethrow. Focus on auth/authz/validation code paths.\n\nFix correctly: Catch only what is expected and handled. Log security-relevant exceptions with full context (without secrets). Let the rest propagate to a global handler that logs and returns a generic error.\n\nAcceptance: No security-relevant exception is silently swallowed. Add a test asserting auth failures surface in audit logs."
+      }
+    },
+    {
+      "question": "Does the application read security-sensitive configuration (allowed origins, auth flags) at runtime from sources that aren't authenticated or signed (etcd/consul/redis with no auth, S3 buckets without integrity)? (V13.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V13.1.2: integrity-check security configuration sources",
+        "prompt": "Problem: Tampered configuration is a quiet way to disable security controls (loosen CORS, lower MFA requirements).\n\nFind all instances: Map config sources used at runtime; check for authentication and integrity (signed config, hashed bundles).\n\nFix correctly: Use authenticated config sources; sign config bundles; verify on load. Restrict who can write to config stores. Alert on config changes.\n\nAcceptance: Config loads fail closed on tampering. Add a test rejecting an unsigned/tampered config."
+      }
+    },
+    {
+      "question": "Are server-side template engines configured with raw/unescaped output as the default (or with auto-escaping disabled globally), inviting XSS? (V1.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V1.1.2: keep auto-escaping on; require explicit opt-in for raw output",
+        "prompt": "Problem: When the engine doesn't auto-escape, every author must remember to escape — and one slip is a vulnerability.\n\nFind all instances: Locate template engine configuration; check the default escaping mode.\n\nFix correctly: Enable auto-escaping globally. Require explicit, audited opt-in for raw output (and prefer sanitised rich-content rendering over raw).\n\nAcceptance: Default rendering is auto-escaped. Add a test asserting a script-tag in a template variable renders as text."
+      }
+    },
+    {
+      "question": "Does the application not log denied authorisation attempts, making it hard to detect privilege-escalation attempts? (V16.1.3)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V16.1.3: log every authorisation denial",
+        "prompt": "Problem: Without denial logs, attackers probing for privilege escalation leave no trace.\n\nFind all instances: Inspect the authorisation layer; check whether denials are logged with actor, target, action, and reason.\n\nFix correctly: Emit a structured audit event on every denial. Aggregate to detect probing patterns (many denials from one principal).\n\nAcceptance: Denials are visible in the audit log and aggregated. Add a test causing denials and asserting they appear."
+      }
+    },
+    {
+      "question": "Are JSON Web Encryption (JWE) tokens accepted with weak alg/enc combinations or with parameters chosen from the header rather than pinned by the receiver? (V9.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V9.1.2: pin JWE alg/enc; reject unsupported combinations",
+        "prompt": "Problem: JWE libraries that trust the header for alg/enc allow weak combinations (RSA1_5 + A128CBC-HS256) or unsupported algorithms.\n\nFind all instances: Locate JWE decrypt call sites; check whether alg/enc are pinned.\n\nFix correctly: Pin to a strong combination (ECDH-ES+A256GCM or A256GCMKW). Reject any other alg/enc.\n\nAcceptance: JWE with non-allowed alg/enc are refused. Add tests for each."
+      }
+    },
+    {
+      "question": "Are remember-me / persistent-login tokens stored in cookies without secure-by-default attributes and without server-side revocation? (V7.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V7.5.1: harden remember-me cookies and make them revocable",
+        "prompt": "Problem: Long-lived remember-me tokens magnify the impact of cookie theft.\n\nFind all instances: Locate remember-me/persistent-login implementations.\n\nFix correctly: Generate CSPRNG-derived selector+verifier; store hash server-side; rotate on use (one-time-use chain that detects theft on replay). Apply Secure/HttpOnly/SameSite and a constrained Path. Allow user-driven revocation.\n\nAcceptance: A replayed remember-me token invalidates the chain. Add a test asserting reuse-detection invalidates both."
+      }
+    },
+    {
+      "question": "Do role/group assignments come from sources the application doesn't authenticate (HTTP headers from clients, JWT custom claims not verified), allowing client-side privilege injection? (V8.6.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V8.6.1: derive role/group only from authenticated sources",
+        "prompt": "Problem: Trusting client-supplied role/group claims (X-Roles header, unverified JWT claim) allows privilege injection.\n\nFind all instances: Locate code that reads roles/groups; trace the source.\n\nFix correctly: Derive roles/groups only from authenticated identity provider claims or server-side records. Verify JWT signatures before reading claims.\n\nAcceptance: Client-set role headers are ignored. Add a test asserting injected role headers do not grant privilege."
+      }
+    },
+    {
+      "question": "Is the application missing dependency-graph monitoring for transitive vulnerabilities (only top-level deps are scanned)? (V15.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V15.1.2: scan the full transitive dependency tree",
+        "prompt": "Problem: Critical CVEs often hide in transitive dependencies that surface-level scans miss.\n\nFind all instances: Inspect the SCA configuration; verify it walks the lockfile, not just package.json/requirements.txt.\n\nFix correctly: Switch to an SCA tool that operates on the lockfile (npm audit, pip-audit, cargo-audit, grype). Wire it into CI to block on critical/high findings.\n\nAcceptance: SCA covers transitives. Add a test/CI step asserting a known-vulnerable transitive surfaces."
+      }
+    },
+    {
+      "question": "Are container images built FROM untrusted base images with no provenance, or pulled at runtime by mutable tag (e.g. :latest) so the image can change between runs? (V15.2.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V15.2.2: pin base images by digest; pull from trusted registries",
+        "prompt": "Problem: Mutable tags let images change under the runtime; untrusted bases ship vulnerabilities and possibly malware.\n\nFind all instances: Inspect Dockerfiles and Helm/Kustomize manifests; identify tag-based pulls and questionable bases.\n\nFix correctly: Pin base images by digest (sha256:...). Use a curated internal registry. Scan images on build; gate on findings.\n\nAcceptance: All image pulls are by digest from trusted sources. Add a CI policy check."
+      }
+    },
+    {
+      "question": "Are cryptographic operations performed by hand-rolled implementations or by deprecated libraries instead of the platform's standard, audited primitives? (V11.4.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.4.1: use platform-standard, audited cryptographic libraries",
+        "prompt": "Problem: Hand-rolled crypto has consistent issues (constant-time, key handling, padding). Deprecated libraries lack timely fixes.\n\nFind all instances: Locate cryptographic operations; identify hand-rolled implementations and deprecated libraries.\n\nFix correctly: Replace with the platform's standard crypto library (libsodium/NaCl, BoringSSL, .NET's System.Security.Cryptography, Python's cryptography). Use high-level APIs (AEAD, password-hash) over primitives.\n\nAcceptance: No hand-rolled crypto in security paths. Add a CI rule flagging direct-block-cipher use outside known wrappers."
+      }
+    },
+    {
+      "question": "Do session cookies persist across browser sessions when they should be session-only (no max-age/expires), making compromised devices a permanent foothold? (V7.6.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V7.6.1: scope session cookies to browser sessions where appropriate",
+        "prompt": "Problem: Persistent session cookies on shared/compromised devices outlive the user's browser session.\n\nFind all instances: Inspect Set-Cookie for session cookies; check whether they carry Max-Age/Expires that exceed the intended scope.\n\nFix correctly: For session-only behaviour, omit Max-Age/Expires (or set Max-Age=0 on logout). Use server-side absolute timeout as the authoritative bound. Distinguish remember-me from session cookies.\n\nAcceptance: Closing the browser ends the session. Add a test asserting Max-Age semantics."
+      }
+    },
+    {
+      "question": "Is access to sensitive data not subject to fine-grained authorisation checks at the row/field level, so the API leaks data the caller is technically authorised to receive but should not see in bulk (mass-export abuse)? (V8.7.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V8.7.1: bound bulk-data access by per-row authorisation and export limits",
+        "prompt": "Problem: Endpoints that return collections without row-level authorisation can be drained by abusive callers.\n\nFind all instances: Locate list/search endpoints; check whether each row is checked against the caller's permissions and whether export caps apply.\n\nFix correctly: Enforce per-row authorisation (or query filters bound to the caller). Cap page size; require authentication and abuse signals for large queries; rate-limit bulk endpoints.\n\nAcceptance: A low-privilege caller cannot mass-export. Add a test asserting limits and per-row checks."
+      }
+    },
+    {
+      "question": "Does the application not validate file/path inputs against canonicalisation attacks (Unicode normalisation tricks, mixed slashes, encoded slashes)? (V5.2.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V5.2.2: canonicalise file paths fully before authorisation/decisions",
+        "prompt": "Problem: Authorisation decisions made on non-canonical paths can be bypassed by Unicode tricks (\\u002f, %2f, ..\\\\, NFKD-mapped slashes).\n\nFind all instances: Locate code that authorises/uses file paths; check whether paths are normalised and re-validated post-canonicalisation.\n\nFix correctly: URL-decode once, normalise Unicode to NFC, resolve to absolute path, and confirm the result starts with the allowed root. Reject mixed slashes and encoded path separators.\n\nAcceptance: Encoded-traversal payloads are refused. Add tests with %2f, NFKD-mapped variants, and Unicode look-alikes."
+      }
+    },
+    {
+      "question": "Does the application not enforce subresource integrity (SRI) on third-party scripts and stylesheets it loads, leaving it exposed to CDN compromise? (V3.2.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V3.2.2: pin external script/style integrity with SRI",
+        "prompt": "Problem: Third-party scripts loaded without SRI execute whatever the CDN serves, including compromised payloads.\n\nFind all instances: Inspect HTML/SPA shells for <script src=\"//cdn...\"> and <link rel=\"stylesheet\" href=\"//cdn...\"> tags without integrity attributes.\n\nFix correctly: Add integrity=\"sha384-...\" and crossorigin=\"anonymous\". Generate and update integrity hashes during build. Self-host critical scripts where feasible.\n\nAcceptance: Every external script/style declares integrity. Add a CI step asserting SRI on all external <script>/<link> tags."
+      }
+    },
+    {
+      "question": "Are integer arithmetic operations on untrusted values (sizes, counts, amounts) unchecked, allowing overflow/wrap/sign-flip to produce out-of-bounds states? (V2.1.2)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V2.1.2: checked arithmetic and explicit bounds on untrusted integers",
+        "prompt": "Problem: Untrusted integers in arithmetic can overflow/wrap, leading to negative quantities, buffer-size underflow, or pricing bugs.\n\nFind all instances: Locate arithmetic on user-derived integers in security-relevant code (sizes, indices, money).\n\nFix correctly: Use checked arithmetic (checked{} in C#, Math.addExact in Java, explicit overflow checks). Cap values at safe bounds before use. Use decimal types for money.\n\nAcceptance: Overflow inputs produce explicit failures, not silent wraps. Add tests at boundary values."
+      }
+    },
+    {
+      "question": "Does the codebase commit timing-side-channel-vulnerable comparisons (string equality of secrets/HMACs) instead of constant-time comparison? (V11.5.1)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix V11.5.1: use constant-time comparison for secrets",
+        "prompt": "Problem: == on secrets/HMACs leaks length and prefix information via timing, especially over networks.\n\nFind all instances: Locate comparisons of HMACs, tokens, password hashes, MAC tags; check whether they use the platform's constant-time helper.\n\nFix correctly: Use crypto.timingSafeEqual, hmac.compare_digest, CryptographicOperations.FixedTimeEquals, MessageDigest.isEqual. Wrap into a helper to make reuse easy.\n\nAcceptance: All secret comparisons go through the constant-time helper. Add a test asserting equal-length but differing inputs return false."
+      }
+    }
+  ]
+}
