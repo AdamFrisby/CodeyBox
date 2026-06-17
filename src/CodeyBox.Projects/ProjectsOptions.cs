@@ -216,6 +216,7 @@ public sealed class ProjectConfiguredAuditorConfig
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
     public bool CanShortCircuitOnBlockingFinding { get; set; }
+    public string? Role { get; set; }
 }
 
 public static class ProjectsOptionsBinder

@@ -105,6 +105,33 @@ public sealed class LlmReviewAuditorTests
     }
 
     [Fact]
+    public async Task RunAsync_CustomFrameWithoutCiNote_PrependsRequiredBuildTestInstruction()
+    {
+        var runner = new PromptCapturingRunner();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "custom frame\n{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
+        });
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work",
+            AuditRunner: runner);
+
+        await auditor.RunAsync(new ResultFileSandbox(), "/work", ctx);
+
+        Assert.Contains(LlmReviewAuditor.CiAlreadyRanMarker, runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains(LlmReviewAuditor.DoNotRunBuildOrTestsMarker, runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains(LlmReviewAuditor.AntiBiasMarker, runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains("custom frame", runner.ObservedPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task RunAsync_TestCoveragePromptDoesNotScoreUnrunnableE2EProjects()
     {
         var runner = new UnrunnableE2ERuleAwareRunner();
@@ -140,6 +167,27 @@ public sealed class LlmReviewAuditorTests
             runner.ObservedPrompt,
             StringComparison.Ordinal);
         Assert.DoesNotContain(result.Findings, f => f.Title.Contains("add more E2E coverage", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private sealed class PromptCapturingRunner : IAgentRunner
+    {
+        public AgentKind Kind => AgentKind.Codex;
+        public string ObservedPrompt { get; private set; } = string.Empty;
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            ObservedPrompt = prompt;
+            return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
+        }
     }
 
     private sealed class CredentialCapturingRunner : IAgentRunner

@@ -105,11 +105,47 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        // Missing-tool gate findings are non-blocking by existing policy, but
-        // a non-passing BuildTestGate still cannot allow the CI-passed prompt
-        // claim to reach the LLM panel.
-        Assert.Equal(WorkItemState.Done, final!.State);
+        // A non-passing BuildTestGate cannot allow a green audit even when the
+        // auditor's own finding was informational. The pipeline synthesizes a
+        // blocking gate finding so the item cannot merge without verified tests.
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
 
+        Assert.Equal(0, llmRunsSeen);
+        Assert.Empty(llm.SeenIterations);
+        Assert.Equal([1], gate.SeenIterations);
+    }
+
+    [Fact]
+    public async Task BuildTestGatePassedTrueWithErrorFinding_LlmPanelIsSkippedAndAuditBlocks()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+        [
+            new AuditOutcome(true, [new AuditFinding(
+                "csharp:test-pass", AuditSeverity.Error,
+                "tests failed despite passed flag", "The test command reported a failure.")]),
+        ]);
+
+        var llmRunsSeen = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRunsSeen));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            auditors: [gate, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials());
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Equal(0, llmRunsSeen);
         Assert.Empty(llm.SeenIterations);
         Assert.Equal([1], gate.SeenIterations);
@@ -164,6 +200,9 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         // build+test, not lint/format).
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
 
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass", AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])]);
         var format = new RoleStampedScriptedAuditor(
             "csharp:format-check", AuditorRole.None,
             [new AuditOutcome(false, [new AuditFinding(
@@ -174,7 +213,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
-            auditors: [format, llm],
+            auditors: [format, gate, llm],
             maxAuditIterations: 1,
             credentials: AuditCredentials());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -223,15 +262,9 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 /// </summary>
 public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
 {
-    private const string AntiBiasMarker =
-        "does NOT mean the code is correct, complete, or well-designed";
-    private const string CiAlreadyRanMarker =
-        "Automated CI has already built the project and run the full test suite";
-    // The operative anti-rerun instruction. Asserted separately from the
-    // surrounding CI-claim/anti-bias clauses so removing JUST this sentence
-    // (leaving the context that hints at it) still fails the test.
-    private const string DoNotRunBuildOrTestsMarker =
-        "Do NOT run any build or test commands yourself";
+    private const string AntiBiasMarker = LlmReviewAuditor.AntiBiasMarker;
+    private const string CiAlreadyRanMarker = LlmReviewAuditor.CiAlreadyRanMarker;
+    private const string DoNotRunBuildOrTestsMarker = LlmReviewAuditor.DoNotRunBuildOrTestsMarker;
 
     [Fact]
     public async Task FrameTemplate_AntiBiasDisclaimer_SurvivesPromptRendering_AndFindingsSurface()
@@ -261,7 +294,7 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
             Iteration: 1,
             OriginalPrompt: "Add a feature flag for X.",
             AuditRunner: runner);
-        var sandbox = new WritableResultFileSandbox();
+        var sandbox = new LowQualityDiffSandbox();
 
         var result = await auditor.RunAsync(sandbox, "/work", ctx);
 
@@ -271,18 +304,20 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
         Assert.Contains(DoNotRunBuildOrTestsMarker, runner.ObservedPrompt, StringComparison.Ordinal);
         Assert.Contains(AntiBiasMarker, runner.ObservedPrompt, StringComparison.Ordinal);
 
-        // The deterministic reviewer is a prompt-wiring simulation: when the
-        // anti-bias disclaimer reaches the prompt, its JSON verdict contains
-        // the blocking findings this regression needs surfaced.
+        // The deterministic reviewer inspects the low-quality diff exposed by
+        // the sandbox. The anti-bias sentence alone is not enough to make it
+        // fail: removing the diff context would produce a passing verdict.
         Assert.False(result.Passed);
         Assert.NotEmpty(result.Findings);
         Assert.Contains(result.Findings, f => f.Severity == AuditSeverity.Error);
+        Assert.Contains(sandbox.Executed, e => e.Argv.Count >= 2 && e.Argv[0] == "git" && e.Argv[1] == "diff");
+        Assert.DoesNotContain(sandbox.Executed, IsBuildOrTestCommand);
     }
 
     /// <summary>
-    /// Stub reviewer for the prompt-frame wiring contract. It emits the
-    /// low-quality-diff findings only when the anti-bias disclaimer survives
-    /// rendering into the prompt; this is not a live-model behaviour test.
+    /// Stub reviewer for the prompt-frame wiring contract. It reads the diff
+    /// from the sandbox and reports the unwired/undertested change only when
+    /// both the anti-bias note and the low-quality diff are present.
     /// </summary>
     private sealed class LowQualityDiffReviewRunner : IAgentRunner
     {
@@ -301,36 +336,92 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
             bool captureStructuredStream = false)
         {
             ObservedPrompt = prompt;
-            if (sandbox is WritableResultFileSandbox writable)
+            var diff = sandbox.ExecAsync(new SandboxExec
             {
-                writable.ResultJson = prompt.Contains(AntiBiasMarker, StringComparison.Ordinal)
-                    ? """
-                      {"passed":false,"findings":[
-                        {"severity":"error","title":"new code path is never wired to a caller","description":"AddFeatureFlagX is defined but no consumer invokes it; tests cover it directly only","location":"src/Foo.cs:42"},
-                        {"severity":"error","title":"no test covers the disabled branch","description":"only the enabled branch is asserted; disabled path is unobserved","location":"tests/FooTests.cs:10"}
-                      ]}
-                      """
-                    : """
-                      {"passed":true,"findings":[]}
-                      """;
+                Argv = ["git", "diff", "main...codeybox/test", "--", "src/FeatureFlags.cs", "tests/FeatureFlagsTests.cs"],
+                WorkingDirectory = workingDirectory,
+            }, ct).GetAwaiter().GetResult().Stdout;
+
+            var lowQualityDiff =
+                diff.Contains("public static bool AddFeatureFlagX", StringComparison.Ordinal)
+                && !diff.Contains("services.AddSingleton", StringComparison.Ordinal)
+                && !diff.Contains("DisabledBranch_ReturnsFalse", StringComparison.Ordinal);
+            var shouldReport = prompt.Contains(AntiBiasMarker, StringComparison.Ordinal) && lowQualityDiff;
+            var resultJson = shouldReport
+                ? """
+                  {"passed":false,"findings":[
+                    {"severity":"error","title":"new code path is never wired to a caller","description":"AddFeatureFlagX is defined but no consumer invokes it; tests cover it directly only","location":"src/FeatureFlags.cs:42"},
+                    {"severity":"error","title":"no test covers the disabled branch","description":"only the enabled branch is asserted; disabled path is unobserved","location":"tests/FeatureFlagsTests.cs:10"}
+                  ]}
+                  """
+                : """
+                  {"passed":true,"findings":[]}
+                  """;
+
+            if (sandbox is LowQualityDiffSandbox writable)
+            {
+                writable.ResultJson = resultJson;
             }
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
         }
     }
 
-    private sealed class WritableResultFileSandbox : ISandbox
+    private sealed class LowQualityDiffSandbox : ISandbox
     {
         public string Id => "low-quality-diff-sandbox";
         public string ResultJson { get; set; } = "{\"passed\":true,\"findings\":[]}";
+        public List<SandboxExec> Executed { get; } = [];
+
+        private const string LowQualityDiff = """
+            diff --git a/src/FeatureFlags.cs b/src/FeatureFlags.cs
+            new file mode 100644
+            index 0000000..1111111
+            --- /dev/null
+            +++ b/src/FeatureFlags.cs
+            @@ -0,0 +1,7 @@
+            +namespace App;
+            +
+            +public static class FeatureFlags
+            +{
+            +    public static bool AddFeatureFlagX(IConfiguration config)
+            +        => config["FeatureX"] == "enabled";
+            +}
+            diff --git a/tests/FeatureFlagsTests.cs b/tests/FeatureFlagsTests.cs
+            new file mode 100644
+            index 0000000..2222222
+            --- /dev/null
+            +++ b/tests/FeatureFlagsTests.cs
+            @@ -0,0 +1,7 @@
+            +public sealed class FeatureFlagsTests
+            +{
+            +    [Fact]
+            +    public void EnabledBranch_ReturnsTrue()
+            +        => Assert.True(FeatureFlags.AddFeatureFlagX(Config("enabled")));
+            +}
+            """;
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
+            Executed.Add(exec);
             if (exec.Argv.Count > 0 && exec.Argv[0] == "cat")
                 return Task.FromResult(new SandboxExecResult(0, ResultJson, ""));
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "git" && exec.Argv[1] == "diff")
+                return Task.FromResult(new SandboxExecResult(0, LowQualityDiff, ""));
             return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private static bool IsBuildOrTestCommand(SandboxExec exec)
+    {
+        var joined = string.Join(' ', exec.Argv);
+        return joined.Contains("dotnet build", StringComparison.Ordinal)
+            || joined.Contains("dotnet test", StringComparison.Ordinal)
+            || joined.Contains("npm test", StringComparison.Ordinal)
+            || joined.Contains("pytest", StringComparison.Ordinal)
+            || joined.Contains("cargo test", StringComparison.Ordinal)
+            || joined.Contains("go test", StringComparison.Ordinal);
     }
 }
 
@@ -383,7 +474,7 @@ file sealed class RoleStampedScriptedAuditor : IAuditor
 /// credentials and network required). Always passes; records each iteration on
 /// which it was invoked, so tests can assert it was skipped.
 /// </summary>
-file sealed class RecordingLlmAuditor : IAuditor
+file sealed class RecordingLlmAuditor : IAuditor, IRequiresPassedBuildTestGate
 {
     private readonly Action<int> _onRun;
 

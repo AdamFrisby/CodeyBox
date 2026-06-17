@@ -148,6 +148,55 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void AuditTypeOverride_WiresBuildTestGateRoleToScriptBackedShellAuditor()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-script-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-script-build:test-pass",
+                            Script = "dotnet test",
+                            ToolName = "dotnet",
+                            Role = "build-test-gate",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-script-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-script-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+    }
+
+    [Fact]
+    public void RepositoryAuditTypeYaml_AcceptsBuildTestGateRole()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "repo-build.yaml"), """
+            id: repo-build
+            auditors:
+              - name: repo-build:test-pass
+                argv: ["dotnet", "test"]
+                role: build-test-gate
+            """);
+
+        var auditor = new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path })
+            .ResolveAuditType("repo-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "repo-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+    }
+
+    [Fact]
     public async Task CSharpPreset_TestPassUsesDotnetOutputClassifier()
     {
         var auditor = new PresetCatalog()

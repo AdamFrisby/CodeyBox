@@ -140,6 +140,10 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:Audit:AuditTypes:security:ReviewFocus"] = "project security focus",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:DisplayName"] = "Custom review",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:ReviewFocus"] = "custom focus",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Name"] = "custom:test-pass",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:0"] = "dotnet",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Role"] = "build-test-gate",
                 ["CodeyBox:Projects:0:Audit:LlmPromptFrameTemplate"] = "{{reviewFocus}}\n{{resultFile}}",
             })
             .Build();
@@ -151,6 +155,7 @@ public sealed class ProjectRepositoryTests
         Assert.Equal(["custom", "security"], p!.Audit.AuditTypes.Order(StringComparer.Ordinal).ToArray());
         Assert.Equal("project security focus", p.Audit.AuditTypeOverrides["security"].ReviewFocus);
         Assert.Equal("Custom review", p.Audit.AuditTypeOverrides["custom"].DisplayName);
+        Assert.Equal("build-test-gate", p.Audit.AuditTypeOverrides["custom"].Auditors.Single().Role);
         Assert.Equal("{{reviewFocus}}\n{{resultFile}}", p.Audit.LlmPromptFrameTemplate);
     }
 

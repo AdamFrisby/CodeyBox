@@ -33,6 +33,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
     public AuditCapabilities Required => AuditCapabilities.None;
     public bool RequiresFreshSandbox => true;
     public string? SelfReviewGuidance => "run build (warnings-as-errors) + formatter before committing";
+    public AuditorRole Role => AuditorRole.BuildTestGate;
 
 
     public async Task<AuditResult> RunAsync(

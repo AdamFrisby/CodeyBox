@@ -528,6 +528,7 @@ public sealed record ProjectConfiguredAuditor
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
+    public string? Role { get; init; }
 }
 
 public sealed record ProjectAuditTypeOverride

@@ -13,7 +13,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task EnabledLanguageWithoutMarker_ReportsInfoAndDoesNotRunTool()
+    public async Task BuildTestGateLanguageWithoutMarker_BlocksAndDoesNotRunTool()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
@@ -22,15 +22,15 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.True(result.Passed);
+        Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
-        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("python preset enabled", finding.Title);
         Assert.DoesNotContain(sandbox.Commands, c => c.Contains("pytest", StringComparison.Ordinal));
     }
 
     [Fact]
-    public async Task EnabledLanguageWithMissingTool_ReportsInfoAndPasses()
+    public async Task BuildTestGateLanguageWithMissingTool_Blocks()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
@@ -39,9 +39,9 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.True(result.Passed);
+        Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
-        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("tool not installed", finding.Title);
         Assert.Contains(sandbox.Commands, c =>
             c.Contains("command -v", StringComparison.Ordinal) &&
@@ -158,7 +158,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task NodeTestPass_MissingNpmTool_ReportsInfo()
+    public async Task NodeTestPass_MissingNpmTool_Blocks()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("node", new PresetContext(new FakeAgent()))
@@ -167,9 +167,9 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.True(result.Passed);
+        Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
-        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("tool not installed", finding.Title);
     }
 

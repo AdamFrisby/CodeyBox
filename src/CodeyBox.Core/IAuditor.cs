@@ -71,6 +71,14 @@ public interface IAuditSandboxIsolation
     bool RequiresFreshSandbox => true;
 }
 
+/// <summary>
+/// Marker for auditors whose prompt or contract assumes deterministic build/test
+/// gates have already completed successfully. The pipeline runs all
+/// <see cref="AuditorRole.BuildTestGate"/> auditors first and skips these
+/// auditors unless at least one build/test gate actually passed.
+/// </summary>
+public interface IRequiresPassedBuildTestGate;
+
 [Flags]
 public enum AuditCapabilities
 {

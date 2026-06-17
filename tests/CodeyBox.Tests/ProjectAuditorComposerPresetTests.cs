@@ -120,6 +120,7 @@ public sealed class ProjectAuditorComposerPresetTests
                             {
                                 Name = "csharp:project-test",
                                 Argv = ["dotnet", "test"],
+                                Role = "build-test-gate",
                             },
                         ],
                     },
@@ -130,6 +131,7 @@ public sealed class ProjectAuditorComposerPresetTests
         var auditors = composer.Compose(project, new CapturingAgent());
 
         Assert.Equal(["csharp:project-test"], auditors.Select(a => a.Name).ToArray());
+        Assert.Equal(AuditorRole.BuildTestGate, auditors.Single().Role);
     }
 
     [Fact]

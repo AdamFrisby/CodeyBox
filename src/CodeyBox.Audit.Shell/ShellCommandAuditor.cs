@@ -97,7 +97,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         // propagate exit 127 from repository-controlled scripts; those remain
         // blocking command failures.
         var missingTool = IsConfirmedMissingTopLevelTool(result);
-        var severity = missingTool
+        var severity = missingTool && _opts.Role != AuditorRole.BuildTestGate
             ? AuditSeverity.Info
             : AuditSeverity.Error;
         var title = missingTool
@@ -138,7 +138,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     {
         var finding = new AuditFinding(
             AuditorName: Name,
-            Severity: AuditSeverity.Info,
+            Severity: _opts.Role == AuditorRole.BuildTestGate ? AuditSeverity.Error : AuditSeverity.Info,
             Title: $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)",
             Description: $"The auditor command was not run because '{toolName}' is not available in the audit sandbox.");
         return new AuditResult(false, [finding], RawOutput: rawOutput);

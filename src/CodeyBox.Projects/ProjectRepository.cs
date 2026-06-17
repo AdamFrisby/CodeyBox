@@ -211,6 +211,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
+                    Role = a.Role,
                 }).ToList(),
             };
         }
@@ -230,6 +231,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
+                    Role = a.Role,
                 }).ToList(),
                 Patterns = ov.Patterns.Select(p => new ConfiguredDiffPattern
                 {
@@ -600,6 +602,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             ToolName = auditor.ToolName,
             TreatExit127AsMissingTool = auditor.TreatExit127AsMissingTool,
             CanShortCircuitOnBlockingFinding = auditor.CanShortCircuitOnBlockingFinding,
+            Role = auditor.Role,
         };
 
     private static CustomAuditorConfig CustomAuditorToConfig(CustomAuditorDescriptor auditor)
@@ -672,6 +675,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             ToolName = config.ToolName,
             TreatExit127AsMissingTool = config.TreatExit127AsMissingTool,
             CanShortCircuitOnBlockingFinding = config.CanShortCircuitOnBlockingFinding,
+            Role = config.Role,
         };
 
     private static IReadOnlyDictionary<string, ProjectAuditTypeOverride> MergeAuditTypeOverrides(
