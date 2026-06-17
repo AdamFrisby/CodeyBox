@@ -3366,7 +3366,7 @@ namespace CodeyBox.Api
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string TemplateDirectory { get; set; } = "templates";
-        public const int DefaultMaxTemplateChecks = 100;
+        public const int DefaultMaxTemplateChecks = 256;
         public const int MaximumMaxTemplateChecks = 1000;
         public int MaxTemplateChecks { get; set; } = DefaultMaxTemplateChecks;
         public string SandboxImageReference { get; set; } = "";
