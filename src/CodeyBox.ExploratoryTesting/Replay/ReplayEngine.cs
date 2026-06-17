@@ -28,8 +28,11 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// </list>
 ///
 /// <para>The engine is stateless: it owns nothing across calls and can be
-/// reused / fanned out across many sandboxes in parallel. Each replay only
-/// holds onto the <see cref="ISandbox"/> passed in.</para>
+/// reused / fanned out across many sandboxes in parallel. The recorded
+/// screenshot for visual-match assertions flows through
+/// <see cref="IAssertionVerifier.VerifyAsync"/> as a parameter, not through
+/// a shared mutable property — so a single verifier instance is safe to
+/// share across concurrent replays.</para>
 ///
 /// <para><b>Locator-miss policy:</b> FAIL deterministically with a clear
 /// diagnostic. The optional <see cref="ILocatorHealer"/> seam is consulted
@@ -57,7 +60,7 @@ public sealed class ReplayEngine
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _locator = locator ?? new AccessibilityElementLocator();
-        _reachability = reachability ?? new ReachabilityChecker(_bridge);
+        _reachability = reachability ?? new ReachabilityChecker(_bridge, _locator);
         _visualWait = visualWait ?? new ScreenshotStabilityWait(timeProvider);
         _assertions = assertions ?? new DefaultAssertionVerifier();
         _healer = healer;
@@ -93,7 +96,7 @@ public sealed class ReplayEngine
                 return new ReplayResult
                 {
                     Passed = false,
-                    Steps = steps,
+                    Steps = steps.ToArray(),
                     FailedStep = step,
                     Duration = _timeProvider.GetUtcNow() - start,
                 };
@@ -103,7 +106,7 @@ public sealed class ReplayEngine
         return new ReplayResult
         {
             Passed = true,
-            Steps = steps,
+            Steps = steps.ToArray(),
             Duration = _timeProvider.GetUtcNow() - start,
         };
     }
@@ -137,13 +140,29 @@ public sealed class ReplayEngine
                 return await FailAsync(
                     sandbox, entry,
                     ReplayFailureKind.NotFound,
-                    $"step {entry.Sequence} ({action.Kind}): recorded target not found on current screen (descriptor={DescribeDescriptor(action.TargetDescriptor)})",
+                    $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): recorded target not found on current screen (descriptor={DescribeDescriptor(action.TargetDescriptor)})",
                     locatedTarget: null,
                     ct).ConfigureAwait(false);
             }
 
-            var reach = await _reachability.EnsureReachableAsync(
-                sandbox, located, action.TargetDescriptor.Accessibility, options, ct).ConfigureAwait(false);
+            ReachabilityOutcome reach;
+            try
+            {
+                reach = await _reachability.EnsureReachableAsync(
+                    sandbox, located, action.TargetDescriptor, options, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return await FailAsync(
+                    sandbox, entry, ReplayFailureKind.ActionFailed,
+                    $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): reachability check failed: {DiagnosticText.Sanitize(ex.Message)}",
+                    locatedTarget: located,
+                    ct).ConfigureAwait(false);
+            }
 
             if (reach.Status != ReachabilityStatus.Reachable)
             {
@@ -152,7 +171,7 @@ public sealed class ReplayEngine
                     : ReplayFailureKind.Occluded;
                 return await FailAsync(
                     sandbox, entry, kind,
-                    $"step {entry.Sequence} ({action.Kind}): {reach.Diagnostic ?? reach.Status.ToString()}",
+                    $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): {DiagnosticText.Sanitize(reach.Diagnostic ?? reach.Status.ToString())}",
                     locatedTarget: reach.Target,
                     ct).ConfigureAwait(false);
             }
@@ -164,11 +183,15 @@ public sealed class ReplayEngine
         {
             await DispatchActionAsync(sandbox, action, located, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
         {
             return await FailAsync(
                 sandbox, entry, ReplayFailureKind.ActionFailed,
-                $"step {entry.Sequence} ({action.Kind}): input dispatch failed: {ex.Message}",
+                $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): input dispatch failed: {DiagnosticText.Sanitize(ex.Message)}",
                 locatedTarget: located,
                 ct).ConfigureAwait(false);
         }
@@ -178,30 +201,16 @@ public sealed class ReplayEngine
         {
             return await FailAsync(
                 sandbox, entry, ReplayFailureKind.WaitTimeout,
-                $"step {entry.Sequence} ({action.Kind}): screen did not settle within {options.VisualWaitTimeout}",
+                $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): screen did not settle within {options.VisualWaitTimeout}",
                 locatedTarget: located,
                 ct).ConfigureAwait(false);
         }
 
         if (entry.Assertion is { } assertion)
         {
-            string? accessibility = null;
-            try
-            {
-                accessibility = await sandbox.GetAccessibilityTreeJsonAsync(ct).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                accessibility = null;
-            }
-
-            if (_assertions is DefaultAssertionVerifier defaultVerifier)
-            {
-                defaultVerifier.CurrentRecordedScreenshot = entry.Observation.ScreenshotPng;
-            }
-
+            var accessibility = await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false);
             var diag = await _assertions
-                .VerifyAsync(sandbox, assertion, settled, accessibility, ct)
+                .VerifyAsync(sandbox, assertion, settled, entry.Observation.ScreenshotPng, accessibility, ct)
                 .ConfigureAwait(false);
             if (diag is not null)
             {
@@ -211,7 +220,7 @@ public sealed class ReplayEngine
                     ActionKind = action.Kind,
                     Passed = false,
                     FailureKind = ReplayFailureKind.AssertionMismatch,
-                    Diagnostic = $"step {entry.Sequence} ({action.Kind}): assertion '{assertion.Kind}' failed: {diag}",
+                    Diagnostic = $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' failed: {DiagnosticText.Sanitize(diag)}",
                     DiagnosticScreenshotPng = settled,
                     LocatedTarget = located,
                 };
@@ -233,39 +242,36 @@ public sealed class ReplayEngine
         ReplayOptions options,
         CancellationToken ct)
     {
+        _ = options;
+
+        ComputerUseResult bridgeResult;
         try
         {
-            await _bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "screenshot" }, ct)
+            bridgeResult = await _bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "screenshot" }, ct)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
         {
             return await FailAsync(
                 sandbox, entry, ReplayFailureKind.ActionFailed,
-                $"step {entry.Sequence} (screenshot): {ex.Message}",
+                $"step {entry.Sequence} (screenshot): {DiagnosticText.Sanitize(ex.Message)}",
                 locatedTarget: null,
                 ct).ConfigureAwait(false);
         }
 
         if (entry.Assertion is { } assertion)
         {
-            byte[]? current = await TryCaptureScreenshotAsync(sandbox, ct).ConfigureAwait(false);
-            string? accessibility = null;
-            try
-            {
-                accessibility = await sandbox.GetAccessibilityTreeJsonAsync(ct).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                accessibility = null;
-            }
-
-            if (_assertions is DefaultAssertionVerifier defaultVerifier)
-            {
-                defaultVerifier.CurrentRecordedScreenshot = entry.Observation.ScreenshotPng;
-            }
+            // Reuse the bridge's captured frame instead of issuing a second
+            // GetScreenshotAsync — two captures can disagree on a moving UI
+            // and the user only asked for one screenshot at this checkpoint.
+            var current = bridgeResult.ScreenshotPng;
+            var accessibility = await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false);
             var diag = await _assertions
-                .VerifyAsync(sandbox, assertion, current, accessibility, ct)
+                .VerifyAsync(sandbox, assertion, current, entry.Observation.ScreenshotPng, accessibility, ct)
                 .ConfigureAwait(false);
             if (diag is not null)
             {
@@ -275,12 +281,11 @@ public sealed class ReplayEngine
                     ActionKind = entry.Action.Kind,
                     Passed = false,
                     FailureKind = ReplayFailureKind.AssertionMismatch,
-                    Diagnostic = $"step {entry.Sequence} (screenshot): assertion '{assertion.Kind}' failed: {diag}",
+                    Diagnostic = $"step {entry.Sequence} (screenshot): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' failed: {DiagnosticText.Sanitize(diag)}",
                     DiagnosticScreenshotPng = current,
                 };
             }
         }
-        _ = options;
 
         return new ReplayStepResult
         {
@@ -322,7 +327,7 @@ public sealed class ReplayEngine
                 X = located!.CenterX,
                 Y = located.CenterY,
             },
-            "scroll" => BuildScrollRequest(action, located),
+            "scroll" => BuildScrollRequest(action),
             "key" => new ComputerUseRequest
             {
                 Action = "key",
@@ -336,20 +341,23 @@ public sealed class ReplayEngine
             "events" => new ComputerUseRequest
             {
                 Action = "events",
-                Events = RelocateEvents(action.InputEvents, located),
+                Events = RelocateEvents(action.InputEvents, located, action),
             },
             _ => throw new NotSupportedException($"Unsupported replay action kind '{action.Kind}'."),
         };
     }
 
-    private static ComputerUseRequest BuildScrollRequest(TraceAction action, LocatedTarget? located)
+    private static ComputerUseRequest BuildScrollRequest(TraceAction action)
     {
+        // The bridge resolves the scroll event from (ScrollX ?? X, ScrollY ?? Y)
+        // and the validator rejects two-axis scroll events. We pass the scroll
+        // magnitude exclusively on the Scroll* axes (one of them zero) and
+        // leave X/Y null so a non-zero located.CenterX can't sneak in and
+        // produce a "both axes set" validator rejection.
         var first = action.InputEvents.Count > 0 ? action.InputEvents[0] : null;
         return new ComputerUseRequest
         {
             Action = "scroll",
-            X = located?.CenterX ?? first?.X,
-            Y = located?.CenterY ?? first?.Y,
             ScrollX = first?.X,
             ScrollY = first?.Y,
         };
@@ -357,9 +365,60 @@ public sealed class ReplayEngine
 
     private static IReadOnlyList<SandboxInputEvent> RelocateEvents(
         IReadOnlyList<SandboxInputEvent> events,
-        LocatedTarget? located)
+        LocatedTarget? located,
+        TraceAction action)
     {
         if (located is null) return events;
+        // Anchor relative offsets at the recorded centre so a drag (or any
+        // multi-event sequence with internal motion) preserves its geometry
+        // when the target moved on screen: each event's recorded (X, Y) is
+        // translated by the delta from the recorded anchor to the located
+        // anchor. If the action has no recorded coordinates to anchor on, the
+        // first Click/Move position acts as the anchor.
+        var anchor = FindAnchor(events, action);
+        if (anchor is null)
+        {
+            return CollapseToCentre(events, located);
+        }
+        var deltaX = located.CenterX - anchor.Value.X;
+        var deltaY = located.CenterY - anchor.Value.Y;
+        var result = new List<SandboxInputEvent>(events.Count);
+        foreach (var evt in events)
+        {
+            result.Add(evt.Type switch
+            {
+                SandboxInputEventType.Click or SandboxInputEventType.Move when evt.X is not null && evt.Y is not null =>
+                    evt with { X = evt.X + deltaX, Y = evt.Y + deltaY },
+                SandboxInputEventType.Click or SandboxInputEventType.Move =>
+                    evt with { X = located.CenterX, Y = located.CenterY },
+                _ => evt,
+            });
+        }
+        return result;
+    }
+
+    private static (int X, int Y)? FindAnchor(IReadOnlyList<SandboxInputEvent> events, TraceAction action)
+    {
+        foreach (var evt in events)
+        {
+            if (evt.X is int x && evt.Y is int y &&
+                (evt.Type == SandboxInputEventType.Click || evt.Type == SandboxInputEventType.Move))
+            {
+                return (x, y);
+            }
+        }
+        // Fall back to the recorded descriptor's centre when no Click/Move is
+        // present — covers events sequences that only carry keyboard input.
+        var region = action.TargetDescriptor.Visual.Region;
+        if (region.Width > 0 && region.Height > 0)
+            return (region.X + region.Width / 2, region.Y + region.Height / 2);
+        return null;
+    }
+
+    private static IReadOnlyList<SandboxInputEvent> CollapseToCentre(
+        IReadOnlyList<SandboxInputEvent> events,
+        LocatedTarget located)
+    {
         var result = new List<SandboxInputEvent>(events.Count);
         foreach (var evt in events)
         {
@@ -388,7 +447,7 @@ public sealed class ReplayEngine
     }
 
     private static bool NeedsLocator(string actionKind) =>
-        actionKind is "click" or "double_click" or "move" or "scroll" or "events";
+        actionKind is "click" or "double_click" or "move" or "events";
 
     private async Task<ReplayStepResult> FailAsync(
         ISandbox sandbox,
@@ -417,8 +476,37 @@ public sealed class ReplayEngine
         {
             return await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
         {
+            throw;
+        }
+        catch (Exception)
+        {
+            // Best-effort diagnostic screenshot — failing to capture it must
+            // not mask the underlying step failure (e.g. the sandbox went
+            // away mid-step). The step result already carries the categorical
+            // failure kind; the missing PNG just means the reporter has no
+            // screenshot for this finding.
+            return null;
+        }
+    }
+
+    private static async Task<string?> TryGetAccessibilityTreeAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        try
+        {
+            return await sandbox.GetAccessibilityTreeJsonAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // Accessibility-tree fetch is auxiliary diagnostic context for the
+            // assertion verifier; a transient failure should not abort the
+            // step. Verifiers that need the tree will surface "tree is empty"
+            // diagnostics when this returns null.
             return null;
         }
     }
@@ -428,7 +516,8 @@ public sealed class ReplayEngine
         var acc = descriptor.Accessibility;
         var accPart = acc is null
             ? "no-accessibility"
-            : $"role={acc.Role ?? "?"} name={acc.Name ?? "?"}";
-        return $"{accPart} region=({descriptor.Visual.Region.X},{descriptor.Visual.Region.Y} {descriptor.Visual.Region.Width}x{descriptor.Visual.Region.Height})";
+            : $"role={DiagnosticText.Sanitize(acc.Role ?? "?")} name={DiagnosticText.Sanitize(acc.Name ?? "?")}";
+        var region = descriptor.Visual.Region;
+        return $"{accPart} region=({region.X},{region.Y} {region.Width}x{region.Height})";
     }
 }

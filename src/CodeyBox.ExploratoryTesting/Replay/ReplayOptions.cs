@@ -4,63 +4,161 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// Tuning knobs for <see cref="ReplayEngine"/>. Defaults match the JobTrack
 /// pilot's web-graphical target; CLI / native modalities pass their own
 /// instance.
+///
+/// <para>All numeric knobs validate in their <c>init</c> setters so a caller
+/// can't accidentally configure the locator into an infinite loop (a
+/// zero-step search would never advance) or the visual wait into a tight
+/// spin (zero poll interval). Validation runs whether the instance is built
+/// with object-initializer syntax or via a <c>with</c> expression.</para>
 /// </summary>
 public sealed record ReplayOptions
 {
+    private readonly int _screenWidth = 1280;
+    private readonly int _screenHeight = 800;
+    private readonly int _maxScrollAttempts = 3;
+    private readonly int _scrollStep = 5;
+    private readonly TimeSpan _visualWaitTimeout = TimeSpan.FromSeconds(15);
+    private readonly TimeSpan _visualWaitPollInterval = TimeSpan.FromMilliseconds(250);
+    private readonly int _stableFrameCount = 2;
+    private readonly int _spiralSearchRadius = 24;
+    private readonly int _spiralSearchStep = 8;
+
     /// <summary>
     /// Width of the captured screen, in pixels. Used by the default
     /// reachability checker to decide whether a located rect is off-screen.
     /// Defaults to the JobTrack pilot resolution.
     /// </summary>
-    public int ScreenWidth { get; init; } = 1280;
+    public int ScreenWidth
+    {
+        get => _screenWidth;
+        init
+        {
+            if (value <= 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "ScreenWidth must be positive.");
+            _screenWidth = value;
+        }
+    }
 
     /// <summary>
     /// Height of the captured screen, in pixels.
     /// </summary>
-    public int ScreenHeight { get; init; } = 800;
+    public int ScreenHeight
+    {
+        get => _screenHeight;
+        init
+        {
+            if (value <= 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "ScreenHeight must be positive.");
+            _screenHeight = value;
+        }
+    }
 
     /// <summary>
     /// Number of scroll attempts the engine performs when the located target
     /// is off-screen, before giving up with <see cref="ReplayFailureKind.OffScreen"/>.
     /// </summary>
-    public int MaxScrollAttempts { get; init; } = 3;
+    public int MaxScrollAttempts
+    {
+        get => _maxScrollAttempts;
+        init
+        {
+            if (value < 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "MaxScrollAttempts cannot be negative.");
+            _maxScrollAttempts = value;
+        }
+    }
 
     /// <summary>
     /// Magnitude (in scroll units) of each scroll attempt. Positive scrolls
-    /// down when the target is below the viewport; negative scrolls up.
+    /// down/right when the target is below/beyond the viewport; negative
+    /// scrolls the other way.
     /// </summary>
-    public int ScrollStep { get; init; } = 5;
+    public int ScrollStep
+    {
+        get => _scrollStep;
+        init
+        {
+            if (value <= 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "ScrollStep must be positive.");
+            _scrollStep = value;
+        }
+    }
 
     /// <summary>
     /// Maximum wall-clock the visual / observational wait will spend polling
     /// for a stable / expected screen state before failing the step with
     /// <see cref="ReplayFailureKind.WaitTimeout"/>.
     /// </summary>
-    public TimeSpan VisualWaitTimeout { get; init; } = TimeSpan.FromSeconds(15);
+    public TimeSpan VisualWaitTimeout
+    {
+        get => _visualWaitTimeout;
+        init
+        {
+            if (value <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "VisualWaitTimeout must be positive.");
+            _visualWaitTimeout = value;
+        }
+    }
 
     /// <summary>
-    /// Interval between screenshot polls during the visual wait.
+    /// Interval between screenshot polls during the visual wait. Must be &gt; 0
+    /// to avoid a tight-spin polling loop.
     /// </summary>
-    public TimeSpan VisualWaitPollInterval { get; init; } = TimeSpan.FromMilliseconds(250);
+    public TimeSpan VisualWaitPollInterval
+    {
+        get => _visualWaitPollInterval;
+        init
+        {
+            if (value <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "VisualWaitPollInterval must be positive.");
+            _visualWaitPollInterval = value;
+        }
+    }
 
     /// <summary>
     /// Number of consecutive identical screenshots required before the
     /// visual wait declares the screen "settled". Two is enough for a
     /// genuine settle; bump higher on noisy displays.
     /// </summary>
-    public int StableFrameCount { get; init; } = 2;
+    public int StableFrameCount
+    {
+        get => _stableFrameCount;
+        init
+        {
+            if (value < 1)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "StableFrameCount must be at least 1.");
+            _stableFrameCount = value;
+        }
+    }
 
     /// <summary>
-    /// Half-size of the accessibility spiral search around the recorded
-    /// click centre, in pixels. The engine probes
-    /// <c>(cx + dx, cy + dy)</c> for <c>|dx|, |dy| &lt;= radius</c> stepping
-    /// by <see cref="SpiralSearchStep"/> until an accessibility match is
-    /// found or the radius is exhausted.
+    /// Half-size of the accessibility search around the recorded click
+    /// centre, in pixels. The locator scans concentric square rings outward
+    /// to this radius and returns the first accessibility match.
     /// </summary>
-    public int SpiralSearchRadius { get; init; } = 24;
+    public int SpiralSearchRadius
+    {
+        get => _spiralSearchRadius;
+        init
+        {
+            if (value < 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "SpiralSearchRadius cannot be negative.");
+            _spiralSearchRadius = value;
+        }
+    }
 
     /// <summary>
-    /// Pixel step of the accessibility spiral search.
+    /// Pixel step of the accessibility search grid. Must be &gt; 0 so the
+    /// search loop is guaranteed to advance.
     /// </summary>
-    public int SpiralSearchStep { get; init; } = 8;
+    public int SpiralSearchStep
+    {
+        get => _spiralSearchStep;
+        init
+        {
+            if (value <= 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "SpiralSearchStep must be positive.");
+            _spiralSearchStep = value;
+        }
+    }
 }

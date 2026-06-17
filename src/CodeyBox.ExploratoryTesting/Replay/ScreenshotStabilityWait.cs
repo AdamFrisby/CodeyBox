@@ -20,6 +20,11 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// noise restarts the stable count. That's what we want — the cursor blink
 /// is the canonical false positive a softer "near equal" metric would
 /// accept, and accepting it is how you build a flaky test suite.</para>
+///
+/// <para>On deadline expiry the wait returns <c>null</c>: a screen that
+/// never settles (a continuous animation / never-ending load) is a real
+/// failure class the engine reports as <see cref="ReplayFailureKind.WaitTimeout"/>,
+/// not a soft pass.</para>
 /// </summary>
 public sealed class ScreenshotStabilityWait : IVisualWait
 {
@@ -42,7 +47,6 @@ public sealed class ScreenshotStabilityWait : IVisualWait
         var deadline = _timeProvider.GetUtcNow() + options.VisualWaitTimeout;
         byte[]? previous = null;
         var stable = 0;
-        byte[]? last = null;
 
         while (true)
         {
@@ -53,21 +57,28 @@ public sealed class ScreenshotStabilityWait : IVisualWait
             {
                 current = await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
             {
+                throw;
+            }
+            catch (Exception)
+            {
+                // Screenshot acquisition can hiccup on graphical sandboxes (window
+                // not yet mapped, transient framebuffer error). The wait absorbs
+                // those by counting them as "no frame this poll" — the deadline
+                // path below will still surface a sustained failure as null.
                 current = null;
             }
 
             if (current is not null)
             {
-                last = current;
                 if (predicate is not null && predicate(current))
                     return current;
 
                 if (previous is not null && ByteSpansEqual(previous, current))
                 {
                     stable++;
-                    if (predicate is null && stable >= Math.Max(1, options.StableFrameCount - 1))
+                    if (predicate is null && stable + 1 >= options.StableFrameCount)
                         return current;
                 }
                 else
@@ -78,17 +89,9 @@ public sealed class ScreenshotStabilityWait : IVisualWait
             }
 
             if (_timeProvider.GetUtcNow() >= deadline)
-                return predicate is null ? last : null;
+                return null;
 
-            try
-            {
-                await Task.Delay(options.VisualWaitPollInterval, _timeProvider, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                // delay aborted because the cancellation token tied to a sub-component fired;
-                // surface the next iteration so the deadline check terminates cleanly.
-            }
+            await Task.Delay(options.VisualWaitPollInterval, _timeProvider, ct).ConfigureAwait(false);
         }
     }
 

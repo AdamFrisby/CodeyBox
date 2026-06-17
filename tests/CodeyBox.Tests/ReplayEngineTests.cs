@@ -83,6 +83,28 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
+    public async Task Replay_FailsWithNotFound_WhenDescriptorHasNoAccessibility()
+    {
+        // No accessibility signature on the descriptor — locator strictly
+        // surfaces NotFound rather than falling back to raw recorded coords.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var trace = MakeTrace(
+            ClickEntry(seq: 1,
+                region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: null));
+
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.NotNull(result.FailedStep);
+        Assert.Equal(ReplayFailureKind.NotFound, result.FailedStep.FailureKind);
+        Assert.Contains("no-accessibility", result.FailedStep.Diagnostic);
+        Assert.Empty(sandbox.RecordedInputEvents);
+    }
+
+    [Fact]
     public async Task Replay_HealerCanRescue_NotFound_LocatorMiss()
     {
         var sandbox = new ScriptedSandbox(StableScreenshotA)
@@ -111,6 +133,11 @@ public sealed class ReplayEngineTests
 
         Assert.True(result.Passed, result.FailedStep?.Diagnostic);
         Assert.Equal(1, healer.Calls);
+        // Drove input at the healer's coordinates, not at the original recorded centre.
+        var clicks = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Click).ToList();
+        Assert.Single(clicks);
+        Assert.Equal(300, clicks[0].X);
+        Assert.Equal(200, clicks[0].Y);
     }
 
     // ------------------------------------------------------------------
@@ -120,11 +147,18 @@ public sealed class ReplayEngineTests
     [Fact]
     public async Task Replay_FailsWithOffScreen_WhenTargetNeverScrollsIntoView()
     {
-        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        // Off-screen recorded centre (Y=1510 in an 800-tall viewport). The
+        // sandbox keeps answering with the matching element at that coord
+        // — simulating an element that exists somewhere off-screen but
+        // never moves into view despite scroll attempts.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
         var trace = MakeTrace(
             ClickEntry(seq: 1,
                 region: new TraceBoundingRegion { X = 200, Y = 1500, Width = 40, Height = 20 },
-                accessibility: null));
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
 
         var engine = NewEngineFor(sandbox);
 
@@ -135,6 +169,11 @@ public sealed class ReplayEngineTests
         Assert.Equal(ReplayFailureKind.OffScreen, result.FailedStep.FailureKind);
         Assert.Contains("outside viewport", result.FailedStep.Diagnostic);
         Assert.Equal(StableScreenshotA, result.FailedStep.DiagnosticScreenshotPng);
+        // Scroll attempts produced real scroll events (one per failed attempt).
+        var scrolls = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Scroll).ToList();
+        Assert.NotEmpty(scrolls);
+        Assert.All(scrolls, s => Assert.True((s.X ?? 0) == 0 || (s.Y ?? 0) == 0,
+            "scroll events must set only one axis at a time"));
     }
 
     [Fact]
@@ -198,6 +237,27 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
+    public async Task Replay_PassesAssertion_OnVisualMatchExact()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        var entry = ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" },
+            observationScreenshot: StableScreenshotA);
+        entry = entry with { Assertion = new TraceAssertion { Kind = "visual-match" } };
+        var trace = MakeTrace(entry);
+
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+    }
+
+    [Fact]
     public async Task Replay_PassesAssertion_OnTextContainsInAccessibilityTree()
     {
         var sandbox = new ScriptedSandbox(StableScreenshotA)
@@ -245,6 +305,31 @@ public sealed class ReplayEngineTests
         Assert.Equal(ReplayFailureKind.AssertionMismatch, result.FailedStep.FailureKind);
     }
 
+    [Fact]
+    public async Task Replay_FailsAssertion_OnElementPresentMissing()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+            AccessibilityTreeJson = "{\"tree\":[{\"role\":\"button\"}]}",
+        };
+        var entry = ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" });
+        entry = entry with
+        {
+            Assertion = new TraceAssertion { Kind = "element-present", Detail = "checkout-banner" },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.AssertionMismatch, result.FailedStep!.FailureKind);
+        Assert.Contains("element-present", result.FailedStep.Diagnostic);
+    }
+
     // ------------------------------------------------------------------
     // Visual wait under jitter / timeout
     // ------------------------------------------------------------------
@@ -289,7 +374,7 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
-    public async Task VisualWait_TimesOutWhenScreenNeverSettles()
+    public async Task VisualWait_ReturnsNullOnTimeout_WhenScreenNeverSettles()
     {
         var counter = 0;
         var sandbox = new ScriptedSandbox(StableScreenshotA);
@@ -305,7 +390,6 @@ public sealed class ReplayEngineTests
         };
 
         var task = wait.WaitAsync(sandbox, predicate: null, options, CancellationToken.None);
-        // Sufficient to elapse the 200ms deadline; loop exits returning the last frame.
         for (var i = 0; i < 30 && !task.IsCompleted; i++)
         {
             clock.Advance(TimeSpan.FromMilliseconds(60));
@@ -313,26 +397,28 @@ public sealed class ReplayEngineTests
         }
         var settled = await task;
 
-        // Without a predicate, the wait returns the last seen frame even on timeout
-        // (the engine then proceeds to the next step). The predicate variant returns null.
-        Assert.NotNull(settled);
+        // Never-settling screen is a real failure class — must surface as null
+        // so the engine reports WaitTimeout instead of silently proceeding.
+        Assert.Null(settled);
+        Assert.True(clock.GetUtcNow() - FrozenNow > options.VisualWaitTimeout,
+            "wait must consume the full timeout window before reporting failure");
     }
 
     [Fact]
-    public async Task Replay_FailsWithWaitTimeout_WhenPredicateNeverHolds()
+    public async Task Replay_FailsWithWaitTimeout_WhenScreenNeverSettles()
     {
+        // Engine reports WaitTimeout when the default visual wait returns null.
+        var counter = 0;
         var sandbox = new ScriptedSandbox(StableScreenshotA)
         {
             AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
         };
+        sandbox.GetScreenshot = _ => Task.FromResult(new byte[] { (byte)(counter++ & 0x7F) });
 
         var clock = new FakeTimeProvider(FrozenNow);
-        // Force the visual wait into the predicate path with a never-true predicate
-        // so we exercise the engine's WaitTimeout reporting path.
-        var visualWait = new PredicateWait();
         var engine = new ReplayEngine(
             bridge: new ComputerUseBridge(timeProvider: clock),
-            visualWait: visualWait,
+            visualWait: new ImmediateNullWait(),
             timeProvider: clock);
         var trace = MakeTrace(ClickEntry(seq: 1,
             region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
@@ -363,8 +449,6 @@ public sealed class ReplayEngineTests
             var sandbox = new ScriptedSandbox(StableScreenshotA);
             sandbox.AccessibilityAtPoint = (x, y) =>
             {
-                // Map both buttons to their recorded centres; reachability re-probes
-                // the same point so we must serve a consistent answer per coordinate.
                 if (Math.Abs(x - 170) <= 1 && Math.Abs(y - 90) <= 1) return Accessible("button", "Login");
                 if (Math.Abs(x - 415) <= 1 && Math.Abs(y - 215) <= 1) return Accessible("link", "Next");
                 return null;
@@ -386,26 +470,37 @@ public sealed class ReplayEngineTests
         {
             Assert.Equal(r1.Steps[i].Sequence, r2.Steps[i].Sequence);
             Assert.Equal(r1.Steps[i].LocatedTarget?.CenterX, r2.Steps[i].LocatedTarget?.CenterX);
+            Assert.Equal(r1.Steps[i].LocatedTarget?.CenterY, r2.Steps[i].LocatedTarget?.CenterY);
+            Assert.Equal(r1.Steps[i].LocatedTarget?.CenterX, r3.Steps[i].LocatedTarget?.CenterX);
             Assert.Equal(r1.Steps[i].LocatedTarget?.CenterY, r3.Steps[i].LocatedTarget?.CenterY);
         }
     }
 
     [Fact]
-    public async Task Replay_RunsInParallel_AgainstIndependentSandboxes()
+    public async Task Replay_RunsInParallel_AgainstIndependentSandboxes_IncludingAssertions()
     {
+        // Each parallel replay carries its own per-step recorded screenshot
+        // through VerifyAsync — proves no shared mutable state leaks between
+        // concurrent replays sharing one engine + verifier instance.
         var engine = new ReplayEngine(new ComputerUseBridge());
-        var trace = MakeTrace(
-            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
-                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
 
         var tasks = Enumerable.Range(0, 8).Select(async i =>
         {
-            var sandbox = new ScriptedSandbox(StableScreenshotA)
+            var recorded = new byte[] { 0x10, 0x20, 0x30, (byte)i };
+            var sandbox = new ScriptedSandbox(recorded)
             {
                 AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
             };
+            var entry = ClickEntry(
+                seq: 1,
+                region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" },
+                observationScreenshot: recorded);
+            entry = entry with { Assertion = new TraceAssertion { Kind = "visual-match" } };
+            var trace = MakeTrace(entry);
             var result = await engine.ReplayAsync(sandbox, trace);
-            return (i, result.Passed, sandbox.RecordedInputEvents.Count);
+            var click = sandbox.RecordedInputEvents.SingleOrDefault(e => e.Type == SandboxInputEventType.Click);
+            return (i, result.Passed, click?.X, click?.Y);
         }).ToArray();
 
         var results = await Task.WhenAll(tasks);
@@ -413,7 +508,8 @@ public sealed class ReplayEngineTests
         Assert.All(results, r =>
         {
             Assert.True(r.Passed);
-            Assert.True(r.Item3 >= 1); // click registered
+            Assert.Equal(170, r.X);
+            Assert.Equal(90, r.Y);
         });
     }
 
@@ -452,6 +548,368 @@ public sealed class ReplayEngineTests
         Assert.Single(result.Steps);
         Assert.Equal("screenshot", result.Steps[0].ActionKind);
         Assert.Empty(sandbox.RecordedInputEvents);
+    }
+
+    [Fact]
+    public async Task Replay_RunsScreenshotStep_AssertionMatchesRecordedScreenshot()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [],
+                Kind = "screenshot",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 },
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = StableScreenshotA, CapturedAt = FrozenNow },
+            Assertion = new TraceAssertion { Kind = "visual-match" },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+    }
+
+    [Fact]
+    public async Task Replay_RunsScreenshotStep_AssertionMismatchSurfaces()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotB);
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [],
+                Kind = "screenshot",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 },
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = StableScreenshotA, CapturedAt = FrozenNow },
+            Assertion = new TraceAssertion { Kind = "visual-match" },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.AssertionMismatch, result.FailedStep!.FailureKind);
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-step traces: first failure terminates the replay
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_StopsAtFirstFailure_AndDoesNotAttemptSubsequentSteps()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Different"),
+        };
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }),
+            TypeEntry(seq: 2, text: "unreached"));
+
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Single(result.Steps);
+        Assert.Equal(1, result.FailedStep!.Sequence);
+        Assert.DoesNotContain(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Type);
+    }
+
+    // ------------------------------------------------------------------
+    // ActionFailed: bridge / dispatch throws on input
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_FailsWithActionFailed_WhenBridgeRejectsInput()
+    {
+        // SynthesizeInputAsync throws — engine must coerce into ActionFailed
+        // step result with a diagnostic, not propagate out of ReplayAsync.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        sandbox.OnSynthesizeInput = _ => throw new InvalidOperationException("bridge offline");
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
+
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.ActionFailed, result.FailedStep!.FailureKind);
+        Assert.Contains("input dispatch failed", result.FailedStep.Diagnostic);
+    }
+
+    // ------------------------------------------------------------------
+    // DefaultAssertionVerifier: shared between concurrent replays
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task DefaultAssertionVerifier_IsParallelSafe_AcrossSharedInstance()
+    {
+        // Single verifier instance shared by both replays. With the previous
+        // mutable-property contract, one replay's recorded screenshot could
+        // leak into the other's comparison.
+        var verifier = new DefaultAssertionVerifier();
+        var bytesA = new byte[] { 0xAA };
+        var bytesB = new byte[] { 0xBB };
+        var taskA = verifier.VerifyAsync(
+            sandbox: new ScriptedSandbox(bytesA),
+            assertion: new TraceAssertion { Kind = "visual-match" },
+            currentScreenshotPng: bytesA,
+            recordedScreenshotPng: bytesA,
+            accessibilitySnapshotJson: null,
+            ct: CancellationToken.None);
+        var taskB = verifier.VerifyAsync(
+            sandbox: new ScriptedSandbox(bytesB),
+            assertion: new TraceAssertion { Kind = "visual-match" },
+            currentScreenshotPng: bytesB,
+            recordedScreenshotPng: bytesB,
+            accessibilitySnapshotJson: null,
+            ct: CancellationToken.None);
+
+        var diagA = await taskA;
+        var diagB = await taskB;
+
+        Assert.Null(diagA);
+        Assert.Null(diagB);
+    }
+
+    [Fact]
+    public async Task DefaultAssertionVerifier_ResolvesNamedRecordedScreenshot_ByDetail()
+    {
+        var map = new Dictionary<string, byte[]?>(StringComparer.Ordinal)
+        {
+            ["after-checkout"] = StableScreenshotB,
+        };
+        var verifier = new DefaultAssertionVerifier(map);
+
+        var diag = await verifier.VerifyAsync(
+            sandbox: new ScriptedSandbox(StableScreenshotB),
+            assertion: new TraceAssertion { Kind = "visual-match", Detail = "after-checkout" },
+            currentScreenshotPng: StableScreenshotB,
+            recordedScreenshotPng: StableScreenshotA,
+            accessibilitySnapshotJson: null,
+            ct: CancellationToken.None);
+
+        Assert.Null(diag);
+    }
+
+    [Fact]
+    public async Task DefaultAssertionVerifier_UnknownKind_ReturnsDiagnostic()
+    {
+        var verifier = new DefaultAssertionVerifier();
+        var diag = await verifier.VerifyAsync(
+            sandbox: new ScriptedSandbox(StableScreenshotA),
+            assertion: new TraceAssertion { Kind = "screenshot-similar", Detail = "0.95" },
+            currentScreenshotPng: StableScreenshotA,
+            recordedScreenshotPng: null,
+            accessibilitySnapshotJson: null,
+            ct: CancellationToken.None);
+
+        Assert.NotNull(diag);
+        Assert.Contains("unsupported assertion kind", diag);
+    }
+
+    // ------------------------------------------------------------------
+    // ReplayOptions validation
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void ReplayOptions_Rejects_ZeroSpiralSearchStep()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayOptions { SpiralSearchStep = 0 });
+    }
+
+    [Fact]
+    public void ReplayOptions_Rejects_ZeroVisualWaitPollInterval()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayOptions { VisualWaitPollInterval = TimeSpan.Zero });
+    }
+
+    [Fact]
+    public void ReplayOptions_Rejects_NegativeMaxScrollAttempts()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayOptions { MaxScrollAttempts = -1 });
+    }
+
+    [Fact]
+    public void ReplayOptions_Rejects_ZeroStableFrameCount()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayOptions { StableFrameCount = 0 });
+    }
+
+    // ------------------------------------------------------------------
+    // Diagnostic sanitization: untrusted screen text cannot inject newlines
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_SanitizesUntrustedAccessibilityTextInDiagnostics()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => null,
+        };
+        var trace = MakeTrace(ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor
+            {
+                Role = "button",
+                Name = "Sign\nIn\rFAKE-LOG-LINE",
+            }));
+
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.NotNull(result.FailedStep!.Diagnostic);
+        Assert.DoesNotContain('\n', result.FailedStep.Diagnostic);
+        Assert.DoesNotContain('\r', result.FailedStep.Diagnostic);
+    }
+
+    // ------------------------------------------------------------------
+    // Action-kind coverage: double_click, key, events
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_DispatchesDoubleClick_AtLocatedCentre()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("cell", "row-3"),
+        };
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [],
+                Kind = "double_click",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Accessibility = new TraceAccessibilityDescriptor { Role = "cell", Name = "row-3" },
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 100, Y = 100, Width = 40, Height = 40 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        var clicks = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Click).ToList();
+        Assert.Equal(2, clicks.Count); // double_click resolves to two clicks
+        Assert.All(clicks, c => Assert.Equal(120, c.X));
+        Assert.All(clicks, c => Assert.Equal(120, c.Y));
+    }
+
+    [Fact]
+    public async Task Replay_DispatchesKey_WithoutLocator()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Enter" }],
+                Kind = "key",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        var keys = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Key).ToList();
+        Assert.Single(keys);
+        Assert.Equal("Enter", keys[0].Key);
+    }
+
+    [Fact]
+    public async Task Replay_RelocatesEventsSequence_PreservingDragOffsets()
+    {
+        // 'events' sequence with a recorded mouse-down at (100, 100) and a
+        // move to (140, 130) — a drag of (40, 30). The recorded anchor centre
+        // is at (100, 100); the located centre is at (200, 200). We expect
+        // the move to land at (240, 230), not collapsed onto the centre.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("canvas", "viewport"),
+        };
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents =
+                [
+                    new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 100, Y = 100 },
+                    new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 140, Y = 130 },
+                ],
+                Kind = "events",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Accessibility = new TraceAccessibilityDescriptor { Role = "canvas", Name = "viewport" },
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 180, Y = 180, Width = 40, Height = 40 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        var clicks = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Click).ToList();
+        var moves = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Move).ToList();
+        Assert.Single(clicks);
+        Assert.Single(moves);
+        // Located centre is (200, 200); anchor (the recorded click at (100, 100))
+        // shifts to (200, 200), so the move's delta (40, 30) translates to (240, 230).
+        Assert.Equal(200, clicks[0].X);
+        Assert.Equal(200, clicks[0].Y);
+        Assert.Equal(240, moves[0].X);
+        Assert.Equal(230, moves[0].Y);
     }
 
     // ------------------------------------------------------------------
@@ -544,6 +1002,7 @@ public sealed class ReplayEngineTests
         public Func<CancellationToken, Task<byte[]>> GetScreenshot { get; set; }
         public Func<int, int, SandboxAccessibilitySnapshot?>? AccessibilityAtPoint { get; set; }
         public string? AccessibilityTreeJson { get; set; }
+        public Action<IReadOnlyList<SandboxInputEvent>>? OnSynthesizeInput { get; set; }
 
         public List<SandboxInputEvent> RecordedInputEvents { get; } = new();
 
@@ -554,6 +1013,8 @@ public sealed class ReplayEngineTests
 
         public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
         {
+            OnSynthesizeInput?.Invoke(events);
+            // Append AFTER the hook so a throwing hook short-circuits before recording.
             RecordedInputEvents.AddRange(events);
             return Task.CompletedTask;
         }
@@ -591,7 +1052,7 @@ public sealed class ReplayEngineTests
         }
     }
 
-    private sealed class PredicateWait : IVisualWait
+    private sealed class ImmediateNullWait : IVisualWait
     {
         // Forces the engine's predicate=null call to fail by returning null,
         // exercising the WaitTimeout reporting path.

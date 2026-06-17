@@ -17,13 +17,23 @@ public interface IAssertionVerifier
 {
     /// <summary>
     /// Return null on success; a diagnostic string when the assertion
-    /// does not hold against <paramref name="screenshotPng"/> /
-    /// <paramref name="accessibilitySnapshotJson"/>.
+    /// does not hold against the current observation.
     /// </summary>
+    /// <param name="sandbox">Sandbox the assertion is being evaluated against.</param>
+    /// <param name="assertion">The recorded assertion to verify.</param>
+    /// <param name="currentScreenshotPng">Screenshot captured AFTER the action — the "now" frame.</param>
+    /// <param name="recordedScreenshotPng">
+    /// Per-step recorded observation screenshot, when present. The recorded
+    /// screenshot is threaded through the call (not stored on the verifier)
+    /// so multiple replays may share one verifier instance safely in parallel.
+    /// </param>
+    /// <param name="accessibilitySnapshotJson">Current accessibility-tree snapshot, when available.</param>
+    /// <param name="ct">Cancellation token.</param>
     Task<string?> VerifyAsync(
         ISandbox sandbox,
         TraceAssertion assertion,
-        byte[]? screenshotPng,
+        byte[]? currentScreenshotPng,
+        byte[]? recordedScreenshotPng,
         string? accessibilitySnapshotJson,
         CancellationToken ct);
 }
