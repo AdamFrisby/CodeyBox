@@ -112,8 +112,15 @@ first dispatch can actually run.
       "apt-get update",
       "apt-get install -y curl ca-certificates nodejs npm",
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
-      "curl -fsSL https://cursor.com/install | bash",
-      "curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin"
+      "curl -fsSL https://cursor.com/install | bash"
+    ],
+    "MultipassExecutableProvisions": [
+      {
+        "HostSourcePath": "/home/<operator>/.codeybox/agy-seed/agy",
+        "VmDestPath": "/home/ubuntu/.local/bin/agy",
+        "VmSymlinks": ["/usr/local/bin/agy"],
+        "Label": "antigravity"
+      }
     ]
   }
 }
@@ -123,11 +130,19 @@ Pick the subset that matches the agents you have registered. For Gemini,
 reasoning level is encoded in the model id (e.g. `gemini-3-flash-preview`),
 not a CLI flag — there is no `--thinking` flag to pin a version against.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
-on `$PATH` after the bake. Antigravity's installer defaults to `~/.local/bin`;
-use `--dir /usr/local/bin` so non-login sandbox execs can find `agy`. The
-baseline bake now runs the registered `--version` checks for every configured
-CLI-backed agent before marking the image ready to clone, so a missing `agy`
-fails the bake instead of surfacing as dispatch exit 127. The standalone Copilot
+on `$PATH` after the bake. **Antigravity (`agy`) is provisioned via
+`MultipassExecutableProvisions`, NOT a `curl … | bash` runcmd entry**: the
+upstream installer URL (`https://antigravity.google/cli/install.sh`) no longer
+returns a shell script — as of 2026-06-17 it serves the Antigravity landing
+HTML, which fails `bash` parsing and would silently slip past a `… || true`
+runcmd. Stage a vetted copy of the binary on the host (e.g. extracted from a
+known-good Multipass VM) and point `HostSourcePath` at it; the provisioner
+sets mode 0755 and ownership root:root deterministically via `install -m
+0755 -o root -g root`, then drops a `/usr/local/bin/agy` symlink onto the
+non-login sandbox PATH. The baseline bake runs the registered `--version`
+checks for every configured CLI-backed agent before marking the image ready
+to clone, so a missing `agy` (or a missing host-staged file) fails the bake
+instead of surfacing as dispatch exit 127. The standalone Copilot
 CLI (binary name
 `copilot`) is operator-supplied; do **not** substitute
 `gh extension install github/gh-copilot`, which produces a `gh copilot`

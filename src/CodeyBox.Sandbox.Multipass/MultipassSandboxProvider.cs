@@ -1364,13 +1364,16 @@ git push origin HEAD:{refName}";
             includeGraphicalInstall: false,
             baselineInstallCommands: opts.ExtraRuncmd);
         var seedsStr = string.Join(";", opts.PackageCacheSeeds.Select(s => $"{s.HostSourcePath}->{s.VmDestPath}({s.MaxSizeMB})"));
-        // Build a canonical, version-prefixed string. The 'v2' prefix lets
+        var execsStr = string.Join(";", opts.ExecutableProvisions.Select(e =>
+            $"{e.HostSourcePath}->{e.VmDestPath}[{string.Join(",", e.VmSymlinks)}]"));
+        // Build a canonical, version-prefixed string. The 'v3' prefix lets
         // future schema changes invalidate every existing baseline without
-        // ambiguity. Field separator is '|' which cannot appear in profile
-        // names or flavor enum strings.
+        // ambiguity (bumped from v2 when ExecutableProvisions was added).
+        // Field separator is '|' which cannot appear in profile names or
+        // flavor enum strings.
         var canon = string.Join("|", new[]
         {
-            "v2",
+            "v3",
             profileName,
             flavor.ToString(),
             cloudInit,
@@ -1378,6 +1381,7 @@ git push origin HEAD:{refName}";
             string.Join("\n", opts.BaselineVerificationCommands.Select(RenderBaselineVerificationCommandForHash)),
             opts.ExtraCloudInit ?? string.Empty,
             seedsStr,
+            execsStr,
         });
         var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canon));
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
@@ -1566,6 +1570,12 @@ git push origin HEAD:{refName}";
                 }
             }
 
+            // Provision host-staged executable binaries (e.g. the agy CLI) into the
+            // baseline before the binary-verification gate runs. Verification expects
+            // the binary on PATH with the executable bit set; doing this here keeps the
+            // missing-binary failure mode loud (verify exit 127) instead of dispatch-time.
+            await ProvisionExecutablesAsync(opts, baselineName, workItemId, ct).ConfigureAwait(false);
+
             await VerifyBaselineRequiredBinariesAsync(opts, baselineName, workItemId, ct);
 
             // Seed package caches into the baseline VM before stopping it
@@ -1665,6 +1675,114 @@ git push origin HEAD:{refName}";
             }
         }
     }
+
+    private async Task ProvisionExecutablesAsync(
+        MultipassSandboxOptions opts,
+        string baselineName,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        if (opts.ExecutableProvisions == null || opts.ExecutableProvisions.Count == 0)
+            return;
+
+        for (var i = 0; i < opts.ExecutableProvisions.Count; i++)
+        {
+            var exe = opts.ExecutableProvisions[i];
+            var label = string.IsNullOrWhiteSpace(exe.Label)
+                ? (string.IsNullOrWhiteSpace(exe.VmDestPath) ? $"exe-{i + 1}" : Path.GetFileName(exe.VmDestPath))
+                : exe.Label!;
+
+            if (string.IsNullOrWhiteSpace(exe.HostSourcePath) || string.IsNullOrWhiteSpace(exe.VmDestPath))
+                throw new InvalidOperationException(
+                    $"ExecutableProvisions[{i}] (label '{label}') is invalid: HostSourcePath and VmDestPath are both required.");
+
+            if (!Path.IsPathRooted(exe.VmDestPath))
+                throw new InvalidOperationException(
+                    $"ExecutableProvisions[{i}] (label '{label}') VmDestPath must be absolute, got '{exe.VmDestPath}'.");
+
+            var hostPath = ResolvePath(exe.HostSourcePath);
+            if (!File.Exists(hostPath))
+                throw new InvalidOperationException(
+                    $"ExecutableProvisions[{i}] (label '{label}') host file '{hostPath}' does not exist; cannot ship binary into baseline {baselineName}.");
+
+            // Transfer to a predictable temp path in /home/ubuntu first. Multipass
+            // transfers run as the default `ubuntu` user; from there we use sudo
+            // install to relocate with mode/owner deterministically. Doing it this
+            // way avoids relying on `multipass transfer` preserving the executable
+            // bit (undocumented) and lets the destination live in root-owned
+            // directories like /usr/local/bin.
+            var uniqueId = Guid.NewGuid().ToString("N");
+            var vmStageName = $"codeybox-exe-{uniqueId}";
+            var vmStagePath = $"/home/ubuntu/{vmStageName}";
+
+            _log.LogInformation(
+                "Provisioning executable {Label} into {Baseline}: host {HostPath} -> VM {VmDestPath}",
+                label, baselineName, hostPath, exe.VmDestPath);
+
+            var transfer = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "transfer", hostPath, $"{baselineName}:{vmStagePath}"],
+                stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+            if (transfer.ExitCode != 0)
+            {
+                ThrowIfProvisioningRetryExhausted("transfer", transfer);
+                throw new InvalidOperationException(
+                    $"ExecutableProvisions[{i}] (label '{label}') transfer failed (exit {transfer.ExitCode}): {transfer.Stderr}");
+            }
+
+            var destDir = Path.GetDirectoryName(exe.VmDestPath);
+            if (string.IsNullOrEmpty(destDir))
+                throw new InvalidOperationException(
+                    $"ExecutableProvisions[{i}] (label '{label}') VmDestPath has no directory component: '{exe.VmDestPath}'.");
+
+            // Single in-VM shell step (atomic from the bake's perspective): mkdir
+            // the parent, install with mode 0755 and root ownership, drop any
+            // requested symlinks, and clean the staging copy. `install` is used
+            // instead of `mv` + `chmod` because it sets mode and ownership in one
+            // syscall sequence and is portable across the targets we ship to.
+            var script = new System.Text.StringBuilder();
+            script.Append("set -euo pipefail; ");
+            script.Append("mkdir -p ").Append(ShellQuote(destDir!)).Append("; ");
+            script.Append("install -m 0755 -o root -g root ")
+                .Append(ShellQuote(vmStagePath))
+                .Append(' ')
+                .Append(ShellQuote(exe.VmDestPath))
+                .Append("; ");
+            if (exe.VmSymlinks is not null)
+            {
+                foreach (var link in exe.VmSymlinks)
+                {
+                    if (string.IsNullOrWhiteSpace(link)) continue;
+                    if (!Path.IsPathRooted(link))
+                        throw new InvalidOperationException(
+                            $"ExecutableProvisions[{i}] (label '{label}') VmSymlink must be absolute, got '{link}'.");
+                    var linkDir = Path.GetDirectoryName(link);
+                    if (!string.IsNullOrEmpty(linkDir))
+                        script.Append("mkdir -p ").Append(ShellQuote(linkDir!)).Append("; ");
+                    script.Append("ln -sf ")
+                        .Append(ShellQuote(exe.VmDestPath))
+                        .Append(' ')
+                        .Append(ShellQuote(link))
+                        .Append("; ");
+                }
+            }
+            script.Append("rm -f ").Append(ShellQuote(vmStagePath));
+
+            var execRun = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", script.ToString()],
+                stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+            if (execRun.ExitCode != 0)
+            {
+                ThrowIfProvisioningRetryExhausted("exec", execRun);
+                throw new InvalidOperationException(
+                    $"ExecutableProvisions[{i}] (label '{label}') install failed (exit {execRun.ExitCode}): {execRun.Stderr}");
+            }
+        }
+    }
+
+    private static string ShellQuote(string s) =>
+        "'" + s.Replace("'", @"'\''", StringComparison.Ordinal) + "'";
 
     private async Task SeedPackageCachesAsync(
         MultipassSandboxOptions opts,
@@ -4761,6 +4879,20 @@ public sealed record MultipassSandboxOptions
     /// Configurable list of package cache seeds to copy from the host to the baseline VM at bake time.
     /// </summary>
     public IReadOnlyList<PackageCacheSeedOptions> PackageCacheSeeds { get; init; } = [];
+
+    /// <summary>
+    /// Host-staged executable binaries to ship into the baseline VM at bake time.
+    /// Each entry copies one host file to an absolute VM path with mode 0755,
+    /// optionally creating symlinks (e.g. into <c>/usr/local/bin</c>) so the
+    /// binary lands on the non-login sandbox PATH.
+    /// <para>
+    /// Use this instead of a <see cref="ExtraRuncmd"/> <c>curl … | bash</c> step
+    /// when the upstream installer is not durable (URL or shape may drift) or
+    /// when the operator already has a vetted binary on disk and wants the bake
+    /// to fail loudly if the file is missing rather than silently proceed.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<ExecutableProvisionOptions> ExecutableProvisions { get; init; } = [];
 }
 
 /// <summary>
@@ -4771,6 +4903,44 @@ public sealed record PackageCacheSeedOptions
     public string HostSourcePath { get; init; } = string.Empty;
     public string VmDestPath { get; init; } = string.Empty;
     public double? MaxSizeMB { get; init; }
+}
+
+/// <summary>
+/// Configuration for a host-staged executable binary that the baseline bake
+/// must ship into the VM at a known absolute path with mode 0755.
+/// <para>
+/// Provisioning uses <c>multipass transfer</c> for the bytes followed by an
+/// in-VM <c>install -m 0755 -o root -g root</c>, so the executable bit and
+/// ownership are set deterministically — neither <c>File.Copy</c> on the host
+/// staging side nor <c>multipass transfer</c> documents preservation of the
+/// executable bit, and depending on it has produced silent breakage.
+/// </para>
+/// </summary>
+public sealed record ExecutableProvisionOptions
+{
+    /// <summary>Host path to the executable file. Tilde-expansion is honoured.</summary>
+    public string HostSourcePath { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Absolute VM path where the executable must land (e.g.
+    /// <c>/home/ubuntu/.local/bin/agy</c>). The parent directory is created
+    /// with <c>mkdir -p</c> if it does not already exist.
+    /// </summary>
+    public string VmDestPath { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Optional absolute VM paths at which to create symlinks pointing to
+    /// <see cref="VmDestPath"/>. Use to put a binary installed under the
+    /// non-login user's home onto a system PATH (e.g.
+    /// <c>/usr/local/bin/agy</c>).
+    /// </summary>
+    public IReadOnlyList<string> VmSymlinks { get; init; } = [];
+
+    /// <summary>
+    /// Diagnostic label used in log lines and bake-failure messages. Defaults to
+    /// the destination filename when unset.
+    /// </summary>
+    public string? Label { get; init; }
 }
 
 /// <summary>
