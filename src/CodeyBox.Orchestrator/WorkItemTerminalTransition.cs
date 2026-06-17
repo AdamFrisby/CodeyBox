@@ -8,7 +8,7 @@ public interface IWorkItemTerminalTransition
     Task<WorkItemTerminalTransitionResult> TransitionFailedAsync(
         WorkItem item,
         string error,
-        WorkItemTerminalFailureTransitionOptions options,
+        WorkItemTerminalFailureTransitionCommand command,
         CancellationToken ct);
 }
 
@@ -17,26 +17,30 @@ public interface IWorkItemTerminalRevisionBuilder
     Task<TerminalRevisionAttribution?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct);
 }
 
-public sealed record WorkItemTerminalFailureTransitionOptions
+public sealed record WorkItemTerminalFailureTransitionCommand
 {
-    public Project? Project { get; init; }
     public string? FailureKind { get; init; }
     public DateTimeOffset? QuotaResetAt { get; init; }
     public string? CancellationSource { get; init; }
     public IReadOnlyCollection<WorkItemState>? ExpectedStates { get; init; }
     public DateTimeOffset? ExpectedUpdatedAt { get; init; }
-    public Func<WorkItem, WorkItem>? PrepareFailedItem { get; init; }
-    public object? Details { get; init; }
-    public Func<WorkItem, object?>? DetailsFactory { get; init; }
-    public bool ResolveProjectWhenMissing { get; init; }
-    public bool FallbackProjectWhenMissing { get; init; } = true;
-    public bool SwallowPublishExceptions { get; init; }
+    public WorkItemTransientRetryExhaustion? TransientRetryExhaustion { get; init; }
 }
 
 public sealed record WorkItemTerminalTransitionResult(
     bool Updated,
     WorkItem? FailedWorkItem,
     WorkItem? CurrentWorkItem);
+
+public sealed record WorkItemTransientRetryExhaustion(
+    string Reason,
+    DateTimeOffset? FirstFailedAt);
+
+public sealed record WorkItemTransientRetryExhaustedDetails(
+    string workItemId,
+    string? failureKind,
+    string reason,
+    int transientRetryAttempts);
 
 /// <summary>
 /// Shared terminal-failure state transition and event attribution path.
@@ -86,11 +90,11 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
     public async Task<WorkItemTerminalTransitionResult> TransitionFailedAsync(
         WorkItem item,
         string error,
-        WorkItemTerminalFailureTransitionOptions options,
+        WorkItemTerminalFailureTransitionCommand command,
         CancellationToken ct)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
-        if (options.ExpectedStates is not null && !options.ExpectedStates.Contains(current.State))
+        if (command.ExpectedStates is not null && !command.ExpectedStates.Contains(current.State))
         {
             return new WorkItemTerminalTransitionResult(
                 Updated: false,
@@ -98,7 +102,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
                 CurrentWorkItem: current);
         }
 
-        if (options.ExpectedUpdatedAt is { } expectedUpdatedAt
+        if (command.ExpectedUpdatedAt is { } expectedUpdatedAt
             && current.UpdatedAt != expectedUpdatedAt)
         {
             return new WorkItemTerminalTransitionResult(
@@ -110,21 +114,26 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
         var failed = current.With(
             WorkItemState.Failed,
             error,
-            failureKind: options.FailureKind,
-            quotaResetAt: options.QuotaResetAt,
-            cancellationSource: options.CancellationSource);
+            failureKind: command.FailureKind,
+            quotaResetAt: command.QuotaResetAt,
+            cancellationSource: command.CancellationSource);
 
-        if (string.Equals(options.FailureKind, "quota", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(command.FailureKind, "quota", StringComparison.OrdinalIgnoreCase))
         {
-            failed = failed with { NextQuotaRetryAt = options.QuotaResetAt };
+            failed = failed with { NextQuotaRetryAt = command.QuotaResetAt };
         }
 
-        if (options.PrepareFailedItem is not null)
+        if (command.TransientRetryExhaustion is { } transientRetryExhaustion)
         {
-            failed = options.PrepareFailedItem(failed);
+            failed = failed with
+            {
+                NextTransientRetryAt = null,
+                TransientRetryFirstFailedAt =
+                    transientRetryExhaustion.FirstFailedAt ?? failed.TransientRetryFirstFailedAt,
+            };
         }
 
-        var updated = options.ExpectedUpdatedAt is { } expectedForUpdate
+        var updated = command.ExpectedUpdatedAt is { } expectedForUpdate
             ? await _store.TryUpdateIfStateAndUpdatedAtAsync(failed, current.State, expectedForUpdate, ct)
             : await _store.TryUpdateIfStateAsync(failed, current.State, ct);
         if (!updated)
@@ -136,7 +145,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
         }
 
         AuditLog.WorkItemFailed(failed.Id, error);
-        await PublishFailedAsync(failed, options, ct);
+        await PublishFailedAsync(failed, command, ct);
 
         return new WorkItemTerminalTransitionResult(
             Updated: true,
@@ -146,21 +155,15 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
 
     private async Task PublishFailedAsync(
         WorkItem failed,
-        WorkItemTerminalFailureTransitionOptions options,
+        WorkItemTerminalFailureTransitionCommand command,
         CancellationToken ct)
     {
         if (_webhooks is null)
             return;
 
-        if (!options.SwallowPublishExceptions)
-        {
-            await PublishFailedCoreAsync(failed, options, ct);
-            return;
-        }
-
         try
         {
-            await PublishFailedCoreAsync(failed, options, ct);
+            await PublishFailedCoreAsync(failed, command, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -177,10 +180,10 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
 
     private async Task PublishFailedCoreAsync(
         WorkItem failed,
-        WorkItemTerminalFailureTransitionOptions options,
+        WorkItemTerminalFailureTransitionCommand command,
         CancellationToken ct)
     {
-        var project = await ResolveProjectAsync(failed, options, ct);
+        var project = await ResolveProjectAsync(failed, ct);
         var revision = await BuildTerminalRevisionCoreAsync(failed, ct);
         await _webhooks!.PublishAsync(new WebhookEvent
         {
@@ -190,30 +193,56 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
             PromptRevision = revision?.PromptRevision,
             RevisionAtCompletion = revision?.RevisionAtCompletion,
             RevisionMatches = revision?.RevisionMatches,
-            Details = options.DetailsFactory?.Invoke(failed) ?? options.Details,
+            Details = BuildFailureDetails(failed, command),
         }, ct);
+    }
+
+    private static object? BuildFailureDetails(
+        WorkItem failed,
+        WorkItemTerminalFailureTransitionCommand command)
+    {
+        return command.TransientRetryExhaustion is { } transientRetryExhaustion
+            ? new WorkItemTransientRetryExhaustedDetails(
+                failed.Id.ToString(),
+                failed.FailureKind,
+                transientRetryExhaustion.Reason,
+                failed.TransientRetryAttempts)
+            : null;
     }
 
     private async Task<Project?> ResolveProjectAsync(
         WorkItem item,
-        WorkItemTerminalFailureTransitionOptions options,
         CancellationToken ct)
     {
-        if (options.Project is not null)
-            return options.Project;
-
-        if (options.ResolveProjectWhenMissing && _projects is not null)
-            return await _projects.GetAsync(item.ProjectId, ct);
-
-        return options.FallbackProjectWhenMissing
-            ? new Project
+        if (_projects is not null)
+        {
+            try
             {
-                Id = item.ProjectId,
-                DisplayName = item.ProjectId.Value,
-                RepositoryUrl = string.Empty,
+                return await _projects.GetAsync(item.ProjectId, ct)
+                    ?? FallbackProject(item);
             }
-            : null;
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Failed to resolve project {ProjectId} for terminal failure webhook; using fallback project shape",
+                    item.ProjectId);
+            }
+        }
+
+        return FallbackProject(item);
     }
+
+    private static Project FallbackProject(WorkItem item) => new()
+    {
+        Id = item.ProjectId,
+        DisplayName = item.ProjectId.Value,
+        RepositoryUrl = string.Empty,
+    };
 }
 
 /// <summary>

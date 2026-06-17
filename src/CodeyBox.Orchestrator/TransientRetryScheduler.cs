@@ -9,7 +9,7 @@ namespace CodeyBox.Orchestrator;
 /// Hosted service that automatically retries work items parked for transient
 /// transport backoff.
 /// </summary>
-public sealed class TransientRetryScheduler : BackgroundService, IDisposable
+public sealed class TransientRetryScheduler : BackgroundService, IDisposable, ITransientFailureAutoRetryScheduler
 {
     // Match QuotaRetryScheduler's hot-reload polling cadence while disabled.
     private static readonly TimeSpan OptionsReloadPollInterval = TimeSpan.FromSeconds(1);
@@ -432,7 +432,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable
         var transition = await _terminalTransitions.TransitionFailedAsync(
             item,
             $"transient network auto-retry exhausted ({reason}); operator retry required",
-            new WorkItemTerminalFailureTransitionOptions
+            new WorkItemTerminalFailureTransitionCommand
             {
                 FailureKind = "transient-exhausted",
                 ExpectedStates =
@@ -441,21 +441,9 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable
                     WorkItemState.WaitingForTransientRetry,
                 ],
                 ExpectedUpdatedAt = expectedUpdatedAt,
-                PrepareFailedItem = failed => failed with
-                {
-                    NextTransientRetryAt = null,
-                    TransientRetryFirstFailedAt = item.TransientRetryFirstFailedAt ?? failed.TransientRetryFirstFailedAt,
-                },
-                DetailsFactory = failed => new
-                {
-                    workItemId = failed.Id.ToString(),
-                    failureKind = failed.FailureKind,
+                TransientRetryExhaustion = new WorkItemTransientRetryExhaustion(
                     reason,
-                    transientRetryAttempts = failed.TransientRetryAttempts,
-                },
-                ResolveProjectWhenMissing = true,
-                FallbackProjectWhenMissing = false,
-                SwallowPublishExceptions = true,
+                    item.TransientRetryFirstFailedAt),
             },
             ct);
 
@@ -485,11 +473,10 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable
             ? null
             : NormalizeRetryFrom(item.TransientRetryFrom);
 
-        var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
+        var (success, error, _, actualFrom, _) = await _retrier.RetryTransientAutoAsync(
             item,
             from: retryFrom,
             trigger: $"transient-{trigger}",
-            autoRetryKind: WorkItemAutoRetryKind.Transient,
             ct: ct);
 
         if (!success)

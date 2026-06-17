@@ -2376,10 +2376,14 @@ builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryS
     }));
 builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<IQuotaFailureAutoRetryScheduler>(sp =>
+    sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<ITransientFailureAutoRetryScheduler>(sp =>
+    sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
     new WorkItemAutoRetryScheduler(
-        sp.GetRequiredService<QuotaRetryScheduler>(),
-        sp.GetRequiredService<TransientRetryScheduler>()));
+        sp.GetRequiredService<IQuotaFailureAutoRetryScheduler>(),
+        sp.GetRequiredService<ITransientFailureAutoRetryScheduler>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(

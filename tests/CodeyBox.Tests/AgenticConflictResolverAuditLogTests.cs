@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Serilog;
 using Serilog.Events;
@@ -110,6 +111,45 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
         Assert.Equal(1, GetScalar<int>(evt, "Attempt"));
         Assert.Equal(1, GetScalar<int>(evt, "Max"));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_AgentReportsFailure_RedactsLoggerAndFailureSummaryWithoutLoggerEnricher()
+    {
+        var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
+        sandbox.AddConflictedFile("conflict.txt",
+            "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");
+
+        var apiKey = "sk-ant-api03-AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT-0123456";
+        var pat = "ghp_XYZabc789012345678901234567890";
+        var runner = new StubFailingAgentRunner(
+            stdout: $"agent printed token={pat}",
+            stderr: $"agent stderr leaked api_key={apiKey}",
+            summary: $"agent exited 1: api_key={apiKey}");
+        var logger = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
+            logger);
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("***", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("sk-ant-api03", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("ghp_", result.Summary, StringComparison.Ordinal);
+
+        var warning = Assert.Single(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("reported failure", StringComparison.Ordinal));
+        Assert.Contains("***", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("sk-ant-api03", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("ghp_", warning.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -239,7 +279,13 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     {
         private readonly string _stdout;
         private readonly string _stderr;
-        public StubFailingAgentRunner(string stdout, string stderr) { _stdout = stdout; _stderr = stderr; }
+        private readonly string _summary;
+        public StubFailingAgentRunner(string stdout, string stderr, string summary = "agent exited 1")
+        {
+            _stdout = stdout;
+            _stderr = stderr;
+            _summary = summary;
+        }
         public AgentKind Kind { get; init; } = new("stub-failing");
 
         public Task<AgentResult> RunAsync(
@@ -252,7 +298,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken ct = default,
             Action<string>? stdoutChunkCallback = null,
             bool captureStructuredStream = false)
-            => Task.FromResult(new AgentResult(false, "agent exited 1", _stdout, _stderr));
+            => Task.FromResult(new AgentResult(false, _summary, _stdout, _stderr));
     }
 
     /// <summary>

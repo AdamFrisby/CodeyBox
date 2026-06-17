@@ -390,11 +390,11 @@ public sealed class AgenticConflictResolver
                     AuditLog.AgenticConflictResolverAttemptFailed(
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
                         attempt, maxAttemptsPerAgent,
-                        $"session resume exhausted: {ex.LastResult.Summary}",
+                        $"session resume exhausted: {RedactText(ex.LastResult.Summary)}",
                         stdoutTail: RedactAuditTail(ex.LastResult.Stdout),
                         stderrTail: RedactAuditTail(ex.LastResult.Stderr));
                     attemptTrail.Add(
-                        $"{runner.Kind.Value}#{attempt}(session resume exhausted: {Truncate(ex.LastResult.Summary, 120)}; stderr: {Truncate(RedactAuditTail(ex.LastResult.Stderr), 200)})");
+                        $"{runner.Kind.Value}#{attempt}(session resume exhausted: {RedactAndTruncate(ex.LastResult.Summary, 120)}; stderr: {RedactAndTruncate(ex.LastResult.Stderr, 200)})");
                     lastAgentResult = ex.LastResult;
                     RecordFailureForClassification(runner, candidate.Credential, ex.LastResult, allowTransientBackoff: true);
                     break;
@@ -407,10 +407,10 @@ public sealed class AgenticConflictResolver
                     AuditLog.AgenticConflictResolverAttemptFailed(
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
                         attempt, maxAttemptsPerAgent,
-                        $"threw {ex.GetType().Name}: {ex.Message}",
+                        $"threw {ex.GetType().Name}: {RedactText(ex.Message)}",
                         stdoutTail: null,
                         stderrTail: RedactAuditTail(ex.ToString()));
-                    attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {ex.Message})");
+                    attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {RedactAndTruncate(ex.Message, 200)})");
                     RecordFailureForClassification(
                         runner,
                         candidate.Credential,
@@ -441,22 +441,25 @@ public sealed class AgenticConflictResolver
                     // "agent exited 1" failures impossible to diagnose without
                     // a sandbox re-run. Operators need the runner's own output
                     // here to see auth/network/CLI startup errors.
+                    var redactedSummary = RedactText(agentResult.Summary);
+                    var redactedStdoutTail = RedactAndTruncate(agentResult.Stdout, 4096);
+                    var redactedStderrTail = RedactAndTruncate(agentResult.Stderr, 4096);
                     _log.LogWarning(
                         "Agentic conflict resolver: agent '{Agent}' reported failure on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}, model {Model}, reasoning {Reasoning}): {Summary}\n--- stdout (tail) ---\n{StdoutTail}\n--- stderr (tail) ---\n{StderrTail}",
                         runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId,
                         sandbox.Id, workingDirectory,
                         candidate.ModelId ?? "(default)", candidate.ReasoningMode ?? "(default)",
-                        agentResult.Summary,
-                        Truncate(agentResult.Stdout, 4096),
-                        Truncate(agentResult.Stderr, 4096));
+                        redactedSummary,
+                        redactedStdoutTail,
+                        redactedStderrTail);
                     AuditLog.AgenticConflictResolverAttemptFailed(
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
                         attempt, maxAttemptsPerAgent,
-                        agentResult.Summary,
+                        redactedSummary,
                         stdoutTail: RedactAuditTail(agentResult.Stdout),
                         stderrTail: RedactAuditTail(agentResult.Stderr));
                     attemptTrail.Add(
-                        $"{runner.Kind.Value}#{attempt}(agent failed: {Truncate(agentResult.Summary, 120)}; stderr: {Truncate(agentResult.Stderr, 200)})");
+                        $"{runner.Kind.Value}#{attempt}(agent failed: {RedactAndTruncate(agentResult.Summary, 120)}; stderr: {RedactAndTruncate(agentResult.Stderr, 200)})");
                     RecordFailureForClassification(runner, candidate.Credential, agentResult, allowTransientBackoff: true);
                     break;
                 }
@@ -477,7 +480,8 @@ public sealed class AgenticConflictResolver
                 }
 
                 lastVerificationError = verification.Reason;
-                attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(verification.Reason, 200)})");
+                var redactedVerificationReason = RedactText(verification.Reason);
+                attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(redactedVerificationReason, 200)})");
                 RecordFailureForClassification(
                     runner,
                     candidate.Credential,
@@ -490,18 +494,18 @@ public sealed class AgenticConflictResolver
                 AuditLog.AgenticConflictResolverAttemptFailed(
                     workItemId, runner.Kind, sandbox.Id, workingDirectory,
                     attempt, maxAttemptsPerAgent,
-                    $"verification: {verification.Reason}",
+                    $"verification: {redactedVerificationReason}",
                     stdoutTail: RedactAuditTail(agentResult.Stdout),
                     stderrTail: RedactAuditTail(agentResult.Stderr));
                 _log.LogInformation(
                     "Agentic conflict resolver: verification failed for agent '{Agent}' attempt {Attempt}/{Max} on {WorkItemId} (sandbox {Sandbox}): {Reason}",
-                    runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, verification.Reason);
+                    runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, redactedVerificationReason);
             }
         }
 
-        var summary = lastVerificationError
+        var summary = RedactText(lastVerificationError
             ?? lastAgentResult?.Summary
-            ?? "no candidate produced a clean resolution";
+            ?? "no candidate produced a clean resolution");
         var trail = attemptTrail.Count == 0 ? "(none)" : string.Join("; ", attemptTrail);
         return new AgenticConflictResolverResult(
             Success: false,
@@ -710,6 +714,12 @@ public sealed class AgenticConflictResolver
         if (string.IsNullOrEmpty(value)) return "";
         return value.Length <= maxChars ? value : value[..maxChars] + "…";
     }
+
+    private static string RedactText(string? value) =>
+        value is null ? "" : RawOutputRedactor.Redact(value);
+
+    private static string RedactAndTruncate(string? value, int maxChars) =>
+        Truncate(RedactText(value), maxChars);
 
     private static string? RedactAuditTail(string? value) =>
         value is null ? null : RawOutputRedactor.Redact(value);

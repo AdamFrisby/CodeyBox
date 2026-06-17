@@ -8,7 +8,7 @@ namespace CodeyBox.Orchestrator;
 /// <summary>
 /// Hosted service that automatically retries work items parked for quota reset.
 /// </summary>
-public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery
+public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery, IQuotaFailureAutoRetryScheduler
 {
     // There is no provider-agnostic options-change callback on this class: the
     // live options enter through an accessor. While disabled, poll that
@@ -734,11 +734,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
         // Re-use logic from shared WorkItemRetrier to ensure identical side effects,
         // audit logs, and conditional state updates (prevents race conditions).
-        var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
+        var (success, error, _, actualFrom, _) = await _retrier.RetryQuotaAutoAsync(
             item,
             from: retryFrom,
             trigger: trigger,
-            autoRetryKind: WorkItemAutoRetryKind.Quota,
             ct: ct);
 
         if (!success)

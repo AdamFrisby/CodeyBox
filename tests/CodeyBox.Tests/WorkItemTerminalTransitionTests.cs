@@ -44,7 +44,7 @@ public sealed class WorkItemTerminalTransitionTests : IDisposable
         var result = await transition.TransitionFailedAsync(
             stale,
             "transient network auto-retry exhausted",
-            new WorkItemTerminalFailureTransitionOptions
+            new WorkItemTerminalFailureTransitionCommand
             {
                 FailureKind = "transient-exhausted",
                 ExpectedStates =
@@ -81,7 +81,7 @@ public sealed class WorkItemTerminalTransitionTests : IDisposable
         var transitionTask = transition.TransitionFailedAsync(
             item,
             "post-agent transition timeout",
-            new WorkItemTerminalFailureTransitionOptions
+            new WorkItemTerminalFailureTransitionCommand
             {
                 FailureKind = "transient-exhausted",
             },
@@ -97,6 +97,57 @@ public sealed class WorkItemTerminalTransitionTests : IDisposable
         var stored = await store.GetAsync(item.Id);
         Assert.NotNull(stored);
         Assert.Equal(WorkItemState.Failed, stored!.State);
+    }
+
+    [Fact]
+    public async Task TransitionFailedAsync_WhenExpectedUpdatedAtMismatches_DoesNotFailNewerRow()
+    {
+        using var store = new SqliteWorkItemStore(Path.Combine(_workspace, "updated-at-mismatch.db"));
+        var transition = new WorkItemTerminalTransition(
+            store,
+            new CapturingWebhookDispatcher(),
+            projects: null,
+            NullLogger<WorkItemTerminalTransition>.Instance);
+        var stale = NewTransientItem() with
+        {
+            NextTransientRetryAt = DateTimeOffset.UtcNow.AddSeconds(-1),
+            TransientRetryAttempts = 5,
+            TransientRetryFirstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+        };
+        await store.CreateAsync(stale);
+
+        var newer = stale with
+        {
+            LastError = "newer retry state",
+            UpdatedAt = stale.UpdatedAt.AddSeconds(1),
+        };
+        await store.UpdateAsync(newer);
+
+        var result = await transition.TransitionFailedAsync(
+            stale,
+            "transient network auto-retry exhausted",
+            new WorkItemTerminalFailureTransitionCommand
+            {
+                FailureKind = "transient-exhausted",
+                ExpectedStates =
+                [
+                    WorkItemState.Failed,
+                    WorkItemState.WaitingForTransientRetry,
+                ],
+                ExpectedUpdatedAt = stale.UpdatedAt,
+                TransientRetryExhaustion = new WorkItemTransientRetryExhaustion(
+                    "attempts=5; max=5",
+                    stale.TransientRetryFirstFailedAt),
+            },
+            CancellationToken.None);
+
+        var stored = await store.GetAsync(stale.Id);
+        Assert.False(result.Updated);
+        Assert.Equal(newer.UpdatedAt, result.CurrentWorkItem?.UpdatedAt);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal("transient", stored.FailureKind);
+        Assert.Equal("newer retry state", stored.LastError);
     }
 
     [Fact]
@@ -116,11 +167,9 @@ public sealed class WorkItemTerminalTransitionTests : IDisposable
         var transitionTask = transition.TransitionFailedAsync(
             item,
             "post-agent transition timeout",
-            new WorkItemTerminalFailureTransitionOptions
+            new WorkItemTerminalFailureTransitionCommand
             {
                 FailureKind = "transient-exhausted",
-                ResolveProjectWhenMissing = true,
-                FallbackProjectWhenMissing = false,
             },
             cts.Token);
 

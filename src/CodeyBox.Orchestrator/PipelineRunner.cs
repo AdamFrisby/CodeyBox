@@ -13311,16 +13311,15 @@ Original merge-phase failure (for context):
                     transitionCt);
             }
 
-            var transition = await _terminalTransitions.TransitionFailedAsync(
-                current,
-                error,
-                new WorkItemTerminalFailureTransitionOptions
-                {
-                    Project = project,
-                    FailureKind = failureKind,
-                    QuotaResetAt = effectiveQuotaResetAt,
-                    CancellationSource = cancellationSource,
-                },
+	            var transition = await _terminalTransitions.TransitionFailedAsync(
+	                current,
+	                error,
+	                new WorkItemTerminalFailureTransitionCommand
+	                {
+	                    FailureKind = failureKind,
+	                    QuotaResetAt = effectiveQuotaResetAt,
+	                    CancellationSource = cancellationSource,
+	                },
                 transitionCt);
             if (!transition.Updated || transition.FailedWorkItem is not { } next)
             {

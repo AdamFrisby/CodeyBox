@@ -3,13 +3,6 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-public enum WorkItemAutoRetryKind
-{
-    None,
-    Quota,
-    Transient,
-}
-
 /// <summary>
 /// Consolidates retry logic for terminal and operator-parked work items,
 /// ensuring consistent state transitions, audit logs, and side effects (e.g.
@@ -17,6 +10,13 @@ public enum WorkItemAutoRetryKind
 /// </summary>
 public sealed class WorkItemRetrier
 {
+    private enum RetryAccounting
+    {
+        None,
+        QuotaAutoRetry,
+        TransientAutoRetry,
+    }
+
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
     private readonly IGitHost _gitHost;
@@ -55,8 +55,29 @@ public sealed class WorkItemRetrier
         WorkItem item,
         string? from = null,
         string trigger = "manual",
-        WorkItemAutoRetryKind autoRetryKind = WorkItemAutoRetryKind.None,
         CancellationToken ct = default)
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.None, ct);
+
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryQuotaAutoAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct = default)
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, ct);
+
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryTransientAutoAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct = default)
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, ct);
+
+    private async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryCoreAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        RetryAccounting accounting,
+        CancellationToken ct)
     {
         if (item.State == WorkItemState.NeedsOperatorInput && _questions is not null)
         {
@@ -150,16 +171,16 @@ public sealed class WorkItemRetrier
         {
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
-            QuotaRetryAttempts = autoRetryKind == WorkItemAutoRetryKind.Quota
+            QuotaRetryAttempts = accounting == RetryAccounting.QuotaAutoRetry
                 ? item.QuotaRetryAttempts + 1
                 : item.QuotaRetryAttempts,
-            TransientRetryAttempts = autoRetryKind == WorkItemAutoRetryKind.Transient
+            TransientRetryAttempts = accounting == RetryAccounting.TransientAutoRetry
                 ? item.TransientRetryAttempts + 1
                 : 0,
-            TransientRetryFirstFailedAt = autoRetryKind == WorkItemAutoRetryKind.Transient
+            TransientRetryFirstFailedAt = accounting == RetryAccounting.TransientAutoRetry
                 ? item.TransientRetryFirstFailedAt
                 : null,
-            TransientRetryFrom = autoRetryKind == WorkItemAutoRetryKind.Transient
+            TransientRetryFrom = accounting == RetryAccounting.TransientAutoRetry
                 ? item.TransientRetryFrom
                 : null,
             TerminalRetryAttempts = resetsTerminalRetries ? 0 : item.TerminalRetryAttempts,
@@ -173,7 +194,7 @@ public sealed class WorkItemRetrier
         // WaitingForQuotaReset, or WaitingForTransientRetry. Eligibility gates
         // that must apply across HTTP, scheduler, and operator paths live in
         // this retrier before the write.
-        var updated = autoRetryKind == WorkItemAutoRetryKind.Transient
+        var updated = accounting == RetryAccounting.TransientAutoRetry
             ? await _store.TryUpdateIfStateAndUpdatedAtAsync(resumed, item.State, item.UpdatedAt, ct)
             : await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
@@ -227,13 +248,6 @@ public sealed class WorkItemRetrier
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
         return (true, null, resumeState, actualFrom, null);
     }
-
-    public Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAsync(
-        WorkItem item,
-        string? from,
-        string trigger,
-        CancellationToken ct)
-        => RetryAsync(item, from, trigger, WorkItemAutoRetryKind.None, ct);
 
     /// <summary>
     /// Picks a sensible default <c>from</c> phase for retries when the operator

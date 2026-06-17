@@ -12,14 +12,24 @@ public interface IWorkItemAutoRetryScheduler
     Task<WorkItemAutoRetryScheduleResult> NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default);
 }
 
+public interface IQuotaFailureAutoRetryScheduler
+{
+    Task NotifyQuotaFailureAsync(WorkItem item, CancellationToken ct = default);
+}
+
+public interface ITransientFailureAutoRetryScheduler
+{
+    Task<WorkItemAutoRetryScheduleResult> NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default);
+}
+
 public sealed class WorkItemAutoRetryScheduler : IWorkItemAutoRetryScheduler
 {
-    private readonly QuotaRetryScheduler _quota;
-    private readonly TransientRetryScheduler? _transient;
+    private readonly IQuotaFailureAutoRetryScheduler _quota;
+    private readonly ITransientFailureAutoRetryScheduler? _transient;
 
     public WorkItemAutoRetryScheduler(
-        QuotaRetryScheduler quota,
-        TransientRetryScheduler? transient)
+        IQuotaFailureAutoRetryScheduler quota,
+        ITransientFailureAutoRetryScheduler? transient)
     {
         _quota = quota;
         _transient = transient;

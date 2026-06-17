@@ -24,6 +24,19 @@ public static class AgentFailureClassifier
 
     private const int MaxStructuredOutputLineChars = 64 * 1024;
 
+    private static readonly IReadOnlyList<string> StructuredTurnFailedTimeoutPatterns = new[]
+    {
+        "stream timeout",
+        "provider timeout",
+        "request timeout",
+        "request timed out",
+        "connection timeout",
+        "connection timed out",
+        "network timeout",
+        "transport timeout",
+        "i/o timeout",
+    };
+
     /// <summary>
     /// Quota / capacity exhaustion shapes where an immediate same-agent resume
     /// would almost certainly re-fail.
@@ -383,6 +396,7 @@ public static class AgentFailureClassifier
         if (string.Equals(message.Trim(), "timeout", StringComparison.OrdinalIgnoreCase))
             return true;
 
-        return ContainsAny(message, TransientNetworkPatterns);
+        return ContainsAny(message, TransientNetworkPatterns)
+            || ContainsAny(message, StructuredTurnFailedTimeoutPatterns);
     }
 }

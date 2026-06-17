@@ -219,6 +219,8 @@ public sealed class AgentFailureClassifierTests
     [InlineData("""{"type":"turn.failed","error":"request\u0020timed\u0020out while reading stream"}""")]
     [InlineData("""{"type":"turn.failed","error":{"message":"request\u005ftimeout"}}""")]
     [InlineData("""{"type":"turn.failed","result":{"error":{"message":"Transport\u0020channel\u0020closed"}}}""")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"stream timeout after 60s"}}""")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"provider timeout while waiting"}}""")]
     public void TurnFailed_WithStructuredTransientMessage_Classified_AsTransient(string payload)
     {
         Assert.DoesNotContain("request timed out", payload, StringComparison.OrdinalIgnoreCase);
@@ -226,6 +228,17 @@ public sealed class AgentFailureClassifierTests
         Assert.DoesNotContain("Transport channel closed", payload, StringComparison.OrdinalIgnoreCase);
 
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: payload);
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Fact]
+    public void SummaryTurnFailed_WithStructuredTransientMessage_Classified_AsTransient()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: null,
+            summary: """{"type":"turn.failed","error":{"message":"provider timeout while waiting"}}""");
 
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
     }
@@ -300,6 +313,23 @@ public sealed class AgentFailureClassifierTests
 
             Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
             Assert.Equal(AgentFailureKind.TransientNetwork, builtIn.Kind);
+        }
+        finally
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+        }
+    }
+
+    [Fact]
+    public void AdditionalTransientNetworkPatterns_IgnoreWhitespaceEntries()
+    {
+        try
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(["", " ", "\t"]);
+
+            var c = AgentFailureClassifier.Classify(stderr: "compile error: missing semicolon");
+
+            Assert.Equal(AgentFailureKind.Normal, c.Kind);
         }
         finally
         {
