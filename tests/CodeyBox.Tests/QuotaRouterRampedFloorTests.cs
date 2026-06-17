@@ -269,6 +269,116 @@ public sealed class QuotaRouterRampedFloorTests
     }
 
     [Fact]
+    public void WindowsAware_ClaudeShape_RampKeysOffLongWindowNotShorterBindingWindow()
+    {
+        // Repro for the operator's "ramp collapsed to EndFloor" bug: when the
+        // binding window is shorter than RampWindow, ramping against
+        // quota.ResetAt (= the binding short window's reset) makes
+        // untilReset << RampWindow every cycle, so fractionElapsed clamps to
+        // ~1 and the floor collapses to ~EndFloor. With the windows-aware
+        // overload, the long (seven_day) reset is selected and the early-week
+        // oversight reservation StartFloorPct is honoured.
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 5.0,
+            StartFloorPct = 40.0,
+            EndFloorPct = 5.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        var policy = new QuotaGatePolicy(opts);
+        var fiveHourReset = Now + TimeSpan.FromHours(1);
+        var sevenDayReset = Now + TimeSpan.FromDays(4);
+        var quota = new EffectiveQuota(
+            AvailablePct: 9.0,
+            ResetAt: fiveHourReset,
+            Window: "five_hour",
+            Windows: new[]
+            {
+                new WindowQuota { Name = "five_hour", AvailablePct = 9.0, ResetAt = fiveHourReset },
+                new WindowQuota { Name = "seven_day", AvailablePct = 29.0, ResetAt = sevenDayReset },
+            });
+
+        var floor = policy.ComputeEffectiveFloorPct(Claude, quota, Now);
+
+        // lerp(40, 5, 1 - 4/7) = 40 + (5 - 40) * 3/7 = 40 - 15 = 25.0
+        Assert.Equal(25.0, floor, precision: 6);
+        // And to make the bug-fix posture explicit: the old behaviour would
+        // have collapsed to ~EndFloorPct.
+        Assert.True(floor > opts.EndFloorPct + 5.0,
+            $"expected mid-ramp floor well above EndFloorPct={opts.EndFloorPct}, got {floor}");
+    }
+
+    [Fact]
+    public void WindowsAware_CodexShape_OnlyWeeklyWindow_BehaviourUnchanged()
+    {
+        // Codex's binding window IS the weekly. Both overall.ResetAt and the
+        // single window entry resolve to the same reset, so the windows-aware
+        // overload picks the same point the legacy resetAt overload always
+        // did — no behaviour drift for codex.
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 5.0,
+            StartFloorPct = 10.0,
+            EndFloorPct = 5.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        var policy = new QuotaGatePolicy(opts);
+        var weeklyReset = Now + TimeSpan.FromDays(4.2);
+        var quota = new EffectiveQuota(
+            AvailablePct: 6.0,
+            ResetAt: weeklyReset,
+            Window: "weekly",
+            Windows: new[]
+            {
+                new WindowQuota { Name = "weekly", AvailablePct = 6.0, ResetAt = weeklyReset },
+            });
+
+        var floor = policy.ComputeEffectiveFloorPct(Codex, quota, Now);
+
+        // lerp(10, 5, 1 - 4.2/7) = 10 + (5 - 10) * 0.4 = 8.0
+        Assert.Equal(8.0, floor, precision: 6);
+    }
+
+    [Fact]
+    public void WindowsAware_NoWindowsAndNoOverallReset_FallsBackToMinQuotaPct()
+    {
+        // Probe surfaced nothing window-shaped and no overall reset either —
+        // ramp cannot be computed, so the gate falls back to MinQuotaPct just
+        // like the resetAt-only overload (preserves the original fixed-floor
+        // behaviour).
+        var opts = DefaultOpts();
+        var policy = new QuotaGatePolicy(opts);
+        var quota = new EffectiveQuota(
+            AvailablePct: 50.0,
+            ResetAt: null,
+            Window: null);
+
+        var floor = policy.ComputeEffectiveFloorPct(Claude, quota, Now);
+
+        Assert.Equal(opts.MinQuotaPct, floor, precision: 6);
+    }
+
+    [Fact]
+    public void WindowsAware_OverallResetButNoWindowEntries_UsesOverallReset()
+    {
+        // Snapshots from sources that don't decompose into per-window readings
+        // (e.g. budget-derived quotas in PipelineRunner) still get the
+        // resetAt-based ramp.
+        var opts = DefaultOpts();
+        var policy = new QuotaGatePolicy(opts);
+        var weeklyReset = Now + TimeSpan.FromDays(3.5);
+        var quota = new EffectiveQuota(
+            AvailablePct: 50.0,
+            ResetAt: weeklyReset,
+            Window: null);
+
+        var floor = policy.ComputeEffectiveFloorPct(Claude, quota, Now);
+
+        // lerp(25, 3, 0.5) = 14.0 (same number the resetAt-only API returns mid-week)
+        Assert.Equal(14.0, floor, precision: 6);
+    }
+
+    [Fact]
     public void HotReloadOfOptions_TakesEffectOnNextCall()
     {
         // The router holds the QuotaRouterOptions singleton by reference and
