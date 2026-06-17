@@ -22,6 +22,7 @@ using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.Deployment;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
@@ -3551,6 +3552,33 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 
+// --- Verification deployment drivers + manager -------------------------------
+// Built ONLY as the deployment abstraction (chain link 1) — no pipeline/audit
+// integration yet. Drivers are DI-resolved by their Kind via
+// DeploymentDriverRegistry, so a new kind is one new IDeploymentDriver
+// registration + recipe schema entry with zero core changes (per AGENTS.md
+// declared-capability pattern). The leak reaper sweeps managed sandboxes
+// whose deployment owner no longer exists in the manager's active set
+// (orchestrator restart, aborted deploy) — sibling to SandboxLeakReaper.
+builder.Services.AddSingleton<IDeploymentDriver, WebAppDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, DaemonDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, CliDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, LibraryDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriverRegistry, DeploymentDriverRegistry>();
+builder.Services.AddSingleton<IDeploymentManager>(sp => new DeploymentManager(
+    sp.GetRequiredService<IDeploymentDriverRegistry>(),
+    sp.GetRequiredService<ILogger<DeploymentManager>>()));
+builder.Services.AddSingleton<DeploymentLeakReaper>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new DeploymentLeakReaper(
+        sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<IDeploymentManager>(),
+        () => monitor.CurrentValue.DeploymentLeak,
+        sp.GetRequiredService<ILogger<DeploymentLeakReaper>>());
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DeploymentLeakReaper>());
+
 // --- B1 baseline-image reaper ------------------------------------------------
 // Reference-counted GC for content-hashed Multipass baseline VMs. The reaper
 // stays inactive when the registered sandbox provider does not implement
@@ -5198,6 +5226,15 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+
+        /// <summary>
+        /// Verification-deployment leak reaper configuration. Sweeps managed
+        /// sandboxes that outlived an <see cref="IDeploymentManager"/>-tracked
+        /// deployment (orchestrator crash / aborted deploy). Same pattern as
+        /// <see cref="SandboxLeak"/>; running both is safe — each scopes to
+        /// its own concern.
+        /// </summary>
+        public DeploymentLeakOptions DeploymentLeak { get; set; } = new();
 
         /// <summary>
         /// B1 baseline-image reaper configuration. Reference-counted GC for

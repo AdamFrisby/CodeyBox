@@ -1,3 +1,4 @@
+using CodeyBox.Deployment;
 using Microsoft.Extensions.Configuration;
 
 namespace CodeyBox.Projects;
@@ -70,6 +71,13 @@ public sealed class ProjectConfig
     /// value clears the inherited default for that known key.
     /// </summary>
     public Dictionary<string, string>? Knobs { get; set; }
+
+    /// <summary>
+    /// Optional deployment recipe describing how the project's software is
+    /// stood up for verification audits. Null = the project does not opt
+    /// into deployment verification.
+    /// </summary>
+    public DeploymentRecipeConfig? Deployment { get; set; }
 }
 
 /// <summary>

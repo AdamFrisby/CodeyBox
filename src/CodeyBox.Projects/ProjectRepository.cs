@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Audit.Presets;
+using CodeyBox.Deployment;
 using Microsoft.Extensions.Options;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
@@ -337,6 +338,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 Enabled = pc.ClaudeSession?.Enabled ?? false,
             },
             Knobs = ResolveKnobs(pc.Id, pc.Knobs, defaults.Knobs),
+            Deployment = DeploymentRecipeBinder.ToRecipe(pc.Deployment),
         };
     }
 

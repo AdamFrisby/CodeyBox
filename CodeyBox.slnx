@@ -17,6 +17,7 @@
     <Project Path="src/CodeyBox.Audit.Shell/CodeyBox.Audit.Shell.csproj" />
     <Project Path="src/CodeyBox.Audit/CodeyBox.Audit.csproj" />
     <Project Path="src/CodeyBox.Core/CodeyBox.Core.csproj" />
+    <Project Path="src/CodeyBox.Deployment/CodeyBox.Deployment.csproj" />
     <Project Path="src/CodeyBox.ExploratoryTesting/CodeyBox.ExploratoryTesting.csproj" />
     <Project Path="src/CodeyBox.Git/CodeyBox.Git.csproj" />
     <Project Path="src/CodeyBox.Orchestrator/CodeyBox.Orchestrator.csproj" />
