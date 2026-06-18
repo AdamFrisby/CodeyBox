@@ -6298,7 +6298,7 @@ public sealed class PipelineRunner : IPipelineRunner
             && (prefix.BuildTestGateFailed || !HasPassedBuildAndTestGateEvidence(prefix)))
         {
             _log.LogInformation(
-                "Audit iteration {Iter}: skipping {Count} LLM auditor(s) because verified deterministic build-and-test evidence is unavailable or a build/test gate failed",
+                "Audit iteration {Iter}: skipping {Count} build/test-gated auditor(s) because verified deterministic build-and-test evidence is unavailable or a build/test gate failed",
                 ctx.Iteration,
                 gatedReviewAuditors.Count);
             AuditLog.LlmPanelSkippedBuildTestGate(item.Id, gatedReviewAuditors.Count);
@@ -6512,8 +6512,8 @@ public sealed class PipelineRunner : IPipelineRunner
         return new AuditFinding(
             AuditorName: "audit:build-test-gate",
             Severity: AuditSeverity.Error,
-            Title: "LLM review skipped because no verified build/test gate passed",
-            Description: $"The configured LLM review auditor(s) require verified deterministic build and test evidence before they can run: {auditorList}. Configure build/test auditor(s) with role 'build-test-gate' and gateEvidence 'build-and-test', or separate 'build' and 'test' gates, that actually run and pass before the LLM panel.");
+            Title: "build/test-gated auditor skipped because no verified build/test gate passed",
+            Description: $"The configured build/test-gated auditor(s) require verified deterministic build and test evidence before they can run: {auditorList}. Configure build/test auditor(s) with role 'build-test-gate' and gateEvidence 'build-and-test', or separate 'build' and 'test' gates, that actually run and pass before the gated auditor(s).");
     }
 
     private static bool HasPassedBuildAndTestGateEvidence(AuditorBatchResult result)
@@ -6551,7 +6551,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     AuditorName: run.Auditor.Name,
                     Severity: AuditSeverity.Error,
                     Title: "build/test gate did not verify",
-                    Description: $"Build/test gate '{run.Auditor.Name}' returned a passing result but explicitly reported that its evidence was not verified. The LLM review panel was skipped because the CI-passed prompt claim cannot be verified."))
+                    Description: $"Build/test gate '{run.Auditor.Name}' returned a passing result but explicitly reported that its evidence was not verified. Build/test-gated auditor(s) were skipped because the CI-passed prompt claim cannot be verified."))
                 .ToList();
             return run with
             {
@@ -6573,7 +6573,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 AuditorName: run.Auditor.Name,
                 Severity: AuditSeverity.Error,
                 Title: "build/test gate did not pass",
-                Description: $"Build/test gate '{run.Auditor.Name}' returned a non-passing result without a blocking finding. The LLM review panel was skipped because the CI-passed prompt claim cannot be verified."))
+                Description: $"Build/test gate '{run.Auditor.Name}' returned a non-passing result without a blocking finding. Build/test-gated auditor(s) were skipped because the CI-passed prompt claim cannot be verified."))
             .ToList();
         return run with
         {

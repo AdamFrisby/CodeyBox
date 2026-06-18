@@ -580,17 +580,17 @@ public static class AuditLog
                 auditorName, workItemId.ToString(), candidateCount);
 
     /// <summary>
-    /// Emitted when the LLM auditor panel is skipped because verified build
-    /// and test evidence is unavailable, or because one or more
+    /// Emitted when build/test-gated auditors are skipped because verified
+    /// build and test evidence is unavailable, or because one or more
     /// BuildTestGate-role auditors produced a blocking finding in this audit
-    /// iteration. The panel's prompt frame asserts "CI built and ran tests
-    /// with no failures"; that claim must stay true, so the panel is bypassed
+    /// iteration. LLM prompt frames assert "CI built and ran tests with no
+    /// failures"; that claim must stay true, so gated auditors are bypassed
     /// until the deterministic evidence is present.
     /// </summary>
     public static void LlmPanelSkippedBuildTestGate(WorkItemId workItemId, int skippedAuditorCount) =>
         Audit("audit.llm_panel_skipped_build_test_gate")
             .Information(
-                "LLM auditor panel skipped for {WorkItemId}: {SkippedCount} LLM auditor(s) bypassed because verified build/test gate evidence was unavailable or a build/test gate failed in this iteration",
+                "Build/test-gated auditor(s) skipped for {WorkItemId}: {SkippedCount} auditor(s) bypassed because verified build/test gate evidence was unavailable or a build/test gate failed in this iteration",
                 workItemId.ToString(), skippedAuditorCount);
 
     /// <summary>
