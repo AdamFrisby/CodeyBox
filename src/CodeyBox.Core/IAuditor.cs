@@ -83,6 +83,8 @@ public interface IAuditSandboxIsolation
 /// completed successfully. The pipeline runs all
 /// <see cref="AuditorRole.BuildTestGate"/> auditors first and skips these
 /// auditors unless deterministic build and test evidence actually passed.
+/// LLM auditors are also gated by their <see cref="IAuditor.Kind"/> because
+/// the shared LLM prompt frame states that CI already ran successfully.
 /// </summary>
 public interface IRequiresPassedBuildTestGate;
 

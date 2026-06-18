@@ -6470,7 +6470,8 @@ public sealed class PipelineRunner : IPipelineRunner
         => !result.Passed || result.Findings.Any(f => f.Severity == AuditSeverity.Error);
 
     private static bool RequiresPassedBuildTestGate(IAuditor auditor)
-        => auditor is IRequiresPassedBuildTestGate;
+        => auditor is IRequiresPassedBuildTestGate
+           || string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase);
 
     private static AuditorBatchResult EmptyAuditorBatchResult()
         => new([], null, false, CompletedAuditors: []);

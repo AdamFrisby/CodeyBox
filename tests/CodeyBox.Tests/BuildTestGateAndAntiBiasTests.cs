@@ -503,7 +503,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
-    public async Task UnmarkedLlmAuditorDoesNotRequireBuildTestGate()
+    public async Task UnmarkedLlmAuditorIsStillBuildTestGatedByKind()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new RoleStampedScriptedAuditor(
@@ -539,7 +539,8 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Equal([1], gate.SeenIterations);
-        Assert.Equal(1, llmRuns);
+        Assert.Equal(0, llmRuns);
+        Assert.Empty(llm.SeenIterations);
     }
 
     [Fact]
