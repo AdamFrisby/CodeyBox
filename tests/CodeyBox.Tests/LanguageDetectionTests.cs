@@ -270,7 +270,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task CSharpRootMarker_RunsOnceFromRepositoryRoot()
+    public async Task CSharpRootMarker_DoesNotSuppressNestedProjectDirectories()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
@@ -279,10 +279,32 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.True(result.Passed);
-        Assert.Equal(1, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings, f =>
+            f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal(
+            LanguageProjectDiscovery.MaxProjectDirectoriesToRun,
+            sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
         Assert.Contains("/repo", sandbox.WorkingDirectories);
-        Assert.DoesNotContain("/repo/project-0", sandbox.WorkingDirectories);
+        Assert.Contains("/repo/project-0", sandbox.WorkingDirectories);
+        Assert.DoesNotContain("/repo/project-31", sandbox.WorkingDirectories);
+    }
+
+    [Fact]
+    public async Task CSharpTestPass_MixedProjectEvidenceReportsUnverified()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:test-pass");
+        var sandbox = new MixedCSharpGateEvidenceSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        Assert.False(result.BuildTestGateEvidenceVerified);
+        Assert.Contains("/repo/project-ok", sandbox.WorkingDirectories);
+        Assert.Contains("/repo/project-unverified", sandbox.WorkingDirectories);
     }
 
     private static AuditContext FakeAuditContext() =>
@@ -478,6 +500,46 @@ public sealed class LanguageDetectionTests
 
                 var output = string.Join('\n', directories) + "\n";
                 return Task.FromResult(new SandboxExecResult(0, output, ""));
+            }
+
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class MixedCSharpGateEvidenceSandbox : ISandbox
+    {
+        public List<string> WorkingDirectories { get; } = [];
+        public string Id => "mixed-csharp-gate-evidence";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.WorkingDirectory is not null)
+                WorkingDirectories.Add(exec.WorkingDirectory);
+
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(0, "/usr/bin/dotnet\n", ""));
+
+                return Task.FromResult(new SandboxExecResult(0, "./project-ok\n./project-unverified\n", ""));
+            }
+
+            if (exec.Argv.Count >= 2 &&
+                exec.Argv[0] == "dotnet" &&
+                exec.Argv[1] == "test" &&
+                exec.WorkingDirectory?.EndsWith("/project-unverified", StringComparison.Ordinal) == true)
+            {
+                const string output = """
+                      Failed App.Tests.E2E.LoginTests.CanOpenLoginPage [< 1 ms]
+                      Error Message:
+                       Microsoft.Playwright.PlaywrightException : Browser executable was not found
+                      Stack Trace:
+
+                    Failed!  - Failed: 1, Passed: 100, Skipped: 0, Total: 101, Duration: 4 s
+                    """;
+                return Task.FromResult(new SandboxExecResult(1, output, ""));
             }
 
             return Task.FromResult(new SandboxExecResult(0, "", ""));

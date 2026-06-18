@@ -106,10 +106,12 @@ the panel, because the panel's CI claim only covers build and tests.
 
 Built-in language presets mark the `<lang>:build-*` (where the preset
 ships a separate build step — currently only `csharp:build-WaE`) and the
-`<lang>:test-*` auditor as BuildTestGate. The other shipped languages
-(Go, Node, Python, Rust) fold the build into the same command as the
-test suite, so only their `<lang>:test-*` auditor carries the role and it
-advertises `build-and-test` evidence.
+`<lang>:test-*` auditor as BuildTestGate. Go and Rust test commands build the
+tested packages as part of the command, so their `<lang>:test-*` gates
+advertise `build-and-test` evidence. Node and Python default test commands
+(`npm test`, `pytest`) advertise `test` evidence only; projects that want LLM
+review for those languages must also provide build evidence, for example with
+a repo-root `build.sh` or a trusted custom build gate.
 Gate metadata is accepted only from trusted configuration: built-in presets
 or operator/project appsettings overrides. Repository-supplied YAML can add
 shell auditors, but it cannot declare `role` or `gateEvidence`, because that

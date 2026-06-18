@@ -249,9 +249,11 @@ public sealed record AuditResult
     /// <summary>
     /// When set to false, the result explicitly did not verify build/test
     /// evidence. For BuildTestGate auditors, the pipeline treats that as a
-    /// blocking gate failure before any LLM panel can run; for ordinary
-    /// auditors it only records the evidence state. Used for classified
-    /// "unrunnable in this environment" outcomes.
+    /// blocking gate failure before any LLM panel can run, except for the
+    /// optional repo-root build.sh gate when it is absent and produces no
+    /// findings; other passing build/test gates can still contribute the
+    /// missing evidence. For ordinary auditors it only records the evidence
+    /// state. Used for classified "unrunnable in this environment" outcomes.
     /// </summary>
     public bool? BuildTestGateEvidenceVerified { get; init; }
 }

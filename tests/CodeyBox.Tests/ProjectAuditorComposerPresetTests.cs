@@ -1,7 +1,9 @@
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
+using CodeyBox.PluginSdk;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -345,6 +347,31 @@ public sealed class ProjectAuditorComposerPresetTests
         Assert.Contains("supported only for custom shell auditors", ex.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("build-test-gate", null)]
+    [InlineData(null, "test")]
+    public void Compose_CustomPluginAuditorWithGateMetadataIsRejected(
+        string? role,
+        string? gateEvidence)
+    {
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [new TestPluginAuditor()],
+            NullLogger<ProjectAuditorComposer>.Instance);
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Kind = "plugin",
+            PluginId = "test.plugin-auditor",
+            Role = role,
+            GateEvidence = gateEvidence,
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("Custom plugin auditor 'test.plugin-auditor' cannot set Role or GateEvidence", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("supported only for custom shell auditors", ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Compose_LoadsLanguagePresetFromLocalRepository()
     {
@@ -440,6 +467,16 @@ public sealed class ProjectAuditorComposerPresetTests
     private sealed class NamedAuditor(string name) : IAuditor
     {
         public string Name { get; } = name;
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    [CodeyBoxPlugin("test.plugin-auditor", "Test Plugin Auditor")]
+    private sealed class TestPluginAuditor : IAuditor
+    {
+        public string Name => "test:plugin-auditor";
         public string Kind => "tool";
         public AuditCapabilities Required => AuditCapabilities.None;
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)

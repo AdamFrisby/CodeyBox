@@ -191,8 +191,11 @@ Declared short-circuit gates are controlled globally with
 `CodeyBox:PipelineTuning:AuditShortCircuitEnabled` (default `true`,
 hot-reloadable). The built-in `csharp:build-WaE` and `csharp:test-pass`
 auditors run before LLM reviewers and skip the LLM panel when they produce a
-blocking result. Non-LLM tool auditors continue to run when
-`StopOnFirstFailure=false`.
+blocking result. With the default short-circuit toggle enabled, those same
+blocking C# gates also skip later tool auditors for that iteration. If
+declared short-circuit routing is disabled, or the blocking build/test gate does
+not opt into short-circuiting, non-LLM tool auditors continue to run when
+`StopOnFirstFailure=false`; the LLM panel remains gated either way.
 
 The built-in `uat` profile is intended for UAT/test-generation work. It keeps
 C# format/build/test checks, gitleaks, semgrep, security LLM review, and the

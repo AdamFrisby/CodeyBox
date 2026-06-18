@@ -26,10 +26,6 @@ public static class LanguageProjectDiscovery
         string language,
         IReadOnlyList<string> projectDirectories)
     {
-        if (string.Equals(language, "csharp", StringComparison.OrdinalIgnoreCase) &&
-            projectDirectories.Contains(".", StringComparer.Ordinal))
-            return ["."];
-
         return projectDirectories;
     }
 

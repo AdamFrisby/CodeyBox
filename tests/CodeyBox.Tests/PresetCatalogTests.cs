@@ -107,8 +107,8 @@ public sealed class PresetCatalogTests
         AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
-        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.BuildAndTest);
-        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.Test);
         AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.BuildAndTest);
         AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.BuildAndTest);
     }
@@ -212,6 +212,37 @@ public sealed class PresetCatalogTests
 
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
         Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_WiresExplicitBuildTestGateEvidenceToScriptAuditor()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-script-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-script-build:test-pass",
+                            Script = "dotnet test",
+                            ToolName = "dotnet",
+                            Role = "build-test-gate",
+                            GateEvidence = "build-and-test",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-script-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-script-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
     }
 
     [Fact]

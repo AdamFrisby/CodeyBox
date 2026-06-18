@@ -608,6 +608,52 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task RequiredBuildGateFailureStillRunsNonGatedToolAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var requiredBuild = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Failed(1, "compile failed"));
+        var toolRuns = 0;
+        var nonGatedTool = new RoleStampedScriptedAuditor(
+            "security:gitleaks",
+            AuditorRole.None,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Interlocked.Increment(ref toolRuns));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [nonGatedTool, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: requiredBuild);
+
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(
+            barePath,
+            "update-ref",
+            $"refs/heads/{item.WorkBranch}",
+            "refs/heads/main");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.AuditFailed,
+            $"expected AuditFailed, got {final.State}: {final.LastError}");
+        Assert.Equal(1, requiredBuild.VerifyCalls);
+        Assert.Equal(1, toolRuns);
+        Assert.Equal(0, llmRuns);
+        Assert.Contains("required build failed", final.LastError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task RequiredBuildGatePassAloneDoesNotUnlockLlmPanelWithoutTestGate()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -943,7 +989,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     [Theory]
     [InlineData("node", "package.json", "{\"scripts\":{\"test\":\"node -e 0\"}}\n", "npm test")]
     [InlineData("python", "pyproject.toml", "[project]\nname = \"sample\"\nversion = \"0.1.0\"\n", "pytest ")]
-    public async Task BuiltInNodeAndPythonPassingTestGateUnlocksLlmPanel(
+    public async Task BuiltInNodeAndPythonPassingTestGateDoesNotUnlockLlmPanelWithoutBuildEvidence(
         string language,
         string markerFile,
         string markerContents,
@@ -997,9 +1043,10 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.True(
-            final!.State == WorkItemState.Done,
-            $"expected Done, got {final.State}: {final.LastError}");
-        Assert.Equal(1, llmRuns);
+            final!.State == WorkItemState.AuditFailed,
+            $"expected AuditFailed, got {final.State}: {final.LastError}");
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, llmRuns);
         var toolLog = await File.ReadAllLinesAsync(fakeTools.LogPath);
         Assert.Contains(expectedTestCommand, toolLog);
     }

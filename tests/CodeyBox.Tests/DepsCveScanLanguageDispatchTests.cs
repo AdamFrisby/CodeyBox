@@ -458,7 +458,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task CSharpRootMarker_RunsSingleRootCveScan()
+    public async Task CSharpRootMarker_DoesNotSuppressNestedCveScans()
     {
         var discoveryStdout = ".\n" + string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./csharp-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -472,11 +472,15 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
-        Assert.True(result.Passed);
-        Assert.Equal(1, sandbox.Commands.Count(c =>
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings, f =>
+            f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal(LanguageProjectDiscovery.MaxProjectDirectoriesToRun, sandbox.Commands.Count(c =>
             c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal)));
         Assert.Contains("/repo", sandbox.WorkingDirectories);
-        Assert.DoesNotContain("/repo/csharp-0", sandbox.WorkingDirectories);
+        Assert.Contains("/repo/csharp-0", sandbox.WorkingDirectories);
+        Assert.DoesNotContain("/repo/csharp-31", sandbox.WorkingDirectories);
     }
 
     [Fact]
