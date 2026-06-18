@@ -261,6 +261,7 @@ public static class ProjectsOptionsBinder
 
         ApplyLanguageMap(auditSection, audit);
         ApplyAuditTypeMap(auditSection, audit);
+        ApplyMechanicalFixersList(auditSection, audit);
 
         var profileSections = auditSection.GetSection("Profiles").GetChildren().ToList();
         foreach (var profileSection in profileSections)
@@ -269,6 +270,19 @@ public static class ProjectsOptionsBinder
                 continue;
             ApplyAuditMaps(profileSection, profile);
         }
+    }
+
+    private static void ApplyMechanicalFixersList(IConfigurationSection auditSection, ProjectAuditConfig audit)
+    {
+        if (!auditSection.GetChildren().Any(c => string.Equals(c.Key, "MechanicalFixers", StringComparison.OrdinalIgnoreCase)))
+            return;
+
+        var fixersSection = auditSection.GetSection("MechanicalFixers");
+        var children = fixersSection.GetChildren().ToList();
+        audit.MechanicalFixers = children
+            .OrderBy(c => int.TryParse(c.Key, out var index) ? index : int.MaxValue)
+            .Select(c => c.Value ?? string.Empty)
+            .ToList();
     }
 
     private static void ApplyLanguageMap(IConfigurationSection auditSection, ProjectAuditConfig? audit)

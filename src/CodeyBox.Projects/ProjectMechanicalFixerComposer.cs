@@ -12,14 +12,13 @@ namespace CodeyBox.Projects;
 public sealed class ProjectMechanicalFixerComposer
 {
     private readonly IReadOnlyDictionary<string, IMechanicalFixer> _fixersByName;
-    private readonly ILogger<ProjectMechanicalFixerComposer> _logger;
 
     public ProjectMechanicalFixerComposer(
         IMechanicalFixerRegistry registry,
         ILogger<ProjectMechanicalFixerComposer> logger)
     {
+        _ = logger;
         _fixersByName = registry.All.ToDictionary(f => f.Name, StringComparer.OrdinalIgnoreCase);
-        _logger = logger;
     }
 
     public static ProjectMechanicalFixerComposer FromFixers(IEnumerable<IMechanicalFixer> fixers)
@@ -45,10 +44,8 @@ public sealed class ProjectMechanicalFixerComposer
             }
             else
             {
-                _logger.LogWarning(
-                    "Mechanical fixer '{FixerName}' was requested by project {ProjectId} but is not registered; skipping",
-                    name,
-                    project.Id.Value);
+                throw new InvalidOperationException(
+                    $"Project '{project.Id.Value}' requested mechanical fixer '{name}', but that fixer is not registered.");
             }
         }
 

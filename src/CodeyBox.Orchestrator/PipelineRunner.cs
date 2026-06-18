@@ -5753,7 +5753,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 baseBranch,
                 auditIteration,
                 project.Id.Value,
-                auditors);
+                BuildMechanicalFixerShellCommands(auditors));
 
             var changedFixers = new List<string>();
             foreach (var fixer in fixers)
@@ -5835,7 +5835,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 activitySource: CodeyBoxActivities.Sandbox,
                 log: _log))
             {
-                await ImportMechanicalCommitPatchAsync(repoId, workBranch, patch.Stdout, commitMessage, phaseCt);
+                await ImportMechanicalCommitPatchAsync(
+                    project,
+                    item,
+                    repoId,
+                    workBranch,
+                    patch.Stdout,
+                    commitMessage,
+                    gitName,
+                    gitEmail,
+                    phaseCt);
             }
         }
         catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
@@ -5856,6 +5865,24 @@ public sealed class PipelineRunner : IPipelineRunner
         => mount.HostPath is null || mount.Tmpfs
             ? mount
             : mount with { ReadOnly = true };
+
+    private static IReadOnlyList<ShellAuditorCommandDescriptor> BuildMechanicalFixerShellCommands(
+        IReadOnlyList<IAuditor> auditors)
+    {
+        var commands = new List<ShellAuditorCommandDescriptor>();
+        foreach (var auditor in auditors)
+        {
+            if (auditor is not IShellAuditorArgvProvider provider || provider.Argv.Count == 0)
+                continue;
+
+            commands.Add(new ShellAuditorCommandDescriptor(
+                auditor.Name,
+                provider.Argv,
+                provider.CommandMetadata));
+        }
+
+        return commands;
+    }
 
     private async Task<int?> ResolveMechanicalPromptRevisionForCommitAsync(
         WorkItem item,
@@ -5890,35 +5917,60 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private async Task ImportMechanicalCommitPatchAsync(
+        Project project,
+        WorkItem item,
         string repoId,
         string workBranch,
         string patch,
         string commitMessage,
+        string gitName,
+        string gitEmail,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(patch))
             throw new MechanicalFixerException("mechanical-edit produced an empty patch");
 
-        _gitHost.PrepareRepositoryForHostGitOperations(repoId);
-        var repoPath = _gitHost.GetRepoPath(repoId);
-        if (!Directory.Exists(repoPath))
-            throw new MechanicalFixerException($"mechanical-edit could not find host bare repo for '{repoId}' at {repoPath}");
-
-        var tempRoot = Path.Combine(Path.GetTempPath(), "codeybox-mechanical-" + Guid.NewGuid().ToString("N"));
-        var worktree = Path.Combine(tempRoot, "worktree");
-        var patchPath = Path.Combine(tempRoot, "mechanical.patch");
-        Directory.CreateDirectory(tempRoot);
-
         try
         {
-            await File.WriteAllTextAsync(patchPath, patch, Encoding.UTF8, ct);
-            await RunHostGitAsync(tempRoot, ct, "clone", "--", repoPath, worktree);
-            await RunHostGitAsync(worktree, ct, "checkout", "-B", workBranch, $"origin/{workBranch}");
-            await RunHostGitAsync(worktree, ct, "config", "user.name", "CodeyBox");
-            await RunHostGitAsync(worktree, ct, "config", "user.email", "noreply@codeybox.invalid");
-            await RunHostGitAsync(worktree, ct, "apply", "--index", patchPath);
-            await RunHostGitAsync(worktree, ct, "commit", "-m", commitMessage);
-            await RunHostGitAsync(worktree, ct, "push", "origin", $"HEAD:refs/heads/{workBranch}");
+            var access = _gitHost.GetSandboxAccess(repoId);
+            var sandboxTarget = SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditTool, AuditCapabilities.None);
+            var spec = BuildSandboxSpec(
+                access,
+                includeAgentCredential: null,
+                allowAgentNetwork: false,
+                hostNetworkProfile: sandboxTarget.NetworkProfile,
+                timingWorkItemId: item.Id,
+                timingPhase: "mechanical-edit",
+                flavor: sandboxTarget.Flavor,
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
+
+            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            await RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await RunWithCancellation(
+                sandbox,
+                ct,
+                "git",
+                "-C",
+                SandboxConventions.WorkDir,
+                "checkout",
+                "-B",
+                workBranch,
+                $"origin/{workBranch}");
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+
+            const string patchPath = "/tmp/codeybox-mechanical.patch";
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", patchPath],
+                Stdin = patch,
+            }, ct);
+            if (!write.Success)
+                throw new MechanicalFixerException($"mechanical-edit could not materialize formatter patch: {write.Stderr}");
+
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "apply", "--index", patchPath);
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:refs/heads/{workBranch}");
         }
         catch (MechanicalFixerException)
         {
@@ -5927,18 +5979,6 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw new MechanicalFixerException($"mechanical-edit could not import formatter commit to '{workBranch}': {ex.Message}", ex);
-        }
-        finally
-        {
-            try
-            {
-                if (Directory.Exists(tempRoot))
-                    Directory.Delete(tempRoot, recursive: true);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                _log.LogWarning(ex, "Failed to clean mechanical-edit import temp directory {Path}", tempRoot);
-            }
         }
     }
 

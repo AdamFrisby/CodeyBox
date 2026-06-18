@@ -37,7 +37,7 @@ public sealed record MechanicalFixerContext(
     string BaseBranch,
     int AuditIteration,
     string ProjectId,
-    IReadOnlyList<IAuditor> Auditors);
+    IReadOnlyList<ShellAuditorCommandDescriptor> ShellCommands);
 
 /// <summary>Result from one mechanical fixer invocation.</summary>
 public sealed record MechanicalFixerResult(

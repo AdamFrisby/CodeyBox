@@ -213,6 +213,32 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpFormatCheck_CompilerErrorsAreReportedAsCommandFailureNotFormattingChanges()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string stderr = """
+            /work/src/Program.cs(7,13): error CS0103: The name 'missing' does not exist in the current context [/work/src/App.csproj]
+            Build FAILED.
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format command failed", finding.Title);
+        Assert.Contains("CS0103", finding.Description);
+        Assert.DoesNotContain("Run `dotnet format`", finding.Description);
+    }
+
+    [Fact]
     public async Task ShellCommandAuditor_Exit127WithSpoofedMissingToolOutput_RemainsError()
     {
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions

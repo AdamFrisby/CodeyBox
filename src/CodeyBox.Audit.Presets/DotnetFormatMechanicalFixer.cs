@@ -11,8 +11,10 @@ namespace CodeyBox.Audit.Presets;
 /// </summary>
 public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 {
-    public const string FixerName = "dotnet-format";
+    public const string FixerName = MechanicalFixerNames.DotnetFormat;
     internal const string FormatCheckAuditorName = "csharp:format-check";
+    private const int MaxRawOutputChars = 16_000;
+    private const int MaxExceptionOutputChars = 1_000;
 
     public string Name => FixerName;
     public string Kind => "shell";
@@ -23,21 +25,30 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         MechanicalFixerContext context,
         CancellationToken ct = default)
     {
-        var auditor = context.Auditors.FirstOrDefault(a =>
-            a.Name.Equals(FormatCheckAuditorName, StringComparison.OrdinalIgnoreCase));
-        if (auditor is not IShellAuditorArgvProvider argvProvider || argvProvider.Argv.Count == 0)
+        var command = context.ShellCommands.FirstOrDefault(c =>
+            c.Name.Equals(FormatCheckAuditorName, StringComparison.OrdinalIgnoreCase));
+        if (command is null || command.Argv.Count == 0)
         {
             return new MechanicalFixerResult(
                 Changed: false,
                 Summary: $"{FormatCheckAuditorName} is not active; {FixerName} skipped");
         }
 
-        var formatArgv = ToFixerArgv(argvProvider.Argv);
-        var projectDirectories = await DiscoverProjectDirectoriesAsync(
+        var formatArgv = ToFixerArgv(command.Argv);
+        var discovery = await DiscoverProjectDirectoriesAsync(
             sandbox,
             workingDirectory,
-            auditor as ILanguagePresetAuditorMetadata,
+            command.Metadata,
             ct);
+        if (discovery.FailureSummary is not null)
+        {
+            return new MechanicalFixerResult(
+                Changed: false,
+                Summary: discovery.FailureSummary,
+                RawOutput: discovery.RawOutput);
+        }
+
+        var projectDirectories = discovery.ProjectDirectories;
 
         if (projectDirectories.Count == 0)
         {
@@ -52,8 +63,9 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             out var skippedDueToLimit);
         if (skippedDueToLimit > 0)
         {
-            throw new InvalidOperationException(
-                $"dotnet-format fixer found {projectDirectories.Count} C# project directories; refusing to run because the audit preset limit is {LanguageProjectDiscovery.MaxProjectDirectoriesToRun}.");
+            return new MechanicalFixerResult(
+                Changed: false,
+                Summary: $"dotnet-format found {projectDirectories.Count} C# project directories and skipped normalization so {FormatCheckAuditorName} can report the preset directory cap");
         }
 
         var before = await GitStatusAsync(sandbox, workingDirectory, ct);
@@ -76,8 +88,11 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
             if (!result.Success)
             {
-                throw new InvalidOperationException(
-                    $"dotnet-format fixer command failed (exit {result.ExitCode}) in {projectDirectory}: {string.Join(' ', formatArgv)}\n{result.Stderr}{result.Stdout}");
+                await DiscardTrackedChangesAsync(sandbox, workingDirectory, ct);
+                return new MechanicalFixerResult(
+                    Changed: false,
+                    Summary: $"dotnet format exited {result.ExitCode} in {projectDirectory}; skipped normalization so audit can report the project error",
+                    RawOutput: BoundedOutput(output.ToString()));
             }
         }
 
@@ -121,14 +136,14 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         return argv;
     }
 
-    private static async Task<IReadOnlyList<string>> DiscoverProjectDirectoriesAsync(
+    private static async Task<ProjectDirectoryDiscovery> DiscoverProjectDirectoriesAsync(
         ISandbox sandbox,
         string workingDirectory,
-        ILanguagePresetAuditorMetadata? metadata,
+        ShellAuditorCommandMetadata? metadata,
         CancellationToken ct)
     {
-        if (metadata is null)
-            return ["."];
+        if (string.IsNullOrWhiteSpace(metadata?.MarkerScript))
+            return new ProjectDirectoryDiscovery(["."]);
 
         var discovery = await sandbox.ExecAsync(new SandboxExec
         {
@@ -138,11 +153,15 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
         if (discovery.ExitCode != 0)
         {
-            throw new InvalidOperationException(
-                $"dotnet-format fixer could not discover C# project markers. Discovery exited {discovery.ExitCode}: {discovery.Stderr}");
+            var rawOutput = BoundedOutput(CombinedOutput(discovery));
+            return new ProjectDirectoryDiscovery(
+                [],
+                $"dotnet-format marker discovery exited {discovery.ExitCode}; skipped normalization so {FormatCheckAuditorName} can report the discovery failure",
+                rawOutput);
         }
 
-        return LanguagePresetProjectDiscovery.ParseProjectDirectories(discovery.Stdout);
+        return new ProjectDirectoryDiscovery(
+            LanguagePresetProjectDiscovery.ParseProjectDirectories(discovery.Stdout));
     }
 
     private static async Task<string> GitStatusAsync(
@@ -155,7 +174,60 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             Argv = ["git", "-C", workingDirectory, "status", "--porcelain=v1", "-z", "--untracked-files=no"],
         }, ct);
         if (!result.Success)
-            throw new InvalidOperationException($"failed to read git status for mechanical fixer: {result.Stderr}");
+            throw new InvalidOperationException(
+                $"failed to read git status for mechanical fixer: {ExceptionSafeOutput(result)}");
         return result.Stdout;
     }
+
+    private static async Task DiscardTrackedChangesAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct)
+    {
+        var reset = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", workingDirectory, "reset", "--hard", "HEAD"],
+        }, ct);
+        if (!reset.Success)
+        {
+            throw new InvalidOperationException(
+                $"dotnet-format fixer could not discard partial changes after command failure: {ExceptionSafeOutput(reset)}");
+        }
+    }
+
+    private static string CombinedOutput(SandboxExecResult result)
+    {
+        if (string.IsNullOrWhiteSpace(result.Stderr))
+            return result.Stdout;
+        if (string.IsNullOrWhiteSpace(result.Stdout))
+            return result.Stderr;
+        return result.Stdout + "\n" + result.Stderr;
+    }
+
+    private static string BoundedOutput(string output)
+    {
+        output = output.TrimEnd();
+        return output.Length <= MaxRawOutputChars
+            ? output
+            : output[..MaxRawOutputChars] + "\n... output truncated.";
+    }
+
+    private static string ExceptionSafeOutput(SandboxExecResult result)
+    {
+        var output = CombinedOutput(result)
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Replace('\n', ' ')
+            .Trim();
+        if (string.IsNullOrEmpty(output))
+            return "(no output)";
+        return output.Length <= MaxExceptionOutputChars
+            ? output
+            : output[..MaxExceptionOutputChars] + " ... output truncated.";
+    }
+
+    private sealed record ProjectDirectoryDiscovery(
+        IReadOnlyList<string> ProjectDirectories,
+        string? FailureSummary = null,
+        string? RawOutput = null);
 }

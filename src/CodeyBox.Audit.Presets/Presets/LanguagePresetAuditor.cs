@@ -41,6 +41,8 @@ internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvide
     public string Language => _language;
     public string MarkerDescription => _markerDescription;
     public string MarkerScript => _markerScript;
+    public ShellAuditorCommandMetadata? CommandMetadata
+        => new(Language: _language, MarkerDescription: _markerDescription, MarkerScript: _markerScript);
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,

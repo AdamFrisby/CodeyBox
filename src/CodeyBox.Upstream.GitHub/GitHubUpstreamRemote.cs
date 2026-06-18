@@ -1057,6 +1057,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             return true;
         if (lower.StartsWith("merge branch ", StringComparison.Ordinal)) return true;
         if (lower.StartsWith("merge main", StringComparison.Ordinal)) return true;
+        if (lower is "chore: normalize (dotnet format)" or "chore: normalize mechanical edits" or
+            "normalize (dotnet format)" or "normalize mechanical edits")
+            return true;
         if (lower.Contains("merge conflict", StringComparison.Ordinal) &&
             (lower.StartsWith("chore:", StringComparison.Ordinal) ||
              lower.StartsWith("fix:", StringComparison.Ordinal) ||

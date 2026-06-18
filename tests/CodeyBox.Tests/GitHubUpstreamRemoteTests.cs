@@ -504,7 +504,9 @@ public sealed class GitHubUpstreamRemoteTests
         handler.Enqueue(PullRequestCommitsResponse(
             "codeybox: stamp prompt-revision trailer\n\nCodeyBox-Prompt-Revision: 40\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
             "chore: restamp prompt revision trailer\n\nCodeyBox-Prompt-Revision: 41\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
-            "codeybox rework: address audit findings\n\nCodeyBox-Prompt-Revision: 42\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"));
+            "chore: normalize (dotnet format)\n\nCodeyBox-Prompt-Revision: 42\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            "chore: normalize mechanical edits\n\nCodeyBox-Prompt-Revision: 43\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            "codeybox rework: address audit findings\n\nCodeyBox-Prompt-Revision: 44\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"));
         handler.Enqueue(MergeOkResponse("last-resort-body-sha"));
 
         var remote = BuildRemote(
@@ -527,7 +529,7 @@ public sealed class GitHubUpstreamRemoteTests
             """
             Apply the CodeyBox work item changes.
 
-            CodeyBox-Prompt-Revision: 42
+            CodeyBox-Prompt-Revision: 44
             Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
             """,
             message);
