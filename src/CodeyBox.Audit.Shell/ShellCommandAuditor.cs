@@ -7,7 +7,9 @@ namespace CodeyBox.Audit.Shell;
 /// sandbox. Most commands follow the shell-style "exit 0 = good" contract:
 /// exit code 0 passes, and non-zero fails with stdout/stderr captured as a
 /// single Error finding. If the top-level tool is confirmed missing before
-/// the command runs, the auditor emits a non-blocking Info finding instead.
+/// the command runs, the auditor usually emits a non-blocking Info finding;
+/// BuildTestGate auditors emit Error because missing deterministic build/test
+/// evidence must block dependent auditors.
 /// A command-specific result classifier can refine non-zero exits without
 /// making this generic shell runner aware of language- or tool-specific
 /// output formats.

@@ -256,9 +256,22 @@ internal sealed class PresetConfigLoader
         if (!string.IsNullOrWhiteSpace(incoming.DisplayName))
             existing.DisplayName = incoming.DisplayName;
         if (incoming.Marker is not null)
+        {
+            if (!isTrusted && HasBuildTestGateMetadata(existing))
+            {
+                throw new PresetConfigurationException(
+                    $"Repository-provided language '{incoming.Id}' cannot override /marker for a language with trusted build-test-gate auditors. Use trusted project configuration to change build/test discovery.");
+            }
+
             existing.Marker = incoming.Marker;
+        }
         existing.Auditors.AddRange(incoming.Auditors);
     }
+
+    private static bool HasBuildTestGateMetadata(LanguagePresetDefinition definition)
+        => definition.Auditors.Any(static a =>
+            !string.IsNullOrWhiteSpace(a.Role) ||
+            !string.IsNullOrWhiteSpace(a.GateEvidence));
 
     private static IEnumerable<string> PresetFiles(string? projectRoot, string childDirectory)
     {

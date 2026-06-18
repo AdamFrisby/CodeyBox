@@ -43,21 +43,19 @@ public interface IAuditor
     string? SelfReviewGuidance => null;
 
     /// <summary>
-    /// Optional role marker used by the pipeline to gate later auditors. The
-    /// default <see cref="AuditorRole.None"/> means "no special role". Marking
-    /// the deterministic build/test commands as <see cref="AuditorRole.BuildTestGate"/>
-    /// guarantees they run and pass before any LLM auditor panel — the panel's
-    /// prompt frame asserts "CI built the project and ran tests with no failures"
-    /// and that claim must stay true.
+    /// Optional role marker used by the pipeline to order and gate later
+    /// auditors. The default <see cref="AuditorRole.None"/> means "no special
+    /// role". Marking deterministic build/test commands as
+    /// <see cref="AuditorRole.BuildTestGate"/> lets later auditors require
+    /// verified build/test evidence before they run.
     /// </summary>
     AuditorRole Role => AuditorRole.None;
 
     /// <summary>
     /// Evidence produced by this auditor when <see cref="Role"/> is
-    /// <see cref="AuditorRole.BuildTestGate"/>. Build-only checks must not
-    /// authorize LLM auditors whose prompt says the full test suite passed.
-    /// Implementations must opt in explicitly; the default contributes no
-    /// evidence so a role marker alone cannot prove build or test coverage.
+    /// <see cref="AuditorRole.BuildTestGate"/>. Implementations must opt in
+    /// explicitly; the default contributes no evidence so a role marker alone
+    /// cannot prove build or test coverage.
     /// </summary>
     BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.None;
 
@@ -81,8 +79,8 @@ public interface IAuditSandboxIsolation
 }
 
 /// <summary>
-/// Marker for auditors whose prompt or contract assumes deterministic build/test
-/// gates have already completed successfully. The pipeline runs all
+/// Marker for auditors that require deterministic build/test gates to have
+/// completed successfully. The pipeline runs all
 /// <see cref="AuditorRole.BuildTestGate"/> auditors first and skips these
 /// auditors unless deterministic build and test evidence actually passed.
 /// </summary>
@@ -113,19 +111,16 @@ public enum AuditorRole
 
     /// <summary>
     /// Deterministic build/test gate (e.g. <c>csharp:build-WaE</c>,
-    /// <c>csharp:test-pass</c>). The pipeline GUARANTEES every auditor with
-    /// this role runs to completion and passes before any LLM-driven auditor
-    /// runs in the same audit iteration. If any build/test gate does not pass,
-    /// the LLM panel is skipped for that iteration — the panel's prompt frame
-    /// says CI built and tested the project with no failures, and that claim
-    /// must never be a lie. Findings still flow to rework as normal.
+    /// <c>csharp:test-pass</c>). The pipeline runs auditors with this role
+    /// before auditors that require verified build/test evidence. If any
+    /// build/test gate does not pass, dependent auditors are skipped for that
+    /// iteration. Findings still flow to rework as normal.
     /// </summary>
     BuildTestGate,
 }
 
 /// <summary>
-/// The part of the LLM prompt's CI-passed claim that a BuildTestGate auditor
-/// can verify when it passes.
+/// The build/test evidence a BuildTestGate auditor can verify when it passes.
 /// </summary>
 [Flags]
 public enum BuildTestGateEvidence

@@ -137,6 +137,76 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void Compose_ProjectLanguageOverrideRejectsInvalidTrustedRole()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Languages = ["csharp"],
+                LanguageOverrides = new Dictionary<string, ProjectLanguagePresetOverride>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["csharp"] = new()
+                    {
+                        Auditors =
+                        [
+                            new ProjectConfiguredAuditor
+                            {
+                                Name = "csharp:project-test",
+                                Argv = ["dotnet", "test"],
+                                Role = "ci-gate",
+                            },
+                        ],
+                    },
+                },
+            },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("not a recognised auditor role", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_ProjectAuditTypeOverrideRejectsInvalidTrustedRole()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["custom"],
+                AuditTypeOverrides = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["custom"] = new()
+                    {
+                        Auditors =
+                        [
+                            new ProjectConfiguredAuditor
+                            {
+                                Name = "custom:test-pass",
+                                Argv = ["dotnet", "test"],
+                                Role = "ci-gate",
+                            },
+                        ],
+                    },
+                },
+            },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("not a recognised auditor role", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Compose_CustomShellAuditorCanOptIntoBuildTestGate()
     {
         var composer = new ProjectAuditorComposer(new PresetCatalog());
@@ -302,6 +372,31 @@ public sealed class ProjectAuditorComposerPresetTests
         var auditors = composer.Compose(project, new CapturingAgent());
 
         Assert.Equal(["elixir:test-pass"], auditors.Select(a => a.Name).ToArray());
+    }
+
+    [Fact]
+    public void Compose_RepositoryLanguagePresetCannotOverrideMarkerForTrustedGateLanguage()
+    {
+        using var temp = new TempDirectory();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "csharp.yaml"), """
+            id: csharp
+            marker:
+              globs: ["fake/**/*.csproj"]
+            """);
+
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = new Uri(temp.Path).AbsoluteUri,
+            Audit = new ProjectAudit { Languages = ["csharp"] },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("cannot override /marker", ex.Message, StringComparison.Ordinal);
     }
 
     private sealed class CapturingAgent : IAgentRunner
