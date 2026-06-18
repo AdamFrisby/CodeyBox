@@ -38,9 +38,11 @@ internal static class AuditTypePresets
         {
             var role = PresetConfigLoader.ParseAuditorRole(
                 $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/role", a.Role);
+            var gateEvidence = PresetConfigLoader.ParseBuildTestGateEvidence(
+                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/gateEvidence", a.Role, a.GateEvidence);
             if (string.IsNullOrWhiteSpace(a.Script))
             {
-                auditors.Add(Shell(a.Name, a.CanShortCircuitOnBlockingFinding, role, [.. a.Argv]));
+                auditors.Add(Shell(a.Name, a.CanShortCircuitOnBlockingFinding, role, gateEvidence, [.. a.Argv]));
             }
             else
             {
@@ -55,6 +57,7 @@ internal static class AuditTypePresets
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = role,
+                    BuildTestGateEvidence = gateEvidence,
                 }));
             }
         }
@@ -99,6 +102,7 @@ internal static class AuditTypePresets
         string name,
         bool canShortCircuitOnBlockingFinding,
         AuditorRole role,
+        BuildTestGateEvidence gateEvidence,
         params string[] argv)
         => new ShellCommandAuditor(new ShellCommandAuditorOptions
         {
@@ -106,6 +110,7 @@ internal static class AuditTypePresets
             Argv = argv,
             CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
             Role = role,
+            BuildTestGateEvidence = gateEvidence,
         });
 }
 

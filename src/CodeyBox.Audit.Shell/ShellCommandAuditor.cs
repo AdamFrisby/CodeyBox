@@ -45,6 +45,9 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     }
 
     public AuditorRole Role => _opts.Role;
+    public BuildTestGateEvidence BuildTestGateEvidence => _opts.Role == AuditorRole.BuildTestGate
+        ? _opts.BuildTestGateEvidence
+        : BuildTestGateEvidence.None;
 
     /// <summary>
     /// The argv this auditor invokes. Exposed so the work-phase prompt builder
@@ -154,4 +157,5 @@ public sealed record ShellCommandAuditorOptions
     public IShellCommandResultClassifier? ResultClassifier { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
+    public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.BuildAndTest;
 }

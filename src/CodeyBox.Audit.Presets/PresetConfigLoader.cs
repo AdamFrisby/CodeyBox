@@ -149,6 +149,7 @@ internal sealed class PresetConfigLoader
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
+                    GateEvidence = a.GateEvidence,
                 }).ToList(),
             };
             ValidateLanguage($"Audit.Languages.Overrides[{id}]", definition, allowPartial: languages.ContainsKey(id), isTrusted: true);
@@ -172,6 +173,7 @@ internal sealed class PresetConfigLoader
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
+                    GateEvidence = a.GateEvidence,
                 }).ToList(),
                 Patterns = ov.Patterns.Select(p => new DiffPatternDefinition
                 {
@@ -459,6 +461,8 @@ internal sealed class PresetConfigLoader
 
         if (!string.IsNullOrWhiteSpace(auditor.Role))
             _ = ParseAuditorRole(source, $"{pointer}/role", auditor.Role);
+        if (!string.IsNullOrWhiteSpace(auditor.GateEvidence))
+            _ = ParseBuildTestGateEvidence(source, $"{pointer}/gateEvidence", auditor.Role, auditor.GateEvidence);
     }
 
     internal static AuditorRole ParseAuditorRole(string source, string pointer, string? role)
@@ -468,6 +472,33 @@ internal sealed class PresetConfigLoader
         return role.Equals("build-test-gate", StringComparison.OrdinalIgnoreCase)
             ? AuditorRole.BuildTestGate
             : throw new PresetConfigurationException($"{source}: {pointer} = '{role}' is not a recognised auditor role. Allowed values: build-test-gate.");
+    }
+
+    internal static BuildTestGateEvidence ParseBuildTestGateEvidence(
+        string source,
+        string pointer,
+        string? role,
+        string? evidence)
+    {
+        var parsedRole = ParseAuditorRole(
+            source,
+            pointer.Replace("/gateEvidence", "/role", StringComparison.Ordinal),
+            role);
+        if (string.IsNullOrWhiteSpace(evidence))
+            return parsedRole == AuditorRole.BuildTestGate
+                ? BuildTestGateEvidence.BuildAndTest
+                : BuildTestGateEvidence.None;
+
+        if (parsedRole != AuditorRole.BuildTestGate)
+            throw new PresetConfigurationException($"{source}: {pointer} requires role 'build-test-gate'.");
+
+        return evidence.Trim().ToLowerInvariant() switch
+        {
+            "build" => BuildTestGateEvidence.Build,
+            "test" => BuildTestGateEvidence.Test,
+            "build-and-test" => BuildTestGateEvidence.BuildAndTest,
+            _ => throw new PresetConfigurationException($"{source}: {pointer} = '{evidence}' is not a recognised gate evidence value. Allowed values: build, test, build-and-test."),
+        };
     }
 
     private static void ValidateToolName(string source, string pointer, string? tool, bool isTrusted)
@@ -565,6 +596,11 @@ internal sealed class PresetConfigLoader
         return definition.Auditors.Select(a =>
         {
             var role = ParseAuditorRole($"language '{definition.Id}'", $"/auditors/{a.Name}/role", a.Role);
+            var gateEvidence = ParseBuildTestGateEvidence(
+                $"language '{definition.Id}'",
+                $"/auditors/{a.Name}/gateEvidence",
+                a.Role,
+                a.GateEvidence);
             return string.IsNullOrWhiteSpace(a.Script)
                 ? LanguagePresetHelpers.Shell(
                     definition.Id,
@@ -573,7 +609,8 @@ internal sealed class PresetConfigLoader
                     a.Name,
                     [.. a.Argv],
                     a.CanShortCircuitOnBlockingFinding,
-                    role)
+                    role,
+                    gateEvidence)
                 : LanguagePresetHelpers.ShellScript(
                     definition.Id,
                     markerDescription,
@@ -583,7 +620,8 @@ internal sealed class PresetConfigLoader
                     a.ToolName ?? a.Name,
                     a.TreatExit127AsMissingTool,
                     a.CanShortCircuitOnBlockingFinding,
-                    role);
+                    role,
+                    gateEvidence);
         }).ToList();
     }
 
@@ -660,6 +698,12 @@ internal sealed class AuditorDefinition
     /// build or test gate the pipeline runs and passes before any LLM panel.
     /// </summary>
     public string? Role { get; set; }
+
+    /// <summary>
+    /// Optional evidence produced by a passing build-test gate:
+    /// <c>build</c>, <c>test</c>, or <c>build-and-test</c>.
+    /// </summary>
+    public string? GateEvidence { get; set; }
 }
 
 internal sealed class AuditTypePresetDefinition

@@ -121,6 +121,7 @@ public sealed class ProjectAuditorComposerPresetTests
                                 Name = "csharp:project-test",
                                 Argv = ["dotnet", "test"],
                                 Role = "build-test-gate",
+                                GateEvidence = "test",
                             },
                         ],
                     },
@@ -132,6 +133,39 @@ public sealed class ProjectAuditorComposerPresetTests
 
         Assert.Equal(["csharp:project-test"], auditors.Select(a => a.Name).ToArray());
         Assert.Equal(AuditorRole.BuildTestGate, auditors.Single().Role);
+        Assert.Equal(BuildTestGateEvidence.Test, auditors.Single().BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void Compose_CustomShellAuditorCanOptIntoBuildTestGate()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Custom =
+                [
+                    new CustomAuditorDescriptor
+                    {
+                        Name = "custom:test-pass",
+                        Kind = "shell",
+                        Argv = ["dotnet", "test"],
+                        Role = "build-test-gate",
+                        GateEvidence = "test",
+                    },
+                ],
+            },
+        };
+
+        var auditor = composer.Compose(project, new CapturingAgent())
+            .Single(a => a.Name == "custom:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.Test, auditor.BuildTestGateEvidence);
     }
 
     [Fact]

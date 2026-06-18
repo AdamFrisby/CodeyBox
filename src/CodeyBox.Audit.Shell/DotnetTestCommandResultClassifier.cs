@@ -14,7 +14,8 @@ public sealed class DotnetTestCommandResultClassifier : IShellCommandResultClass
             return new AuditResult(
                 parsed.Findings.Count == 0,
                 parsed.Findings,
-                RawOutput: context.CombinedOutput);
+                RawOutput: context.CombinedOutput,
+                BuildTestGateEvidenceVerified: parsed.Findings.Count > 0 ? null : false);
 
         if (parsed.Findings.Count == 0)
             return null;

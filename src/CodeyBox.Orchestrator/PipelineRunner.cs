@@ -6277,12 +6277,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 ct);
 
             prefix = gate with { DeclaredShortCircuitBlocking = false };
-            if (gate.IncompleteVerdict
-                || gate.BuildTestGateFailed
-                || gate.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
-            {
+            if (gate.IncompleteVerdict)
                 return prefix;
-            }
         }
 
         if (remainingAuditors.Count == 0)
@@ -6291,21 +6287,39 @@ public sealed class PipelineRunner : IPipelineRunner
         var gatedReviewAuditors = remainingAuditors
             .Where(RequiresPassedBuildTestGate)
             .ToList();
-        if (gatedReviewAuditors.Count > 0 && !prefix.BuildTestGatePassed)
+        if (gatedReviewAuditors.Count > 0
+            && (prefix.BuildTestGateFailed || !HasPassedTestGateEvidence(prefix)))
         {
-            var missingGate = MissingBuildTestGateFinding(gatedReviewAuditors);
-            var result = MergeAuditorBatchResults(
-                prefix,
-                new AuditorBatchResult([missingGate], null, false));
-            if (progressUpdate is not null)
+            _log.LogInformation(
+                "Audit iteration {Iter}: skipping {Count} LLM auditor(s) because deterministic test-gate evidence is unavailable or a build/test gate failed",
+                ctx.Iteration,
+                gatedReviewAuditors.Count);
+            AuditLog.LlmPanelSkippedBuildTestGate(item.Id, gatedReviewAuditors.Count);
+
+            if (!prefix.BuildTestGateFailed && !HasPassedTestGateEvidence(prefix))
             {
-                await progressUpdate(
-                    new AuditProgressUpdate(
-                        result.Findings,
-                        result.CompletedAuditors ?? []),
-                    ct).ConfigureAwait(false);
+                var missingGate = MissingBuildTestGateFinding(gatedReviewAuditors);
+                prefix = MergeAuditorBatchResults(
+                    prefix,
+                    new AuditorBatchResult([missingGate], null, false));
             }
-            return result;
+
+            remainingAuditors = remainingAuditors
+                .Where(a => !RequiresPassedBuildTestGate(a))
+                .ToList();
+
+            if (remainingAuditors.Count == 0)
+            {
+                if (progressUpdate is not null)
+                {
+                    await progressUpdate(
+                        new AuditProgressUpdate(
+                            prefix.Findings,
+                            prefix.CompletedAuditors ?? []),
+                        ct).ConfigureAwait(false);
+                }
+                return prefix;
+            }
         }
 
         var remainingProgressUpdate = PrefixProgressUpdate(prefix, progressUpdate);
@@ -6328,7 +6342,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 ctx,
                 detectDeclaredShortCircuit: false,
                 remainingProgressUpdate,
-                ct)) with { DeclaredShortCircuitBlocking = false };
+                ct)) with
+            { DeclaredShortCircuitBlocking = false };
 
         return MergeAuditorBatchResults(prefix, remaining);
     }
@@ -6456,7 +6471,7 @@ public sealed class PipelineRunner : IPipelineRunner
             first.IncompleteVerdict || second.IncompleteVerdict,
             [.. (first.CompletedAuditors ?? []), .. (second.CompletedAuditors ?? [])],
             [.. (first.IncompleteAuditors ?? []), .. (second.IncompleteAuditors ?? [])],
-            first.BuildTestGatePassed || second.BuildTestGatePassed,
+            first.PassedBuildTestGateEvidence | second.PassedBuildTestGateEvidence,
             first.BuildTestGateFailed || second.BuildTestGateFailed);
 
     private static Func<AuditProgressUpdate, CancellationToken, Task>? PrefixProgressUpdate(
@@ -6488,16 +6503,19 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditorName: "audit:build-test-gate",
             Severity: AuditSeverity.Error,
             Title: "LLM review skipped because no build/test gate passed",
-            Description: $"The configured LLM review auditor(s) require a passed deterministic build/test gate before they can run: {auditorList}. Configure at least one auditor with role 'build-test-gate' that actually runs and passes before the LLM panel.");
+            Description: $"The configured LLM review auditor(s) require a passed deterministic test gate before they can run: {auditorList}. Configure at least one auditor with role 'build-test-gate' and gateEvidence 'test' that actually runs and passes before the LLM panel.");
     }
+
+    private static bool HasPassedTestGateEvidence(AuditorBatchResult result)
+        => (result.PassedBuildTestGateEvidence & BuildTestGateEvidence.Test) != 0;
 
     private static AuditorRunRecord NormalizeBuildTestGateRun(
         AuditorRunRecord run,
         Project project,
-        out bool passedGate,
+        out BuildTestGateEvidence passedGateEvidence,
         out bool failedGate)
     {
-        passedGate = false;
+        passedGateEvidence = BuildTestGateEvidence.None;
         failedGate = false;
 
         if (run.Auditor.Role != AuditorRole.BuildTestGate)
@@ -6507,7 +6525,7 @@ public sealed class PipelineRunner : IPipelineRunner
         failedGate = !run.Result.Passed || blocking;
         if (!failedGate)
         {
-            passedGate = IsBuildTestGatePassEvidence(run);
+            passedGateEvidence = BuildTestGatePassEvidence(run);
             return run;
         }
 
@@ -6533,16 +6551,14 @@ public sealed class PipelineRunner : IPipelineRunner
         };
     }
 
-    private static bool IsBuildTestGatePassEvidence(AuditorRunRecord run)
+    private static BuildTestGateEvidence BuildTestGatePassEvidence(AuditorRunRecord run)
     {
         if (!run.Result.Passed)
-            return false;
-        if (run.Auditor.Name == BuildScriptAuditor.AuditorName
-            && string.Equals(run.Result.RawOutput, "build.sh absent; auditor skipped", StringComparison.Ordinal))
-        {
-            return false;
-        }
-        return true;
+            return BuildTestGateEvidence.None;
+        if (run.Result.BuildTestGateEvidenceVerified == false)
+            return BuildTestGateEvidence.None;
+
+        return run.Auditor.BuildTestGateEvidence;
     }
 
     private async Task<AuditorBatchResult> CollectFindingsBatchAsync(
@@ -6649,7 +6665,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // suite with no failures") would be false, so we skip LLM auditors
         // entirely for this iteration. The build/test findings still flow to
         // rework as normal.
-        var buildTestGatePassed = false;
+        var passedBuildTestGateEvidence = BuildTestGateEvidence.None;
         var buildTestGateFailed = false;
 
         foreach (var group in byCaps)
@@ -6800,9 +6816,9 @@ public sealed class PipelineRunner : IPipelineRunner
                         run = NormalizeBuildTestGateRun(
                             run,
                             project,
-                            out var passedGate,
+                            out var passedGateEvidence,
                             out var failedGate);
-                        buildTestGatePassed |= passedGate;
+                        passedBuildTestGateEvidence |= passedGateEvidence;
                         buildTestGateFailed |= failedGate;
 
                         await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
@@ -6824,7 +6840,7 @@ public sealed class PipelineRunner : IPipelineRunner
                                 activeAuditAgentKind,
                                 declaredShortCircuitBlocking,
                                 CompletedAuditors: completedAuditors.ToList(),
-                                BuildTestGatePassed: buildTestGatePassed,
+                                PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
                                 BuildTestGateFailed: buildTestGateFailed);
                     }
                 }
@@ -6843,7 +6859,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         IncompleteVerdict: true,
                         CompletedAuditors: completedAuditors.ToList(),
                         IncompleteAuditors: [ex.AuditorName],
-                        BuildTestGatePassed: buildTestGatePassed,
+                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
                         BuildTestGateFailed: buildTestGateFailed);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException
@@ -7226,7 +7242,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         IncompleteVerdict: true,
                         CompletedAuditors: partialCompleted,
                         IncompleteAuditors: incompleteAuditors,
-                        BuildTestGatePassed: buildTestGatePassed,
+                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
                         BuildTestGateFailed: buildTestGateFailed);
                 }
 
@@ -7259,7 +7275,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         activeAuditAgentKind,
                         declaredShortCircuitBlocking,
                         CompletedAuditors: completedAuditors.ToList(),
-                        BuildTestGatePassed: buildTestGatePassed,
+                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
                         BuildTestGateFailed: buildTestGateFailed);
             }
         }
@@ -7269,7 +7285,7 @@ public sealed class PipelineRunner : IPipelineRunner
             activeAuditAgentKind,
             declaredShortCircuitBlocking,
             CompletedAuditors: completedAuditors.ToList(),
-            BuildTestGatePassed: buildTestGatePassed,
+            PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
             BuildTestGateFailed: buildTestGateFailed);
     }
 
@@ -7922,7 +7938,7 @@ public sealed class PipelineRunner : IPipelineRunner
         bool IncompleteVerdict = false,
         IReadOnlyList<string>? CompletedAuditors = null,
         IReadOnlyList<string>? IncompleteAuditors = null,
-        bool BuildTestGatePassed = false,
+        BuildTestGateEvidence PassedBuildTestGateEvidence = BuildTestGateEvidence.None,
         bool BuildTestGateFailed = false);
 
     private enum AuditProgressUpdateOperation

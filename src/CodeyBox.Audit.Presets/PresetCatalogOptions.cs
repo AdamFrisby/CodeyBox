@@ -83,6 +83,7 @@ public sealed class ConfiguredAuditor
     public bool? TreatExit127AsMissingTool { get; set; }
     public bool CanShortCircuitOnBlockingFinding { get; set; }
     public string? Role { get; set; }
+    public string? GateEvidence { get; set; }
 
     public ConfiguredAuditor Clone()
         => new()
@@ -94,6 +95,7 @@ public sealed class ConfiguredAuditor
             TreatExit127AsMissingTool = TreatExit127AsMissingTool,
             CanShortCircuitOnBlockingFinding = CanShortCircuitOnBlockingFinding,
             Role = Role,
+            GateEvidence = GateEvidence,
         };
 }
 

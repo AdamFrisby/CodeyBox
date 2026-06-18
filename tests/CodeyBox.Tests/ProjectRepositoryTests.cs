@@ -144,6 +144,7 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:0"] = "dotnet",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:1"] = "test",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:GateEvidence"] = "test",
                 ["CodeyBox:Projects:0:Audit:LlmPromptFrameTemplate"] = "{{reviewFocus}}\n{{resultFile}}",
             })
             .Build();
@@ -156,6 +157,7 @@ public sealed class ProjectRepositoryTests
         Assert.Equal("project security focus", p.Audit.AuditTypeOverrides["security"].ReviewFocus);
         Assert.Equal("Custom review", p.Audit.AuditTypeOverrides["custom"].DisplayName);
         Assert.Equal("build-test-gate", p.Audit.AuditTypeOverrides["custom"].Auditors.Single().Role);
+        Assert.Equal("test", p.Audit.AuditTypeOverrides["custom"].Auditors.Single().GateEvidence);
         Assert.Equal("{{reviewFocus}}\n{{resultFile}}", p.Audit.LlmPromptFrameTemplate);
     }
 
@@ -233,6 +235,8 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Name"] = "csharp:custom-test",
                 ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Argv:0"] = "dotnet",
                 ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:GateEvidence"] = "test",
             })
             .Build();
 
@@ -246,6 +250,8 @@ public sealed class ProjectRepositoryTests
         var auditor = Assert.Single(languageOverride.Value.Auditors);
         Assert.Equal("csharp:custom-test", auditor.Name);
         Assert.Equal(["dotnet", "test"], auditor.Argv);
+        Assert.Equal("build-test-gate", auditor.Role);
+        Assert.Equal("test", auditor.GateEvidence);
     }
 
     [Fact]

@@ -217,6 +217,7 @@ public sealed class ProjectConfiguredAuditorConfig
     public bool? TreatExit127AsMissingTool { get; set; }
     public bool CanShortCircuitOnBlockingFinding { get; set; }
     public string? Role { get; set; }
+    public string? GateEvidence { get; set; }
 }
 
 public static class ProjectsOptionsBinder
@@ -318,6 +319,8 @@ public sealed class CustomAuditorConfig
     public List<string>? Argv { get; set; }
     public string? ReviewFocus { get; set; }
     public List<DiffPatternConfig>? Patterns { get; set; }
+    public string? Role { get; set; }
+    public string? GateEvidence { get; set; }
 }
 
 public sealed class DiffPatternConfig

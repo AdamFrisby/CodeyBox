@@ -529,6 +529,7 @@ public sealed record ProjectConfiguredAuditor
     public bool? TreatExit127AsMissingTool { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public string? Role { get; init; }
+    public string? GateEvidence { get; init; }
 }
 
 public sealed record ProjectAuditTypeOverride
@@ -567,6 +568,8 @@ public sealed record CustomAuditorDescriptor
     public IReadOnlyList<string> Argv { get; init; } = [];
     public string? ReviewFocus { get; init; }
     public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];
+    public string? Role { get; init; }
+    public string? GateEvidence { get; init; }
 }
 
 public sealed record DiffPatternDescriptor

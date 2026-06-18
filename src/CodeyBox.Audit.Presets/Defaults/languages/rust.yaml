@@ -12,3 +12,4 @@ auditors:
   - name: rust:test-pass
     argv: ["cargo", "test"]
     role: build-test-gate
+    gateEvidence: test

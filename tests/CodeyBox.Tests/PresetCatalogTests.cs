@@ -100,11 +100,17 @@ public sealed class PresetCatalogTests
         AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:format-check", AuditorRole.None);
         AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:build-WaE", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorEvidence(catalog, ctx, "csharp", "csharp:build-WaE", BuildTestGateEvidence.Build);
+        AssertLanguageAuditorEvidence(catalog, ctx, "csharp", "csharp:test-pass", BuildTestGateEvidence.Test);
 
         AssertLanguageAuditorRole(catalog, ctx, "python", "python:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.Test);
     }
 
     [Fact]
@@ -596,6 +602,18 @@ public sealed class PresetCatalogTests
         var auditor = catalog.ResolveLanguage(language, ctx)
             .Single(a => a.Name == auditorName);
         Assert.Equal(expected, auditor.Role);
+    }
+
+    private static void AssertLanguageAuditorEvidence(
+        PresetCatalog catalog,
+        PresetContext ctx,
+        string language,
+        string auditorName,
+        BuildTestGateEvidence expected)
+    {
+        var auditor = catalog.ResolveLanguage(language, ctx)
+            .Single(a => a.Name == auditorName);
+        Assert.Equal(expected, auditor.BuildTestGateEvidence);
     }
 
     private static TempDirectory TempProject() => new();

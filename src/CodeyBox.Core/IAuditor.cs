@@ -53,6 +53,15 @@ public interface IAuditor
     AuditorRole Role => AuditorRole.None;
 
     /// <summary>
+    /// Evidence produced by this auditor when <see cref="Role"/> is
+    /// <see cref="AuditorRole.BuildTestGate"/>. Build-only checks must not
+    /// authorize LLM auditors whose prompt says the full test suite passed.
+    /// </summary>
+    BuildTestGateEvidence BuildTestGateEvidence => Role == AuditorRole.BuildTestGate
+        ? BuildTestGateEvidence.BuildAndTest
+        : BuildTestGateEvidence.None;
+
+    /// <summary>
     /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
     /// </summary>
     Task<AuditResult> RunAsync(
@@ -112,6 +121,19 @@ public enum AuditorRole
     /// must never be a lie. Findings still flow to rework as normal.
     /// </summary>
     BuildTestGate,
+}
+
+/// <summary>
+/// The part of the LLM prompt's CI-passed claim that a BuildTestGate auditor
+/// can verify when it passes.
+/// </summary>
+[Flags]
+public enum BuildTestGateEvidence
+{
+    None = 0,
+    Build = 1 << 0,
+    Test = 1 << 1,
+    BuildAndTest = Build | Test,
 }
 
 /// <summary>Information the pipeline passes to each auditor.</summary>
@@ -194,7 +216,14 @@ public sealed record AuditResult(
     string? RawOutput = null,
     string? AgentStderr = null,
     string? AgentSummary = null,
-    string? AgentStdout = null);
+    string? AgentStdout = null,
+    /// <summary>
+    /// When set to false, a passing BuildTestGate result is still a pass for
+    /// normal audit scoring but must not count as evidence that build/tests
+    /// actually completed successfully. Used for classified "unrunnable in
+    /// this environment" outcomes.
+    /// </summary>
+    bool? BuildTestGateEvidenceVerified = null);
 
 public sealed record AuditFinding(
     string AuditorName,

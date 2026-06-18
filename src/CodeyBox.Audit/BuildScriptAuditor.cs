@@ -34,6 +34,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
     public bool RequiresFreshSandbox => true;
     public string? SelfReviewGuidance => "run build (warnings-as-errors) + formatter before committing";
     public AuditorRole Role => AuditorRole.BuildTestGate;
+    public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.Build;
 
 
     public async Task<AuditResult> RunAsync(
@@ -121,7 +122,11 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
     }
 
     private static AuditResult MissingOptionalResult()
-        => new(true, [], RawOutput: "build.sh absent; auditor skipped");
+        => new(
+            true,
+            [],
+            RawOutput: "build.sh absent; auditor skipped",
+            BuildTestGateEvidenceVerified: false);
 
     private static AuditResult MissingRequiredResult(string description)
     {

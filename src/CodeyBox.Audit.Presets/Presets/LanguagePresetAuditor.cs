@@ -29,6 +29,7 @@ internal sealed class LanguagePresetAuditor : IAuditor
     public bool CanShortCircuitOnBlockingFinding => _inner.CanShortCircuitOnBlockingFinding;
     public string? SelfReviewGuidance => _inner.SelfReviewGuidance;
     public AuditorRole Role => _inner.Role;
+    public BuildTestGateEvidence BuildTestGateEvidence => _inner.BuildTestGateEvidence;
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,

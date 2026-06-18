@@ -2,6 +2,7 @@ using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
@@ -152,6 +153,159 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildOnlyGateDoesNotUnlockLlmPanel_AndNonLlmAuditorsStillRun()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var executionOrder = new List<string>();
+        var orderLock = new object();
+        void Record(string n) { lock (orderLock) executionOrder.Add(n); }
+
+        var buildOnlyGate = new RoleStampedScriptedAuditor(
+            "csharp:build-WaE",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Record("build"),
+            gateEvidence: BuildTestGateEvidence.Build);
+        var format = new RoleStampedScriptedAuditor(
+            "csharp:format-check",
+            AuditorRole.None,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Record("format"));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [buildOnlyGate, format, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(["build", "format"], executionOrder);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
+    public async Task FailedBuildTestGateSkipsOnlyLlmPanel_WhenStopOnFirstFailureOff()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var formatRuns = 0;
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(false, [new AuditFinding(
+                "csharp:test-pass",
+                AuditSeverity.Error,
+                "tests failed",
+                "UnitTests.Fail failed")])],
+            gateEvidence: BuildTestGateEvidence.Test);
+        var format = new RoleStampedScriptedAuditor(
+            "csharp:format-check",
+            AuditorRole.None,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Interlocked.Increment(ref formatRuns));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate, format, llm],
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+                StopOnFirstFailure = false,
+            },
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(1, formatRuns);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
+    public async Task MissingTestGateRejectsLlmPanel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
+    public async Task RequiredBuildGateFailureRunsBeforeAndSkipsLlmPanel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var requiredBuild = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Failed(1, "compile failed"));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: requiredBuild);
+
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(
+            barePath,
+            "update-ref",
+            $"refs/heads/{item.WorkBranch}",
+            "refs/heads/main");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.AuditFailed,
+            $"expected AuditFailed, got {final.State}: {final.LastError}");
+        Assert.Equal(1, requiredBuild.VerifyCalls);
+        Assert.Equal(0, llmRuns);
+        Assert.Contains("required build failed", final.LastError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task BuildTestGateOrdersAheadOfOtherToolAuditors_AndAheadOfLlmPanel()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -224,6 +378,97 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         // LLM panel still runs even though a non-gate tool auditor blocked.
         Assert.Equal(1, llmRuns);
+    }
+
+    [Fact]
+    public async Task PassingBuildAndTestGatesStillAllowLlmToFlagLowQualityDiff()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var build = new RoleStampedScriptedAuditor(
+            "csharp:build-WaE",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            gateEvidence: BuildTestGateEvidence.Build);
+        var test = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            gateEvidence: BuildTestGateEvidence.Test);
+        var llm = new LowQualityPipelineLlmAuditor();
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [build, test, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            await ExecOk(sandbox, workingDirectory, ["mkdir", "-p", "src", "tests"], ct);
+            await WriteFile(sandbox, workingDirectory, "src/FeatureFlags.cs", """
+                namespace App;
+
+                public static class FeatureFlags
+                {
+                    public static bool AddFeatureFlagX(IDictionary<string, string> config)
+                        => config["FeatureX"] == "enabled";
+                }
+                """, ct);
+            await WriteFile(sandbox, workingDirectory, "tests/FeatureFlagsTests.cs", """
+                public sealed class FeatureFlagsTests
+                {
+                    [Fact]
+                    public void EnabledBranch_ReturnsTrue()
+                        => Assert.True(FeatureFlags.AddFeatureFlagX(Config("enabled")));
+                }
+                """, ct);
+        };
+        tp.Agent.WorkResults.Enqueue(new AgentResult(true, "ok", null, null));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.AuditFailed,
+            $"expected AuditFailed, got {final.State}: {final.LastError}");
+        Assert.Equal([1], build.SeenIterations);
+        Assert.Equal([1], test.SeenIterations);
+        Assert.Equal([1], llm.SeenIterations);
+        Assert.Contains("new code path is never wired", final.LastError, StringComparison.OrdinalIgnoreCase);
+
+        static async Task WriteFile(
+            ISandbox sandbox,
+            string workingDirectory,
+            string relativePath,
+            string contents,
+            CancellationToken ct)
+        {
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/{relativePath}"],
+                Stdin = contents,
+            }, ct);
+            if (!result.Success)
+                throw new InvalidOperationException($"failed to write {relativePath}: {result.Stderr}");
+        }
+
+        static async Task ExecOk(
+            ISandbox sandbox,
+            string workingDirectory,
+            IReadOnlyList<string> argv,
+            CancellationToken ct)
+        {
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+            }, ct);
+            if (!result.Success)
+                throw new InvalidOperationException($"command failed: {string.Join(' ', argv)}: {result.Stderr}");
+        }
     }
 
     private static ConstantCredentialProvider AuditCredentials()
@@ -439,23 +684,29 @@ file sealed class RoleStampedScriptedAuditor : IAuditor
 {
     private readonly Queue<AuditOutcome> _plan;
     private readonly Action<int>? _onRun;
+    private readonly BuildTestGateEvidence _gateEvidence;
 
     public RoleStampedScriptedAuditor(
         string name,
         AuditorRole role,
         IEnumerable<AuditOutcome> plan,
-        Action<int>? onRun = null)
+        Action<int>? onRun = null,
+        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.BuildAndTest)
     {
         Name = name;
         Role = role;
         _plan = new Queue<AuditOutcome>(plan);
         _onRun = onRun;
+        _gateEvidence = gateEvidence;
     }
 
     public string Name { get; }
     public string Kind => "tool";
     public AuditCapabilities Required => AuditCapabilities.None;
     public AuditorRole Role { get; }
+    public BuildTestGateEvidence BuildTestGateEvidence => Role == AuditorRole.BuildTestGate
+        ? _gateEvidence
+        : BuildTestGateEvidence.None;
     public List<int> SeenIterations { get; } = [];
 
     public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
@@ -494,5 +745,44 @@ file sealed class RecordingLlmAuditor : IAuditor, IRequiresPassedBuildTestGate
         SeenIterations.Add(context.Iteration);
         _onRun(context.Iteration);
         return Task.FromResult(new AuditResult(true, []));
+    }
+}
+
+file sealed class LowQualityPipelineLlmAuditor : IAuditor, IRequiresPassedBuildTestGate
+{
+    public string Name => "quality:llm-review";
+    public string Kind => "llm";
+    public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+    public List<int> SeenIterations { get; } = [];
+
+    public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+    {
+        SeenIterations.Add(context.Iteration);
+        var feature = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat src/FeatureFlags.cs 2>/dev/null || true"],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        var tests = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat tests/FeatureFlagsTests.cs 2>/dev/null || true"],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+
+        var lowQuality = feature.Stdout.Contains("AddFeatureFlagX", StringComparison.Ordinal)
+            && !feature.Stdout.Contains("services.AddSingleton", StringComparison.Ordinal)
+            && !tests.Stdout.Contains("DisabledBranch_ReturnsFalse", StringComparison.Ordinal);
+
+        return lowQuality
+            ? new AuditResult(false,
+                [
+                    new AuditFinding(
+                        Name,
+                        AuditSeverity.Error,
+                        "new code path is never wired to a caller",
+                        "AddFeatureFlagX is defined but no consumer invokes it; tests cover it directly only",
+                        "src/FeatureFlags.cs:5"),
+                ])
+            : new AuditResult(true, []);
     }
 }

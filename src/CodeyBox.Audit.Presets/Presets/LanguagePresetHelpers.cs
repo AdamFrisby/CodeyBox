@@ -12,7 +12,8 @@ internal static class LanguagePresetHelpers
         string name,
         string[] argv,
         bool canShortCircuitOnBlockingFinding = false,
-        AuditorRole role = AuditorRole.None)
+        AuditorRole role = AuditorRole.None,
+        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -24,6 +25,7 @@ internal static class LanguagePresetHelpers
                 ResultClassifier = ResultClassifierFor(language, name, argv),
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
+                BuildTestGateEvidence = gateEvidence,
             }));
 
     public static IAuditor ShellScript(
@@ -35,7 +37,8 @@ internal static class LanguagePresetHelpers
         string? toolName = null,
         bool? treatExit127AsMissingTool = null,
         bool canShortCircuitOnBlockingFinding = false,
-        AuditorRole role = AuditorRole.None)
+        AuditorRole role = AuditorRole.None,
+        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -48,6 +51,7 @@ internal static class LanguagePresetHelpers
                 TreatExit127AsMissingTool = treatExit127AsMissingTool,
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
+                BuildTestGateEvidence = gateEvidence,
             }));
 
     private static IShellCommandResultClassifier? ResultClassifierFor(

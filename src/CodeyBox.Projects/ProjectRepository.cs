@@ -212,6 +212,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
+                    GateEvidence = a.GateEvidence,
                 }).ToList(),
             };
         }
@@ -232,6 +233,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
+                    GateEvidence = a.GateEvidence,
                 }).ToList(),
                 Patterns = ov.Patterns.Select(p => new ConfiguredDiffPattern
                 {
@@ -603,6 +605,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             TreatExit127AsMissingTool = auditor.TreatExit127AsMissingTool,
             CanShortCircuitOnBlockingFinding = auditor.CanShortCircuitOnBlockingFinding,
             Role = auditor.Role,
+            GateEvidence = auditor.GateEvidence,
         };
 
     private static CustomAuditorConfig CustomAuditorToConfig(CustomAuditorDescriptor auditor)
@@ -613,6 +616,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             PluginId = auditor.PluginId,
             Argv = [.. auditor.Argv],
             ReviewFocus = auditor.ReviewFocus,
+            Role = auditor.Role,
+            GateEvidence = auditor.GateEvidence,
             Patterns = auditor.Patterns.Select(p => new DiffPatternConfig
             {
                 Description = p.Description,
@@ -676,6 +681,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             TreatExit127AsMissingTool = config.TreatExit127AsMissingTool,
             CanShortCircuitOnBlockingFinding = config.CanShortCircuitOnBlockingFinding,
             Role = config.Role,
+            GateEvidence = config.GateEvidence,
         };
 
     private static IReadOnlyDictionary<string, ProjectAuditTypeOverride> MergeAuditTypeOverrides(
@@ -771,6 +777,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             PluginId = c.PluginId,
             Argv = c.Argv ?? [],
             ReviewFocus = c.ReviewFocus,
+            Role = c.Role,
+            GateEvidence = c.GateEvidence,
             Patterns = (c.Patterns ?? []).Select(p => new DiffPatternDescriptor
             {
                 Description = p.Description ?? "(no description)",

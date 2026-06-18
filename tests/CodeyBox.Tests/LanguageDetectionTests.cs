@@ -49,6 +49,23 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
+    public async Task NonGateLanguageWithoutMarker_ReportsInfoAndPasses()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new MarkerlessSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Contains("csharp preset enabled", finding.Title);
+        Assert.DoesNotContain(sandbox.Commands, c => c.Contains("dotnet format", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task PythonTypecheckMissingMypyAndPyright_ReportsInfoAndPasses()
     {
         var catalog = new PresetCatalog();

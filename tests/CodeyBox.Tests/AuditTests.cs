@@ -116,6 +116,27 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task ShellCommandAuditor_BuildTestGateTreatExit127AsMissingTool_Blocks()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "custom:test-pass",
+            Argv = ["custom-test"],
+            TreatExit127AsMissingTool = true,
+            Role = AuditorRole.BuildTestGate,
+            BuildTestGateEvidence = BuildTestGateEvidence.Test,
+        });
+        var sandbox = new FakeSandbox(_ => new SandboxExecResult(127, "", "custom-test: not found"));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("tool not installed", finding.Title);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_IgnoresFastFailuresWithoutStackTraceAndReportsRealFailures()
     {
         var auditor = CSharpTestPassAuditor();
@@ -244,6 +265,7 @@ public sealed class AuditTests
 
         Assert.True(result.Passed);
         Assert.Empty(result.Findings);
+        Assert.False(result.BuildTestGateEvidenceVerified);
     }
 
     [Fact]
