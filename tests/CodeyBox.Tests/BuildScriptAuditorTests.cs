@@ -345,8 +345,8 @@ public sealed class BuildScriptAuditorTests : IDisposable
         var auditor = new BuildScriptAuditor();
 
         Assert.Equal(AuditCapabilities.None, auditor.Required);
-        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
-        Assert.Equal(BuildTestGateEvidence.Build, auditor.BuildTestGateEvidence);
+        Assert.Equal(AuditorRole.None, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
         Assert.True(((IAuditSandboxIsolation)auditor).RequiresFreshSandbox);
     }
 

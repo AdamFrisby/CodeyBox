@@ -5423,6 +5423,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     ProjectId: project.Id.Value);
                 var preCollectedFindings = new List<AuditFinding>();
                 var preCompletedAuditors = new List<string>();
+                var prePassedBuildTestGateEvidence = BuildTestGateEvidence.None;
                 var auditorsForCollection = scheduledAuditors;
                 if (scheduledAuditors.Any(RequiresPassedBuildTestGate))
                 {
@@ -5430,6 +5431,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
                     if (requiredBuildGateResult.Applies)
                         preCompletedAuditors.Add(RequiredBuildGateIdentity.AuditorName);
+                    prePassedBuildTestGateEvidence |= requiredBuildGateResult.PassedEvidence;
                     if (requiredBuildGateResult.Finding is not null)
                     {
                         preCollectedFindings.Add(requiredBuildGateResult.Finding);
@@ -5477,6 +5479,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     repoId,
                     ctx,
                     auditShortCircuitEnabled,
+                    prePassedBuildTestGateEvidence,
                     progressUpdateWithPreCollected,
                     auditPhase.Token);
                 var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
@@ -6249,20 +6252,25 @@ public sealed class PipelineRunner : IPipelineRunner
         string repoId,
         AuditContext ctx,
         bool auditShortCircuitEnabled,
+        BuildTestGateEvidence initialPassedBuildTestGateEvidence,
         Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate,
         CancellationToken ct)
     {
         if (auditors.Count == 0)
-            return EmptyAuditorBatchResult();
+            return EmptyAuditorBatchResult(initialPassedBuildTestGateEvidence);
 
         var buildTestGateAuditors = auditors
             .Where(a => a.Role == AuditorRole.BuildTestGate)
+            .Select((auditor, index) => new { Auditor = auditor, Index = index })
+            .OrderBy(x => BuildTestGateOrderingTier(x.Auditor))
+            .ThenBy(x => x.Index)
+            .Select(x => x.Auditor)
             .ToList();
         var remainingAuditors = buildTestGateAuditors.Count == 0
             ? auditors
             : auditors.Where(a => a.Role != AuditorRole.BuildTestGate).ToList();
 
-        var prefix = EmptyAuditorBatchResult();
+        var prefix = EmptyAuditorBatchResult(initialPassedBuildTestGateEvidence);
         if (buildTestGateAuditors.Count > 0)
         {
             var gate = await CollectFindingsBatchAsync(
@@ -6276,7 +6284,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 progressUpdate,
                 ct);
 
-            prefix = gate;
+            prefix = MergeAuditorBatchResults(prefix, gate);
             if (gate.IncompleteVerdict)
                 return prefix;
             if (gate.DeclaredShortCircuitBlocking)
@@ -6470,6 +6478,25 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private static AuditorBatchResult EmptyAuditorBatchResult()
         => new([], null, false, CompletedAuditors: []);
+
+    private static AuditorBatchResult EmptyAuditorBatchResult(
+        BuildTestGateEvidence passedBuildTestGateEvidence)
+        => new(
+            [],
+            null,
+            false,
+            CompletedAuditors: [],
+            PassedBuildTestGateEvidence: passedBuildTestGateEvidence);
+
+    private static int BuildTestGateOrderingTier(IAuditor auditor)
+    {
+        var evidence = auditor.BuildTestGateEvidence;
+        if ((evidence & BuildTestGateEvidence.Build) == BuildTestGateEvidence.Build)
+            return 0;
+        if ((evidence & BuildTestGateEvidence.Test) == BuildTestGateEvidence.Test)
+            return 1;
+        return 2;
+    }
 
     private static AuditorBatchResult MergeAuditorBatchResults(
         AuditorBatchResult first,

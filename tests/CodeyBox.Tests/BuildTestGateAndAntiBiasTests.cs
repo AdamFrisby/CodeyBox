@@ -693,6 +693,56 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task RequiredBuildGatePassPlusTestGateUnlocksLlmPanel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var requiredBuild = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Passed(0, "compile ok"));
+        var testGate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            gateEvidence: BuildTestGateEvidence.Test);
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [testGate, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: requiredBuild);
+
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(
+            barePath,
+            "update-ref",
+            $"refs/heads/{item.WorkBranch}",
+            "refs/heads/main");
+        await CommitFileToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "trusted-build-plus-test.txt",
+            "change\n");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(1, requiredBuild.VerifyCalls);
+        Assert.Equal([1], testGate.SeenIterations);
+        Assert.Equal(1, llmRuns);
+        Assert.Equal([1], llm.SeenIterations);
+    }
+
+    [Fact]
     public async Task BuildTestGateOrdersAheadOfOtherToolAuditors_AndAheadOfLlmPanel()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -732,6 +782,48 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             final!.State == WorkItemState.Done,
             $"expected Done, got {final.State}: {final.LastError}");
         Assert.Equal(["gate", "format", "llm"], executionOrder);
+    }
+
+    [Fact]
+    public async Task BuildEvidenceGateRunsBeforeTestEvidenceEvenWhenRegisteredAfter()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var executionOrder = new List<string>();
+        var orderLock = new object();
+        void Record(string n) { lock (orderLock) executionOrder.Add(n); }
+
+        var test = new RoleStampedScriptedAuditor(
+            "custom:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Record("test"),
+            gateEvidence: BuildTestGateEvidence.Test);
+        var build = new RoleStampedScriptedAuditor(
+            "custom:build-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Record("build"),
+            gateEvidence: BuildTestGateEvidence.Build);
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Record("llm"));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [test, build, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(["build", "test", "llm"], executionOrder);
     }
 
     [Fact]
@@ -1100,6 +1192,34 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         WorkBranch = "feature/x",
         PushUpstream = false,
     };
+
+    private static async Task CommitFileToBareBranchAsync(
+        string barePath,
+        string branch,
+        string relativePath,
+        string contents)
+    {
+        var clone = Directory.CreateTempSubdirectory("codeybox-gate-branch-").FullName;
+        try
+        {
+            await TestSupport.RunGit(clone, "clone", barePath, ".");
+            await TestSupport.RunGit(clone, "config", "user.email", "test@example.invalid");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", "-B", branch, "origin/main");
+
+            var path = Path.Combine(clone, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllTextAsync(path, contents);
+
+            await TestSupport.RunGit(clone, "add", relativePath);
+            await TestSupport.RunGit(clone, "commit", "-m", "add test change");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
+        }
+        finally
+        {
+            try { Directory.Delete(clone, recursive: true); } catch { }
+        }
+    }
 
     private sealed record FakeAuditTools(
         string Path,

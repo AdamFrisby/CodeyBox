@@ -255,14 +255,14 @@ public sealed class WebAppHarness : IAppUnderTestHarness
 
     private async Task<byte[]> WaitForRenderedUiAsync(ISandbox sandbox, WebAppRecipe recipe, CancellationToken ct)
     {
+        var deadline = _timeProvider.GetUtcNow() + recipe.ReadinessTimeout;
         if (recipe.BrowserSettleDelay > TimeSpan.Zero)
             await Task.Delay(recipe.BrowserSettleDelay, _timeProvider, ct);
 
-        var deadline = _timeProvider.GetUtcNow() + recipe.ReadinessTimeout;
         byte[]? lastScreenshot = null;
         Exception? lastError = null;
         var attemptedScreenshot = false;
-        while (!attemptedScreenshot || _timeProvider.GetUtcNow() < deadline)
+        while (!attemptedScreenshot || _timeProvider.GetUtcNow() <= deadline)
         {
             attemptedScreenshot = true;
             ct.ThrowIfCancellationRequested();
