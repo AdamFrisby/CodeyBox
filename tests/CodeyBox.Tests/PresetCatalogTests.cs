@@ -107,10 +107,10 @@ public sealed class PresetCatalogTests
         AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
-        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.Test);
-        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.Test);
-        AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.Test);
-        AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.BuildAndTest);
     }
 
     [Fact]
@@ -151,6 +151,7 @@ public sealed class PresetCatalogTests
             .Single(a => a.Name == "custom-build:test-pass");
 
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
     }
 
     [Fact]
@@ -180,6 +181,7 @@ public sealed class PresetCatalogTests
             .Single(a => a.Name == "custom-script-build:test-pass");
 
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
     }
 
     [Fact]
@@ -200,6 +202,59 @@ public sealed class PresetCatalogTests
             .Single(a => a.Name == "repo-build:test-pass");
 
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_RejectsGateEvidenceWithoutBuildTestGateRole()
+    {
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            GateEvidence = "test",
+                        },
+                    ],
+                },
+            },
+        }));
+
+        Assert.Contains("requires role 'build-test-gate'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_RejectsUnknownGateEvidenceValue()
+    {
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            Role = "build-test-gate",
+                            GateEvidence = "tests",
+                        },
+                    ],
+                },
+            },
+        }));
+
+        Assert.Contains("not a recognised gate evidence value", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("build, test, build-and-test", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -239,6 +294,7 @@ public sealed class PresetCatalogTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
+        Assert.False(result.BuildTestGateEvidenceVerified);
     }
 
     [Fact]

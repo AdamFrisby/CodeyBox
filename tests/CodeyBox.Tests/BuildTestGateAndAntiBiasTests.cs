@@ -195,6 +195,82 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task TestOnlyGateDoesNotUnlockLlmPanel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var testOnlyGate = new RoleStampedScriptedAuditor(
+            "custom:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            gateEvidence: BuildTestGateEvidence.Test);
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [testOnlyGate, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([1], testOnlyGate.SeenIterations);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
+    public async Task UnverifiedGateBlocksLlmPanel_EvenWhenOtherGateProvidesEvidence()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var build = new RoleStampedScriptedAuditor(
+            "custom:build",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            gateEvidence: BuildTestGateEvidence.Build);
+        var unverifiedTest = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [], BuildTestGateEvidenceVerified: false)],
+            gateEvidence: BuildTestGateEvidence.Test);
+        var secondTest = new RoleStampedScriptedAuditor(
+            "custom:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            gateEvidence: BuildTestGateEvidence.Test);
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [build, unverifiedTest, secondTest, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("did not verify", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([1], build.SeenIterations);
+        Assert.Equal([1], unverifiedTest.SeenIterations);
+        Assert.Equal([1], secondTest.SeenIterations);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
     public async Task FailedBuildTestGateSkipsOnlyLlmPanel_WhenStopOnFirstFailureOff()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -237,6 +313,46 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Equal(1, formatRuns);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
+    public async Task FailedBuildTestGateSkipsUnmarkedLlmAuditor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(false, [new AuditFinding(
+                "csharp:test-pass",
+                AuditSeverity.Error,
+                "tests failed",
+                "UnitTests.Fail failed")])],
+            gateEvidence: BuildTestGateEvidence.BuildAndTest);
+        var llmRuns = 0;
+        var llm = new UnmarkedRecordingLlmAuditor("plugin:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate, llm],
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+                StopOnFirstFailure = false,
+            },
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal([1], gate.SeenIterations);
         Assert.Equal(0, llmRuns);
     }
 
@@ -672,7 +788,10 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
 
 // ── Test helpers (file-scoped) ────────────────────────────────────────────────
 
-file sealed record AuditOutcome(bool Passed, IReadOnlyList<AuditFinding> Findings);
+file sealed record AuditOutcome(
+    bool Passed,
+    IReadOnlyList<AuditFinding> Findings,
+    bool? BuildTestGateEvidenceVerified = null);
 
 /// <summary>
 /// Drives a scripted sequence of outcomes per iteration and lets the test
@@ -716,7 +835,10 @@ file sealed class RoleStampedScriptedAuditor : IAuditor
         SeenIterations.Add(context.Iteration);
         _onRun?.Invoke(context.Iteration);
         var outcome = _plan.Dequeue();
-        return Task.FromResult(new AuditResult(outcome.Passed, outcome.Findings));
+        return Task.FromResult(new AuditResult(
+            outcome.Passed,
+            outcome.Findings,
+            BuildTestGateEvidenceVerified: outcome.BuildTestGateEvidenceVerified));
     }
 }
 
@@ -730,6 +852,29 @@ file sealed class RecordingLlmAuditor : IAuditor, IRequiresPassedBuildTestGate
     private readonly Action<int> _onRun;
 
     public RecordingLlmAuditor(string name, Action<int> onRun)
+    {
+        Name = name;
+        _onRun = onRun;
+    }
+
+    public string Name { get; }
+    public string Kind => "llm";
+    public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+    public List<int> SeenIterations { get; } = [];
+
+    public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+    {
+        SeenIterations.Add(context.Iteration);
+        _onRun(context.Iteration);
+        return Task.FromResult(new AuditResult(true, []));
+    }
+}
+
+file sealed class UnmarkedRecordingLlmAuditor : IAuditor
+{
+    private readonly Action<int> _onRun;
+
+    public UnmarkedRecordingLlmAuditor(string name, Action<int> onRun)
     {
         Name = name;
         _onRun = onRun;

@@ -190,8 +190,9 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 Declared short-circuit gates are controlled globally with
 `CodeyBox:PipelineTuning:AuditShortCircuitEnabled` (default `true`,
 hot-reloadable). The built-in `csharp:build-WaE` and `csharp:test-pass`
-auditors run before LLM reviewers and skip the remaining auditors when they
-produce a blocking result.
+auditors run before LLM reviewers and skip the LLM panel when they produce a
+blocking result. Non-LLM tool auditors continue to run when
+`StopOnFirstFailure=false`.
 
 The built-in `uat` profile is intended for UAT/test-generation work. It keeps
 C# format/build/test checks, gitleaks, semgrep, security LLM review, and the
@@ -221,7 +222,8 @@ Each language preset recursively checks for that language's marker files before 
 `requirements.txt` for Python, `package.json` for Node, `go.mod` for Go, and
 `Cargo.toml` for Rust. In side-by-side repositories, the tools run from the
 matched project directories. If a language is enabled but its markers are
-absent, the auditor emits an Info finding and skips.
+absent, BuildTestGate language auditors emit an Error finding and block the
+LLM panel because the configured build/test evidence was not verified.
 
 All language presets are tool-only (no agent credentials). A buggy linter
 cannot exfiltrate the agent's API key — the audit phase runs them in a

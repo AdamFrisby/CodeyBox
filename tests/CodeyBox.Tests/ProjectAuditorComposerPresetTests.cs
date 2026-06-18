@@ -169,6 +169,113 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void Compose_CustomShellBuildTestGateDefaultsToBuildAndTestEvidence()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Custom =
+                [
+                    new CustomAuditorDescriptor
+                    {
+                        Name = "custom:ci-pass",
+                        Kind = "shell",
+                        Argv = ["./ci.sh"],
+                        Role = "build-test-gate",
+                    },
+                ],
+            },
+        };
+
+        var auditor = composer.Compose(project, new CapturingAgent())
+            .Single(a => a.Name == "custom:ci-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void Compose_CustomGateEvidenceWithoutRoleIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:test-pass",
+            Kind = "shell",
+            Argv = ["dotnet", "test"],
+            GateEvidence = "test",
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("sets GateEvidence but is not a build-test-gate", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_CustomUnsupportedRoleIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:test-pass",
+            Kind = "shell",
+            Argv = ["dotnet", "test"],
+            Role = "ci-gate",
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("unsupported Role", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_CustomInvalidGateEvidenceIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:test-pass",
+            Kind = "shell",
+            Argv = ["dotnet", "test"],
+            Role = "build-test-gate",
+            GateEvidence = "tests",
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("unsupported GateEvidence", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_CustomGateMetadataOnNonShellAuditorIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:pattern",
+            Kind = "diff-pattern",
+            Role = "build-test-gate",
+            Patterns =
+            [
+                new DiffPatternDescriptor
+                {
+                    Regex = "TODO",
+                    Description = "No TODOs",
+                },
+            ],
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("supported only for custom shell auditors", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Compose_LoadsLanguagePresetFromLocalRepository()
     {
         using var temp = new TempDirectory();
@@ -217,6 +324,14 @@ public sealed class ProjectAuditorComposerPresetTests
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
         }
     }
+
+    private static Project ProjectWithCustom(params CustomAuditorDescriptor[] custom) => new()
+    {
+        Id = new ProjectId("alpha"),
+        DisplayName = "Alpha",
+        RepositoryUrl = "https://example.com/repo.git",
+        Audit = new ProjectAudit { Custom = custom },
+    };
 
     private sealed class NamedProfileCatalog : IPresetCatalog
     {

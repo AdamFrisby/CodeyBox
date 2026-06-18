@@ -258,7 +258,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
         };
 
         var projects = new InMemoryProjectRepository(project);
-        var presetCatalog = new ScriptedAuditorCatalog([.. auditors]);
+        var presetCatalog = new ScriptedAuditorCatalog([.. TestAuditGates.WithPassedBuildAndTest(auditors)]);
         var composer = new ProjectAuditorComposer(presetCatalog);
         var webhooks = new CapturingWebhookDispatcher();
 

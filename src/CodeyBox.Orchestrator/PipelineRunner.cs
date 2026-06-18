@@ -6288,15 +6288,15 @@ public sealed class PipelineRunner : IPipelineRunner
             .Where(RequiresPassedBuildTestGate)
             .ToList();
         if (gatedReviewAuditors.Count > 0
-            && (prefix.BuildTestGateFailed || !HasPassedTestGateEvidence(prefix)))
+            && (prefix.BuildTestGateFailed || !HasPassedBuildAndTestGateEvidence(prefix)))
         {
             _log.LogInformation(
-                "Audit iteration {Iter}: skipping {Count} LLM auditor(s) because deterministic test-gate evidence is unavailable or a build/test gate failed",
+                "Audit iteration {Iter}: skipping {Count} LLM auditor(s) because verified deterministic build-and-test evidence is unavailable or a build/test gate failed",
                 ctx.Iteration,
                 gatedReviewAuditors.Count);
             AuditLog.LlmPanelSkippedBuildTestGate(item.Id, gatedReviewAuditors.Count);
 
-            if (!prefix.BuildTestGateFailed && !HasPassedTestGateEvidence(prefix))
+            if (!prefix.BuildTestGateFailed && !HasPassedBuildAndTestGateEvidence(prefix))
             {
                 var missingGate = MissingBuildTestGateFinding(gatedReviewAuditors);
                 prefix = MergeAuditorBatchResults(
@@ -6456,7 +6456,11 @@ public sealed class PipelineRunner : IPipelineRunner
         => !result.Passed || result.Findings.Any(f => f.Severity == AuditSeverity.Error);
 
     private static bool RequiresPassedBuildTestGate(IAuditor auditor)
-        => auditor is IRequiresPassedBuildTestGate;
+        => auditor is IRequiresPassedBuildTestGate || IsLlmDrivenAuditor(auditor);
+
+    private static bool IsLlmDrivenAuditor(IAuditor auditor)
+        => string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase)
+           || auditor.Required.HasFlag(AuditCapabilities.AgentCredentials);
 
     private static AuditorBatchResult EmptyAuditorBatchResult()
         => new([], null, false, CompletedAuditors: []);
@@ -6502,12 +6506,13 @@ public sealed class PipelineRunner : IPipelineRunner
         return new AuditFinding(
             AuditorName: "audit:build-test-gate",
             Severity: AuditSeverity.Error,
-            Title: "LLM review skipped because no build/test gate passed",
-            Description: $"The configured LLM review auditor(s) require a passed deterministic test gate before they can run: {auditorList}. Configure at least one auditor with role 'build-test-gate' and gateEvidence 'test' that actually runs and passes before the LLM panel.");
+            Title: "LLM review skipped because no verified build/test gate passed",
+            Description: $"The configured LLM review auditor(s) require verified deterministic build and test evidence before they can run: {auditorList}. Configure build/test auditor(s) with role 'build-test-gate' and gateEvidence 'build-and-test', or separate 'build' and 'test' gates, that actually run and pass before the LLM panel.");
     }
 
-    private static bool HasPassedTestGateEvidence(AuditorBatchResult result)
-        => (result.PassedBuildTestGateEvidence & BuildTestGateEvidence.Test) != 0;
+    private static bool HasPassedBuildAndTestGateEvidence(AuditorBatchResult result)
+        => (result.PassedBuildTestGateEvidence & BuildTestGateEvidence.BuildAndTest)
+           == BuildTestGateEvidence.BuildAndTest;
 
     private static AuditorRunRecord NormalizeBuildTestGateRun(
         AuditorRunRecord run,
@@ -6522,11 +6527,34 @@ public sealed class PipelineRunner : IPipelineRunner
             return run;
 
         var blocking = HasAuditBlockingFinding(run.Result, project);
-        failedGate = !run.Result.Passed || blocking;
+        var unverified = run.Result.Passed
+            && !blocking
+            && run.Result.BuildTestGateEvidenceVerified == false
+            && !IsOptionalSkippedBuildTestGate(run);
+        failedGate = !run.Result.Passed || blocking || unverified;
         if (!failedGate)
         {
             passedGateEvidence = BuildTestGatePassEvidence(run);
             return run;
+        }
+
+        if (unverified)
+        {
+            var unverifiedFindings = run.Result.Findings
+                .Append(new AuditFinding(
+                    AuditorName: run.Auditor.Name,
+                    Severity: AuditSeverity.Error,
+                    Title: "build/test gate did not verify",
+                    Description: $"Build/test gate '{run.Auditor.Name}' returned a passing result but explicitly reported that its evidence was not verified. The LLM review panel was skipped because the CI-passed prompt claim cannot be verified."))
+                .ToList();
+            return run with
+            {
+                Result = run.Result with
+                {
+                    Passed = false,
+                    Findings = unverifiedFindings,
+                },
+            };
         }
 
         if (blocking)
@@ -6560,6 +6588,12 @@ public sealed class PipelineRunner : IPipelineRunner
 
         return run.Auditor.BuildTestGateEvidence;
     }
+
+    private static bool IsOptionalSkippedBuildTestGate(AuditorRunRecord run)
+        => run.Auditor.Name.Equals(WellKnownAuditorNames.BuildScript, StringComparison.OrdinalIgnoreCase)
+           && run.Result.Passed
+           && run.Result.BuildTestGateEvidenceVerified == false
+           && run.Result.Findings.Count == 0;
 
     private async Task<AuditorBatchResult> CollectFindingsBatchAsync(
         WorkItem item,

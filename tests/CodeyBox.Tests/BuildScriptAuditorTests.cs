@@ -345,7 +345,47 @@ public sealed class BuildScriptAuditorTests : IDisposable
 
         Assert.Equal(AuditCapabilities.None, auditor.Required);
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.Build, auditor.BuildTestGateEvidence);
         Assert.True(((IAuditSandboxIsolation)auditor).RequiresFreshSandbox);
+    }
+
+    [Fact]
+    public async Task Pipeline_PassingBuildScriptAloneDoesNotUnlockLlmPanel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var llm = new BuildScriptRecordingLlmAuditor();
+        var projectAudit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            StopOnFirstFailure = false,
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 }), llm],
+            projectAudit: projectAudit,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        var item = NewItem("feature/build-script-only") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitBuildScriptToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            """
+            #!/bin/sh
+            echo build ok
+            exit 0
+            """);
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(llm.SeenIterations);
     }
 
     [Fact]
@@ -646,6 +686,12 @@ public sealed class BuildScriptAuditorTests : IDisposable
         OriginalPrompt: "prompt",
         BuildScriptRequired: required);
 
+    private static ConstantCredentialProvider AuditCredentials()
+        => new(new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "test-key" },
+            new Dictionary<string, string>()));
+
     private static WorkItem NewItem(string workBranch) => new()
     {
         Id = WorkItemId.New(),
@@ -833,6 +879,24 @@ public sealed class BuildScriptAuditorTests : IDisposable
         {
             var removed = Reports.RemoveAll(r => r.StartedAt < cutoff);
             return Task.FromResult(removed);
+        }
+    }
+
+    private sealed class BuildScriptRecordingLlmAuditor : IAuditor
+    {
+        public string Name => "quality:llm-review";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+        public List<int> SeenIterations { get; } = [];
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            SeenIterations.Add(context.Iteration);
+            return Task.FromResult(new AuditResult(true, []));
         }
     }
 }

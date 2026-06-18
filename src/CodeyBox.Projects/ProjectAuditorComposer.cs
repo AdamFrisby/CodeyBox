@@ -191,6 +191,10 @@ public sealed class ProjectAuditorComposer
 
     private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
     {
+        if (HasCustomGateMetadata(descriptor))
+            throw new InvalidOperationException(
+                $"Custom plugin auditor '{descriptor.PluginId ?? descriptor.Name}' cannot set Role or GateEvidence; build-test-gate metadata is supported only for custom shell auditors");
+
         if (string.IsNullOrWhiteSpace(descriptor.PluginId))
         {
             _logger.LogWarning(
@@ -219,6 +223,11 @@ public sealed class ProjectAuditorComposer
     {
         if (string.IsNullOrWhiteSpace(c.Name))
             throw new InvalidOperationException($"Custom auditor of kind '{c.Kind}' requires a non-empty Name");
+        var isShell = c.Kind.Equals("shell", StringComparison.OrdinalIgnoreCase);
+        if (!isShell && HasCustomGateMetadata(c))
+            throw new InvalidOperationException(
+                $"Custom auditor '{c.Name}' of kind '{c.Kind}' cannot set Role or GateEvidence; build-test-gate metadata is supported only for custom shell auditors");
+
         var role = ParseCustomAuditorRole(c);
         var gateEvidence = ParseCustomGateEvidence(c, role);
 
@@ -251,6 +260,10 @@ public sealed class ProjectAuditorComposer
             _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
         };
     }
+
+    private static bool HasCustomGateMetadata(CustomAuditorDescriptor descriptor)
+        => !string.IsNullOrWhiteSpace(descriptor.Role)
+           || !string.IsNullOrWhiteSpace(descriptor.GateEvidence);
 
     private static AuditorRole ParseCustomAuditorRole(CustomAuditorDescriptor descriptor)
     {

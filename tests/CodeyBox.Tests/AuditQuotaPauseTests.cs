@@ -879,7 +879,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             prs,
             projects,
             new TestUpstreamFactory(),
-            new ProjectAuditorComposer(new ScriptedAuditorCatalog([.. auditors])),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog(TestAuditGates.WithPassedBuildAndTest(auditors))),
             store,
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },

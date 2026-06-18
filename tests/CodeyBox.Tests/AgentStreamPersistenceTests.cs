@@ -159,7 +159,7 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: auditors,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditors),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 1,
             agentStreams: streamStore);
@@ -285,7 +285,7 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             agentStreams: streamStore);
         tp.Agent.StructuredStreamSupportResult = false;
@@ -347,7 +347,7 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 2,
             agentStreams: streamStore,
             cliSessionResumableAgent: true);

@@ -74,6 +74,7 @@ internal sealed class LanguagePresetAuditor : IAuditor
         var passed = true;
         var rawOutputChars = 0;
         var rawOutputTruncated = false;
+        bool? buildTestGateEvidenceVerified = null;
 
         var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
             _language,
@@ -90,6 +91,9 @@ internal sealed class LanguagePresetAuditor : IAuditor
 
             passed &= result.Passed ||
                 (result.Findings.Count > 0 && result.Findings.All(f => f.Severity != AuditSeverity.Error));
+            buildTestGateEvidenceVerified = MergeBuildTestGateEvidenceVerified(
+                buildTestGateEvidenceVerified,
+                result.BuildTestGateEvidenceVerified);
             allFindings.AddRange(result.Findings);
             if (!string.IsNullOrWhiteSpace(result.RawOutput))
                 AppendRawPart(rawParts, $"## {projectDirectory}\n{result.RawOutput}", ref rawOutputChars, ref rawOutputTruncated);
@@ -112,7 +116,20 @@ internal sealed class LanguagePresetAuditor : IAuditor
                 Title: $"{_language} preset raw output truncated",
                 Description: $"Combined raw output exceeded {MaxRawOutputChars} characters and was truncated before storage."));
 
-        return new AuditResult(passed, allFindings, RawOutput: string.Join("\n\n", rawParts));
+        return new AuditResult(
+            passed,
+            allFindings,
+            RawOutput: string.Join("\n\n", rawParts),
+            BuildTestGateEvidenceVerified: buildTestGateEvidenceVerified);
+    }
+
+    private static bool? MergeBuildTestGateEvidenceVerified(bool? current, bool? next)
+    {
+        if (current == false || next == false)
+            return false;
+        if (current == true || next == true)
+            return true;
+        return null;
     }
 
     private static IReadOnlyList<string> ParseProjectDirectories(string output)

@@ -973,7 +973,10 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = maxAuditIterations, AuditTypes = auditTypes },
         });
 
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
+        var effectiveAuditors = auditorList.Any(RequiresBuildTestGate)
+            ? TestAuditGates.WithPassedBuildAndTest(auditorList)
+            : auditorList;
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(effectiveAuditors));
         var upstreamFactory = new TestUpstreamFactory();
         var webhooks = new NullWebhookDispatcher();
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
@@ -1012,6 +1015,10 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }
+
+    private static bool RequiresBuildTestGate(IAuditor auditor)
+        => string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase)
+            || (auditor.Required & AuditCapabilities.AgentCredentials) != 0;
 
     // ── Scripted auditors ─────────────────────────────────────────────────────
 

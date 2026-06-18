@@ -159,4 +159,26 @@ public sealed class AuditorPluginInProjectAuditTests
         Assert.True(auditors.Count >= 3, $"Expected at least 3 auditors, got {auditors.Count}");
         Assert.Contains(auditors, a => a.Name == "test:inline-plugin");
     }
+
+    [Fact]
+    public void PluginAuditor_WithGateMetadata_IsRejected()
+    {
+        var plugin = new InlinePluginAuditor();
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [plugin],
+            NullLogger<ProjectAuditorComposer>.Instance);
+        var project = MakeProject(
+            new CustomAuditorDescriptor
+            {
+                Kind = "plugin",
+                PluginId = "test.inline-plugin",
+                Role = "build-test-gate",
+                GateEvidence = "test",
+            });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new FakeAgent()));
+
+        Assert.Contains("supported only for custom shell auditors", ex.Message, StringComparison.Ordinal);
+    }
 }

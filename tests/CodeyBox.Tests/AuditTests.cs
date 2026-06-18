@@ -36,6 +36,32 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public void Registry_OrdersBuildTestGateBeforeShortCircuitToolAndLlmAuditors()
+    {
+        var llm = new FakeAuditor("llm", AuditCapabilities.AgentCredentials | AuditCapabilities.Network, _ => new(true, []));
+        var tool = new FakeAuditor("tool", AuditCapabilities.None, _ => new(true, []));
+        var shortCircuit = new FakeAuditor(
+            "short-circuit",
+            AuditCapabilities.None,
+            _ => new(true, []),
+            canShortCircuitOnBlockingFinding: true);
+        var buildTestGate = new FakeAuditor(
+            "build-test",
+            AuditCapabilities.None,
+            _ => new(true, []),
+            role: AuditorRole.BuildTestGate);
+
+        var reg = new AuditorRegistry([llm, tool, shortCircuit, buildTestGate]);
+
+        Assert.Collection(reg.All,
+            a => Assert.Equal("build-test", a.Name),
+            a => Assert.Equal("short-circuit", a.Name),
+            a => Assert.Equal("tool", a.Name),
+            a => Assert.Equal("llm", a.Name));
+    }
+
+
+    [Fact]
     public void ReworkPromptBuilder_GroupsByAuditorAndIncludesOriginal()
     {
         var findings = new[]
@@ -540,17 +566,20 @@ public sealed class AuditTests
             string name,
             AuditCapabilities required,
             Func<AuditContext, AuditResult> impl,
-            bool canShortCircuitOnBlockingFinding = false)
+            bool canShortCircuitOnBlockingFinding = false,
+            AuditorRole role = AuditorRole.None)
         {
             Name = name;
             Required = required;
             _impl = impl;
             CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding;
+            Role = role;
         }
         public string Name { get; }
         public string Kind => "tool";
         public AuditCapabilities Required { get; }
         public bool CanShortCircuitOnBlockingFinding { get; }
+        public AuditorRole Role { get; }
         public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ctx, CancellationToken ___ = default)
             => Task.FromResult(_impl(ctx));
     }

@@ -306,9 +306,16 @@ public static class ProjectsOptionsBinder
                 Id = c.Key,
                 Override = c.Get<ProjectAuditTypeOverrideConfig>() ?? new ProjectAuditTypeOverrideConfig(),
             })
-            .Where(x => x.Override.DisplayName is not null || x.Override.ReviewFocus is not null)
+            .Where(x => HasAuditTypeOverrideContent(x.Override))
             .ToDictionary(x => x.Id, x => x.Override, StringComparer.OrdinalIgnoreCase);
     }
+
+    private static bool HasAuditTypeOverrideContent(ProjectAuditTypeOverrideConfig ov)
+        => ov.DisplayName is not null
+           || ov.ReviewFocus is not null
+           || ov.Replace
+           || ov.Auditors is { Count: > 0 }
+           || ov.Patterns is { Count: > 0 };
 }
 
 public sealed class CustomAuditorConfig

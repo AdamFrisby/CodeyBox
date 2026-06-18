@@ -162,6 +162,33 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task ProjectAuditTypesObject_BindsAuditorOnlyOverride()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Name"] = "custom:test-pass",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:0"] = "dotnet",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:GateEvidence"] = "test",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["custom"], p!.Audit.AuditTypes);
+        var auditor = Assert.Single(p.Audit.AuditTypeOverrides["custom"].Auditors);
+        Assert.Equal("custom:test-pass", auditor.Name);
+        Assert.Equal("build-test-gate", auditor.Role);
+        Assert.Equal("test", auditor.GateEvidence);
+    }
+
+    [Fact]
     public async Task ProjectAuditProfiles_BindAndResolveSelectedProfile()
     {
         var config = new ConfigurationBuilder()

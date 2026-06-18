@@ -84,7 +84,7 @@ public interface IAuditSandboxIsolation
 /// Marker for auditors whose prompt or contract assumes deterministic build/test
 /// gates have already completed successfully. The pipeline runs all
 /// <see cref="AuditorRole.BuildTestGate"/> auditors first and skips these
-/// auditors unless at least one build/test gate actually passed.
+/// auditors unless deterministic build and test evidence actually passed.
 /// </summary>
 public interface IRequiresPassedBuildTestGate;
 
@@ -282,7 +282,7 @@ public interface IAuditorRegistry
 /// BuildTestGate auditors first (tier 0), declared short-circuit gates next
 /// (tier 1), other tool/local auditors next (tier 2), credential-requiring
 /// (LLM) auditors last (tier 3). The pipeline uses this to guarantee the LLM
-/// panel's "CI ran with no failures" prompt claim is always true. Both
+/// panel's "CI ran with no failures" prompt claim can be verified. Both
 /// <see cref="IAuditorRegistry"/> and the pipeline's per-iteration sort go
 /// through this helper so a new tier or a gate-semantics change only ever
 /// needs to be made in one place.

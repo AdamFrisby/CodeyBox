@@ -91,10 +91,13 @@ when the auditor requires a desktop sandbox.
 In addition to capability flags, an auditor can declare a `Role` of
 `AuditorRole.BuildTestGate`. The pipeline GUARANTEES every BuildTestGate
 auditor runs and passes before any LLM-driven auditor runs in the same
-audit iteration. If any BuildTestGate auditor produces a blocking finding,
-the LLM panel is skipped for that iteration — the LLM prompt frame asserts
-that CI built the project and ran tests with no failures, and that claim
-must never be false. The findings still flow to rework as normal.
+audit iteration. The LLM panel requires verified build and test evidence:
+either one gate with `gateEvidence: build-and-test`, or separate passing
+`build` and `test` gates. If any BuildTestGate auditor produces a blocking
+finding or reports unverified evidence, the LLM panel is skipped for that
+iteration — the LLM prompt frame asserts that CI built the project and ran
+tests with no failures, and that claim must never be false. The findings
+still flow to rework as normal.
 
 This gate is independent of `StopOnFirstFailure`: even when the option is
 `false` (the default), a failing build/test gate still short-circuits the
@@ -105,7 +108,8 @@ Built-in language presets mark the `<lang>:build-*` (where the preset
 ships a separate build step — currently only `csharp:build-WaE`) and the
 `<lang>:test-*` auditor as BuildTestGate. The other shipped languages
 (Go, Node, Python, Rust) fold the build into the same command as the
-test suite, so only their `<lang>:test-*` auditor carries the role.
+test suite, so only their `<lang>:test-*` auditor carries the role and it
+advertises `build-and-test` evidence.
 Repository-supplied YAML may also mark its own shell auditors with
 `role: build-test-gate` — do so for any custom step (e.g. a separate
 `tsc`/`cargo check`/cross-compile) whose failure should also short-circuit
