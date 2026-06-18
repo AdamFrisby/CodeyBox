@@ -261,8 +261,10 @@ public sealed class WebAppHarness : IAppUnderTestHarness
         var deadline = _timeProvider.GetUtcNow() + recipe.ReadinessTimeout;
         byte[]? lastScreenshot = null;
         Exception? lastError = null;
-        while (_timeProvider.GetUtcNow() < deadline)
+        var attemptedScreenshot = false;
+        while (!attemptedScreenshot || _timeProvider.GetUtcNow() < deadline)
         {
+            attemptedScreenshot = true;
             ct.ThrowIfCancellationRequested();
             try
             {
@@ -280,7 +282,15 @@ public sealed class WebAppHarness : IAppUnderTestHarness
             {
                 lastError = ex;
             }
-            await Task.Delay(recipe.ReadinessPollInterval, _timeProvider, ct);
+
+            var remaining = deadline - _timeProvider.GetUtcNow();
+            if (remaining <= TimeSpan.Zero)
+                break;
+
+            await Task.Delay(
+                remaining < recipe.ReadinessPollInterval ? remaining : recipe.ReadinessPollInterval,
+                _timeProvider,
+                ct);
         }
 
         var detail = lastError is not null
