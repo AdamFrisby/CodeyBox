@@ -903,7 +903,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     [Theory]
     [InlineData("node", "package.json", "{\"scripts\":{\"test\":\"node -e 0\"}}\n", "npm test")]
     [InlineData("python", "pyproject.toml", "[project]\nname = \"sample\"\nversion = \"0.1.0\"\n", "pytest ")]
-    public async Task BuiltInNodeAndPythonPassingTestGateDoesNotUnlockLlmPanelWithoutBuildEvidence(
+    public async Task BuiltInNodeAndPythonPassingTestGateUnlocksLlmPanel(
         string language,
         string markerFile,
         string markerContents,
@@ -957,10 +957,9 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.True(
-            final!.State == WorkItemState.AuditFailed,
-            $"expected AuditFailed, got {final.State}: {final.LastError}");
-        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(0, llmRuns);
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(1, llmRuns);
         var toolLog = await File.ReadAllLinesAsync(fakeTools.LogPath);
         Assert.Contains(expectedTestCommand, toolLog);
     }
