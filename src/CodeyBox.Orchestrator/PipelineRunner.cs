@@ -5431,7 +5431,6 @@ public sealed class PipelineRunner : IPipelineRunner
                         item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
                     if (requiredBuildGateResult.Applies)
                         preCompletedAuditors.Add(RequiredBuildGateIdentity.AuditorName);
-                    prePassedBuildTestGateEvidence |= requiredBuildGateResult.PassedEvidence;
                     if (requiredBuildGateResult.Finding is not null)
                     {
                         preCollectedFindings.Add(requiredBuildGateResult.Finding);
@@ -6471,10 +6470,7 @@ public sealed class PipelineRunner : IPipelineRunner
         => !result.Passed || result.Findings.Any(f => f.Severity == AuditSeverity.Error);
 
     private static bool RequiresPassedBuildTestGate(IAuditor auditor)
-        => auditor is IRequiresPassedBuildTestGate || IsLlmDrivenAuditor(auditor);
-
-    private static bool IsLlmDrivenAuditor(IAuditor auditor)
-        => string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase);
+        => auditor is IRequiresPassedBuildTestGate;
 
     private static AuditorBatchResult EmptyAuditorBatchResult()
         => new([], null, false, CompletedAuditors: []);

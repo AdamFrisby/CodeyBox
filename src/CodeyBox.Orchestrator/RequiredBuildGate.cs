@@ -191,10 +191,7 @@ internal sealed class RequiredBuildGate
         if (result.Status == RequiredBuildVerificationStatus.Skipped)
             return new RequiredBuildAuditGateResult(Applies: false, Finding: null);
         if (result.Status != RequiredBuildVerificationStatus.Failed)
-            return new RequiredBuildAuditGateResult(
-                Applies: true,
-                Finding: null,
-                PassedEvidence: BuildTestGateEvidence.Build);
+            return new RequiredBuildAuditGateResult(Applies: true, Finding: null);
 
         return new RequiredBuildAuditGateResult(Applies: true, new AuditFinding(
             AuditorName: RequiredBuildGateIdentity.AuditorName,
@@ -407,7 +404,4 @@ internal sealed class RequiredBuildGate
     }
 }
 
-internal sealed record RequiredBuildAuditGateResult(
-    bool Applies,
-    AuditFinding? Finding,
-    BuildTestGateEvidence PassedEvidence = BuildTestGateEvidence.None);
+internal sealed record RequiredBuildAuditGateResult(bool Applies, AuditFinding? Finding);

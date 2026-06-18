@@ -270,7 +270,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task CSharpRootMarker_DoesNotSuppressNestedProjectDirectories()
+    public async Task CSharpRootMarker_RunsOnceFromRepositoryRoot()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
@@ -279,16 +279,10 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.False(result.Passed);
-        var finding = Assert.Single(result.Findings, f =>
-            f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Equal(
-            LanguageProjectDiscovery.MaxProjectDirectoriesToRun,
-            sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+        Assert.True(result.Passed);
+        Assert.Equal(1, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
         Assert.Contains("/repo", sandbox.WorkingDirectories);
-        Assert.Contains("/repo/project-0", sandbox.WorkingDirectories);
-        Assert.DoesNotContain("/repo/project-31", sandbox.WorkingDirectories);
+        Assert.DoesNotContain("/repo/project-0", sandbox.WorkingDirectories);
     }
 
     [Fact]

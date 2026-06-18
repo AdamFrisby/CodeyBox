@@ -111,7 +111,7 @@ tested packages as part of the command, so their `<lang>:test-*` gates
 advertise `build-and-test` evidence. Node and Python default test commands
 (`npm test`, `pytest`) advertise `test` evidence only; projects that want LLM
 review for those languages must also provide build evidence, for example with
-a repo-root `build.sh` or a trusted custom build gate.
+a trusted custom build gate.
 Gate metadata is accepted only from trusted configuration: built-in presets
 or operator/project appsettings overrides. Repository-supplied YAML can add
 shell auditors, but it cannot declare `role` or `gateEvidence`, because that
@@ -120,6 +120,9 @@ review. In trusted config, set `role: build-test-gate` plus explicit
 `gateEvidence` for any custom step (e.g. a separate `tsc`/`cargo check`/
 cross-compile) whose successful run should contribute to the LLM panel gate.
 If `gateEvidence` is omitted, the gate contributes no build/test evidence.
+The built-in `process:build-script` auditor runs a repository-owned
+`build.sh` as an ordinary tool audit only; it is not trusted build evidence
+and cannot unlock LLM review.
 
 ## Built-in auditors
 

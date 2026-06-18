@@ -503,7 +503,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
-    public async Task FailedBuildTestGateSkipsUnmarkedLlmAuditor()
+    public async Task UnmarkedLlmAuditorDoesNotRequireBuildTestGate()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new RoleStampedScriptedAuditor(
@@ -539,7 +539,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Equal([1], gate.SeenIterations);
-        Assert.Equal(0, llmRuns);
+        Assert.Equal(1, llmRuns);
     }
 
     [Fact]
@@ -693,7 +693,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
-    public async Task RequiredBuildGatePassPlusTestGateUnlocksLlmPanel()
+    public async Task RequiredBuildGatePassPlusTestGateDoesNotUnlockLlmPanelWithoutBuildGate()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var requiredBuild = new TestRequiredBuildVerifier(
@@ -734,12 +734,13 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.True(
-            final!.State == WorkItemState.Done,
-            $"expected Done, got {final.State}: {final.LastError}");
+            final!.State == WorkItemState.AuditFailed,
+            $"expected AuditFailed, got {final.State}: {final.LastError}");
         Assert.Equal(1, requiredBuild.VerifyCalls);
         Assert.Equal([1], testGate.SeenIterations);
-        Assert.Equal(1, llmRuns);
-        Assert.Equal([1], llm.SeenIterations);
+        Assert.Equal(0, llmRuns);
+        Assert.Empty(llm.SeenIterations);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
