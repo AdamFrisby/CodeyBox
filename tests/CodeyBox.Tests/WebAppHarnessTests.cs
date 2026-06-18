@@ -278,6 +278,50 @@ public sealed class WebAppHarnessTests
         Assert.True(sandbox.Disposed);
     }
 
+    [Fact]
+    public async Task LaunchAsync_BrowserSettleDelayConsumesReadinessWindow_StillAttemptsScreenshot()
+    {
+        var sandbox = new RecordingHarnessSandbox(screenshotsToReturn: [NonUniformPng]);
+        var provider = new ScriptedSandboxProvider(sandbox);
+        var clock = new AutoAdvancingTimeProvider();
+        var harness = new WebAppHarness(provider, timeProvider: clock);
+        var recipe = MinimalRecipe() with
+        {
+            ReadinessTimeout = TimeSpan.FromMilliseconds(10),
+            ReadinessPollInterval = TimeSpan.FromMilliseconds(100),
+            BrowserSettleDelay = TimeSpan.FromMilliseconds(20),
+        };
+
+        await using var session = await harness.LaunchAsync(recipe);
+
+        Assert.Equal(NonUniformPng, session.ReadinessScreenshotPng);
+        Assert.Equal(1, sandbox.ScreenshotCalls);
+        Assert.Equal([TimeSpan.FromMilliseconds(20)], clock.DelayRequests);
+    }
+
+    [Fact]
+    public async Task LaunchAsync_ScreenshotRetryDelayIsClampedToRemainingReadinessTimeout()
+    {
+        var sandbox = new RecordingHarnessSandbox(screenshotsToReturn: [UniformPng, NonUniformPng]);
+        var provider = new ScriptedSandboxProvider(sandbox);
+        var clock = new AutoAdvancingTimeProvider();
+        var harness = new WebAppHarness(provider, timeProvider: clock);
+        var recipe = MinimalRecipe() with
+        {
+            ReadinessTimeout = TimeSpan.FromMilliseconds(50),
+            ReadinessPollInterval = TimeSpan.FromMilliseconds(100),
+            BrowserSettleDelay = TimeSpan.FromMilliseconds(40),
+        };
+
+        await using var session = await harness.LaunchAsync(recipe);
+
+        Assert.Equal(NonUniformPng, session.ReadinessScreenshotPng);
+        Assert.Equal(2, sandbox.ScreenshotCalls);
+        Assert.Equal(
+            [TimeSpan.FromMilliseconds(40), TimeSpan.FromMilliseconds(10)],
+            clock.DelayRequests);
+    }
+
     [Theory]
     [InlineData("", "EntryUrl")]
     [InlineData("INVALID", "TargetName")]
@@ -621,6 +665,89 @@ public sealed class WebAppHarnessTests
             Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
 
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class AutoAdvancingTimeProvider : TimeProvider
+    {
+        private readonly object _gate = new();
+        private DateTimeOffset _utcNow = DateTimeOffset.UnixEpoch;
+        private readonly List<TimeSpan> _delayRequests = [];
+
+        public IReadOnlyList<TimeSpan> DelayRequests
+        {
+            get
+            {
+                lock (_gate)
+                    return _delayRequests.ToList();
+            }
+        }
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            lock (_gate)
+                return _utcNow;
+        }
+
+        public override ITimer CreateTimer(
+            TimerCallback callback,
+            object? state,
+            TimeSpan dueTime,
+            TimeSpan period)
+            => new AutoAdvancingTimer(this, callback, state, dueTime);
+
+        private void Schedule(TimerCallback callback, object? state, TimeSpan dueTime)
+        {
+            if (dueTime == Timeout.InfiniteTimeSpan)
+                return;
+
+            if (dueTime < TimeSpan.Zero)
+                dueTime = TimeSpan.Zero;
+
+            lock (_gate)
+            {
+                _delayRequests.Add(dueTime);
+                _utcNow += dueTime;
+            }
+
+            ThreadPool.QueueUserWorkItem(_ => callback(state));
+        }
+
+        private sealed class AutoAdvancingTimer : ITimer
+        {
+            private readonly AutoAdvancingTimeProvider _provider;
+            private readonly TimerCallback _callback;
+            private readonly object? _state;
+            private bool _disposed;
+
+            public AutoAdvancingTimer(
+                AutoAdvancingTimeProvider provider,
+                TimerCallback callback,
+                object? state,
+                TimeSpan dueTime)
+            {
+                _provider = provider;
+                _callback = callback;
+                _state = state;
+                Change(dueTime, Timeout.InfiniteTimeSpan);
+            }
+
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                if (_disposed)
+                    return false;
+
+                _provider.Schedule(_callback, _state, dueTime);
+                return true;
+            }
+
+            public void Dispose() => _disposed = true;
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+        }
     }
 
     private sealed class RecordingHarnessSandbox : ISandbox

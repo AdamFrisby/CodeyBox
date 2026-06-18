@@ -930,6 +930,31 @@ internal sealed class SandboxTextOnlyScriptedAgent : ScriptedAgent
 
 internal sealed record FileWrite(string FileName, string Contents);
 
+internal static class TestAuditGates
+{
+    public static IReadOnlyList<IAuditor> WithPassedBuildAndTest(params IAuditor[] auditors)
+        => [new PassingBuildAndTestGateAuditor(), .. auditors];
+
+    public static IReadOnlyList<IAuditor> WithPassedBuildAndTest(IEnumerable<IAuditor> auditors)
+        => [new PassingBuildAndTestGateAuditor(), .. auditors];
+}
+
+internal sealed class PassingBuildAndTestGateAuditor : IAuditor
+{
+    public string Name => "test:build-and-test-pass";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditorRole Role => AuditorRole.BuildTestGate;
+    public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.BuildAndTest;
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+        => Task.FromResult(new AuditResult(true, []));
+}
+
 /// <summary>
 /// One per-hunk payload as the conflict resolver sees it in hunk-scoped mode:
 /// the file path, the conflict region's 1-indexed line range, the slice's

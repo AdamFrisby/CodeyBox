@@ -813,7 +813,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             prs,
             projects,
             new TestUpstreamFactory(),
-            new ProjectAuditorComposer(new ScriptedAuditorCatalog([auditor])),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog(TestAuditGates.WithPassedBuildAndTest([auditor]))),
             store,
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },

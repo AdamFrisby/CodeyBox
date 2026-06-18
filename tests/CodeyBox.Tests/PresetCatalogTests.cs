@@ -92,6 +92,28 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void LanguagePresetYamlLoading_WiresBuildTestGateRolesFromBuiltInYaml()
+    {
+        var catalog = new PresetCatalog();
+        var ctx = new PresetContext(new FakeAgent());
+
+        AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:format-check", AuditorRole.None);
+        AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:build-WaE", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "csharp", "csharp:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorEvidence(catalog, ctx, "csharp", "csharp:build-WaE", BuildTestGateEvidence.Build);
+        AssertLanguageAuditorEvidence(catalog, ctx, "csharp", "csharp:test-pass", BuildTestGateEvidence.Test);
+
+        AssertLanguageAuditorRole(catalog, ctx, "python", "python:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
+        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.BuildAndTest);
+    }
+
+    [Fact]
     public void CSharpPreset_DeclaresBuildAndTestAsShortCircuitGates()
     {
         var auditors = new PresetCatalog()
@@ -101,6 +123,258 @@ public sealed class PresetCatalogTests
         Assert.False(auditors["csharp:format-check"].CanShortCircuitOnBlockingFinding);
         Assert.True(auditors["csharp:build-WaE"].CanShortCircuitOnBlockingFinding);
         Assert.True(auditors["csharp:test-pass"].CanShortCircuitOnBlockingFinding);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_BuildTestGateWithoutEvidenceContributesNoEvidence()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            Role = "build-test-gate",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_WiresExplicitBuildTestGateEvidenceToShellAuditor()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            Role = "build-test-gate",
+                            GateEvidence = "build-and-test",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_BuildTestGateScriptWithoutEvidenceContributesNoEvidence()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-script-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-script-build:test-pass",
+                            Script = "dotnet test",
+                            ToolName = "dotnet",
+                            Role = "build-test-gate",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-script-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-script-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_WiresExplicitBuildTestGateEvidenceToScriptAuditor()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-script-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-script-build:test-pass",
+                            Script = "dotnet test",
+                            ToolName = "dotnet",
+                            Role = "build-test-gate",
+                            GateEvidence = "build-and-test",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-script-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-script-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void RepositoryAuditTypeYaml_RejectsBuildTestGateRole()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "repo-build.yaml"), """
+            id: repo-build
+            auditors:
+              - name: repo-build:test-pass
+                argv: ["dotnet", "test"]
+                role: build-test-gate
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("role is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryAuditTypeYaml_RejectsGateEvidence()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "repo-build.yaml"), """
+            id: repo-build
+            auditors:
+              - name: repo-build:test-pass
+                argv: ["dotnet", "test"]
+                gateEvidence: build-and-test
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("gateEvidence is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryLanguageYaml_RejectsBuildTestGateRole()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "repo-lang.yaml"), """
+            id: repo-lang
+            marker:
+              globs: ["**/*.csproj"]
+            auditors:
+              - name: repo-lang:test-pass
+                argv: ["dotnet", "test"]
+                role: build-test-gate
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("role is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryLanguageYaml_RejectsGateEvidence()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "repo-lang.yaml"), """
+            id: repo-lang
+            marker:
+              globs: ["**/*.csproj"]
+            auditors:
+              - name: repo-lang:test-pass
+                argv: ["dotnet", "test"]
+                gateEvidence: build-and-test
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("gateEvidence is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_RejectsGateEvidenceWithoutBuildTestGateRole()
+    {
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            GateEvidence = "test",
+                        },
+                    ],
+                },
+            },
+        }));
+
+        Assert.Contains("requires role 'build-test-gate'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_RejectsUnknownGateEvidenceValue()
+    {
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            Role = "build-test-gate",
+                            GateEvidence = "tests",
+                        },
+                    ],
+                },
+            },
+        }));
+
+        Assert.Contains("not a recognised gate evidence value", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("build, test, build-and-test", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -140,6 +414,7 @@ public sealed class PresetCatalogTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
+        Assert.False(result.BuildTestGateEvidenceVerified);
     }
 
     [Fact]
@@ -270,6 +545,24 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void SchemaValidation_RejectsInvalidAuditorRole()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "csharp.yaml"), """
+            id: csharp
+            auditors:
+              - name: csharp:bad
+                argv: ["dotnet", "test"]
+                role: build_test_gate
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("role", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void UserOverride_AdditiveAuditors_AppendsInOrder()
     {
         using var temp = TempProject();
@@ -297,8 +590,6 @@ public sealed class PresetCatalogTests
         File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "csharp.yaml"), """
             id: csharp
             replace: true
-            marker:
-              globs: ["**/*.csproj"]
             auditors:
               - name: csharp:replacement
                 argv: ["dotnet", "test"]
@@ -473,6 +764,30 @@ public sealed class PresetCatalogTests
         Assert.Equal(3, catalog.ResolveLanguage("node", ctx).Count);
         Assert.Equal(3, catalog.ResolveLanguage("go", ctx).Count);
         Assert.Equal(3, catalog.ResolveLanguage("rust", ctx).Count);
+    }
+
+    private static void AssertLanguageAuditorRole(
+        PresetCatalog catalog,
+        PresetContext ctx,
+        string language,
+        string auditorName,
+        AuditorRole expected)
+    {
+        var auditor = catalog.ResolveLanguage(language, ctx)
+            .Single(a => a.Name == auditorName);
+        Assert.Equal(expected, auditor.Role);
+    }
+
+    private static void AssertLanguageAuditorEvidence(
+        PresetCatalog catalog,
+        PresetContext ctx,
+        string language,
+        string auditorName,
+        BuildTestGateEvidence expected)
+    {
+        var auditor = catalog.ResolveLanguage(language, ctx)
+            .Single(a => a.Name == auditorName);
+        Assert.Equal(expected, auditor.BuildTestGateEvidence);
     }
 
     private static TempDirectory TempProject() => new();

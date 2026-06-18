@@ -28,7 +28,8 @@ internal sealed class LanguagePresetAuditor : IAuditor
     public AuditCapabilities Required => _inner.Required;
     public bool CanShortCircuitOnBlockingFinding => _inner.CanShortCircuitOnBlockingFinding;
     public string? SelfReviewGuidance => _inner.SelfReviewGuidance;
-
+    public AuditorRole Role => _inner.Role;
+    public BuildTestGateEvidence BuildTestGateEvidence => _inner.BuildTestGateEvidence;
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
@@ -53,9 +54,10 @@ internal sealed class LanguagePresetAuditor : IAuditor
         if (projectDirectories.Count > 0)
             return await RunInnerForProjectDirectoriesAsync(sandbox, workingDirectory, context, projectDirectories, ct);
 
-        return new AuditResult(true, [new AuditFinding(
+        var gateSkipped = Role == AuditorRole.BuildTestGate;
+        return new AuditResult(!gateSkipped, [new AuditFinding(
             AuditorName: Name,
-            Severity: AuditSeverity.Info,
+            Severity: gateSkipped ? AuditSeverity.Error : AuditSeverity.Info,
             Title: $"{_language} preset enabled but no {_markerDescription} found; skipping",
             Description: $"The project declares language '{_language}', but no {_markerDescription} marker file was present in the work tree.")]);
     }
@@ -72,6 +74,7 @@ internal sealed class LanguagePresetAuditor : IAuditor
         var passed = true;
         var rawOutputChars = 0;
         var rawOutputTruncated = false;
+        bool? buildTestGateEvidenceVerified = null;
 
         var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
             _language,
@@ -88,6 +91,9 @@ internal sealed class LanguagePresetAuditor : IAuditor
 
             passed &= result.Passed ||
                 (result.Findings.Count > 0 && result.Findings.All(f => f.Severity != AuditSeverity.Error));
+            buildTestGateEvidenceVerified = MergeBuildTestGateEvidenceVerified(
+                buildTestGateEvidenceVerified,
+                result.BuildTestGateEvidenceVerified);
             allFindings.AddRange(result.Findings);
             if (!string.IsNullOrWhiteSpace(result.RawOutput))
                 AppendRawPart(rawParts, $"## {projectDirectory}\n{result.RawOutput}", ref rawOutputChars, ref rawOutputTruncated);
@@ -110,7 +116,22 @@ internal sealed class LanguagePresetAuditor : IAuditor
                 Title: $"{_language} preset raw output truncated",
                 Description: $"Combined raw output exceeded {MaxRawOutputChars} characters and was truncated before storage."));
 
-        return new AuditResult(passed, allFindings, RawOutput: string.Join("\n\n", rawParts));
+        return new AuditResult(
+            passed,
+            allFindings,
+            RawOutput: string.Join("\n\n", rawParts))
+        {
+            BuildTestGateEvidenceVerified = buildTestGateEvidenceVerified,
+        };
+    }
+
+    private static bool? MergeBuildTestGateEvidenceVerified(bool? current, bool? next)
+    {
+        if (current == false || next == false)
+            return false;
+        if (current == true || next == true)
+            return true;
+        return null;
     }
 
     private static IReadOnlyList<string> ParseProjectDirectories(string output)

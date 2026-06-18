@@ -12,3 +12,5 @@ auditors:
     argv: ["go", "vet", "./..."]
   - name: go:test-pass
     argv: ["go", "test", "./..."]
+    role: build-test-gate
+    gateEvidence: build-and-test

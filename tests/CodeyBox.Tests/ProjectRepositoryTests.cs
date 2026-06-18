@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Configuration;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Projects;
 
@@ -140,6 +141,11 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:Audit:AuditTypes:security:ReviewFocus"] = "project security focus",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:DisplayName"] = "Custom review",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:ReviewFocus"] = "custom focus",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Name"] = "custom:test-pass",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:0"] = "dotnet",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:GateEvidence"] = "test",
                 ["CodeyBox:Projects:0:Audit:LlmPromptFrameTemplate"] = "{{reviewFocus}}\n{{resultFile}}",
             })
             .Build();
@@ -151,7 +157,81 @@ public sealed class ProjectRepositoryTests
         Assert.Equal(["custom", "security"], p!.Audit.AuditTypes.Order(StringComparer.Ordinal).ToArray());
         Assert.Equal("project security focus", p.Audit.AuditTypeOverrides["security"].ReviewFocus);
         Assert.Equal("Custom review", p.Audit.AuditTypeOverrides["custom"].DisplayName);
+        Assert.Equal("build-test-gate", p.Audit.AuditTypeOverrides["custom"].Auditors.Single().Role);
+        Assert.Equal("test", p.Audit.AuditTypeOverrides["custom"].Auditors.Single().GateEvidence);
         Assert.Equal("{{reviewFocus}}\n{{resultFile}}", p.Audit.LlmPromptFrameTemplate);
+    }
+
+    [Fact]
+    public async Task ProjectAuditTypesObject_BindsAuditorOnlyOverride()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Name"] = "custom:test-pass",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:0"] = "dotnet",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:GateEvidence"] = "test",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["custom"], p!.Audit.AuditTypes);
+        var auditor = Assert.Single(p.Audit.AuditTypeOverrides["custom"].Auditors);
+        Assert.Equal("custom:test-pass", auditor.Name);
+        Assert.Equal("build-test-gate", auditor.Role);
+        Assert.Equal("test", auditor.GateEvidence);
+    }
+
+    [Fact]
+    public async Task ProjectAuditTypesObject_BindsReplaceOnlyOverride()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Replace"] = "true",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["custom"], p!.Audit.AuditTypes);
+        Assert.True(p.Audit.AuditTypeOverrides["custom"].Replace);
+    }
+
+    [Fact]
+    public async Task ProjectAuditTypesObject_BindsPatternOnlyOverride()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Patterns:0:Regex"] = "TODO",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Patterns:0:Description"] = "No TODOs",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Patterns:0:Severity"] = "warning",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["custom"], p!.Audit.AuditTypes);
+        var pattern = Assert.Single(p.Audit.AuditTypeOverrides["custom"].Patterns);
+        Assert.Equal("TODO", pattern.Regex);
+        Assert.Equal("No TODOs", pattern.Description);
+        Assert.Equal("warning", pattern.Severity);
     }
 
     [Fact]
@@ -228,6 +308,8 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Name"] = "csharp:custom-test",
                 ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Argv:0"] = "dotnet",
                 ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:Languages:Overrides:csharp:Auditors:0:GateEvidence"] = "test",
             })
             .Build();
 
@@ -241,6 +323,43 @@ public sealed class ProjectRepositoryTests
         var auditor = Assert.Single(languageOverride.Value.Auditors);
         Assert.Equal("csharp:custom-test", auditor.Name);
         Assert.Equal(["dotnet", "test"], auditor.Argv);
+        Assert.Equal("build-test-gate", auditor.Role);
+        Assert.Equal("test", auditor.GateEvidence);
+    }
+
+    [Fact]
+    public async Task ProjectCustomAuditor_BindsBuildTestGateMetadataFromConfig()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Name"] = "custom:test-pass",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Kind"] = "shell",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Argv:0"] = "dotnet",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:Custom:0:GateEvidence"] = "test",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        var descriptor = Assert.Single(p!.Audit.Custom);
+        Assert.Equal("custom:test-pass", descriptor.Name);
+        Assert.Equal("shell", descriptor.Kind);
+        Assert.Equal(["dotnet", "test"], descriptor.Argv);
+        Assert.Equal("build-test-gate", descriptor.Role);
+        Assert.Equal("test", descriptor.GateEvidence);
+
+        var auditor = new ProjectAuditorComposer(new PresetCatalog())
+            .Compose(p, new NullAgent())
+            .Single(a => a.Name == "custom:test-pass");
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.Test, auditor.BuildTestGateEvidence);
     }
 
     [Fact]
@@ -885,6 +1004,23 @@ public sealed class ProjectRepositoryTests
         Assert.NotNull(p);
         Assert.Equal("noop", p!.Upstream.Kind);
     }
+}
+
+file sealed class NullAgent : IAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+        => Task.FromResult(new AgentResult(true, "ok", "", null));
 }
 
 /// <summary>

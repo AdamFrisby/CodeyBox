@@ -30,7 +30,7 @@ public sealed class AuditReportsPipelineAndRetentionTests : IDisposable
         using var pipeline = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [first, second],
+            auditors: TestAuditGates.WithPassedBuildAndTest([first, second]),
             auditReportStore: captureStore,
             maxLlmAuditorParallelism: 2);
         pipeline.Agent.WorkPlan.Enqueue(new FileWrite("result.txt", "done\n"));
@@ -45,9 +45,12 @@ public sealed class AuditReportsPipelineAndRetentionTests : IDisposable
 
         var final = await pipeline.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
+        var llmReports = captureStore.Reports
+            .Where(r => r.AuditorName.EndsWith(":llm-review", StringComparison.Ordinal))
+            .ToList();
         Assert.Equal(["quality:llm-review", "security:llm-review"],
-            captureStore.Reports.Select(r => r.AuditorName).Order(StringComparer.Ordinal).ToArray());
-        Assert.All(captureStore.Reports, report =>
+            llmReports.Select(r => r.AuditorName).Order(StringComparer.Ordinal).ToArray());
+        Assert.All(llmReports, report =>
         {
             Assert.Equal(item.Id.ToString(), report.WorkItemId);
             Assert.Equal(1, report.Iteration);

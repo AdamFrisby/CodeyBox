@@ -172,14 +172,12 @@ internal sealed class RequiredBuildGate
     }
 
     /// <summary>
-    /// Runs the gate as an audit-phase auditor. Returns an
-    /// <see cref="AuditFinding"/> when the build failed (the caller folds it
-    /// into the iteration's blocking findings) or null on pass/skip.
-    /// Unavailable status propagates as
-    /// <see cref="RequiredBuildVerificationUnavailableException"/> so the
-    /// audit phase distinguishes infra degradation from real breakage.
+    /// Runs the gate as an audit-phase auditor. Returns whether the gate applied
+    /// and an <see cref="AuditFinding"/> when the build failed. Unavailable
+    /// status propagates as <see cref="RequiredBuildVerificationUnavailableException"/>
+    /// so the audit phase distinguishes infra degradation from real breakage.
     /// </summary>
-    public async Task<AuditFinding?> RunForAuditAsync(
+    public async Task<RequiredBuildAuditGateResult> RunForAuditGateAsync(
         WorkItem item,
         Project project,
         string repoId,
@@ -190,15 +188,28 @@ internal sealed class RequiredBuildGate
     {
         var result = await VerifyAsync(
             item, project, repoId, baseBranch, workBranch, phase: "audit", iteration: iteration, ct);
+        if (result.Status == RequiredBuildVerificationStatus.Skipped)
+            return new RequiredBuildAuditGateResult(Applies: false, Finding: null);
         if (result.Status != RequiredBuildVerificationStatus.Failed)
-            return null;
+            return new RequiredBuildAuditGateResult(Applies: true, Finding: null);
 
-        return new AuditFinding(
+        return new RequiredBuildAuditGateResult(Applies: true, new AuditFinding(
             AuditorName: RequiredBuildGateIdentity.AuditorName,
             Severity: AuditSeverity.Error,
             Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
-            Description: BuildFailureSummary(result));
+            Description: BuildFailureSummary(result)));
     }
+
+    public async Task<AuditFinding?> RunForAuditAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        int iteration,
+        CancellationToken ct)
+        => (await RunForAuditGateAsync(item, project, repoId, baseBranch, workBranch, iteration, ct))
+            .Finding;
 
     /// <summary>
     /// Enforces the build gate when an item resumes at AuditPassed (skips the
@@ -392,3 +403,5 @@ internal sealed class RequiredBuildGate
                 "RequiredBuildAuditorAdapter is a persistence-only adapter; the build verifier owns execution.");
     }
 }
+
+internal sealed record RequiredBuildAuditGateResult(bool Applies, AuditFinding? Finding);

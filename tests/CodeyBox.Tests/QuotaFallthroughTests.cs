@@ -173,7 +173,7 @@ public sealed class QuotaFallthroughTests : IDisposable
         };
 
         var projects = new InMemoryProjectRepository(project);
-        var presetCatalog = new ScriptedAuditorCatalog([.. auditors]);
+        var presetCatalog = new ScriptedAuditorCatalog([.. TestAuditGates.WithPassedBuildAndTest(auditors)]);
         var composer = new ProjectAuditorComposer(presetCatalog);
         // Gemini always has credentials so we reach the quota check.
         var credentials = new SelectiveCredentialProvider(AgentKind.Gemini);

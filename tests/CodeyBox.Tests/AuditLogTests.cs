@@ -620,6 +620,21 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
     }
 
+    [Fact]
+    public void LlmPanelSkippedBuildTestGate_emits_event_with_work_item_and_skipped_count()
+    {
+        var workItemId = WorkItemId.New();
+
+        AuditLog.LlmPanelSkippedBuildTestGate(workItemId, skippedAuditorCount: 3);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal(LogEventLevel.Information, evt.Level);
+        Assert.Equal("audit.llm_panel_skipped_build_test_gate", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal(3, GetScalar<int>(evt, "SkippedCount"));
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static T? GetScalar<T>(LogEvent evt, string key)

@@ -51,7 +51,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             involvement: involvement,
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
@@ -87,7 +87,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -161,7 +161,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [new LlmNoisySuccessAuditor()],
+            auditors: TestAuditGates.WithPassedBuildAndTest([new LlmNoisySuccessAuditor()]),
             involvement: involvement,
             maxAuditIterations: 1);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -1424,7 +1424,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [blocker, sometimesHangs],
+            auditors: TestAuditGates.WithPassedBuildAndTest([blocker, sometimesHangs]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning);
@@ -1453,7 +1453,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttempt);
         var firstAudit = Assert.Single(progress, p => p.Iteration == 1);
         Assert.Equal(AuditProgressStatuses.Incomplete, firstAudit.Status);
-        Assert.Equal(["architecture"], firstAudit.CompletedAuditors);
+        Assert.Equal(["architecture"], WithoutBuildTestGate(firstAudit.CompletedAuditors));
         Assert.Contains(firstAudit.Findings, f => f.Title == "real finding");
     }
 
@@ -1480,7 +1480,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [blocker, unavailable, hanging],
+            auditors: TestAuditGates.WithPassedBuildAndTest([blocker, unavailable, hanging]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 3,
             pipelineTuning: tuning);
@@ -1575,7 +1575,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [warning, sometimesHangs],
+            auditors: TestAuditGates.WithPassedBuildAndTest([warning, sometimesHangs]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning);
@@ -1628,7 +1628,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [blocker, sometimesHangs],
+            auditors: TestAuditGates.WithPassedBuildAndTest([blocker, sometimesHangs]),
             maxAuditIterations: 1,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning);
@@ -1674,7 +1674,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [blocker, alwaysHangs],
+            auditors: TestAuditGates.WithPassedBuildAndTest([blocker, alwaysHangs]),
             maxAuditIterations: 1,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning);
@@ -1732,7 +1732,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [blocker, sometimesHangs],
+            auditors: TestAuditGates.WithPassedBuildAndTest([blocker, sometimesHangs]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning,
@@ -1749,8 +1749,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var auditBuildRequests = requiredBuild.VerificationRequests
             .Where(r => r.Phase == "audit")
             .ToList();
-        var auditBuildRequest = Assert.Single(auditBuildRequests);
-        Assert.Equal(2, auditBuildRequest.Iteration);
+        Assert.Equal([1, 2], auditBuildRequests.Select(r => r.Iteration).Order().ToArray());
         Assert.Equal(2, blockerCalls);
         Assert.Equal(3, hangingCalls);
     }
@@ -1786,7 +1785,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [finding, quota],
+            auditors: TestAuditGates.WithPassedBuildAndTest([finding, quota]),
             maxAuditIterations: 1,
             maxLlmAuditorParallelism: 2);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -1838,7 +1837,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [blocker, slow],
+            auditors: TestAuditGates.WithPassedBuildAndTest([blocker, slow]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
             auditProgressOverride: progressStore);
@@ -1853,10 +1852,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             var partial = await WaitForProgressAsync(
                 progressStore,
                 r => r.Progress.Status == AuditProgressStatuses.InProgress
-                     && r.Progress.CompletedAuditors?.SequenceEqual(["architecture"]) == true
+                     && WithoutBuildTestGate(r.Progress.CompletedAuditors).SequenceEqual(["architecture"])
                      && r.Progress.Findings.Any(f => f.Title == "durable blocker"));
 
-            Assert.Equal(["architecture", "quality"], partial.Progress.ScheduledAuditors);
+            Assert.Equal(["architecture", "quality"], WithoutBuildTestGate(partial.Progress.ScheduledAuditors));
         }
         finally
         {
@@ -1880,7 +1879,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             pipelineTuning: tuning);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -1921,7 +1920,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             pipelineTuning: tuning,
             agentStreams: streamStore);
@@ -1970,7 +1969,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             pipelineTuning: tuning,
             sandboxProvider: sandboxProvider);
@@ -2007,7 +2006,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             pipelineTuning: tuning,
             sandboxProvider: sandboxProvider);
@@ -2042,7 +2041,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [slowSilent],
+            auditors: TestAuditGates.WithPassedBuildAndTest([slowSilent]),
             maxAuditIterations: 1,
             pipelineTuning: tuning);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -2076,7 +2075,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [streaming],
+            auditors: TestAuditGates.WithPassedBuildAndTest([streaming]),
             maxAuditIterations: 1,
             pipelineTuning: tuning);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -2579,7 +2578,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             => _inner.DisposeLeakedAsync(name, ct);
 
         private bool ShouldHangClone()
-            => Interlocked.Increment(ref _cloneCalls) == 2;
+            => Interlocked.Increment(ref _cloneCalls) == 3;
 
         private void MarkObservedCloneCancellation()
             => ObservedCloneCancellation = true;
@@ -2640,7 +2639,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
-            if (Interlocked.Increment(ref _createCalls) == 2)
+            if (Interlocked.Increment(ref _createCalls) == 3)
             {
                 try
                 {
@@ -2993,6 +2992,11 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         WorkBranch = "feature/x",
         PushUpstream = false,
     };
+
+    private static IReadOnlyList<string> WithoutBuildTestGate(IEnumerable<string>? auditors)
+        => (auditors ?? [])
+            .Where(a => !string.Equals(a, "test:build-and-test-pass", StringComparison.Ordinal))
+            .ToArray();
 
     private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
     {

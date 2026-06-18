@@ -87,6 +87,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.True(result.Passed);
         Assert.Empty(result.Findings);
         Assert.Equal("build.sh absent; auditor skipped", result.RawOutput);
+        Assert.False(result.BuildTestGateEvidenceVerified);
         Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
         var onlyExec = Assert.Single(sandbox.Executed);
         Assert.True(IsPresenceCheck(onlyExec));
@@ -344,7 +345,86 @@ public sealed class BuildScriptAuditorTests : IDisposable
         var auditor = new BuildScriptAuditor();
 
         Assert.Equal(AuditCapabilities.None, auditor.Required);
+        Assert.Equal(AuditorRole.None, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
         Assert.True(((IAuditSandboxIsolation)auditor).RequiresFreshSandbox);
+    }
+
+    [Fact]
+    public async Task Pipeline_PassingBuildScriptAloneDoesNotUnlockLlmPanel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var llm = new BuildScriptRecordingLlmAuditor();
+        var projectAudit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            StopOnFirstFailure = false,
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 }), llm],
+            projectAudit: projectAudit,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        var item = NewItem("feature/build-script-only") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitBuildScriptToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            """
+            #!/bin/sh
+            echo build ok
+            exit 0
+            """);
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(llm.SeenIterations);
+    }
+
+    [Fact]
+    public async Task Pipeline_OptionalMissingBuildScriptDoesNotProvideBuildEvidence_WhenTestGatePasses()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var testGate = new PassingTestGateAuditor();
+        var llm = new BuildScriptRecordingLlmAuditor();
+        var projectAudit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            StopOnFirstFailure = false,
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 }), testGate, llm],
+            projectAudit: projectAudit,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        var item = NewItem("feature/optional-build-script-missing") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitFileToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "work.txt",
+            "work complete\n");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([1], testGate.SeenIterations);
+        Assert.Empty(llm.SeenIterations);
     }
 
     [Fact]
@@ -645,6 +725,12 @@ public sealed class BuildScriptAuditorTests : IDisposable
         OriginalPrompt: "prompt",
         BuildScriptRequired: required);
 
+    private static ConstantCredentialProvider AuditCredentials()
+        => new(new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "test-key" },
+            new Dictionary<string, string>()));
+
     private static WorkItem NewItem(string workBranch) => new()
     {
         Id = WorkItemId.New(),
@@ -832,6 +918,44 @@ public sealed class BuildScriptAuditorTests : IDisposable
         {
             var removed = Reports.RemoveAll(r => r.StartedAt < cutoff);
             return Task.FromResult(removed);
+        }
+    }
+
+    private sealed class BuildScriptRecordingLlmAuditor : IAuditor
+    {
+        public string Name => "quality:llm-review";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+        public List<int> SeenIterations { get; } = [];
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            SeenIterations.Add(context.Iteration);
+            return Task.FromResult(new AuditResult(true, []));
+        }
+    }
+
+    private sealed class PassingTestGateAuditor : IAuditor
+    {
+        public string Name => "custom:test-pass";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public AuditorRole Role => AuditorRole.BuildTestGate;
+        public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.Test;
+        public List<int> SeenIterations { get; } = [];
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            SeenIterations.Add(context.Iteration);
+            return Task.FromResult(new AuditResult(true, []));
         }
     }
 }

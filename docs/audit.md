@@ -86,6 +86,44 @@ network (downloading CVE feeds, fetching package versions), declare
 if the auditor itself is an LLM call. Declare `AuditCapabilities.Graphical`
 when the auditor requires a desktop sandbox.
 
+### Build/test gate ordering
+
+In addition to capability flags, an auditor can declare a `Role` of
+`AuditorRole.BuildTestGate`. The pipeline GUARANTEES every BuildTestGate
+auditor runs and passes before any LLM-driven auditor runs in the same
+audit iteration. The LLM panel requires verified build and test evidence:
+either one gate with `gateEvidence: build-and-test`, or separate passing
+`build` and `test` gates. If any BuildTestGate auditor produces a blocking
+finding or reports unverified evidence, the LLM panel is skipped for that
+iteration — the LLM prompt frame asserts that CI built the project and ran
+tests with no failures, and that claim must never be false. The findings
+still flow to rework as normal.
+
+This gate is independent of `StopOnFirstFailure`: even when the option is
+`false` (the default), a failing build/test gate still short-circuits the
+LLM panel. Tool auditors without the role (e.g. format-check) do not gate
+the panel, because the panel's CI claim only covers build and tests.
+
+Built-in language presets mark the `<lang>:build-*` (where the preset
+ships a separate build step — currently only `csharp:build-WaE`) and the
+`<lang>:test-*` auditor as BuildTestGate. Go and Rust test commands build the
+tested packages as part of the command, so their `<lang>:test-*` gates
+advertise `build-and-test` evidence. Node and Python default test commands
+(`npm test`, `pytest`) advertise `test` evidence only; projects that want LLM
+review for those languages must also provide build evidence, for example with
+a trusted custom build gate.
+Gate metadata is accepted only from trusted configuration: built-in presets
+or operator/project appsettings overrides. Repository-supplied YAML can add
+shell auditors, but it cannot declare `role` or `gateEvidence`, because that
+would let an untrusted repository forge the CI evidence used to unlock LLM
+review. In trusted config, set `role: build-test-gate` plus explicit
+`gateEvidence` for any custom step (e.g. a separate `tsc`/`cargo check`/
+cross-compile) whose successful run should contribute to the LLM panel gate.
+If `gateEvidence` is omitted, the gate contributes no build/test evidence.
+The built-in `process:build-script` auditor runs a repository-owned
+`build.sh` as an ordinary tool audit only; it is not trusted build evidence
+and cannot unlock LLM review.
+
 ## Built-in auditors
 
 ### `ShellCommandAuditor` (`CodeyBox.Audit.Shell`)

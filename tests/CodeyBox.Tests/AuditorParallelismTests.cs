@@ -172,7 +172,7 @@ public sealed class AuditorParallelismTests : IDisposable
             }))
             .ToArray();
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: auditors, maxLlmAuditorParallelism: AuditorCount);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: TestAuditGates.WithPassedBuildAndTest(auditors), maxLlmAuditorParallelism: AuditorCount);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();
@@ -238,7 +238,7 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
 
         // Findings are Warnings; FailingSeverity defaults to Error so audit passes.
         using var tp = TestSupport.BuildPipeline(_workspace, seed,
-            auditors: [auditorA, auditorB, auditorC],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditorA, auditorB, auditorC),
             maxLlmAuditorParallelism: 3,
             auditReportStore: captureStore);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -257,6 +257,7 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
         var reports = captureStore.Reports
             .Where(r => r.WorkItemId == item.Id.ToString())
             .Select(r => r.AuditorName)
+            .Where(n => n != "test:build-and-test-pass")
             .ToList();
         Assert.Equal(["A", "B", "C"], reports);
     }
@@ -285,7 +286,7 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
 
         // StopOnFirstFailure requires maxAuditIterations=1 to avoid a rework loop
         // consuming the missing work-plan entries and confusing the assertion.
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditorA, auditorB],
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: TestAuditGates.WithPassedBuildAndTest(auditorA, auditorB),
             maxAuditIterations: 1, maxLlmAuditorParallelism: 2);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
@@ -342,7 +343,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [laterTool, llm, gate],
+            auditors: TestAuditGates.WithPassedBuildAndTest(laterTool, llm, gate),
             maxAuditIterations: 1,
             auditReportStore: reports);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -356,7 +357,10 @@ public sealed class AuditorShortCircuitTests : IDisposable
         Assert.Equal(1, gateCalls);
         Assert.Equal(0, laterToolCalls);
         Assert.Equal(0, llmCalls);
-        Assert.Equal(["gate:build"], reports.Reports.Select(r => r.AuditorName).ToArray());
+        Assert.Equal(["gate:build"], reports.Reports
+            .Select(r => r.AuditorName)
+            .Where(n => n != "test:build-and-test-pass")
+            .ToArray());
     }
 
     [Fact]
@@ -390,7 +394,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [laterTool, llm, gate],
+            auditors: TestAuditGates.WithPassedBuildAndTest(laterTool, llm, gate),
             maxAuditIterations: 1,
             auditReportStore: reports);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -404,7 +408,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
         Assert.Equal(1, gateCalls);
         Assert.Equal(0, laterToolCalls);
         Assert.Equal(0, llmCalls);
-        var report = Assert.Single(reports.Reports);
+        var report = Assert.Single(reports.Reports, r => r.AuditorName != "test:build-and-test-pass");
         Assert.Equal("gate:build", report.AuditorName);
         var finding = Assert.Single(report.Findings);
         Assert.Equal("Error", finding.Severity);
@@ -430,7 +434,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [laterTool, llm, gate],
+            auditors: TestAuditGates.WithPassedBuildAndTest(laterTool, llm, gate),
             maxAuditIterations: 1,
             auditReportStore: reports);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
@@ -442,11 +446,13 @@ public sealed class AuditorShortCircuitTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(["gate:build", "tool:later", "llm:review"],
-            reports.Reports.Select(r => r.AuditorName).ToArray());
+            reports.Reports.Select(r => r.AuditorName)
+                .Where(n => n != "test:build-and-test-pass")
+                .ToArray());
     }
 
     [Fact]
-    public async Task DisabledShortCircuit_RunsRemainingAuditorsAfterBlockingGate()
+    public async Task DisabledShortCircuit_PreservesNonGateRegistrationOrder()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new CapturingAuditReportStore();
@@ -472,7 +478,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [laterTool, gate, llm],
+            auditors: TestAuditGates.WithPassedBuildAndTest(laterTool, gate, llm),
             maxAuditIterations: 1,
             auditReportStore: reports,
             pipelineTuning: tuning);
@@ -485,7 +491,9 @@ public sealed class AuditorShortCircuitTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Equal(["tool:later", "gate:build", "llm:review"],
-            reports.Reports.Select(r => r.AuditorName).ToArray());
+            reports.Reports.Select(r => r.AuditorName)
+                .Where(n => n != "test:build-and-test-pass")
+                .ToArray());
     }
 }
 
@@ -516,7 +524,7 @@ public sealed class AuditorParallelismRespectsMaxTests : IDisposable
             }))
             .ToArray();
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: auditors, maxLlmAuditorParallelism: 1);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: TestAuditGates.WithPassedBuildAndTest(auditors), maxLlmAuditorParallelism: 1);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();
@@ -568,7 +576,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
             return Task.FromResult(new AuditResult(true, []));
         });
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], maxAuditIterations: 1);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: TestAuditGates.WithPassedBuildAndTest(auditor), maxAuditIterations: 1);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();
@@ -601,7 +609,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
             },
             AuditCapabilities.AgentCredentials);
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], maxAuditIterations: 1);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: TestAuditGates.WithPassedBuildAndTest(auditor), maxAuditIterations: 1);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();
@@ -679,7 +687,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions);
@@ -752,7 +760,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions);
@@ -818,7 +826,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions);
@@ -906,7 +914,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions);
@@ -988,7 +996,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions,
@@ -1082,7 +1090,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions,
@@ -1184,7 +1192,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions,
@@ -1286,7 +1294,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions);
@@ -1409,7 +1417,7 @@ public sealed class AuditorParallelismIsolationTests : IDisposable
             return new AuditResult(false, [new AuditFinding("B", AuditSeverity.Warning, "warn-B", "from B")]);
         });
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditorA, auditorB], maxLlmAuditorParallelism: 2);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: TestAuditGates.WithPassedBuildAndTest(auditorA, auditorB), maxLlmAuditorParallelism: 2);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();
@@ -1458,7 +1466,7 @@ public sealed class AuditorParallelismCancellationTests : IDisposable
             }))
             .ToArray();
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: auditors, maxLlmAuditorParallelism: 3);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: TestAuditGates.WithPassedBuildAndTest(auditors), maxLlmAuditorParallelism: 3);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();
@@ -1520,7 +1528,7 @@ public sealed class AuditorParallelismCancellationTests : IDisposable
         });
 
         using var tp = TestSupport.BuildPipeline(_workspace, seed,
-            auditors: [auditor], maxAuditIterations: 1);
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor), maxAuditIterations: 1);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();

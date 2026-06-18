@@ -202,7 +202,7 @@ public sealed class CrossReviewIntegrationTests : IDisposable
         };
 
         var projects = new InMemoryProjectRepository(project);
-        var presetCatalog = new ScriptedAuditorCatalog([.. auditors]);
+        var presetCatalog = new ScriptedAuditorCatalog([.. TestAuditGates.WithPassedBuildAndTest(auditors)]);
         var composer = new ProjectAuditorComposer(presetCatalog);
         // Gemini has credentials; Claude uses the null provider (existing test convention).
         var credentials = new SelectiveCredentialProvider(AgentKind.Gemini);

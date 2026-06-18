@@ -62,6 +62,20 @@
           },
           "canShortCircuitOnBlockingFinding": {
             "type": "boolean"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "build-test-gate"
+            ]
+          },
+          "gateEvidence": {
+            "type": "string",
+            "enum": [
+              "build",
+              "test",
+              "build-and-test"
+            ]
           }
         }
       }

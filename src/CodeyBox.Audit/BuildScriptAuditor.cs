@@ -3,9 +3,11 @@ using CodeyBox.Core;
 namespace CodeyBox.Audit;
 
 /// <summary>
-/// Language-agnostic build gate driven by a project-owned repo-root
+/// Language-agnostic build check driven by a project-owned repo-root
 /// <c>build.sh</c>. Runs as a credential-free tool auditor; the project owns
 /// what the script does, while CodeyBox only enforces the exit contract.
+/// Because the reviewed branch controls this script, passing it is not trusted
+/// CI evidence for the build/test-gated LLM prompt.
 /// </summary>
 public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
 {
@@ -33,6 +35,8 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
     public AuditCapabilities Required => AuditCapabilities.None;
     public bool RequiresFreshSandbox => true;
     public string? SelfReviewGuidance => "run build (warnings-as-errors) + formatter before committing";
+    public AuditorRole Role => AuditorRole.None;
+    public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.None;
 
 
     public async Task<AuditResult> RunAsync(
@@ -120,7 +124,13 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
     }
 
     private static AuditResult MissingOptionalResult()
-        => new(true, [], RawOutput: "build.sh absent; auditor skipped");
+        => new(
+            true,
+            [],
+            RawOutput: "build.sh absent; auditor skipped")
+        {
+            BuildTestGateEvidenceVerified = false,
+        };
 
     private static AuditResult MissingRequiredResult(string description)
     {

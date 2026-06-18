@@ -534,7 +534,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Done, final!.State);
-        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var rows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase != "audit:test:build-and-test-pass")
+            .ToList();
         Assert.Contains(rows, r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "failure:quota");
         Assert.Contains(rows, r => r.Phase == "rework" && r.Iteration == 2 && r.Outcome == "success");
 
@@ -695,7 +697,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Done, finalItem!.State);
 
-        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var rows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase != "audit:test:build-and-test-pass")
+            .ToList();
 
         // One row per phase transition, in order. The OnceFailingAuditor forces a
         // single rework (audit iter 1 fails, iter 2 passes); the rework following
@@ -747,7 +751,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Done, finalItem!.State);
 
-        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var rows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase != "audit:test:build-and-test-pass")
+            .ToList();
 
         // 1 work + 3 audits(iter1) + 1 rework + 3 audits(iter2) + 1 merge = 9.
         // The three LLM auditors run concurrently, so rows within a single audit
@@ -806,7 +812,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Done, finalItem!.State);
 
-        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var rows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase != "audit:test:build-and-test-pass")
+            .ToList();
 
         // 1 work + 2 audits(iter1) + 1 rework + 2 audits(iter2) + 1 merge = 7.
         Assert.Equal(7, rows.Count);
@@ -1919,6 +1927,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         };
 
         var auditorList = auditors ?? [];
+        var effectiveAuditors = auditorList.Any(RequiresBuildTestGate)
+            ? TestAuditGates.WithPassedBuildAndTest(auditorList)
+            : auditorList;
         var project = new Project
         {
             Id = new ProjectId("test-project"),
@@ -1937,7 +1948,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         };
 
         var projects = new InMemoryProjectRepository(project);
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(effectiveAuditors));
 
         var codexProbe = new RecordingProbe(AgentKind.Codex, codexQuotaSnapshot);
         var claudeProbe = new RecordingProbe(AgentKind.Claude, claudeQuotaSnapshot);
@@ -1986,6 +1997,10 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
+
+    private static bool RequiresBuildTestGate(IAuditor auditor)
+        => string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase)
+            || (auditor.Required & AuditCapabilities.AgentCredentials) != 0;
 
     private TestFixture BuildPipelineWithCost(string seedRepoUrl, IWorkItemCostStore costStore)
     {

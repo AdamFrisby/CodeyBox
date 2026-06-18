@@ -580,6 +580,20 @@ public static class AuditLog
                 auditorName, workItemId.ToString(), candidateCount);
 
     /// <summary>
+    /// Emitted when build/test-gated auditors are skipped because verified
+    /// build and test evidence is unavailable, or because one or more
+    /// BuildTestGate-role auditors produced a blocking finding in this audit
+    /// iteration. LLM prompt frames assert "CI built and ran tests with no
+    /// failures"; that claim must stay true, so gated auditors are bypassed
+    /// until the deterministic evidence is present.
+    /// </summary>
+    public static void LlmPanelSkippedBuildTestGate(WorkItemId workItemId, int skippedAuditorCount) =>
+        Audit("audit.llm_panel_skipped_build_test_gate")
+            .Information(
+                "Build/test-gated auditor(s) skipped for {WorkItemId}: {SkippedCount} auditor(s) bypassed because verified build/test gate evidence was unavailable or a build/test gate failed in this iteration",
+                workItemId.ToString(), skippedAuditorCount);
+
+    /// <summary>
     /// Emitted when the pickup-time rebase resolver routed past a candidate
     /// whose non-cap pre-dispatch gate rejected it. <paramref name="rejectedAgent"/>
     /// is the resolver's primary candidate: the configured

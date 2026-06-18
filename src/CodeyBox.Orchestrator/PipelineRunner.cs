@@ -5421,18 +5421,34 @@ public sealed class PipelineRunner : IPipelineRunner
                     PromptRevisionAtDispatch: revisionForCtx,
                     BuildScriptRequired: project.Audit.BuildScriptRequired,
                     ProjectId: project.Id.Value);
-                var collectTask = CollectFindingsAsync(
-                    item,
-                    project,
-                    runner,
-                    scheduledAuditors,
-                    repoId,
-                    ctx,
-                    auditShortCircuitEnabled,
+                var preCollectedFindings = new List<AuditFinding>();
+                var preCompletedAuditors = new List<string>();
+                var prePassedBuildTestGateEvidence = BuildTestGateEvidence.None;
+                var auditorsForCollection = scheduledAuditors;
+                if (scheduledAuditors.Any(RequiresPassedBuildTestGate))
+                {
+                    var requiredBuildGateResult = await _requiredBuildGate.RunForAuditGateAsync(
+                        item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
+                    if (requiredBuildGateResult.Applies)
+                        preCompletedAuditors.Add(RequiredBuildGateIdentity.AuditorName);
+                    if (requiredBuildGateResult.Finding is not null)
+                    {
+                        preCollectedFindings.Add(requiredBuildGateResult.Finding);
+                        auditorsForCollection = scheduledAuditors
+                            .Where(a => !RequiresPassedBuildTestGate(a))
+                            .ToList();
+                    }
+                }
+
+                Func<AuditProgressUpdate, CancellationToken, Task> progressUpdateWithPreCollected =
                     async (progress, progressCt) =>
                     {
-                        var partialFindings = progress.Findings;
-                        var partialCompletedAuditors = progress.CompletedAuditors;
+                        IReadOnlyList<AuditFinding> partialFindings = progress.Operation == AuditProgressUpdateOperation.Replace
+                            ? progress.Findings
+                            : [.. preCollectedFindings, .. progress.Findings];
+                        IReadOnlyList<string> partialCompletedAuditors = progress.Operation == AuditProgressUpdateOperation.Replace
+                            ? progress.CompletedAuditors
+                            : [.. preCompletedAuditors, .. progress.CompletedAuditors];
                         var partialBlocking = partialFindings
                             .Where(f => f.Severity >= project.Audit.FailingSeverity)
                             .ToList();
@@ -5452,7 +5468,18 @@ public sealed class PipelineRunner : IPipelineRunner
                                 scheduledAuditorNames,
                                 partialCompletedAuditors),
                             progressCt).ConfigureAwait(false);
-                    },
+                    };
+
+                var collectTask = CollectFindingsAsync(
+                    item,
+                    project,
+                    runner,
+                    auditorsForCollection,
+                    repoId,
+                    ctx,
+                    auditShortCircuitEnabled,
+                    prePassedBuildTestGateEvidence,
+                    progressUpdateWithPreCollected,
                     auditPhase.Token);
                 var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completedAuditTask != collectTask)
@@ -5467,16 +5494,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 }
 
                 var collection = await collectTask;
-                findings = collection.Findings;
+                findings = [.. preCollectedFindings, .. collection.Findings];
                 activeAuditAgentKind = collection.ActiveAuditAgentKind;
                 declaredShortCircuitBlocking = collection.DeclaredShortCircuitBlocking;
                 incompleteVerdict = collection.IncompleteVerdict;
-                completedAuditors = collection.CompletedAuditors ?? [];
+                completedAuditors = [.. preCompletedAuditors, .. (collection.CompletedAuditors ?? [])];
                 incompleteAuditors = collection.IncompleteAuditors ?? [];
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
 
-                requiredBuildFinding = incompleteVerdict
+                requiredBuildFinding = incompleteVerdict || scheduledAuditors.Any(RequiresPassedBuildTestGate)
                     ? null
                     : await _requiredBuildGate.RunForAuditAsync(
                         item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
@@ -6224,23 +6251,129 @@ public sealed class PipelineRunner : IPipelineRunner
         string repoId,
         AuditContext ctx,
         bool auditShortCircuitEnabled,
+        BuildTestGateEvidence initialPassedBuildTestGateEvidence,
         Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate,
         CancellationToken ct)
     {
-        if (!auditShortCircuitEnabled)
+        if (auditors.Count == 0)
+            return EmptyAuditorBatchResult(initialPassedBuildTestGateEvidence);
+
+        var buildTestGateAuditors = auditors
+            .Where(a => a.Role == AuditorRole.BuildTestGate)
+            .Select((auditor, index) => new { Auditor = auditor, Index = index })
+            .OrderBy(x => BuildTestGateOrderingTier(x.Auditor))
+            .ThenBy(x => x.Index)
+            .Select(x => x.Auditor)
+            .ToList();
+        var remainingAuditors = buildTestGateAuditors.Count == 0
+            ? auditors
+            : auditors.Where(a => a.Role != AuditorRole.BuildTestGate).ToList();
+
+        var prefix = EmptyAuditorBatchResult(initialPassedBuildTestGateEvidence);
+        if (buildTestGateAuditors.Count > 0)
         {
-            var all = await CollectFindingsBatchAsync(
+            var gate = await CollectFindingsBatchAsync(
                 item,
                 project,
                 workRunner,
-                auditors,
+                buildTestGateAuditors,
+                repoId,
+                ctx,
+                detectDeclaredShortCircuit: auditShortCircuitEnabled,
+                progressUpdate,
+                ct);
+
+            prefix = MergeAuditorBatchResults(prefix, gate);
+            if (gate.IncompleteVerdict)
+                return prefix;
+            if (gate.DeclaredShortCircuitBlocking)
+                return prefix;
+            if (project.Audit.StopOnFirstFailure
+                && gate.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+            {
+                return prefix;
+            }
+        }
+
+        if (remainingAuditors.Count == 0)
+            return prefix;
+
+        var gatedReviewAuditors = remainingAuditors
+            .Where(RequiresPassedBuildTestGate)
+            .ToList();
+        if (gatedReviewAuditors.Count > 0
+            && (prefix.BuildTestGateFailed || !HasPassedBuildAndTestGateEvidence(prefix)))
+        {
+            _log.LogInformation(
+                "Audit iteration {Iter}: skipping {Count} build/test-gated auditor(s) because verified deterministic build-and-test evidence is unavailable or a build/test gate failed",
+                ctx.Iteration,
+                gatedReviewAuditors.Count);
+            AuditLog.LlmPanelSkippedBuildTestGate(item.Id, gatedReviewAuditors.Count);
+
+            if (!prefix.BuildTestGateFailed && !HasPassedBuildAndTestGateEvidence(prefix))
+            {
+                var missingGate = MissingBuildTestGateFinding(gatedReviewAuditors);
+                prefix = MergeAuditorBatchResults(
+                    prefix,
+                    new AuditorBatchResult([missingGate], null, false));
+            }
+
+            remainingAuditors = remainingAuditors
+                .Where(a => !RequiresPassedBuildTestGate(a))
+                .ToList();
+
+            if (remainingAuditors.Count == 0)
+            {
+                if (progressUpdate is not null)
+                {
+                    await progressUpdate(
+                        new AuditProgressUpdate(
+                            prefix.Findings,
+                            prefix.CompletedAuditors ?? []),
+                        ct).ConfigureAwait(false);
+                }
+                return prefix;
+            }
+        }
+
+        var remainingProgressUpdate = PrefixProgressUpdate(prefix, progressUpdate);
+        var remaining = auditShortCircuitEnabled
+            ? await CollectFindingsWithDeclaredShortCircuitAsync(
+                item,
+                project,
+                workRunner,
+                remainingAuditors,
+                repoId,
+                ctx,
+                remainingProgressUpdate,
+                ct)
+            : (await CollectFindingsBatchAsync(
+                item,
+                project,
+                workRunner,
+                remainingAuditors,
                 repoId,
                 ctx,
                 detectDeclaredShortCircuit: false,
-                progressUpdate,
-                ct);
-            return all with { DeclaredShortCircuitBlocking = false };
-        }
+                remainingProgressUpdate,
+                ct)) with
+            { DeclaredShortCircuitBlocking = false };
+
+        return MergeAuditorBatchResults(prefix, remaining);
+    }
+
+    private async Task<AuditorBatchResult> CollectFindingsWithDeclaredShortCircuitAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner workRunner,
+        IReadOnlyList<IAuditor> auditors,
+        string repoId,
+        AuditContext ctx,
+        Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate,
+        CancellationToken ct)
+    {
+        if (auditors.Count == 0)
+            return EmptyAuditorBatchResult();
 
         var gateAuditors = auditors
             .Where(a => a.CanShortCircuitOnBlockingFinding)
@@ -6310,13 +6443,9 @@ public sealed class PipelineRunner : IPipelineRunner
             remainingProgressUpdate,
             ct);
 
-        return new AuditorBatchResult(
-            [.. gate.Findings, .. remaining.Findings],
-            gate.ActiveAuditAgentKind ?? remaining.ActiveAuditAgentKind,
-            false,
-            gate.IncompleteVerdict || remaining.IncompleteVerdict,
-            [.. (gate.CompletedAuditors ?? []), .. (remaining.CompletedAuditors ?? [])],
-            [.. (gate.IncompleteAuditors ?? []), .. (remaining.IncompleteAuditors ?? [])]);
+        return MergeAuditorBatchResults(
+            gate with { DeclaredShortCircuitBlocking = false },
+            remaining);
     }
 
     private static IReadOnlyList<IAuditor> OrderAuditorsForShortCircuit(
@@ -6328,7 +6457,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         return auditors
             .Select((auditor, index) => new { Auditor = auditor, Index = index })
-            .OrderBy(x => x.Auditor.CanShortCircuitOnBlockingFinding ? 0 : 1)
+            .OrderBy(x => AuditorOrdering.TierOf(x.Auditor))
             .ThenBy(x => x.Index)
             .Select(x => x.Auditor)
             .ToList();
@@ -6339,6 +6468,162 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private static bool IsDeclaredShortCircuitBlockingResult(AuditResult result)
         => !result.Passed || result.Findings.Any(f => f.Severity == AuditSeverity.Error);
+
+    private static bool RequiresPassedBuildTestGate(IAuditor auditor)
+        => auditor is IRequiresPassedBuildTestGate
+           || string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase);
+
+    private static AuditorBatchResult EmptyAuditorBatchResult()
+        => new([], null, false, CompletedAuditors: []);
+
+    private static AuditorBatchResult EmptyAuditorBatchResult(
+        BuildTestGateEvidence passedBuildTestGateEvidence)
+        => new(
+            [],
+            null,
+            false,
+            CompletedAuditors: [],
+            PassedBuildTestGateEvidence: passedBuildTestGateEvidence);
+
+    private static int BuildTestGateOrderingTier(IAuditor auditor)
+    {
+        var evidence = auditor.BuildTestGateEvidence;
+        if ((evidence & BuildTestGateEvidence.Build) == BuildTestGateEvidence.Build)
+            return 0;
+        if ((evidence & BuildTestGateEvidence.Test) == BuildTestGateEvidence.Test)
+            return 1;
+        return 2;
+    }
+
+    private static AuditorBatchResult MergeAuditorBatchResults(
+        AuditorBatchResult first,
+        AuditorBatchResult second)
+        => new(
+            [.. first.Findings, .. second.Findings],
+            first.ActiveAuditAgentKind ?? second.ActiveAuditAgentKind,
+            first.DeclaredShortCircuitBlocking || second.DeclaredShortCircuitBlocking,
+            first.IncompleteVerdict || second.IncompleteVerdict,
+            [.. (first.CompletedAuditors ?? []), .. (second.CompletedAuditors ?? [])],
+            [.. (first.IncompleteAuditors ?? []), .. (second.IncompleteAuditors ?? [])],
+            first.PassedBuildTestGateEvidence | second.PassedBuildTestGateEvidence,
+            first.BuildTestGateFailed || second.BuildTestGateFailed);
+
+    private static Func<AuditProgressUpdate, CancellationToken, Task>? PrefixProgressUpdate(
+        AuditorBatchResult prefix,
+        Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate)
+    {
+        if (progressUpdate is null)
+            return null;
+
+        return (progress, progressCt) =>
+        {
+            if (progress.Operation == AuditProgressUpdateOperation.Replace)
+                return progressUpdate(progress, progressCt);
+
+            return progressUpdate(
+                progress with
+                {
+                    Findings = [.. prefix.Findings, .. progress.Findings],
+                    CompletedAuditors = [.. (prefix.CompletedAuditors ?? []), .. progress.CompletedAuditors],
+                },
+                progressCt);
+        };
+    }
+
+    private static AuditFinding MissingBuildTestGateFinding(IReadOnlyList<IAuditor> gatedReviewAuditors)
+    {
+        var auditorList = string.Join(", ", gatedReviewAuditors.Select(a => a.Name));
+        return new AuditFinding(
+            AuditorName: "audit:build-test-gate",
+            Severity: AuditSeverity.Error,
+            Title: "build/test-gated auditor skipped because no verified build/test gate passed",
+            Description: $"The configured build/test-gated auditor(s) require verified deterministic build and test evidence before they can run: {auditorList}. Configure build/test auditor(s) with role 'build-test-gate' and gateEvidence 'build-and-test', or separate 'build' and 'test' gates, that actually run and pass before the gated auditor(s).");
+    }
+
+    private static bool HasPassedBuildAndTestGateEvidence(AuditorBatchResult result)
+        => (result.PassedBuildTestGateEvidence & BuildTestGateEvidence.BuildAndTest)
+           == BuildTestGateEvidence.BuildAndTest;
+
+    private static AuditorRunRecord NormalizeBuildTestGateRun(
+        AuditorRunRecord run,
+        Project project,
+        out BuildTestGateEvidence passedGateEvidence,
+        out bool failedGate)
+    {
+        passedGateEvidence = BuildTestGateEvidence.None;
+        failedGate = false;
+
+        if (run.Auditor.Role != AuditorRole.BuildTestGate)
+            return run;
+
+        var blocking = HasAuditBlockingFinding(run.Result, project);
+        var unverified = run.Result.Passed
+            && !blocking
+            && run.Result.BuildTestGateEvidenceVerified == false
+            && !IsOptionalSkippedBuildTestGate(run);
+        failedGate = !run.Result.Passed || blocking || unverified;
+        if (!failedGate)
+        {
+            passedGateEvidence = BuildTestGatePassEvidence(run);
+            return run;
+        }
+
+        if (unverified)
+        {
+            var unverifiedFindings = run.Result.Findings
+                .Append(new AuditFinding(
+                    AuditorName: run.Auditor.Name,
+                    Severity: AuditSeverity.Error,
+                    Title: "build/test gate did not verify",
+                    Description: $"Build/test gate '{run.Auditor.Name}' returned a passing result but explicitly reported that its evidence was not verified. Build/test-gated auditor(s) were skipped because the CI-passed prompt claim cannot be verified."))
+                .ToList();
+            return run with
+            {
+                Result = run.Result with
+                {
+                    Passed = false,
+                    Findings = unverifiedFindings,
+                },
+            };
+        }
+
+        if (blocking)
+            return run.Result.Passed
+                ? run with { Result = run.Result with { Passed = false } }
+                : run;
+
+        var augmentedFindings = run.Result.Findings
+            .Append(new AuditFinding(
+                AuditorName: run.Auditor.Name,
+                Severity: AuditSeverity.Error,
+                Title: "build/test gate did not pass",
+                Description: $"Build/test gate '{run.Auditor.Name}' returned a non-passing result without a blocking finding. Build/test-gated auditor(s) were skipped because the CI-passed prompt claim cannot be verified."))
+            .ToList();
+        return run with
+        {
+            Result = run.Result with
+            {
+                Passed = false,
+                Findings = augmentedFindings,
+            },
+        };
+    }
+
+    private static BuildTestGateEvidence BuildTestGatePassEvidence(AuditorRunRecord run)
+    {
+        if (!run.Result.Passed)
+            return BuildTestGateEvidence.None;
+        if (run.Result.BuildTestGateEvidenceVerified == false)
+            return BuildTestGateEvidence.None;
+
+        return run.Auditor.BuildTestGateEvidence;
+    }
+
+    private static bool IsOptionalSkippedBuildTestGate(AuditorRunRecord run)
+        => run.Auditor.Name.Equals(WellKnownAuditorNames.BuildScript, StringComparison.OrdinalIgnoreCase)
+           && run.Result.Passed
+           && run.Result.BuildTestGateEvidenceVerified == false
+           && run.Result.Findings.Count == 0;
 
     private async Task<AuditorBatchResult> CollectFindingsBatchAsync(
         WorkItem item,
@@ -6417,6 +6702,13 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
 
+        // BuildTestGate-role auditors are always forced to the front because
+        // the LLM prompt frame claims build/tests already passed. Declared
+        // short-circuit auditors only get priority when the operator switch
+        // is enabled; with it disabled, non-gate auditors keep their normal
+        // registration order as far as the capability grouping below allows.
+        resolved = OrderResolvedAuditorsForBatch(resolved, detectDeclaredShortCircuit);
+
         // Group by (capabilities, resolved-runner-kind) so auditors that need
         // different agent credentials get separate sandboxes — each sandbox is
         // only ever loaded with the credentials of a single agent kind.
@@ -6428,6 +6720,14 @@ public sealed class PipelineRunner : IPipelineRunner
                     ? x.Member?.RouteKey ?? x.Runner.Kind.Value
                     : string.Empty))
             .ToList();
+
+        // Once any BuildTestGate auditor does not pass, the LLM panel's
+        // prompt-frame claim ("CI built the project and ran the full test
+        // suite with no failures") would be false, so we skip LLM auditors
+        // entirely for this iteration. The build/test findings still flow to
+        // rework as normal.
+        var passedBuildTestGateEvidence = BuildTestGateEvidence.None;
+        var buildTestGateFailed = false;
 
         foreach (var group in byCaps)
         {
@@ -6574,6 +6874,14 @@ public sealed class PipelineRunner : IPipelineRunner
                                 ct);
                         }
 
+                        run = NormalizeBuildTestGateRun(
+                            run,
+                            project,
+                            out var passedGateEvidence,
+                            out var failedGate);
+                        passedBuildTestGateEvidence |= passedGateEvidence;
+                        buildTestGateFailed |= failedGate;
+
                         await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                         if (needsCreds && runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= runner.Kind;
@@ -6586,12 +6894,15 @@ public sealed class PipelineRunner : IPipelineRunner
                         {
                             declaredShortCircuitBlocking = true;
                         }
-                        if (project.Audit.StopOnFirstFailure && HasAuditBlockingFinding(run.Result, project))
+                        var blockingForThisAuditor = HasAuditBlockingFinding(run.Result, project);
+                        if (project.Audit.StopOnFirstFailure && blockingForThisAuditor)
                             return new AuditorBatchResult(
                                 findings.ToList(),
                                 activeAuditAgentKind,
                                 declaredShortCircuitBlocking,
-                                CompletedAuditors: completedAuditors.ToList());
+                                CompletedAuditors: completedAuditors.ToList(),
+                                PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
+                                BuildTestGateFailed: buildTestGateFailed);
                     }
                 }
                 catch (AuditorIdleTimeoutException ex)
@@ -6608,7 +6919,9 @@ public sealed class PipelineRunner : IPipelineRunner
                         declaredShortCircuitBlocking,
                         IncompleteVerdict: true,
                         CompletedAuditors: completedAuditors.ToList(),
-                        IncompleteAuditors: [ex.AuditorName]);
+                        IncompleteAuditors: [ex.AuditorName],
+                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
+                        BuildTestGateFailed: buildTestGateFailed);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException
                                            && (findings.Count > 0 || completedAuditors.Count > 0))
@@ -6628,6 +6941,14 @@ public sealed class PipelineRunner : IPipelineRunner
             // /audit/result.json. Post-processing is sequential and stable-ordered.
             if (llmPairs.Count > 0)
             {
+                if (buildTestGateFailed)
+                {
+                    _log.LogInformation(
+                        "Audit iteration {Iter}: skipping {Count} LLM auditor(s) because a build/test gate produced a blocking finding — the LLM prompt frame asserts CI passed, so the panel must not run when that claim is false",
+                        ctx.Iteration, llmPairs.Count);
+                    AuditLog.LlmPanelSkippedBuildTestGate(item.Id, llmPairs.Count);
+                    continue;
+                }
                 var maxPar = project.Audit.MaxLlmAuditorParallelism;
                 using var sem = new SemaphoreSlim(maxPar, maxPar);
 
@@ -6981,7 +7302,9 @@ public sealed class PipelineRunner : IPipelineRunner
                         declaredShortCircuitBlocking,
                         IncompleteVerdict: true,
                         CompletedAuditors: partialCompleted,
-                        IncompleteAuditors: incompleteAuditors);
+                        IncompleteAuditors: incompleteAuditors,
+                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
+                        BuildTestGateFailed: buildTestGateFailed);
                 }
 
                 // Every task succeeded — gather results in stable order.
@@ -7012,7 +7335,9 @@ public sealed class PipelineRunner : IPipelineRunner
                         findings.ToList(),
                         activeAuditAgentKind,
                         declaredShortCircuitBlocking,
-                        CompletedAuditors: completedAuditors.ToList());
+                        CompletedAuditors: completedAuditors.ToList(),
+                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
+                        BuildTestGateFailed: buildTestGateFailed);
             }
         }
 
@@ -7020,7 +7345,33 @@ public sealed class PipelineRunner : IPipelineRunner
             findings.ToList(),
             activeAuditAgentKind,
             declaredShortCircuitBlocking,
-            CompletedAuditors: completedAuditors.ToList());
+            CompletedAuditors: completedAuditors.ToList(),
+            PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
+            BuildTestGateFailed: buildTestGateFailed);
+    }
+
+    private static List<(IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member)> OrderResolvedAuditorsForBatch(
+        IReadOnlyList<(IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member)> resolved,
+        bool detectDeclaredShortCircuit)
+    {
+        if (resolved.Count <= 1)
+            return resolved.ToList();
+
+        return resolved
+            .Select((entry, index) => new { Entry = entry, Index = index })
+            .OrderBy(x => BatchOrderingTier(x.Entry.Auditor, detectDeclaredShortCircuit))
+            .ThenBy(x => x.Index)
+            .Select(x => x.Entry)
+            .ToList();
+    }
+
+    private static int BatchOrderingTier(IAuditor auditor, bool detectDeclaredShortCircuit)
+    {
+        if (auditor.Role == AuditorRole.BuildTestGate)
+            return 0;
+        if (detectDeclaredShortCircuit && auditor.CanShortCircuitOnBlockingFinding)
+            return 1;
+        return 2;
     }
 
     /// <summary>
@@ -7671,7 +8022,9 @@ public sealed class PipelineRunner : IPipelineRunner
         bool DeclaredShortCircuitBlocking,
         bool IncompleteVerdict = false,
         IReadOnlyList<string>? CompletedAuditors = null,
-        IReadOnlyList<string>? IncompleteAuditors = null);
+        IReadOnlyList<string>? IncompleteAuditors = null,
+        BuildTestGateEvidence PassedBuildTestGateEvidence = BuildTestGateEvidence.None,
+        bool BuildTestGateFailed = false);
 
     private enum AuditProgressUpdateOperation
     {

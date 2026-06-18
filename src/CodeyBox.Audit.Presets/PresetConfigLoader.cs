@@ -148,6 +148,8 @@ internal sealed class PresetConfigLoader
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
+                    Role = a.Role,
+                    GateEvidence = a.GateEvidence,
                 }).ToList(),
             };
             ValidateLanguage($"Audit.Languages.Overrides[{id}]", definition, allowPartial: languages.ContainsKey(id), isTrusted: true);
@@ -170,6 +172,8 @@ internal sealed class PresetConfigLoader
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
+                    Role = a.Role,
+                    GateEvidence = a.GateEvidence,
                 }).ToList(),
                 Patterns = ov.Patterns.Select(p => new DiffPatternDefinition
                 {
@@ -252,9 +256,22 @@ internal sealed class PresetConfigLoader
         if (!string.IsNullOrWhiteSpace(incoming.DisplayName))
             existing.DisplayName = incoming.DisplayName;
         if (incoming.Marker is not null)
+        {
+            if (!isTrusted && HasBuildTestGateMetadata(existing))
+            {
+                throw new PresetConfigurationException(
+                    $"Repository-provided language '{incoming.Id}' cannot override /marker for a language with trusted build-test-gate auditors. Use trusted project configuration to change build/test discovery.");
+            }
+
             existing.Marker = incoming.Marker;
+        }
         existing.Auditors.AddRange(incoming.Auditors);
     }
+
+    private static bool HasBuildTestGateMetadata(LanguagePresetDefinition definition)
+        => definition.Auditors.Any(static a =>
+            !string.IsNullOrWhiteSpace(a.Role) ||
+            !string.IsNullOrWhiteSpace(a.GateEvidence));
 
     private static IEnumerable<string> PresetFiles(string? projectRoot, string childDirectory)
     {
@@ -454,6 +471,53 @@ internal sealed class PresetConfigLoader
         {
             ValidateToolName(source, $"{pointer}/toolName", auditor.ToolName, isTrusted);
         }
+
+        if (!string.IsNullOrWhiteSpace(auditor.Role))
+        {
+            if (!isTrusted)
+                throw new PresetConfigurationException($"{source}: {pointer}/role is not allowed in repository-provided configuration. Build/test gate metadata must come from trusted configuration.");
+            _ = ParseAuditorRole(source, $"{pointer}/role", auditor.Role);
+        }
+        if (!string.IsNullOrWhiteSpace(auditor.GateEvidence))
+        {
+            if (!isTrusted)
+                throw new PresetConfigurationException($"{source}: {pointer}/gateEvidence is not allowed in repository-provided configuration. Build/test gate metadata must come from trusted configuration.");
+            _ = ParseBuildTestGateEvidence(source, $"{pointer}/gateEvidence", auditor.Role, auditor.GateEvidence);
+        }
+    }
+
+    internal static AuditorRole ParseAuditorRole(string source, string pointer, string? role)
+    {
+        if (string.IsNullOrWhiteSpace(role))
+            return AuditorRole.None;
+        return role.Equals("build-test-gate", StringComparison.OrdinalIgnoreCase)
+            ? AuditorRole.BuildTestGate
+            : throw new PresetConfigurationException($"{source}: {pointer} = '{role}' is not a recognised auditor role. Allowed values: build-test-gate.");
+    }
+
+    internal static BuildTestGateEvidence ParseBuildTestGateEvidence(
+        string source,
+        string pointer,
+        string? role,
+        string? evidence)
+    {
+        var parsedRole = ParseAuditorRole(
+            source,
+            pointer.Replace("/gateEvidence", "/role", StringComparison.Ordinal),
+            role);
+        if (string.IsNullOrWhiteSpace(evidence))
+            return BuildTestGateEvidence.None;
+
+        if (parsedRole != AuditorRole.BuildTestGate)
+            throw new PresetConfigurationException($"{source}: {pointer} requires role 'build-test-gate'.");
+
+        return evidence.Trim().ToLowerInvariant() switch
+        {
+            "build" => BuildTestGateEvidence.Build,
+            "test" => BuildTestGateEvidence.Test,
+            "build-and-test" => BuildTestGateEvidence.BuildAndTest,
+            _ => throw new PresetConfigurationException($"{source}: {pointer} = '{evidence}' is not a recognised gate evidence value. Allowed values: build, test, build-and-test."),
+        };
     }
 
     private static void ValidateToolName(string source, string pointer, string? tool, bool isTrusted)
@@ -549,14 +613,23 @@ internal sealed class PresetConfigLoader
             : BuildMarkerScript(marker.Globs);
 
         return definition.Auditors.Select(a =>
-            string.IsNullOrWhiteSpace(a.Script)
+        {
+            var role = ParseAuditorRole($"language '{definition.Id}'", $"/auditors/{a.Name}/role", a.Role);
+            var gateEvidence = ParseBuildTestGateEvidence(
+                $"language '{definition.Id}'",
+                $"/auditors/{a.Name}/gateEvidence",
+                a.Role,
+                a.GateEvidence);
+            return string.IsNullOrWhiteSpace(a.Script)
                 ? LanguagePresetHelpers.Shell(
                     definition.Id,
                     markerDescription,
                     markerScript,
                     a.Name,
+                    [.. a.Argv],
                     a.CanShortCircuitOnBlockingFinding,
-                    [.. a.Argv])
+                    role,
+                    gateEvidence)
                 : LanguagePresetHelpers.ShellScript(
                     definition.Id,
                     markerDescription,
@@ -565,7 +638,10 @@ internal sealed class PresetConfigLoader
                     a.Script,
                     a.ToolName ?? a.Name,
                     a.TreatExit127AsMissingTool,
-                    a.CanShortCircuitOnBlockingFinding)).ToList();
+                    a.CanShortCircuitOnBlockingFinding,
+                    role,
+                    gateEvidence);
+        }).ToList();
     }
 
     private static string BuildMarkerScript(IReadOnlyList<string> globs)
@@ -634,6 +710,19 @@ internal sealed class AuditorDefinition
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
     public bool CanShortCircuitOnBlockingFinding { get; set; }
+
+    /// <summary>
+    /// Optional role marker. The only accepted non-default value today is
+    /// <c>build-test-gate</c>, which marks the auditor as a deterministic
+    /// build or test gate the pipeline runs and passes before any LLM panel.
+    /// </summary>
+    public string? Role { get; set; }
+
+    /// <summary>
+    /// Optional evidence produced by a passing build-test gate:
+    /// <c>build</c>, <c>test</c>, or <c>build-and-test</c>.
+    /// </summary>
+    public string? GateEvidence { get; set; }
 }
 
 internal sealed class AuditTypePresetDefinition

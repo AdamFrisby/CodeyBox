@@ -10,6 +10,10 @@ auditors:
   - name: csharp:build-WaE
     canShortCircuitOnBlockingFinding: true
     argv: ["dotnet", "build", "--no-incremental", "/warnaserror"]
+    role: build-test-gate
+    gateEvidence: build
   - name: csharp:test-pass
     canShortCircuitOnBlockingFinding: true
     argv: ["dotnet", "test", "--no-build"]
+    role: build-test-gate
+    gateEvidence: test

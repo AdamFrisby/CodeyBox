@@ -7,7 +7,9 @@ namespace CodeyBox.Audit.Shell;
 /// sandbox. Most commands follow the shell-style "exit 0 = good" contract:
 /// exit code 0 passes, and non-zero fails with stdout/stderr captured as a
 /// single Error finding. If the top-level tool is confirmed missing before
-/// the command runs, the auditor emits a non-blocking Info finding instead.
+/// the command runs, the auditor usually emits a non-blocking Info finding;
+/// BuildTestGate auditors emit Error because missing deterministic build/test
+/// evidence must block dependent auditors.
 /// A command-specific result classifier can refine non-zero exits without
 /// making this generic shell runner aware of language- or tool-specific
 /// output formats.
@@ -44,6 +46,10 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         }
     }
 
+    public AuditorRole Role => _opts.Role;
+    public BuildTestGateEvidence BuildTestGateEvidence => _opts.Role == AuditorRole.BuildTestGate
+        ? _opts.BuildTestGateEvidence
+        : BuildTestGateEvidence.None;
 
     /// <summary>
     /// The argv this auditor invokes. Exposed so the work-phase prompt builder
@@ -96,7 +102,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         // propagate exit 127 from repository-controlled scripts; those remain
         // blocking command failures.
         var missingTool = IsConfirmedMissingTopLevelTool(result);
-        var severity = missingTool
+        var severity = missingTool && _opts.Role != AuditorRole.BuildTestGate
             ? AuditSeverity.Info
             : AuditSeverity.Error;
         var title = missingTool
@@ -137,7 +143,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     {
         var finding = new AuditFinding(
             AuditorName: Name,
-            Severity: AuditSeverity.Info,
+            Severity: _opts.Role == AuditorRole.BuildTestGate ? AuditSeverity.Error : AuditSeverity.Info,
             Title: $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)",
             Description: $"The auditor command was not run because '{toolName}' is not available in the audit sandbox.");
         return new AuditResult(false, [finding], RawOutput: rawOutput);
@@ -152,4 +158,6 @@ public sealed record ShellCommandAuditorOptions
     public bool? TreatExit127AsMissingTool { get; init; }
     public IShellCommandResultClassifier? ResultClassifier { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
+    public AuditorRole Role { get; init; } = AuditorRole.None;
+    public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;
 }

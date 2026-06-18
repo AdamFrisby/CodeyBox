@@ -42,6 +42,22 @@ public interface IAuditor
     /// </summary>
     string? SelfReviewGuidance => null;
 
+    /// <summary>
+    /// Optional role marker used by the pipeline to order and gate later
+    /// auditors. The default <see cref="AuditorRole.None"/> means "no special
+    /// role". Marking deterministic build/test commands as
+    /// <see cref="AuditorRole.BuildTestGate"/> lets later auditors require
+    /// verified build/test evidence before they run.
+    /// </summary>
+    AuditorRole Role => AuditorRole.None;
+
+    /// <summary>
+    /// Evidence produced by this auditor when <see cref="Role"/> is
+    /// <see cref="AuditorRole.BuildTestGate"/>. Implementations must opt in
+    /// explicitly; the default contributes no evidence so a role marker alone
+    /// cannot prove build or test coverage.
+    /// </summary>
+    BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.None;
 
     /// <summary>
     /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
@@ -62,6 +78,16 @@ public interface IAuditSandboxIsolation
     bool RequiresFreshSandbox => true;
 }
 
+/// <summary>
+/// Marker for auditors that require deterministic build/test gates to have
+/// completed successfully. The pipeline runs all
+/// <see cref="AuditorRole.BuildTestGate"/> auditors first and skips these
+/// auditors unless deterministic build and test evidence actually passed.
+/// LLM auditors are also gated by their <see cref="IAuditor.Kind"/> because
+/// the shared LLM prompt frame states that CI already ran successfully.
+/// </summary>
+public interface IRequiresPassedBuildTestGate;
+
 [Flags]
 public enum AuditCapabilities
 {
@@ -72,6 +98,39 @@ public enum AuditCapabilities
     Network = 1 << 1,
     /// <summary>Auditor needs a sandbox with graphical desktop capabilities.</summary>
     Graphical = 1 << 2,
+}
+
+/// <summary>
+/// Coarse-grained role classification used by the pipeline to enforce
+/// cross-auditor ordering invariants. Distinct from <see cref="AuditCapabilities"/>:
+/// capabilities describe what an auditor NEEDS; <see cref="AuditorRole"/>
+/// describes what role it FILLS in the audit panel.
+/// </summary>
+public enum AuditorRole
+{
+    /// <summary>Default — no special ordering or gating semantics.</summary>
+    None,
+
+    /// <summary>
+    /// Deterministic build/test gate (e.g. <c>csharp:build-WaE</c>,
+    /// <c>csharp:test-pass</c>). The pipeline runs auditors with this role
+    /// before auditors that require verified build/test evidence. If any
+    /// build/test gate does not pass, dependent auditors are skipped for that
+    /// iteration. Findings still flow to rework as normal.
+    /// </summary>
+    BuildTestGate,
+}
+
+/// <summary>
+/// The build/test evidence a BuildTestGate auditor can verify when it passes.
+/// </summary>
+[Flags]
+public enum BuildTestGateEvidence
+{
+    None = 0,
+    Build = 1 << 0,
+    Test = 1 << 1,
+    BuildAndTest = Build | Test,
 }
 
 /// <summary>Information the pipeline passes to each auditor.</summary>
@@ -148,13 +207,56 @@ public sealed record AuditContext(
     string? ProjectId = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
-public sealed record AuditResult(
-    bool Passed,
-    IReadOnlyList<AuditFinding> Findings,
-    string? RawOutput = null,
-    string? AgentStderr = null,
-    string? AgentSummary = null,
-    string? AgentStdout = null);
+public sealed record AuditResult
+{
+    public AuditResult(
+        bool Passed,
+        IReadOnlyList<AuditFinding> Findings,
+        string? RawOutput = null,
+        string? AgentStderr = null,
+        string? AgentSummary = null,
+        string? AgentStdout = null)
+    {
+        this.Passed = Passed;
+        this.Findings = Findings;
+        this.RawOutput = RawOutput;
+        this.AgentStderr = AgentStderr;
+        this.AgentSummary = AgentSummary;
+        this.AgentStdout = AgentStdout;
+    }
+
+    public bool Passed { get; init; }
+    public IReadOnlyList<AuditFinding> Findings { get; init; }
+    public string? RawOutput { get; init; }
+    public string? AgentStderr { get; init; }
+    public string? AgentSummary { get; init; }
+    public string? AgentStdout { get; init; }
+
+    public void Deconstruct(
+        out bool Passed,
+        out IReadOnlyList<AuditFinding> Findings,
+        out string? RawOutput,
+        out string? AgentStderr,
+        out string? AgentSummary,
+        out string? AgentStdout)
+    {
+        Passed = this.Passed;
+        Findings = this.Findings;
+        RawOutput = this.RawOutput;
+        AgentStderr = this.AgentStderr;
+        AgentSummary = this.AgentSummary;
+        AgentStdout = this.AgentStdout;
+    }
+
+    /// <summary>
+    /// When set to false, the result explicitly did not verify build/test
+    /// evidence. For BuildTestGate auditors, the pipeline treats that as a
+    /// blocking gate failure before any dependent auditor can run. For
+    /// ordinary auditors it only records the evidence state. Used for
+    /// classified "unrunnable in this environment" outcomes.
+    /// </summary>
+    public bool? BuildTestGateEvidenceVerified { get; init; }
+}
 
 public sealed record AuditFinding(
     string AuditorName,

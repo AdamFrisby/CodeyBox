@@ -664,7 +664,7 @@ public sealed class GraphicalSandboxTests
             using var tp = TestSupport.BuildPipeline(
                 workspace,
                 seed,
-                auditors: [auditor],
+                auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
                 projectAudit: new ProjectAudit
                 {
                     MaxIterations = 1,
@@ -700,7 +700,9 @@ public sealed class GraphicalSandboxTests
 
             var final = await tp.Store.GetAsync(item.Id);
             Assert.Equal(WorkItemState.Done, final!.State);
-            var auditSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "audit");
+            var auditSpec = Assert.Single(sandboxes.Specs, s =>
+                s.TimingPhase == "audit" &&
+                s.Network.ProfileName == "audit-agent-profile");
             Assert.Equal(SandboxProfileFlavor.Headless, auditSpec.Flavor);
             Assert.Equal("audit-agent-profile", auditSpec.Network.ProfileName);
             Assert.Contains("api.anthropic.com", auditSpec.Network.AllowedHosts);

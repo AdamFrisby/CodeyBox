@@ -13,3 +13,5 @@ auditors:
     treatExit127AsMissingTool: true
   - name: python:test-pass
     argv: ["pytest"]
+    role: build-test-gate
+    gateEvidence: test

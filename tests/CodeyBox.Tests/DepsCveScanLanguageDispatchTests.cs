@@ -458,7 +458,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task CSharpRootMarker_RunsSingleRootCveScan()
+    public async Task CSharpRootMarker_RunsCveScanOnceFromRepositoryRoot()
     {
         var discoveryStdout = ".\n" + string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./csharp-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);

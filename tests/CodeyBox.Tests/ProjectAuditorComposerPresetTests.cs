@@ -1,7 +1,9 @@
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
+using CodeyBox.PluginSdk;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -120,6 +122,8 @@ public sealed class ProjectAuditorComposerPresetTests
                             {
                                 Name = "csharp:project-test",
                                 Argv = ["dotnet", "test"],
+                                Role = "build-test-gate",
+                                GateEvidence = "test",
                             },
                         ],
                     },
@@ -130,6 +134,242 @@ public sealed class ProjectAuditorComposerPresetTests
         var auditors = composer.Compose(project, new CapturingAgent());
 
         Assert.Equal(["csharp:project-test"], auditors.Select(a => a.Name).ToArray());
+        Assert.Equal(AuditorRole.BuildTestGate, auditors.Single().Role);
+        Assert.Equal(BuildTestGateEvidence.Test, auditors.Single().BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void Compose_ProjectLanguageOverrideRejectsInvalidTrustedRole()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Languages = ["csharp"],
+                LanguageOverrides = new Dictionary<string, ProjectLanguagePresetOverride>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["csharp"] = new()
+                    {
+                        Auditors =
+                        [
+                            new ProjectConfiguredAuditor
+                            {
+                                Name = "csharp:project-test",
+                                Argv = ["dotnet", "test"],
+                                Role = "ci-gate",
+                            },
+                        ],
+                    },
+                },
+            },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("not a recognised auditor role", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_ProjectAuditTypeOverrideRejectsInvalidTrustedRole()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["custom"],
+                AuditTypeOverrides = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["custom"] = new()
+                    {
+                        Auditors =
+                        [
+                            new ProjectConfiguredAuditor
+                            {
+                                Name = "custom:test-pass",
+                                Argv = ["dotnet", "test"],
+                                Role = "ci-gate",
+                            },
+                        ],
+                    },
+                },
+            },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("not a recognised auditor role", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_CustomShellAuditorCanOptIntoBuildTestGate()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Custom =
+                [
+                    new CustomAuditorDescriptor
+                    {
+                        Name = "custom:test-pass",
+                        Kind = "shell",
+                        Argv = ["dotnet", "test"],
+                        Role = "build-test-gate",
+                        GateEvidence = "test",
+                    },
+                ],
+            },
+        };
+
+        var auditor = composer.Compose(project, new CapturingAgent())
+            .Single(a => a.Name == "custom:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.Test, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void Compose_CustomShellBuildTestGateWithoutEvidenceContributesNoEvidence()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Custom =
+                [
+                    new CustomAuditorDescriptor
+                    {
+                        Name = "custom:ci-pass",
+                        Kind = "shell",
+                        Argv = ["./ci.sh"],
+                        Role = "build-test-gate",
+                    },
+                ],
+            },
+        };
+
+        var auditor = composer.Compose(project, new CapturingAgent())
+            .Single(a => a.Name == "custom:ci-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void Compose_CustomGateEvidenceWithoutRoleIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:test-pass",
+            Kind = "shell",
+            Argv = ["dotnet", "test"],
+            GateEvidence = "test",
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("sets GateEvidence but is not a build-test-gate", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_CustomUnsupportedRoleIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:test-pass",
+            Kind = "shell",
+            Argv = ["dotnet", "test"],
+            Role = "ci-gate",
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("unsupported Role", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_CustomInvalidGateEvidenceIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:test-pass",
+            Kind = "shell",
+            Argv = ["dotnet", "test"],
+            Role = "build-test-gate",
+            GateEvidence = "tests",
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("unsupported GateEvidence", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compose_CustomGateMetadataOnNonShellAuditorIsRejected()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:pattern",
+            Kind = "diff-pattern",
+            Role = "build-test-gate",
+            Patterns =
+            [
+                new DiffPatternDescriptor
+                {
+                    Regex = "TODO",
+                    Description = "No TODOs",
+                },
+            ],
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("supported only for custom shell auditors", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("build-test-gate", null)]
+    [InlineData(null, "test")]
+    public void Compose_CustomPluginAuditorWithGateMetadataIsRejected(
+        string? role,
+        string? gateEvidence)
+    {
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [new TestPluginAuditor()],
+            NullLogger<ProjectAuditorComposer>.Instance);
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Kind = "plugin",
+            PluginId = "test.plugin-auditor",
+            Role = role,
+            GateEvidence = gateEvidence,
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("Custom plugin auditor 'test.plugin-auditor' cannot set Role or GateEvidence", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("supported only for custom shell auditors", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -161,6 +401,31 @@ public sealed class ProjectAuditorComposerPresetTests
         Assert.Equal(["elixir:test-pass"], auditors.Select(a => a.Name).ToArray());
     }
 
+    [Fact]
+    public void Compose_RepositoryLanguagePresetCannotOverrideMarkerForTrustedGateLanguage()
+    {
+        using var temp = new TempDirectory();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "csharp.yaml"), """
+            id: csharp
+            marker:
+              globs: ["fake/**/*.csproj"]
+            """);
+
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = new Uri(temp.Path).AbsoluteUri,
+            Audit = new ProjectAudit { Languages = ["csharp"] },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new CapturingAgent()));
+
+        Assert.Contains("cannot override /marker", ex.Message, StringComparison.Ordinal);
+    }
+
     private sealed class CapturingAgent : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
@@ -182,6 +447,14 @@ public sealed class ProjectAuditorComposerPresetTests
         }
     }
 
+    private static Project ProjectWithCustom(params CustomAuditorDescriptor[] custom) => new()
+    {
+        Id = new ProjectId("alpha"),
+        DisplayName = "Alpha",
+        RepositoryUrl = "https://example.com/repo.git",
+        Audit = new ProjectAudit { Custom = custom },
+    };
+
     private sealed class NamedProfileCatalog : IPresetCatalog
     {
         public IReadOnlyList<IAuditor> ResolveLanguage(string name, PresetContext ctx) => [];
@@ -194,6 +467,16 @@ public sealed class ProjectAuditorComposerPresetTests
     private sealed class NamedAuditor(string name) : IAuditor
     {
         public string Name { get; } = name;
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    [CodeyBoxPlugin("test.plugin-auditor", "Test Plugin Auditor")]
+    private sealed class TestPluginAuditor : IAuditor
+    {
+        public string Name => "test:plugin-auditor";
         public string Kind => "tool";
         public AuditCapabilities Required => AuditCapabilities.None;
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)

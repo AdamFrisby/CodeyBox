@@ -11,3 +11,5 @@ auditors:
     argv: ["eslint", "."]
   - name: node:test-pass
     argv: ["npm", "test"]
+    role: build-test-gate
+    gateEvidence: test

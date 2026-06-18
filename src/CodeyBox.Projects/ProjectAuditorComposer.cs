@@ -191,6 +191,10 @@ public sealed class ProjectAuditorComposer
 
     private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
     {
+        if (HasCustomGateMetadata(descriptor))
+            throw new InvalidOperationException(
+                $"Custom plugin auditor '{descriptor.PluginId ?? descriptor.Name}' cannot set Role or GateEvidence; build-test-gate metadata is supported only for custom shell auditors");
+
         if (string.IsNullOrWhiteSpace(descriptor.PluginId))
         {
             _logger.LogWarning(
@@ -219,6 +223,13 @@ public sealed class ProjectAuditorComposer
     {
         if (string.IsNullOrWhiteSpace(c.Name))
             throw new InvalidOperationException($"Custom auditor of kind '{c.Kind}' requires a non-empty Name");
+        var isShell = c.Kind.Equals("shell", StringComparison.OrdinalIgnoreCase);
+        if (!isShell && HasCustomGateMetadata(c))
+            throw new InvalidOperationException(
+                $"Custom auditor '{c.Name}' of kind '{c.Kind}' cannot set Role or GateEvidence; build-test-gate metadata is supported only for custom shell auditors");
+
+        var role = ParseCustomAuditorRole(c);
+        var gateEvidence = ParseCustomGateEvidence(c, role);
 
         return c.Kind.ToLowerInvariant() switch
         {
@@ -226,6 +237,8 @@ public sealed class ProjectAuditorComposer
             {
                 Name = c.Name,
                 Argv = c.Argv.Count > 0 ? c.Argv : throw new InvalidOperationException($"shell auditor '{c.Name}' needs Argv"),
+                Role = role,
+                BuildTestGateEvidence = gateEvidence,
             }),
             "diff-pattern" => new DiffPatternAuditor(new DiffPatternAuditorOptions
             {
@@ -245,6 +258,43 @@ public sealed class ProjectAuditorComposer
                 FrameTemplate = frameTemplate,
             }),
             _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
+        };
+    }
+
+    private static bool HasCustomGateMetadata(CustomAuditorDescriptor descriptor)
+        => !string.IsNullOrWhiteSpace(descriptor.Role)
+           || !string.IsNullOrWhiteSpace(descriptor.GateEvidence);
+
+    private static AuditorRole ParseCustomAuditorRole(CustomAuditorDescriptor descriptor)
+    {
+        if (string.IsNullOrWhiteSpace(descriptor.Role))
+            return AuditorRole.None;
+
+        if (descriptor.Role.Equals("build-test-gate", StringComparison.OrdinalIgnoreCase))
+            return AuditorRole.BuildTestGate;
+
+        throw new InvalidOperationException(
+            $"Custom auditor '{descriptor.Name}' has unsupported Role '{descriptor.Role}' (expected: build-test-gate)");
+    }
+
+    private static BuildTestGateEvidence ParseCustomGateEvidence(
+        CustomAuditorDescriptor descriptor,
+        AuditorRole role)
+    {
+        if (string.IsNullOrWhiteSpace(descriptor.GateEvidence))
+            return BuildTestGateEvidence.None;
+
+        if (role != AuditorRole.BuildTestGate)
+            throw new InvalidOperationException(
+                $"Custom auditor '{descriptor.Name}' sets GateEvidence but is not a build-test-gate");
+
+        return descriptor.GateEvidence.Trim().ToLowerInvariant() switch
+        {
+            "build" => BuildTestGateEvidence.Build,
+            "test" => BuildTestGateEvidence.Test,
+            "build-and-test" => BuildTestGateEvidence.BuildAndTest,
+            _ => throw new InvalidOperationException(
+                $"Custom auditor '{descriptor.Name}' has unsupported GateEvidence '{descriptor.GateEvidence}' (expected: build, test, or build-and-test)"),
         };
     }
 }

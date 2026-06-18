@@ -36,6 +36,75 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public void Registry_OrdersBuildTestGateBeforeShortCircuitToolAndLlmAuditors()
+    {
+        var llm = new FakeAuditor("llm", AuditCapabilities.AgentCredentials | AuditCapabilities.Network, _ => new(true, []));
+        var tool = new FakeAuditor("tool", AuditCapabilities.None, _ => new(true, []));
+        var shortCircuit = new FakeAuditor(
+            "short-circuit",
+            AuditCapabilities.None,
+            _ => new(true, []),
+            canShortCircuitOnBlockingFinding: true);
+        var buildTestGate = new FakeAuditor(
+            "build-test",
+            AuditCapabilities.None,
+            _ => new(true, []),
+            role: AuditorRole.BuildTestGate);
+
+        var reg = new AuditorRegistry([llm, tool, shortCircuit, buildTestGate]);
+
+        Assert.Collection(reg.All,
+            a => Assert.Equal("build-test", a.Name),
+            a => Assert.Equal("short-circuit", a.Name),
+            a => Assert.Equal("tool", a.Name),
+            a => Assert.Equal("llm", a.Name));
+    }
+
+    [Fact]
+    public void AuditResult_RetainsSixArgumentConstructorForPluginAbi()
+    {
+        var ctor = typeof(AuditResult).GetConstructor(
+        [
+            typeof(bool),
+            typeof(IReadOnlyList<AuditFinding>),
+            typeof(string),
+            typeof(string),
+            typeof(string),
+            typeof(string),
+        ]);
+
+        Assert.NotNull(ctor);
+    }
+
+    [Fact]
+    public void AuditResult_RetainsSixArgumentDeconstructForPluginAbi()
+    {
+        var findings = new[]
+        {
+            new AuditFinding("audit", AuditSeverity.Warning, "title", "description"),
+        };
+        var result = new AuditResult(
+            true,
+            findings,
+            RawOutput: "raw",
+            AgentStderr: "stderr",
+            AgentSummary: "summary",
+            AgentStdout: "stdout")
+        {
+            BuildTestGateEvidenceVerified = true,
+        };
+
+        var (passed, deconstructedFindings, rawOutput, agentStderr, agentSummary, agentStdout) = result;
+
+        Assert.True(passed);
+        Assert.Same(findings, deconstructedFindings);
+        Assert.Equal("raw", rawOutput);
+        Assert.Equal("stderr", agentStderr);
+        Assert.Equal("summary", agentSummary);
+        Assert.Equal("stdout", agentStdout);
+    }
+
+    [Fact]
     public void ReworkPromptBuilder_GroupsByAuditorAndIncludesOriginal()
     {
         var findings = new[]
@@ -113,6 +182,27 @@ public sealed class AuditTests
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("command exited 127", finding.Title);
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_BuildTestGateTreatExit127AsMissingTool_Blocks()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "custom:test-pass",
+            Argv = ["custom-test"],
+            TreatExit127AsMissingTool = true,
+            Role = AuditorRole.BuildTestGate,
+            BuildTestGateEvidence = BuildTestGateEvidence.Test,
+        });
+        var sandbox = new FakeSandbox(_ => new SandboxExecResult(127, "", "custom-test: not found"));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("tool not installed", finding.Title);
     }
 
     [Fact]
@@ -244,6 +334,7 @@ public sealed class AuditTests
 
         Assert.True(result.Passed);
         Assert.Empty(result.Findings);
+        Assert.False(result.BuildTestGateEvidenceVerified);
     }
 
     [Fact]
@@ -518,17 +609,20 @@ public sealed class AuditTests
             string name,
             AuditCapabilities required,
             Func<AuditContext, AuditResult> impl,
-            bool canShortCircuitOnBlockingFinding = false)
+            bool canShortCircuitOnBlockingFinding = false,
+            AuditorRole role = AuditorRole.None)
         {
             Name = name;
             Required = required;
             _impl = impl;
             CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding;
+            Role = role;
         }
         public string Name { get; }
         public string Kind => "tool";
         public AuditCapabilities Required { get; }
         public bool CanShortCircuitOnBlockingFinding { get; }
+        public AuditorRole Role { get; }
         public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ctx, CancellationToken ___ = default)
             => Task.FromResult(_impl(ctx));
     }
