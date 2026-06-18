@@ -509,7 +509,10 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var profiles = AuditProfilePresets.CreateBuiltIns()
             .ToDictionary(
                 kvp => kvp.Key,
-                kvp => InheritGlobalProfilePolicy(kvp.Value, baseAudit),
+                kvp => InheritGlobalProfilePolicy(
+                    kvp.Value,
+                    baseAudit,
+                    baseMechanicalFixersConfigured: project?.MechanicalFixers is not null || defaults?.MechanicalFixers is not null),
                 StringComparer.OrdinalIgnoreCase);
 
         if (defaults?.Profiles is not null)
@@ -539,10 +542,18 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         return resolved with { Profile = profileName };
     }
 
-    private static ProjectAudit InheritGlobalProfilePolicy(ProjectAudit profile, ProjectAudit fallback)
+    private static ProjectAudit InheritGlobalProfilePolicy(
+        ProjectAudit profile,
+        ProjectAudit fallback,
+        bool baseMechanicalFixersConfigured)
         => profile with
         {
             BuildScriptRequired = fallback.BuildScriptRequired,
+            MechanicalFixers = profile.MechanicalFixers.Count > 0
+                ? profile.MechanicalFixers
+                : baseMechanicalFixersConfigured
+                    ? fallback.MechanicalFixers
+                    : ResolveMechanicalFixers(project: null, defaults: null, profile.Languages),
         };
 
     private static ProjectAuditConfig ProjectAuditToConfig(ProjectAudit audit)
@@ -592,7 +603,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             LlmPromptFrameTemplate = audit.LlmPromptFrameTemplate,
             Custom = audit.Custom.Select(CustomAuditorToConfig).ToList(),
             ExcludedAuditors = [.. audit.ExcludedAuditors],
-            MechanicalFixers = [.. audit.MechanicalFixers],
+            MechanicalFixers = audit.MechanicalFixers.Count == 0 ? null : [.. audit.MechanicalFixers],
             AuditAgent = audit.AuditAgent?.Value,
             PerAuditorAgent = audit.PerAuditorAgent.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Value),
             MaxLlmAuditorParallelism = audit.MaxLlmAuditorParallelism,

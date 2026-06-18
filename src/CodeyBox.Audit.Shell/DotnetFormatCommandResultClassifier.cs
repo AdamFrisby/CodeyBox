@@ -23,7 +23,24 @@ public sealed class DotnetFormatCommandResultClassifier : IShellCommandResultCla
             .Take(MaxViolationLines + 1)
             .ToList();
         if (lines.Count == 0)
-            return null;
+        {
+            var fallbackDescription = "dotnet format reported that formatting verification failed, but did not emit parseable file-level violation lines. "
+                + "Run `dotnet format --verbosity diagnostic` with the same SDK/baseline as the auditor, or let the configured mechanical fixer apply it before audit.";
+            if (!string.IsNullOrWhiteSpace(context.CombinedOutput))
+                fallbackDescription += "\n\n" + Truncate(context.CombinedOutput.Trim(), 4000);
+
+            return new AuditResult(
+                Passed: false,
+                Findings:
+                [
+                    new AuditFinding(
+                        AuditorName: context.AuditorName,
+                        Severity: AuditSeverity.Error,
+                        Title: "dotnet format verification failed",
+                        Description: fallbackDescription),
+                ],
+                RawOutput: context.CombinedOutput);
+        }
 
         var truncated = lines.Count > MaxViolationLines;
         if (truncated)
@@ -53,4 +70,9 @@ public sealed class DotnetFormatCommandResultClassifier : IShellCommandResultCla
            line.Contains(": error CA", StringComparison.OrdinalIgnoreCase) ||
            line.Contains(": error CS", StringComparison.OrdinalIgnoreCase) ||
            line.Contains(": error ", StringComparison.OrdinalIgnoreCase);
+
+    private static string Truncate(string value, int maxChars)
+        => value.Length <= maxChars
+            ? value
+            : value[..maxChars] + "\n... output truncated.";
 }

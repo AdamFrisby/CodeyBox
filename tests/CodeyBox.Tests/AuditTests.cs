@@ -1,5 +1,6 @@
 using System.Text;
 using CodeyBox.Audit;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 
@@ -166,18 +167,17 @@ public sealed class AuditTests
     [Fact]
     public async Task CSharpFormatCheck_FailureReportsDotnetFormatViolations()
     {
-        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
-        {
-            Name = "csharp:format-check",
-            Argv = ["dotnet", "format", "--verify-no-changes"],
-            ResultClassifier = new DotnetFormatCommandResultClassifier(),
-        });
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
         const string stderr = """
             /work/src/App/Program.cs(4,12): error WHITESPACE: Fix whitespace formatting. Insert '\s'. [/work/src/App/App.csproj]
             /work/src/App/Program.cs(8,1): error IDE0055: Fix formatting. [/work/src/App/App.csproj]
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(2, "", stderr));
 
@@ -189,6 +189,27 @@ public sealed class AuditTests
         Assert.Contains("Run `dotnet format`", finding.Description);
         Assert.Contains("Program.cs(4,12)", finding.Description);
         Assert.Contains("IDE0055", finding.Description);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_FailureWithoutViolationLinesStillClassifiesDotnetFormat()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", "format verification failed"));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format verification failed", finding.Title);
+        Assert.Contains("format verification failed", finding.Description);
     }
 
     [Fact]
@@ -610,6 +631,12 @@ public sealed class AuditTests
         exec.Argv[0] == "sh" &&
         exec.Argv[1] == "-c" &&
         exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
+
+    private static bool IsLanguageMarkerProbe(SandboxExec exec) =>
+        exec.Argv.Count >= 3 &&
+        exec.Argv[0] == "sh" &&
+        exec.Argv[1] == "-c" &&
+        !exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private static string BuildRepeatedDotnetFailureOutput(int count)
     {

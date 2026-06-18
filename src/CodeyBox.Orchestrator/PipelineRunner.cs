@@ -1562,6 +1562,11 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex, "Work item {Id} could not persist audit progress", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
+        catch (MechanicalFixerException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} mechanical edit phase failed", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
         catch (TerminalQuotaError ex)
         {
             // Quota rejection is never a terminal Failure: the agent (or a peer
@@ -5710,9 +5715,13 @@ public sealed class PipelineRunner : IPipelineRunner
         try
         {
             var access = _gitHost.GetSandboxAccess(repoId);
+            var readOnlyAccess = access with
+            {
+                Mounts = access.Mounts.Select(MakeReadOnlyRepositoryMount).ToList(),
+            };
             var sandboxTarget = SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditTool, AuditCapabilities.None);
             var spec = BuildSandboxSpec(
-                access,
+                readOnlyAccess,
                 includeAgentCredential: null,
                 allowAgentNetwork: false,
                 hostNetworkProfile: sandboxTarget.NetworkProfile,
@@ -5722,7 +5731,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, phaseCt);
-            await RunWithCancellation(sandbox, phaseCt, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await RunWithCancellation(sandbox, phaseCt, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             await RunWithCancellation(
                 sandbox,
                 phaseCt,
@@ -5764,14 +5773,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var status = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain", "--untracked-files=no"],
             }, phaseCt);
             if (!status.Success)
-                throw new InvalidOperationException($"mechanical-edit could not read git status: {status.Stderr}");
+                throw new MechanicalFixerException($"mechanical-edit could not read git status: {status.Stderr}");
             if (string.IsNullOrWhiteSpace(status.Stdout))
                 return;
 
-            await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "add", "-u");
             var staged = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
@@ -5779,9 +5788,9 @@ public sealed class PipelineRunner : IPipelineRunner
             if (staged.ExitCode == 0)
                 return;
             if (staged.ExitCode != 1)
-                throw new InvalidOperationException($"mechanical-edit could not inspect staged diff: {staged.Stderr}");
+                throw new MechanicalFixerException($"mechanical-edit could not inspect staged diff: {staged.Stderr}");
 
-            var revision = await TryLookupIterationRevisionAsync(item.Id, auditIteration, phaseCt) ?? item.PromptRevision;
+            var revision = await ResolveMechanicalPromptRevisionForCommitAsync(item, auditIteration, phaseCt);
             var model = changedFixers.Count == 0
                 ? string.Join("+", fixers.Select(f => f.Name))
                 : string.Join("+", changedFixers);
@@ -5808,6 +5817,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
             }
 
+            var patch = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--binary", "HEAD^", "HEAD"],
+            }, phaseCt);
+            if (!patch.Success || string.IsNullOrWhiteSpace(patch.Stdout))
+            {
+                throw new MechanicalFixerException(
+                    $"mechanical-edit could not export formatter commit diff (exit {patch.ExitCode}): {patch.Stderr}");
+            }
+
             await using (var pushScope = await TimingScope.BeginAsync(
                 _timings,
                 item.Id,
@@ -5816,12 +5835,110 @@ public sealed class PipelineRunner : IPipelineRunner
                 activitySource: CodeyBoxActivities.Sandbox,
                 log: _log))
             {
-                await PushSandboxWorkBranchWithReconcileAsync(sandbox, workBranch, phaseCt);
+                await ImportMechanicalCommitPatchAsync(repoId, workBranch, patch.Stdout, commitMessage, phaseCt);
             }
         }
         catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
         {
             throw mechanicalPhase.Wrap(oce);
+        }
+        catch (MechanicalFixerException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new MechanicalFixerException($"mechanical-edit failed: {ex.Message}", ex);
+        }
+    }
+
+    private static SandboxMount MakeReadOnlyRepositoryMount(SandboxMount mount)
+        => mount.HostPath is null || mount.Tmpfs
+            ? mount
+            : mount with { ReadOnly = true };
+
+    private async Task<int?> ResolveMechanicalPromptRevisionForCommitAsync(
+        WorkItem item,
+        int auditIteration,
+        CancellationToken ct)
+    {
+        var dispatchedRevision = await TryLookupIterationRevisionAsync(item.Id, auditIteration, ct) ?? item.PromptRevision;
+        WorkItem? freshItem;
+        try
+        {
+            freshItem = await _store.GetAsync(item.Id, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex,
+                "Failed to re-read work item {Id} during mechanical commit trailer composition; using in-memory snapshot",
+                item.Id);
+            freshItem = item;
+        }
+
+        var currentRevision = freshItem?.PromptRevision ?? item.PromptRevision;
+        if (currentRevision == dispatchedRevision)
+            return dispatchedRevision;
+
+        _log.LogInformation(
+            "Work item {Id}: omitting {Trailer} from mechanical commit because dispatched revision {Dispatched} differs from current {Current}; auditor will preserve the stale-prompt signal",
+            item.Id,
+            CodeyBoxTrailers.PromptRevisionTrailerKey,
+            dispatchedRevision,
+            currentRevision);
+        return null;
+    }
+
+    private async Task ImportMechanicalCommitPatchAsync(
+        string repoId,
+        string workBranch,
+        string patch,
+        string commitMessage,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(patch))
+            throw new MechanicalFixerException("mechanical-edit produced an empty patch");
+
+        _gitHost.PrepareRepositoryForHostGitOperations(repoId);
+        var repoPath = _gitHost.GetRepoPath(repoId);
+        if (!Directory.Exists(repoPath))
+            throw new MechanicalFixerException($"mechanical-edit could not find host bare repo for '{repoId}' at {repoPath}");
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), "codeybox-mechanical-" + Guid.NewGuid().ToString("N"));
+        var worktree = Path.Combine(tempRoot, "worktree");
+        var patchPath = Path.Combine(tempRoot, "mechanical.patch");
+        Directory.CreateDirectory(tempRoot);
+
+        try
+        {
+            await File.WriteAllTextAsync(patchPath, patch, Encoding.UTF8, ct);
+            await RunHostGitAsync(tempRoot, ct, "clone", "--", repoPath, worktree);
+            await RunHostGitAsync(worktree, ct, "checkout", "-B", workBranch, $"origin/{workBranch}");
+            await RunHostGitAsync(worktree, ct, "config", "user.name", "CodeyBox");
+            await RunHostGitAsync(worktree, ct, "config", "user.email", "noreply@codeybox.invalid");
+            await RunHostGitAsync(worktree, ct, "apply", "--index", patchPath);
+            await RunHostGitAsync(worktree, ct, "commit", "-m", commitMessage);
+            await RunHostGitAsync(worktree, ct, "push", "origin", $"HEAD:refs/heads/{workBranch}");
+        }
+        catch (MechanicalFixerException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new MechanicalFixerException($"mechanical-edit could not import formatter commit to '{workBranch}': {ex.Message}", ex);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                    Directory.Delete(tempRoot, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log.LogWarning(ex, "Failed to clean mechanical-edit import temp directory {Path}", tempRoot);
+            }
         }
     }
 
@@ -13983,6 +14100,7 @@ Original merge-phase failure (for context):
         "work" => WorkItemState.Queued,
         "rework-resume" => WorkItemState.WorkComplete,
         "rework" => WorkItemState.WorkComplete,
+        "mechanical-edit" => WorkItemState.WorkComplete,
         "audit" => WorkItemState.WorkComplete,
         "merge" => WorkItemState.AuditPassed,
         "upstream" => WorkItemState.Merged,
@@ -14871,6 +14989,19 @@ internal sealed class SandboxPushReconcileConflictException : InvalidOperationEx
 
     public string Branch { get; }
     public string Strategy { get; }
+}
+
+internal sealed class MechanicalFixerException : InvalidOperationException
+{
+    public MechanicalFixerException(string message)
+        : base(message)
+    {
+    }
+
+    public MechanicalFixerException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
 }
 
 internal sealed record QuestionAskedDetails(

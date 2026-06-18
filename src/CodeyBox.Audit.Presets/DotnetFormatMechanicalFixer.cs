@@ -152,7 +152,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
     {
         var result = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["git", "-C", workingDirectory, "status", "--porcelain=v1", "-z"],
+            Argv = ["git", "-C", workingDirectory, "status", "--porcelain=v1", "-z", "--untracked-files=no"],
         }, ct);
         if (!result.Success)
             throw new InvalidOperationException($"failed to read git status for mechanical fixer: {result.Stderr}");
