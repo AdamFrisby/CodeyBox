@@ -32,7 +32,8 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, sandbox.LastExec?.LaunchMode);
         Assert.True(env!.TryGetValue(SandboxConventions.AgentLogFileEnv, out var path));
         Assert.Equal("/work/.codeybox/agent-logs/wi-work-i0.log", path);
     }
@@ -52,7 +53,8 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, sandbox.LastExec?.LaunchMode);
         Assert.False(env!.ContainsKey(SandboxConventions.AgentLogFileEnv));
     }
 
@@ -65,6 +67,7 @@ public sealed class CliAgentLogFileEnvInjectionTests
         await runner.RunAsync(sandbox, "/work", "echo ok", credential: null);
 
         Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.Attached, sandbox.LastExec?.LaunchMode);
     }
 
     [Fact]
@@ -83,7 +86,8 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, sandbox.LastExec?.LaunchMode);
         Assert.False(env!.ContainsKey(SandboxConventions.AgentLogFileEnv));
     }
 
@@ -107,7 +111,8 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         var env = sandbox.LastExec?.ExtraEnvironment;
         Assert.NotNull(env);
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, sandbox.LastExec?.LaunchMode);
         Assert.True(env!.TryGetValue(SandboxConventions.AgentLogFileEnv, out var path));
         Assert.Equal("/work/.codeybox/agent-logs/wi-resume.log", path);
     }
@@ -129,6 +134,9 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
         public string Id => "capturing-test-sandbox";
         public SandboxAgentOutputTransportKind AgentOutputTransportKind => _transportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => _transportKind == SandboxAgentOutputTransportKind.HttpIngest
+            ? SandboxBatchLaunchMode.Detached
+            : SandboxBatchLaunchMode.Attached;
         public SandboxExec? LastExec { get; private set; }
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)

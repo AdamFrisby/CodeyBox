@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Globalization;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -13,10 +12,8 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
 {
     internal const string UrlEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_URL";
     internal const string TokenEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_TOKEN";
-    internal const string ExitTokenEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN";
     internal const string RunIdEnvironmentVariable = "CODEYBOX_AGENT_OUTPUT_RUN_ID";
     internal const int MaxChunkBytes = 256 * 1024;
-    internal const int MaxExitBodyBytes = 32;
     internal const int MaxRequestsPerSecond = 2048;
 
     private const int TokenBytes = 32;
@@ -27,17 +24,13 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     private readonly HttpListener _listener;
     private readonly ILogger _log;
     private readonly byte[] _expectedStreamTokenHash;
-    private readonly byte[] _expectedExitTokenHash;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _listenTask;
     private readonly object _rateGate = new();
-    private readonly object _exitGate = new();
     private readonly StreamState _stdout;
     private readonly StreamState _stderr;
-    private readonly TaskCompletionSource<int> _exitCode = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private DateTimeOffset _rateWindowStart = DateTimeOffset.UtcNow;
     private int _rateWindowCount;
-    private int? _reportedExitCode;
     private bool _disposed;
 
     private MultipassAgentOutputHttpIngestSession(
@@ -45,7 +38,6 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         string baseUrl,
         string runId,
         string streamToken,
-        string exitToken,
         ILogger log,
         Action<string>? stdoutChunkCallback,
         Action<string>? stderrChunkCallback)
@@ -54,10 +46,8 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         BaseUrl = baseUrl;
         RunId = runId;
         Token = streamToken;
-        ExitToken = exitToken;
         _log = log;
         _expectedStreamTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(streamToken));
-        _expectedExitTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(exitToken));
         _stdout = new StreamState(stdoutChunkCallback);
         _stderr = new StreamState(stderrChunkCallback);
         _listenTask = Task.Run(ListenAsync);
@@ -66,11 +56,9 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     public string BaseUrl { get; }
     public string RunId { get; }
     public string Token { get; }
-    public string ExitToken { get; }
     public bool ReceivedAgentBytes => _stdout.BytesReceived > 0 || _stderr.BytesReceived > 0;
     public string Stdout => _stdout.Text;
     public string Stderr => _stderr.Text;
-    public Task<int> WaitForExitAsync(CancellationToken ct) => _exitCode.Task.WaitAsync(ct);
 
     public static async Task<MultipassAgentOutputHttpIngestSession?> TryStartAsync(
         IPAddress bindAddress,
@@ -84,7 +72,6 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
             return null;
 
         var streamToken = GenerateToken();
-        var exitToken = GenerateToken();
         for (var attempt = 0; attempt < 20; attempt++)
         {
             ct.ThrowIfCancellationRequested();
@@ -101,7 +88,6 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
                     prefix.TrimEnd('/'),
                     runId,
                     streamToken,
-                    exitToken,
                     log,
                     stdoutChunkCallback,
                     stderrChunkCallback);
@@ -235,11 +221,10 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         }
 
         var streamName = Uri.UnescapeDataString(parts[2]);
-        var isExit = string.Equals(streamName, "exit", StringComparison.Ordinal);
         if (!TokenMatches(
                 request.Headers["Authorization"],
-                isExit ? ExitToken : Token,
-                isExit ? _expectedExitTokenHash : _expectedStreamTokenHash))
+                Token,
+                _expectedStreamTokenHash))
         {
             Reject(response, HttpStatusCode.Unauthorized);
             return;
@@ -260,49 +245,6 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         if (!long.TryParse(parts[3], out var seq) || seq < 0)
         {
             Reject(response, HttpStatusCode.BadRequest);
-            return;
-        }
-
-        if (string.Equals(streamName, "exit", StringComparison.Ordinal))
-        {
-            if (seq != 0)
-            {
-                Reject(response, HttpStatusCode.BadRequest);
-                return;
-            }
-
-            if (request.ContentLength64 > MaxExitBodyBytes)
-            {
-                Reject(response, HttpStatusCode.RequestEntityTooLarge);
-                return;
-            }
-
-            var body = await ReadExitBodyAsync(request.InputStream, ct).ConfigureAwait(false);
-            if (body is null)
-            {
-                Reject(response, HttpStatusCode.RequestEntityTooLarge);
-                return;
-            }
-
-            if (!int.TryParse(body, NumberStyles.Integer, CultureInfo.InvariantCulture, out var exitCode))
-            {
-                Reject(response, HttpStatusCode.BadRequest);
-                return;
-            }
-
-            lock (_exitGate)
-            {
-                if (_reportedExitCode is { } existing)
-                {
-                    Reject(response, existing == exitCode ? HttpStatusCode.OK : HttpStatusCode.Conflict);
-                    return;
-                }
-
-                _reportedExitCode = exitCode;
-                _exitCode.TrySetResult(exitCode);
-            }
-
-            Reject(response, HttpStatusCode.NoContent);
             return;
         }
 
@@ -327,32 +269,6 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
             AppendOutcome.TooLarge => HttpStatusCode.RequestEntityTooLarge,
             _ => HttpStatusCode.InternalServerError,
         });
-    }
-
-    private static async Task<string?> ReadExitBodyAsync(Stream body, CancellationToken ct)
-    {
-        var buffer = ArrayPool<byte>.Shared.Rent(MaxExitBodyBytes + 1);
-        var total = 0;
-        try
-        {
-            while (total <= MaxExitBodyBytes)
-            {
-                var read = await body
-                    .ReadAsync(buffer.AsMemory(total, MaxExitBodyBytes + 1 - total), ct)
-                    .ConfigureAwait(false);
-                if (read == 0)
-                    return Encoding.UTF8.GetString(buffer, 0, total).Trim();
-                total += read;
-                if (total > MaxExitBodyBytes)
-                    return null;
-            }
-
-            return null;
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
     }
 
     private static bool TokenMatches(string? authorization, string expectedToken, byte[] expectedTokenHash)

@@ -236,7 +236,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = token,
-            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = exitToken,
+            ["CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN"] = exitToken,
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = runId,
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
         };
@@ -312,6 +312,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         try
         {
             var agentScript = """
+                if [ -n "${CODEYBOX_AGENT_EXIT_FILE:-}" ]; then printf 'exit file leaked\n'; fi
                 printf 'out-log\n'
                 printf 'err-log\n' >&2
                 exit 5
@@ -362,7 +363,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
-            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
+            ["CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN"] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-conflict",
             ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
@@ -545,6 +546,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         psi.Environment.Remove("CODEYBOX_AGENT_LOG_FILE");
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
+        psi.Environment.Remove("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN");
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
     }
 

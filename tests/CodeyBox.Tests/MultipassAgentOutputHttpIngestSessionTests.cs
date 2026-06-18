@@ -18,11 +18,9 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
 
         var wrongToken = new string('A', session.Token.Length);
         var wrongTokenStatus = await PostAsync(client, session, "run-x", "stdout", 0, wrongToken, "blocked");
-        var exitTokenOnStdoutStatus = await PostAsync(client, session, "run-x", "stdout", 0, session.ExitToken, "blocked");
         var wrongRunStatus = await PostAsync(client, session, "run-y", "stdout", 0, session.Token, "blocked");
 
         Assert.Equal(HttpStatusCode.Unauthorized, wrongTokenStatus);
-        Assert.Equal(HttpStatusCode.Unauthorized, exitTokenOnStdoutStatus);
         Assert.Equal(HttpStatusCode.Forbidden, wrongRunStatus);
         Assert.Empty(chunks);
         Assert.Equal("", session.Stdout);
@@ -37,98 +35,25 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
 
         var readyStatus = await PostAsync(client, session, "run-x", "ready", 0, session.Token, "");
         var stdoutStatus = await PostAsync(client, session, "run-x", "stdout", 0, session.Token, "hello\n");
-        var exitStatus = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "7\n");
 
         Assert.Equal(HttpStatusCode.NoContent, readyStatus);
         Assert.Equal(HttpStatusCode.OK, stdoutStatus);
-        Assert.Equal(HttpStatusCode.NoContent, exitStatus);
         Assert.Equal("hello\n", session.Stdout);
         Assert.Equal(["hello\n"], chunks);
         Assert.True(session.ReceivedAgentBytes);
-        Assert.Equal(7, await session.WaitForExitAsync(CancellationToken.None));
     }
 
     [Fact]
-    public async Task Post_RejectsMalformedAndConflictingExitNotifications()
+    public async Task Post_RejectsExitStreamAsUnsupportedOutput()
     {
         var chunks = new List<string>();
         await using var session = await StartAsync(chunks.Add);
         using var client = new HttpClient();
 
-        var malformed = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "not-an-int");
-        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "3\n");
-        var duplicate = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "3\n");
-        var conflicting = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "4\n");
+        var status = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "7\n");
 
-        Assert.Equal(HttpStatusCode.BadRequest, malformed);
-        Assert.Equal(HttpStatusCode.NoContent, first);
-        Assert.Equal(HttpStatusCode.OK, duplicate);
-        Assert.Equal(HttpStatusCode.Conflict, conflicting);
-        Assert.Equal(3, await session.WaitForExitAsync(CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task Post_RejectsOutOfOrderExitNotificationWithoutCompletingRun()
-    {
-        var chunks = new List<string>();
-        await using var session = await StartAsync(chunks.Add);
-        using var client = new HttpClient();
-
-        var outOfOrder = await PostAsync(client, session, "run-x", "exit", 1, session.ExitToken, "9\n");
-        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "5\n");
-
-        Assert.Equal(HttpStatusCode.BadRequest, outOfOrder);
-        Assert.Equal(HttpStatusCode.NoContent, first);
-        Assert.Equal(5, await session.WaitForExitAsync(CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task Post_RejectsOversizedExitBodyWithoutCompletingRun()
-    {
-        var chunks = new List<string>();
-        await using var session = await StartAsync(chunks.Add);
-        using var client = new HttpClient();
-        var oversized = new string('9', MultipassAgentOutputHttpIngestSession.MaxExitBodyBytes + 1);
-
-        var rejected = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, oversized);
-        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "6\n");
-
-        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, rejected);
-        Assert.Equal(HttpStatusCode.NoContent, first);
-        Assert.Equal(6, await session.WaitForExitAsync(CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task Post_RejectsStreamTokenForExitWithoutCompletingRun()
-    {
-        var chunks = new List<string>();
-        await using var session = await StartAsync(chunks.Add);
-        using var client = new HttpClient();
-
-        var forged = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "0\n");
-        var real = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "8\n");
-
-        Assert.Equal(HttpStatusCode.Unauthorized, forged);
-        Assert.Equal(HttpStatusCode.NoContent, real);
-        Assert.Equal(8, await session.WaitForExitAsync(CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task Post_RejectsUnknownLengthOversizedExitBodyWithoutCompletingRun()
-    {
-        var chunks = new List<string>();
-        await using var session = await StartAsync(chunks.Add);
-        using var client = new HttpClient();
-        var oversized = Encoding.UTF8.GetBytes(new string('9', MultipassAgentOutputHttpIngestSession.MaxExitBodyBytes + 1));
-
-        using var request = NewPostRequest(session, "run-x", "exit", 0, session.ExitToken);
-        request.Content = new UnknownLengthContent(oversized);
-        using var response = await client.SendAsync(request);
-        var first = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "6\n");
-
-        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
-        Assert.Equal(HttpStatusCode.NoContent, first);
-        Assert.Equal(6, await session.WaitForExitAsync(CancellationToken.None));
+        Assert.Equal(HttpStatusCode.BadRequest, status);
+        Assert.Empty(chunks);
     }
 
     [Fact]
@@ -243,15 +168,4 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
             .SetValue(session, count);
     }
 
-    private sealed class UnknownLengthContent(byte[] bytes) : HttpContent
-    {
-        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
-            => stream.WriteAsync(bytes, 0, bytes.Length);
-
-        protected override bool TryComputeLength(out long length)
-        {
-            length = 0;
-            return false;
-        }
-    }
 }

@@ -76,8 +76,18 @@ internal sealed class RecordingMultipassRunner : IProcessRunner
             stdoutChunkCallback is not null,
             stderrChunkCallback is not null,
             killOnOutputLimit));
-        return await _handler(argv, stdin, ct);
+        var result = await _handler(argv, stdin, ct);
+        if (IsUnhandledDetachedOutputSidecarRead(argv, result))
+            return new ProcessRunResult(0, "", "");
+        return result;
     }
+
+    private static bool IsUnhandledDetachedOutputSidecarRead(
+        IReadOnlyList<string> argv,
+        ProcessRunResult result)
+        => argv is [_, "exec", _, "--", "sudo", "-n", "sh", "-c", _, "codeybox-detached-output", _]
+           && result.ExitCode == 99
+           && result.Stderr.Contains("unexpected argv", StringComparison.Ordinal);
 }
 
 internal sealed record MultipassCall(

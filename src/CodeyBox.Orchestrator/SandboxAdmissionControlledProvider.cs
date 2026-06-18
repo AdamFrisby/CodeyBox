@@ -111,6 +111,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     public string Name => _inner.Name;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+    public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
@@ -821,6 +822,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
 
     public string Id => _inner.Id;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+    public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
         _inner.ExecAsync(exec, ct);

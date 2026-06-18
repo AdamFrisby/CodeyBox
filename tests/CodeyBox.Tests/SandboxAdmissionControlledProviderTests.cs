@@ -711,13 +711,12 @@ public sealed class SandboxAdmissionControlledProviderTests
 
     /// <summary>
     /// Production sandboxes go through <see cref="SandboxAdmissionControlledProvider"/>.
-    /// If that wrapper drops <see cref="ISandbox.AgentOutputTransportKind"/> or stops
-    /// forwarding <see cref="SandboxExec.AgentOutputTransport"/>, batch runners
-    /// silently fall back to the attached ExecPipe in production while the runner-
-    /// level transport-selection tests continue to pass against fakes. Cover the
-    /// wrapper directly: an HttpIngest-capable inner sandbox must still report
-    /// HttpIngest after wrap, and a PreferDetachedHttpIngest request on the wrapped
-    /// sandbox must reach the inner ExecAsync with that preference intact.
+    /// If that wrapper drops <see cref="ISandbox.AgentOutputTransportKind"/> /
+    /// <see cref="ISandbox.BatchLaunchMode"/> or stops forwarding
+    /// <see cref="SandboxExec.AgentOutputTransport"/> /
+    /// <see cref="SandboxExec.LaunchMode"/>, batch runners silently fall back to
+    /// attached execution in production while the runner-level selection tests
+    /// continue to pass against fakes. Cover the wrapper directly.
     /// </summary>
     [Fact]
     public async Task Wrap_HttpIngestInnerSandbox_PreservesTransportKindAndForwardsBatchExecPreference()
@@ -726,21 +725,25 @@ public sealed class SandboxAdmissionControlledProviderTests
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
 
         Assert.Equal(SandboxAgentOutputTransportKind.HttpIngest, provider.AgentOutputTransportKind);
+        Assert.Equal(SandboxBatchLaunchMode.Detached, provider.BatchLaunchMode);
 
         await using var wrapped = await provider.CreateAsync(Spec(), CancellationToken.None);
         Assert.Equal(SandboxAgentOutputTransportKind.HttpIngest, wrapped.AgentOutputTransportKind);
+        Assert.Equal(SandboxBatchLaunchMode.Detached, wrapped.BatchLaunchMode);
 
-        var batchPreference = SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest;
+        var batchPreference = SandboxAgentOutputTransportPreference.PreferHttpIngest;
         await wrapped.ExecAsync(new SandboxExec
         {
             Argv = ["agent-cli", "--json"],
             WorkingDirectory = "/work",
             AgentOutputTransport = batchPreference,
+            LaunchMode = SandboxExecLaunchMode.DetachedBatch,
         }, CancellationToken.None);
 
         var recorded = inner.LastExec;
         Assert.NotNull(recorded);
         Assert.Equal(batchPreference, recorded!.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, recorded.LaunchMode);
         Assert.Equal(new[] { "agent-cli", "--json" }, recorded.Argv);
     }
 
@@ -749,6 +752,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         public SandboxExec? LastExec { get; set; }
 
         SandboxAgentOutputTransportKind ISandboxProvider.AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+        SandboxBatchLaunchMode ISandboxProvider.BatchLaunchMode => SandboxBatchLaunchMode.Detached;
 
         public override Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
             => Task.FromResult<ISandbox>(new HttpIngestCapableSandbox(this));
@@ -758,6 +762,7 @@ public sealed class SandboxAdmissionControlledProviderTests
             public string Id => "http-ingest-sandbox";
             public long? MemoryBytes => null;
             public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+            public SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Detached;
 
             public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             {

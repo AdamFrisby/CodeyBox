@@ -198,6 +198,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
     public string Name => "multipass";
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+    public SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Detached;
 
     private void MarkTrackedActive(string name)
     {
@@ -4922,6 +4923,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         TryResolveAgentOutputBindAddress() is null
             ? SandboxAgentOutputTransportKind.ExecPipe
             : SandboxAgentOutputTransportKind.HttpIngest;
+    public SandboxBatchLaunchMode BatchLaunchMode =>
+        TryResolveAgentOutputBindAddress() is null
+            ? SandboxBatchLaunchMode.Attached
+            : SandboxBatchLaunchMode.Detached;
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
@@ -5139,7 +5144,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 if (result.ExitCode != 0)
                     return result;
 
-                var detachedExit = await WaitForDetachedCompletionAsync(agentOutputIngest, detachedProcessGroupMarker!, ct)
+                var detachedExit = await WaitForDetachedCompletionAsync(detachedProcessGroupMarker!, ct)
+                    .ConfigureAwait(false);
+                var detachedOutput = await ReadDetachedOutputSidecarsAsync(detachedProcessGroupMarker!, ct)
                     .ConfigureAwait(false);
                 await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
                 var detachedIngested = agentOutputIngest;
@@ -5150,8 +5157,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 return result with
                 {
                     ExitCode = detachedExitCode,
-                    Stdout = detachedIngested.Stdout + result.Stdout,
-                    Stderr = detachedIngested.Stderr + AppendDetachedMarkerError(result.Stderr, detachedExit.Error),
+                    Stdout = detachedOutput.Stdout + detachedIngested.Stdout + result.Stdout,
+                    Stderr = detachedOutput.Stderr
+                             + detachedIngested.Stderr
+                             + AppendDetachedMarkerError(result.Stderr, detachedExit.Error)
+                             + detachedOutput.Error,
                 };
             }
 
@@ -5327,13 +5337,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         SandboxExec exec,
         int? maxStdoutBytes,
         int? maxStderrBytes)
-        => (exec.AgentOutputTransport is SandboxAgentOutputTransportPreference.PreferHttpIngest
-                or SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest)
+        => exec.AgentOutputTransport == SandboxAgentOutputTransportPreference.PreferHttpIngest
             && maxStdoutBytes is null
             && maxStderrBytes is null;
 
     private static bool ShouldDetachAgentOutputHttpIngest(SandboxExec exec)
-        => exec.AgentOutputTransport == SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest;
+        => exec.AgentOutputTransport == SandboxAgentOutputTransportPreference.PreferHttpIngest
+            && exec.LaunchMode == SandboxExecLaunchMode.DetachedBatch;
 
     private System.Net.IPAddress? TryResolveAgentOutputBindAddress()
     {
@@ -5567,8 +5577,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         // CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN is no longer trusted as a
         // completion signal. Detached completion comes from the root-owned
         // supervisor sidecar; stale values from a prior turn are scrubbed
-        // defensively so the wrapper / agent never sees them.
-        sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_RUN_ID");
+        // defensively so the wrapper / agent never sees them. The agent run id
+        // intentionally remains visible so host-shutdown preemption can target
+        // the detached process tree by run id.
+        sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
         sb.AppendLine("codeybox_http_ready() {");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
@@ -5618,11 +5630,32 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1; pgid=$2; tmp=\"${marker}.tmp\"; umask 077; printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\" && { chown root:root \"$marker\" 2>/dev/null || true; } && chmod 0600 \"$marker\"' \"$codeybox_pgid_marker\" \"$codeybox_pgid\"; then");
         sb.AppendLine("    exit 88");
         sb.AppendLine("fi");
-        sb.AppendLine("\"$@\" </dev/null >/dev/null 2>/dev/null");
+        sb.AppendLine("codeybox_stdout_file=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-stdout.XXXXXX\") || exit 88");
+        sb.AppendLine("codeybox_stderr_file=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-stderr.XXXXXX\") || { rm -f \"$codeybox_stdout_file\"; exit 88; }");
+        sb.AppendLine("\"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
         sb.AppendLine("codeybox_wrapper_rc=$?");
-        sb.AppendLine("if ! codeybox_root_sh 'exit_file=$1; exit_code=$2; tmp=\"${exit_file}.tmp\"; umask 077; printf \"%s\\n\" \"$exit_code\" > \"$tmp\" && mv -f \"$tmp\" \"$exit_file\" && { chown root:root \"$exit_file\" 2>/dev/null || true; } && chmod 0600 \"$exit_file\"' \"${codeybox_pgid_marker}.exit\" \"$codeybox_wrapper_rc\"; then");
+        sb.AppendLine("if ! codeybox_root_sh 'marker=$1");
+        sb.AppendLine("stdout_file=$2");
+        sb.AppendLine("stderr_file=$3");
+        sb.AppendLine("exit_code=$4");
+        sb.AppendLine("stdout_tmp=\"${marker}.stdout.tmp\"");
+        sb.AppendLine("stderr_tmp=\"${marker}.stderr.tmp\"");
+        sb.AppendLine("exit_tmp=\"${marker}.exit.tmp\"");
+        sb.AppendLine("umask 077");
+        sb.AppendLine(": > \"$stdout_tmp\" || exit 1");
+        sb.AppendLine("dd if=\"$stdout_file\" of=\"$stdout_tmp\" bs=65536 count=1 2>/dev/null || true");
+        sb.AppendLine(": > \"$stderr_tmp\" || exit 1");
+        sb.AppendLine("dd if=\"$stderr_file\" of=\"$stderr_tmp\" bs=65536 count=1 2>/dev/null || true");
+        sb.AppendLine("printf \"%s\\n\" \"$exit_code\" > \"$exit_tmp\" || exit 1");
+        sb.AppendLine("mv -f \"$stdout_tmp\" \"${marker}.stdout\" || exit 1");
+        sb.AppendLine("mv -f \"$stderr_tmp\" \"${marker}.stderr\" || exit 1");
+        sb.AppendLine("mv -f \"$exit_tmp\" \"${marker}.exit\" || exit 1");
+        sb.AppendLine("{ chown root:root \"${marker}.stdout\" \"${marker}.stderr\" \"${marker}.exit\" 2>/dev/null || true; }");
+        sb.AppendLine("chmod 0600 \"${marker}.stdout\" \"${marker}.stderr\" \"${marker}.exit\"' \"$codeybox_pgid_marker\" \"$codeybox_stdout_file\" \"$codeybox_stderr_file\" \"$codeybox_wrapper_rc\"; then");
+        sb.AppendLine("    rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
         sb.AppendLine("    exit 88");
         sb.AppendLine("fi");
+        sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
@@ -5691,14 +5724,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     }
 
     private async Task<DetachedExitResult> WaitForDetachedCompletionAsync(
-        MultipassAgentOutputHttpIngestSession ingest,
         string processGroupMarker,
         CancellationToken ct)
     {
-        _ = ingest;
         // Trust only the root-owned process-group probe and exit-code sidecar.
-        // The HTTP exit notification is intentionally not awaited here — a
-        // same-UID prior-turn process could forge it.
         var pollFailures = 0;
         while (true)
         {
@@ -5759,6 +5788,45 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             AgentOutputHttpSetupFailedExitCode,
             "",
             AgentOutputHttpSetupFailureMarker + suffix + "\n");
+    }
+
+    private async Task<DetachedOutputSidecars> ReadDetachedOutputSidecarsAsync(
+        string processGroupMarker,
+        CancellationToken ct)
+    {
+        var stdout = await ReadDetachedOutputSidecarAsync(processGroupMarker + ".stdout", ct).ConfigureAwait(false);
+        var stderr = await ReadDetachedOutputSidecarAsync(processGroupMarker + ".stderr", ct).ConfigureAwait(false);
+        return new DetachedOutputSidecars(
+            stdout.Output,
+            stderr.Output,
+            stdout.Error + stderr.Error);
+    }
+
+    private async Task<DetachedOutputSidecar> ReadDetachedOutputSidecarAsync(
+        string vmPath,
+        CancellationToken ct)
+    {
+        const string readCommand = """
+            codeybox_output_file=$1
+            if ! test -f "$codeybox_output_file"; then
+                exit 0
+            fi
+            dd if="$codeybox_output_file" bs=65536 count=1 2>/dev/null || true
+            exit 0
+            """;
+        var result = await RunMultipassAsync(
+            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", readCommand, "codeybox-detached-output", vmPath],
+            stdin: null,
+            ct: ct,
+            maxStdoutBytes: 65536,
+            maxStderrBytes: 4096,
+            killOnOutputLimit: false).ConfigureAwait(false);
+        if (result.ExitCode == 0)
+            return new DetachedOutputSidecar(result.Stdout, "");
+
+        return new DetachedOutputSidecar(
+            "",
+            $"failed to read detached exec output sidecar {vmPath} (exit {result.ExitCode}): {result.Stderr.TrimEnd()}\n");
     }
 
     private async Task<string?> EnsureDetachedProcessGroupReapedAsync(string processGroupMarker, CancellationToken ct)
@@ -5842,8 +5910,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                         printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
                         ;;
                 esac
-            elif ! test -d "/proc/$codeybox_pgid"; then
-                printf 'exited %s\n' "$codeybox_pgid"
             elif [ "$codeybox_alive" = "alive" ]; then
                 printf 'alive %s\n' "$codeybox_pgid"
             else
@@ -5986,6 +6052,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     }
 
     private readonly record struct DetachedExitResult(int ExitCode, string? Error);
+    private readonly record struct DetachedOutputSidecars(string Stdout, string Stderr, string Error);
+    private readonly record struct DetachedOutputSidecar(string Output, string Error);
     private readonly record struct DetachedProcessGroupProbe(
         DetachedProcessGroupStatus Status,
         int? ProcessGroupId,
@@ -6024,7 +6092,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             rm -f -- "$codeybox_pgid_marker" \
                 "${codeybox_pgid_marker}.tmp" \
                 "${codeybox_pgid_marker}.exit" \
-                "${codeybox_pgid_marker}.exit.tmp"
+                "${codeybox_pgid_marker}.exit.tmp" \
+                "${codeybox_pgid_marker}.stdout" \
+                "${codeybox_pgid_marker}.stdout.tmp" \
+                "${codeybox_pgid_marker}.stderr" \
+                "${codeybox_pgid_marker}.stderr.tmp"
             rmdir "${codeybox_pgid_marker}.lock" 2>/dev/null || true
             exit 0
             """;

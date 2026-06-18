@@ -403,7 +403,7 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunTextOnlyAsync_HttpIngestSandboxPrefersDetachedTransport()
+    public async Task RunTextOnlyAsync_HttpIngestSandboxPrefersDetachedBatchLaunch()
     {
         var sandbox = new TextOnlyRecordingSandbox(
             "resolved json",
@@ -415,7 +415,8 @@ public sealed class OpencodeAgentRunnerTests
 
         Assert.True(result.Success);
         var agentExec = sandbox.Execs.Last(e => e.Argv.Count >= 2 && e.Argv[0] == "opencode" && e.Argv[1] == "run");
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, agentExec.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, agentExec.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, agentExec.LaunchMode);
     }
 
     [Fact]
@@ -481,6 +482,9 @@ public sealed class OpencodeAgentRunnerTests
     {
         public string Id => "recording-text-only";
         public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; } = transportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
+            ? SandboxBatchLaunchMode.Detached
+            : SandboxBatchLaunchMode.Attached;
         public List<SandboxExec> Execs { get; } = [];
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)

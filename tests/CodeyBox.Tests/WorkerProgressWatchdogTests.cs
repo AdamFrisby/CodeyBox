@@ -595,7 +595,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task DefaultActivitySource_ActiveProcessStateCountsAsProgressWithoutCpuDelta()
+    public async Task DefaultActivitySource_RunningProcessStateCountsAsProgressWithoutCpuDelta()
     {
         var itemId = WorkItemId.New();
         var active = false;
@@ -623,7 +623,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.NotNull(activeState);
         Assert.Equal("process-cpu", activeState!.Reason);
         Assert.True(DefaultWorkerProgressActivitySource.IsActiveProcessState('R'));
-        Assert.True(DefaultWorkerProgressActivitySource.IsActiveProcessState('D'));
+        Assert.False(DefaultWorkerProgressActivitySource.IsActiveProcessState('D'));
         Assert.False(DefaultWorkerProgressActivitySource.IsActiveProcessState('S'));
     }
 

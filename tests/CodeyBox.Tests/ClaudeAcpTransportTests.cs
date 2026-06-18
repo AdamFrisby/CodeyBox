@@ -29,8 +29,9 @@ public sealed class ClaudeAcpTransportTests
         var argv = sandbox.LastClaudeExec!.Argv.ToList();
         Assert.Contains("--print", argv);
         Assert.Equal(
-            SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest,
+            SandboxAgentOutputTransportPreference.PreferHttpIngest,
             sandbox.LastClaudeExec.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, sandbox.LastClaudeExec.LaunchMode);
         Assert.Equal("print", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
     }
 
@@ -49,6 +50,7 @@ public sealed class ClaudeAcpTransportTests
         var sandbox = new RecordingSandbox(StreamJsonOk("cli-execpipe"))
         {
             AgentOutputTransportKind = SandboxAgentOutputTransportKind.ExecPipe,
+            BatchLaunchMode = SandboxBatchLaunchMode.Attached,
         };
         var worker = new ClaudeSessionWorker(BuildRunner());
 
@@ -60,6 +62,7 @@ public sealed class ClaudeAcpTransportTests
         Assert.Equal(
             SandboxAgentOutputTransportPreference.ExecPipe,
             sandbox.LastClaudeExec.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.Attached, sandbox.LastClaudeExec.LaunchMode);
         Assert.Equal("print", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
     }
 
@@ -1014,6 +1017,7 @@ public sealed class ClaudeAcpTransportTests
         public SandboxExec? LastClaudeExec => AllClaudeExecs.Count == 0 ? null : AllClaudeExecs[^1];
         public string Id { get; } = "vm-" + Guid.NewGuid().ToString("N")[..8];
         public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; init; } = SandboxAgentOutputTransportKind.HttpIngest;
+        public SandboxBatchLaunchMode BatchLaunchMode { get; init; } = SandboxBatchLaunchMode.Detached;
 
         public RecordingSandbox(params string[] claudeStdouts)
             => _claudeStdouts = new Queue<string>(claudeStdouts);

@@ -304,7 +304,7 @@ public sealed class CursorAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunTextOnlyInSandboxAsync_HttpIngestSandboxPrefersDetachedTransport()
+    public async Task RunTextOnlyInSandboxAsync_HttpIngestSandboxPrefersDetachedBatchLaunch()
     {
         var sandbox = new RecordingSandbox(
             agentStdout: "assistant text",
@@ -319,7 +319,8 @@ public sealed class CursorAgentRunnerTests
 
         Assert.True(result.Success, $"{result.Summary} | {result.Error}");
         var agentExec = sandbox.Execs.Last(e => e.Argv.Count > 0 && e.Argv[0] == "agent");
-        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, agentExec.AgentOutputTransport);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, agentExec.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, agentExec.LaunchMode);
     }
 
     [Fact]
@@ -392,6 +393,9 @@ public sealed class CursorAgentRunnerTests
 
         public string Id => "recording-cursor";
         public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; }
+        public SandboxBatchLaunchMode BatchLaunchMode => AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
+            ? SandboxBatchLaunchMode.Detached
+            : SandboxBatchLaunchMode.Attached;
         public List<SandboxExec> Execs { get; } = [];
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)

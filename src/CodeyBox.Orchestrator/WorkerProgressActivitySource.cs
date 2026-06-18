@@ -157,9 +157,10 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
             return false;
         }
 
-        // An R/D process state is itself a progress signal; the watchdog does
-        // not need to wait for a CPU tick to accrue when a tracked process is
-        // actively running or in uninterruptible sleep.
+        // A running process state is itself a progress signal; the watchdog
+        // does not need to wait for a CPU tick to accrue when a tracked process
+        // is actively scheduled. Linux D-state is deliberately excluded: it can
+        // be an unbounded storage/network wait and should not mask a stall.
         if (sample.HasActiveProcessState)
         {
             _processSamples[itemId] = sample with { HasConfirmedProgress = true };
@@ -300,7 +301,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     }
 
     internal static bool IsActiveProcessState(char state) =>
-        state is 'R' or 'D';
+        state is 'R';
 
     private static bool ProcessEnvironmentContains(string procDir, string envEntry)
     {
