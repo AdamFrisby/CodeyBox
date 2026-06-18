@@ -744,16 +744,20 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     public async Task PassingBuildAndTestGatesStillAllowLlmToFlagLowQualityDiff()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var build = new RoleStampedScriptedAuditor(
-            "csharp:build-WaE",
-            AuditorRole.BuildTestGate,
-            [new AuditOutcome(true, [])],
-            gateEvidence: BuildTestGateEvidence.Build);
-        var test = new RoleStampedScriptedAuditor(
-            "csharp:test-pass",
-            AuditorRole.BuildTestGate,
-            [new AuditOutcome(true, [])],
-            gateEvidence: BuildTestGateEvidence.Test);
+        var build = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:build-WaE",
+            Argv = ["dotnet", "build", "tests/FeatureFlagsTests.csproj", "--no-incremental", "/warnaserror"],
+            Role = AuditorRole.BuildTestGate,
+            BuildTestGateEvidence = BuildTestGateEvidence.Build,
+        });
+        var test = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "tests/FeatureFlagsTests.csproj", "--no-build"],
+            Role = AuditorRole.BuildTestGate,
+            BuildTestGateEvidence = BuildTestGateEvidence.Test,
+        });
         var llm = new LowQualityPipelineLlmAuditor();
 
         using var tp = TestSupport.BuildPipeline(
@@ -766,21 +770,53 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
         {
             await ExecOk(sandbox, workingDirectory, ["mkdir", "-p", "src", "tests"], ct);
+            await WriteFile(sandbox, workingDirectory, "src/App.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """, ct);
             await WriteFile(sandbox, workingDirectory, "src/FeatureFlags.cs", """
                 namespace App;
 
                 public static class FeatureFlags
                 {
-                    public static bool AddFeatureFlagX(IDictionary<string, string> config)
-                        => config["FeatureX"] == "enabled";
+                    public static bool AddFeatureFlagX(IReadOnlyDictionary<string, string> config)
+                        => config.TryGetValue("FeatureX", out var value) && value == "enabled";
                 }
                 """, ct);
+            await WriteFile(sandbox, workingDirectory, "tests/FeatureFlagsTests.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                    <IsPackable>false</IsPackable>
+                    <IsTestProject>true</IsTestProject>
+                  </PropertyGroup>
+                  <ItemGroup>
+                    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+                    <PackageReference Include="xunit" Version="2.9.3" />
+                    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+                  </ItemGroup>
+                  <ItemGroup>
+                    <ProjectReference Include="../src/App.csproj" />
+                    <Using Include="Xunit" />
+                  </ItemGroup>
+                </Project>
+                """, ct);
             await WriteFile(sandbox, workingDirectory, "tests/FeatureFlagsTests.cs", """
+                using App;
+
                 public sealed class FeatureFlagsTests
                 {
                     [Fact]
                     public void EnabledBranch_ReturnsTrue()
-                        => Assert.True(FeatureFlags.AddFeatureFlagX(Config("enabled")));
+                        => Assert.True(FeatureFlags.AddFeatureFlagX(
+                            new Dictionary<string, string> { ["FeatureX"] = "enabled" }));
                 }
                 """, ct);
         };
@@ -794,8 +830,6 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         Assert.True(
             final!.State == WorkItemState.AuditFailed,
             $"expected AuditFailed, got {final.State}: {final.LastError}");
-        Assert.Equal([1], build.SeenIterations);
-        Assert.Equal([1], test.SeenIterations);
         Assert.Equal([1], llm.SeenIterations);
         Assert.Contains("new code path is never wired", final.LastError, StringComparison.OrdinalIgnoreCase);
 
@@ -834,7 +868,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     [Theory]
     [InlineData("node", "package.json", "{\"scripts\":{\"test\":\"node -e 0\"}}\n", "npm test")]
     [InlineData("python", "pyproject.toml", "[project]\nname = \"sample\"\nversion = \"0.1.0\"\n", "pytest ")]
-    public async Task BuiltInNodeAndPythonPassingTestGateUnlocksLlmPanel(
+    public async Task BuiltInNodeAndPythonPassingTestGateDoesNotUnlockLlmPanelWithoutBuildEvidence(
         string language,
         string markerFile,
         string markerContents,
@@ -880,17 +914,15 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             }, ct);
         };
         tp.Agent.WorkPlan.Enqueue(new FileWrite("change.txt", "v1"));
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("llm-touch.txt", "reviewed"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.True(
-            final!.State == WorkItemState.Done,
-            $"expected Done, got {final.State}: {final.LastError}");
-        Assert.Equal(1, llmRuns);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("no verified build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, llmRuns);
         var toolLog = await File.ReadAllLinesAsync(fakeTools.LogPath);
         Assert.Contains(expectedTestCommand, toolLog);
     }
