@@ -145,6 +145,32 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditStarted_ReportsBuildTestGateBeforeShortCircuitAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = BuildPipeline(_workspace, seed, webhooks,
+            auditors:
+            [
+                new OrderedPassAuditor("audit:style"),
+                new OrderedPassAuditor("audit:policy-gate", canShortCircuit: true),
+                new OrderedPassAuditor("csharp:test-pass", role: AuditorRole.BuildTestGate),
+            ]);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-started-order.txt", "x\n"));
+
+        var item = MakeItem("feature/audit-started-order");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var auditStarted = webhooks.Events.First(e => e.Event == "audit.started");
+        var details = Assert.IsType<AuditStartedDetails>(auditStarted.Details);
+        Assert.Equal(
+            ["csharp:test-pass", "audit:policy-gate", "audit:style"],
+            details.AuditorsScheduled);
+    }
+
+    [Fact]
     public async Task AuditFindingsEmitted_PassingIteration_HasEmptyFindings()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -462,6 +488,31 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         public string Name { get; }
         public string Kind => "tool";
         public AuditCapabilities Required => AuditCapabilities.None;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    private sealed class OrderedPassAuditor : IAuditor
+    {
+        public OrderedPassAuditor(
+            string name,
+            AuditorRole role = AuditorRole.None,
+            bool canShortCircuit = false)
+        {
+            Name = name;
+            Role = role;
+            CanShortCircuitOnBlockingFinding = canShortCircuit;
+        }
+
+        public string Name { get; }
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public AuditorRole Role { get; }
+        public bool CanShortCircuitOnBlockingFinding { get; }
+        public BuildTestGateEvidence BuildTestGateEvidence => Role == AuditorRole.BuildTestGate
+            ? BuildTestGateEvidence.BuildAndTest
+            : BuildTestGateEvidence.None;
+
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
             => Task.FromResult(new AuditResult(true, []));
     }

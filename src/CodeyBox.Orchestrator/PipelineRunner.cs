@@ -6450,7 +6450,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         return auditors
             .Select((auditor, index) => new { Auditor = auditor, Index = index })
-            .OrderBy(x => x.Auditor.CanShortCircuitOnBlockingFinding ? 0 : 1)
+            .OrderBy(x => AuditorOrdering.TierOf(x.Auditor))
             .ThenBy(x => x.Index)
             .Select(x => x.Auditor)
             .ToList();
