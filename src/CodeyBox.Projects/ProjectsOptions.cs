@@ -175,6 +175,11 @@ public sealed class ProjectAuditConfig
     public string? LlmPromptFrameTemplate { get; set; }
     public List<CustomAuditorConfig>? Custom { get; set; }
     public List<string>? ExcludedAuditors { get; set; }
+    /// <summary>
+    /// Deterministic normalizers to run after work/rework and before audit.
+    /// Null = inherit or derive from languages; empty list = disabled.
+    /// </summary>
+    public List<string>? MechanicalFixers { get; set; }
 
     /// <summary>
     /// Agent used for LLM-based auditors. Null = use the project's primary agent.

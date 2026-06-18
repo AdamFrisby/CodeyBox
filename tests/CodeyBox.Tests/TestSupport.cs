@@ -127,6 +127,7 @@ internal static class TestSupport
         CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null,
         ISessionAgentRunner? sessionAgentRunnerOverride = null,
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshotOverride = null,
+        IEnumerable<IMechanicalFixer>? mechanicalFixers = null,
         // Extra registry entries — register additional agent runners alongside
         // the default ScriptedAgent so tests can exercise audit-pool routing
         // for non-work agents (e.g. asserting missing-credentials / smoke-
@@ -198,6 +199,7 @@ internal static class TestSupport
 
         var presetCatalog = presetCatalogOverride ?? new ScriptedAuditorCatalog(auditorList);
         var composer = new ProjectAuditorComposer(presetCatalog);
+        var mechanicalComposer = ProjectMechanicalFixerComposer.FromFixers(mechanicalFixers ?? []);
         var resolvedUpstreamFactory = upstreamFactory ?? new TestUpstreamFactory();
         var resolvedOptions = pipelineOptions ?? new PipelineOptions
         {
@@ -297,7 +299,8 @@ internal static class TestSupport
                     : new Func<AgentSessionHandle, AgentSessionHandle>(claudeSessionWorker.SnapshotPersistedHandle)),
             cancellationRegistry: cancellationRegistry,
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            mechanicalFixerComposer: mechanicalComposer);
 
         return new TestPipeline(
             pipeline,

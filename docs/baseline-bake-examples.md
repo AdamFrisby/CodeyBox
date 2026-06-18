@@ -15,7 +15,11 @@ tool and re-run audit to get enforcement.
   "CodeyBox": {
     "MultipassExtraRuncmd": [
       "apt-get update",
-      "apt-get install -y curl ca-certificates git python3 python3-pip python3-venv nodejs npm golang rustup dotnet-sdk-10.0",
+      "apt-get install -y curl ca-certificates git python3 python3-pip python3-venv nodejs npm golang rustup",
+      "curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh",
+      "bash /tmp/dotnet-install.sh --version 10.0.301 --install-dir /usr/share/dotnet",
+      "ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet",
+      "dotnet --version | grep -Fx 10.0.301",
       "python3 -m pip install --break-system-packages ruff mypy pytest pip-audit",
       "npm install -g prettier eslint",
       "go install golang.org/x/vuln/cmd/govulncheck@latest",
@@ -33,11 +37,26 @@ tool and re-run audit to get enforcement.
   "CodeyBox": {
     "MultipassExtraRuncmd": [
       "apt-get update",
-      "apt-get install -y dotnet-sdk-10.0"
+      "apt-get install -y curl ca-certificates",
+      "curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh",
+      "bash /tmp/dotnet-install.sh --version 10.0.301 --install-dir /usr/share/dotnet",
+      "ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet",
+      "dotnet --version | grep -Fx 10.0.301"
     ]
   }
 }
 ```
+
+## Pinning .NET SDKs
+
+Do not bake C# baselines from a floating .NET SDK channel such as
+`dotnet-install.sh --channel 10.0` or an unpinned `dotnet-sdk-10.0` package.
+`dotnet format` behavior can change across SDK feature bands, and audit-tool
+sandboxes must use the same formatter version as the mechanical
+`dotnet-format` fixer. Pin an exact SDK version in `MultipassExtraRuncmd`,
+verify it with `dotnet --version`, and deliberately bump the version in both
+the baseline config and any developer/CI images when you want formatter rules
+to change.
 
 ## Python Minimal
 

@@ -53,6 +53,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IProjectRepository _projects;
     private readonly IUpstreamRemoteFactory _upstreamFactory;
     private readonly ProjectAuditorComposer _auditorComposer;
+    private readonly ProjectMechanicalFixerComposer _mechanicalFixerComposer;
     private readonly IWorkItemStore _store;
     private readonly IWebhookDispatcher _webhooks;
     private readonly IWorkItemTerminalTransition _terminalTransitions;
@@ -275,7 +276,8 @@ public sealed class PipelineRunner : IPipelineRunner
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null,
         CancellationRegistry? cancellationRegistry = null,
         IWorkItemTerminalTransition? terminalTransitions = null,
-        IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null)
+        IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null,
+        ProjectMechanicalFixerComposer? mechanicalFixerComposer = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -285,6 +287,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _projects = projects;
         _upstreamFactory = upstreamFactory;
         _auditorComposer = auditorComposer;
+        _mechanicalFixerComposer = mechanicalFixerComposer ?? ProjectMechanicalFixerComposer.FromFixers([]);
         _store = store;
         _webhooks = webhooks;
         _opts = opts;
@@ -5374,6 +5377,17 @@ public sealed class PipelineRunner : IPipelineRunner
             if (iteration > 1)
                 await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
 
+            await RunMechanicalFixersAsync(
+                item,
+                project,
+                repoId,
+                baseBranch,
+                workBranch,
+                auditors,
+                iteration,
+                ct,
+                hostShutdownToken);
+
             // Per-iteration audit phase scope. Disposed explicitly before the
             // rework scope (below) so codeybox.phase.duration_ms{phase=audit}
             // measures only the auditing work — not nested rework or later
@@ -5670,6 +5684,145 @@ public sealed class PipelineRunner : IPipelineRunner
             if (parked) return true;
         }
         return false;
+    }
+
+    private async Task RunMechanicalFixersAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        IReadOnlyList<IAuditor> auditors,
+        int auditIteration,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        var fixers = _mechanicalFixerComposer.Compose(project);
+        if (fixers.Count == 0)
+            return;
+
+        using var phaseScope = BeginPhaseScope(item, "mechanical-edit");
+        using var mechanicalPhase = new PhaseCancellation("mechanical-edit", ct, _opts.TimeProvider);
+        mechanicalPhase.SetPhaseTimeout(project.Audit.PerIterationTimeout);
+        mechanicalPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+        var phaseCt = mechanicalPhase.Token;
+
+        try
+        {
+            var access = _gitHost.GetSandboxAccess(repoId);
+            var sandboxTarget = SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditTool, AuditCapabilities.None);
+            var spec = BuildSandboxSpec(
+                access,
+                includeAgentCredential: null,
+                allowAgentNetwork: false,
+                hostNetworkProfile: sandboxTarget.NetworkProfile,
+                timingWorkItemId: item.Id,
+                timingPhase: "mechanical-edit",
+                flavor: sandboxTarget.Flavor,
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
+
+            await using var sandbox = await _sandboxes.CreateAsync(spec, phaseCt);
+            await RunWithCancellation(sandbox, phaseCt, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await RunWithCancellation(
+                sandbox,
+                phaseCt,
+                "git",
+                "-C",
+                SandboxConventions.WorkDir,
+                "checkout",
+                "-B",
+                workBranch,
+                $"origin/{workBranch}");
+
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+
+            var ctx = new MechanicalFixerContext(
+                item.Id,
+                workBranch,
+                baseBranch,
+                auditIteration,
+                project.Id.Value,
+                auditors);
+
+            var changedFixers = new List<string>();
+            foreach (var fixer in fixers)
+            {
+                var result = await fixer.ApplyAsync(sandbox, SandboxConventions.WorkDir, ctx, phaseCt);
+                if (result.Changed)
+                    changedFixers.Add(fixer.Name);
+
+                _log.LogInformation(
+                    "Mechanical fixer {FixerName} completed for work item {WorkItemId} audit iteration {AuditIteration}: changed={Changed}; {Summary}",
+                    fixer.Name,
+                    item.Id,
+                    auditIteration,
+                    result.Changed,
+                    result.Summary ?? "(no summary)");
+            }
+
+            var status = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+            }, phaseCt);
+            if (!status.Success)
+                throw new InvalidOperationException($"mechanical-edit could not read git status: {status.Stderr}");
+            if (string.IsNullOrWhiteSpace(status.Stdout))
+                return;
+
+            await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            var staged = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
+            }, phaseCt);
+            if (staged.ExitCode == 0)
+                return;
+            if (staged.ExitCode != 1)
+                throw new InvalidOperationException($"mechanical-edit could not inspect staged diff: {staged.Stderr}");
+
+            var revision = await TryLookupIterationRevisionAsync(item.Id, auditIteration, phaseCt) ?? item.PromptRevision;
+            var model = changedFixers.Count == 0
+                ? string.Join("+", fixers.Select(f => f.Name))
+                : string.Join("+", changedFixers);
+            var trailerBlock = await ComposeCommitTrailerBlockAsync(
+                item.Id,
+                new AgentKind("mechanical"),
+                model,
+                phaseCt,
+                promptRevisionAtDispatch: revision);
+            var subject = changedFixers.Count == 1 &&
+                          changedFixers[0].Equals("dotnet-format", StringComparison.OrdinalIgnoreCase)
+                ? "chore: normalize (dotnet format)"
+                : "chore: normalize mechanical edits";
+            var commitMessage = $"{subject}\n\n{trailerBlock}";
+
+            await using (var commitScope = await TimingScope.BeginAsync(
+                _timings,
+                item.Id,
+                "mechanical-edit",
+                "git.commit",
+                activitySource: CodeyBoxActivities.Sandbox,
+                log: _log))
+            {
+                await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+            }
+
+            await using (var pushScope = await TimingScope.BeginAsync(
+                _timings,
+                item.Id,
+                "mechanical-edit",
+                "git.push_back_to_bare_repo",
+                activitySource: CodeyBoxActivities.Sandbox,
+                log: _log))
+            {
+                await PushSandboxWorkBranchWithReconcileAsync(sandbox, workBranch, phaseCt);
+            }
+        }
+        catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+        {
+            throw mechanicalPhase.Wrap(oce);
+        }
     }
 
     private async Task<bool> HandleExhaustedPersistedAuditHistoryAsync(

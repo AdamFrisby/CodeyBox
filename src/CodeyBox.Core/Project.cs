@@ -458,6 +458,11 @@ public sealed record ProjectAudit
     public string? LlmPromptFrameTemplate { get; init; }
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
     public IReadOnlyList<string> ExcludedAuditors { get; init; } = [];
+    /// <summary>
+    /// Deterministic normalizers to run after work/rework and before audit.
+    /// Empty disables the mechanical-edit phase for this audit profile.
+    /// </summary>
+    public IReadOnlyList<string> MechanicalFixers { get; init; } = [];
 
     /// <summary>
     /// Agent runner used for LLM-based auditors (security:llm-review,

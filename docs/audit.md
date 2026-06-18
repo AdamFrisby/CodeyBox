@@ -17,6 +17,8 @@ Work phase             ─→  push <workBranch>
        ▼
 Audit + rework loop:
    for iteration 1..MaxIterations:
+       Mechanical fixers (deterministic, may commit)
+         │
        Audit sandboxes (capability-grouped)
          │
          ├── pass  → break, proceed to merge
@@ -51,6 +53,34 @@ WorkComplete ──→ Auditing ──pass──→ AuditPassed ──→ Mergin
 `AuditFailed` is treated as a terminal failure distinct from `Failed`
 so operators can dashboards-filter "agent didn't converge" separately
 from "infrastructure broke."
+
+## Mechanical edit step
+
+Before each audit iteration, CodeyBox can run configured
+`IMechanicalFixer` implementations against the work branch. This is a
+separate primitive from both auditors and LLM-driven work/rework:
+
+- Auditors are read-only and produce verdicts/findings.
+- Work/rework calls an agent and is non-deterministic.
+- Mechanical fixers are deterministic, no-model transforms that may edit the
+  work tree.
+
+Fixers run after the initial work phase and after every rework phase, before
+auditors inspect the tree. If a fixer changes files, the pipeline commits the
+delta as a clearly labeled mechanical commit and pushes the work branch before
+continuing. That commit carries the same prompt-revision metadata trailers as
+agent commits, but it is not treated as agent work and does not trip the
+"agent produced no changes" failure path.
+
+Mechanical edit failures are infrastructure failures for the item, not audit
+findings. A successful no-op fixer produces no commit.
+
+The v1 built-in fixer is `dotnet-format`. It is enabled by default when the
+C# language preset is enabled, unless the project sets
+`Audit.MechanicalFixers: []`. It reuses the active `csharp:format-check`
+auditor command and language marker discovery, removing only read-only flags
+such as `--verify-no-changes`. This guarantees the normalizer and the matching
+format auditor run under the same SDK, configuration, and sandbox baseline.
 
 ## Auditor capability groups
 

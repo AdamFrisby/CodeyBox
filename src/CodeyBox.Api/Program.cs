@@ -1666,6 +1666,8 @@ builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
+builder.Services.AddSingleton<IMechanicalFixer, DotnetFormatMechanicalFixer>();
+builder.Services.AddSingleton<IMechanicalFixerRegistry, MechanicalFixerRegistry>();
 
 // Mutation-testing rigor gate (disabled by default; per-project threshold).
 // The auditor short-circuits to pass when Enabled=false, so registering the
@@ -1703,6 +1705,7 @@ builder.Services.AddSingleton<IAuditor>(sp =>
 });
 
 builder.Services.AddSingleton<ProjectAuditorComposer>();
+builder.Services.AddSingleton<ProjectMechanicalFixerComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------
 // Registered as IDeepAuditor; ReleaseService resolves the subset configured per
@@ -2354,7 +2357,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
         : null,
     cancellationRegistry: sp.GetRequiredService<CancellationRegistry>(),
     terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>(),
-    terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>()));
+    terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>(),
+    mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

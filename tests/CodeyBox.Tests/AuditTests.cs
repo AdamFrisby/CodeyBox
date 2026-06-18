@@ -164,6 +164,34 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpFormatCheck_FailureReportsDotnetFormatViolations()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:format-check",
+            Argv = ["dotnet", "format", "--verify-no-changes"],
+            ResultClassifier = new DotnetFormatCommandResultClassifier(),
+        });
+        const string stderr = """
+            /work/src/App/Program.cs(4,12): error WHITESPACE: Fix whitespace formatting. Insert '\s'. [/work/src/App/App.csproj]
+            /work/src/App/Program.cs(8,1): error IDE0055: Fix formatting. [/work/src/App/App.csproj]
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format would change files", finding.Title);
+        Assert.Contains("Run `dotnet format`", finding.Description);
+        Assert.Contains("Program.cs(4,12)", finding.Description);
+        Assert.Contains("IDE0055", finding.Description);
+    }
+
+    [Fact]
     public async Task ShellCommandAuditor_Exit127WithSpoofedMissingToolOutput_RemainsError()
     {
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
