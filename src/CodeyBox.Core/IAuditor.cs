@@ -56,10 +56,10 @@ public interface IAuditor
     /// Evidence produced by this auditor when <see cref="Role"/> is
     /// <see cref="AuditorRole.BuildTestGate"/>. Build-only checks must not
     /// authorize LLM auditors whose prompt says the full test suite passed.
+    /// Implementations must opt in explicitly; the default contributes no
+    /// evidence so a role marker alone cannot prove build or test coverage.
     /// </summary>
-    BuildTestGateEvidence BuildTestGateEvidence => Role == AuditorRole.BuildTestGate
-        ? BuildTestGateEvidence.BuildAndTest
-        : BuildTestGateEvidence.None;
+    BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.None;
 
     /// <summary>
     /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
@@ -234,6 +234,22 @@ public sealed record AuditResult
     public string? AgentStderr { get; init; }
     public string? AgentSummary { get; init; }
     public string? AgentStdout { get; init; }
+
+    public void Deconstruct(
+        out bool Passed,
+        out IReadOnlyList<AuditFinding> Findings,
+        out string? RawOutput,
+        out string? AgentStderr,
+        out string? AgentSummary,
+        out string? AgentStdout)
+    {
+        Passed = this.Passed;
+        Findings = this.Findings;
+        RawOutput = this.RawOutput;
+        AgentStderr = this.AgentStderr;
+        AgentSummary = this.AgentSummary;
+        AgentStdout = this.AgentStdout;
+    }
 
     /// <summary>
     /// When set to false, a passing BuildTestGate result is still a pass for

@@ -14,4 +14,4 @@ auditors:
   - name: python:test-pass
     argv: ["pytest"]
     role: build-test-gate
-    gateEvidence: test
+    gateEvidence: build-and-test

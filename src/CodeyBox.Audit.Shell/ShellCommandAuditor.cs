@@ -157,5 +157,5 @@ public sealed record ShellCommandAuditorOptions
     public IShellCommandResultClassifier? ResultClassifier { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
-    public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.BuildAndTest;
+    public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;
 }

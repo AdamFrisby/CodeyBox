@@ -107,8 +107,8 @@ public sealed class PresetCatalogTests
         AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
-        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.Test);
-        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.BuildAndTest);
         AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.BuildAndTest);
         AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.BuildAndTest);
     }
@@ -126,7 +126,7 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
-    public void AuditTypeOverride_WiresBuildTestGateRoleToShellAuditor()
+    public void AuditTypeOverride_BuildTestGateWithoutEvidenceContributesNoEvidence()
     {
         var catalog = new PresetCatalog(new PresetCatalogOptions
         {
@@ -151,11 +151,41 @@ public sealed class PresetCatalogTests
             .Single(a => a.Name == "custom-build:test-pass");
 
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void AuditTypeOverride_WiresExplicitBuildTestGateEvidenceToShellAuditor()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["custom-build"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "custom-build:test-pass",
+                            Argv = ["dotnet", "test"],
+                            Role = "build-test-gate",
+                            GateEvidence = "build-and-test",
+                        },
+                    ],
+                },
+            },
+        });
+
+        var auditor = catalog.ResolveAuditType("custom-build", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "custom-build:test-pass");
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
         Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
     }
 
     [Fact]
-    public void AuditTypeOverride_WiresBuildTestGateRoleToScriptBackedShellAuditor()
+    public void AuditTypeOverride_BuildTestGateScriptWithoutEvidenceContributesNoEvidence()
     {
         var catalog = new PresetCatalog(new PresetCatalogOptions
         {
@@ -181,11 +211,11 @@ public sealed class PresetCatalogTests
             .Single(a => a.Name == "custom-script-build:test-pass");
 
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
-        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
     }
 
     [Fact]
-    public void RepositoryAuditTypeYaml_AcceptsBuildTestGateRole()
+    public void RepositoryAuditTypeYaml_RejectsBuildTestGateRole()
     {
         using var temp = TempProject();
         Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
@@ -197,12 +227,29 @@ public sealed class PresetCatalogTests
                 role: build-test-gate
             """);
 
-        var auditor = new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path })
-            .ResolveAuditType("repo-build", new PresetContext(new FakeAgent()))
-            .Single(a => a.Name == "repo-build:test-pass");
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
 
-        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
-        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
+        Assert.Contains("role is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryAuditTypeYaml_RejectsGateEvidence()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "repo-build.yaml"), """
+            id: repo-build
+            auditors:
+              - name: repo-build:test-pass
+                argv: ["dotnet", "test"]
+                gateEvidence: build-and-test
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("gateEvidence is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

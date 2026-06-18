@@ -282,9 +282,7 @@ public sealed class ProjectAuditorComposer
         AuditorRole role)
     {
         if (string.IsNullOrWhiteSpace(descriptor.GateEvidence))
-            return role == AuditorRole.BuildTestGate
-                ? BuildTestGateEvidence.BuildAndTest
-                : BuildTestGateEvidence.None;
+            return BuildTestGateEvidence.None;
 
         if (role != AuditorRole.BuildTestGate)
             throw new InvalidOperationException(

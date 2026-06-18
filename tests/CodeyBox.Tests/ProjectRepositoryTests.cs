@@ -190,6 +190,51 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task ProjectAuditTypesObject_BindsReplaceOnlyOverride()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Replace"] = "true",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["custom"], p!.Audit.AuditTypes);
+        Assert.True(p.Audit.AuditTypeOverrides["custom"].Replace);
+    }
+
+    [Fact]
+    public async Task ProjectAuditTypesObject_BindsPatternOnlyOverride()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Patterns:0:Regex"] = "TODO",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Patterns:0:Description"] = "No TODOs",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Patterns:0:Severity"] = "warning",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["custom"], p!.Audit.AuditTypes);
+        var pattern = Assert.Single(p.Audit.AuditTypeOverrides["custom"].Patterns);
+        Assert.Equal("TODO", pattern.Regex);
+        Assert.Equal("No TODOs", pattern.Description);
+        Assert.Equal("warning", pattern.Severity);
+    }
+
+    [Fact]
     public async Task ProjectAuditProfiles_BindAndResolveSelectedProfile()
     {
         var config = new ConfigurationBuilder()

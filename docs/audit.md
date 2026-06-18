@@ -110,10 +110,14 @@ ships a separate build step — currently only `csharp:build-WaE`) and the
 (Go, Node, Python, Rust) fold the build into the same command as the
 test suite, so only their `<lang>:test-*` auditor carries the role and it
 advertises `build-and-test` evidence.
-Repository-supplied YAML may also mark its own shell auditors with
-`role: build-test-gate` — do so for any custom step (e.g. a separate
-`tsc`/`cargo check`/cross-compile) whose failure should also short-circuit
-the LLM panel.
+Gate metadata is accepted only from trusted configuration: built-in presets
+or operator/project appsettings overrides. Repository-supplied YAML can add
+shell auditors, but it cannot declare `role` or `gateEvidence`, because that
+would let an untrusted repository forge the CI evidence used to unlock LLM
+review. In trusted config, set `role: build-test-gate` plus explicit
+`gateEvidence` for any custom step (e.g. a separate `tsc`/`cargo check`/
+cross-compile) whose successful run should contribute to the LLM panel gate.
+If `gateEvidence` is omitted, the gate contributes no build/test evidence.
 
 ## Built-in auditors
 

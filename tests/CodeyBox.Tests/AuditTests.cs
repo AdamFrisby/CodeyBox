@@ -76,6 +76,33 @@ public sealed class AuditTests
         Assert.NotNull(ctor);
     }
 
+    [Fact]
+    public void AuditResult_RetainsSixArgumentDeconstructForPluginAbi()
+    {
+        var findings = new[]
+        {
+            new AuditFinding("audit", AuditSeverity.Warning, "title", "description"),
+        };
+        var result = new AuditResult(
+            true,
+            findings,
+            RawOutput: "raw",
+            AgentStderr: "stderr",
+            AgentSummary: "summary",
+            AgentStdout: "stdout")
+        {
+            BuildTestGateEvidenceVerified = true,
+        };
+
+        var (passed, deconstructedFindings, rawOutput, agentStderr, agentSummary, agentStdout) = result;
+
+        Assert.True(passed);
+        Assert.Same(findings, deconstructedFindings);
+        Assert.Equal("raw", rawOutput);
+        Assert.Equal("stderr", agentStderr);
+        Assert.Equal("summary", agentSummary);
+        Assert.Equal("stdout", agentStdout);
+    }
 
     [Fact]
     public void ReworkPromptBuilder_GroupsByAuditorAndIncludesOriginal()

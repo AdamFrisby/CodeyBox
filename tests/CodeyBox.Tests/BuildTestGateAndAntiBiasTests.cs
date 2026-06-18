@@ -4,6 +4,8 @@ using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -68,7 +70,9 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
 
         // The LLM auditor must have run exactly once (iter 2), never iter 1.
         Assert.Equal(1, llmRunsSeen);
@@ -317,6 +321,153 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task FailedBuildTestGateStopsRemainingAuditors_WhenStopOnFirstFailureOn()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var formatRuns = 0;
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(false, [new AuditFinding(
+                "csharp:test-pass",
+                AuditSeverity.Error,
+                "tests failed",
+                "UnitTests.Fail failed")])],
+            gateEvidence: BuildTestGateEvidence.Test);
+        var format = new RoleStampedScriptedAuditor(
+            "csharp:format-check",
+            AuditorRole.None,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Interlocked.Increment(ref formatRuns));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate, format, llm],
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+                StopOnFirstFailure = true,
+            },
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(0, formatRuns);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
+    public async Task FailedBuildTestGateHonorsDeclaredShortCircuit_WhenEnabled()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var laterToolRuns = 0;
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:build-WaE",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(false, [new AuditFinding(
+                "csharp:build-WaE",
+                AuditSeverity.Error,
+                "build failed",
+                "compile error")])],
+            onRun: _ => { },
+            gateEvidence: BuildTestGateEvidence.Build,
+            canShortCircuitOnBlockingFinding: true);
+        var laterTool = new RoleStampedScriptedAuditor(
+            "csharp:format-check",
+            AuditorRole.None,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Interlocked.Increment(ref laterToolRuns));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate, laterTool, llm],
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+                StopOnFirstFailure = false,
+            },
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(0, laterToolRuns);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
+    public async Task FailedBuildTestGateSkipsLlmButRunsNonLlmTools_WhenShortCircuitRoutingDisabled()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var laterToolRuns = 0;
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:build-WaE",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(false, [new AuditFinding(
+                "csharp:build-WaE",
+                AuditSeverity.Error,
+                "build failed",
+                "compile error")])],
+            onRun: _ => { },
+            gateEvidence: BuildTestGateEvidence.Build,
+            canShortCircuitOnBlockingFinding: true);
+        var laterTool = new RoleStampedScriptedAuditor(
+            "csharp:format-check",
+            AuditorRole.None,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Interlocked.Increment(ref laterToolRuns));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditShortCircuitEnabled = false,
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate, laterTool, llm],
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+                StopOnFirstFailure = false,
+            },
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(1, laterToolRuns);
+        Assert.Equal(0, llmRuns);
+    }
+
+    [Fact]
     public async Task FailedBuildTestGateSkipsUnmarkedLlmAuditor()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -496,7 +647,9 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
         Assert.Equal(["gate", "format", "llm"], executionOrder);
     }
 
@@ -533,6 +686,58 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         // LLM panel still runs even though a non-gate tool auditor blocked.
         Assert.Equal(1, llmRuns);
+    }
+
+    [Fact]
+    public async Task MarkerInterfaceGatesCredentialFreeNonLlmAuditor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var markedRuns = 0;
+        var marked = new MarkedToolReviewAuditor("custom:design-review", _ => Interlocked.Increment(ref markedRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [marked],
+            maxAuditIterations: 1,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, markedRuns);
+    }
+
+    [Fact]
+    public async Task CredentialedNonLlmAuditorDoesNotRequireBuildTestGate()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var credentialedRuns = 0;
+        var credentialed = new CredentialedToolAuditor("plugin:credentialed-scan", _ => Interlocked.Increment(ref credentialedRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [credentialed],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(1, credentialedRuns);
     }
 
     [Fact]
@@ -626,6 +831,103 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData("node", "package.json", "{\"scripts\":{\"test\":\"node -e 0\"}}\n", "npm test")]
+    [InlineData("python", "pyproject.toml", "[project]\nname = \"sample\"\nversion = \"0.1.0\"\n", "pytest ")]
+    public async Task BuiltInNodeAndPythonPassingTestGateUnlocksLlmPanel(
+        string language,
+        string markerFile,
+        string markerContents,
+        string expectedTestCommand)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace, $"seed-{language}");
+        await File.WriteAllTextAsync(Path.Combine(seed, markerFile), markerContents);
+        await TestSupport.RunGit(seed, "add", markerFile);
+        await TestSupport.RunGit(seed, "commit", "-m", $"add {language} marker");
+
+        var fakeTools = await CreateFakeAuditToolsAsync();
+        var llmRuns = 0;
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                Languages = [language],
+                LanguagesConfigured = true,
+                AuditTypes = ["quality"],
+                MaxLlmAuditorParallelism = 1,
+            },
+            presetCatalogOverride: new PresetCatalog(),
+            sandboxProvider: new PathInjectingSandboxProvider(fakeTools.Path, fakeTools.Environment),
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var auditDir = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["test", "-d", "audit"],
+                WorkingDirectory = workingDirectory,
+            }, ct);
+            if (!auditDir.Success)
+                return;
+
+            Interlocked.Increment(ref llmRuns);
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf '%s' '{\"passed\":true,\"findings\":[]}' > audit/result.json"],
+                WorkingDirectory = workingDirectory,
+            }, ct);
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("change.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("llm-touch.txt", "reviewed"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(1, llmRuns);
+        var toolLog = await File.ReadAllLinesAsync(fakeTools.LogPath);
+        Assert.Contains(expectedTestCommand, toolLog);
+    }
+
+    private async Task<FakeAuditTools> CreateFakeAuditToolsAsync()
+    {
+        var bin = Path.Combine(_workspace, "fake-audit-tools-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(bin);
+        var log = Path.Combine(_workspace, "fake-audit-tools-" + Guid.NewGuid().ToString("N")[..8] + ".log");
+        foreach (var tool in new[] { "prettier", "eslint", "npm", "ruff", "mypy", "pyright", "pytest" })
+        {
+            var path = Path.Combine(bin, tool);
+            await File.WriteAllTextAsync(path, """
+                #!/bin/sh
+                printf '%s %s\n' "$(basename "$0")" "$*" >> "$CODEYBOX_FAKE_AUDIT_TOOL_LOG"
+                exit 0
+                """);
+            MakeExecutable(path);
+        }
+
+        return new FakeAuditTools(
+            bin + Path.PathSeparator + "/usr/bin:/bin",
+            log,
+            new Dictionary<string, string> { ["CODEYBOX_FAKE_AUDIT_TOOL_LOG"] = log });
+    }
+
+    private static void MakeExecutable(string path)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        File.SetUnixFileMode(path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+            UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+
     private static ConstantCredentialProvider AuditCredentials()
         => new(new AgentCredential(
             AgentKind.Claude,
@@ -642,6 +944,66 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         WorkBranch = "feature/x",
         PushUpstream = false,
     };
+
+    private sealed record FakeAuditTools(
+        string Path,
+        string LogPath,
+        IReadOnlyDictionary<string, string> Environment);
+
+    private sealed class PathInjectingSandboxProvider(
+        string path,
+        IReadOnlyDictionary<string, string>? environment = null) : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner =
+            new(NullLogger<ProcessSandboxProvider>.Instance);
+
+        public string Name => _inner.Name;
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => new PathInjectingSandbox(await _inner.CreateAsync(spec, ct), path, environment);
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class PathInjectingSandbox(
+        ISandbox inner,
+        string path,
+        IReadOnlyDictionary<string, string>? environment) : ISandbox
+    {
+        public string Id => inner.Id;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var env = exec.ExtraEnvironment is null
+                ? new Dictionary<string, string>()
+                : new Dictionary<string, string>(exec.ExtraEnvironment);
+            env["PATH"] = path;
+            if (environment is not null)
+            {
+                foreach (var (key, value) in environment)
+                    env[key] = value;
+            }
+
+            var argv = exec.Argv;
+            if (argv.Count > 0 && !Path.IsPathRooted(argv[0]))
+            {
+                var toolPath = path
+                    .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(dir => Path.Combine(dir, argv[0]))
+                    .FirstOrDefault(File.Exists);
+                if (toolPath is not null)
+                    argv = [toolPath, .. argv.Skip(1)];
+            }
+
+            return inner.ExecAsync(exec with { Argv = argv, ExtraEnvironment = env }, ct);
+        }
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
 }
 
 // ── Anti-bias: low-quality diff still produces findings ───────────────────────
@@ -849,19 +1211,22 @@ file sealed class RoleStampedScriptedAuditor : IAuditor
         AuditorRole role,
         IEnumerable<AuditOutcome> plan,
         Action<int>? onRun = null,
-        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.BuildAndTest)
+        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.BuildAndTest,
+        bool canShortCircuitOnBlockingFinding = false)
     {
         Name = name;
         Role = role;
         _plan = new Queue<AuditOutcome>(plan);
         _onRun = onRun;
         _gateEvidence = gateEvidence;
+        CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding;
     }
 
     public string Name { get; }
     public string Kind => "tool";
     public AuditCapabilities Required => AuditCapabilities.None;
     public AuditorRole Role { get; }
+    public bool CanShortCircuitOnBlockingFinding { get; }
     public BuildTestGateEvidence BuildTestGateEvidence => Role == AuditorRole.BuildTestGate
         ? _gateEvidence
         : BuildTestGateEvidence.None;
@@ -880,6 +1245,48 @@ file sealed class RoleStampedScriptedAuditor : IAuditor
         {
             BuildTestGateEvidenceVerified = outcome.BuildTestGateEvidenceVerified,
         });
+    }
+}
+
+file sealed class MarkedToolReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
+{
+    private readonly Action<int> _onRun;
+
+    public MarkedToolReviewAuditor(string name, Action<int> onRun)
+    {
+        Name = name;
+        _onRun = onRun;
+    }
+
+    public string Name { get; }
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+
+    public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+    {
+        _onRun(context.Iteration);
+        return Task.FromResult(new AuditResult(true, []));
+    }
+}
+
+file sealed class CredentialedToolAuditor : IAuditor
+{
+    private readonly Action<int> _onRun;
+
+    public CredentialedToolAuditor(string name, Action<int> onRun)
+    {
+        Name = name;
+        _onRun = onRun;
+    }
+
+    public string Name { get; }
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
+
+    public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+    {
+        _onRun(context.Iteration);
+        return Task.FromResult(new AuditResult(true, []));
     }
 }
 

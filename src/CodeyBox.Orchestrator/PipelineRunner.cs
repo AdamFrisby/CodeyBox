@@ -6272,13 +6272,20 @@ public sealed class PipelineRunner : IPipelineRunner
                 buildTestGateAuditors,
                 repoId,
                 ctx,
-                detectDeclaredShortCircuit: false,
+                detectDeclaredShortCircuit: auditShortCircuitEnabled,
                 progressUpdate,
                 ct);
 
-            prefix = gate with { DeclaredShortCircuitBlocking = false };
+            prefix = gate;
             if (gate.IncompleteVerdict)
                 return prefix;
+            if (gate.DeclaredShortCircuitBlocking)
+                return prefix;
+            if (project.Audit.StopOnFirstFailure
+                && gate.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+            {
+                return prefix;
+            }
         }
 
         if (remainingAuditors.Count == 0)
@@ -6459,8 +6466,7 @@ public sealed class PipelineRunner : IPipelineRunner
         => auditor is IRequiresPassedBuildTestGate || IsLlmDrivenAuditor(auditor);
 
     private static bool IsLlmDrivenAuditor(IAuditor auditor)
-        => string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase)
-           || auditor.Required.HasFlag(AuditCapabilities.AgentCredentials);
+        => string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase);
 
     private static AuditorBatchResult EmptyAuditorBatchResult()
         => new([], null, false, CompletedAuditors: []);

@@ -460,9 +460,17 @@ internal sealed class PresetConfigLoader
         }
 
         if (!string.IsNullOrWhiteSpace(auditor.Role))
+        {
+            if (!isTrusted)
+                throw new PresetConfigurationException($"{source}: {pointer}/role is not allowed in repository-provided configuration. Build/test gate metadata must come from trusted configuration.");
             _ = ParseAuditorRole(source, $"{pointer}/role", auditor.Role);
+        }
         if (!string.IsNullOrWhiteSpace(auditor.GateEvidence))
+        {
+            if (!isTrusted)
+                throw new PresetConfigurationException($"{source}: {pointer}/gateEvidence is not allowed in repository-provided configuration. Build/test gate metadata must come from trusted configuration.");
             _ = ParseBuildTestGateEvidence(source, $"{pointer}/gateEvidence", auditor.Role, auditor.GateEvidence);
+        }
     }
 
     internal static AuditorRole ParseAuditorRole(string source, string pointer, string? role)
@@ -485,9 +493,7 @@ internal sealed class PresetConfigLoader
             pointer.Replace("/gateEvidence", "/role", StringComparison.Ordinal),
             role);
         if (string.IsNullOrWhiteSpace(evidence))
-            return parsedRole == AuditorRole.BuildTestGate
-                ? BuildTestGateEvidence.BuildAndTest
-                : BuildTestGateEvidence.None;
+            return BuildTestGateEvidence.None;
 
         if (parsedRole != AuditorRole.BuildTestGate)
             throw new PresetConfigurationException($"{source}: {pointer} requires role 'build-test-gate'.");

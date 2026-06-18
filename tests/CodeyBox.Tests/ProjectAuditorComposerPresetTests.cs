@@ -169,7 +169,7 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
-    public void Compose_CustomShellBuildTestGateDefaultsToBuildAndTestEvidence()
+    public void Compose_CustomShellBuildTestGateWithoutEvidenceContributesNoEvidence()
     {
         var composer = new ProjectAuditorComposer(new PresetCatalog());
         var project = new Project
@@ -196,7 +196,7 @@ public sealed class ProjectAuditorComposerPresetTests
             .Single(a => a.Name == "custom:ci-pass");
 
         Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
-        Assert.Equal(BuildTestGateEvidence.BuildAndTest, auditor.BuildTestGateEvidence);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
     }
 
     [Fact]
