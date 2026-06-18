@@ -114,6 +114,35 @@ public sealed class SupervisedTurnDispatcherTests
         Assert.False(sandbox.Disposed);
     }
 
+    [Fact]
+    public async Task RunAutonomousAndQueuedInjectionsAsync_SessionRunnerPreservesSandboxTransportKind()
+    {
+        var service = new AgentSupervisionService(() => new AgentSupervisionOptions { Enabled = true });
+        await using var scope = await service.TryStartSessionAsync(Start())
+            ?? throw new InvalidOperationException("expected supervision scope");
+        var inner = new RecordingRunner();
+        var sessionRunner = new RecordingSessionRunner(inner);
+        var sandbox = new StubSandbox(SandboxAgentOutputTransportKind.HttpIngest);
+
+        var result = await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+            sessionRunner,
+            sandbox,
+            "/work",
+            "autonomous-prompt",
+            credential: null,
+            modelId: "m",
+            reasoningMode: "r",
+            scope,
+            stdoutCallback: null,
+            captureStructuredStream: false,
+            promptPreprocessor: null,
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(SandboxAgentOutputTransportKind.HttpIngest, sessionRunner.OpenedSandboxTransportKinds.Single());
+        Assert.False(sandbox.Disposed);
+    }
+
     private sealed class RecordingRunner : IAgentRunner
     {
         public List<string> RunCalls { get; } = [];
@@ -145,6 +174,7 @@ public sealed class SupervisedTurnDispatcherTests
         private readonly RecordingRunner _inner;
         public List<string> SessionCalls => _inner.SessionCalls;
         public List<string> OpenedSessionIds { get; } = [];
+        public List<SandboxAgentOutputTransportKind> OpenedSandboxTransportKinds { get; } = [];
         public List<string> SendTurnSessionIds { get; } = [];
         public bool SessionsClosed { get; private set; }
 
@@ -167,6 +197,7 @@ public sealed class SupervisedTurnDispatcherTests
         {
             var sessionId = "session-" + Guid.NewGuid().ToString("N");
             OpenedSessionIds.Add(sessionId);
+            OpenedSandboxTransportKinds.Add(sandbox.AgentOutputTransportKind);
             return Task.FromResult(new AgentSessionHandle(
                 Kind, sessionId,
                 new AgentSessionSandboxRef(sandbox.Id), workingDirectory, modelId, reasoningMode));
@@ -197,9 +228,11 @@ public sealed class SupervisedTurnDispatcherTests
         }
     }
 
-    private sealed class StubSandbox : ISandbox
+    private sealed class StubSandbox(
+        SandboxAgentOutputTransportKind transportKind = SandboxAgentOutputTransportKind.ExecPipe) : ISandbox
     {
         public string Id => "stub-sandbox";
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; } = transportKind;
         public bool Disposed { get; private set; }
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>

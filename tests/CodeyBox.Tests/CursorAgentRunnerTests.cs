@@ -299,7 +299,27 @@ public sealed class CursorAgentRunnerTests
         Assert.Contains("--model", agentExec.Argv);
         Assert.Contains("composer-2.5", agentExec.Argv);
         Assert.Equal(prompt, agentExec.Stdin);
+        Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, agentExec.AgentOutputTransport);
         Assert.Null(agentExec.ExtraEnvironment);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyInSandboxAsync_HttpIngestSandboxPrefersDetachedTransport()
+    {
+        var sandbox = new RecordingSandbox(
+            agentStdout: "assistant text",
+            transportKind: SandboxAgentOutputTransportKind.HttpIngest);
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred, sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.True(result.Success, $"{result.Summary} | {result.Error}");
+        var agentExec = sandbox.Execs.Last(e => e.Argv.Count > 0 && e.Argv[0] == "agent");
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferDetachedHttpIngest, agentExec.AgentOutputTransport);
     }
 
     [Fact]
@@ -360,15 +380,18 @@ public sealed class CursorAgentRunnerTests
             int authWriteExitCode = 0,
             int agentExitCode = 0,
             string agentStdout = "ok",
-            string agentStderr = "")
+            string agentStderr = "",
+            SandboxAgentOutputTransportKind transportKind = SandboxAgentOutputTransportKind.ExecPipe)
         {
             _authWriteExitCode = authWriteExitCode;
             _agentExitCode = agentExitCode;
             _agentStdout = agentStdout;
             _agentStderr = agentStderr;
+            AgentOutputTransportKind = transportKind;
         }
 
         public string Id => "recording-cursor";
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; }
         public List<SandboxExec> Execs { get; } = [];
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
