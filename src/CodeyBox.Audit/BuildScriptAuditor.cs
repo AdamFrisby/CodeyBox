@@ -125,8 +125,10 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         => new(
             true,
             [],
-            RawOutput: "build.sh absent; auditor skipped",
-            BuildTestGateEvidenceVerified: false);
+            RawOutput: "build.sh absent; auditor skipped")
+        {
+            BuildTestGateEvidenceVerified = false,
+        };
 
     private static AuditResult MissingRequiredResult(string description)
     {

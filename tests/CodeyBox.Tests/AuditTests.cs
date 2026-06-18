@@ -60,6 +60,22 @@ public sealed class AuditTests
             a => Assert.Equal("llm", a.Name));
     }
 
+    [Fact]
+    public void AuditResult_RetainsSixArgumentConstructorForPluginAbi()
+    {
+        var ctor = typeof(AuditResult).GetConstructor(
+        [
+            typeof(bool),
+            typeof(IReadOnlyList<AuditFinding>),
+            typeof(string),
+            typeof(string),
+            typeof(string),
+            typeof(string),
+        ]);
+
+        Assert.NotNull(ctor);
+    }
+
 
     [Fact]
     public void ReworkPromptBuilder_GroupsByAuditorAndIncludesOriginal()

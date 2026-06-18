@@ -422,6 +422,45 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task RequiredBuildGatePassAloneDoesNotUnlockLlmPanelWithoutTestGate()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var requiredBuild = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Passed(0, "compile ok"));
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: requiredBuild);
+
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(
+            barePath,
+            "update-ref",
+            $"refs/heads/{item.WorkBranch}",
+            "refs/heads/main");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.AuditFailed,
+            $"expected AuditFailed, got {final.State}: {final.LastError}");
+        Assert.Equal(1, requiredBuild.VerifyCalls);
+        Assert.Equal(0, llmRuns);
+        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task BuildTestGateOrdersAheadOfOtherToolAuditors_AndAheadOfLlmPanel()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -837,8 +876,10 @@ file sealed class RoleStampedScriptedAuditor : IAuditor
         var outcome = _plan.Dequeue();
         return Task.FromResult(new AuditResult(
             outcome.Passed,
-            outcome.Findings,
-            BuildTestGateEvidenceVerified: outcome.BuildTestGateEvidenceVerified));
+            outcome.Findings)
+        {
+            BuildTestGateEvidenceVerified = outcome.BuildTestGateEvidenceVerified,
+        });
     }
 }
 

@@ -210,20 +210,39 @@ public sealed record AuditContext(
     string? ProjectId = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
-public sealed record AuditResult(
-    bool Passed,
-    IReadOnlyList<AuditFinding> Findings,
-    string? RawOutput = null,
-    string? AgentStderr = null,
-    string? AgentSummary = null,
-    string? AgentStdout = null,
+public sealed record AuditResult
+{
+    public AuditResult(
+        bool Passed,
+        IReadOnlyList<AuditFinding> Findings,
+        string? RawOutput = null,
+        string? AgentStderr = null,
+        string? AgentSummary = null,
+        string? AgentStdout = null)
+    {
+        this.Passed = Passed;
+        this.Findings = Findings;
+        this.RawOutput = RawOutput;
+        this.AgentStderr = AgentStderr;
+        this.AgentSummary = AgentSummary;
+        this.AgentStdout = AgentStdout;
+    }
+
+    public bool Passed { get; init; }
+    public IReadOnlyList<AuditFinding> Findings { get; init; }
+    public string? RawOutput { get; init; }
+    public string? AgentStderr { get; init; }
+    public string? AgentSummary { get; init; }
+    public string? AgentStdout { get; init; }
+
     /// <summary>
     /// When set to false, a passing BuildTestGate result is still a pass for
     /// normal audit scoring but must not count as evidence that build/tests
     /// actually completed successfully. Used for classified "unrunnable in
     /// this environment" outcomes.
     /// </summary>
-    bool? BuildTestGateEvidenceVerified = null);
+    public bool? BuildTestGateEvidenceVerified { get; init; }
+}
 
 public sealed record AuditFinding(
     string AuditorName,
@@ -275,23 +294,4 @@ public static class AuditSeverityParser
 public interface IAuditorRegistry
 {
     IReadOnlyList<IAuditor> All { get; }
-}
-
-/// <summary>
-/// Single source of truth for the per-iteration audit-panel ordering tier:
-/// BuildTestGate auditors first (tier 0), declared short-circuit gates next
-/// (tier 1), other tool/local auditors next (tier 2), credential-requiring
-/// (LLM) auditors last (tier 3). The pipeline uses this to guarantee the LLM
-/// panel's "CI ran with no failures" prompt claim can be verified. Both
-/// <see cref="IAuditorRegistry"/> and the pipeline's per-iteration sort go
-/// through this helper so a new tier or a gate-semantics change only ever
-/// needs to be made in one place.
-/// </summary>
-public static class AuditorOrdering
-{
-    public static int TierOf(IAuditor auditor)
-        => auditor.Role == AuditorRole.BuildTestGate ? 0
-            : auditor.CanShortCircuitOnBlockingFinding ? 1
-            : auditor.Required.HasFlag(AuditCapabilities.AgentCredentials) ? 3
-            : 2;
 }

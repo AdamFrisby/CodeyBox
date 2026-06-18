@@ -119,8 +119,10 @@ internal sealed class LanguagePresetAuditor : IAuditor
         return new AuditResult(
             passed,
             allFindings,
-            RawOutput: string.Join("\n\n", rawParts),
-            BuildTestGateEvidenceVerified: buildTestGateEvidenceVerified);
+            RawOutput: string.Join("\n\n", rawParts))
+        {
+            BuildTestGateEvidenceVerified = buildTestGateEvidenceVerified,
+        };
     }
 
     private static bool? MergeBuildTestGateEvidenceVerified(bool? current, bool? next)

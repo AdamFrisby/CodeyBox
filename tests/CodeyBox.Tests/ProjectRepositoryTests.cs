@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Configuration;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Projects;
 
@@ -279,6 +280,41 @@ public sealed class ProjectRepositoryTests
         Assert.Equal(["dotnet", "test"], auditor.Argv);
         Assert.Equal("build-test-gate", auditor.Role);
         Assert.Equal("test", auditor.GateEvidence);
+    }
+
+    [Fact]
+    public async Task ProjectCustomAuditor_BindsBuildTestGateMetadataFromConfig()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Name"] = "custom:test-pass",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Kind"] = "shell",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Argv:0"] = "dotnet",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Argv:1"] = "test",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Role"] = "build-test-gate",
+                ["CodeyBox:Projects:0:Audit:Custom:0:GateEvidence"] = "test",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        var descriptor = Assert.Single(p!.Audit.Custom);
+        Assert.Equal("custom:test-pass", descriptor.Name);
+        Assert.Equal("shell", descriptor.Kind);
+        Assert.Equal(["dotnet", "test"], descriptor.Argv);
+        Assert.Equal("build-test-gate", descriptor.Role);
+        Assert.Equal("test", descriptor.GateEvidence);
+
+        var auditor = new ProjectAuditorComposer(new PresetCatalog())
+            .Compose(p, new NullAgent())
+            .Single(a => a.Name == "custom:test-pass");
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.Test, auditor.BuildTestGateEvidence);
     }
 
     [Fact]
@@ -923,6 +959,23 @@ public sealed class ProjectRepositoryTests
         Assert.NotNull(p);
         Assert.Equal("noop", p!.Upstream.Kind);
     }
+}
+
+file sealed class NullAgent : IAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+        => Task.FromResult(new AgentResult(true, "ok", "", null));
 }
 
 /// <summary>
