@@ -689,6 +689,46 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildTestGateStillRunsBeforeLlm_WhenShortCircuitRoutingDisabledAndLlmRegisteredFirst()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var executionOrder = new List<string>();
+        var orderLock = new object();
+        void Record(string n) { lock (orderLock) executionOrder.Add(n); }
+
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Record("llm"));
+        var gate = new RoleStampedScriptedAuditor(
+            "csharp:test-pass",
+            AuditorRole.BuildTestGate,
+            [new AuditOutcome(true, [])],
+            onRun: _ => Record("gate"));
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditShortCircuitEnabled = false,
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [llm, gate],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(["gate", "llm"], executionOrder);
+    }
+
+    [Fact]
     public async Task NonGateBlockingFinding_DoesNotSkipLlmPanel()
     {
         // Confirms the gate is scoped to BuildTestGate role specifically: a
@@ -903,7 +943,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     [Theory]
     [InlineData("node", "package.json", "{\"scripts\":{\"test\":\"node -e 0\"}}\n", "npm test")]
     [InlineData("python", "pyproject.toml", "[project]\nname = \"sample\"\nversion = \"0.1.0\"\n", "pytest ")]
-    public async Task BuiltInNodeAndPythonPassingTestGateAloneDoesNotUnlockGatedReview(
+    public async Task BuiltInNodeAndPythonPassingTestGateUnlocksLlmPanel(
         string language,
         string markerFile,
         string markerContents,
@@ -957,10 +997,9 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.True(
-            final!.State == WorkItemState.AuditFailed,
-            $"expected AuditFailed, got {final.State}: {final.LastError}");
-        Assert.Contains("build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(0, llmRuns);
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(1, llmRuns);
         var toolLog = await File.ReadAllLinesAsync(fakeTools.LogPath);
         Assert.Contains(expectedTestCommand, toolLog);
     }

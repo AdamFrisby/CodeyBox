@@ -107,8 +107,8 @@ public sealed class PresetCatalogTests
         AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
-        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.Test);
-        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.BuildAndTest);
         AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.BuildAndTest);
         AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.BuildAndTest);
     }
