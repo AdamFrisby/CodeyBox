@@ -1335,6 +1335,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
                 continue;
 
+            if (await TryDeferForProjectPauseAtPickupAsync(candidate, stoppingToken))
+                continue;
+
             if (candidate.JobType == JobType.Refactor)
             {
                 if (candidate.StartedAt is not null)
@@ -1438,6 +1441,27 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 candidate.Id, candidate.State, candidate.DependsOn.Count);
             return false;
         }
+    }
+
+    private async Task<bool> TryDeferForProjectPauseAtPickupAsync(WorkItem candidate, CancellationToken stoppingToken)
+    {
+        if (_queueController is null)
+            return false;
+
+        var projectState = await _queueController.GetProjectStateAsync(candidate.ProjectId, stoppingToken);
+        if (projectState is not { Paused: true })
+            return false;
+
+        _log.LogInformation(
+            "Dispatch skip {Id}: project {ProjectId} queue is paused — {Reason}",
+            candidate.Id,
+            candidate.ProjectId.Value,
+            projectState.PausedReason);
+        ScheduleDeferredRequeue(
+            candidate.Id,
+            _budgetDeferralRecheck?.Current.PausedProjectRecheck ?? TimeSpan.FromMinutes(1),
+            stoppingToken);
+        return true;
     }
 
     /// <summary>

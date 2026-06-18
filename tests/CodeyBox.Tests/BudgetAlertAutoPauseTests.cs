@@ -179,30 +179,44 @@ public sealed class BudgetAlertAutoPauseTests : IDisposable
         var pipeline = new FakePipelineRunner(itemStore);
         var registry = new CancellationRegistry(CancellationToken.None);
 
-        // OnWorkerSpawned fires right before Task.Run inside the dispatch loop,
-        // i.e. after the item is dequeued and before RunItemAsync executes.
-        var spawnedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var spawnCount = 0;
+        var deferredTcs = new TaskCompletionSource<(WorkItemId Id, TimeSpan Delay)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         var svc = new OrchestratorService(
             taskQueue, itemStore, pipeline, registry,
             new OrchestratorOptions
             {
                 MaxConcurrentWorkers = 1,
-                OnWorkerSpawned = () => spawnedTcs.TrySetResult(),
+                OnWorkerSpawned = () => Interlocked.Increment(ref spawnCount),
             },
             NullLogger<OrchestratorService>.Instance,
             projects: new InMemoryProjectRepository(project),
             queueController: queueController);
+        svc.DeferredRequeueDelayForTest = (deferredId, delay, ct) =>
+        {
+            deferredTcs.TrySetResult((deferredId, delay));
+            return Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        };
 
         using var cts = new CancellationTokenSource();
-        _ = svc.StartAsync(cts.Token);
+        try
+        {
+            _ = svc.StartAsync(cts.Token);
 
-        // Wait until the dispatch loop picks up the item, then give RunItemAsync
-        // time to complete the per-project pause check and return.
-        await spawnedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await Task.Delay(200);
+            // The dispatch selector itself should notice the paused project,
+            // defer the item, and avoid spawning a worker at all.
+            var deferred = await deferredTcs.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(item.Id, deferred.Id);
+            Assert.True(deferred.Delay > TimeSpan.Zero);
+            Assert.True(svc.IsDeferredForTest(item.Id));
+            Assert.Equal(0, Volatile.Read(ref spawnCount));
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            await svc.StopAsync(CancellationToken.None);
+        }
 
-        await cts.CancelAsync();
-        await svc.StopAsync(CancellationToken.None);
 
         // The pipeline must never have been invoked for the paused project.
         Assert.Empty(pipeline.Executed);
