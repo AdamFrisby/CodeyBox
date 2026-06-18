@@ -12,4 +12,4 @@ auditors:
   - name: node:test-pass
     argv: ["npm", "test"]
     role: build-test-gate
-    gateEvidence: test
+    gateEvidence: build-and-test

@@ -252,10 +252,11 @@ public sealed record AuditResult
     }
 
     /// <summary>
-    /// When set to false, a passing BuildTestGate result is still a pass for
-    /// normal audit scoring but must not count as evidence that build/tests
-    /// actually completed successfully. Used for classified "unrunnable in
-    /// this environment" outcomes.
+    /// When set to false, the result explicitly did not verify build/test
+    /// evidence. For BuildTestGate auditors, the pipeline treats that as a
+    /// blocking gate failure before any LLM panel can run; for ordinary
+    /// auditors it only records the evidence state. Used for classified
+    /// "unrunnable in this environment" outcomes.
     /// </summary>
     public bool? BuildTestGateEvidenceVerified { get; init; }
 }

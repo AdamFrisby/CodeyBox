@@ -6678,15 +6678,12 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
 
-        // Re-order so BuildTestGate-role auditors run first, then other
-        // tool/local auditors, then credential-requiring (LLM) auditors. The
-        // tier function lives in AuditorOrdering.TierOf so the invariant has
-        // one source of truth (AuditorRegistry uses the same helper). OrderBy
-        // is stable, so within each tier the original registration order is
-        // preserved; the byCaps GroupBy below preserves first-seen-key order,
-        // so tool groups (and BuildTestGate within them) iterate before any
-        // LLM group.
-        resolved = resolved.OrderBy(x => AuditorOrdering.TierOf(x.Auditor)).ToList();
+        // BuildTestGate-role auditors are always forced to the front because
+        // the LLM prompt frame claims build/tests already passed. Declared
+        // short-circuit auditors only get priority when the operator switch
+        // is enabled; with it disabled, non-gate auditors keep their normal
+        // registration order as far as the capability grouping below allows.
+        resolved = OrderResolvedAuditorsForBatch(resolved, detectDeclaredShortCircuit);
 
         // Group by (capabilities, resolved-runner-kind) so auditors that need
         // different agent credentials get separate sandboxes — each sandbox is
@@ -7327,6 +7324,30 @@ public sealed class PipelineRunner : IPipelineRunner
             CompletedAuditors: completedAuditors.ToList(),
             PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
             BuildTestGateFailed: buildTestGateFailed);
+    }
+
+    private static List<(IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member)> OrderResolvedAuditorsForBatch(
+        IReadOnlyList<(IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member)> resolved,
+        bool detectDeclaredShortCircuit)
+    {
+        if (resolved.Count <= 1)
+            return resolved.ToList();
+
+        return resolved
+            .Select((entry, index) => new { Entry = entry, Index = index })
+            .OrderBy(x => BatchOrderingTier(x.Entry.Auditor, detectDeclaredShortCircuit))
+            .ThenBy(x => x.Index)
+            .Select(x => x.Entry)
+            .ToList();
+    }
+
+    private static int BatchOrderingTier(IAuditor auditor, bool detectDeclaredShortCircuit)
+    {
+        if (auditor.Role == AuditorRole.BuildTestGate)
+            return 0;
+        if (detectDeclaredShortCircuit && auditor.CanShortCircuitOnBlockingFinding)
+            return 1;
+        return 2;
     }
 
     /// <summary>

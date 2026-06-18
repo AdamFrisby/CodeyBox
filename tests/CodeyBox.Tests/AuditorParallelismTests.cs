@@ -452,7 +452,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
     }
 
     [Fact]
-    public async Task DisabledShortCircuit_RunsRemainingAuditorsAfterBlockingGate()
+    public async Task DisabledShortCircuit_PreservesNonGateRegistrationOrder()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new CapturingAuditReportStore();
@@ -490,7 +490,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Equal(["gate:build", "tool:later", "llm:review"],
+        Assert.Equal(["tool:later", "gate:build", "llm:review"],
             reports.Reports.Select(r => r.AuditorName)
                 .Where(n => n != "test:build-and-test-pass")
                 .ToArray());

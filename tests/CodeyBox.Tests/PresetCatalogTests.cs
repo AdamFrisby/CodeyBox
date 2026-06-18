@@ -107,8 +107,8 @@ public sealed class PresetCatalogTests
         AssertLanguageAuditorRole(catalog, ctx, "node", "node:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "go", "go:test-pass", AuditorRole.BuildTestGate);
         AssertLanguageAuditorRole(catalog, ctx, "rust", "rust:test-pass", AuditorRole.BuildTestGate);
-        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.Test);
-        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.Test);
+        AssertLanguageAuditorEvidence(catalog, ctx, "python", "python:test-pass", BuildTestGateEvidence.BuildAndTest);
+        AssertLanguageAuditorEvidence(catalog, ctx, "node", "node:test-pass", BuildTestGateEvidence.BuildAndTest);
         AssertLanguageAuditorEvidence(catalog, ctx, "go", "go:test-pass", BuildTestGateEvidence.BuildAndTest);
         AssertLanguageAuditorEvidence(catalog, ctx, "rust", "rust:test-pass", BuildTestGateEvidence.BuildAndTest);
     }
@@ -242,6 +242,48 @@ public sealed class PresetCatalogTests
             id: repo-build
             auditors:
               - name: repo-build:test-pass
+                argv: ["dotnet", "test"]
+                gateEvidence: build-and-test
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("gateEvidence is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryLanguageYaml_RejectsBuildTestGateRole()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "repo-lang.yaml"), """
+            id: repo-lang
+            marker:
+              globs: ["**/*.csproj"]
+            auditors:
+              - name: repo-lang:test-pass
+                argv: ["dotnet", "test"]
+                role: build-test-gate
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("role is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryLanguageYaml_RejectsGateEvidence()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "repo-lang.yaml"), """
+            id: repo-lang
+            marker:
+              globs: ["**/*.csproj"]
+            auditors:
+              - name: repo-lang:test-pass
                 argv: ["dotnet", "test"]
                 gateEvidence: build-and-test
             """);

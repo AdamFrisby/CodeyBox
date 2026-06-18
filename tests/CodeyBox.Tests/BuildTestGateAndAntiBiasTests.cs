@@ -275,6 +275,41 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task TimedOutBuildTestGateReturnsIncompleteVerdict_AndSkipsLlmPanel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new HangingBuildTestGateAuditor("csharp:test-pass");
+        var llmRuns = 0;
+        var llm = new RecordingLlmAuditor("security:llm-review", _ => Interlocked.Increment(ref llmRuns));
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate, llm],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("incomplete auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("csharp:test-pass", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, gate.RunCount);
+        Assert.Equal(0, llmRuns);
+        Assert.Empty(llm.SeenIterations);
+    }
+
+    [Fact]
     public async Task FailedBuildTestGateSkipsOnlyLlmPanel_WhenStopOnFirstFailureOff()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -868,7 +903,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     [Theory]
     [InlineData("node", "package.json", "{\"scripts\":{\"test\":\"node -e 0\"}}\n", "npm test")]
     [InlineData("python", "pyproject.toml", "[project]\nname = \"sample\"\nversion = \"0.1.0\"\n", "pytest ")]
-    public async Task BuiltInNodeAndPythonPassingTestGateDoesNotUnlockLlmPanelWithoutBuildEvidence(
+    public async Task BuiltInNodeAndPythonPassingTestGateUnlocksLlmPanelWithBuildAndTestEvidence(
         string language,
         string markerFile,
         string markerContents,
@@ -914,15 +949,17 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             }, ct);
         };
         tp.Agent.WorkPlan.Enqueue(new FileWrite("change.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-agent-touch.txt", "ok"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Contains("no verified build/test gate", final.LastError, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(0, llmRuns);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done, got {final.State}: {final.LastError}");
+        Assert.Equal(1, llmRuns);
         var toolLog = await File.ReadAllLinesAsync(fakeTools.LogPath);
         Assert.Contains(expectedTestCommand, toolLog);
     }
@@ -1298,6 +1335,29 @@ file sealed class MarkedToolReviewAuditor : IAuditor, IRequiresPassedBuildTestGa
     {
         _onRun(context.Iteration);
         return Task.FromResult(new AuditResult(true, []));
+    }
+}
+
+file sealed class HangingBuildTestGateAuditor : IAuditor
+{
+    public HangingBuildTestGateAuditor(string name) => Name = name;
+
+    public string Name { get; }
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditorRole Role => AuditorRole.BuildTestGate;
+    public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.BuildAndTest;
+    public int RunCount { get; private set; }
+
+    public async Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        RunCount++;
+        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        return new AuditResult(true, []);
     }
 }
 
