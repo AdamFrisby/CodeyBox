@@ -34,7 +34,13 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
                 Summary: $"{FormatCheckAuditorName} is not active; {FixerName} skipped");
         }
 
-        var formatArgv = ToFixerArgv(command.Argv);
+        if (!TryToFixerArgv(command.Argv, out var formatArgv))
+        {
+            return new MechanicalFixerResult(
+                Changed: false,
+                Summary: $"{FormatCheckAuditorName} does not invoke 'dotnet format'; {FixerName} skipped");
+        }
+
         var discovery = await DiscoverProjectDirectoriesAsync(
             sandbox,
             workingDirectory,
@@ -108,12 +114,23 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
     public static IReadOnlyList<string> ToFixerArgv(IReadOnlyList<string> formatCheckArgv)
     {
+        if (TryToFixerArgv(formatCheckArgv, out var argv))
+            return argv;
+
+        throw new InvalidOperationException(
+            $"{FormatCheckAuditorName} must invoke 'dotnet format' for the {FixerName} fixer to reuse it.");
+    }
+
+    public static bool TryToFixerArgv(
+        IReadOnlyList<string> formatCheckArgv,
+        out IReadOnlyList<string> fixerArgv)
+    {
         if (formatCheckArgv.Count < 2 ||
             !formatCheckArgv[0].Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
             !formatCheckArgv[1].Equals("format", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException(
-                $"{FormatCheckAuditorName} must invoke 'dotnet format' for the {FixerName} fixer to reuse it.");
+            fixerArgv = [];
+            return false;
         }
 
         var argv = new List<string>(formatCheckArgv.Count);
@@ -133,7 +150,8 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             argv.Add(arg);
         }
 
-        return argv;
+        fixerArgv = argv;
+        return true;
     }
 
     private static async Task<ProjectDirectoryDiscovery> DiscoverProjectDirectoriesAsync(

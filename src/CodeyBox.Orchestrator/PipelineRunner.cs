@@ -5970,7 +5970,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "apply", "--index", patchPath);
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:refs/heads/{workBranch}");
+            await PushSandboxWorkBranchWithReconcileAsync(sandbox, workBranch, ct);
         }
         catch (MechanicalFixerException)
         {

@@ -192,6 +192,54 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpFormatCheck_FailureReportsAnalyzerViolations()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string stderr = """
+            /work/src/App/Program.cs(12,18): error CA1822: Member does not access instance data and can be marked as static [/work/src/App/App.csproj]
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format would change files", finding.Title);
+        Assert.Contains("CA1822", finding.Description);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_TruncatesViolationLines()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var stderr = string.Join('\n', Enumerable.Range(1, 45)
+            .Select(i => $"/work/src/App/Program.cs({i},1): error WHITESPACE: Fix whitespace formatting. [/work/src/App/App.csproj]"));
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Contains("omitted after 40 lines", finding.Description);
+        Assert.Contains("Program.cs(40,1)", finding.Description);
+        Assert.DoesNotContain("Program.cs(41,1)", finding.Description);
+    }
+
+    [Fact]
     public async Task CSharpFormatCheck_FailureWithoutViolationLinesStillClassifiesDotnetFormat()
     {
         var auditor = new PresetCatalog()

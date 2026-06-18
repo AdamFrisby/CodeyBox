@@ -508,16 +508,17 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     {
         var baseMechanicalFixersConfigured = project?.MechanicalFixers is not null || defaults?.MechanicalFixers is not null;
         var profilePreservesMechanicalFixers = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        var profiles = AuditProfilePresets.CreateBuiltIns()
-            .ToDictionary(
-                kvp => kvp.Key,
-                kvp => InheritGlobalProfilePolicy(
-                    kvp.Value,
-                    baseAudit,
-                    baseMechanicalFixersConfigured: baseMechanicalFixersConfigured),
-                StringComparer.OrdinalIgnoreCase);
-        foreach (var (name, profile) in profiles)
-            profilePreservesMechanicalFixers[name] = baseMechanicalFixersConfigured || profile.MechanicalFixers.Count > 0;
+        var profiles = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, profile) in AuditProfilePresets.CreateBuiltIns())
+        {
+            var profileMechanicalFixersConfigured = profile.MechanicalFixers.Count > 0;
+            profiles[name] = InheritGlobalProfilePolicy(
+                profile,
+                baseAudit,
+                baseMechanicalFixersConfigured: baseMechanicalFixersConfigured);
+            profilePreservesMechanicalFixers[name] =
+                baseMechanicalFixersConfigured || profileMechanicalFixersConfigured;
+        }
 
         if (defaults?.Profiles is not null)
         {
@@ -526,12 +527,11 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 var fallback = profiles.TryGetValue(name, out var existing) ? existing : baseAudit;
                 var preserveFallbackFixers = profilePreservesMechanicalFixers.TryGetValue(name, out var preserve)
                     ? preserve
-                    : baseMechanicalFixersConfigured || fallback.MechanicalFixers.Count > 0;
+                    : baseMechanicalFixersConfigured;
                 profiles[name] = ResolveAuditProfileBundle(config, fallback, name, preserveFallbackFixers);
                 profilePreservesMechanicalFixers[name] =
                     config.MechanicalFixers is not null ||
-                    preserveFallbackFixers ||
-                    profiles[name].MechanicalFixers.Count > 0;
+                    preserveFallbackFixers;
             }
         }
 
@@ -542,12 +542,11 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 var fallback = profiles.TryGetValue(name, out var existing) ? existing : baseAudit;
                 var preserveFallbackFixers = profilePreservesMechanicalFixers.TryGetValue(name, out var preserve)
                     ? preserve
-                    : baseMechanicalFixersConfigured || fallback.MechanicalFixers.Count > 0;
+                    : baseMechanicalFixersConfigured;
                 profiles[name] = ResolveAuditProfileBundle(config, fallback, name, preserveFallbackFixers);
                 profilePreservesMechanicalFixers[name] =
                     config.MechanicalFixers is not null ||
-                    preserveFallbackFixers ||
-                    profiles[name].MechanicalFixers.Count > 0;
+                    preserveFallbackFixers;
             }
         }
 
@@ -583,7 +582,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
 
     private static ProjectAuditConfig ProjectAuditToConfig(
         ProjectAudit audit,
-        bool preserveEmptyMechanicalFixers)
+        bool preserveMechanicalFixers)
         => new()
         {
             Profile = audit.Profile,
@@ -630,7 +629,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             LlmPromptFrameTemplate = audit.LlmPromptFrameTemplate,
             Custom = audit.Custom.Select(CustomAuditorToConfig).ToList(),
             ExcludedAuditors = [.. audit.ExcludedAuditors],
-            MechanicalFixers = preserveEmptyMechanicalFixers || audit.MechanicalFixers.Count > 0
+            MechanicalFixers = preserveMechanicalFixers
                 ? [.. audit.MechanicalFixers]
                 : null,
             AuditAgent = audit.AuditAgent?.Value,

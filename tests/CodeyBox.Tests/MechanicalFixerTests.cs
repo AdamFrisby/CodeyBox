@@ -200,6 +200,85 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task ProjectRepository_ProfileLanguagesDeriveMechanicalFixersWithoutLeakingFallbackCSharpDefault()
+    {
+        var repo = new ProjectRepository(Options.Create(new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "p",
+                    RepositoryUrl = "https://example.invalid/repo.git",
+                    Audit = new ProjectAuditConfig
+                    {
+                        Languages = ["csharp"],
+                        Profiles = new Dictionary<string, ProjectAuditConfig>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["ci"] = new()
+                            {
+                                Languages = ["python"],
+                            },
+                        },
+                    },
+                },
+            ],
+        }));
+
+        var project = await repo.GetAsync(new ProjectId("p"));
+
+        Assert.Equal([DotnetFormatMechanicalFixer.FixerName], project!.Audit.MechanicalFixers);
+        Assert.Empty(project.Audit.ResolveProfile("ci").MechanicalFixers);
+    }
+
+    [Fact]
+    public async Task ProjectRepository_ExplicitMechanicalFixersAreTrimmedPreservedAndHotReloaded()
+    {
+        var monitor = new TestProjectsOptionsMonitor(BindProjectsOptions(
+            """
+            {
+              "CodeyBox": {
+                "Projects": [
+                  {
+                    "Id": "p",
+                    "RepositoryUrl": "https://example.invalid/repo.git",
+                    "Audit": {
+                      "Languages": [ "csharp" ],
+                      "MechanicalFixers": [ " dotnet-format ", " custom-normalizer ", " " ]
+                    }
+                  }
+                ]
+              }
+            }
+            """));
+        using var repo = new ProjectRepository(monitor, NullLogger<ProjectRepository>.Instance);
+
+        var before = await repo.GetAsync(new ProjectId("p"));
+        Assert.Equal(["dotnet-format", "custom-normalizer"], before!.Audit.MechanicalFixers);
+
+        monitor.Push(BindProjectsOptions(
+            """
+            {
+              "CodeyBox": {
+                "Projects": [
+                  {
+                    "Id": "p",
+                    "RepositoryUrl": "https://example.invalid/repo.git",
+                    "Audit": {
+                      "Languages": [ "csharp" ],
+                      "MechanicalFixers": [ "other-normalizer" ]
+                    }
+                  }
+                ]
+              }
+            }
+            """));
+
+        var after = await repo.GetAsync(new ProjectId("p"));
+        Assert.Equal(["other-normalizer"], after!.Audit.MechanicalFixers);
+    }
+
+    [Fact]
     public void ProjectMechanicalFixerComposer_TrimsDedupesAndUsesSelectedProfile()
     {
         var fixer = new NoOpMechanicalFixer();
@@ -252,9 +331,33 @@ public sealed class MechanicalFixerTests : IDisposable
     public void DotnetFormatFixer_ReusesFormatCheckCommandWithoutReadOnlyFlags()
     {
         var argv = DotnetFormatMechanicalFixer.ToFixerArgv(
-            ["dotnet", "format", "--verify-no-changes", "--report", "/tmp/report", "--no-restore"]);
+            ["dotnet", "format", "--verify-no-changes", "--report", "/tmp/report", "--report=/tmp/other-report", "--no-restore"]);
 
         Assert.Equal(["dotnet", "format", "--no-restore"], argv);
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_IncompatibleFormatAuditorSkipsWithoutThrowing()
+    {
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [],
+            formatResult: new SandboxExecResult(0, "formatted", ""));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                [new ShellAuditorCommandDescriptor("csharp:format-check", ["./format-wrapper", "--verify-no-changes"])]));
+
+        Assert.False(result.Changed);
+        Assert.Contains("dotnet-format skipped", result.Summary);
+        Assert.Empty(sandbox.Execs);
     }
 
     [Fact]
@@ -289,6 +392,32 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task DotnetFormatFixer_SuccessWithoutTrackedChangesReportsNoOp()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: ["", ""],
+            formatResult: new SandboxExecResult(0, "formatted", ""));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                ShellCommandsFor(auditor)));
+
+        Assert.False(result.Changed);
+        Assert.Equal("dotnet format made no changes", result.Summary);
+    }
+
+    [Fact]
     public async Task DotnetFormatFixer_CommandFailureRollsBackAndLetsAuditReport()
     {
         var auditor = new PresetCatalog()
@@ -314,6 +443,35 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Contains("skipped normalization", result.Summary);
         Assert.Contains("format failed", result.RawOutput);
         Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_CommandFailureThrowsWhenRollbackFails()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [""],
+            formatResult: new SandboxExecResult(2, "", "format failed"),
+            resetResult: new SandboxExecResult(128, "", "reset failed\nwith details"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new DotnetFormatMechanicalFixer().ApplyAsync(
+                sandbox,
+                "/work/repo",
+                new MechanicalFixerContext(
+                    WorkItemId.New(),
+                    "feature/test",
+                    "main",
+                    1,
+                    "project",
+                    ShellCommandsFor(auditor))));
+
+        Assert.Contains("could not discard partial changes", ex.Message);
+        Assert.Contains("reset failed with details", ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
     }
 
     [Fact]
@@ -707,6 +865,175 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Contains("mechanical-edit failed", final.LastError);
     }
 
+    public static IEnumerable<object[]> PipelineMechanicalGitFailureCases()
+    {
+        yield return
+        [
+            "status",
+            new MechanicalCommandFailureRule(
+                1,
+                exec => IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "status", "--porcelain", "--untracked-files=no"),
+                new SandboxExecResult(128, "", "status failed")),
+            "mechanical-edit could not read git status",
+        ];
+        yield return
+        [
+            "staged-diff",
+            new MechanicalCommandFailureRule(
+                1,
+                exec => IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"),
+                new SandboxExecResult(128, "", "diff failed")),
+            "mechanical-edit could not inspect staged diff",
+        ];
+        yield return
+        [
+            "patch-export",
+            new MechanicalCommandFailureRule(
+                1,
+                exec => IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "diff", "--binary", "HEAD^", "HEAD"),
+                new SandboxExecResult(0, "", "")),
+            "mechanical-edit could not export formatter commit diff",
+        ];
+        yield return
+        [
+            "patch-materialize",
+            new MechanicalCommandFailureRule(
+                2,
+                exec => exec.Argv.SequenceEqual(["sh", "-c", "cat > \"$0\"", "/tmp/codeybox-mechanical.patch"]),
+                new SandboxExecResult(1, "", "write failed")),
+            "mechanical-edit could not materialize formatter patch",
+        ];
+        yield return
+        [
+            "patch-apply",
+            new MechanicalCommandFailureRule(
+                2,
+                exec => IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "apply", "--index", "/tmp/codeybox-mechanical.patch"),
+                new SandboxExecResult(1, "", "apply failed")),
+            "mechanical-edit could not import formatter commit",
+        ];
+        yield return
+        [
+            "import-commit",
+            new MechanicalCommandFailureRule(
+                2,
+                exec => IsGitSubcommand(exec, "commit"),
+                new SandboxExecResult(1, "", "commit failed")),
+            "mechanical-edit could not import formatter commit",
+        ];
+        yield return
+        [
+            "import-push",
+            new MechanicalCommandFailureRule(
+                2,
+                exec => IsGitSubcommand(exec, "push"),
+                new SandboxExecResult(1, "", "permission denied")),
+            "mechanical-edit could not import formatter commit",
+        ];
+    }
+
+    [Theory]
+    [MemberData(nameof(PipelineMechanicalGitFailureCases))]
+    public async Task Pipeline_MechanicalGitFailurePathsAreInfrastructureFailures(
+        string branchSuffix,
+        MechanicalCommandFailureRule failure,
+        string expectedError)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var provider = new MechanicalCommandInterceptingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            [failure]);
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            sandboxProvider: provider,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem($"feature/mechanical-owned-failure-{branchSuffix}");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains(expectedError, final.LastError);
+        Assert.True(failure.Fired);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize",
+            "--format=%s",
+            item.WorkBranch!);
+        Assert.DoesNotContain("chore: normalize", mechanicalLog);
+    }
+
+    [Fact]
+    public async Task Pipeline_MechanicalImportPushReconcilesNonFastForwardRejection()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var pushRejected = new MechanicalCommandFailureRule(
+            2,
+            exec => IsGitSubcommand(exec, "push"),
+            new SandboxExecResult(1, "", "! [rejected] feature/mechanical-reconcile -> feature/mechanical-reconcile (non-fast-forward)"));
+        var provider = new MechanicalCommandInterceptingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            [pushRejected]);
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            sandboxProvider: provider,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-reconcile");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
+        Assert.True(pushRejected.Fired);
+        Assert.Contains(provider.MechanicalCommands, argv =>
+            argv.SequenceEqual([
+                "git",
+                "-C",
+                SandboxConventions.WorkDir,
+                "fetch",
+                "--no-tags",
+                "origin",
+                $"+refs/heads/{item.WorkBranch}:refs/remotes/origin/{item.WorkBranch}",
+            ]));
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize mechanical edits",
+            "--format=%s",
+            item.WorkBranch!);
+        Assert.Contains("chore: normalize mechanical edits", mechanicalLog);
+    }
+
     private static WorkItem NewItem(string branch) => new()
     {
         Id = WorkItemId.New(),
@@ -729,6 +1056,17 @@ public sealed class MechanicalFixerTests : IDisposable
         return count;
     }
 
+    private static bool IsGitArgs(SandboxExec exec, params string[] args)
+        => exec.Argv.Count == args.Length + 1 &&
+           exec.Argv[0] == "git" &&
+           exec.Argv.Skip(1).SequenceEqual(args);
+
+    private static bool IsGitSubcommand(SandboxExec exec, string subcommand)
+        => exec.Argv.Count >= 4 &&
+           exec.Argv[0] == "git" &&
+           exec.Argv[1] == "-C" &&
+           exec.Argv[3] == subcommand;
+
     private static async Task AddTrackedFileAsync(string repo, string path, string contents)
     {
         var fullPath = Path.Combine(repo, path);
@@ -736,6 +1074,13 @@ public sealed class MechanicalFixerTests : IDisposable
         await File.WriteAllTextAsync(fullPath, contents);
         await TestSupport.RunGit(repo, "add", "--", path);
         await TestSupport.RunGit(repo, "commit", "-m", $"add {path}");
+    }
+
+    private static ProjectsOptions BindProjectsOptions(string json)
+    {
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+        var config = new ConfigurationBuilder().AddJsonStream(stream).Build();
+        return ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
     }
 
     private static IReadOnlyList<ShellAuditorCommandDescriptor> ShellCommandsFor(IAuditor auditor)
@@ -931,19 +1276,22 @@ public sealed class MechanicalFixerTests : IDisposable
         private readonly Queue<SandboxExecResult>? _statusResults;
         private readonly SandboxExecResult _formatResult;
         private readonly SandboxExecResult? _markerResult;
+        private readonly SandboxExecResult? _resetResult;
 
         public DotnetFormatSandbox(
             string markerStdout,
             IEnumerable<string> statusOutputs,
             SandboxExecResult formatResult,
             SandboxExecResult? markerResult = null,
-            IEnumerable<SandboxExecResult>? statusResults = null)
+            IEnumerable<SandboxExecResult>? statusResults = null,
+            SandboxExecResult? resetResult = null)
         {
             _markerStdout = markerStdout;
             _statusOutputs = new Queue<string>(statusOutputs);
             _formatResult = formatResult;
             _markerResult = markerResult;
             _statusResults = statusResults is null ? null : new Queue<SandboxExecResult>(statusResults);
+            _resetResult = resetResult;
         }
 
         public string Id => "dotnet-format-fake";
@@ -962,6 +1310,9 @@ public sealed class MechanicalFixerTests : IDisposable
                 var stdout = _statusOutputs.Count > 0 ? _statusOutputs.Dequeue() : "";
                 return Task.FromResult(new SandboxExecResult(0, stdout, ""));
             }
+
+            if (exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]))
+                return Task.FromResult(_resetResult ?? new SandboxExecResult(0, "", ""));
 
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "format")
                 return Task.FromResult(_formatResult);
@@ -992,5 +1343,118 @@ public sealed class MechanicalFixerTests : IDisposable
 
         public Task DisposeLeakedAsync(string name, CancellationToken ct)
             => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    public sealed class MechanicalCommandFailureRule
+    {
+        private readonly Func<SandboxExec, bool> _predicate;
+        private readonly SandboxExecResult _result;
+
+        public MechanicalCommandFailureRule(
+            int mechanicalSandboxOrdinal,
+            Func<SandboxExec, bool> predicate,
+            SandboxExecResult result)
+        {
+            MechanicalSandboxOrdinal = mechanicalSandboxOrdinal;
+            _predicate = predicate;
+            _result = result;
+        }
+
+        public int MechanicalSandboxOrdinal { get; }
+        public bool Fired { get; private set; }
+
+        public bool TryMatch(int mechanicalSandboxOrdinal, SandboxExec exec, out SandboxExecResult result)
+        {
+            if (!Fired &&
+                MechanicalSandboxOrdinal == mechanicalSandboxOrdinal &&
+                _predicate(exec))
+            {
+                Fired = true;
+                result = _result;
+                return true;
+            }
+
+            result = default!;
+            return false;
+        }
+    }
+
+    private sealed class MechanicalCommandInterceptingSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        private readonly IReadOnlyList<MechanicalCommandFailureRule> _failures;
+        private int _mechanicalSandboxCount;
+
+        public MechanicalCommandInterceptingSandboxProvider(
+            ISandboxProvider inner,
+            IReadOnlyList<MechanicalCommandFailureRule> failures)
+        {
+            _inner = inner;
+            _failures = failures;
+        }
+
+        public string Name => _inner.Name;
+        public List<IReadOnlyList<string>> MechanicalCommands { get; } = [];
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var sandbox = await _inner.CreateAsync(spec, ct);
+            if (!string.Equals(spec.TimingPhase, "mechanical-edit", StringComparison.Ordinal))
+                return sandbox;
+
+            var ordinal = Interlocked.Increment(ref _mechanicalSandboxCount);
+            return new MechanicalCommandInterceptingSandbox(
+                sandbox,
+                ordinal,
+                _failures,
+                MechanicalCommands);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class MechanicalCommandInterceptingSandbox : ISandbox
+    {
+        private readonly ISandbox _inner;
+        private readonly int _mechanicalSandboxOrdinal;
+        private readonly IReadOnlyList<MechanicalCommandFailureRule> _failures;
+        private readonly List<IReadOnlyList<string>> _commands;
+
+        public MechanicalCommandInterceptingSandbox(
+            ISandbox inner,
+            int mechanicalSandboxOrdinal,
+            IReadOnlyList<MechanicalCommandFailureRule> failures,
+            List<IReadOnlyList<string>> commands)
+        {
+            _inner = inner;
+            _mechanicalSandboxOrdinal = mechanicalSandboxOrdinal;
+            _failures = failures;
+            _commands = commands;
+        }
+
+        public string Id => _inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _commands.Add(exec.Argv.ToArray());
+            foreach (var failure in _failures)
+            {
+                if (failure.TryMatch(_mechanicalSandboxOrdinal, exec, out var result))
+                    return Task.FromResult(result);
+            }
+
+            return _inner.ExecAsync(exec, ct);
+        }
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default)
+            => _inner.KillActiveExecsAsync(ct);
+
+        public ValueTask DisposeAsync()
+            => _inner.DisposeAsync();
     }
 }
