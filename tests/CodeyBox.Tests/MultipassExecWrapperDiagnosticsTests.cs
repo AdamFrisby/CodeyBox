@@ -152,6 +152,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             Assert.Equal(0, exit);
             Assert.Equal("", stderr);
             Assert.Equal("hello\nworld", stdout);
+            Assert.False(File.Exists(envPath));
         }
         finally
         {

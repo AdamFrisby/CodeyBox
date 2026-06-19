@@ -31,8 +31,10 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     private readonly Task _listenTask;
     private readonly object _rateGate = new();
     private readonly object _exitGate = new();
+    private readonly object _diagnosticGate = new();
     private readonly StreamState _stdout;
     private readonly StreamState _stderr;
+    private readonly StringBuilder _exitDiagnostics = new();
     private DateTimeOffset _rateWindowStart = DateTimeOffset.UtcNow;
     private int _rateWindowCount;
     private int? _exitCode;
@@ -67,7 +69,14 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
     public string ExitToken { get; }
     public bool ReceivedAgentBytes => _stdout.BytesReceived > 0 || _stderr.BytesReceived > 0;
     public string Stdout => _stdout.Text;
-    public string Stderr => _stderr.Text;
+    public string Stderr
+    {
+        get
+        {
+            lock (_diagnosticGate)
+                return _stderr.Text + _exitDiagnostics;
+        }
+    }
 
     public static async Task<MultipassAgentOutputHttpIngestSession?> TryStartAsync(
         IPAddress bindAddress,
@@ -321,21 +330,47 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         if (seq != 0)
             return HttpStatusCode.BadRequest;
 
-        var text = body.Trim();
-        if (!int.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var exitCode))
+        var normalized = body.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var newline = normalized.IndexOf('\n');
+        var exitCodeText = newline < 0
+            ? normalized.Trim()
+            : normalized[..newline].Trim();
+        var diagnostic = newline < 0 ? "" : normalized[(newline + 1)..];
+        if (!int.TryParse(exitCodeText, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var exitCode))
             return HttpStatusCode.BadRequest;
 
+        HttpStatusCode status;
         lock (_exitGate)
         {
             if (_exitCode is null)
             {
                 _exitCode = exitCode;
-                return HttpStatusCode.OK;
+                status = HttpStatusCode.OK;
             }
+            else
+            {
+                status = _exitCode.Value == exitCode
+                    ? HttpStatusCode.OK
+                    : HttpStatusCode.Conflict;
+            }
+        }
 
-            return _exitCode.Value == exitCode
-                ? HttpStatusCode.OK
-                : HttpStatusCode.Conflict;
+        if (status == HttpStatusCode.OK)
+            AppendExitDiagnostic(diagnostic);
+
+        return status;
+    }
+
+    private void AppendExitDiagnostic(string diagnostic)
+    {
+        if (string.IsNullOrWhiteSpace(diagnostic))
+            return;
+
+        lock (_diagnosticGate)
+        {
+            _exitDiagnostics.Append(diagnostic);
+            if (!diagnostic.EndsWith('\n'))
+                _exitDiagnostics.Append('\n');
         }
     }
 

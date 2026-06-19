@@ -462,6 +462,40 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task Watchdog_StableActiveSandboxOwnershipDoesNotMaskRecoveryAfterTimeout()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMilliseconds(100),
+            CheckInterval = TimeSpan.FromMilliseconds(50),
+            ProcessCpuProgressSignalEnabled = false,
+            ActiveSandboxProgressSignalEnabled = true,
+        };
+        var provider = new ActiveSandboxProviderStub(item.Id);
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            activitySource: new DefaultWorkerProgressActivitySource(provider));
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        Assert.Empty(_slotReleaser.Releases);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(250));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Single(_slotReleaser.Releases);
+        Assert.Empty(await _registry.ListAsync());
+    }
+
+    [Fact]
     public async Task Watchdog_ActivityDisappearingAfterPriorSignal_RecoversAfterTimeout()
     {
         var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
@@ -777,7 +811,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task DefaultActivitySource_StableActiveSandboxSet_RepeatsProgress()
+    public async Task DefaultActivitySource_StableActiveSandboxSet_DoesNotRepeatProgress()
     {
         var itemId = WorkItemId.New();
         var provider = new ActiveSandboxProviderStub(itemId);
@@ -792,8 +826,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
 
         Assert.NotNull(first);
         Assert.Equal("active-sandbox", first!.Reason);
-        Assert.NotNull(second);
-        Assert.Equal("active-sandbox", second!.Reason);
+        Assert.Null(second);
     }
 
     [Fact]

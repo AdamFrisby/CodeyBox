@@ -606,6 +606,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["sh", "-c", "echo ignored-by-fake-runner"],
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "stale-caller-exit-token",
+            },
             AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
             StdoutChunkCallback = stdoutChunks.Add,
             StderrChunkCallback = stderrChunks.Add,
@@ -617,6 +621,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(["hello over http\n"], stdoutChunks);
         Assert.Equal(["warn over http\n"], stderrChunks);
         Assert.NotNull(observedToken);
+        Assert.NotNull(transferredEnvContent);
+        Assert.DoesNotContain("stale-caller-exit-token", transferredEnvContent, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable,
+            transferredEnvContent,
+            StringComparison.Ordinal);
         foreach (var call in runner.Calls)
             Assert.DoesNotContain(observedToken!, string.Join("\0", call.Argv), StringComparison.Ordinal);
     }
@@ -1132,7 +1142,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("codeybox_root_sh 'rm -f -- \"$1\"' \"$codeybox_exit_token_file\"", script);
         Assert.Contains("sudo -n sh -c", script);
         Assert.Contains("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"", script);
-        Assert.Contains("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi", script);
+        Assert.Contains("codeybox_drain_stdin", script);
+        Assert.Contains("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi", script);
         Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
         Assert.Contains("codeybox_detached_pid=$!", script);
         Assert.Contains("codeybox_pgid=$$", script);
@@ -1142,6 +1153,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("mv -f \"$stderr_tmp\" \"${marker}.stderr\"", script);
         Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
         Assert.DoesNotContain("codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"", script);
+        Assert.DoesNotContain("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN=\"$codeybox_output_exit_token\"", script);
         Assert.DoesNotContain("codeybox_exit_marker", script);
         Assert.Contains("exit 88", script);
     }
@@ -1305,7 +1317,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var second = await RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
-            environmentOverrides: FakeSudoPathEnvironment());
+            environmentOverrides: FakeSudoPathEnvironment(),
+            stdin: "retry-token-line-that-must-be-drained\n" + new string('x', 1024 * 1024));
         await Task.Delay(200);
 
         Assert.Equal(0, first.Exit);
@@ -1471,6 +1484,51 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildDetachedLaunchScript_ReturnsExit88WhenExitTokenSidecarPublicationFails()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var launchScript = Path.Combine(_workspace, "detached-exit-token-publication-fails.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-exit-token-publication-fails.pgid");
+        var exitTokenFile = processGroupMarker + ".exit-token";
+        var sentinel = Path.Combine(_workspace, "detached-exit-token-publication-fails.started");
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                "/does/not/need/to/exist",
+                processGroupMarker,
+                null,
+                ["/bin/sh", "-c", "printf should-not-run > \"$1\"", "codeybox-exit-token-fail", sentinel],
+                exitTokenFile: exitTokenFile));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var fakeSudo = CreateFakeSudoBin(
+            """
+            #!/bin/sh
+            if [ "$1" = "-n" ]; then shift; fi
+            if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
+                case "$3" in *'token_file=$1'*) exit 1 ;; esac
+            fi
+            exec "$@"
+            """);
+        var (exit, stdout, stderr) = await RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+            },
+            stdin: "exit-token-that-cannot-be-published\n" + new string('p', 1024 * 1024));
+
+        Assert.Equal(88, exit);
+        Assert.Equal("", stdout);
+        Assert.Contains("codeybox-detached: failed to publish exit token sidecar", stderr, StringComparison.Ordinal);
+        Assert.False(File.Exists(exitTokenFile));
+        Assert.False(File.Exists(sentinel));
+    }
+
+    [Fact]
     public async Task BuildDetachedLaunchScript_ReturnsExit88WhenProcessGroupMarkerPublicationFails()
     {
         if (OperatingSystem.IsWindows())
@@ -1577,7 +1635,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task BuildDetachedLaunchScript_DetachedChildDoesNotPublishExitSidecarWhenSidecarPublicationFails()
+    public async Task BuildDetachedLaunchScript_DetachedChildPostsAuthenticatedExitWhenSidecarPublicationFails()
     {
         if (OperatingSystem.IsWindows())
             return;
@@ -1593,16 +1651,19 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             return;
 
         var envFile = Path.Combine(_workspace, "detached-sidecar-publication-fails.env");
+        var exitTokenFile = Path.Combine(_workspace, "detached-sidecar-publication-fails.token");
         var launchScript = Path.Combine(_workspace, "detached-sidecar-publication-fails.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-sidecar-publication-fails.pgid");
-        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
+        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment(includeExitToken: false)));
+        await File.WriteAllTextAsync(exitTokenFile, session.ExitToken);
         await File.WriteAllTextAsync(
             launchScript,
             MultipassSandbox.BuildDetachedLaunchScript(
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", "-c", "exit 3"]));
+                ["/bin/sh", "-c", "exit 3"],
+                exitTokenFile: exitTokenFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin(
@@ -1622,12 +1683,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
             });
         await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        await WaitForExitCodeAsync(session, 3, TimeSpan.FromSeconds(6));
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
         Assert.True(File.Exists(processGroupMarker));
         Assert.False(File.Exists(processGroupMarker + ".exit"));
+        Assert.False(File.Exists(exitTokenFile));
+        Assert.Contains("codeybox-detached: failed to publish output sidecars", session.Stderr, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2493,6 +2557,56 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => execTask);
 
+        Assert.True(killAttempted);
+    }
+
+    [Fact]
+    public async Task ExecAsync_DetachedRunExceptionTerminatesRecordedProcessGroup()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var detachedLaunchObserved = false;
+        var killAttempted = false;
+        var runner = new RecordingMultipassRunner((argv, stdin, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "transfer", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                AssertDetachedLaunchStdin(stdin);
+                detachedLaunchObserved = true;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (IsDetachedProcessGroupPoll(argv))
+                throw new InvalidOperationException("poll transport exploded after launch");
+            if (IsDetachedProcessGroupKill(argv))
+            {
+                killAttempted = true;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            LaunchMode = SandboxExecLaunchMode.DetachedBatch,
+        }, timeout.Token));
+
+        Assert.Contains("poll transport exploded", ex.Message, StringComparison.Ordinal);
+        Assert.True(detachedLaunchObserved);
         Assert.True(killAttempted);
     }
 

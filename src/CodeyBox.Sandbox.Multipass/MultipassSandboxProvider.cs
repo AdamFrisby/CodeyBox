@@ -5024,18 +5024,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 if (agentOutputIngest is not null)
                 {
                     detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
+                    effectiveEnvironment = MergeExecEnvironment(
+                        RemoveAgentOutputExitToken(effectiveEnvironment),
+                        agentOutputIngest.BuildEnvironment(includeExitToken: false));
                     if (detachedHttpIngest)
                     {
                         detachedExitToken = agentOutputIngest.ExitToken;
-                        effectiveEnvironment = MergeExecEnvironment(
-                            effectiveEnvironment,
-                            agentOutputIngest.BuildEnvironment(includeExitToken: false));
-                    }
-                    else
-                    {
-                        effectiveEnvironment = MergeExecEnvironment(
-                            effectiveEnvironment,
-                            agentOutputIngest.BuildEnvironment(includeExitToken: false));
                     }
                     stdoutChunkCallback = null;
                     stderrChunkCallback = null;
@@ -5240,6 +5234,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 await TryTerminateDetachedProcessGroupAsync(detachedProcessGroupMarker).ConfigureAwait(false);
             throw;
         }
+        catch (Exception) when (detachedHttpIngest && detachedProcessGroupMarker is not null)
+        {
+            await TryTerminateDetachedProcessGroupAsync(detachedProcessGroupMarker).ConfigureAwait(false);
+            throw;
+        }
         finally
         {
             if (agentOutputIngest is not null)
@@ -5432,6 +5431,20 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return merged;
     }
 
+    private static IReadOnlyDictionary<string, string>? RemoveAgentOutputExitToken(
+        IReadOnlyDictionary<string, string>? environment)
+    {
+        if (environment is null
+            || !environment.ContainsKey(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable))
+        {
+            return environment;
+        }
+
+        var scrubbed = new Dictionary<string, string>(environment, StringComparer.Ordinal);
+        scrubbed.Remove(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable);
+        return scrubbed;
+    }
+
     private static bool IsAgentOutputHttpSetupFailure(
         ProcessRunResult result,
         MultipassAgentOutputHttpIngestSession ingest)
@@ -5593,6 +5606,41 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         if (launchLockAttempts < 0)
             throw new ArgumentOutOfRangeException(nameof(launchLockAttempts), "Launch lock attempts must be non-negative.");
 
+        const string detachedHttpExitPosterScript = """
+import os, sys, time, urllib.error, urllib.parse, urllib.request
+base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')
+run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')
+token = sys.stdin.buffer.readline().decode('utf-8').rstrip('\n')
+data = sys.stdin.buffer.read()
+if not base or not run_id or not token or not data:
+    sys.exit(0)
+url = base + '/' + urllib.parse.quote(run_id, safe='') + '/exit/0'
+deadline = time.monotonic() + 300.0
+attempt = 0
+while True:
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method='POST',
+        headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain; charset=utf-8'})
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            code = resp.getcode()
+            if 200 <= code < 300:
+                sys.exit(0)
+            if code in (401, 403, 409, 413):
+                sys.exit(70)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403, 409, 413):
+            sys.exit(70)
+    except Exception:
+        pass
+    if time.monotonic() >= deadline:
+        sys.exit(75)
+    time.sleep(min(5.0, 0.1 * (2 ** min(attempt, 5))))
+    attempt += 1
+""";
+
         var sb = new StringBuilder();
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("set -e");
@@ -5611,23 +5659,28 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("codeybox_release_lock() {");
         sb.AppendLine("    codeybox_root_sh 'rmdir \"$1\" 2>/dev/null || true' \"$codeybox_lock_dir\" || true");
         sb.AppendLine("}");
+        sb.AppendLine("codeybox_drain_stdin() {");
+        sb.AppendLine("    cat >/dev/null 2>/dev/null || true");
+        sb.AppendLine("}");
         sb.AppendLine("if ! codeybox_root_sh 'mkdir -p \"$1\" && { chown root:root \"$1\" 2>/dev/null || true; } && chmod 0700 \"$1\"' \"$codeybox_supervisor_dir\"; then");
         sb.AppendLine("    echo \"codeybox-detached: failed to prepare supervisor directory\" >&2");
+        sb.AppendLine("    codeybox_drain_stdin");
         sb.AppendLine($"    exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("fi");
-        sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi");
+        sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi");
         sb.AppendLine("codeybox_lock_i=0");
         sb.AppendLine("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"; do");
-        sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi");
+        sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi");
         sb.AppendLine("    if [ \"$codeybox_lock_i\" -ge \"$codeybox_lock_max\" ]; then");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for launch lock\" >&2");
+        sb.AppendLine("        codeybox_drain_stdin");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");
         sb.AppendLine("    sleep 0.1");
         sb.AppendLine("    codeybox_lock_i=$((codeybox_lock_i + 1))");
         sb.AppendLine("done");
         sb.AppendLine("trap codeybox_release_lock EXIT");
-        sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi");
+        sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi");
         sb.AppendLine("codeybox_root_sh 'rm -f \"$1.tmp\" \"$1.exit.tmp\" \"$1.exit-token.tmp\" \"$1.stdin\" \"$1.stdin.tmp\"' \"$codeybox_pgid_marker\" || true");
         sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ]; then");
         sb.AppendLine("    codeybox_output_exit_token=");
@@ -5641,6 +5694,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("chmod 0600 \"$token_tmp\" || exit 1");
         sb.AppendLine("mv -f \"$token_tmp\" \"$token_file\" || exit 1' \"$codeybox_exit_token_file\"; then");
         sb.AppendLine("            echo \"codeybox-detached: failed to publish exit token sidecar\" >&2");
+        sb.AppendLine("            codeybox_drain_stdin");
         sb.AppendLine($"            exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("        fi");
         sb.AppendLine("    fi");
@@ -5648,6 +5702,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
         sb.AppendLine("    if ! codeybox_root_sh 'stdin_file=$1; stdin_tmp=\"${stdin_file}.tmp\"; umask 077; cat > \"$stdin_tmp\" && mv -f \"$stdin_tmp\" \"$stdin_file\" && { chown root:root \"$stdin_file\" 2>/dev/null || true; } && chmod 0600 \"$stdin_file\"' \"$codeybox_stdin_file\"; then");
         sb.AppendLine("        echo \"codeybox-detached: failed to publish stdin sidecar\" >&2");
+        sb.AppendLine("        codeybox_drain_stdin");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");
         sb.AppendLine("fi");
@@ -5686,13 +5741,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.Append("    echo ")
             .Append(MultipassSandboxProvider.ShellSingleQuote(AgentOutputHttpSetupFailureMarker))
             .AppendLine(" >&2");
-        sb.AppendLine("    exit 86");
+        sb.AppendLine($"    exit {AgentOutputHttpSetupFailedExitCode}");
         sb.AppendLine("fi");
         sb.AppendLine("if ! codeybox_http_ready; then");
         sb.Append("    echo ")
             .Append(MultipassSandboxProvider.ShellSingleQuote(AgentOutputHttpSetupFailureMarker))
             .AppendLine(" >&2");
-        sb.AppendLine("    exit 86");
+        sb.AppendLine($"    exit {AgentOutputHttpSetupFailedExitCode}");
         sb.AppendLine("fi");
         sb.AppendLine("codeybox_child_script=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-child.XXXXXX\")");
         sb.AppendLine("cat > \"$codeybox_child_script\" <<'CODEYBOX_DETACHED_CHILD'");
@@ -5726,41 +5781,23 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("    unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
         sb.AppendLine("fi");
         sb.AppendLine("codeybox_http_exit() {");
+        sb.AppendLine("local codeybox_exit_code=\"$1\"");
+        sb.AppendLine("local codeybox_exit_diagnostic=\"${2:-}\"");
+        sb.AppendLine("if [ -z \"$codeybox_output_exit_token\" ]; then");
+        sb.AppendLine("    return 0");
+        sb.AppendLine("fi");
+        sb.AppendLine("{");
+        sb.AppendLine("    printf '%s\\n' \"$codeybox_output_exit_token\"");
+        sb.AppendLine("    printf '%s\\n' \"$codeybox_exit_code\"");
+        sb.AppendLine("    if [ -n \"$codeybox_exit_diagnostic\" ]; then");
+        sb.AppendLine("        printf '%s\\n' \"$codeybox_exit_diagnostic\"");
+        sb.AppendLine("    fi");
+        sb.AppendLine("} | \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
-        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN=\"$codeybox_output_exit_token\" \\");
-        sb.AppendLine("CODEYBOX_AGENT_EXIT_CODE=\"$1\" \\");
-        sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, sys, time, urllib.error, urllib.parse, urllib.request");
-        sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
-        sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
-        sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN', '')");
-        sb.AppendLine("exit_code = os.environ.get('CODEYBOX_AGENT_EXIT_CODE', '')");
-        sb.AppendLine("if not base or not run_id or not token or not exit_code:");
-        sb.AppendLine("    sys.exit(0)");
-        sb.AppendLine("url = base + '/' + urllib.parse.quote(run_id, safe='') + '/exit/0'");
-        sb.AppendLine("data = (exit_code + '\\n').encode('utf-8')");
-        sb.AppendLine("deadline = time.monotonic() + 300.0");
-        sb.AppendLine("attempt = 0");
-        sb.AppendLine("while True:");
-        sb.AppendLine("    req = urllib.request.Request(url, data=data, method='POST', headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain; charset=utf-8'})");
-        sb.AppendLine("    try:");
-        sb.AppendLine("        with urllib.request.urlopen(req, timeout=10.0) as resp:");
-        sb.AppendLine("            code = resp.getcode()");
-        sb.AppendLine("            if 200 <= code < 300:");
-        sb.AppendLine("                sys.exit(0)");
-        sb.AppendLine("            if code in (401, 403, 409, 413):");
-        sb.AppendLine("                sys.exit(70)");
-        sb.AppendLine("    except urllib.error.HTTPError as exc:");
-        sb.AppendLine("        if exc.code in (401, 403, 409, 413):");
-        sb.AppendLine("            sys.exit(70)");
-        sb.AppendLine("    except Exception:");
-        sb.AppendLine("        pass");
-        sb.AppendLine("    if time.monotonic() >= deadline:");
-        sb.AppendLine("        sys.exit(75)");
-        sb.AppendLine("    time.sleep(min(5.0, 0.1 * (2 ** min(attempt, 5))))");
-        sb.AppendLine("    attempt += 1");
-        sb.AppendLine("PY");
+        sb.Append("python3 -c ")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(detachedHttpExitPosterScript))
+            .Append('\n');
         sb.AppendLine("}");
         sb.AppendLine("codeybox_pgid=$$");
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1; pgid=$2; tmp=\"${marker}.tmp\"; umask 077; printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\" && { chown root:root \"$marker\" 2>/dev/null || true; } && chmod 0600 \"$marker\"' \"$codeybox_pgid_marker\" \"$codeybox_pgid\"; then");
@@ -5777,6 +5814,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_wrapper_rc=$?");
         sb.AppendLine("fi");
+        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1");
         sb.AppendLine("stdout_file=$2");
         sb.AppendLine("stderr_file=$3");
@@ -5796,10 +5834,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("{ chown root:root \"${marker}.stdout\" \"${marker}.stderr\" \"${marker}.exit\" 2>/dev/null || true; }");
         sb.AppendLine("chmod 0600 \"${marker}.stdout\" \"${marker}.stderr\" \"${marker}.exit\"' \"$codeybox_pgid_marker\" \"$codeybox_stdout_file\" \"$codeybox_stderr_file\" \"$codeybox_wrapper_rc\"; then");
         sb.AppendLine("    rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
-        sb.AppendLine($"    exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    codeybox_http_exit \"$codeybox_wrapper_rc\" \"codeybox-detached: failed to publish output sidecars\" || true");
+        sb.AppendLine("    exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("fi");
         sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
-        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
