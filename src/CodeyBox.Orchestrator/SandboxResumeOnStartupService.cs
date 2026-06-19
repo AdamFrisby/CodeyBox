@@ -224,7 +224,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 return Task.CompletedTask;
             }
 
-            _resumeTask = RunLongRunningAsync(() => ResumeAllAndSignalAsync(ct));
+            _resumeTask = ResumeAllAndSignalAsync(ct);
             return _resumeTask;
         }
     }
@@ -454,7 +454,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             resumeTask = RunLongRunningAsync(
                 () => suspending.ResumeSandboxAsync(vmName, timeoutCts.Token));
-            if (UseBlockingResumeTimeoutWait(timeout))
+            if (UseShortResumeTimeoutWait(timeout))
             {
                 await WaitForTaskOrTimeoutAsync(resumeTask, timeout, ct);
             }
@@ -756,7 +756,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
     }
 
-    private static bool UseBlockingResumeTimeoutWait(TimeSpan timeout) =>
+    private static bool UseShortResumeTimeoutWait(TimeSpan timeout) =>
         timeout <= TimeSpan.FromSeconds(5);
 
     private static async Task WaitForTaskOrTimeoutAsync(Task task, TimeSpan timeout, CancellationToken ct)
@@ -767,34 +767,19 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             return;
         }
 
-        using var completed = new ManualResetEventSlim(false);
-        using var cancellationRegistration = ct.Register(
-            static state => ((ManualResetEventSlim)state!).Set(),
-            completed);
-        _ = task.ContinueWith(
-            static (_, state) =>
-            {
-                try
-                {
-                    ((ManualResetEventSlim)state!).Set();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // The timeout path already moved on; the provider task is
-                    // observed separately so late completion is harmless.
-                }
-            },
-            completed,
-            CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var timeoutTask = Task.Delay(timeout, timeoutCts.Token);
+        var completedTask = await Task.WhenAny(task, timeoutTask).ConfigureAwait(false);
+        if (ReferenceEquals(completedTask, task))
+        {
+            timeoutCts.Cancel();
+            await task.ConfigureAwait(false);
+            return;
+        }
 
-        if (!completed.Wait(timeout))
-            throw new TimeoutException();
         if (ct.IsCancellationRequested)
             throw new OperationCanceledException(ct);
-
-        await task.ConfigureAwait(false);
+        throw new TimeoutException();
     }
 
     private static Task RunLongRunningAsync(Func<Task> work) =>
