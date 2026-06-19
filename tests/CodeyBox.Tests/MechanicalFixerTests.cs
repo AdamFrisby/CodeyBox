@@ -1200,6 +1200,36 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task Pipeline_ExplicitEmptyMechanicalFixersSkipsRegisteredFixerAndSandbox()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new SpecRecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            sandboxProvider: recorder,
+            mechanicalFixers: [new ThrowingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-disabled");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
+        Assert.DoesNotContain(recorder.Specs, s => s.TimingPhase == "mechanical-edit");
+    }
+
+    [Fact]
     public async Task Pipeline_MechanicalFailureIsInfrastructureFailure()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1225,6 +1255,40 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("mechanical-edit failed", final.LastError);
+    }
+
+    [Fact]
+    public async Task Pipeline_MechanicalCancellationAutoRetriesFromWorkComplete()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new CountingAuditor(new AuditResult(true, []));
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [CancellingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            mechanicalFixers: [new CancellingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-cancel");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WorkComplete, final!.State);
+        Assert.Equal(1, final.TransientCancelRetries);
+        Assert.Equal(CancellationSources.Unknown, final.CancellationSource);
+        Assert.Null(final.FailureKind);
+        Assert.Contains("mechanical-edit", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
+        Assert.Equal(0, auditor.Calls);
     }
 
     [Fact]
@@ -1639,6 +1703,27 @@ public sealed class MechanicalFixerTests : IDisposable
             => throw new InvalidOperationException("normalizer unavailable");
     }
 
+    private sealed class CancellingMechanicalFixer : IMechanicalFixer
+    {
+        public const string FixerName = "cancelling-normalizer";
+
+        public string Name => FixerName;
+        public string Kind => "test";
+
+        public Task<MechanicalFixerResult> ApplyAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            MechanicalFixerContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            throw new OperationCanceledException("mechanical fixer cancelled");
+        }
+    }
+
     private sealed class OnceFailingAuditor : IAuditor
     {
         public string Name => "test:once-failing";
@@ -1719,6 +1804,32 @@ public sealed class MechanicalFixerTests : IDisposable
             }
 
             return new AuditResult(true, []);
+        }
+    }
+
+    private sealed class CountingAuditor : IAuditor
+    {
+        private readonly AuditResult _result;
+
+        public CountingAuditor(AuditResult result) => _result = result;
+
+        public string Name => "test:counting";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public int Calls { get; private set; }
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            Calls++;
+            return Task.FromResult(_result);
         }
     }
 
