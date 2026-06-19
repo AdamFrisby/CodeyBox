@@ -492,6 +492,115 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         }
     }
 
+    [Fact]
+    public async Task ExecWrapper_HttpOutputTransportExitPostFailureFailsRunAfterStreaming()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        if (!await CommandAvailableAsync("python3")) return;
+
+        await using var server = StubHttpIngestServer.Start(request =>
+            request.Stream == "ready" ? 204 : request.Stream == "exit" ? 409 : 200);
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        Directory.CreateDirectory(workDir);
+        var exitFile = Path.Combine(workDir, "agent.exit");
+        var env = new Dictionary<string, string?>
+        {
+            [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
+            [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
+            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-exit-post-fail",
+            ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
+            ["CODEYBOX_AGENT_LOG_FILE"] = "",
+        };
+
+        try
+        {
+            var agentScript = """
+                printf 'out-before-completion-fail\n'
+                printf 'err-before-completion-fail\n' >&2
+                exit 4
+                """;
+
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, workDir, "sh", "-c", agentScript],
+                env);
+
+            Assert.Equal(87, exit);
+            Assert.Equal("", stdout);
+            Assert.Contains("agent output HTTP completion failed during run", stderr, StringComparison.Ordinal);
+            Assert.Equal("87", (await File.ReadAllTextAsync(exitFile)).Trim());
+
+            var requests = server.Requests.ToArray();
+            Assert.Contains(requests, r => r.Stream == "stdout" && r.BodyText == "out-before-completion-fail\n");
+            Assert.Contains(requests, r => r.Stream == "stderr" && r.BodyText == "err-before-completion-fail\n");
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal("4\n", exitRequest.BodyText);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecWrapper_HttpOutputTransportWithLogFileExitPostFailureWritesTransportFailureSidecars()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        if (!await CommandAvailableAsync("python3")) return;
+
+        await using var server = StubHttpIngestServer.Start(request =>
+            request.Stream == "ready" ? 204 : request.Stream == "exit" ? 409 : 200);
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        Directory.CreateDirectory(workDir);
+        var logPath = Path.Combine(workDir, "agent.log");
+        var exitFile = Path.Combine(workDir, "agent.host.exit");
+        var env = new Dictionary<string, string?>
+        {
+            [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
+            [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
+            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-log-exit-post-fail",
+            ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
+            ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
+        };
+
+        try
+        {
+            var agentScript = """
+                printf 'out-log-before-completion-fail\n'
+                printf 'err-log-before-completion-fail\n' >&2
+                exit 5
+                """;
+
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, workDir, "sh", "-c", agentScript],
+                env);
+
+            Assert.Equal(87, exit);
+            Assert.Equal("", stdout);
+            Assert.Contains("agent output HTTP completion failed during run", stderr, StringComparison.Ordinal);
+            Assert.Equal("out-log-before-completion-fail\nerr-log-before-completion-fail\n", await File.ReadAllTextAsync(logPath));
+            Assert.Equal("87", (await File.ReadAllTextAsync(logPath + ".exit")).Trim());
+            Assert.Equal("87", (await File.ReadAllTextAsync(exitFile)).Trim());
+
+            var requests = server.Requests.ToArray();
+            Assert.Equal("out-log-before-completion-fail\nerr-log-before-completion-fail\n", string.Concat(
+                requests.Where(r => r.Stream == "stdout").OrderBy(r => r.Seq).Select(r => r.BodyText)));
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal("5\n", exitRequest.BodyText);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
     private static Task<(int Exit, string Stdout, string Stderr)> RunShellAsync(string script, string arg)
         => RunProcessAsync("/bin/sh", ["-c", script, "codeybox-test", arg]);
 

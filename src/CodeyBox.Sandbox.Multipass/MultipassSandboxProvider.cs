@@ -5690,11 +5690,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine($"codeybox_stderr_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stderr.XXXXXX\") || {{ rm -f \"$codeybox_stdout_file\"; exit {DetachedSupervisorSetupFailedExitCode}; }}");
         sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
         sb.AppendLine("    set -o pipefail");
-        sb.AppendLine("    { codeybox_root_sh 'cat -- \"$1\"' \"$codeybox_stdin_file\" | \"$@\"; } >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
+        sb.AppendLine("    codeybox_root_sh 'cat -- \"$1\"' \"$codeybox_stdin_file\" 2>>\"$codeybox_stderr_file\" | \"$@\" >\"$codeybox_stdout_file\" 2>>\"$codeybox_stderr_file\"");
+        sb.AppendLine("    codeybox_status=(\"${PIPESTATUS[@]}\")");
+        sb.AppendLine("    codeybox_wrapper_rc=${codeybox_status[1]}");
         sb.AppendLine("else");
         sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
+        sb.AppendLine("    codeybox_wrapper_rc=$?");
         sb.AppendLine("fi");
-        sb.AppendLine("codeybox_wrapper_rc=$?");
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1");
         sb.AppendLine("stdout_file=$2");
         sb.AppendLine("stderr_file=$3");

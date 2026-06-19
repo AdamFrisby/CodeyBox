@@ -53,11 +53,12 @@ public sealed class WorkerProgressWatchdogOptions
     public bool ProcessCpuProgressSignalEnabled { get; set; } = true;
 
     /// <summary>
-    /// When true, the watchdog can treat provider-reported sandbox activity
-    /// transitions as progress. Static ownership of a live sandbox is not
-    /// enough: providers whose guest CPU is not visible from host <c>/proc</c>
-    /// must report a changing activity projection for this signal to fire.
-    /// Default true. Hot-reloadable on the next sweep.
+    /// When true, the watchdog can treat provider-reported active sandbox
+    /// ownership as progress. Stable ownership of a live sandbox is enough;
+    /// providers may report richer changing activity projections, but detached
+    /// Multipass batch runs rely on the live VM ownership signal because guest
+    /// CPU is not visible from host <c>/proc</c>. Default true. Hot-reloadable
+    /// on the next sweep.
     /// </summary>
     public bool ActiveSandboxProgressSignalEnabled { get; set; } = true;
 

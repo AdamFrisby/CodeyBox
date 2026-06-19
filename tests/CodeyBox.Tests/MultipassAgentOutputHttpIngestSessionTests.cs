@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
@@ -62,6 +63,27 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         Assert.Equal(HttpStatusCode.Conflict, conflicting);
         Assert.True(session.TryGetExitCode(out var exitCode));
         Assert.Equal(7, exitCode);
+        Assert.Empty(chunks);
+    }
+
+    [Fact]
+    public async Task Post_ExitStreamRejectsMalformedRequestsWithoutRecordingCompletion()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+        var oversizedBody = new string('1', 65);
+
+        var nonNumericSeq = await PostAsync(client, session, "run-x", "exit", "not-a-number", session.ExitToken, "7\n");
+        var nonZeroSeq = await PostAsync(client, session, "run-x", "exit", "1", session.ExitToken, "7\n");
+        var nonIntegerBody = await PostAsync(client, session, "run-x", "exit", "0", session.ExitToken, "not-an-int\n");
+        var oversized = await PostAsync(client, session, "run-x", "exit", "0", session.ExitToken, oversizedBody);
+
+        Assert.Equal(HttpStatusCode.BadRequest, nonNumericSeq);
+        Assert.Equal(HttpStatusCode.BadRequest, nonZeroSeq);
+        Assert.Equal(HttpStatusCode.BadRequest, nonIntegerBody);
+        Assert.Equal(HttpStatusCode.BadRequest, oversized);
+        Assert.False(session.TryGetExitCode(out _));
         Assert.Empty(chunks);
     }
 
@@ -134,12 +156,29 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
             CancellationToken.None)
         ?? throw new InvalidOperationException("Failed to bind test ingest listener.");
 
-    private static async Task<HttpStatusCode> PostAsync(
+    private static Task<HttpStatusCode> PostAsync(
         HttpClient client,
         MultipassAgentOutputHttpIngestSession session,
         string runId,
         string stream,
         long seq,
+        string token,
+        string body)
+        => PostAsync(
+            client,
+            session,
+            runId,
+            stream,
+            seq.ToString(CultureInfo.InvariantCulture),
+            token,
+            body);
+
+    private static async Task<HttpStatusCode> PostAsync(
+        HttpClient client,
+        MultipassAgentOutputHttpIngestSession session,
+        string runId,
+        string stream,
+        string seq,
         string token,
         string body)
     {
@@ -153,12 +192,12 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         MultipassAgentOutputHttpIngestSession session,
         string runId,
         string stream,
-        long seq,
+        string seq,
         string token)
     {
         var request = new HttpRequestMessage(
             HttpMethod.Post,
-            $"{session.BaseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{seq}");
+            $"{session.BaseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{Uri.EscapeDataString(seq)}");
         request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
         return request;
     }
