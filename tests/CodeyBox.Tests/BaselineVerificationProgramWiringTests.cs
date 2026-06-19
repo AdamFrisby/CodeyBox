@@ -83,6 +83,29 @@ public sealed class BaselineVerificationProgramWiringTests
     }
 
     [Fact]
+    public void Program_PopulatesExecutableProvisions_FromConfiguration()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "multipass",
+            ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+            ["CodeyBox:MultipassExecutableProvisions:0:HostSourcePath"] = "/home/operator/agy seed/agy",
+            ["CodeyBox:MultipassExecutableProvisions:0:VmDestPath"] = "/home/ubuntu/.local/bin/agy",
+            ["CodeyBox:MultipassExecutableProvisions:0:VmSymlinks:0"] = "/usr/local/bin/agy",
+            ["CodeyBox:MultipassExecutableProvisions:0:VmSymlinks:1"] = "/opt/codeybox/bin/agy",
+            ["CodeyBox:MultipassExecutableProvisions:0:Label"] = "antigravity",
+        });
+
+        var opts = ResolveLiveMultipassOptions(factory);
+
+        var provision = Assert.Single(opts.ExecutableProvisions);
+        Assert.Equal("/home/operator/agy seed/agy", provision.HostSourcePath);
+        Assert.Equal("/home/ubuntu/.local/bin/agy", provision.VmDestPath);
+        Assert.Equal(["/usr/local/bin/agy", "/opt/codeybox/bin/agy"], provision.VmSymlinks);
+        Assert.Equal("antigravity", provision.Label);
+    }
+
+    [Fact]
     public void Program_LeavesBaselineVerificationCommandsEmpty_WhenBaselineImagesDisabled()
     {
         // When UseBaselineImages=false there is no baseline to verify, so the

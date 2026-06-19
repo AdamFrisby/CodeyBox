@@ -500,7 +500,14 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
                     HostSourcePath = s.HostSourcePath,
                     VmDestPath = s.VmDestPath,
                     MaxSizeMB = s.MaxSizeMB
-                }).ToList() ?? []
+                }).ToList() ?? [],
+                ExecutableProvisions = live.MultipassExecutableProvisions?.Select(e => new ExecutableProvisionOptions
+                {
+                    HostSourcePath = e.HostSourcePath,
+                    VmDestPath = e.VmDestPath,
+                    VmSymlinks = e.VmSymlinks?.ToList() ?? [],
+                    Label = e.Label,
+                }).ToList() ?? [],
             };
         },
         loggerFactory.CreateLogger<MultipassSandboxProvider>(),
@@ -3603,6 +3610,16 @@ namespace CodeyBox.Api
         public List<PackageCacheSeedConfig> MultipassPackageCacheSeeds { get; set; } = [];
 
         /// <summary>
+        /// Executable binaries to ship into the baseline VM at bake time. Each
+        /// entry copies one host file to an absolute VM path with mode 0755 and
+        /// optional symlinks (e.g. into <c>/usr/local/bin</c>). Use when the
+        /// upstream installer is non-durable (a <c>curl … | bash</c> URL has
+        /// drifted or now serves HTML) and the operator already has a vetted
+        /// copy of the binary staged on the host.
+        /// </summary>
+        public List<ExecutableProvisionConfig> MultipassExecutableProvisions { get; set; } = [];
+
+        /// <summary>
         /// Disk-guard preflight configuration. Enabled by default
         /// (<see cref="DiskGuardOptions.Enabled"/>=<c>true</c>,
         /// <see cref="DiskGuardOptions.MinFreeBytes"/>=10 GiB); every
@@ -3843,6 +3860,17 @@ namespace CodeyBox.Api
         public string HostSourcePath { get; set; } = string.Empty;
         public string VmDestPath { get; set; } = string.Empty;
         public double? MaxSizeMB { get; set; }
+    }
+
+    /// <summary>
+    /// Config-bound shape of <see cref="ExecutableProvisionOptions"/>.
+    /// </summary>
+    public sealed class ExecutableProvisionConfig
+    {
+        public string HostSourcePath { get; set; } = string.Empty;
+        public string VmDestPath { get; set; } = string.Empty;
+        public List<string> VmSymlinks { get; set; } = [];
+        public string? Label { get; set; }
     }
 
     /// <summary>

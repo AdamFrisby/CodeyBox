@@ -41,7 +41,7 @@ the most common cause of fresh-class dispatch failures.
 | `gemini`  | `npm install -g @google/gemini-cli` | `ReasoningMode` is **not** wired into argv — Gemini's reasoning level is encoded in `ModelId` (pick a `gemini-3-*-preview` model for HIGH). See [Gemini quirks](#google-gemini-cli-googlegemini-cli). |
 | `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). See [Cursor quirks](#cursor-cli-agent). |
 | `opencode` | *not yet integrated in this repo — no `IAgentRunner` for opencode has shipped.* Operators tracking the integration can pre-stage with `curl -fsSL https://opencode.ai/install \| bash`, but the orchestrator will not route work to it until a runner is registered. | Listed for doc parity with the install-checklist; **does not** imply opencode is dispatchable today. |
-| `antigravity` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash -s -- --dir /usr/local/bin` | Installs the proprietary `agy` CLI on the non-login sandbox PATH. The installer resolves the current Linux payload from Google's Antigravity CLI updater manifest and verifies its SHA-512 before copying it. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. See [Antigravity quirks](#google-antigravity-cli-agy). |
+| `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it into the baseline via `CodeyBox:MultipassExecutableProvisions`* (see [Antigravity quirks](#google-antigravity-cli-agy)). The previously documented `curl -fsSL https://antigravity.google/cli/install.sh \| bash` URL no longer serves a shell script (returns HTML as of 2026-06-17); piping HTML into `bash` fails silently if the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. After updating
@@ -700,16 +700,45 @@ Google AI subscription quota. The runner is registered as **light-duty
 overflow**, not a workhorse: AI Pro caps requests on a weekly window with
 up to a 7-day lockout on cap breach, so over-use is especially expensive.
 
-**Binary name:** `agy`. Install via the upstream CLI installer:
+**Binary name:** `agy`. **Provision via `MultipassExecutableProvisions`, not
+`MultipassExtraRuncmd`.** The previously documented installer at
+`https://antigravity.google/cli/install.sh` no longer serves a shell script —
+as of 2026-06-17 it returns the Antigravity landing page (HTTP 200,
+`Content-Type: text/html`). Piping HTML into `bash` exits 2; with a trailing
+`|| true`, the runcmd reports success and the baseline is sealed without
+`agy`. Subsequent dispatches to antigravity fail `agy: command not found`
+(exit 127). The current self-update endpoint is only reachable from an
+already-installed agy binary, so there is no usable `curl|bash` line to put
+into runcmd. Stage a vetted copy of the binary on the host and ship it into
+the baseline at bake time:
 
-```sh
-curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin
+```jsonc
+// settings.json
+{
+  "CodeyBox": {
+    "MultipassExecutableProvisions": [
+      {
+        "HostSourcePath": "/home/<operator>/.codeybox/agy-seed/agy",
+        "VmDestPath": "/home/ubuntu/.local/bin/agy",
+        "VmSymlinks": ["/usr/local/bin/agy"],
+        "Label": "antigravity"
+      }
+    ]
+  }
+}
 ```
 
-The `--dir /usr/local/bin` flag matters in the sandbox baseline: CodeyBox
-execs non-login commands, so `~/.local/bin` may not be on PATH. The baseline
-bake verifies `agy --version` for configured Antigravity members before the
-image is marked ready to clone.
+The provisioner `multipass transfer`s the host file into the VM, then runs
+`install -m 0755 -o root -g root` so the executable bit and ownership are
+set deterministically (neither `File.Copy` on the host staging side nor
+`multipass transfer` documents preservation of the executable bit). The
+`/usr/local/bin/agy` symlink puts `agy` on the non-login sandbox PATH that
+`multipass exec` uses. The baseline bake verifies `agy --version` for
+configured Antigravity members before the image is marked ready to clone,
+so a missing/broken host binary fails the bake loudly instead of surfacing
+as dispatch exit 127. Hot-reloadable via the existing `IOptionsMonitor`
+plumbing; changing the host path or symlinks invalidates the cached
+`cb-baseline-*` images via the baseline hash.
 
 **Non-interactive invocation:** `agy --print --dangerously-skip-permissions
 --model <gateway-model-id>` with the prompt on stdin (the sandbox is the

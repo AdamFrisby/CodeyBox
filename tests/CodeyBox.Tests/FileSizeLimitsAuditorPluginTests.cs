@@ -127,6 +127,48 @@ public sealed class FileSizeLimitsAuditorPluginTests
     }
 
     [Fact]
+    public async Task IncludeGlob_QuestionMarkAndCaseInsensitiveLiterals_FilterFiles()
+    {
+        using var repo = await AuditRepo.CreateAsync();
+        await repo.CheckoutNewBranchAsync("feature/question-glob");
+        await repo.WriteAndCommitAsync("src/FOO1.cs", "a\nb\n");
+        await repo.WriteAndCommitAsync("src/FOO12.cs", "a\nb\n");
+
+        var result = await RunAuditorAsync(repo.Path, ConfigWithGlobs(
+            ["SRC/foo?.CS"],
+            ["**/NoMatch/**"],
+            ("WarnFileBytes", "0"),
+            ("MaxFileBytes", "0"),
+            ("WarnFileLines", "0"),
+            ("MaxFileLines", "1")));
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("src/FOO1.cs", finding.Location);
+    }
+
+    [Fact]
+    public async Task ExcludeGlob_BarePathWildcard_SkipsBinDescendants()
+    {
+        using var repo = await AuditRepo.CreateAsync();
+        await repo.CheckoutNewBranchAsync("feature/bin-exclude");
+        await repo.WriteAndCommitAsync("src/App.cs", "a\nb\n");
+        await repo.WriteAndCommitAsync("src/bin/Nested.cs", "a\nb\n");
+
+        var result = await RunAuditorAsync(repo.Path, ConfigWithGlobs(
+            ["**/*.cs"],
+            ["**/bin/**"],
+            ("WarnFileBytes", "0"),
+            ("MaxFileBytes", "0"),
+            ("WarnFileLines", "0"),
+            ("MaxFileLines", "1")));
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("src/App.cs", finding.Location);
+    }
+
+    [Fact]
     public async Task Grandfathering_PreExistingOverCapUnchanged_WarnsOnly()
     {
         using var repo = await AuditRepo.CreateAsync();
@@ -294,6 +336,24 @@ public sealed class FileSizeLimitsAuditorPluginTests
             kvp => (string?)kvp.Value,
             StringComparer.OrdinalIgnoreCase);
         data["CodeyBox:Auditors:FileSizeLimits:IncludeGlobs:0"] = "**/*.cs";
+        return new ConfigurationBuilder().AddInMemoryCollection(data).Build();
+    }
+
+    private static IConfigurationRoot ConfigWithGlobs(
+        IReadOnlyList<string> includeGlobs,
+        IReadOnlyList<string> excludeGlobs,
+        params (string Key, string Value)[] values)
+    {
+        var data = values.ToDictionary(
+            kvp => "CodeyBox:Auditors:FileSizeLimits:" + kvp.Key,
+            kvp => (string?)kvp.Value,
+            StringComparer.OrdinalIgnoreCase);
+
+        for (var i = 0; i < includeGlobs.Count; i++)
+            data[$"CodeyBox:Auditors:FileSizeLimits:IncludeGlobs:{i}"] = includeGlobs[i];
+        for (var i = 0; i < excludeGlobs.Count; i++)
+            data[$"CodeyBox:Auditors:FileSizeLimits:ExcludeGlobs:{i}"] = excludeGlobs[i];
+
         return new ConfigurationBuilder().AddInMemoryCollection(data).Build();
     }
 

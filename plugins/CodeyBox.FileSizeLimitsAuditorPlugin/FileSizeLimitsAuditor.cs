@@ -1,6 +1,4 @@
 using System.Globalization;
-using System.Text;
-using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using Microsoft.Extensions.Configuration;
@@ -18,7 +16,6 @@ public sealed class FileSizeLimitsAuditor : IAuditor, IPluginInitializer
     public const string AuditorName = "codeybox:file-size-limits";
     private const string RootConfigSection = "CodeyBox:Auditors:FileSizeLimits";
     private const string HeadRef = "HEAD";
-    private static readonly TimeSpan GlobRegexTimeout = TimeSpan.FromSeconds(1);
 
     private readonly IConfiguration? _configuration;
     private IConfigurationSection? _pluginScopedConfig;
@@ -398,22 +395,89 @@ public sealed class FileSizeLimitsAuditor : IAuditor, IPluginInitializer
 
     private sealed class GlobPattern
     {
-        private readonly Regex _regex;
+        private readonly IReadOnlyList<GlobToken> _tokens;
 
-        private GlobPattern(Regex regex)
+        private GlobPattern(IReadOnlyList<GlobToken> tokens)
         {
-            _regex = regex;
+            _tokens = tokens;
         }
 
         public static GlobPattern Create(string pattern)
-            => new(BuildRegex(NormalizePath(pattern)));
+            => new(Parse(NormalizePath(pattern)));
 
         public bool IsMatch(string path)
-            => _regex.IsMatch(path);
-
-        private static Regex BuildRegex(string pattern)
         {
-            var sb = new StringBuilder("^");
+            var memo = new Dictionary<(int TokenIndex, int PathIndex), bool>();
+            return Match(0, 0);
+
+            bool Match(int tokenIndex, int pathIndex)
+            {
+                if (tokenIndex == _tokens.Count)
+                    return pathIndex == path.Length;
+
+                var key = (tokenIndex, pathIndex);
+                if (memo.TryGetValue(key, out var cached))
+                    return cached;
+
+                var token = _tokens[tokenIndex];
+                var matched = token.Kind switch
+                {
+                    GlobTokenKind.Literal => pathIndex < path.Length
+                        && CharsEqual(token.Literal, path[pathIndex])
+                        && Match(tokenIndex + 1, pathIndex + 1),
+                    GlobTokenKind.SingleCharacter => pathIndex < path.Length
+                        && path[pathIndex] != '/'
+                        && Match(tokenIndex + 1, pathIndex + 1),
+                    GlobTokenKind.SegmentWildcard => MatchSegmentWildcard(tokenIndex, pathIndex),
+                    GlobTokenKind.PathWildcard => MatchPathWildcard(tokenIndex, pathIndex),
+                    GlobTokenKind.DirectoryPrefixWildcard => MatchDirectoryPrefixWildcard(tokenIndex, pathIndex),
+                    _ => false,
+                };
+                memo[key] = matched;
+                return matched;
+            }
+
+            bool MatchSegmentWildcard(int tokenIndex, int pathIndex)
+            {
+                for (var i = pathIndex; ; i++)
+                {
+                    if (Match(tokenIndex + 1, i))
+                        return true;
+
+                    if (i >= path.Length || path[i] == '/')
+                        return false;
+                }
+            }
+
+            bool MatchPathWildcard(int tokenIndex, int pathIndex)
+            {
+                for (var i = pathIndex; i <= path.Length; i++)
+                {
+                    if (Match(tokenIndex + 1, i))
+                        return true;
+                }
+
+                return false;
+            }
+
+            bool MatchDirectoryPrefixWildcard(int tokenIndex, int pathIndex)
+            {
+                if (Match(tokenIndex + 1, pathIndex))
+                    return true;
+
+                for (var i = pathIndex; i < path.Length; i++)
+                {
+                    if (path[i] == '/' && Match(tokenIndex + 1, i + 1))
+                        return true;
+                }
+
+                return false;
+            }
+        }
+
+        private static IReadOnlyList<GlobToken> Parse(string pattern)
+        {
+            var tokens = new List<GlobToken>(pattern.Length);
             for (var i = 0; i < pattern.Length; i++)
             {
                 var c = pattern[i];
@@ -426,28 +490,40 @@ public sealed class FileSizeLimitsAuditor : IAuditor, IPluginInitializer
                         if (i + 1 < pattern.Length && pattern[i + 1] == '/')
                         {
                             i++;
-                            sb.Append("(?:.*/)?");
+                            tokens.Add(new GlobToken(GlobTokenKind.DirectoryPrefixWildcard));
                         }
                         else
                         {
-                            sb.Append(".*");
+                            tokens.Add(new GlobToken(GlobTokenKind.PathWildcard));
                         }
                     }
                     else
                     {
-                        sb.Append("[^/]*");
+                        tokens.Add(new GlobToken(GlobTokenKind.SegmentWildcard));
                     }
                     continue;
                 }
 
-                sb.Append(c == '?' ? "[^/]" : Regex.Escape(c.ToString()));
+                tokens.Add(c == '?'
+                    ? new GlobToken(GlobTokenKind.SingleCharacter)
+                    : new GlobToken(GlobTokenKind.Literal, c));
             }
 
-            sb.Append('$');
-            return new Regex(
-                sb.ToString(),
-                RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Compiled,
-                GlobRegexTimeout);
+            return tokens;
+        }
+
+        private static bool CharsEqual(char left, char right)
+            => char.ToUpperInvariant(left) == char.ToUpperInvariant(right);
+
+        private readonly record struct GlobToken(GlobTokenKind Kind, char Literal = '\0');
+
+        private enum GlobTokenKind
+        {
+            Literal,
+            SingleCharacter,
+            SegmentWildcard,
+            PathWildcard,
+            DirectoryPrefixWildcard,
         }
     }
 }

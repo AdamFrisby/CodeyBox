@@ -242,6 +242,40 @@ public sealed class BaselineVerificationProbeBuilderTests
     }
 
     [Fact]
+    public void Build_OmitsAntigravityVerification_WhenNotConfigured()
+    {
+        // The bake gate must be silent for agents the operator hasn't opted into.
+        // A bake that included `agy --version` for a class without antigravity
+        // would fail the bake on every operator who has never installed agy —
+        // exactly the regression the original gating exists to prevent.
+        var opts = new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new AgentClassOptions
+                {
+                    Id = "no-agy",
+                    Members =
+                    [
+                        new AgentMembershipOptions { Agent = AgentKind.Claude.Value },
+                        new AgentMembershipOptions { Agent = AgentKind.Codex.Value },
+                    ],
+                },
+            ],
+        };
+
+        var probes = BaselineVerificationProbeBuilder.Build(
+            opts,
+            new ProjectsOptions(),
+            AllProbes());
+
+        var labels = probes.Select(p => p.Label).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain(AgentKind.Antigravity.Value, labels);
+        Assert.Contains(AgentKind.Claude.Value, labels);
+        Assert.Contains(AgentKind.Codex.Value, labels);
+    }
+
+    [Fact]
     public void Build_ThrowsWhenProbeHasNoCredentialIndependentStep()
     {
         // A probe-shape bug is still a hard error: the agent IS in the
