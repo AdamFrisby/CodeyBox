@@ -5764,12 +5764,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 project.Id.Value,
                 BuildMechanicalFixerInputs(auditors));
 
-            var changedFixers = new List<string>();
+            var changedFixers = new List<IMechanicalFixer>();
             foreach (var fixer in fixers)
             {
                 var result = await fixer.ApplyAsync(sandbox, SandboxConventions.WorkDir, ctx, phaseCt);
                 if (result.Changed)
-                    changedFixers.Add(fixer.Name);
+                    changedFixers.Add(fixer);
 
                 _log.LogInformation(
                     "Mechanical fixer {FixerName} completed for work item {WorkItemId} audit iteration {AuditIteration}: changed={Changed}; {Summary}",
@@ -5800,19 +5800,19 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw new MechanicalFixerException($"mechanical-edit could not inspect staged diff: {staged.Stderr}");
 
             var revision = await ResolveMechanicalPromptRevisionForCommitAsync(item, auditIteration, phaseCt);
+            var commitFixers = changedFixers.Count == 0 ? fixers : changedFixers;
             var model = changedFixers.Count == 0
                 ? string.Join("+", fixers.Select(f => f.Name))
-                : string.Join("+", changedFixers);
+                : string.Join("+", changedFixers.Select(f => f.Name));
             var trailerBlock = await ComposeCommitTrailerBlockAsync(
                 item.Id,
                 new AgentKind("mechanical"),
                 model,
                 phaseCt,
                 promptRevisionAtDispatch: revision);
-            var subject = changedFixers.Count == 1 &&
-                          changedFixers[0].Equals("dotnet-format", StringComparison.OrdinalIgnoreCase)
-                ? "chore: normalize (dotnet format)"
-                : "chore: normalize mechanical edits";
+            var subject = commitFixers.Count == 1 && !string.IsNullOrWhiteSpace(commitFixers[0].CommitSubject)
+                ? commitFixers[0].CommitSubject.Trim()
+                : MechanicalFixerCommitSubjects.Default;
             var commitMessage = $"{subject}\n\n{trailerBlock}";
 
             await using (var commitScope = await TimingScope.BeginAsync(

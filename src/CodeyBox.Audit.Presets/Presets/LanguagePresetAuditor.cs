@@ -185,22 +185,32 @@ internal static class LanguagePresetProjectDiscovery
         if (projectDirectory == "." || string.IsNullOrWhiteSpace(projectDirectory))
             return workingDirectory;
 
-        var relativeProjectDirectory = projectDirectory.Replace('\\', '/');
+        var relativeProjectDirectory = projectDirectory.Replace('\\', '/').Trim();
         if (relativeProjectDirectory.StartsWith("./", StringComparison.Ordinal))
             relativeProjectDirectory = relativeProjectDirectory[2..];
-        relativeProjectDirectory = relativeProjectDirectory.Trim('/');
 
         if (string.IsNullOrWhiteSpace(relativeProjectDirectory) || relativeProjectDirectory == ".")
             return workingDirectory;
 
         if (relativeProjectDirectory.Contains("..", StringComparison.Ordinal) ||
-            relativeProjectDirectory.StartsWith('/') ||
+            relativeProjectDirectory.StartsWith("/", StringComparison.Ordinal) ||
+            LooksLikeWindowsRootedPath(relativeProjectDirectory) ||
             Path.IsPathRooted(relativeProjectDirectory))
         {
             throw new InvalidOperationException(
                 $"Language preset discovery returned an unsafe project directory: '{projectDirectory}'. Project directories must be relative and stay within the repository root.");
         }
 
+        relativeProjectDirectory = relativeProjectDirectory.Trim('/');
+        if (string.IsNullOrWhiteSpace(relativeProjectDirectory) || relativeProjectDirectory == ".")
+            return workingDirectory;
+
         return workingDirectory.TrimEnd('/') + "/" + relativeProjectDirectory;
     }
+
+    private static bool LooksLikeWindowsRootedPath(string path)
+        => path.Length >= 3 &&
+           char.IsLetter(path[0]) &&
+           path[1] == ':' &&
+           path[2] == '/';
 }

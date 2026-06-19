@@ -13,6 +13,9 @@ public interface IMechanicalFixer
     /// <summary>Implementation kind for logs and diagnostics.</summary>
     string Kind { get; }
 
+    /// <summary>Commit subject to use when this fixer is the only normalizer that contributed changes.</summary>
+    string CommitSubject => MechanicalFixerCommitSubjects.Default;
+
     /// <summary>
     /// Apply the deterministic transform to <paramref name="workingDirectory"/>.
     /// Implementations must not call a model and should be idempotent.
@@ -65,3 +68,8 @@ public sealed record MechanicalFixerResult(
     bool Changed,
     string? Summary = null,
     string? RawOutput = null);
+
+public static class MechanicalFixerCommitSubjects
+{
+    public const string Default = "chore: normalize mechanical edits";
+}

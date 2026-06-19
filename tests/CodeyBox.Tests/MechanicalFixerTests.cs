@@ -592,6 +592,39 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task DotnetFormatFixer_CommandExecutionUnavailableRollsBackAndLetsAuditReport()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [""],
+            formatResult: new SandboxExecResult(
+                0,
+                "",
+                "sandbox provider unavailable",
+                ExecutionUnavailable: true));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.False(result.Changed);
+        Assert.Contains("skipped normalization", result.Summary);
+        Assert.Contains("sandbox provider unavailable", result.RawOutput);
+        Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
+        Assert.Single(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
+    }
+
+    [Fact]
     public async Task DotnetFormatFixer_CommandFailureRestoresPreExistingTrackedDiff()
     {
         var auditor = new PresetCatalog()
@@ -624,6 +657,64 @@ public sealed class MechanicalFixerTests : IDisposable
                 InputsFor(auditor)));
 
         Assert.False(result.Changed);
+        Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
+        Assert.Equal(previousFixerPatch, Assert.Single(sandbox.WrittenPatches));
+        Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual([
+            "git",
+            "-C",
+            "/work/repo",
+            "apply",
+            "--whitespace=nowarn",
+            "/tmp/codeybox-dotnet-format-before.patch",
+        ]));
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_PartialMultiProjectFailureRestoresPreExistingTrackedDiff()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string previousFixerPatch =
+            """
+            diff --git a/normalizer.txt b/normalizer.txt
+            index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..56a6051ca2b02b04ef92d5150c9ef600403cb1de 100644
+            --- a/normalizer.txt
+            +++ b/normalizer.txt
+            @@ -0,0 +1 @@
+            +1
+            """;
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: "src/App\nsrc/Lib\n",
+            statusOutputs: [" M normalizer.txt\0"],
+            formatResult: new SandboxExecResult(0, "formatted app", ""),
+            diffOutputs: [previousFixerPatch],
+            formatResults:
+            [
+                new SandboxExecResult(0, "formatted app", ""),
+                new SandboxExecResult(2, "", "format lib failed"),
+            ]);
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.False(result.Changed);
+        Assert.Contains("src/Lib", result.Summary);
+        Assert.Contains("format lib failed", result.RawOutput);
+        Assert.Equal(
+            ["/work/repo/src/App", "/work/repo/src/Lib"],
+            sandbox.Execs
+                .Where(e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format")
+                .Select(e => e.WorkingDirectory ?? string.Empty)
+                .ToArray());
         Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
         Assert.Equal(previousFixerPatch, Assert.Single(sandbox.WrittenPatches));
         Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual([
@@ -967,6 +1058,72 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.False(result.Changed);
         Assert.Contains("marker discovery exited 1", result.Summary);
         Assert.Contains("find failed", result.RawOutput);
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_DiscoveryOutputLimitSkipsForAuditorFinding()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: "",
+            statusOutputs: [],
+            formatResult: new SandboxExecResult(0, "formatted", ""),
+            markerResult: new SandboxExecResult(
+                0,
+                "partial marker output",
+                "partial marker stderr",
+                StdoutLimitExceeded: true));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.False(result.Changed);
+        Assert.Contains("marker discovery exceeded", result.Summary);
+        Assert.Contains("partial marker output", result.RawOutput);
+        Assert.Contains("stdout truncated", result.RawOutput);
+        Assert.DoesNotContain(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
+    }
+
+    [Theory]
+    [InlineData("/tmp/outside")]
+    [InlineData("../outside")]
+    [InlineData("src/../outside")]
+    [InlineData("C:/outside")]
+    public async Task DotnetFormatFixer_UnsafeProjectDirectoryStopsBeforeFormat(string markerPath)
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: markerPath + "\n",
+            statusOutputs: [""],
+            formatResult: new SandboxExecResult(0, "formatted", ""));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new DotnetFormatMechanicalFixer().ApplyAsync(
+                sandbox,
+                "/work/repo",
+                new MechanicalFixerContext(
+                    WorkItemId.New(),
+                    "feature/test",
+                    "main",
+                    1,
+                    "project",
+                    InputsFor(auditor))));
+
+        Assert.Contains("unsafe project directory", ex.Message);
+        Assert.Contains(markerPath, ex.Message);
+        Assert.DoesNotContain(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
     }
 
     [Fact]
@@ -2411,6 +2568,7 @@ public sealed class MechanicalFixerTests : IDisposable
         private readonly Queue<string> _diffOutputs;
         private readonly Queue<SandboxExecResult>? _diffResults;
         private readonly SandboxExecResult _formatResult;
+        private readonly Queue<SandboxExecResult>? _formatResults;
         private readonly SandboxExecResult? _markerResult;
         private readonly SandboxExecResult? _resetResult;
         private readonly SandboxExecResult? _applyResult;
@@ -2426,12 +2584,14 @@ public sealed class MechanicalFixerTests : IDisposable
             IEnumerable<string>? diffOutputs = null,
             SandboxExecResult? applyResult = null,
             IEnumerable<SandboxExecResult>? diffResults = null,
-            SandboxExecResult? patchWriteResult = null)
+            SandboxExecResult? patchWriteResult = null,
+            IEnumerable<SandboxExecResult>? formatResults = null)
         {
             _markerStdout = markerStdout;
             _statusOutputs = new Queue<string>(statusOutputs);
             _diffOutputs = new Queue<string>(diffOutputs ?? []);
             _formatResult = formatResult;
+            _formatResults = formatResults is null ? null : new Queue<SandboxExecResult>(formatResults);
             _markerResult = markerResult;
             _statusResults = statusResults is null ? null : new Queue<SandboxExecResult>(statusResults);
             _resetResult = resetResult;
@@ -2479,7 +2639,11 @@ public sealed class MechanicalFixerTests : IDisposable
                 return Task.FromResult(_applyResult ?? new SandboxExecResult(0, "", ""));
 
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "format")
+            {
+                if (_formatResults is { Count: > 0 })
+                    return Task.FromResult(_formatResults.Dequeue());
                 return Task.FromResult(_formatResult);
+            }
 
             return Task.FromResult(new SandboxExecResult(0, "", ""));
         }

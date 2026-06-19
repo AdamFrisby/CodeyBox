@@ -20,6 +20,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
     public string Name => FixerName;
     public string Kind => "shell";
+    public string CommitSubject => "chore: normalize (dotnet format)";
 
     public async Task<MechanicalFixerResult> ApplyAsync(
         ISandbox sandbox,
