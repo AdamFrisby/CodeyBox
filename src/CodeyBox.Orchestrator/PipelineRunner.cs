@@ -8324,12 +8324,40 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(stderr))
             return;
 
-        // Auditor stdout is a real CLI output stream. A matching login prompt
-        // benches the auditor agent immediately, including exit-0/missing-result
-        // runs where in-VM smoke is disabled or only probes binary presence.
-        await ThrowIfAuthRequiredOutputAsync(
-            item, project, run.Runner.Kind, $"audit:{run.Auditor.Name}", stdout, stderr,
-            ct: ct);
+        var phase = $"audit:{run.Auditor.Name}";
+        var detection = _authFailureClassifier.DetectDetailed(run.Runner.Kind, stderr, stdout);
+        if (detection is { Classification.Kind: AgentFailureKind.AuthRequired })
+        {
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                run.Runner.Kind,
+                phase,
+                detection.Classification,
+                throwOnMatch: true,
+                stdoutOnlyEvidence: detection.IsStdoutOnly,
+                ct: ct);
+        }
+
+        // LLM audit-agent execution failures report CLI diagnostics through
+        // AgentStdout/AgentStderr, not source-code review prose. Accept guarded
+        // stdout login fragments here so auth wins over a companion quota
+        // diagnostic and the agent is benched instead of quota-parked.
+        if (IsLlmAgentExecutionFailure(run.Result)
+            && AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout))
+        {
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                run.Runner.Kind,
+                phase,
+                new AgentFailureClassification(
+                    AgentFailureKind.AuthRequired,
+                    Reason: "auth/login prompt pattern matched in audit agent stdout"),
+                throwOnMatch: true,
+                stdoutOnlyEvidence: true,
+                ct: ct);
+        }
     }
 
     private async Task ThrowIfAuditorRunQuotaAsync(
