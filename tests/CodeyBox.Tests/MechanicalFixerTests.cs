@@ -374,6 +374,17 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public void DotnetFormatFixer_ToFixerArgvThrowsForNonDotnetFormatCommand()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            DotnetFormatMechanicalFixer.ToFixerArgv(["dotnet", "build", "--no-restore"]));
+
+        Assert.Contains("csharp:format-check", ex.Message);
+        Assert.Contains("dotnet format", ex.Message);
+        Assert.Contains("dotnet-format", ex.Message);
+    }
+
+    [Fact]
     public async Task DotnetFormatFixer_IncompatibleFormatAuditorSkipsWithoutThrowing()
     {
         var sandbox = new DotnetFormatSandbox(
@@ -510,6 +521,51 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Contains("skipped normalization", result.Summary);
         Assert.Contains("format failed", result.RawOutput);
         Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_CommandFailureRestoresPreExistingTrackedDiff()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string previousFixerPatch =
+            """
+            diff --git a/normalizer.txt b/normalizer.txt
+            index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..56a6051ca2b02b04ef92d5150c9ef600403cb1de 100644
+            --- a/normalizer.txt
+            +++ b/normalizer.txt
+            @@ -0,0 +1 @@
+            +1
+            """;
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [" M normalizer.txt\0"],
+            formatResult: new SandboxExecResult(2, "", "format failed"),
+            diffOutputs: [previousFixerPatch]);
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.False(result.Changed);
+        Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
+        Assert.Equal(previousFixerPatch, Assert.Single(sandbox.WrittenPatches));
+        Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual([
+            "git",
+            "-C",
+            "/work/repo",
+            "apply",
+            "--whitespace=nowarn",
+            "/tmp/codeybox-dotnet-format-before.patch",
+        ]));
     }
 
     [Fact]
@@ -890,13 +946,14 @@ public sealed class MechanicalFixerTests : IDisposable
     public async Task Pipeline_MechanicalSandboxUsesAuditToolProfileWithoutCredentialsAndReadOnlyRepo()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
         var recorder = new SpecRecordingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         var audit = new ProjectAudit
         {
             MaxIterations = 1,
             AuditTypes = ["scripted"],
-            MechanicalFixers = [NoOpMechanicalFixer.FixerName],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
         };
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -908,20 +965,28 @@ public sealed class MechanicalFixerTests : IDisposable
             {
                 AuditTool = "audit-tool-profile",
             },
-            mechanicalFixers: [new NoOpMechanicalFixer()]);
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
 
         var item = NewItem("feature/mechanical-spec");
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var spec = Assert.Single(recorder.Specs, s => s.TimingPhase == "mechanical-edit");
-        Assert.Equal("audit-tool-profile", spec.Network.ProfileName);
-        Assert.Empty(spec.Network.AllowedHosts);
-        Assert.DoesNotContain(CodeyBoxTrailers.PromptRevisionEnvVar, spec.Environment.Keys);
-        Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
-        var repoMount = Assert.Single(spec.Mounts, m => m.SandboxPath == "/repo");
-        Assert.True(repoMount.ReadOnly);
+        var specs = recorder.Specs.Where(s => s.TimingPhase == "mechanical-edit").ToArray();
+        Assert.Equal(2, specs.Length);
+        Assert.All(specs, spec =>
+        {
+            Assert.Equal("audit-tool-profile", spec.Network.ProfileName);
+            Assert.Empty(spec.Network.AllowedHosts);
+            Assert.DoesNotContain(CodeyBoxTrailers.PromptRevisionEnvVar, spec.Environment.Keys);
+            Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
+        });
+
+        var normalizationRepoMount = Assert.Single(specs[0].Mounts, m => m.SandboxPath == "/repo");
+        Assert.True(normalizationRepoMount.ReadOnly);
+
+        var importRepoMount = Assert.Single(specs[1].Mounts, m => m.SandboxPath == "/repo");
+        Assert.False(importRepoMount.ReadOnly);
     }
 
     [Fact]
@@ -994,12 +1059,30 @@ public sealed class MechanicalFixerTests : IDisposable
         ];
         yield return
         [
+            "stage",
+            new MechanicalCommandFailureRule(
+                1,
+                exec => IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "add", "-u"),
+                new SandboxExecResult(128, "", "add failed")),
+            "git -C /work add -u",
+        ];
+        yield return
+        [
             "staged-diff",
             new MechanicalCommandFailureRule(
                 1,
                 exec => IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"),
                 new SandboxExecResult(128, "", "diff failed")),
             "mechanical-edit could not inspect staged diff",
+        ];
+        yield return
+        [
+            "first-commit",
+            new MechanicalCommandFailureRule(
+                1,
+                exec => IsGitSubcommand(exec, "commit"),
+                new SandboxExecResult(1, "", "commit failed")),
+            "git -C /work commit -m",
         ];
         yield return
         [
@@ -1366,9 +1449,11 @@ public sealed class MechanicalFixerTests : IDisposable
         private readonly string _markerStdout;
         private readonly Queue<string> _statusOutputs;
         private readonly Queue<SandboxExecResult>? _statusResults;
+        private readonly Queue<string> _diffOutputs;
         private readonly SandboxExecResult _formatResult;
         private readonly SandboxExecResult? _markerResult;
         private readonly SandboxExecResult? _resetResult;
+        private readonly SandboxExecResult? _applyResult;
 
         public DotnetFormatSandbox(
             string markerStdout,
@@ -1376,22 +1461,33 @@ public sealed class MechanicalFixerTests : IDisposable
             SandboxExecResult formatResult,
             SandboxExecResult? markerResult = null,
             IEnumerable<SandboxExecResult>? statusResults = null,
-            SandboxExecResult? resetResult = null)
+            SandboxExecResult? resetResult = null,
+            IEnumerable<string>? diffOutputs = null,
+            SandboxExecResult? applyResult = null)
         {
             _markerStdout = markerStdout;
             _statusOutputs = new Queue<string>(statusOutputs);
+            _diffOutputs = new Queue<string>(diffOutputs ?? []);
             _formatResult = formatResult;
             _markerResult = markerResult;
             _statusResults = statusResults is null ? null : new Queue<SandboxExecResult>(statusResults);
             _resetResult = resetResult;
+            _applyResult = applyResult;
         }
 
         public string Id => "dotnet-format-fake";
         public List<SandboxExec> Execs { get; } = [];
+        public List<string> WrittenPatches { get; } = [];
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Execs.Add(exec);
+            if (exec.Argv.SequenceEqual(["sh", "-c", "cat > \"$0\"", "/tmp/codeybox-dotnet-format-before.patch"]))
+            {
+                WrittenPatches.Add(exec.Stdin ?? "");
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
             if (exec.Argv is ["sh", "-c", var script] && !script.Contains("command -v", StringComparison.Ordinal))
                 return Task.FromResult(_markerResult ?? new SandboxExecResult(0, _markerStdout, ""));
 
@@ -1403,8 +1499,17 @@ public sealed class MechanicalFixerTests : IDisposable
                 return Task.FromResult(new SandboxExecResult(0, stdout, ""));
             }
 
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "git" && exec.Argv.Contains("diff"))
+            {
+                var stdout = _diffOutputs.Count > 0 ? _diffOutputs.Dequeue() : "";
+                return Task.FromResult(new SandboxExecResult(0, stdout, ""));
+            }
+
             if (exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]))
                 return Task.FromResult(_resetResult ?? new SandboxExecResult(0, "", ""));
+
+            if (exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "apply", "--whitespace=nowarn", "/tmp/codeybox-dotnet-format-before.patch"]))
+                return Task.FromResult(_applyResult ?? new SandboxExecResult(0, "", ""));
 
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "format")
                 return Task.FromResult(_formatResult);

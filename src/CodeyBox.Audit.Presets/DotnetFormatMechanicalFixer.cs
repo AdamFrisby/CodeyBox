@@ -74,6 +74,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         }
 
         var before = await GitStatusAsync(sandbox, workingDirectory, ct);
+        var beforePatch = await GitTrackedDiffAsync(sandbox, workingDirectory, ct);
         var output = new StringBuilder();
         foreach (var projectDirectory in selectedDirectories)
         {
@@ -93,7 +94,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
             if (!result.Success)
             {
-                await DiscardTrackedChangesAsync(sandbox, workingDirectory, ct);
+                await RestorePreFixerTrackedChangesAsync(sandbox, workingDirectory, beforePatch, ct);
                 return new MechanicalFixerResult(
                     Changed: false,
                     Summary: $"dotnet format exited {result.ExitCode} in {projectDirectory}; skipped normalization so audit can report the project error",
@@ -102,7 +103,9 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         }
 
         var after = await GitStatusAsync(sandbox, workingDirectory, ct);
-        var changed = !string.Equals(before, after, StringComparison.Ordinal);
+        var afterPatch = await GitTrackedDiffAsync(sandbox, workingDirectory, ct);
+        var changed = !string.Equals(before, after, StringComparison.Ordinal) ||
+                      !string.Equals(beforePatch, afterPatch, StringComparison.Ordinal);
         return new MechanicalFixerResult(
             Changed: changed,
             Summary: changed
@@ -196,11 +199,29 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         return result.Stdout;
     }
 
-    private static async Task DiscardTrackedChangesAsync(
+    private static async Task<string> GitTrackedDiffAsync(
         ISandbox sandbox,
         string workingDirectory,
         CancellationToken ct)
     {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", workingDirectory, "diff", "--binary", "--full-index", "HEAD", "--"],
+        }, ct);
+        if (!result.Success)
+            throw new InvalidOperationException(
+                $"failed to read git diff for mechanical fixer: {ExceptionSafeOutput(result)}");
+        return result.Stdout;
+    }
+
+    private static async Task RestorePreFixerTrackedChangesAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string beforePatch,
+        CancellationToken ct)
+    {
+        // Reset the formatter's partial output, then reapply the tracked diff
+        // that existed before this fixer ran so earlier fixers keep their edits.
         var reset = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", workingDirectory, "reset", "--hard", "HEAD"],
@@ -209,6 +230,31 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         {
             throw new InvalidOperationException(
                 $"dotnet-format fixer could not discard partial changes after command failure: {ExceptionSafeOutput(reset)}");
+        }
+
+        if (string.IsNullOrWhiteSpace(beforePatch))
+            return;
+
+        const string patchPath = "/tmp/codeybox-dotnet-format-before.patch";
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$0\"", patchPath],
+            Stdin = beforePatch,
+        }, ct);
+        if (!write.Success)
+        {
+            throw new InvalidOperationException(
+                $"dotnet-format fixer could not materialize pre-existing changes after command failure: {ExceptionSafeOutput(write)}");
+        }
+
+        var apply = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", workingDirectory, "apply", "--whitespace=nowarn", patchPath],
+        }, ct);
+        if (!apply.Success)
+        {
+            throw new InvalidOperationException(
+                $"dotnet-format fixer could not restore pre-existing changes after command failure: {ExceptionSafeOutput(apply)}");
         }
     }
 

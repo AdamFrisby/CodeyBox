@@ -1,5 +1,6 @@
 using System.Reflection;
 using CodeyBox.Api;
+using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -30,6 +31,8 @@ public sealed class MechanicalFixerProgramWiringTests
             .Compose(project!);
 
         Assert.IsType<DotnetFormatMechanicalFixer>(Assert.Single(fixers));
+        Assert.IsType<DotnetFormatMechanicalFixerInputProvider>(
+            Assert.Single(factory.Services.GetServices<IMechanicalFixerInputProvider>()));
 
         var runner = factory.Services.GetRequiredService<PipelineRunner>();
         var wiredComposer = typeof(PipelineRunner)
@@ -38,6 +41,11 @@ public sealed class MechanicalFixerProgramWiringTests
         Assert.Same(
             factory.Services.GetRequiredService<ProjectMechanicalFixerComposer>(),
             wiredComposer);
+
+        var wiredInputProviders = (IReadOnlyList<IMechanicalFixerInputProvider>)typeof(PipelineRunner)
+            .GetField("_mechanicalFixerInputProviders", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(runner)!;
+        Assert.IsType<DotnetFormatMechanicalFixerInputProvider>(Assert.Single(wiredInputProviders));
     }
 
     private sealed class MechanicalFixerWiringFactory : WebApplicationFactory<Program>
