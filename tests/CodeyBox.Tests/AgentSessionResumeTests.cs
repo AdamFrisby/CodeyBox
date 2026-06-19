@@ -16,7 +16,7 @@ namespace CodeyBox.Tests;
 /// <c>--resume &lt;session-id&gt;</c> in the SAME sandbox — instead of failing
 /// the whole work item and re-driving from scratch.
 /// </summary>
-[Collection("Session resume options")]
+[Collection("GlobalSerilog")]
 public sealed class AgentSessionResumeTests : IDisposable
 {
     // Only the session-resume static is mutated here — leaving
@@ -1060,9 +1060,4 @@ public sealed class AgentSessionResumeTests : IDisposable
             return (T)(object)(int)l;
         return default;
     }
-}
-
-[CollectionDefinition("Session resume options", DisableParallelization = true)]
-public sealed class SessionResumeOptionsCollection
-{
 }
