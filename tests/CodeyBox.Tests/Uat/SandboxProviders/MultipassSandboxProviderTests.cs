@@ -1156,6 +1156,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
         Assert.Contains("while kill -0 \"-$codeybox_detached_pid\"", script);
         Assert.Contains("kill -KILL \"-$codeybox_detached_pid\"", script);
+        Assert.Contains("wait \"$codeybox_detached_pid\" 2>/dev/null", script);
         Assert.DoesNotContain("codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"", script);
         Assert.DoesNotContain("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN=\"$codeybox_output_exit_token\"", script);
         Assert.DoesNotContain("codeybox_exit_marker", script);

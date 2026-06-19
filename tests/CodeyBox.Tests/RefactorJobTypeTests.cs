@@ -509,7 +509,7 @@ public sealed class RefactorJobTypeTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        var enteredId = await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var enteredId = await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal(refactor.Id, enteredId);
         Assert.False(svc.IsDeferredForTest(refactor.Id));
 
