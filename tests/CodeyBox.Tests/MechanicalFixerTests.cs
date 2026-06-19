@@ -2299,6 +2299,44 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task Pipeline_MechanicalGitEmailConfigUsesPhaseCancellation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var provider = new MechanicalCommandInterceptingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            []);
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            sandboxProvider: provider,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-cancellable-email-config");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
+
+        var emailConfigInvocations = provider.MechanicalCommandInvocations
+            .Where(invocation => IsGitConfigKey(invocation.Argv, "user.email"))
+            .ToArray();
+
+        Assert.Equal([1, 2], emailConfigInvocations.Select(invocation => invocation.MechanicalSandboxOrdinal).ToArray());
+        Assert.All(emailConfigInvocations, invocation => Assert.True(invocation.CancellationCanBeCanceled));
+    }
+
+    [Fact]
     public async Task Pipeline_MechanicalPatchExportOutputLimitRejectsOversizedCommit()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2455,12 +2493,15 @@ public sealed class MechanicalFixerTests : IDisposable
            exec.Argv[3] == "checkout";
 
     private static bool IsGitConfigKey(SandboxExec exec, string key)
-        => exec.Argv.Count >= 6 &&
-           exec.Argv[0] == "git" &&
-           exec.Argv[1] == "-C" &&
-           exec.Argv[2] == SandboxConventions.WorkDir &&
-           exec.Argv[3] == "config" &&
-           exec.Argv[4] == key;
+        => IsGitConfigKey(exec.Argv, key);
+
+    private static bool IsGitConfigKey(IReadOnlyList<string> argv, string key)
+        => argv.Count >= 6 &&
+           argv[0] == "git" &&
+           argv[1] == "-C" &&
+           argv[2] == SandboxConventions.WorkDir &&
+           argv[3] == "config" &&
+           argv[4] == key;
 
     private static bool IsGitSubcommand(SandboxExec exec, string subcommand)
         => exec.Argv.Count >= 4 &&
@@ -3227,6 +3268,7 @@ public sealed class MechanicalFixerTests : IDisposable
 
         public string Name => _inner.Name;
         public List<IReadOnlyList<string>> MechanicalCommands { get; } = [];
+        public List<MechanicalCommandInvocation> MechanicalCommandInvocations { get; } = [];
 
         public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
@@ -3239,7 +3281,8 @@ public sealed class MechanicalFixerTests : IDisposable
                 sandbox,
                 ordinal,
                 _failures,
-                MechanicalCommands);
+                MechanicalCommands,
+                MechanicalCommandInvocations);
         }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
@@ -3255,17 +3298,20 @@ public sealed class MechanicalFixerTests : IDisposable
         private readonly int _mechanicalSandboxOrdinal;
         private readonly IReadOnlyList<MechanicalCommandFailureRule> _failures;
         private readonly List<IReadOnlyList<string>> _commands;
+        private readonly List<MechanicalCommandInvocation> _invocations;
 
         public MechanicalCommandInterceptingSandbox(
             ISandbox inner,
             int mechanicalSandboxOrdinal,
             IReadOnlyList<MechanicalCommandFailureRule> failures,
-            List<IReadOnlyList<string>> commands)
+            List<IReadOnlyList<string>> commands,
+            List<MechanicalCommandInvocation> invocations)
         {
             _inner = inner;
             _mechanicalSandboxOrdinal = mechanicalSandboxOrdinal;
             _failures = failures;
             _commands = commands;
+            _invocations = invocations;
         }
 
         public string Id => _inner.Id;
@@ -3273,7 +3319,12 @@ public sealed class MechanicalFixerTests : IDisposable
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            _commands.Add(exec.Argv.ToArray());
+            var argv = exec.Argv.ToArray();
+            _commands.Add(argv);
+            _invocations.Add(new MechanicalCommandInvocation(
+                _mechanicalSandboxOrdinal,
+                argv,
+                ct.CanBeCanceled));
             foreach (var failure in _failures)
             {
                 if (failure.TryMatch(_mechanicalSandboxOrdinal, exec, out var result))
@@ -3289,4 +3340,9 @@ public sealed class MechanicalFixerTests : IDisposable
         public ValueTask DisposeAsync()
             => _inner.DisposeAsync();
     }
+
+    private sealed record MechanicalCommandInvocation(
+        int MechanicalSandboxOrdinal,
+        IReadOnlyList<string> Argv,
+        bool CancellationCanBeCanceled);
 }

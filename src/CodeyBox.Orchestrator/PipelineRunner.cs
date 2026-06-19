@@ -5754,7 +5754,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
             await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
-            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await RunMasked(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
 
             var ctx = new MechanicalFixerContext(
                 item.Id,
@@ -5980,7 +5980,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 workBranch,
                 $"origin/{workBranch}");
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
-            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await RunMasked(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
 
             const string patchPath = "/tmp/codeybox-mechanical.patch";
             var write = await sandbox.ExecAsync(new SandboxExec
@@ -13522,7 +13522,12 @@ Original merge-phase failure (for context):
     // audit-tier logs.
     private static async Task RunMasked(ISandbox sandbox, params string[] argv)
     {
-        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv });
+        await RunMasked(sandbox, CancellationToken.None, argv);
+    }
+
+    private static async Task RunMasked(ISandbox sandbox, CancellationToken ct, params string[] argv)
+    {
+        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
         if (!r.Success)
         {
             var masked = argv.Length > 0
