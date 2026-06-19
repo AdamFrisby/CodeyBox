@@ -197,6 +197,32 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task ShellCommandAuditor_FailsWhenExecutionUnavailableEvenWithZeroExit()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "lint",
+            Argv = ["lint"],
+        });
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/lint\n", "")
+                : new SandboxExecResult(
+                    0,
+                    "",
+                    "sandbox process launcher unavailable",
+                    ExecutionUnavailable: true));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("command exited 0: lint", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("sandbox process launcher unavailable", finding.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CSharpFormatCheck_FailureReportsDotnetFormatViolations()
     {
         var auditor = new PresetCatalog()
