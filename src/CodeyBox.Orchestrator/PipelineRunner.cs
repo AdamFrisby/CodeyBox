@@ -1539,7 +1539,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
                 item.Id, ex.Agent.Value, ex.Phase, ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
         }
         catch (AgentUnavailableException ex)
         {
@@ -1640,6 +1640,33 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var exhaustedRunner = _agents.TryGet(ex.Agent, out var resolvedRunner)
                 ? resolvedRunner
                 : agentRunner;
+            var authDetection = _authFailureClassifier.DetectDetailed(
+                exhaustedRunner.Kind,
+                ex.LastResult.Stderr,
+                ex.LastResult.Stdout);
+            if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            {
+                await HandleAuthRequiredDetectionAsync(
+                    item,
+                    project,
+                    exhaustedRunner.Kind,
+                    "session-resume",
+                    authDetection.Classification,
+                    throwOnMatch: false,
+                    stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                    ct: CancellationToken.None);
+                _log.LogWarning(
+                    "Work item {Id} failed because agent {Agent} requires re-authentication after session resume exhaustion: {Reason}",
+                    item.Id, exhaustedRunner.Kind.Value, ex.Message);
+                await TransitionFailed(
+                    item,
+                    BuildAuthRequiredReason("session-resume", authDetection.Classification, authDetection.IsStdoutOnly),
+                    CancellationToken.None,
+                    project,
+                    failureKind: WorkItemFailureKinds.AuthRequired);
+                return;
+            }
+
             var transient = TryBuildTransientAgentFailure(
                 exhaustedRunner,
                 ex.LastResult,
@@ -4068,14 +4095,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (AgentAuthRequiredException authEx)
         {
-            // failureKind=infrastructure (not "other") so the dispatch retry
-            // policy and operator dashboards treat this as the broken-agent
-            // bench it is — matching the work/merge AgentAuthRequired catch
-            // around RunAsync.
             _log.LogWarning(
                 "Work item {Id} check-and-act paused because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
                 item.Id, authEx.Agent.Value, authEx.Phase, authEx.Message);
-            await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: "infrastructure");
+            await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
         }
         catch (Exception ex)
         {
@@ -5326,13 +5349,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (classification.Kind != AgentFailureKind.AuthRequired)
             return false;
 
-        var reasonDetail = classification.Reason ?? "login prompt matched";
-        if (stdoutOnlyEvidence)
-            reasonDetail = $"{reasonDetail}; stdout accepted as authoritative CLI output for this phase";
+        var reason = BuildAuthRequiredReason(phase, classification, stdoutOnlyEvidence);
 
-        var reason = SingleLineSummary(
-            $"auth required from agent output during {phase}: {reasonDetail}");
+        await PublishAuthRequiredSideEffectsAsync(item, project, agent, reason, ct);
 
+        if (throwOnMatch)
+            throw new AgentAuthRequiredException(agent, phase, reason);
+
+        return true;
+    }
+
+    private async Task PublishAuthRequiredSideEffectsAsync(
+        WorkItem? item,
+        Project project,
+        AgentKind agent,
+        string reason,
+        CancellationToken ct)
+    {
+        _ = ct;
         AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
 
         // AuthRequired is intentionally outside the smoke-gate taxonomy:
@@ -5359,11 +5393,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 },
             }, CancellationToken.None);
         }
+    }
 
-        if (throwOnMatch)
-            throw new AgentAuthRequiredException(agent, phase, reason);
+    private static string BuildAuthRequiredReason(
+        string phase,
+        AgentFailureClassification classification,
+        bool stdoutOnlyEvidence)
+    {
+        var reasonDetail = classification.Reason ?? "login prompt matched";
+        if (stdoutOnlyEvidence)
+            reasonDetail = $"{reasonDetail}; stdout accepted as authoritative CLI output for this phase";
 
-        return true;
+        return SingleLineSummary(
+            $"auth required from agent output during {phase}: {reasonDetail}");
     }
 
     private Task ThrowIfAuthRequiredOutputAsync(
@@ -9745,6 +9787,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (AgentSessionResumeExhaustedException ex)
             {
+                if (await TryConvertResumeExhaustionToAuthRequiredAsync(runner, trialItem, ex, attemptCt)
+                    .ConfigureAwait(false) is { } authEx)
+                {
+                    await FinalizeInvolvementAsync(involvementId, "failure:auth");
+                    throw authEx;
+                }
+
                 if (await TryConvertResumeExhaustionToQuotaAsync(runner, trialItem, ex, attemptCt)
                     .ConfigureAwait(false) is { } quotaEx)
                 {
@@ -9777,6 +9826,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     new KeyValuePair<string, object?>("phase", phase),
                     new KeyValuePair<string, object?>("outcome", outcome));
             }
+        }
+
+        async Task<AgentAuthRequiredException?> TryConvertResumeExhaustionToAuthRequiredAsync(
+            IAgentRunner runner,
+            WorkItem trialItem,
+            AgentSessionResumeExhaustedException resumeEx,
+            CancellationToken token)
+        {
+            var last = resumeEx.LastResult;
+            var detection = _authFailureClassifier.DetectDetailed(runner.Kind, last.Stderr, last.Stdout);
+            if (detection is not { Classification.Kind: AgentFailureKind.AuthRequired })
+                return null;
+
+            var reason = BuildAuthRequiredReason(phase, detection.Classification, detection.IsStdoutOnly);
+            await PublishAuthRequiredSideEffectsAsync(
+                trialItem,
+                project,
+                runner.Kind,
+                reason,
+                token).ConfigureAwait(false);
+
+            return new AgentAuthRequiredException(runner.Kind, phase, reason);
         }
 
         async Task<TerminalQuotaError?> TryConvertResumeExhaustionToQuotaAsync(
@@ -11564,26 +11635,26 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ct,
             sandbox,
             sandbox is null ? null : SandboxConventions.WorkDir);
+        var item = await _store.GetAsync(workItemId, ct);
+        var authDetection = _authFailureClassifier.DetectDetailed(
+            runner.Kind,
+            result.Error,
+            result.Output);
+        if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+        {
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                runner.Kind,
+                "merge-security-review",
+                authDetection.Classification,
+                throwOnMatch: true,
+                stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                ct: ct);
+        }
+
         if (!result.Success)
         {
-            var item = await _store.GetAsync(workItemId, ct);
-            var authDetection = _authFailureClassifier.DetectDetailed(
-                runner.Kind,
-                result.Error,
-                result.Output);
-            if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
-            {
-                await HandleAuthRequiredDetectionAsync(
-                    item,
-                    project,
-                    runner.Kind,
-                    "merge-security-review",
-                    authDetection.Classification,
-                    throwOnMatch: true,
-                    stdoutOnlyEvidence: authDetection.IsStdoutOnly,
-                    ct: ct);
-            }
-
             _log.LogWarning(
                 "Advisory merge security review agent {AgentKind} failed: {Summary} {Stderr}",
                 runner.Kind.Value,

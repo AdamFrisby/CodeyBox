@@ -773,7 +773,7 @@ public sealed class MergeConflictReworkTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.True(final!.State == WorkItemState.Failed,
             $"expected Failed, got {final.State}; error={final.LastError}; conflict prompts={tp.Agent.ConflictReworkPrompts.Count}");
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("conflict_rework", final.LastError);
         Assert.False(availability.GetAvailability(AgentKind.Claude).Available);

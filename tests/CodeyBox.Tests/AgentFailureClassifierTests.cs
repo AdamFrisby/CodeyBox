@@ -103,6 +103,27 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
+    [Fact]
+    public async Task LoginPromptTranscript_EmbeddedInTaskStdout_IsNotAuthRequired()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var stdout = $"""
+            I found a failing authentication flow. The captured CLI transcript was:
+            {transcript}
+            The fix is to detect this as an environment failure.
+            """;
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: stdout);
+        var detection = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: stdout);
+
+        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.Null(detection);
+    }
+
     [Theory]
     [InlineData("not logged into opencode; run `opencode auth login`")]
     [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]

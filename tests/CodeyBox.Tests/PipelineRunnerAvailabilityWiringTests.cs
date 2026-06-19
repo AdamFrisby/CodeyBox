@@ -441,7 +441,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -501,7 +501,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -535,7 +535,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Null(final.QuotaRetryFrom);
         Assert.Contains("auth required from agent output", final.LastError);
 
@@ -645,7 +645,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("merge", final.LastError);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -682,7 +682,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("merge", final.LastError);
 
@@ -726,7 +726,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("merge-resolver", final.LastError);
 
@@ -815,7 +815,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
         Assert.Equal(0, gate.ForceProbeCalls);
@@ -850,7 +850,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.DoesNotContain("Agent produced no changes to commit", final.LastError);
 
@@ -888,7 +888,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
         Assert.Equal(0, gate.ForceProbeCalls);
@@ -923,7 +923,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
 
@@ -957,7 +957,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
 
@@ -992,7 +992,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
         Assert.Equal(0, gate.ForceProbeCalls);
@@ -1028,7 +1028,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
         Assert.Equal(0, gate.ForceProbeCalls);
@@ -1064,7 +1064,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
         Assert.Equal(0, gate.ForceProbeCalls);
@@ -1101,7 +1101,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
         Assert.Equal(0, gate.ForceProbeCalls);

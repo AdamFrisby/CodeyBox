@@ -465,7 +465,7 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
         });
         var reviewAgent = new ScriptedAgent([]);
         reviewAgent.TextOnlyResults.Enqueue(new TextOnlyAgentResult(
-            false,
+            true,
             "agent exited 0",
             """
             Authentication required. Please visit the URL to log in:

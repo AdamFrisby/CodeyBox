@@ -274,6 +274,52 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task Codex_ExhaustsSessionResumeWithConfiguredAuthPattern_FailsAuthRequiredWithoutFallback()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var authClassifier = new AgentAuthFailureClassifier(
+            new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = [new AuthFailurePattern("configured resume auth required")],
+            });
+        using var fix = BuildPipeline(
+            seed,
+            authFailureClassifier: authClassifier,
+            availability: availability);
+
+        fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+            AgentKind.Codex,
+            maxResumeAttempts: 2,
+            new AgentResult(false, "agent exited 1", null, "configured resume auth required")));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("should-not-run.txt", "fallback must not run"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, finalItem.FailureKind);
+        Assert.Contains("auth required from agent output", finalItem.LastError);
+        Assert.Equal(0, fix.Claude.CallCount);
+        Assert.Empty(await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None));
+
+        var current = availability.GetAvailability(AgentKind.Codex);
+        Assert.False(current.Available);
+        Assert.Contains("auth required from agent output", current.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
     public async Task SoleMember_ExhaustsSessionResume_FailsCleanlyWithoutFallback()
     {
         // Companion guard for the nextMember == null path in
@@ -1894,7 +1940,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         AgentQuotaSnapshot? claudeQuotaSnapshot = null,
         bool singleMemberClass = false,
         IQuotaFailureStore? quotaFailures = null,
-        bool wireAuditProgress = false)
+        bool wireAuditProgress = false,
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAvailabilityRegistry? availability = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1993,7 +2041,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
                 ? null
                 : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            authFailureClassifier: authFailureClassifier,
+            availability: availability);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }

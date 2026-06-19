@@ -462,15 +462,20 @@ public static class AgentFailureClassifier
 
     public static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
     {
+        // Stdout is often model-controlled. Trust only a short output that is
+        // entirely the CLI login transcript, not task prose embedding one.
+        const int maxTrustedStdoutLoginTranscriptChars = 8192;
+        const int maxTrustedStdoutLoginTranscriptLines = 8;
+
         if (string.IsNullOrWhiteSpace(stdout))
             return false;
-        if (stdout.Length > 8192)
+        if (stdout.Length > maxTrustedStdoutLoginTranscriptChars)
             return false;
 
         var lines = stdout
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToArray();
-        if (lines.Length == 0 || lines.Length > 8)
+        if (lines.Length == 0 || lines.Length > maxTrustedStdoutLoginTranscriptLines)
             return false;
         if (lines.Any(static line => !IsTrustedStdoutLoginTranscriptLine(line)))
             return false;

@@ -190,7 +190,7 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolverAuthPromptWithoutFallback_FailsAsInfrastructure()
+    public async Task PickupRebaseResolverAuthPromptWithoutFallback_FailsAsAuthRequired()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -224,7 +224,7 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("rebase-resolver", final.LastError);
         Assert.Single(claudeAgent.AgenticConflictInvocations);

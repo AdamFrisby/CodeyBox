@@ -41,11 +41,6 @@ public sealed record AgentAuthFailureDetection(
 
 public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
 {
-    public static readonly IReadOnlyList<AuthFailurePattern> DefaultPatterns =
-        AgentFailureClassifier.AuthRequiredPatterns
-            .Select(static p => new AuthFailurePattern(p))
-            .ToArray();
-
     private readonly IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>> _additionalPatternsByAgent;
 
     public AgentAuthFailureClassifier()

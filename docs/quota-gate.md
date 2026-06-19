@@ -229,13 +229,16 @@ which would otherwise look like a benign "agent produced no changes" outcome.
 
 Built-in defaults cover prompts such as `Authentication required`, OAuth consent
 URLs, `Please visit the URL to log in`, `authentication timed out`, and common
-`run \`... login\`` hints. Add only the new substring under the affected agent:
+`run \`... login\`` hints. Configured patterns default to stderr-only because
+stdout can contain model-controlled task prose. Add `stream: "stdout"` only for
+tightly-formed CLI transcripts that are safe to trust when printed on stdout:
 
 ```json
 "CodeyBox": {
   "AuthFailurePatterns": {
     "antigravity": [
-      { "pattern": "complete browser sign-in before continuing" }
+      { "pattern": "complete browser sign-in before continuing", "stream": "stderr" },
+      { "pattern": "Waiting for browser sign-in confirmation", "stream": "stdout" }
     ]
   }
 }
@@ -243,8 +246,9 @@ URLs, `Please visit the URL to log in`, `authentication timed out`, and common
 
 When a runtime auth/login prompt is detected, the agent is benched via the
 availability registry, an `agent.smoke_failed` webhook with
-`category=persistent` is emitted, and the affected work item fails as
-infrastructure/auth rather than being treated as a normal no-diff run.
+`category=persistent` is emitted, and the affected work item fails with
+`failureKind=auth_required` rather than being treated as a normal no-diff run
+or retryable infrastructure failure.
 
 ## Operator Endpoint
 

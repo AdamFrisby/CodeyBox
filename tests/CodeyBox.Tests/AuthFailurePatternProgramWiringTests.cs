@@ -57,7 +57,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
 
         var final = await store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
 
         var availability = factory.Services.GetRequiredService<IAgentAvailabilityRegistry>()

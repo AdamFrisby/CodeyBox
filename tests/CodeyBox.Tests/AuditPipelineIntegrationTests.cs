@@ -261,7 +261,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("audit:security:llm-review", final.LastError);
 
@@ -312,7 +312,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("audit:security:llm-review", final.LastError);
 
@@ -364,7 +364,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("audit:security:llm-review", final.LastError);
 
@@ -418,7 +418,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Null(final.QuotaRetryFrom);
         Assert.Contains("auth required from agent output", final.LastError);
 

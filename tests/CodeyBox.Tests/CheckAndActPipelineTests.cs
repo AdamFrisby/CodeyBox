@@ -452,7 +452,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
 
         var final = await tp.Store.GetAsync(check.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("check", final.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
@@ -1141,7 +1141,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
 
         var finalFollowup = await tp.Store.GetAsync(followup.Id);
         Assert.Equal(WorkItemState.Failed, finalFollowup!.State);
-        Assert.Equal("infrastructure", finalFollowup.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, finalFollowup.FailureKind);
         Assert.Contains("auth required from agent output", finalFollowup.LastError);
         Assert.Contains("post-act-recheck", finalFollowup.LastError);
         Assert.Contains("stdout accepted as authoritative CLI output", finalFollowup.LastError);
