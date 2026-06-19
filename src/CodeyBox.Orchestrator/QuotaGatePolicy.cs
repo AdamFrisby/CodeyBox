@@ -38,6 +38,12 @@ public sealed class QuotaGatePolicy
         DateTimeOffset nowUtc) =>
         ComputeEffectiveFloorPct(_options, agent, resetAt, nowUtc);
 
+    public double ComputeEffectiveFloorPct(
+        AgentKind agent,
+        EffectiveQuota quota,
+        DateTimeOffset nowUtc) =>
+        ComputeEffectiveFloorPct(_options, agent, quota, nowUtc);
+
     public double ResolveWindowFloorPct(AgentKind agent, string windowName) =>
         ResolveWindowFloorPct(_options, agent, windowName);
 
@@ -56,7 +62,7 @@ public sealed class QuotaGatePolicy
                 observedFailureReason ?? "recent observed quota failure");
         }
 
-        var floor = ComputeFloorPct(options, member, quota.ResetAt, nowUtc);
+        var floor = ComputeFloorPct(options, member, quota, nowUtc);
         var availablePct = quota.AvailablePct;
         if (availablePct >= floor)
         {
@@ -96,9 +102,36 @@ public sealed class QuotaGatePolicy
         QuotaRouterOptions options,
         AgentKind agent,
         DateTimeOffset? resetAt,
+        DateTimeOffset nowUtc) =>
+        ComputeRampedFloor(ResolveFloorSettings(options, agent), resetAt, nowUtc);
+
+    /// <summary>
+    /// Window-aware overload: when <paramref name="quota"/> surfaces per-window
+    /// readings, the ramp is keyed off the window whose reset is the latest
+    /// (the long/weekly window), not the overall binding reset. Without this
+    /// selection an agent whose binding window is shorter than
+    /// <see cref="QuotaRouterOptions.RampWindow"/> (e.g. Claude's 5h cap
+    /// against the global 7d ramp) would always see <c>untilReset &lt;&lt;
+    /// RampWindow</c>, collapsing the linear ramp to <see cref="QuotaRouterOptions.EndFloorPct"/>
+    /// every cycle and defeating the early-week oversight reservation
+    /// <see cref="QuotaRouterOptions.StartFloorPct"/> exists for.
+    /// </summary>
+    public static double ComputeEffectiveFloorPct(
+        QuotaRouterOptions options,
+        AgentKind agent,
+        EffectiveQuota? quota,
         DateTimeOffset nowUtc)
     {
         var settings = ResolveFloorSettings(options, agent);
+        var rampReset = SelectRampResetAt(quota);
+        return ComputeRampedFloor(settings, rampReset, nowUtc);
+    }
+
+    private static double ComputeRampedFloor(
+        AgentFloorSettings settings,
+        DateTimeOffset? resetAt,
+        DateTimeOffset nowUtc)
+    {
         if (resetAt is not { } reset) return settings.MinQuotaPct;
         if (settings.RampWindow <= TimeSpan.Zero) return settings.MinQuotaPct;
 
@@ -112,6 +145,31 @@ public sealed class QuotaGatePolicy
         var lo = Math.Min(settings.StartFloorPct, settings.EndFloorPct);
         var hi = Math.Max(settings.StartFloorPct, settings.EndFloorPct);
         return Math.Clamp(floor, lo, hi);
+    }
+
+    /// <summary>
+    /// Pick the <see cref="WindowQuota.ResetAt"/> that the ramp should key
+    /// off. When the snapshot surfaces multiple windows (e.g. Claude's
+    /// <c>five_hour</c> + <c>seven_day</c>), the latest reset is the long
+    /// window — which is the one whose nominal length corresponds to
+    /// <see cref="QuotaRouterOptions.RampWindow"/>. Falls back to the
+    /// overall <see cref="EffectiveQuota.ResetAt"/> when no per-window
+    /// readings are available (preserves codex-shape behaviour, where the
+    /// binding window already matches the ramp horizon and overall ResetAt
+    /// is already the weekly).
+    /// </summary>
+    private static DateTimeOffset? SelectRampResetAt(EffectiveQuota? quota)
+    {
+        if (quota is null) return null;
+        if (quota.Windows is not { Count: > 0 } windows) return quota.ResetAt;
+
+        DateTimeOffset? latest = null;
+        foreach (var window in windows)
+        {
+            if (window.ResetAt is not { } reset) continue;
+            if (latest is null || reset > latest.Value) latest = reset;
+        }
+        return latest ?? quota.ResetAt;
     }
 
     public static double ResolveWindowFloorPct(
@@ -189,10 +247,10 @@ public sealed class QuotaGatePolicy
     private static double ComputeFloorPct(
         QuotaRouterOptions options,
         AgentMembership member,
-        DateTimeOffset? resetAt,
+        EffectiveQuota quota,
         DateTimeOffset nowUtc) =>
         member.Billing == AgentBilling.Subscription
-            ? ComputeEffectiveFloorPct(options, member.Agent, resetAt, nowUtc)
+            ? ComputeEffectiveFloorPct(options, member.Agent, quota, nowUtc)
             : options.MinQuotaPct;
 
     private static AgentFloorSettings ResolveFloorSettings(QuotaRouterOptions options, AgentKind agent)

@@ -1840,7 +1840,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return false;
 
         var floor = member.Billing == AgentBilling.Subscription
-            ? ComputeEffectiveFloorPct(member.Agent, quota.ResetAt, nowUtc)
+            ? _quotaGatePolicy.ComputeEffectiveFloorPct(member.Agent, quota, nowUtc)
             : _opts.MinQuotaPct;
         if (availablePct < floor)
             return false;
