@@ -83,10 +83,13 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
                 SandboxProfileFlavor.Headless);
 
         var baselineHash = HashFor(opts1.ExecutableProvisions[0]);
+        File.WriteAllText(hostBin, "agy-v1-replaced");
+        var hostContentHash = HashFor(opts1.ExecutableProvisions[0]);
         var hostPathHash = HashFor(opts1.ExecutableProvisions[0] with { HostSourcePath = otherHostBin });
         var vmDestHash = HashFor(opts1.ExecutableProvisions[0] with { VmDestPath = "/opt/agy" });
         var symlinkHash = HashFor(opts1.ExecutableProvisions[0] with { VmSymlinks = new[] { "/opt/bin/agy" } });
 
+        Assert.NotEqual(baselineHash, hostContentHash);
         Assert.NotEqual(baselineHash, hostPathHash);
         Assert.NotEqual(baselineHash, vmDestHash);
         Assert.NotEqual(baselineHash, symlinkHash);
@@ -345,18 +348,18 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         Assert.Equal(hostBin, transferCall![2]);
         Assert.Contains("/home/ubuntu/codeybox-exe-", transferCall[3]);
 
-        // 2. The install script must mkdir the parent and use `install -m 0755 -o root`
-        //    to land the binary deterministically.
+        // 2. The install script must create home parents as ubuntu-owned and use
+        //    `install -m 0755 -o root` to land the binary deterministically.
         var installScript = flatCalls.FirstOrDefault(c =>
             c.Contains("exec") && c.Contains("install -m 0755 -o root -g root"));
         Assert.NotNull(installScript);
-        Assert.Contains("mkdir -p '/home/ubuntu/.local/bin'", installScript);
-        Assert.Contains("'/home/ubuntu/.local/bin/ag y'\\''s'", installScript);
+        Assert.Contains("install -d -m 0755 -o ubuntu -g ubuntu '/home/ubuntu/.local/bin'", installScript);
+        Assert.Contains("'/home/ubuntu/.local/bin/ag y'\"'\"'s'", installScript);
 
         // 3. Requested symlinks are created, including paths that need shell quoting.
-        Assert.Contains("ln -sf '/home/ubuntu/.local/bin/ag y'\\''s' '/usr/local/bin/ag y'\\''s'", installScript);
+        Assert.Contains("ln -sf '/home/ubuntu/.local/bin/ag y'\"'\"'s' '/usr/local/bin/ag y'\"'\"'s'", installScript);
         Assert.Contains("mkdir -p '/opt/codeybox tools'", installScript);
-        Assert.Contains("ln -sf '/home/ubuntu/.local/bin/ag y'\\''s' '/opt/codeybox tools/ag y'\\''s'", installScript);
+        Assert.Contains("ln -sf '/home/ubuntu/.local/bin/ag y'\"'\"'s' '/opt/codeybox tools/ag y'\"'\"'s'", installScript);
 
         // 4. Staging copy is removed from /home/ubuntu so it does not leak into clones.
         Assert.Contains("rm -f '/home/ubuntu/codeybox-exe-", installScript);

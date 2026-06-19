@@ -1364,16 +1364,15 @@ git push origin HEAD:{refName}";
             includeGraphicalInstall: false,
             baselineInstallCommands: opts.ExtraRuncmd);
         var seedsStr = string.Join(";", opts.PackageCacheSeeds.Select(s => $"{s.HostSourcePath}->{s.VmDestPath}({s.MaxSizeMB})"));
-        var execsStr = string.Join(";", opts.ExecutableProvisions.Select(e =>
-            $"{e.HostSourcePath}->{e.VmDestPath}[{string.Join(",", e.VmSymlinks)}]"));
-        // Build a canonical, version-prefixed string. The 'v3' prefix lets
+        var execsStr = string.Join(";", opts.ExecutableProvisions.Select(RenderExecutableProvisionForHash));
+        // Build a canonical, version-prefixed string. The 'v4' prefix lets
         // future schema changes invalidate every existing baseline without
-        // ambiguity (bumped from v2 when ExecutableProvisions was added).
+        // ambiguity (bumped from v3 when executable content fingerprints were added).
         // Field separator is '|' which cannot appear in profile names or
         // flavor enum strings.
         var canon = string.Join("|", new[]
         {
-            "v3",
+            "v4",
             profileName,
             flavor.ToString(),
             cloudInit,
@@ -1385,6 +1384,31 @@ git push origin HEAD:{refName}";
         });
         var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canon));
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
+    }
+
+    private static string RenderExecutableProvisionForHash(ExecutableProvisionOptions exe)
+    {
+        var hostPath = ResolvePath(exe.HostSourcePath);
+        return string.Join("\u001f", new[]
+        {
+            exe.HostSourcePath,
+            hostPath,
+            FingerprintExecutableProvisionHostFile(hostPath),
+            exe.VmDestPath,
+            string.Join("\u001e", exe.VmSymlinks),
+        });
+    }
+
+    private static string FingerprintExecutableProvisionHostFile(string hostPath)
+    {
+        if (string.IsNullOrWhiteSpace(hostPath))
+            return "empty-path";
+        if (!File.Exists(hostPath))
+            return "missing";
+
+        using var stream = File.OpenRead(hostPath);
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        return "sha256:" + Convert.ToHexString(sha.ComputeHash(stream)).ToLowerInvariant();
     }
 
     private static string RenderBaselineVerificationCommandForHash(MultipassBaselineVerificationCommand cmd) =>
@@ -1742,11 +1766,11 @@ git push origin HEAD:{refName}";
             // syscall sequence and is portable across the targets we ship to.
             var script = new System.Text.StringBuilder();
             script.Append("set -euo pipefail; ");
-            script.Append("mkdir -p ").Append(ShellQuote(destDir!)).Append("; ");
+            AppendCreateDirectoryCommand(script, destDir!);
             script.Append("install -m 0755 -o root -g root ")
-                .Append(ShellQuote(vmStagePath))
+                .Append(ShellSingleQuote(vmStagePath))
                 .Append(' ')
-                .Append(ShellQuote(exe.VmDestPath))
+                .Append(ShellSingleQuote(exe.VmDestPath))
                 .Append("; ");
             if (exe.VmSymlinks is not null)
             {
@@ -1758,15 +1782,15 @@ git push origin HEAD:{refName}";
                             $"ExecutableProvisions[{i}] (label '{label}') VmSymlink must be absolute, got '{link}'.");
                     var linkDir = Path.GetDirectoryName(link);
                     if (!string.IsNullOrEmpty(linkDir))
-                        script.Append("mkdir -p ").Append(ShellQuote(linkDir!)).Append("; ");
+                        AppendCreateDirectoryCommand(script, linkDir!);
                     script.Append("ln -sf ")
-                        .Append(ShellQuote(exe.VmDestPath))
+                        .Append(ShellSingleQuote(exe.VmDestPath))
                         .Append(' ')
-                        .Append(ShellQuote(link))
+                        .Append(ShellSingleQuote(link))
                         .Append("; ");
                 }
             }
-            script.Append("rm -f ").Append(ShellQuote(vmStagePath));
+            script.Append("rm -f ").Append(ShellSingleQuote(vmStagePath));
 
             var execRun = await RunAsync(
                 opts,
@@ -1781,8 +1805,27 @@ git push origin HEAD:{refName}";
         }
     }
 
-    private static string ShellQuote(string s) =>
-        "'" + s.Replace("'", @"'\''", StringComparison.Ordinal) + "'";
+    private static void AppendCreateDirectoryCommand(StringBuilder script, string vmDirectory)
+    {
+        if (IsUnderDefaultUbuntuHome(vmDirectory))
+        {
+            script.Append("install -d -m 0755 -o ubuntu -g ubuntu ")
+                .Append(ShellSingleQuote(vmDirectory))
+                .Append("; ");
+            return;
+        }
+
+        script.Append("mkdir -p ")
+            .Append(ShellSingleQuote(vmDirectory))
+            .Append("; ");
+    }
+
+    private static bool IsUnderDefaultUbuntuHome(string vmPath)
+    {
+        var normalized = vmPath.Replace('\\', '/').TrimEnd('/');
+        return string.Equals(normalized, "/home/ubuntu", StringComparison.Ordinal)
+            || normalized.StartsWith("/home/ubuntu/", StringComparison.Ordinal);
+    }
 
     private async Task SeedPackageCachesAsync(
         MultipassSandboxOptions opts,
@@ -4911,9 +4954,9 @@ public sealed record PackageCacheSeedOptions
 /// <para>
 /// Provisioning uses <c>multipass transfer</c> for the bytes followed by an
 /// in-VM <c>install -m 0755 -o root -g root</c>, so the executable bit and
-/// ownership are set deterministically — neither <c>File.Copy</c> on the host
-/// staging side nor <c>multipass transfer</c> documents preservation of the
-/// executable bit, and depending on it has produced silent breakage.
+/// file ownership are set deterministically — neither <c>File.Copy</c> on the
+/// host staging side nor <c>multipass transfer</c> documents preservation of
+/// the executable bit, and depending on it has produced silent breakage.
 /// </para>
 /// </summary>
 public sealed record ExecutableProvisionOptions
@@ -4923,8 +4966,10 @@ public sealed record ExecutableProvisionOptions
 
     /// <summary>
     /// Absolute VM path where the executable must land (e.g.
-    /// <c>/home/ubuntu/.local/bin/agy</c>). The parent directory is created
-    /// with <c>mkdir -p</c> if it does not already exist.
+    /// <c>/home/ubuntu/.local/bin/agy</c>). The parent directory is created if it
+    /// does not already exist; parents below <c>/home/ubuntu</c> are kept owned by
+    /// the unprivileged <c>ubuntu</c> user even though the executable file itself
+    /// is root-owned.
     /// </summary>
     public string VmDestPath { get; init; } = string.Empty;
 
