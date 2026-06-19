@@ -40,7 +40,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         {
             return new MechanicalFixerResult(
                 Changed: false,
-                Summary: $"{FormatCheckAuditorName} does not invoke 'dotnet format'; {FixerName} skipped");
+                Summary: $"{FormatCheckAuditorName} does not expose a writable dotnet-format command; {FixerName} skipped");
         }
 
         var discovery = await DiscoverProjectDirectoriesAsync(
@@ -95,7 +95,14 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
             AppendBoundedOutput(output, CombinedOutput(result));
 
-            if (result.ExitCode != 0 || result.ExecutionUnavailable)
+            if (result.ExecutionUnavailable)
+            {
+                await RestorePreFixerTrackedChangesAsync(sandbox, workingDirectory, beforePatch, ct);
+                throw new InvalidOperationException(
+                    $"dotnet-format fixer could not execute formatter command in {projectDirectory}: {ExceptionSafeOutput(result)}");
+            }
+
+            if (result.ExitCode != 0)
             {
                 await RestorePreFixerTrackedChangesAsync(sandbox, workingDirectory, beforePatch, ct);
                 return new MechanicalFixerResult(
@@ -123,40 +130,241 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             return argv;
 
         throw new InvalidOperationException(
-            $"{FormatCheckAuditorName} must invoke 'dotnet format' for the {FixerName} fixer to reuse it.");
+            $"{FormatCheckAuditorName} must invoke 'dotnet format' directly or expose removable dotnet-format verification flags for the {FixerName} fixer to reuse it.");
     }
 
     public static bool TryToFixerArgv(
         IReadOnlyList<string> formatCheckArgv,
         out IReadOnlyList<string> fixerArgv)
     {
-        if (formatCheckArgv.Count < 2 ||
-            !formatCheckArgv[0].Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
-            !formatCheckArgv[1].Equals("format", StringComparison.OrdinalIgnoreCase))
+        if (formatCheckArgv.Count == 0)
         {
             fixerArgv = [];
             return false;
         }
 
+        if (IsLiteralDotnetFormatCommand(formatCheckArgv))
+        {
+            fixerArgv = StripReadOnlyFormatArgs(formatCheckArgv, out _);
+            return true;
+        }
+
+        if (IsDotnetCommand(formatCheckArgv))
+        {
+            fixerArgv = [];
+            return false;
+        }
+
+        if (TryToShellWrapperFixerArgv(formatCheckArgv, out fixerArgv))
+            return true;
+
+        var argv = StripReadOnlyFormatArgs(formatCheckArgv, out var removedReadOnlyFlag);
+        if (removedReadOnlyFlag)
+        {
+            fixerArgv = argv;
+            return true;
+        }
+
+        fixerArgv = [];
+        return false;
+    }
+
+    private static IReadOnlyList<string> StripReadOnlyFormatArgs(
+        IReadOnlyList<string> formatCheckArgv,
+        out bool removedReadOnlyFlag)
+    {
         var argv = new List<string>(formatCheckArgv.Count);
+        removedReadOnlyFlag = false;
         for (var i = 0; i < formatCheckArgv.Count; i++)
         {
             var arg = formatCheckArgv[i];
             if (arg.Equals("--verify-no-changes", StringComparison.OrdinalIgnoreCase))
+            {
+                removedReadOnlyFlag = true;
                 continue;
+            }
+
             if (arg.Equals("--report", StringComparison.OrdinalIgnoreCase))
             {
+                removedReadOnlyFlag = true;
                 i++;
                 continue;
             }
+
             if (arg.StartsWith("--report=", StringComparison.OrdinalIgnoreCase))
+            {
+                removedReadOnlyFlag = true;
                 continue;
+            }
 
             argv.Add(arg);
         }
 
+        return argv;
+    }
+
+    private static bool TryToShellWrapperFixerArgv(
+        IReadOnlyList<string> formatCheckArgv,
+        out IReadOnlyList<string> fixerArgv)
+    {
+        fixerArgv = [];
+        if (!TryGetShellScriptIndex(formatCheckArgv, out var scriptIndex))
+            return false;
+
+        var script = formatCheckArgv[scriptIndex];
+        var fixerScript = StripReadOnlyFormatTokensFromShellScript(script, out var removedReadOnlyFlag);
+        if (!removedReadOnlyFlag && !ContainsDotnetFormatInvocation(script))
+            return false;
+
+        var argv = formatCheckArgv.ToArray();
+        argv[scriptIndex] = fixerScript;
         fixerArgv = argv;
         return true;
+    }
+
+    private static bool TryGetShellScriptIndex(IReadOnlyList<string> argv, out int scriptIndex)
+    {
+        scriptIndex = -1;
+        if (argv.Count < 3)
+            return false;
+
+        var shellName = Path.GetFileName(argv[0]);
+        if (!shellName.Equals("sh", StringComparison.Ordinal) &&
+            !shellName.Equals("bash", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!argv[1].StartsWith("-", StringComparison.Ordinal) ||
+            argv[1].IndexOf('c') < 0)
+        {
+            return false;
+        }
+
+        scriptIndex = 2;
+        return true;
+    }
+
+    private static bool IsLiteralDotnetFormatCommand(IReadOnlyList<string> argv)
+        => argv.Count >= 2 &&
+           argv[0].Equals("dotnet", StringComparison.OrdinalIgnoreCase) &&
+           argv[1].Equals("format", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDotnetCommand(IReadOnlyList<string> argv)
+        => argv[0].Equals("dotnet", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ContainsDotnetFormatInvocation(string script)
+        => script.Contains("dotnet format", StringComparison.OrdinalIgnoreCase);
+
+    private static string StripReadOnlyFormatTokensFromShellScript(string script, out bool removedReadOnlyFlag)
+    {
+        var tokens = ShellTokenSpans(script);
+        var remove = new bool[tokens.Count];
+        removedReadOnlyFlag = false;
+        for (var i = 0; i < tokens.Count; i++)
+        {
+            var token = script[tokens[i].Start..tokens[i].End];
+            if (token.Equals("--verify-no-changes", StringComparison.OrdinalIgnoreCase))
+            {
+                remove[i] = true;
+                removedReadOnlyFlag = true;
+                continue;
+            }
+
+            if (token.Equals("--report", StringComparison.OrdinalIgnoreCase))
+            {
+                remove[i] = true;
+                removedReadOnlyFlag = true;
+                if (i + 1 < tokens.Count)
+                    remove[++i] = true;
+                continue;
+            }
+
+            if (token.StartsWith("--report=", StringComparison.OrdinalIgnoreCase))
+            {
+                remove[i] = true;
+                removedReadOnlyFlag = true;
+            }
+        }
+
+        if (!removedReadOnlyFlag)
+            return script;
+
+        var builder = new StringBuilder(script.Length);
+        var cursor = 0;
+        for (var i = 0; i < tokens.Count; i++)
+        {
+            if (!remove[i])
+                continue;
+
+            builder.Append(script, cursor, tokens[i].Start - cursor);
+            cursor = tokens[i].End;
+        }
+
+        builder.Append(script, cursor, script.Length - cursor);
+        return builder.ToString();
+    }
+
+    private static List<(int Start, int End)> ShellTokenSpans(string script)
+    {
+        var spans = new List<(int Start, int End)>();
+        var tokenStart = -1;
+        var inSingleQuote = false;
+        var inDoubleQuote = false;
+        var escaped = false;
+
+        for (var i = 0; i < script.Length; i++)
+        {
+            var c = script[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\' && !inSingleQuote)
+            {
+                if (tokenStart < 0)
+                    tokenStart = i;
+                escaped = true;
+                continue;
+            }
+
+            if (c == '\'' && !inDoubleQuote)
+            {
+                if (tokenStart < 0)
+                    tokenStart = i;
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+
+            if (c == '"' && !inSingleQuote)
+            {
+                if (tokenStart < 0)
+                    tokenStart = i;
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+
+            if (!inSingleQuote && !inDoubleQuote && char.IsWhiteSpace(c))
+            {
+                if (tokenStart >= 0)
+                {
+                    spans.Add((tokenStart, i));
+                    tokenStart = -1;
+                }
+
+                continue;
+            }
+
+            if (tokenStart < 0)
+                tokenStart = i;
+        }
+
+        if (tokenStart >= 0)
+            spans.Add((tokenStart, script.Length));
+
+        return spans;
     }
 
     private static async Task<ProjectDirectoryDiscovery> DiscoverProjectDirectoriesAsync(

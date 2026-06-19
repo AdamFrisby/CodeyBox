@@ -375,6 +375,25 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public void DotnetFormatFixer_ReusesShellWrapperScriptWithoutReadOnlyFlags()
+    {
+        var argv = DotnetFormatMechanicalFixer.ToFixerArgv(
+            [
+                "bash",
+                "-lc",
+                "export DOTNET_ROOT=/opt/dotnet; dotnet format --verify-no-changes --report /tmp/report --verbosity diagnostic",
+            ]);
+
+        Assert.Equal("bash", argv[0]);
+        Assert.Equal("-lc", argv[1]);
+        Assert.Contains("dotnet format", argv[2]);
+        Assert.Contains("--verbosity diagnostic", argv[2]);
+        Assert.DoesNotContain("--verify-no-changes", argv[2]);
+        Assert.DoesNotContain("--report", argv[2]);
+        Assert.DoesNotContain("/tmp/report", argv[2]);
+    }
+
+    [Fact]
     public void DotnetFormatFixer_ToFixerArgvThrowsForNonDotnetFormatCommand()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
@@ -386,11 +405,11 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
-    public async Task DotnetFormatFixer_IncompatibleFormatAuditorSkipsWithoutThrowing()
+    public async Task DotnetFormatFixer_ReusesExecutableWrapperCommandWithoutReadOnlyFlags()
     {
         var sandbox = new DotnetFormatSandbox(
             markerStdout: ".\n",
-            statusOutputs: [],
+            statusOutputs: ["", " M Program.cs\0"],
             formatResult: new SandboxExecResult(0, "formatted", ""));
 
         var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
@@ -402,11 +421,13 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                [new DotnetFormatMechanicalFixerInput(["./format-wrapper", "--verify-no-changes"], ".")]));
+                [new DotnetFormatMechanicalFixerInput(
+                    ["./format-wrapper", "--verify-no-changes", "--report", "/tmp/report", "--sdk", "10.0.109"],
+                    ".")]));
 
-        Assert.False(result.Changed);
-        Assert.Contains("dotnet-format skipped", result.Summary);
-        Assert.Empty(sandbox.Execs);
+        Assert.True(result.Changed);
+        var formatExec = Assert.Single(sandbox.Execs, e => e.Argv.Count > 0 && e.Argv[0] == "./format-wrapper");
+        Assert.Equal(["./format-wrapper", "--sdk", "10.0.109"], formatExec.Argv);
     }
 
     [Fact]
@@ -592,7 +613,7 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
-    public async Task DotnetFormatFixer_CommandExecutionUnavailableRollsBackAndLetsAuditReport()
+    public async Task DotnetFormatFixer_CommandExecutionUnavailableThrowsInfrastructureFailure()
     {
         var auditor = new PresetCatalog()
             .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
@@ -606,20 +627,20 @@ public sealed class MechanicalFixerTests : IDisposable
                 "sandbox provider unavailable",
                 ExecutionUnavailable: true));
 
-        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
-            sandbox,
-            "/work/repo",
-            new MechanicalFixerContext(
-                WorkItemId.New(),
-                "feature/test",
-                "main",
-                1,
-                "project",
-                InputsFor(auditor)));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new DotnetFormatMechanicalFixer().ApplyAsync(
+                sandbox,
+                "/work/repo",
+                new MechanicalFixerContext(
+                    WorkItemId.New(),
+                    "feature/test",
+                    "main",
+                    1,
+                    "project",
+                    InputsFor(auditor))));
 
-        Assert.False(result.Changed);
-        Assert.Contains("skipped normalization", result.Summary);
-        Assert.Contains("sandbox provider unavailable", result.RawOutput);
+        Assert.Contains("could not execute formatter command", ex.Message);
+        Assert.Contains("sandbox provider unavailable", ex.Message);
         Assert.Contains(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
         Assert.Single(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
     }
@@ -2573,6 +2594,7 @@ public sealed class MechanicalFixerTests : IDisposable
         private readonly SandboxExecResult? _resetResult;
         private readonly SandboxExecResult? _applyResult;
         private readonly SandboxExecResult? _patchWriteResult;
+        private bool _markerDiscoveryReturned;
 
         public DotnetFormatSandbox(
             string markerStdout,
@@ -2613,8 +2635,13 @@ public sealed class MechanicalFixerTests : IDisposable
                 return Task.FromResult(_patchWriteResult ?? new SandboxExecResult(0, "", ""));
             }
 
-            if (exec.Argv is ["sh", "-c", var script] && !script.Contains("command -v", StringComparison.Ordinal))
+            if (exec.Argv is ["sh", "-c", var script] &&
+                !script.Contains("command -v", StringComparison.Ordinal) &&
+                !_markerDiscoveryReturned)
+            {
+                _markerDiscoveryReturned = true;
                 return Task.FromResult(_markerResult ?? new SandboxExecResult(0, _markerStdout, ""));
+            }
 
             if (exec.Argv.Count >= 3 && exec.Argv[0] == "git" && exec.Argv.Contains("status"))
             {
@@ -2645,7 +2672,9 @@ public sealed class MechanicalFixerTests : IDisposable
                 return Task.FromResult(_formatResult);
             }
 
-            return Task.FromResult(new SandboxExecResult(0, "", ""));
+            if (_formatResults is { Count: > 0 })
+                return Task.FromResult(_formatResults.Dequeue());
+            return Task.FromResult(_formatResult);
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
