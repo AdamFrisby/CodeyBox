@@ -7151,6 +7151,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             environmentOverrides: FakeSudoPathEnvironment());
         await WaitForFileAsync(exitFile, TimeSpan.FromSeconds(6));
         await WaitForExitCodeAsync(session, 2, TimeSpan.FromSeconds(6));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
