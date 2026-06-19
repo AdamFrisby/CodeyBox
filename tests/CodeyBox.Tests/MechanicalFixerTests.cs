@@ -409,6 +409,23 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public void DotnetFormatInputProvider_RejectsLookalikeAuditors()
+    {
+        var provider = new DotnetFormatMechanicalFixerInputProvider();
+
+        Assert.Empty(provider.BuildInputs(
+            [CreateLanguagePresetAuditor("csharp", new NamedShellAuditor("csharp:build", ["dotnet", "build"]))]));
+        Assert.Empty(provider.BuildInputs(
+            [new NamedAuditor("csharp:format-check")]));
+        Assert.Empty(provider.BuildInputs(
+            [new NamedShellAuditor("csharp:format-check", ["dotnet", "format", "--verify-no-changes"])]));
+        Assert.Empty(provider.BuildInputs(
+            [CreateLanguagePresetAuditor("python", new NamedShellAuditor("csharp:format-check", ["dotnet", "format", "--verify-no-changes"]))]));
+        Assert.Empty(provider.BuildInputs(
+            [CreateLanguagePresetAuditor("csharp", new NamedAuditor("csharp:format-check"))]));
+    }
+
+    [Fact]
     public async Task DotnetFormatFixer_UsesActiveCSharpFormatAuditorAndDetectsTrackedChanges()
     {
         var auditor = new PresetCatalog()
@@ -493,6 +510,56 @@ public sealed class MechanicalFixerTests : IDisposable
 
         Assert.False(result.Changed);
         Assert.Equal("dotnet format made no changes", result.Summary);
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_DetectsFormatterChangesWhenGitStatusIsStable()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string stableStatus = " M src/App/Program.cs\0";
+        const string beforePatch =
+            """
+            diff --git a/src/App/Program.cs b/src/App/Program.cs
+            index 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644
+            --- a/src/App/Program.cs
+            +++ b/src/App/Program.cs
+            @@ -1 +1 @@
+            -Console.WriteLine(1);
+            +Console.WriteLine( 1 );
+            """;
+        const string afterPatch =
+            """
+            diff --git a/src/App/Program.cs b/src/App/Program.cs
+            index 1111111111111111111111111111111111111111..3333333333333333333333333333333333333333 100644
+            --- a/src/App/Program.cs
+            +++ b/src/App/Program.cs
+            @@ -1 +1 @@
+            -Console.WriteLine(1);
+            +Console.WriteLine(1);
+            """;
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: "src/App\n",
+            statusOutputs: [stableStatus, stableStatus],
+            formatResult: new SandboxExecResult(0, "formatted", ""),
+            diffOutputs: [beforePatch, afterPatch]);
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.True(result.Changed);
+        Assert.Contains("normalized 1 C# project directory", result.Summary);
+        Assert.Equal(2, sandbox.Execs.Count(e =>
+            e.Argv.SequenceEqual(["git", "-C", "/work/repo", "diff", "--binary", "--full-index", "HEAD", "--"])));
     }
 
     [Fact]
@@ -1320,8 +1387,92 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Single(tp.Agent.WorkPlan);
     }
 
+    [Theory]
+    [InlineData("normalizer-create", 1)]
+    [InlineData("import-create", 2)]
+    public async Task Pipeline_MechanicalSandboxCreationFailurePathsAreInfrastructureFailures(
+        string branchSuffix,
+        int mechanicalSandboxOrdinal)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var provider = new MechanicalSandboxCreationFailureProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            mechanicalSandboxOrdinal,
+            "mechanical sandbox create failed");
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            sandboxProvider: provider,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem($"feature/mechanical-owned-failure-{branchSuffix}");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("mechanical sandbox create failed", final.LastError);
+        Assert.True(provider.Fired);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize",
+            "--format=%s",
+            item.WorkBranch!);
+        Assert.DoesNotContain("chore: normalize", mechanicalLog);
+    }
+
     public static IEnumerable<object[]> PipelineMechanicalGitFailureCases()
     {
+        yield return
+        [
+            "normalizer-clone",
+            new MechanicalCommandFailureRule(
+                1,
+                IsGitClone,
+                new SandboxExecResult(128, "", "clone failed")),
+            "git clone",
+        ];
+        yield return
+        [
+            "normalizer-checkout",
+            new MechanicalCommandFailureRule(
+                1,
+                IsGitCheckout,
+                new SandboxExecResult(128, "", "checkout failed")),
+            "git -C /work checkout",
+        ];
+        yield return
+        [
+            "normalizer-user-name",
+            new MechanicalCommandFailureRule(
+                1,
+                exec => IsGitConfigKey(exec, "user.name"),
+                new SandboxExecResult(128, "", "config name failed")),
+            "git -C /work config user.name",
+        ];
+        yield return
+        [
+            "normalizer-user-email",
+            new MechanicalCommandFailureRule(
+                1,
+                exec => IsGitConfigKey(exec, "user.email"),
+                new SandboxExecResult(128, "", "config email failed")),
+            "git -C /work config user.email ***",
+        ];
         yield return
         [
             "status",
@@ -1366,6 +1517,42 @@ public sealed class MechanicalFixerTests : IDisposable
                 exec => IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "diff", "--binary", "HEAD^", "HEAD"),
                 new SandboxExecResult(0, "", "")),
             "mechanical-edit could not export formatter commit diff",
+        ];
+        yield return
+        [
+            "import-clone",
+            new MechanicalCommandFailureRule(
+                2,
+                IsGitClone,
+                new SandboxExecResult(128, "", "clone failed")),
+            "git clone",
+        ];
+        yield return
+        [
+            "import-checkout",
+            new MechanicalCommandFailureRule(
+                2,
+                IsGitCheckout,
+                new SandboxExecResult(128, "", "checkout failed")),
+            "git -C /work checkout",
+        ];
+        yield return
+        [
+            "import-user-name",
+            new MechanicalCommandFailureRule(
+                2,
+                exec => IsGitConfigKey(exec, "user.name"),
+                new SandboxExecResult(128, "", "config name failed")),
+            "git -C /work config user.name",
+        ];
+        yield return
+        [
+            "import-user-email",
+            new MechanicalCommandFailureRule(
+                2,
+                exec => IsGitConfigKey(exec, "user.email"),
+                new SandboxExecResult(128, "", "config email failed")),
+            "git -C /work config user.email ***",
         ];
         yield return
         [
@@ -1534,6 +1721,26 @@ public sealed class MechanicalFixerTests : IDisposable
            exec.Argv[0] == "git" &&
            exec.Argv.Skip(1).SequenceEqual(args);
 
+    private static bool IsGitClone(SandboxExec exec)
+        => exec.Argv.Count >= 2 &&
+           exec.Argv[0] == "git" &&
+           exec.Argv[1] == "clone";
+
+    private static bool IsGitCheckout(SandboxExec exec)
+        => exec.Argv.Count >= 4 &&
+           exec.Argv[0] == "git" &&
+           exec.Argv[1] == "-C" &&
+           exec.Argv[2] == SandboxConventions.WorkDir &&
+           exec.Argv[3] == "checkout";
+
+    private static bool IsGitConfigKey(SandboxExec exec, string key)
+        => exec.Argv.Count >= 6 &&
+           exec.Argv[0] == "git" &&
+           exec.Argv[1] == "-C" &&
+           exec.Argv[2] == SandboxConventions.WorkDir &&
+           exec.Argv[3] == "config" &&
+           exec.Argv[4] == key;
+
     private static bool IsGitSubcommand(SandboxExec exec, string subcommand)
         => exec.Argv.Count >= 4 &&
            exec.Argv[0] == "git" &&
@@ -1559,6 +1766,27 @@ public sealed class MechanicalFixerTests : IDisposable
     private static IReadOnlyList<IMechanicalFixerInput> InputsFor(IAuditor auditor)
     {
         return new DotnetFormatMechanicalFixerInputProvider().BuildInputs([auditor]);
+    }
+
+    private static IAuditor CreateLanguagePresetAuditor(string language, IAuditor inner)
+    {
+        var type = typeof(DotnetFormatMechanicalFixerInputProvider).Assembly.GetType(
+            "CodeyBox.Audit.Presets.Presets.LanguagePresetAuditor",
+            throwOnError: true)!;
+        var ctor = type.GetConstructor(
+            System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic,
+            binder: null,
+            types:
+            [
+                typeof(string),
+                typeof(string),
+                typeof(string),
+                typeof(IAuditor),
+            ],
+            modifiers: null)!;
+        return (IAuditor)ctor.Invoke([language, "project marker", "printf '.\n'", inner]);
     }
 
     private sealed class AppendingMechanicalFixer : IMechanicalFixer
@@ -1721,6 +1949,59 @@ public sealed class MechanicalFixerTests : IDisposable
             _ = context;
             _ = ct;
             throw new OperationCanceledException("mechanical fixer cancelled");
+        }
+    }
+
+    private sealed class NamedAuditor : IAuditor
+    {
+        public NamedAuditor(string name, string kind = "tool")
+        {
+            Name = name;
+            Kind = kind;
+        }
+
+        public string Name { get; }
+        public string Kind { get; }
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(new AuditResult(true, []));
+        }
+    }
+
+    private sealed class NamedShellAuditor : IAuditor, IShellAuditorArgvProvider
+    {
+        public NamedShellAuditor(string name, IReadOnlyList<string> argv)
+        {
+            Name = name;
+            Argv = argv;
+        }
+
+        public string Name { get; }
+        public string Kind => "shell";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public IReadOnlyList<string> Argv { get; }
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(new AuditResult(true, []));
         }
     }
 
@@ -1943,6 +2224,48 @@ public sealed class MechanicalFixerTests : IDisposable
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
             Specs.Add(spec);
+            return _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class MechanicalSandboxCreationFailureProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        private readonly int _failureOrdinal;
+        private readonly string _message;
+        private int _mechanicalSandboxCount;
+
+        public MechanicalSandboxCreationFailureProvider(
+            ISandboxProvider inner,
+            int failureOrdinal,
+            string message)
+        {
+            _inner = inner;
+            _failureOrdinal = failureOrdinal;
+            _message = message;
+        }
+
+        public string Name => _inner.Name;
+        public bool Fired { get; private set; }
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            if (string.Equals(spec.TimingPhase, "mechanical-edit", StringComparison.Ordinal))
+            {
+                var ordinal = Interlocked.Increment(ref _mechanicalSandboxCount);
+                if (ordinal == _failureOrdinal)
+                {
+                    Fired = true;
+                    throw new InvalidOperationException(_message);
+                }
+            }
+
             return _inner.CreateAsync(spec, ct);
         }
 
