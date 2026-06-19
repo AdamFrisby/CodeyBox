@@ -162,6 +162,28 @@ public sealed class NotificationConditionsTests
     }
 
     [Fact]
+    public async Task AgentAuthRequired_FalseWhenRegisteredAgentIsBenchedForNonAuthSource()
+    {
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        availability.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(
+                false,
+                "host smoke failed [persistent]: auth required: stale diagnostic wording",
+                TimeSpan.Zero,
+                SmokeFailureCategory.Persistent),
+            SmokeExclusionSource.HostSmoke);
+        var condition = new AgentAuthRequiredCondition(
+            availability,
+            new StubAgentRegistry(AgentKind.Codex));
+
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public void AgentAuthRequiredNotificationBuilder_Build_IncludesBenchedAgent()
     {
         var availability = new AgentAvailabilityRegistry(

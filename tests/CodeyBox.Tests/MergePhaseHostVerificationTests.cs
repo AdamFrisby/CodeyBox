@@ -443,6 +443,83 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             conflictsResolvedByConstrainedResolver: true);
     }
 
+    [Fact]
+    public async Task AdvisoryAgentAuthPrompt_BenchesAgentAndRaisesAuthRequired()
+    {
+        var (gitHost, repoId) = await CreateConflictingRepoAsync();
+        var preMergeMain = await gitHost.ResolveCommitAsync(repoId, "main");
+        var workTip = await gitHost.ResolveCommitAsync(repoId, "work");
+        var hostMerge = await gitHost.ComputeMergeTreeAsync(repoId, preMergeMain, workTip);
+        var resolved = await CommitResolvedEvalInsideHunkAsync(gitHost, repoId);
+        var stateDb = Path.Combine(_workspace, "auth-review.db");
+        using var workStore = new SqliteWorkItemStore(stateDb);
+        using var auditStore = new SqliteAuditReportStore(stateDb);
+        var workItemId = WorkItemId.New();
+        await workStore.CreateAsync(new WorkItem
+        {
+            Id = workItemId,
+            ProjectId = new ProjectId("test-project"),
+            Title = "security advisory auth",
+            Prompt = "merge",
+            WorkBranch = "work",
+        });
+        var reviewAgent = new ScriptedAgent([]);
+        reviewAgent.TextOnlyResults.Enqueue(new TextOnlyAgentResult(
+            false,
+            "agent exited 0",
+            """
+            Authentication required. Please visit the URL to log in:
+            https://accounts.google.com/o/oauth2/auth?client_id=redacted
+            Waiting for authentication (timeout 30s)...
+            Error: authentication timed out.
+            """,
+            null));
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = "unused",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit(),
+        };
+        var webhooks = new CapturingWebhookDispatcher();
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var pipeline = CreateVerifier(
+            gitHost,
+            workStore,
+            auditStore,
+            reviewAgent,
+            project,
+            webhooks,
+            availability);
+
+        var ex = await Assert.ThrowsAsync<AgentAuthRequiredException>(() =>
+            pipeline.VerifyMergeResultAgainstHostAsync(
+                workItemId,
+                repoId,
+                preMergeMain,
+                workTip,
+                resolved,
+                hostMerge,
+                bufferLines: 5,
+                ct: CancellationToken.None,
+                project: project,
+                securityReviewRunner: reviewAgent,
+                conflictsResolvedByConstrainedResolver: true));
+
+        Assert.Contains("merge-security-review", ex.Message);
+        var current = availability.GetAvailability(AgentKind.Claude);
+        Assert.False(current.Available);
+        Assert.Contains("auth required from agent output", current.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
     private async Task<(LocalGitHost GitHost, string RepoId)> CreateConflictingRepoAsync()
     {
         var seed = Path.Combine(_workspace, "seed");
@@ -488,7 +565,9 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
         IWorkItemStore workStore,
         IAuditReportStore auditStore,
         ScriptedAgent? agent = null,
-        Project? project = null)
+        Project? project = null,
+        IWebhookDispatcher? webhooks = null,
+        AgentAvailabilityRegistry? availability = null)
     {
         agent ??= new ScriptedAgent([]);
         project ??= new Project
@@ -499,7 +578,7 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             DefaultAgent = AgentKind.Claude,
             Audit = new ProjectAudit(),
         };
-        var webhooks = new NullWebhookDispatcher();
+        webhooks ??= new NullWebhookDispatcher();
         var projects = new InMemoryProjectRepository(project);
         var terminalTransitions = TestSupport.CreateTerminalTransition(workStore, webhooks, projects);
 
@@ -517,6 +596,8 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
             auditReports: auditStore,
+            availability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);

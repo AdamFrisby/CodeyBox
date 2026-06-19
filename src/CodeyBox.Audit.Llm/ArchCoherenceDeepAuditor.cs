@@ -53,9 +53,12 @@ public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
                 Severity: AuditSeverity.Error,
                 Title: "architecture coherence audit agent failed",
                 Description: agentResult.Stderr ?? agentResult.Summary)],
-                RawOutput: agentResult.Stdout);
+                RawOutput: agentResult.Stdout,
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
 
-        return await ReadVerdictAsync(sandbox, agentResult.Stdout, ct);
+        return await ReadVerdictAsync(sandbox, agentResult, ct);
     }
 
     private string BuildPrompt(string workingDirectory) => $$"""
@@ -91,7 +94,7 @@ public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
         Do not include text outside the JSON object. After writing the file, exit.
         """;
 
-    private async Task<AuditResult> ReadVerdictAsync(ISandbox sandbox, string? rawOutput, CancellationToken ct)
+    private async Task<AuditResult> ReadVerdictAsync(ISandbox sandbox, AgentResult agentResult, CancellationToken ct)
     {
         var read = await sandbox.ExecAsync(new SandboxExec { Argv = ["cat", ResultFile] }, ct);
         if (!read.Success || string.IsNullOrWhiteSpace(read.Stdout))
@@ -99,8 +102,11 @@ public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
                 Title: $"agent did not write {ResultFile}",
-                Description: rawOutput ?? "")],
-                RawOutput: rawOutput);
+                Description: agentResult.Stdout ?? "")],
+                RawOutput: agentResult.Stdout,
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
 
         try
         {
@@ -112,7 +118,13 @@ public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
                 Title: f.Title ?? "(no title)",
                 Description: f.Description ?? "",
                 Location: f.Location)).ToList();
-            return new AuditResult(parsed.Passed, findings, RawOutput: rawOutput);
+            return new AuditResult(
+                parsed.Passed,
+                findings,
+                RawOutput: agentResult.Stdout,
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
         }
         catch (JsonException ex)
         {
@@ -121,7 +133,10 @@ public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
                 Severity: AuditSeverity.Error,
                 Title: "arch coherence audit produced invalid JSON",
                 Description: $"{ex.Message}\n---\n{Truncate(read.Stdout, 1024)}")],
-                RawOutput: rawOutput);
+                RawOutput: agentResult.Stdout,
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
         }
     }
 

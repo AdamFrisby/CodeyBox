@@ -9,15 +9,14 @@ namespace CodeyBox.Notifications;
 public sealed class AgentAuthRequiredCondition : ICondition, IDisposable
 {
     public const string Condition = "agent_auth_required";
-    private const string AuthRequiredReasonMarker = "auth required:";
 
-    private readonly IAgentAvailabilityRegistry _availability;
+    private readonly IAgentAuthRequiredAvailabilityReader _availability;
     private readonly IAgentRegistry _agents;
 
     public string Id => Condition;
 
     public AgentAuthRequiredCondition(
-        IAgentAvailabilityRegistry availability,
+        IAgentAuthRequiredAvailabilityReader availability,
         IAgentRegistry agents)
     {
         _availability = availability;
@@ -31,23 +30,19 @@ public sealed class AgentAuthRequiredCondition : ICondition, IDisposable
     }
 
     internal static IReadOnlyList<(AgentKind Agent, string Reason)> GetAuthRequiredAgents(
-        IAgentAvailabilityRegistry availability,
+        IAgentAuthRequiredAvailabilityReader availability,
         IAgentRegistry agents)
     {
         var matches = new List<(AgentKind Agent, string Reason)>();
         foreach (var agent in agents.Available)
         {
-            var current = availability.GetAvailability(agent);
-            if (IsAuthRequired(current))
-                matches.Add((agent, current.Reason!));
+            var current = availability.GetAuthRequiredAvailability(agent);
+            if (current.AuthRequired)
+                matches.Add((agent, current.Reason ?? "auth required"));
         }
 
         return matches;
     }
-
-    internal static bool IsAuthRequired(AgentAvailability availability) =>
-        !availability.Available
-        && availability.Reason?.Contains(AuthRequiredReasonMarker, StringComparison.OrdinalIgnoreCase) == true;
 
     public void Dispose() { }
 }
@@ -57,13 +52,13 @@ public sealed class AgentAuthRequiredCondition : ICondition, IDisposable
 /// </summary>
 public sealed class AgentAuthRequiredNotificationBuilder : INotificationBuilder, IConditionAwareBuilder
 {
-    private readonly IAgentAvailabilityRegistry _availability;
+    private readonly IAgentAuthRequiredAvailabilityReader _availability;
     private readonly IAgentRegistry _agents;
 
     public string ConditionId => AgentAuthRequiredCondition.Condition;
 
     public AgentAuthRequiredNotificationBuilder(
-        IAgentAvailabilityRegistry availability,
+        IAgentAuthRequiredAvailabilityReader availability,
         IAgentRegistry agents)
     {
         _availability = availability;

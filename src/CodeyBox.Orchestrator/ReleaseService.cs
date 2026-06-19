@@ -41,6 +41,8 @@ public sealed class ReleaseService
     private readonly ILogger<ReleaseService> _log;
     private readonly IAgentStreamStore? _agentStreams;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
+    private readonly IAgentAuthAvailabilityRegistry? _authAvailability;
 
     // Hot-reloadable deep-audit concurrency gate — resolved from IOptionsMonitor on every
     // acquire/remediate call so config edits take effect without restart.
@@ -67,7 +69,9 @@ public sealed class ReleaseService
         Func<int> deepAuditMaxConcurrency,
         Func<TimeSpan> deepAuditRemediationItemTimeout,
         IAgentStreamStore? agentStreams = null,
-        AgentPromptPreprocessorChain? promptPreprocessors = null)
+        AgentPromptPreprocessorChain? promptPreprocessors = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         _releases = releases;
         _workItems = workItems;
@@ -88,6 +92,8 @@ public sealed class ReleaseService
         _deepAuditRemediationItemTimeout = deepAuditRemediationItemTimeout;
         _agentStreams = agentStreams;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
+        _authAvailability = authAvailability;
     }
 
     private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)
@@ -415,7 +421,16 @@ public sealed class ReleaseService
         {
             _log.LogInformation("Release {Id}: deep audit iteration {Iter}/{Max}", release.Id, iteration, maxIterations);
 
-            var findings = await RunDeepAuditIterationAsync(release, project, auditors, iteration, ct);
+            IReadOnlyList<AuditFinding> findings;
+            try
+            {
+                findings = await RunDeepAuditIterationAsync(release, project, auditors, iteration, ct);
+            }
+            catch (AgentAuthRequiredException ex)
+            {
+                await FailReleaseAsync(release, ex.Message, ct);
+                return;
+            }
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
 
             var current = await _releases.GetAsync(release.Id, ct) ?? release;
@@ -610,9 +625,17 @@ public sealed class ReleaseService
                 try
                 {
                     var result = await auditor.RunAsync(sandbox, "/work/repo", ctx, ct);
+                    await ThrowIfDeepAuditAuthRequiredAsync(
+                        release,
+                        project,
+                        auditor,
+                        runner,
+                        needsCreds,
+                        result,
+                        ct);
                     allFindings.AddRange(result.Findings);
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is not AgentAuthRequiredException)
                 {
                     _log.LogWarning(ex, "Deep auditor {Name} threw for release {Id}", auditor.Name, release.Id);
                 }
@@ -625,6 +648,57 @@ public sealed class ReleaseService
         }
 
         return allFindings;
+    }
+
+    private async Task ThrowIfDeepAuditAuthRequiredAsync(
+        Release release,
+        Project project,
+        IDeepAuditor auditor,
+        IAgentRunner? runner,
+        bool needsCreds,
+        AuditResult result,
+        CancellationToken ct)
+    {
+        if (!needsCreds || runner is null)
+            return;
+
+        var stdout = !string.IsNullOrEmpty(result.AgentStdout)
+            ? result.AgentStdout
+            : result.RawOutput;
+        var stderr = result.AgentStderr;
+        if (string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(stderr))
+            return;
+
+        var detection = _authFailureClassifier.DetectDetailed(runner.Kind, stderr, stdout);
+        if (detection is null || detection.Classification.Kind != AgentFailureKind.AuthRequired)
+            return;
+
+        var phase = $"release-deep-audit:{auditor.Name}";
+        var reasonDetail = detection.Classification.Reason ?? "login prompt matched";
+        if (detection.IsStdoutOnly)
+            reasonDetail = $"{reasonDetail}; stdout accepted as authoritative CLI output for this phase";
+        var reason = SingleLineSummary(
+            $"auth required from agent output during {phase} for release {release.Id}: {reasonDetail}");
+
+        AuditLog.AgentSmokeFailed(runner.Kind, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
+        var transition = _authAvailability?.MarkAuthRequired(runner.Kind, reason);
+        if (transition is null || transition.SourceChanged)
+        {
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.smoke_failed",
+                Project = project,
+                Release = release,
+                Details = new AgentSmokeFailedDetails
+                {
+                    AgentKind = runner.Kind.Value,
+                    Reason = reason,
+                    Category = SmokeFailureCategory.Persistent,
+                },
+            }, CancellationToken.None);
+        }
+
+        throw new AgentAuthRequiredException(runner.Kind, phase, reason);
     }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
@@ -689,6 +763,17 @@ public sealed class ReleaseService
     private static bool ToolAuditNetworkAllowlistUnsupported(string providerName) =>
         providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase) ||
         providerName.Equals("process", StringComparison.OrdinalIgnoreCase);
+
+    private static string SingleLineSummary(string value)
+    {
+        var normalized = value
+            .Replace("\r", " ", StringComparison.Ordinal)
+            .Replace("\n", " ", StringComparison.Ordinal)
+            .Replace("\t", " ", StringComparison.Ordinal);
+        while (normalized.Contains("  ", StringComparison.Ordinal))
+            normalized = normalized.Replace("  ", " ", StringComparison.Ordinal);
+        return normalized.Length <= 500 ? normalized : normalized[..500] + "...";
+    }
 
     private IAgentRunner WrapPromptPreprocessedRunner(
         IAgentRunner runner,

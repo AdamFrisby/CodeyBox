@@ -115,8 +115,8 @@ public static class AgentFailureClassifier
     /// were intentionally rejected after the auditor flagged them as too
     /// broad. The orchestrator-side <c>AgentAuthFailureClassifier</c> applies
     /// operator-supplied <c>CodeyBox:AuthFailurePatterns</c> to stderr/stdout
-    /// and the pipeline benches matching no-diff CLI output before it can be
-    /// mistaken for a benign empty change.</para>
+    /// with stream scoping; stdout additions should remain tightly formed CLI
+    /// transcript signatures.</para>
     /// </summary>
     public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]
     {
@@ -278,10 +278,15 @@ public static class AgentFailureClassifier
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
-        if (ContainsAuthRequiredPatternInStderr(stderr) || ContainsAuthRequiredPatternInStdout(stdout))
+        var stderrAuthError = ContainsAuthErrorPattern(stderr);
+        if (ContainsAuthRequiredPatternInStderr(stderr)
+            || ContainsAuthRequiredPatternInStdout(stdout)
+            || stderrAuthError && ContainsAuthRequiredFragmentInStdout(stdout))
+        {
             return new AgentFailureClassification(AgentFailureKind.AuthRequired, Reason: "auth-required pattern matched");
+        }
 
-        if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
+        if (stderrAuthError || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
         // The transient list is intentionally conservative; apply it to the
@@ -442,13 +447,13 @@ public static class AgentFailureClassifier
     public static bool ContainsAuthErrorPattern(string? text) =>
         ContainsAny(text, AuthPatterns);
 
-    public static bool ContainsAuthRequiredPatternInStdout(string? stdout)
+    public static bool ContainsAuthRequiredPatternInStdout(string? stdout) =>
+        ContainsTrustedStdoutLoginTranscript(stdout);
+
+    public static bool ContainsAuthRequiredFragmentInStdout(string? stdout)
     {
         if (string.IsNullOrWhiteSpace(stdout))
             return false;
-
-        if (ContainsTrustedStdoutLoginTranscript(stdout))
-            return true;
 
         return stdout
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

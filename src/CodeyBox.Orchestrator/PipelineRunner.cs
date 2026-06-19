@@ -5289,7 +5289,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         };
 
     private async Task<bool> HandleAuthRequiredOutputAsync(
-        WorkItem item,
+        WorkItem? item,
         Project project,
         AgentKind agent,
         string phase,
@@ -5314,7 +5314,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     private async Task<bool> HandleAuthRequiredDetectionAsync(
-        WorkItem item,
+        WorkItem? item,
         Project project,
         AgentKind agent,
         string phase,
@@ -11438,7 +11438,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 sandbox,
                 ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException and not AgentAuthRequiredException)
         {
             _log.LogWarning(ex, "Advisory merge security review failed for work item {WorkItemId}", workItemId);
             return;
@@ -11538,6 +11538,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
             sandbox is null ? null : SandboxConventions.WorkDir);
         if (!result.Success)
         {
+            var item = await _store.GetAsync(workItemId, ct);
+            var authDetection = _authFailureClassifier.DetectDetailed(
+                runner.Kind,
+                result.Error,
+                result.Output);
+            if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            {
+                await HandleAuthRequiredDetectionAsync(
+                    item,
+                    project,
+                    runner.Kind,
+                    "merge-security-review",
+                    authDetection.Classification,
+                    throwOnMatch: true,
+                    stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                    ct: ct);
+            }
+
             _log.LogWarning(
                 "Advisory merge security review agent {AgentKind} failed: {Summary} {Stderr}",
                 runner.Kind.Value,

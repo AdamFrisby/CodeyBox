@@ -1049,6 +1049,30 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task ForceProbeAsync_ProvisioningDeferred_ReturnsNullWithoutBenching()
+    {
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "clone",
+            errorClass: "multipass-instance-lock-contention",
+            detail: "clone retry exhausted",
+            recheckIn: TimeSpan.FromSeconds(30));
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""))
+        {
+            ThrowOnCreate = deferred,
+        };
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, WorkTarget, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
     public async Task ProbeAllAsync_NoConfiguredProfile_SkipsWithoutProvisioning()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));

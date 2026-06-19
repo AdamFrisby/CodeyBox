@@ -52,7 +52,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry, IAgentAuthRequiredAvailabilityReader
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -82,6 +82,19 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     public AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind)
     {
         return GetAvailability(kind, IsNonSmokeExclusion);
+    }
+
+    public AgentAuthRequiredAvailability GetAuthRequiredAvailability(AgentKind kind)
+    {
+        if (!_entries.TryGetValue(kind, out var entry))
+            return new AgentAuthRequiredAvailability(false, null);
+
+        lock (entry.Sync)
+        {
+            return entry.Exclusions.TryGetValue(SmokeExclusionSource.AuthRequired, out var reason)
+                ? new AgentAuthRequiredAvailability(true, reason)
+                : new AgentAuthRequiredAvailability(false, null);
+        }
     }
 
     private AgentAvailability GetAvailability(AgentKind kind, Func<SmokeExclusionSource, bool> include)
@@ -276,7 +289,11 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                 _log.LogWarning(
                     "Agent {Agent} excluded by no-changes circuit breaker after {Count} consecutive distinct work items produced no changes — operator action required (reset via /admin/agent/{Agent}/reset after diagnosing)",
                     kind.Value, entry.ConsecutiveNoChanges, kind.Value);
-                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+                return new AvailabilityTransition(
+                    wasExcluded,
+                    true,
+                    entry.CombinedReason(),
+                    SourceChanged: true);
             }
 
             return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());

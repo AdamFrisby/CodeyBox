@@ -1587,6 +1587,8 @@ builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentAuthAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentAuthRequiredAvailabilityReader>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
@@ -1850,7 +1852,7 @@ builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
 builder.Services.AddSingleton<ICondition>(sp => new AgentAuthRequiredCondition(
-    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
     sp.GetRequiredService<IAgentRegistry>()));
 builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new OrchestratorStallCondition(
@@ -1864,7 +1866,7 @@ builder.Services.AddSingleton<INotificationBuilder>(sp => new AllQuotasExhausted
     sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct));
 builder.Services.AddSingleton<INotificationBuilder>(sp => new AgentAuthRequiredNotificationBuilder(
-    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
     sp.GetRequiredService<IAgentRegistry>()));
 builder.Services.AddSingleton<INotificationBuilder, WorkItemPermanentlyFailedNotificationBuilder>();
 builder.Services.AddSingleton<INotificationBuilder>(sp => new OrchestratorStallNotificationBuilder(
@@ -2553,9 +2555,11 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetRequiredService<IHostApplicationLifetime>(),
     sp.GetRequiredService<ILogger<ReleaseService>>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditMaxConcurrency,
-    () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
-    agentStreams: sp.GetService<IAgentStreamStore>(),
-    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>()));
+	    () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
+	    agentStreams: sp.GetService<IAgentStreamStore>(),
+	    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
+	    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
+	    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
@@ -4769,13 +4773,20 @@ namespace CodeyBox.Api
 
     /// <summary>
     /// One operator-supplied auth/login-prompt pattern entry. Appended to the
-    /// built-in defaults and matched against stderr case-insensitively. Bound from
-    /// <c>CodeyBox:AuthFailurePatterns:&lt;agent-kind&gt;</c>.
+    /// built-in defaults and matched case-insensitively against the configured
+    /// stream. Bound from <c>CodeyBox:AuthFailurePatterns:&lt;agent-kind&gt;</c>.
+    /// Defaults to stderr-only because stdout can contain model-controlled task
+    /// text; stdout patterns should be narrowly formed CLI login transcripts.
     /// </summary>
     public sealed class AuthFailurePatternOptions
     {
-        /// <summary>The substring to search for in stderr.</summary>
+        /// <summary>The substring to search for.</summary>
         public string Pattern { get; set; } = string.Empty;
+        /// <summary>
+        /// Stream to search. Defaults to stderr. Use Stdout or StderrAndStdout
+        /// only for narrow CLI-auth transcript signatures.
+        /// </summary>
+        public AuthFailurePatternStream Stream { get; set; } = AuthFailurePatternStream.Stderr;
     }
 
     /// <summary>
@@ -4801,7 +4812,7 @@ namespace CodeyBox.Api
                         kvp => kvp.Key,
                         kvp => (IReadOnlyList<AuthFailurePattern>)(kvp.Value ?? new List<AuthFailurePatternOptions>())
                             .Where(p => !string.IsNullOrWhiteSpace(p.Pattern))
-                            .Select(p => new AuthFailurePattern(p.Pattern))
+                            .Select(p => new AuthFailurePattern(p.Pattern, p.Stream))
                             .ToArray(),
                         StringComparer.OrdinalIgnoreCase);
             return new AgentAuthFailureClassifier(extras);

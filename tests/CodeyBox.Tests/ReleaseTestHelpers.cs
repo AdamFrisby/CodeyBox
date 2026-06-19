@@ -58,7 +58,9 @@ internal static class ReleaseTestHelper
         IAgentRegistry? agents = null,
         IAgentStreamStore? agentStreams = null,
         PipelineOptions? pipelineOptions = null,
-        ICredentialProvider? credentials = null)
+        ICredentialProvider? credentials = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         return new ReleaseService(
             releaseStore,
@@ -78,7 +80,9 @@ internal static class ReleaseTestHelper
             NullLogger<ReleaseService>.Instance,
             () => 4,
             () => TimeSpan.FromMinutes(30),
-            agentStreams);
+            agentStreams,
+            authFailureClassifier: authFailureClassifier,
+            authAvailability: authAvailability);
     }
 
     public static Release SeedRelease(

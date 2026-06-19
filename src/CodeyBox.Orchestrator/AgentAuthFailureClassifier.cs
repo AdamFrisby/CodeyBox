@@ -21,10 +21,9 @@ public interface IAgentAuthFailureClassifier
     /// Returns the auth-required classification plus the stream that supplied
     /// the evidence. Stderr is treated as CLI diagnostics and matched by
     /// substring. Stdout defaults use the shared guarded stdout matcher so
-    /// concrete CLI login prompts count even when they are printed without a
-    /// matching stderr line. Operator-supplied patterns are also applied to
-    /// stdout so newly observed CLI login prompts can be configured without a
-    /// rebuild.
+    /// concrete CLI login transcripts count even when they are printed without a
+    /// matching stderr line. Operator-supplied patterns are stream-scoped and
+    /// default to stderr-only; stdout patterns must be opted into explicitly.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }
@@ -72,7 +71,8 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         var matchedStderr = AgentFailureClassifier.ContainsAuthRequiredPatternInStderr(stderr);
         var matchedStderrAuthError = AgentFailureClassifier.ContainsAuthErrorPattern(stderr);
         var matchedTrustedStdoutTranscript = AgentFailureClassifier.ContainsTrustedStdoutLoginTranscript(stdout);
-        var matchedDefaultStdout = AgentFailureClassifier.ContainsAuthRequiredPatternInStdout(stdout);
+        var matchedDefaultStdout = matchedTrustedStdoutTranscript;
+        var matchedStdoutFragment = AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout);
         var matchedConfiguredStdout = false;
 
         foreach (var pattern in AdditionalPatternsFor(kind))
@@ -80,21 +80,24 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             if (string.IsNullOrWhiteSpace(pattern.Pattern))
                 continue;
 
-            if (!string.IsNullOrEmpty(stderr)
+            if (pattern.MatchesStderr
+                && !string.IsNullOrEmpty(stderr)
                 && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
                 matchedStderr = true;
             }
 
-            if (!string.IsNullOrEmpty(stdout)
+            if (pattern.MatchesStdout
+                && !string.IsNullOrEmpty(stdout)
                 && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
                 matchedConfiguredStdout = true;
             }
         }
 
-        var matchedStdout = matchedDefaultStdout || matchedConfiguredStdout || matchedTrustedStdoutTranscript;
-        if (matchedStdout && matchedStderrAuthError)
+        var matchedStdout = matchedDefaultStdout || matchedConfiguredStdout
+            || matchedStderrAuthError && matchedStdoutFragment;
+        if (matchedStderrAuthError && (matchedStdout || matchedStdoutFragment))
             matchedStderr = true;
 
         if (matchedStderr || matchedStdout)

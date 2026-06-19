@@ -46,6 +46,7 @@ public sealed class AuthFailurePatternBindingTests
         var classifier = BindAndBuild(new Dictionary<string, string?>
         {
             ["CodeyBox:AuthFailurePatterns:antigravity:0:Pattern"] = "stdout says: needs login",
+            ["CodeyBox:AuthFailurePatterns:antigravity:0:Stream"] = "Stdout",
         });
 
         var stdoutHit = classifier.DetectDetailed(
@@ -61,9 +62,26 @@ public sealed class AuthFailurePatternBindingTests
             AgentKind.Antigravity,
             stderr: "stdout says: needs login",
             stdout: null);
-        Assert.NotNull(stderrHit);
-        Assert.Equal(AgentFailureKind.AuthRequired, stderrHit.Classification.Kind);
+        Assert.Null(stderrHit);
         Assert.Null(classifier.Detect(AgentKind.Codex, stderr: null, stdout: "stdout says: needs login"));
+    }
+
+    [Fact]
+    public void Build_DefaultsAdditionalPerAgentPattern_ToStderrOnly()
+    {
+        var classifier = BindAndBuild(new Dictionary<string, string?>
+        {
+            ["CodeyBox:AuthFailurePatterns:antigravity:0:Pattern"] = "stdout says: needs login",
+        });
+
+        Assert.NotNull(classifier.Detect(AgentKind.Antigravity, stderr: "stdout says: needs login", stdout: null));
+        Assert.Null(classifier.Detect(AgentKind.Antigravity, stderr: null, stdout: "stdout says: needs login"));
+    }
+
+    [Fact]
+    public void Build_NullOptions_ThrowsArgumentNullException()
+    {
+        Assert.Throws<ArgumentNullException>(() => AuthFailurePatternBinder.Build(null!));
     }
 
     [Fact]

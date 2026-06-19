@@ -2524,6 +2524,7 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
     public Queue<TimeSpan> MergeDelays { get; } = new();
     public Queue<FileWrite> WorkPlan { get; } = new();
     public Queue<string?> WorkStdouts { get; } = new();
+    public Queue<string?> WorkStderrs { get; } = new();
     public int CallCount { get; private set; }
     public event Action<AgentKind, string>? PhaseInvocationStarted;
 
@@ -2600,8 +2601,9 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
             Stdin = fw.Contents,
         }, ct);
         var stdout = WorkStdouts.Count > 0 ? WorkStdouts.Dequeue() : null;
+        var stderr = WorkStderrs.Count > 0 ? WorkStderrs.Dequeue() : null;
         return write.Success
-            ? new AgentResult(true, "ok", stdout, null)
+            ? new AgentResult(true, "ok", stdout, stderr)
             : new AgentResult(false, "write failed", write.Stdout, write.Stderr);
     }
 

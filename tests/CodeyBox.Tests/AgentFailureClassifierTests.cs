@@ -109,10 +109,10 @@ public sealed class AgentFailureClassifierTests
     [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
     [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
     [InlineData("Error: authentication timed out.")]
-    public void LoginPromptFragments_InStdout_Classified_AsAuthRequired(string snippet)
+    public void LoginPromptFragments_InStdout_AreNotAuthRequiredByDefault(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
-        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Theory]
@@ -152,17 +152,14 @@ public sealed class AgentFailureClassifierTests
     [Theory]
     [InlineData("not logged into opencode; run `opencode auth login`")]
     [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
-    public void AgentAuthFailureClassifier_DetectsDefaultFragments_InStdout(string snippet)
+    public void AgentAuthFailureClassifier_DoesNotBenchDefaultFragments_InStdout(string snippet)
     {
         var detection = new AgentAuthFailureClassifier().DetectDetailed(
             AgentKind.Opencode,
             stderr: null,
             stdout: snippet);
 
-        Assert.NotNull(detection);
-        Assert.True(detection.IsStdoutOnly);
-        Assert.True(detection.MatchedDefaultStdoutPattern);
-        Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
+        Assert.Null(detection);
     }
 
     [Theory]
@@ -199,7 +196,9 @@ public sealed class AgentFailureClassifierTests
         var classifier = new AgentAuthFailureClassifier(
             new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
             {
-                ["custom"] = [new AuthFailurePattern("stdout-only login ceremony required")],
+                ["custom"] = [new AuthFailurePattern(
+                    "stdout-only login ceremony required",
+                    AuthFailurePatternStream.Stdout)],
             });
 
         var stdoutHit = classifier.DetectDetailed(
@@ -215,8 +214,7 @@ public sealed class AgentFailureClassifierTests
             new AgentKind("custom"),
             stderr: "stdout-only login ceremony required",
             stdout: null);
-        Assert.NotNull(stderrHit);
-        Assert.False(stderrHit.IsStdoutOnly);
+        Assert.Null(stderrHit);
         Assert.Null(classifier.Detect(
             AgentKind.Codex,
             stderr: null,

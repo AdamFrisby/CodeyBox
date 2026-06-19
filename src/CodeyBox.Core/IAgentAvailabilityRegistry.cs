@@ -83,6 +83,18 @@ public interface IAgentAvailabilityReset
 }
 
 /// <summary>
+/// Narrow read model for runtime auth-required exclusions. Consumers that need
+/// to notify operators about unauthenticated agents should use this structured
+/// source instead of parsing <see cref="AgentAvailability.Reason"/>.
+/// </summary>
+public interface IAgentAuthRequiredAvailabilityReader
+{
+    AgentAuthRequiredAvailability GetAuthRequiredAvailability(AgentKind kind);
+}
+
+public sealed record AgentAuthRequiredAvailability(bool AuthRequired, string? Reason);
+
+/// <summary>
 /// State transition returned by registry mutators. Callers use
 /// <c>!PreviouslyExcluded &amp;&amp; NowExcluded</c> to fire "agent newly
 /// excluded" webhook events and <c>PreviouslyExcluded &amp;&amp; !NowExcluded</c>

@@ -5,6 +5,7 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Webhooks;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -287,6 +288,71 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         Assert.Contains("api.anthropic.com", spec.Network.AllowedHosts);
         Assert.DoesNotContain("registry.npmjs.org", spec.Network.AllowedHosts);
         Assert.Equal("secret", spec.Environment["TEST_TOKEN"]);
+    }
+
+    [Fact]
+    public async Task DeepAuditAgentAuthPrompt_BenchesAgentFailsReleaseAndSkipsRemediation()
+    {
+        var transcript = """
+            Authentication required. Please visit the URL to log in:
+            https://accounts.google.com/o/oauth2/auth?client_id=redacted
+            Waiting for authentication (timeout 30s)...
+            Error: authentication timed out.
+            """;
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            AuditCapabilities.AgentCredentials,
+            new AuditResult(true, [], AgentStdout: transcript));
+        var project = ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 3) with
+        {
+            DefaultAgent = AgentKind.Claude,
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: autoCompleteQueue,
+            sandboxes: new AlwaysSucceedSandboxProvider(),
+            gitHost: new DeepAuditTestGitHost(),
+            agents: new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude }]),
+            authFailureClassifier: new AgentAuthFailureClassifier(),
+            authAvailability: availability);
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = MakeWorkItem(rel.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        var finalState = await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        Assert.Equal(ReleaseState.Failed, finalState);
+        var finalRelease = await _releaseStore.GetAsync(rel.Id);
+        Assert.Contains("release-deep-audit", finalRelease!.FailedReason);
+        var current = availability.GetAvailability(AgentKind.Claude);
+        Assert.False(current.Available);
+        Assert.Contains("auth required from agent output", current.Reason);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var wi in _workItemStore.ListByReleaseAsync(rel.Id, default))
+            allItems.Add(wi);
+        Assert.Single(allItems);
+        Assert.DoesNotContain(_webhooks.Events, e => e.Event == "release.deep_audit_remediation_dispatched");
+        var failed = Assert.Single(_webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
     [Theory]
