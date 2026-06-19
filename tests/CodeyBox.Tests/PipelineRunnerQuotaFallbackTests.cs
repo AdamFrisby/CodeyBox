@@ -2015,6 +2015,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         // test inject store faults while still reading the rows that landed.
         IAgentInvolvementStore involvementForPipeline = wrapInvolvement?.Invoke(involvement) ?? involvement;
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
+        var authAvailability = availability as IAgentAuthAvailabilityRegistry
+            ?? new AgentAvailabilityRegistry(
+                new AvailabilityOptions(),
+                TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -2043,7 +2048,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
             authFailureClassifier: authFailureClassifier,
-            availability: availability);
+            availability: availability,
+            authAvailability: authAvailability);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }

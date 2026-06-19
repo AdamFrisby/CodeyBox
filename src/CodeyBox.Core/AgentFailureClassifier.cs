@@ -255,6 +255,14 @@ public static class AgentFailureClassifier
         Classify(stderr, stdout, summary: null);
 
     public static AgentFailureClassification Classify(string? stderr, string? stdout, string? summary)
+        => Classify(default, stderr, stdout, summary);
+
+    public static AgentFailureClassification Classify(
+        AgentKind kind,
+        string? stderr,
+        string? stdout,
+        string? summary,
+        IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>>? additionalAuthPatternsByAgent = null)
     {
         if (IsMaterialisationFailure(summary))
             return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent prerequisite materialisation failed");
@@ -278,14 +286,17 @@ public static class AgentFailureClassifier
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
-        var stderrAuthError = ContainsAuthErrorPattern(stderr);
-        if (ContainsAuthRequiredPatternInStderr(stderr)
-            || ContainsAuthRequiredPatternInStdout(stdout)
-            || stderrAuthError && ContainsAuthRequiredFragmentInStdout(stdout))
+        var authRequired = DetectAuthRequired(
+            kind,
+            stderr,
+            stdout,
+            additionalAuthPatternsByAgent);
+        if (authRequired is not null)
         {
-            return new AgentFailureClassification(AgentFailureKind.AuthRequired, Reason: "auth-required pattern matched");
+            return authRequired.Classification;
         }
 
+        var stderrAuthError = ContainsAuthErrorPattern(stderr);
         if (stderrAuthError || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
@@ -304,6 +315,79 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
         return new AgentFailureClassification(AgentFailureKind.Normal);
+    }
+
+    public static AgentAuthFailureDetection? DetectAuthRequired(
+        AgentKind kind,
+        string? stderr,
+        string? stdout,
+        IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>>? additionalPatternsByAgent = null)
+    {
+        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
+            return null;
+
+        var matchedStderr = ContainsAuthRequiredPatternInStderr(stderr);
+        var matchedStderrAuthError = ContainsAuthErrorPattern(stderr);
+        var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
+        var matchedDefaultStdout = matchedTrustedStdoutTranscript;
+        var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
+        var matchedConfiguredStdout = false;
+
+        foreach (var pattern in AdditionalAuthPatternsFor(kind, additionalPatternsByAgent))
+        {
+            if (string.IsNullOrWhiteSpace(pattern.Pattern))
+                continue;
+
+            if (pattern.MatchesStderr
+                && !string.IsNullOrEmpty(stderr)
+                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedStderr = true;
+            }
+
+            if (pattern.MatchesStdout
+                && !string.IsNullOrEmpty(stdout)
+                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedConfiguredStdout = true;
+            }
+        }
+
+        var matchedStdout = matchedDefaultStdout || matchedConfiguredStdout
+            || matchedStderrAuthError && matchedStdoutFragment;
+        if (matchedStderrAuthError && (matchedStdout || matchedStdoutFragment))
+            matchedStderr = true;
+
+        if (!matchedStderr && !matchedStdout)
+            return null;
+
+        var source = matchedStderr && matchedStdout
+            ? "stderr/stdout"
+            : matchedStderr ? "stderr" : "stdout";
+        return new AgentAuthFailureDetection(
+            new AgentFailureClassification(
+                AgentFailureKind.AuthRequired,
+                Reason: $"auth/login prompt pattern matched in {source}"),
+            matchedStderr,
+            matchedStdout,
+            matchedTrustedStdoutTranscript,
+            matchedConfiguredStdout,
+            matchedDefaultStdout);
+    }
+
+    private static IEnumerable<AuthFailurePattern> AdditionalAuthPatternsFor(
+        AgentKind kind,
+        IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>>? additionalPatternsByAgent)
+    {
+        if (additionalPatternsByAgent is null
+            || string.IsNullOrWhiteSpace(kind.Value)
+            || !additionalPatternsByAgent.TryGetValue(kind.Value, out var exact))
+        {
+            yield break;
+        }
+
+        foreach (var pattern in exact)
+            yield return pattern;
     }
 
     private static bool IsBinaryNotFoundFailure(string? summary, string? stderr, string? stdout)

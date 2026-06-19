@@ -243,6 +243,56 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
+    public void SharedClassifier_AppliesPerAgentConfiguredAuthPattern()
+    {
+        var extras = new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["custom"] = [new AuthFailurePattern("custom auth ceremony required")],
+        };
+
+        var hit = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+        var miss = AgentFailureClassifier.Classify(
+            AgentKind.Codex,
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+
+        Assert.Equal(AgentFailureKind.AuthRequired, hit.Kind);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, miss.Kind);
+    }
+
+    [Fact]
+    public void AuthFailurePatternStreamNone_MatchesNoStreams()
+    {
+        var extras = new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["custom"] = [new AuthFailurePattern("custom auth ceremony required", AuthFailurePatternStream.None)],
+        };
+
+        var stderr = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+        var stdout = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: null,
+            stdout: "custom auth ceremony required",
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+
+        Assert.NotEqual(AgentFailureKind.AuthRequired, stderr.Kind);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, stdout.Kind);
+    }
+
+    [Fact]
     public void AgentAuthFailureClassifier_StdoutPromptWithStderr401_IsCorroboratedByStderr()
     {
         var classifier = new AgentAuthFailureClassifier();
@@ -645,6 +695,21 @@ public sealed class AgentFailureClassifierTests
         var c = runner.ClassifyFailure(new AgentResult(true, "ok", "", null));
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
+    }
+
+    [Fact]
+    public void DefaultClassifyFailure_OnSuccessLoginPrompt_ReturnsAuthRequired()
+    {
+        IAgentRunner runner = new ProbeOnlyRunner();
+        var stdout = """
+            Authentication required. Please visit the URL to log in:
+            Waiting for authentication (timeout 30s)...
+            Error: authentication timed out.
+            """;
+
+        var c = runner.ClassifyFailure(new AgentResult(true, "ok", stdout, null));
+
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Fact]

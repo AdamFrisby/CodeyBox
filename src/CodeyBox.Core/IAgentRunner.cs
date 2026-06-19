@@ -36,9 +36,11 @@ public interface IAgentRunner
     /// </summary>
     AgentFailureClassification ClassifyFailure(AgentResult result)
     {
+        if (AgentFailureClassifier.DetectAuthRequired(Kind, result.Stderr, result.Stdout) is { } authRequired)
+            return authRequired.Classification;
         if (result.Success)
             return new AgentFailureClassification(AgentFailureKind.Normal);
-        return AgentFailureClassifier.Classify(result.Stderr, result.Stdout, result.Summary);
+        return AgentFailureClassifier.Classify(Kind, result.Stderr, result.Stdout, result.Summary);
     }
 }
 

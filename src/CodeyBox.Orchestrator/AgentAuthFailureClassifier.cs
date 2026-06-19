@@ -26,17 +26,12 @@ public interface IAgentAuthFailureClassifier
     /// default to stderr-only; stdout patterns must be opted into explicitly.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
-}
 
-public sealed record AgentAuthFailureDetection(
-    AgentFailureClassification Classification,
-    bool MatchedStderr,
-    bool MatchedStdout,
-    bool MatchedTrustedStdoutTranscript,
-    bool MatchedConfiguredStdoutPattern = false,
-    bool MatchedDefaultStdoutPattern = false)
-{
-    public bool IsStdoutOnly => MatchedStdout && !MatchedStderr;
+    /// <summary>
+    /// Classifies a runner result using the shared classifier plus configured
+    /// per-agent auth/login-prompt patterns.
+    /// </summary>
+    AgentFailureClassification ClassifyFailure(AgentKind kind, AgentResult result);
 }
 
 public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
@@ -59,69 +54,15 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         => DetectDetailed(kind, stderr, stdout)?.Classification;
 
     public AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout)
-    {
-        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
-            return null;
+        => AgentFailureClassifier.DetectAuthRequired(kind, stderr, stdout, _additionalPatternsByAgent);
 
-        var matchedStderr = AgentFailureClassifier.ContainsAuthRequiredPatternInStderr(stderr);
-        var matchedStderrAuthError = AgentFailureClassifier.ContainsAuthErrorPattern(stderr);
-        var matchedTrustedStdoutTranscript = AgentFailureClassifier.ContainsTrustedStdoutLoginTranscript(stdout);
-        var matchedDefaultStdout = matchedTrustedStdoutTranscript;
-        var matchedStdoutFragment = AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout);
-        var matchedConfiguredStdout = false;
-
-        foreach (var pattern in AdditionalPatternsFor(kind))
-        {
-            if (string.IsNullOrWhiteSpace(pattern.Pattern))
-                continue;
-
-            if (pattern.MatchesStderr
-                && !string.IsNullOrEmpty(stderr)
-                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
-            {
-                matchedStderr = true;
-            }
-
-            if (pattern.MatchesStdout
-                && !string.IsNullOrEmpty(stdout)
-                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
-            {
-                matchedConfiguredStdout = true;
-            }
-        }
-
-        var matchedStdout = matchedDefaultStdout || matchedConfiguredStdout
-            || matchedStderrAuthError && matchedStdoutFragment;
-        if (matchedStderrAuthError && (matchedStdout || matchedStdoutFragment))
-            matchedStderr = true;
-
-        if (matchedStderr || matchedStdout)
-        {
-            var source = matchedStderr && matchedStdout
-                ? "stderr/stdout"
-                : matchedStderr ? "stderr" : "stdout";
-            return new AgentAuthFailureDetection(
-                new AgentFailureClassification(
-                    AgentFailureKind.AuthRequired,
-                    Reason: $"auth/login prompt pattern matched in {source}"),
-                matchedStderr,
-                matchedStdout,
-                matchedTrustedStdoutTranscript,
-                matchedConfiguredStdout,
-                matchedDefaultStdout);
-        }
-
-        return null;
-    }
-
-    private IEnumerable<AuthFailurePattern> AdditionalPatternsFor(AgentKind kind)
-    {
-        if (_additionalPatternsByAgent.TryGetValue(kind.Value, out var exact))
-        {
-            foreach (var pattern in exact)
-                yield return pattern;
-        }
-    }
+    public AgentFailureClassification ClassifyFailure(AgentKind kind, AgentResult result)
+        => AgentFailureClassifier.Classify(
+            kind,
+            result.Stderr,
+            result.Stdout,
+            result.Summary,
+            _additionalPatternsByAgent);
 }
 
 /// <summary>

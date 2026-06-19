@@ -84,7 +84,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
-    private readonly IAgentAuthAvailabilityRegistry? _authAvailability;
+    private readonly IAgentAuthAvailabilityRegistry _authAvailability;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentPauseController? _agentPauses;
     private readonly IAgentSupervisionService? _agentSupervision;
@@ -283,7 +283,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
         IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
-        IAgentAuthAvailabilityRegistry? authAvailability = null)
+        IAgentAuthAvailabilityRegistry authAvailability = null!)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -357,8 +357,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _cancellations = cancellationRegistry;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
-        _authAvailability = authAvailability
-            ?? availability as IAgentAuthAvailabilityRegistry;
+        _authAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
         _agentSupervision = agentSupervision;
@@ -4478,7 +4477,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return aggregatedStdout;
     }
 
-    private static void ThrowIfTransientAgentFailure(
+    private void ThrowIfTransientAgentFailure(
         IAgentRunner runner,
         AgentResult result,
         string phase)
@@ -4487,7 +4486,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throw transient;
     }
 
-    private static void ThrowIfTransientAgentFailure(
+    private void ThrowIfTransientAgentFailure(
         IAgentRunner runner,
         AgentSessionResumeExhaustedException resumeEx,
         string phase)
@@ -4502,13 +4501,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private static TerminalTransientNetworkError? TryBuildTransientAgentFailure(
+    private TerminalTransientNetworkError? TryBuildTransientAgentFailure(
         IAgentRunner runner,
         AgentResult result,
         string? phase,
         string failureContext)
     {
-        var classification = runner.ClassifyFailure(result);
+        var classification = ClassifyAgentFailure(runner, result);
         if (classification.Kind != AgentFailureKind.TransientNetwork)
             return null;
 
@@ -4522,6 +4521,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             phase,
             classification,
             $"Agent {runner.Kind} reported transient transport failure {failureContext}{phaseSuffix}: {summary} ({reason})");
+    }
+
+    private AgentFailureClassification ClassifyAgentFailure(IAgentRunner runner, AgentResult result)
+    {
+        var authAwareClassification = _authFailureClassifier.ClassifyFailure(runner.Kind, result);
+        if (authAwareClassification.Kind == AgentFailureKind.AuthRequired)
+        {
+            return authAwareClassification;
+        }
+
+        return runner.ClassifyFailure(result);
     }
 
     /// <summary>
@@ -5197,7 +5207,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         if (!result.Success)
         {
-            var classification = runner.ClassifyFailure(classificationResult ?? result);
+            var classification = ClassifyAgentFailure(runner, classificationResult ?? result);
             if (classification.Kind is AgentFailureKind.Infrastructure or AgentFailureKind.TransientNetwork)
             {
                 if (classification.Kind == AgentFailureKind.Infrastructure)
@@ -5376,9 +5386,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // login-prompt evidence means the binary is broken, so
         // AuthRequired survives the smoke-disabled gate via
         // AgentAvailabilityRegistry.IsNonSmokeExclusion.
-        var transition = _authAvailability?.MarkAuthRequired(agent, reason);
+        var transition = _authAvailability.MarkAuthRequired(agent, reason);
 
-        if (transition is null || transition.SourceChanged)
+        if (transition.SourceChanged)
         {
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -9893,7 +9903,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AgentSessionResumeExhaustedException resumeEx)
         {
             var last = resumeEx.LastResult;
-            var classification = runner.ClassifyFailure(last);
+            var classification = ClassifyAgentFailure(runner, last);
             if (classification.Kind != AgentFailureKind.TransientNetwork)
                 return null;
 
@@ -10540,7 +10550,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (_quotaClassifier.Detect(runner.Kind, result.AgentStderr, result.AgentStdout) is not null)
             return "failure:quota";
 
-        var classification = runner.ClassifyFailure(ToAgentResultForAuditFailureClassification(result));
+        var classification = ClassifyAgentFailure(runner, ToAgentResultForAuditFailureClassification(result));
         if (classification.Kind == AgentFailureKind.QuotaExhausted)
             return "failure:quota";
         if (classification.Kind == AgentFailureKind.TransientNetwork)
@@ -12866,7 +12876,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (AgentSessionResumeExhaustedException ex)
             {
-                var classification = runner.ClassifyFailure(ex.LastResult);
+                var classification = ClassifyAgentFailure(runner, ex.LastResult);
                 await FinalizeInvolvementAsync(
                     conflictInvolvementId,
                     classification.Kind == AgentFailureKind.TransientNetwork
@@ -12906,7 +12916,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // before the generic !Success → failure:agent fallback, otherwise the
             // involvement outcome would mislabel it as a plain agent failure.
             var transientFailure = !agentResult.Success
-                && runner.ClassifyFailure(agentResult).Kind == AgentFailureKind.TransientNetwork;
+                && ClassifyAgentFailure(runner, agentResult).Kind == AgentFailureKind.TransientNetwork;
             await FinalizeInvolvementAsync(conflictInvolvementId,
                 semanticIncompatible is not null ? "failure:semantic-incompatible"
                 : transientFailure ? "failure:transient"

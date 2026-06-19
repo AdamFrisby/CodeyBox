@@ -42,7 +42,7 @@ public sealed class ReleaseService
     private readonly IAgentStreamStore? _agentStreams;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
-    private readonly IAgentAuthAvailabilityRegistry? _authAvailability;
+    private readonly IAgentAuthAvailabilityRegistry _authAvailability;
 
     // Hot-reloadable deep-audit concurrency gate — resolved from IOptionsMonitor on every
     // acquire/remediate call so config edits take effect without restart.
@@ -71,7 +71,7 @@ public sealed class ReleaseService
         IAgentStreamStore? agentStreams = null,
         AgentPromptPreprocessorChain? promptPreprocessors = null,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
-        IAgentAuthAvailabilityRegistry? authAvailability = null)
+        IAgentAuthAvailabilityRegistry authAvailability = null!)
     {
         _releases = releases;
         _workItems = workItems;
@@ -93,7 +93,7 @@ public sealed class ReleaseService
         _agentStreams = agentStreams;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
-        _authAvailability = authAvailability;
+        _authAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
     }
 
     private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)
@@ -681,8 +681,8 @@ public sealed class ReleaseService
             $"auth required from agent output during {phase} for release {release.Id}: {reasonDetail}");
 
         AuditLog.AgentSmokeFailed(runner.Kind, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
-        var transition = _authAvailability?.MarkAuthRequired(runner.Kind, reason);
-        if (transition is null || transition.SourceChanged)
+        var transition = _authAvailability.MarkAuthRequired(runner.Kind, reason);
+        if (transition.SourceChanged)
         {
             await _webhooks.PublishAsync(new WebhookEvent
             {

@@ -168,6 +168,11 @@ internal static class TestSupport
         if (extraAgentRunners is not null)
             runnerList.AddRange(extraAgentRunners);
         var registry = new AgentRegistry(runnerList);
+        var authAvailability = availabilityRegistry
+            ?? new AgentAvailabilityRegistry(
+                new AvailabilityOptions(),
+                TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance);
         var auditorList = (auditors ?? []).ToList();
 
         // Project repo: a single in-memory project pointing at the seed.
@@ -275,7 +280,7 @@ internal static class TestSupport
             pipelineTuning: pipelineTuning,
             taskQueue: queue,
             availability: availabilityRegistry,
-            authAvailability: availabilityRegistry,
+            authAvailability: authAvailability,
             involvement: involvement,
             requiredBuildVerifier: requiredBuildVerifier ?? new SandboxRequiredBuildVerifier(
                 sandboxes,

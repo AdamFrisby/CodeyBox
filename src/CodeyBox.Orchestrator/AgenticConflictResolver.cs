@@ -284,7 +284,7 @@ public sealed class AgenticConflictResolver
             AgentFailureClassification classification;
             try
             {
-                classification = failureRunner.ClassifyFailure(classificationResult);
+                classification = ClassifyAgentFailure(failureRunner, classificationResult);
             }
             catch (Exception ex)
             {
@@ -721,6 +721,17 @@ public sealed class AgenticConflictResolver
         return evidence;
     }
 
+
+    private AgentFailureClassification ClassifyAgentFailure(IAgentRunner runner, AgentResult result)
+    {
+        var authAwareClassification = _authFailureClassifier.ClassifyFailure(runner.Kind, result);
+        if (authAwareClassification.Kind == AgentFailureKind.AuthRequired)
+        {
+            return authAwareClassification;
+        }
+
+        return runner.ClassifyFailure(result);
+    }
 
     internal sealed record VerificationOutcome(bool Success, string Reason);
 

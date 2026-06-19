@@ -11,13 +11,14 @@ public sealed record AuthFailurePattern(
     string Pattern,
     AuthFailurePatternStream Stream = AuthFailurePatternStream.Stderr)
 {
-    public bool MatchesStderr => Stream.HasFlag(AuthFailurePatternStream.Stderr);
-    public bool MatchesStdout => Stream.HasFlag(AuthFailurePatternStream.Stdout);
+    public bool MatchesStderr => (Stream & AuthFailurePatternStream.Stderr) == AuthFailurePatternStream.Stderr;
+    public bool MatchesStdout => (Stream & AuthFailurePatternStream.Stdout) == AuthFailurePatternStream.Stdout;
 }
 
 [Flags]
 public enum AuthFailurePatternStream
 {
+    None = 0,
     Stderr = 1,
     Stdout = 2,
     StderrAndStdout = Stderr | Stdout,

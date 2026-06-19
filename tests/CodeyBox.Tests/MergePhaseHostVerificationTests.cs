@@ -218,6 +218,10 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
         var webhooks = new NullWebhookDispatcher();
         var projects = new InMemoryProjectRepository(project);
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
+        var authAvailability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
 
         return new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
@@ -232,6 +236,7 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
+            authAvailability: authAvailability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
@@ -581,6 +586,11 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
         webhooks ??= new NullWebhookDispatcher();
         var projects = new InMemoryProjectRepository(project);
         var terminalTransitions = TestSupport.CreateTerminalTransition(workStore, webhooks, projects);
+        var authAvailability = availability
+            ?? new AgentAvailabilityRegistry(
+                new AvailabilityOptions(),
+                TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance);
 
         return new PipelineRunner(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
@@ -597,7 +607,7 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             NullLogger<PipelineRunner>.Instance,
             auditReports: auditStore,
             availability: availability,
-            authAvailability: availability,
+            authAvailability: authAvailability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);

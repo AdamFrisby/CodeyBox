@@ -2555,11 +2555,11 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetRequiredService<IHostApplicationLifetime>(),
     sp.GetRequiredService<ILogger<ReleaseService>>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditMaxConcurrency,
-	    () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
-	    agentStreams: sp.GetService<IAgentStreamStore>(),
-	    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
-	    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
-	    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
+    () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
+    agentStreams: sp.GetService<IAgentStreamStore>(),
+    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
+    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
+    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),

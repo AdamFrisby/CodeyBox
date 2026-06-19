@@ -289,6 +289,11 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
         var projects = new InMemoryProjectRepository(project);
         var webhookDispatcher = webhooks ?? new NullWebhookDispatcher();
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhookDispatcher, projects);
+        var authAvailability = availability
+            ?? new AgentAvailabilityRegistry(
+                new AvailabilityOptions(),
+                TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -307,7 +312,7 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             classRouter: router,
             auditReports: auditReportStore,
             availability: availability,
-            authAvailability: availability,
+            authAvailability: authAvailability,
             agenticConflictResolver: agenticConflictResolver,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,

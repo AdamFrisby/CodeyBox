@@ -62,6 +62,12 @@ internal static class ReleaseTestHelper
         IAgentAuthFailureClassifier? authFailureClassifier = null,
         IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
+        var resolvedAuthAvailability = authAvailability
+            ?? new AgentAvailabilityRegistry(
+                new AvailabilityOptions(),
+                TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance);
+
         return new ReleaseService(
             releaseStore,
             workItemStore,
@@ -82,7 +88,7 @@ internal static class ReleaseTestHelper
             () => TimeSpan.FromMinutes(30),
             agentStreams,
             authFailureClassifier: authFailureClassifier,
-            authAvailability: authAvailability);
+            authAvailability: resolvedAuthAvailability);
     }
 
     public static Release SeedRelease(
