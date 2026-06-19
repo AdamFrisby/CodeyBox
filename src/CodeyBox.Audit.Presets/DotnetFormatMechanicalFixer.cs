@@ -137,7 +137,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             return argv;
 
         throw new InvalidOperationException(
-            $"{FormatCheckAuditorName} must invoke 'dotnet format' directly for the {FixerName} fixer to reuse it.");
+            $"{FormatCheckAuditorName} must invoke 'dotnet format' directly or through a trusted 'sh -c' preset script for the {FixerName} fixer to reuse it.");
     }
 
     public static bool TryToFixerArgv(
@@ -152,7 +152,12 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
         if (IsLiteralDotnetFormatCommand(formatCheckArgv))
         {
-            fixerArgv = StripReadOnlyFormatArgs(formatCheckArgv, out _);
+            fixerArgv = StripReadOnlyFormatArgs(formatCheckArgv);
+            return true;
+        }
+
+        if (TryToShellScriptFixerArgv(formatCheckArgv, out fixerArgv))
+        {
             return true;
         }
 
@@ -160,31 +165,25 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         return false;
     }
 
-    private static IReadOnlyList<string> StripReadOnlyFormatArgs(
-        IReadOnlyList<string> formatCheckArgv,
-        out bool removedReadOnlyFlag)
+    private static IReadOnlyList<string> StripReadOnlyFormatArgs(IReadOnlyList<string> formatCheckArgv)
     {
         var argv = new List<string>(formatCheckArgv.Count);
-        removedReadOnlyFlag = false;
         for (var i = 0; i < formatCheckArgv.Count; i++)
         {
             var arg = formatCheckArgv[i];
             if (arg.Equals("--verify-no-changes", StringComparison.OrdinalIgnoreCase))
             {
-                removedReadOnlyFlag = true;
                 continue;
             }
 
             if (arg.Equals("--report", StringComparison.OrdinalIgnoreCase))
             {
-                removedReadOnlyFlag = true;
                 i++;
                 continue;
             }
 
             if (arg.StartsWith("--report=", StringComparison.OrdinalIgnoreCase))
             {
-                removedReadOnlyFlag = true;
                 continue;
             }
 
@@ -194,10 +193,39 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         return argv;
     }
 
+    private static bool TryToShellScriptFixerArgv(
+        IReadOnlyList<string> formatCheckArgv,
+        out IReadOnlyList<string> fixerArgv)
+    {
+        fixerArgv = [];
+        if (formatCheckArgv.Count != 3 ||
+            !IsShellExecutable(formatCheckArgv[0]) ||
+            !formatCheckArgv[1].Equals("-c", StringComparison.Ordinal) ||
+            !ContainsDotnetFormatCommand(formatCheckArgv[2]))
+        {
+            return false;
+        }
+
+        fixerArgv =
+        [
+            formatCheckArgv[0],
+            formatCheckArgv[1],
+            DotnetFormatShellShim + "\n" + formatCheckArgv[2],
+        ];
+        return true;
+    }
+
     private static bool IsLiteralDotnetFormatCommand(IReadOnlyList<string> argv)
         => argv.Count >= 2 &&
            IsDotnetExecutable(argv[0]) &&
            argv[1].Equals("format", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsShellExecutable(string command)
+    {
+        var fileName = Path.GetFileName(command);
+        return fileName.Equals("sh", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals("sh.exe", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool IsDotnetExecutable(string command)
     {
@@ -205,6 +233,88 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         return fileName.Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
                fileName.Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase);
     }
+
+    private const string DotnetFormatShellShim =
+        """
+        dotnet() {
+          if [ "${1-}" = "format" ]; then
+            (
+              while [ "$#" -gt 0 ]; do
+                case "$1" in
+                  --verify-no-changes)
+                    shift
+                    ;;
+                  --report)
+                    shift
+                    if [ "$#" -gt 0 ]; then shift; fi
+                    ;;
+                  --report=*)
+                    shift
+                    ;;
+                  *)
+                    printf '%s\0' "$1"
+                    shift
+                    ;;
+                esac
+              done
+            ) | xargs -0 dotnet
+          else
+            command dotnet "$@"
+          fi
+        }
+        """;
+
+    private static bool ContainsDotnetFormatCommand(string script)
+    {
+        var segments = script
+            .Replace("&&", ";", StringComparison.Ordinal)
+            .Replace("||", ";", StringComparison.Ordinal)
+            .Split([';', '|', '\n', '(', ')'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var segment in segments)
+        {
+            var words = segment.Split([' ', '\t', '\r'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var commandIndex = 0;
+            while (commandIndex < words.Length && IsShellAssignment(words[commandIndex]))
+                commandIndex++;
+
+            if (commandIndex + 1 >= words.Length)
+                continue;
+
+            if (IsBareDotnetExecutable(words[commandIndex]) &&
+                words[commandIndex + 1].Equals("format", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsBareDotnetExecutable(string command)
+        => command.Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
+           command.Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsShellAssignment(string value)
+    {
+        var equalsIndex = value.IndexOf('=');
+        if (equalsIndex <= 0)
+            return false;
+
+        if (!IsShellNameStart(value[0]))
+            return false;
+
+        for (var i = 1; i < equalsIndex; i++)
+        {
+            if (!IsShellNameChar(value[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsShellNameStart(char c)
+        => c == '_' || c is >= 'A' and <= 'Z' || c is >= 'a' and <= 'z';
+
+    private static bool IsShellNameChar(char c)
+        => c == '_' || char.IsAsciiLetterOrDigit(c);
 
     private static async Task<ProjectDirectoryDiscovery> DiscoverProjectDirectoriesAsync(
         ISandbox sandbox,

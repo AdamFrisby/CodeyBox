@@ -421,6 +421,37 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public void DotnetFormatFixer_ReusesShellScriptFormatCheckCommand()
+    {
+        var argv = DotnetFormatMechanicalFixer.ToFixerArgv(
+        [
+            "sh",
+            "-c",
+            "export DOTNET_ROOT=/opt/dotnet; DOTNET_CLI_HOME=/tmp/dotnet dotnet format --verify-no-changes --report /tmp/report --verbosity diagnostic",
+        ]);
+
+        Assert.Equal("sh", argv[0]);
+        Assert.Equal("-c", argv[1]);
+        Assert.Contains("export DOTNET_ROOT=/opt/dotnet", argv[2]);
+        Assert.Contains("DOTNET_CLI_HOME=/tmp/dotnet dotnet format --verify-no-changes --report /tmp/report --verbosity diagnostic", argv[2]);
+        Assert.Contains("xargs -0 dotnet", argv[2]);
+    }
+
+    [Fact]
+    public void DotnetFormatFixer_DoesNotTreatEchoedShellTextAsFormatCommand()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            DotnetFormatMechanicalFixer.ToFixerArgv(
+            [
+                "sh",
+                "-c",
+                "echo dotnet format --verify-no-changes; ./dangerous-format-wrapper --verify-no-changes",
+            ]));
+
+        Assert.Contains("dotnet format", ex.Message);
+    }
+
+    [Fact]
     public void DotnetFormatFixer_ToFixerArgvThrowsForShellWrapperScript()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
@@ -456,6 +487,41 @@ public sealed class MechanicalFixerTests : IDisposable
             ]));
 
         Assert.Contains("dotnet format", ex.Message);
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_ApplyRunsScriptBackedFormatAuditor()
+    {
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: "src/App\n",
+            statusOutputs: ["", " M src/App/Program.cs\0"],
+            formatResult: new SandboxExecResult(0, "formatted", ""));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                [new DotnetFormatMechanicalFixerInput(
+                    [
+                        "sh",
+                        "-c",
+                        "export DOTNET_ROOT=/opt/dotnet; dotnet format --verify-no-changes --report /tmp/report --verbosity diagnostic",
+                    ],
+                    ".")]));
+
+        Assert.True(result.Changed);
+        var formatExec = Assert.Single(sandbox.Execs, e =>
+            e.Argv.Count == 3 &&
+            e.Argv[0] == "sh" &&
+            e.Argv[1] == "-c" &&
+            e.Argv[2].Contains("dotnet format --verify-no-changes", StringComparison.Ordinal));
+        Assert.Contains("export DOTNET_ROOT=/opt/dotnet", formatExec.Argv[2]);
+        Assert.Equal("/work/repo/src/App", formatExec.WorkingDirectory);
     }
 
     [Fact]
