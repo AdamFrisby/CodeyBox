@@ -1161,6 +1161,45 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_CanceledStartupTokenBeforeApplicationStarted_ReturnsCanceledTaskAndDoesNotRegister()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-canceled-before-started",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider();
+        var barrier = new StartupRecoveryBarrier();
+        var lifetime = new ControllableHostApplicationLifetime();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            applicationLifetime: lifetime);
+
+        using var startupCts = new CancellationTokenSource();
+        startupCts.Cancel();
+
+        var startTask = svc.StartAsync(startupCts.Token);
+
+        Assert.True(startTask.IsCanceled);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => startTask);
+
+        lifetime.MarkStarted();
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+        Assert.Empty(provider.ResumedNames);
+        Assert.False(barrier.RecoveryInputReady.IsCompleted);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-canceled-before-started", after!.SuspendedVmName);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task StartupResume_BackgroundResume_IgnoresStartupTokenCancellationAfterStart()
     {
         var item = MakeItem(WorkItemState.Working);
