@@ -5827,7 +5827,15 @@ public sealed class PipelineRunner : IPipelineRunner
             var patch = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--binary", "HEAD^", "HEAD"],
+                MaxStdoutBytes = MechanicalEditLimits.PatchCaptureMaxBytes,
+                MaxStderrBytes = MechanicalEditLimits.GitDiagnosticCaptureMaxBytes,
             }, phaseCt);
+            if (patch.OutputLimitExceeded)
+            {
+                throw new MechanicalFixerException(
+                    $"mechanical-edit formatter commit diff exceeded the {MechanicalEditLimits.PatchCaptureMaxBytes} byte patch cap; rejecting oversized mechanical commit");
+            }
+
             if (!patch.Success || string.IsNullOrWhiteSpace(patch.Stdout))
             {
                 throw new MechanicalFixerException(
@@ -5939,6 +5947,11 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         if (string.IsNullOrWhiteSpace(patch))
             throw new MechanicalFixerException("mechanical-edit produced an empty patch");
+        if (Encoding.UTF8.GetByteCount(patch) > MechanicalEditLimits.PatchCaptureMaxBytes)
+        {
+            throw new MechanicalFixerException(
+                $"mechanical-edit formatter commit diff exceeded the {MechanicalEditLimits.PatchCaptureMaxBytes} byte patch cap; rejecting oversized mechanical commit");
+        }
 
         try
         {

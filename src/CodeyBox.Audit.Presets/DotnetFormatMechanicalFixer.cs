@@ -286,7 +286,12 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", workingDirectory, "diff", "--binary", "--full-index", "HEAD", "--"],
+            MaxStdoutBytes = MechanicalEditLimits.PatchCaptureMaxBytes,
+            MaxStderrBytes = MechanicalEditLimits.GitDiagnosticCaptureMaxBytes,
         }, ct);
+        if (result.OutputLimitExceeded)
+            throw new InvalidOperationException(
+                $"tracked diff for mechanical fixer exceeded the {MechanicalEditLimits.PatchCaptureMaxBytes} byte output cap; skipped normalization");
         if (!result.Success)
             throw new InvalidOperationException(
                 $"failed to read git diff for mechanical fixer: {ExceptionSafeOutput(result)}");

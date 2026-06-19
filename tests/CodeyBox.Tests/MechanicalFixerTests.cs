@@ -1299,6 +1299,46 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task DotnetFormatFixer_GitDiffOutputLimitRejectsNormalizationBeforeFormat()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [""],
+            formatResult: new SandboxExecResult(0, "formatted", ""),
+            diffResults:
+            [
+                new SandboxExecResult(
+                    137,
+                    "partial diff",
+                    "",
+                    StdoutLimitExceeded: true),
+            ]);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new DotnetFormatMechanicalFixer().ApplyAsync(
+                sandbox,
+                "/work/repo",
+                new MechanicalFixerContext(
+                    WorkItemId.New(),
+                    "feature/test",
+                    "main",
+                    1,
+                    "project",
+                    InputsFor(auditor))));
+
+        Assert.Contains("tracked diff for mechanical fixer exceeded", ex.Message);
+        Assert.Contains("skipped normalization", ex.Message);
+        var diffExec = Assert.Single(sandbox.Execs, e =>
+            e.Argv.SequenceEqual(["git", "-C", "/work/repo", "diff", "--binary", "--full-index", "HEAD", "--"]));
+        Assert.Equal(MechanicalEditLimits.PatchCaptureMaxBytes, diffExec.MaxStdoutBytes);
+        Assert.Equal(MechanicalEditLimits.GitDiagnosticCaptureMaxBytes, diffExec.MaxStderrBytes);
+        Assert.DoesNotContain(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
+    }
+
+    [Fact]
     public async Task Pipeline_RunsMechanicalFixerBeforeInitialAuditAndAfterRework()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2247,6 +2287,68 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains(expectedError, final.LastError);
         Assert.True(failure.Fired);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize",
+            "--format=%s",
+            item.WorkBranch!);
+        Assert.DoesNotContain("chore: normalize", mechanicalLog);
+    }
+
+    [Fact]
+    public async Task Pipeline_MechanicalPatchExportOutputLimitRejectsOversizedCommit()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        SandboxExec? patchExportExec = null;
+        var patchExportExceeded = new MechanicalCommandFailureRule(
+            1,
+            exec =>
+            {
+                if (!IsGitArgs(exec, "-C", SandboxConventions.WorkDir, "diff", "--binary", "HEAD^", "HEAD"))
+                    return false;
+
+                patchExportExec = exec;
+                return true;
+            },
+            new SandboxExecResult(
+                137,
+                "partial patch",
+                "",
+                StdoutLimitExceeded: true));
+        var provider = new MechanicalCommandInterceptingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            [patchExportExceeded]);
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            sandboxProvider: provider,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-oversized-patch");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("patch cap", final.LastError);
+        Assert.True(patchExportExceeded.Fired);
+        Assert.NotNull(patchExportExec);
+        Assert.Equal(MechanicalEditLimits.PatchCaptureMaxBytes, patchExportExec!.MaxStdoutBytes);
+        Assert.Equal(MechanicalEditLimits.GitDiagnosticCaptureMaxBytes, patchExportExec.MaxStderrBytes);
 
         var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
         var (_, mechanicalLog, _) = await TestSupport.RunGit(
