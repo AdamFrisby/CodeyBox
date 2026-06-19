@@ -598,6 +598,94 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task DotnetFormatFixer_CommandFailureThrowsWhenRollbackPatchWriteFails()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string previousFixerPatch =
+            """
+            diff --git a/normalizer.txt b/normalizer.txt
+            index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..56a6051ca2b02b04ef92d5150c9ef600403cb1de 100644
+            --- a/normalizer.txt
+            +++ b/normalizer.txt
+            @@ -0,0 +1 @@
+            +1
+            """;
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [" M normalizer.txt\0"],
+            formatResult: new SandboxExecResult(2, "", "format failed"),
+            diffOutputs: [previousFixerPatch],
+            patchWriteResult: new SandboxExecResult(1, "", "write failed\nwith details"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new DotnetFormatMechanicalFixer().ApplyAsync(
+                sandbox,
+                "/work/repo",
+                new MechanicalFixerContext(
+                    WorkItemId.New(),
+                    "feature/test",
+                    "main",
+                    1,
+                    "project",
+                    InputsFor(auditor))));
+
+        Assert.Contains("could not materialize pre-existing changes", ex.Message);
+        Assert.Contains("write failed with details", ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.Equal(previousFixerPatch, Assert.Single(sandbox.WrittenPatches));
+        Assert.DoesNotContain(sandbox.Execs, e => e.Argv.SequenceEqual([
+            "git",
+            "-C",
+            "/work/repo",
+            "apply",
+            "--whitespace=nowarn",
+            "/tmp/codeybox-dotnet-format-before.patch",
+        ]));
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_CommandFailureThrowsWhenRollbackPatchApplyFails()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string previousFixerPatch =
+            """
+            diff --git a/normalizer.txt b/normalizer.txt
+            index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..56a6051ca2b02b04ef92d5150c9ef600403cb1de 100644
+            --- a/normalizer.txt
+            +++ b/normalizer.txt
+            @@ -0,0 +1 @@
+            +1
+            """;
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [" M normalizer.txt\0"],
+            formatResult: new SandboxExecResult(2, "", "format failed"),
+            diffOutputs: [previousFixerPatch],
+            applyResult: new SandboxExecResult(1, "", "apply failed\nwith details"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new DotnetFormatMechanicalFixer().ApplyAsync(
+                sandbox,
+                "/work/repo",
+                new MechanicalFixerContext(
+                    WorkItemId.New(),
+                    "feature/test",
+                    "main",
+                    1,
+                    "project",
+                    InputsFor(auditor))));
+
+        Assert.Contains("could not restore pre-existing changes", ex.Message);
+        Assert.Contains("apply failed with details", ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.Equal(previousFixerPatch, Assert.Single(sandbox.WrittenPatches));
+    }
+
+    [Fact]
     public async Task DotnetFormatFixer_InactiveFormatAuditorSkips()
     {
         var sandbox = new DotnetFormatSandbox(
@@ -730,6 +818,36 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Contains("failed to read git status", ex.Message);
         Assert.DoesNotContain('\n', ex.Message);
         Assert.Contains("output truncated", ex.Message);
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_GitDiffFailureThrowsSanitizedBoundedMessage()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [""],
+            formatResult: new SandboxExecResult(0, "formatted", ""),
+            diffResults: [new SandboxExecResult(128, "", "diff failed\n" + new string('x', 2_000))]);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new DotnetFormatMechanicalFixer().ApplyAsync(
+                sandbox,
+                "/work/repo",
+                new MechanicalFixerContext(
+                    WorkItemId.New(),
+                    "feature/test",
+                    "main",
+                    1,
+                    "project",
+                    InputsFor(auditor))));
+
+        Assert.Contains("failed to read git diff", ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.Contains("output truncated", ex.Message);
+        Assert.DoesNotContain(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
     }
 
     [Fact]
@@ -1450,10 +1568,12 @@ public sealed class MechanicalFixerTests : IDisposable
         private readonly Queue<string> _statusOutputs;
         private readonly Queue<SandboxExecResult>? _statusResults;
         private readonly Queue<string> _diffOutputs;
+        private readonly Queue<SandboxExecResult>? _diffResults;
         private readonly SandboxExecResult _formatResult;
         private readonly SandboxExecResult? _markerResult;
         private readonly SandboxExecResult? _resetResult;
         private readonly SandboxExecResult? _applyResult;
+        private readonly SandboxExecResult? _patchWriteResult;
 
         public DotnetFormatSandbox(
             string markerStdout,
@@ -1463,7 +1583,9 @@ public sealed class MechanicalFixerTests : IDisposable
             IEnumerable<SandboxExecResult>? statusResults = null,
             SandboxExecResult? resetResult = null,
             IEnumerable<string>? diffOutputs = null,
-            SandboxExecResult? applyResult = null)
+            SandboxExecResult? applyResult = null,
+            IEnumerable<SandboxExecResult>? diffResults = null,
+            SandboxExecResult? patchWriteResult = null)
         {
             _markerStdout = markerStdout;
             _statusOutputs = new Queue<string>(statusOutputs);
@@ -1473,6 +1595,8 @@ public sealed class MechanicalFixerTests : IDisposable
             _statusResults = statusResults is null ? null : new Queue<SandboxExecResult>(statusResults);
             _resetResult = resetResult;
             _applyResult = applyResult;
+            _diffResults = diffResults is null ? null : new Queue<SandboxExecResult>(diffResults);
+            _patchWriteResult = patchWriteResult;
         }
 
         public string Id => "dotnet-format-fake";
@@ -1485,7 +1609,7 @@ public sealed class MechanicalFixerTests : IDisposable
             if (exec.Argv.SequenceEqual(["sh", "-c", "cat > \"$0\"", "/tmp/codeybox-dotnet-format-before.patch"]))
             {
                 WrittenPatches.Add(exec.Stdin ?? "");
-                return Task.FromResult(new SandboxExecResult(0, "", ""));
+                return Task.FromResult(_patchWriteResult ?? new SandboxExecResult(0, "", ""));
             }
 
             if (exec.Argv is ["sh", "-c", var script] && !script.Contains("command -v", StringComparison.Ordinal))
@@ -1501,6 +1625,8 @@ public sealed class MechanicalFixerTests : IDisposable
 
             if (exec.Argv.Count >= 3 && exec.Argv[0] == "git" && exec.Argv.Contains("diff"))
             {
+                if (_diffResults is { Count: > 0 })
+                    return Task.FromResult(_diffResults.Dequeue());
                 var stdout = _diffOutputs.Count > 0 ? _diffOutputs.Dequeue() : "";
                 return Task.FromResult(new SandboxExecResult(0, stdout, ""));
             }

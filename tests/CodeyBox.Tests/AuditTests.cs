@@ -307,6 +307,27 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public void DotnetFormatCommandResultClassifier_IgnoresDotnetFormatWithoutVerifyNoChanges()
+    {
+        var classifier = new DotnetFormatCommandResultClassifier();
+        var commandFinding = new AuditFinding(
+            "custom:shell",
+            AuditSeverity.Error,
+            "command exited 2",
+            "failed");
+        const string output = "/work/Program.cs(1,1): error WHITESPACE: Fix whitespace formatting. [/work/App.csproj]";
+
+        var result = classifier.ClassifyFailedCommand(new ShellCommandResultContext(
+            "custom:shell",
+            ["dotnet", "format", "--verbosity", "diagnostic"],
+            new SandboxExecResult(2, "", output),
+            output,
+            commandFinding));
+
+        Assert.Null(result);
+    }
+
+    [Fact]
     public async Task ShellCommandAuditor_Exit127WithSpoofedMissingToolOutput_RemainsError()
     {
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
