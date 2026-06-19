@@ -1513,7 +1513,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // sees the outcome via PipelineRunner's RecordRunOutcome call.
         var codex = new ScriptableAgent(AgentKind.Codex);
         var registry = new AgentRegistry([codex]);
-        var auditorList = auditors ?? Array.Empty<IAuditor>();
+        var auditorList = auditors is { Count: > 0 }
+            ? TestAuditGates.WithPassedBuildAndTest(auditors)
+            : Array.Empty<IAuditor>();
 
         var project = new Project
         {
