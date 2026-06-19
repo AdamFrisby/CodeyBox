@@ -7,12 +7,6 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <AnalysisLevel>latest</AnalysisLevel>
-    <!-- SQLitePCLRaw.lib.e_sqlite3 has no patched 2.x package available
-         (latest remains 2.1.11), and Microsoft.Data.Sqlite 10.0.9 still pulls
-         that native asset. Keep NU1903 visible in restore output instead of
-         hiding it with NuGetAuditSuppress; remove this demotion when the
-         SQLite provider graph can move to a patched native package. -->
-    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1903</WarningsNotAsErrors>
     <!-- Suppress satellite-assembly scanning during ResolveAssemblyReference.
          This is required solution-wide because the build host is fork-heavy
          and the directory-enumeration inside RAR hits ENOMEM on multiple
