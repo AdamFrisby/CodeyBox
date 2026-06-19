@@ -10,7 +10,7 @@ namespace CodeyBox.Core;
 /// commit message separated from the subject/body by a blank line.
 ///
 /// <para>
-/// Schema:
+/// Agent work commit schema:
 ///   <list type="bullet">
 ///     <item><description><c>CodeyBox-WorkItem: &lt;id&gt;</c> — the full work-item id (always present).</description></item>
 ///     <item><description><c>CodeyBox-Agent: &lt;agent&gt;[/&lt;model&gt;]</c> — the final agent/model that produced the work (always present).</description></item>
@@ -19,12 +19,19 @@ namespace CodeyBox.Core;
 ///     <item><description><c>Co-Authored-By: CodeyBox &lt;noreply@codeybox.invalid&gt;</c> — terminal co-author trailer (always present).</description></item>
 ///   </list>
 /// </para>
+///
+/// <para>
+/// Mechanical fixer commit schema uses <c>CodeyBox-Mechanical-Fixer</c>
+/// instead of <c>CodeyBox-Agent</c> so deterministic normalizer commits are
+/// not attributed as agent/model work.
+/// </para>
 /// </summary>
 public static class CodeyBoxTrailers
 {
     public const string CoAuthoredBy = "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>";
     public const string WorkItemTrailerKey = "CodeyBox-WorkItem";
     public const string AgentTrailerKey = "CodeyBox-Agent";
+    public const string MechanicalFixerTrailerKey = "CodeyBox-Mechanical-Fixer";
     public const string PromptRevisionTrailerKey = "CodeyBox-Prompt-Revision";
     public const string FallbacksTrailerKey = "CodeyBox-Fallbacks";
 
@@ -70,6 +77,32 @@ public static class CodeyBoxTrailers
         var fallbackLine = ComposeFallbackSummary(fallbackHistory);
         if (fallbackLine is not null)
             sb.Append(FallbacksTrailerKey).Append(": ").Append(fallbackLine).Append('\n');
+
+        sb.Append(CoAuthoredBy);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Build the trailer block for a deterministic mechanical-fixer commit.
+    /// These commits retain work-item and prompt-revision metadata, but
+    /// intentionally omit <see cref="AgentTrailerKey"/> so commit-log consumers
+    /// do not count normalizer output as agent-produced work.
+    /// </summary>
+    public static string ComposeMechanical(
+        WorkItemId workItemId,
+        string? fixerNames,
+        int? promptRevisionAtDispatch = null)
+    {
+        var sb = new StringBuilder();
+        sb.Append(WorkItemTrailerKey).Append(": ").Append(workItemId).Append('\n');
+
+        var fixers = SanitizeOneLine(fixerNames ?? string.Empty);
+        sb.Append(MechanicalFixerTrailerKey).Append(": ")
+            .Append(fixers.Length == 0 ? "unknown" : fixers)
+            .Append('\n');
+
+        if (promptRevisionAtDispatch is { } rev)
+            sb.Append(PromptRevisionTrailerKey).Append(": ").Append(rev).Append('\n');
 
         sb.Append(CoAuthoredBy);
         return sb.ToString();

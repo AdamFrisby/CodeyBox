@@ -155,18 +155,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             return false;
         }
 
-        if (TryToShellWrapperFixerArgv(formatCheckArgv, out fixerArgv))
-            return true;
-
-        var argv = StripReadOnlyFormatArgs(formatCheckArgv, out var removedReadOnlyFlag);
-        if (removedReadOnlyFlag)
-        {
-            fixerArgv = argv;
-            return true;
-        }
-
-        fixerArgv = [];
-        return false;
+        return TryToShellWrapperFixerArgv(formatCheckArgv, out fixerArgv);
     }
 
     private static IReadOnlyList<string> StripReadOnlyFormatArgs(
@@ -212,10 +201,10 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             return false;
 
         var script = formatCheckArgv[scriptIndex];
-        var fixerScript = StripReadOnlyFormatTokensFromShellScript(script, out var removedReadOnlyFlag);
-        if (!removedReadOnlyFlag && !ContainsDotnetFormatInvocation(script))
+        if (!ContainsDotnetFormatInvocation(script))
             return false;
 
+        var fixerScript = StripReadOnlyFormatTokensFromShellScript(script, out _);
         var argv = formatCheckArgv.ToArray();
         argv[scriptIndex] = fixerScript;
         fixerArgv = argv;
@@ -254,7 +243,77 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         => argv[0].Equals("dotnet", StringComparison.OrdinalIgnoreCase);
 
     private static bool ContainsDotnetFormatInvocation(string script)
-        => script.Contains("dotnet format", StringComparison.OrdinalIgnoreCase);
+    {
+        var tokens = ShellTokenSpans(script);
+        for (var i = 0; i < tokens.Count - 1; i++)
+        {
+            var command = UnquoteShellToken(script[tokens[i].Start..tokens[i].End]);
+            var verb = UnquoteShellToken(script[tokens[i + 1].Start..tokens[i + 1].End]);
+            if (!Path.GetFileName(command).Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
+                !verb.Equals("format", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (IsShellCommandStart(script, tokens, i))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsShellCommandStart(
+        string script,
+        IReadOnlyList<(int Start, int End)> tokens,
+        int tokenIndex)
+    {
+        for (var i = tokenIndex - 1; i >= 0; i--)
+        {
+            var token = script[tokens[i].Start..tokens[i].End];
+            if (TokenEndsCommand(token) ||
+                SpanBetweenTokensEndsCommand(script, tokens[i].End, tokens[i + 1].Start))
+            {
+                return true;
+            }
+
+            if (IsShellAssignmentToken(UnquoteShellToken(token)))
+                continue;
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TokenEndsCommand(string token)
+        => token.EndsWith(';') ||
+           token.EndsWith("&&", StringComparison.Ordinal) ||
+           token.EndsWith("||", StringComparison.Ordinal) ||
+           token.EndsWith('|');
+
+    private static bool SpanBetweenTokensEndsCommand(string script, int start, int end)
+        => script.AsSpan(start, end - start).IndexOfAny(';', '\n') >= 0;
+
+    private static bool IsShellAssignmentToken(string token)
+    {
+        var equals = token.IndexOf('=');
+        if (equals <= 0)
+            return false;
+
+        return token[..equals].All(c => char.IsLetterOrDigit(c) || c == '_');
+    }
+
+    private static string UnquoteShellToken(string token)
+    {
+        if (token.Length >= 2 &&
+            ((token[0] == '\'' && token[^1] == '\'') ||
+             (token[0] == '"' && token[^1] == '"')))
+        {
+            return token[1..^1];
+        }
+
+        return token;
+    }
 
     private static string StripReadOnlyFormatTokensFromShellScript(string script, out bool removedReadOnlyFlag)
     {

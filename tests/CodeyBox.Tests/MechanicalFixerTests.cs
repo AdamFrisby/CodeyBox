@@ -405,11 +405,24 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
-    public async Task DotnetFormatFixer_ReusesExecutableWrapperCommandWithoutReadOnlyFlags()
+    public void DotnetFormatFixer_ToFixerArgvThrowsForShellWrapperThatDoesNotInvokeDotnetFormat()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            DotnetFormatMechanicalFixer.ToFixerArgv([
+                "bash",
+                "-lc",
+                "echo dotnet format --verify-no-changes; ./dangerous-format-wrapper --verify-no-changes",
+            ]));
+
+        Assert.Contains("dotnet format", ex.Message);
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_ApplySkipsUnsupportedFormatCheckCommand()
     {
         var sandbox = new DotnetFormatSandbox(
             markerStdout: ".\n",
-            statusOutputs: ["", " M Program.cs\0"],
+            statusOutputs: [],
             formatResult: new SandboxExecResult(0, "formatted", ""));
 
         var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
@@ -425,9 +438,9 @@ public sealed class MechanicalFixerTests : IDisposable
                     ["./format-wrapper", "--verify-no-changes", "--report", "/tmp/report", "--sdk", "10.0.109"],
                     ".")]));
 
-        Assert.True(result.Changed);
-        var formatExec = Assert.Single(sandbox.Execs, e => e.Argv.Count > 0 && e.Argv[0] == "./format-wrapper");
-        Assert.Equal(["./format-wrapper", "--sdk", "10.0.109"], formatExec.Argv);
+        Assert.False(result.Changed);
+        Assert.Contains("does not expose a writable dotnet-format command", result.Summary);
+        Assert.Empty(sandbox.Execs);
     }
 
     [Fact]
@@ -1245,8 +1258,56 @@ public sealed class MechanicalFixerTests : IDisposable
             "--format=%B",
             item.WorkBranch!);
         Assert.Equal(2, CountOccurrences(mechanicalLog, "chore: normalize mechanical edits"));
-        Assert.Equal(2, CountOccurrences(mechanicalLog, "CodeyBox-Agent: mechanical/fake-normalizer"));
+        Assert.Equal(2, CountOccurrences(mechanicalLog, $"{CodeyBoxTrailers.MechanicalFixerTrailerKey}: fake-normalizer"));
+        Assert.DoesNotContain(CodeyBoxTrailers.AgentTrailerKey, mechanicalLog);
         Assert.Equal(2, CountOccurrences(mechanicalLog, $"{CodeyBoxTrailers.PromptRevisionTrailerKey}: 1"));
+    }
+
+    [Fact]
+    public async Task Pipeline_RunsMechanicalFixerFromWorkItemSelectedAuditProfile()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            MechanicalFixers = [],
+            Profiles = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["ci"] = new()
+                {
+                    MaxIterations = 1,
+                    AuditTypes = ["scripted"],
+                    MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+                },
+            },
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-profile") with { AuditorProfile = "ci" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, normalized, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:normalizer.txt");
+        Assert.Equal("1\n", normalized);
+
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize mechanical edits",
+            "--format=%B",
+            item.WorkBranch!);
+        Assert.Contains($"{CodeyBoxTrailers.MechanicalFixerTrailerKey}: fake-normalizer", mechanicalLog);
     }
 
     [Fact]
@@ -1324,7 +1385,8 @@ public sealed class MechanicalFixerTests : IDisposable
             "--format=%B",
             item.WorkBranch!);
         Assert.Contains("chore: normalize mechanical edits", mechanicalLog);
-        Assert.Contains($"CodeyBox-Agent: mechanical/{FalseReportingTrackedEditMechanicalFixer.FixerName}", mechanicalLog);
+        Assert.Contains($"{CodeyBoxTrailers.MechanicalFixerTrailerKey}: {FalseReportingTrackedEditMechanicalFixer.FixerName}", mechanicalLog);
+        Assert.DoesNotContain(CodeyBoxTrailers.AgentTrailerKey, mechanicalLog);
     }
 
     [Fact]

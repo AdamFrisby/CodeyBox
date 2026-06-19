@@ -34,6 +34,6 @@ public sealed class DotnetFormatMechanicalFixerInputProvider : IMechanicalFixerI
     }
 }
 
-public sealed record DotnetFormatMechanicalFixerInput(
+internal sealed record DotnetFormatMechanicalFixerInput(
     IReadOnlyList<string> FormatCheckArgv,
     string? ProjectMarkerScript) : IMechanicalFixerInput;

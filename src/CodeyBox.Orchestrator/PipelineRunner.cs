@@ -5801,14 +5801,12 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var revision = await ResolveMechanicalPromptRevisionForCommitAsync(item, auditIteration, phaseCt);
             var commitFixers = changedFixers.Count == 0 ? fixers : changedFixers;
-            var model = changedFixers.Count == 0
+            var fixerNames = changedFixers.Count == 0
                 ? string.Join("+", fixers.Select(f => f.Name))
                 : string.Join("+", changedFixers.Select(f => f.Name));
-            var trailerBlock = await ComposeCommitTrailerBlockAsync(
+            var trailerBlock = CodeyBoxTrailers.ComposeMechanical(
                 item.Id,
-                new AgentKind("mechanical"),
-                model,
-                phaseCt,
+                fixerNames,
                 promptRevisionAtDispatch: revision);
             var subject = commitFixers.Count == 1 && !string.IsNullOrWhiteSpace(commitFixers[0].CommitSubject)
                 ? commitFixers[0].CommitSubject.Trim()

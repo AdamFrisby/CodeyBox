@@ -190,6 +190,21 @@ public sealed class CodeyBoxTrailersTests
     }
 
     [Fact]
+    public void ComposeMechanical_EmitsMechanicalFixerWithoutAgentAttribution()
+    {
+        var trailer = CodeyBoxTrailers.ComposeMechanical(
+            TestItemId,
+            "dotnet-format+generated-code",
+            promptRevisionAtDispatch: 3);
+
+        Assert.Contains($"CodeyBox-WorkItem: {TestItemId}", trailer);
+        Assert.Contains("CodeyBox-Mechanical-Fixer: dotnet-format+generated-code", trailer);
+        Assert.Contains($"{CodeyBoxTrailers.PromptRevisionTrailerKey}: 3\n", trailer);
+        Assert.DoesNotContain(CodeyBoxTrailers.AgentTrailerKey, trailer);
+        Assert.EndsWith(CodeyBoxTrailers.CoAuthoredBy, trailer);
+    }
+
+    [Fact]
     public void ComposeFallbackSummary_NullInput_ReturnsNull()
     {
         Assert.Null(CodeyBoxTrailers.ComposeFallbackSummary(null));

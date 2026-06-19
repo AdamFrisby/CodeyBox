@@ -5,6 +5,7 @@ namespace CodeyBox.Audit.Shell;
 public sealed class DotnetFormatCommandResultClassifier : IShellCommandResultClassifier
 {
     private const int MaxViolationLines = 40;
+    private const int MaxFallbackOutputChars = 4_000;
 
     public AuditResult? ClassifyFailedCommand(ShellCommandResultContext context)
     {
@@ -33,7 +34,7 @@ public sealed class DotnetFormatCommandResultClassifier : IShellCommandResultCla
                 : "dotnet format reported that formatting verification failed, but did not emit parseable file-level violation lines. "
                     + "Run `dotnet format --verbosity diagnostic` with the same SDK/baseline as the auditor, or let the configured mechanical fixer apply it before audit.";
             if (!string.IsNullOrWhiteSpace(context.CombinedOutput))
-                fallbackDescription += "\n\n" + Truncate(context.CombinedOutput.Trim(), 4000);
+                fallbackDescription += "\n\n" + Truncate(context.CombinedOutput.Trim(), MaxFallbackOutputChars);
 
             return new AuditResult(
                 Passed: false,
