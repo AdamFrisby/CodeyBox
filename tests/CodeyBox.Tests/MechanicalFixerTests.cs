@@ -932,6 +932,46 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task Pipeline_CommitsTrackedMechanicalEditsEvenWhenFixerReportsUnchanged()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [FalseReportingTrackedEditMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            mechanicalFixers: [new FalseReportingTrackedEditMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-dirty-unchanged");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, normalized, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:normalizer.txt");
+        Assert.Equal("dirty edit\n", normalized);
+
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize mechanical edits",
+            "--format=%B",
+            item.WorkBranch!);
+        Assert.Contains("chore: normalize mechanical edits", mechanicalLog);
+        Assert.Contains($"CodeyBox-Agent: mechanical/{FalseReportingTrackedEditMechanicalFixer.FixerName}", mechanicalLog);
+    }
+
+    [Fact]
     public async Task Pipeline_MechanicalCommitOmitsPromptRevision_WhenPromptChangedAfterDispatch()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1081,30 +1121,82 @@ public sealed class MechanicalFixerTests : IDisposable
             sandboxProvider: recorder,
             networkProfiles: new ProjectNetworkProfiles
             {
+                Work = "work-profile",
                 AuditTool = "audit-tool-profile",
             },
             mechanicalFixers: [new AppendingMechanicalFixer()]);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
 
-        var item = NewItem("feature/mechanical-spec");
+        var item = NewItem("feature/mechanical-spec") with { BaselineImageRef = "work-baseline-pin" };
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var specs = recorder.Specs.Where(s => s.TimingPhase == "mechanical-edit").ToArray();
         Assert.Equal(2, specs.Length);
+        var auditSpec = Assert.Single(recorder.Specs, s => s.TimingPhase == "audit");
         Assert.All(specs, spec =>
         {
             Assert.Equal("audit-tool-profile", spec.Network.ProfileName);
+            Assert.Equal(auditSpec.Network.ProfileName, spec.Network.ProfileName);
+            Assert.Equal(auditSpec.BaselineImageRef, spec.BaselineImageRef);
+            Assert.NotEqual(item.BaselineImageRef, spec.BaselineImageRef);
             Assert.Empty(spec.Network.AllowedHosts);
             Assert.DoesNotContain(CodeyBoxTrailers.PromptRevisionEnvVar, spec.Environment.Keys);
             Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
         });
+        Assert.Equal("audit-tool-profile", auditSpec.Network.ProfileName);
+        Assert.Null(auditSpec.BaselineImageRef);
 
         var normalizationRepoMount = Assert.Single(specs[0].Mounts, m => m.SandboxPath == "/repo");
         Assert.True(normalizationRepoMount.ReadOnly);
 
         var importRepoMount = Assert.Single(specs[1].Mounts, m => m.SandboxPath == "/repo");
         Assert.False(importRepoMount.ReadOnly);
+    }
+
+    [Fact]
+    public async Task Pipeline_NoChangeReworkFailsBeforeMechanicalFixerCanMaskIt()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var fixer = new SecondIterationMechanicalFixer();
+        var auditor = new OnceFailingAuditor();
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 2,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [SecondIterationMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            mechanicalFixers: [fixer]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "same-content\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "same-content\n"));
+
+        var item = NewItem("feature/mechanical-no-change-rework");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Rework agent produced no changes", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(1, auditor.Calls);
+        Assert.Equal([1], fixer.SeenIterations);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, normalized, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:normalizer.txt");
+        Assert.Equal(string.Empty, normalized);
+
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize mechanical edits",
+            "--format=%s",
+            item.WorkBranch!);
+        Assert.DoesNotContain("chore: normalize mechanical edits", mechanicalLog);
     }
 
     [Fact]
@@ -1477,6 +1569,61 @@ public sealed class MechanicalFixerTests : IDisposable
             => Task.FromResult(new MechanicalFixerResult(false, "no changes"));
     }
 
+    private sealed class FalseReportingTrackedEditMechanicalFixer : IMechanicalFixer
+    {
+        public const string FixerName = "false-reporting-normalizer";
+
+        public string Name => FixerName;
+        public string Kind => "test";
+
+        public async Task<MechanicalFixerResult> ApplyAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            MechanicalFixerContext context,
+            CancellationToken ct = default)
+        {
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf 'dirty edit\n' > \"$0\"", $"{workingDirectory}/normalizer.txt"],
+            }, ct);
+
+            if (!result.Success)
+                throw new InvalidOperationException(result.Stderr);
+
+            return new MechanicalFixerResult(false, "edited tracked file but reported unchanged");
+        }
+    }
+
+    private sealed class SecondIterationMechanicalFixer : IMechanicalFixer
+    {
+        public const string FixerName = "second-iteration-normalizer";
+
+        public string Name => FixerName;
+        public string Kind => "test";
+        public List<int> SeenIterations { get; } = [];
+
+        public async Task<MechanicalFixerResult> ApplyAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            MechanicalFixerContext context,
+            CancellationToken ct = default)
+        {
+            SeenIterations.Add(context.AuditIteration);
+            if (context.AuditIteration < 2)
+                return new MechanicalFixerResult(false, "waiting for second iteration");
+
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf '%s\n' \"$1\" >> \"$0\"", $"{workingDirectory}/normalizer.txt", context.AuditIteration.ToString(CultureInfo.InvariantCulture)],
+            }, ct);
+
+            if (!result.Success)
+                throw new InvalidOperationException(result.Stderr);
+
+            return new MechanicalFixerResult(true, $"appended iteration {context.AuditIteration}");
+        }
+    }
+
     private sealed class ThrowingMechanicalFixer : IMechanicalFixer
     {
         public const string FixerName = "throwing-normalizer";
@@ -1490,6 +1637,33 @@ public sealed class MechanicalFixerTests : IDisposable
             MechanicalFixerContext context,
             CancellationToken ct = default)
             => throw new InvalidOperationException("normalizer unavailable");
+    }
+
+    private sealed class OnceFailingAuditor : IAuditor
+    {
+        public string Name => "test:once-failing";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public int Calls { get; private set; }
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            Calls++;
+            return Calls == 1
+                ? Task.FromResult(new AuditResult(false,
+                [
+                    new AuditFinding(Name, AuditSeverity.Error, "first audit requires rework", "scripted one-time failure"),
+                ]))
+                : Task.FromResult(new AuditResult(true, []));
+        }
     }
 
     private sealed class NormalizerAwareOnceFailingAuditor : IAuditor
