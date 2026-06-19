@@ -18,12 +18,15 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
 
         var wrongToken = new string('A', session.Token.Length);
         var wrongTokenStatus = await PostAsync(client, session, "run-x", "stdout", 0, wrongToken, "blocked");
+        var streamTokenForExitStatus = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "0\n");
         var wrongRunStatus = await PostAsync(client, session, "run-y", "stdout", 0, session.Token, "blocked");
 
         Assert.Equal(HttpStatusCode.Unauthorized, wrongTokenStatus);
+        Assert.Equal(HttpStatusCode.Unauthorized, streamTokenForExitStatus);
         Assert.Equal(HttpStatusCode.Forbidden, wrongRunStatus);
         Assert.Empty(chunks);
         Assert.Equal("", session.Stdout);
+        Assert.False(session.TryGetExitCode(out _));
     }
 
     [Fact]
@@ -44,15 +47,21 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
     }
 
     [Fact]
-    public async Task Post_RejectsExitStreamAsUnsupportedOutput()
+    public async Task Post_ExitStreamUsesSeparateTokenAndRecordsExitCode()
     {
         var chunks = new List<string>();
         await using var session = await StartAsync(chunks.Add);
         using var client = new HttpClient();
 
-        var status = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "7\n");
+        var status = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "7\n");
+        var duplicate = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "7\n");
+        var conflicting = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "8\n");
 
-        Assert.Equal(HttpStatusCode.BadRequest, status);
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Equal(HttpStatusCode.OK, duplicate);
+        Assert.Equal(HttpStatusCode.Conflict, conflicting);
+        Assert.True(session.TryGetExitCode(out var exitCode));
+        Assert.Equal(7, exitCode);
         Assert.Empty(chunks);
     }
 

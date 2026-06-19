@@ -236,7 +236,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = token,
-            ["CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN"] = exitToken,
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = exitToken,
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = runId,
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
         };
@@ -273,10 +273,9 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             var stderrRequest = Assert.Single(requests, r => r.Stream == "stderr");
             Assert.Equal(0, stderrRequest.Seq);
             Assert.Equal("err-1\n", stderrRequest.BodyText);
-            // Completion no longer travels over HTTP — the wrapper writes the
-            // exit code to CODEYBOX_AGENT_EXIT_FILE (when set), which the host
-            // reads alongside the process-group probe.
-            Assert.DoesNotContain(requests, r => r.Stream == "exit");
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal(0, exitRequest.Seq);
+            Assert.Equal("0\n", exitRequest.BodyText);
             Assert.DoesNotContain(requests, r => r.BodyText.Contains(token, StringComparison.Ordinal));
             Assert.DoesNotContain(requests, r => r.BodyText.Contains(exitToken, StringComparison.Ordinal));
         }
@@ -304,6 +303,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-log",
             ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
             ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
@@ -329,7 +329,8 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             Assert.Equal("out-log\nerr-log\n", await File.ReadAllTextAsync(logPath));
             // The log-file sidecar stays for the suspend/resume recovery path.
             Assert.Equal("5\n", await File.ReadAllTextAsync(logPath + ".exit"));
-            // The host-trusted sidecar is what the detached supervisor reads.
+            // The sidecar remains diagnostic; detached completion is authenticated
+            // through the HTTP exit stream.
             Assert.Equal("5", (await File.ReadAllTextAsync(exitFile)).Trim());
 
             var requests = server.Requests.ToArray();
@@ -337,8 +338,8 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             Assert.DoesNotContain(requests, r => r.Stream == "stderr");
             Assert.Equal("out-log\nerr-log\n", string.Concat(
                 requests.Where(r => r.Stream == "stdout").OrderBy(r => r.Seq).Select(r => r.BodyText)));
-            // Completion left HTTP — the supervisor reads the sidecar, not /exit.
-            Assert.DoesNotContain(requests, r => r.Stream == "exit");
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal("5\n", exitRequest.BodyText);
         }
         finally
         {
@@ -363,7 +364,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
-            ["CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN"] = "test-exit-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-conflict",
             ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
@@ -409,6 +410,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-log-conflict",
             ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
             ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
@@ -441,11 +443,8 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         if (OperatingSystem.IsWindows()) return;
         if (!await CommandAvailableAsync("python3")) return;
 
-        // The wrapper used to POST /exit and surface 87 on HTTP failure. That
-        // path was removed: completion now travels through the host-trusted
-        // CODEYBOX_AGENT_EXIT_FILE sidecar. The wrapper writes the agent's
-        // exit code there and the supervisor reads it after the process-group
-        // probe reports exited.
+        // Detached completion is authenticated through /exit. The sidecar is
+        // still written for diagnostics / resume paths but is not authoritative.
         await using var server = StubHttpIngestServer.Start(request =>
             request.Stream == "ready" ? 204 : 200);
         var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
@@ -456,6 +455,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         {
             [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
             [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
             [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-exit-sidecar",
             ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
             ["CODEYBOX_AGENT_LOG_FILE"] = "",
@@ -482,7 +482,8 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             var requests = server.Requests.ToArray();
             Assert.Contains(requests, r => r.Stream == "stdout" && r.BodyText == "out-before-exit\n");
             Assert.Contains(requests, r => r.Stream == "stderr" && r.BodyText == "err-before-exit\n");
-            Assert.DoesNotContain(requests, r => r.Stream == "exit");
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal("4\n", exitRequest.BodyText);
         }
         finally
         {
@@ -546,7 +547,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         psi.Environment.Remove("CODEYBOX_AGENT_LOG_FILE");
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
-        psi.Environment.Remove("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN");
+        psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
     }
 

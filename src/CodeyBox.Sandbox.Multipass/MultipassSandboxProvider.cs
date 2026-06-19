@@ -3199,13 +3199,13 @@ test "$work" = present && test "$exec_wrapper" = present
         # variables only for agent CLI invocations that opted into the
         # transport. Copy them into shell locals and remove them from the
         # exported environment before launching the agent. The agent process
-        # inherits neither the stream token nor the run id. Completion no
-        # longer flows over HTTP. Detached runs use a root-owned supervisor
-        # sidecar outside the wrapper environment, so any legacy
-        # CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN is scrubbed defensively even though
-        # it is no longer trusted.
+        # inherits neither the stream token, completion token, nor the run id.
+        # Detached runs authenticate completion through a separate HTTP token;
+        # VM-side sidecars are diagnostic only because the agent has sudo inside
+        # the sandbox.
         codeybox_output_url="${CODEYBOX_AGENT_OUTPUT_URL:-}"
         codeybox_output_token="${CODEYBOX_AGENT_OUTPUT_TOKEN:-}"
+        codeybox_output_exit_token="${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}"
         codeybox_output_run_id="${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}"
         codeybox_exit_file_path="${CODEYBOX_AGENT_EXIT_FILE:-}"
         unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_EXIT_FILE
@@ -3311,11 +3311,15 @@ test "$work" = present && test "$exec_wrapper" = present
         codeybox_http_ready() {
             codeybox_http_post ready 0 "$codeybox_output_token" </dev/null
         }
-        # Best-effort sidecar write. The host polls the detached process group
-        # and reads this file as an optional completion value for non-detached
-        # wrapper users. Detached HTTP runs do not expose this path to the
-        # wrapper; their root-owned supervisor writes the trusted sidecar after
-        # the wrapper exits.
+        codeybox_http_exit() {
+            if [ -z "$codeybox_output_exit_token" ]; then
+                return 0
+            fi
+            printf '%s\n' "$1" | codeybox_http_post exit 0 "$codeybox_output_exit_token"
+        }
+        # Best-effort sidecar write for diagnostic / resume paths. Detached HTTP
+        # runs never trust this value as authoritative because the sandbox user
+        # can sudo-write VM files.
         codeybox_write_exit_file() {
             if [ -z "$codeybox_exit_file_path" ]; then
                 return 0
@@ -3358,10 +3362,17 @@ test "$work" = present && test "$exec_wrapper" = present
                     echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
                     printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
                     codeybox_write_exit_file 87
+                    codeybox_http_exit 87 || true
                     exit 87
                 fi
                 printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
                 codeybox_write_exit_file "$codeybox_user_rc"
+                if ! codeybox_http_exit "$codeybox_user_rc"; then
+                    echo "codeybox-exec: agent output HTTP completion failed during run" >&2
+                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
+                    codeybox_write_exit_file 87
+                    exit 87
+                fi
                 exit "$codeybox_user_rc"
             fi
 
@@ -3384,9 +3395,15 @@ test "$work" = present && test "$exec_wrapper" = present
             if [ "$codeybox_out_stream_rc" -ne 0 ] || [ "$codeybox_err_stream_rc" -ne 0 ]; then
                 echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
                 codeybox_write_exit_file 87
+                codeybox_http_exit 87 || true
                 exit 87
             fi
             codeybox_write_exit_file "$codeybox_user_rc"
+            if ! codeybox_http_exit "$codeybox_user_rc"; then
+                echo "codeybox-exec: agent output HTTP completion failed during run" >&2
+                codeybox_write_exit_file 87
+                exit 87
+            fi
             exit "$codeybox_user_rc"
         fi
         # Tee path is opt-in via CODEYBOX_AGENT_LOG_FILE. When set, both
@@ -5142,7 +5159,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 if (result.ExitCode != 0)
                     return result;
 
-                var detachedExit = await WaitForDetachedCompletionAsync(detachedProcessGroupMarker!, ct)
+                var detachedExit = await WaitForDetachedCompletionAsync(detachedProcessGroupMarker!, agentOutputIngest, ct)
                     .ConfigureAwait(false);
                 var detachedOutput = await ReadDetachedOutputSidecarsAsync(detachedProcessGroupMarker!, ct)
                     .ConfigureAwait(false);
@@ -5565,12 +5582,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
         sb.AppendLine("codeybox_output_token=\"${CODEYBOX_AGENT_OUTPUT_TOKEN:-}\"");
         sb.AppendLine("codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
-        // CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN is no longer trusted as a
-        // completion signal. Detached completion comes from the root-owned
-        // supervisor sidecar; stale values from a prior turn are scrubbed
-        // defensively so the wrapper / agent never sees them. The agent run id
-        // intentionally remains visible so host-shutdown preemption can target
-        // the detached process tree by run id.
+        // Keep the completion token out of this launch shell and let the
+        // wrapper / detached supervisor source it privately from the env file.
+        // The agent run id intentionally remains visible so host-shutdown
+        // preemption can target the detached process tree by run id.
         sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
         sb.AppendLine("codeybox_http_ready() {");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
@@ -5611,12 +5626,61 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("rm -f \"$0\" 2>/dev/null || true");
         sb.AppendLine("codeybox_pgid_marker=$1");
         sb.AppendLine("codeybox_stdin_file=$2");
+        sb.AppendLine("codeybox_env_file=$3");
+        sb.AppendLine("shift");
         sb.AppendLine("shift");
         sb.AppendLine("shift");
         sb.AppendLine("codeybox_root_sh() {");
         sb.AppendLine("    local codeybox_script=\"$1\"");
         sb.AppendLine("    shift");
         sb.AppendLine("    sudo -n sh -c \"$codeybox_script\" codeybox-root-sh \"$@\"");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_output_url=");
+        sb.AppendLine("codeybox_output_run_id=");
+        sb.AppendLine("codeybox_output_exit_token=");
+        sb.AppendLine("if [ -r \"$codeybox_env_file\" ]; then");
+        sb.AppendLine("    . \"$codeybox_env_file\"");
+        sb.AppendLine("    codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
+        sb.AppendLine("    codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
+        sb.AppendLine("    codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"");
+        sb.AppendLine("    unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
+        sb.AppendLine("fi");
+        sb.AppendLine("codeybox_http_exit() {");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN=\"$codeybox_output_exit_token\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_EXIT_CODE=\"$1\" \\");
+        sb.AppendLine("python3 - <<'PY'");
+        sb.AppendLine("import os, sys, time, urllib.error, urllib.parse, urllib.request");
+        sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
+        sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
+        sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN', '')");
+        sb.AppendLine("exit_code = os.environ.get('CODEYBOX_AGENT_EXIT_CODE', '')");
+        sb.AppendLine("if not base or not run_id or not token or not exit_code:");
+        sb.AppendLine("    sys.exit(0)");
+        sb.AppendLine("url = base + '/' + urllib.parse.quote(run_id, safe='') + '/exit/0'");
+        sb.AppendLine("data = (exit_code + '\\n').encode('utf-8')");
+        sb.AppendLine("deadline = time.monotonic() + 300.0");
+        sb.AppendLine("attempt = 0");
+        sb.AppendLine("while True:");
+        sb.AppendLine("    req = urllib.request.Request(url, data=data, method='POST', headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain; charset=utf-8'})");
+        sb.AppendLine("    try:");
+        sb.AppendLine("        with urllib.request.urlopen(req, timeout=10.0) as resp:");
+        sb.AppendLine("            code = resp.getcode()");
+        sb.AppendLine("            if 200 <= code < 300:");
+        sb.AppendLine("                sys.exit(0)");
+        sb.AppendLine("            if code in (401, 403, 409, 413):");
+        sb.AppendLine("                sys.exit(70)");
+        sb.AppendLine("    except urllib.error.HTTPError as exc:");
+        sb.AppendLine("        if exc.code in (401, 403, 409, 413):");
+        sb.AppendLine("            sys.exit(70)");
+        sb.AppendLine("    except Exception:");
+        sb.AppendLine("        pass");
+        sb.AppendLine("    if time.monotonic() >= deadline:");
+        sb.AppendLine("        sys.exit(75)");
+        sb.AppendLine("    time.sleep(min(5.0, 0.1 * (2 ** min(attempt, 5))))");
+        sb.AppendLine("    attempt += 1");
+        sb.AppendLine("PY");
         sb.AppendLine("}");
         sb.AppendLine("codeybox_pgid=$$");
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1; pgid=$2; tmp=\"${marker}.tmp\"; umask 077; printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\" && { chown root:root \"$marker\" 2>/dev/null || true; } && chmod 0600 \"$marker\"' \"$codeybox_pgid_marker\" \"$codeybox_pgid\"; then");
@@ -5653,10 +5717,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine($"    exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("fi");
         sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
+        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
-        sb.Append("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\"");
+        sb.Append("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\"");
         foreach (var arg in command)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
         sb.AppendLine(" </dev/null >/dev/null 2>/dev/null &");
@@ -5722,9 +5787,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     private async Task<DetachedExitResult> WaitForDetachedCompletionAsync(
         string processGroupMarker,
+        MultipassAgentOutputHttpIngestSession ingest,
         CancellationToken ct)
     {
-        // Trust only the root-owned process-group probe and exit-code sidecar.
+        // Trust only host-observed liveness plus the authenticated HTTP exit
+        // completion. VM-side sidecars are diagnostic only: the agent can sudo
+        // inside the sandbox and must not be able to forge a successful exit.
         var pollFailures = 0;
         while (true)
         {
@@ -5759,21 +5827,32 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                     1,
                     $"detached exec process group marker {processGroupMarker} was not written\n");
             if (state.Status == DetachedProcessGroupStatus.Alive)
+            {
+                if (ingest.TryGetExitCode(out var authenticatedExitCode))
+                {
+                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    return new DetachedExitResult(authenticatedExitCode, reapError);
+                }
+
                 continue;
+            }
             if (state.Status == DetachedProcessGroupStatus.Exited)
             {
-                if (state.ExitCode is { } exitCode)
+                if (ingest.TryGetExitCode(out var exitCode))
                 {
                     var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
                     return new DetachedExitResult(exitCode, reapError);
                 }
 
-                // PG is gone but the wrapper did not write the exit sidecar.
-                // The wrapper crashed, was killed, or never reached the sidecar
-                // write — surface a diagnostic rather than guessing success.
+                if (state.ProcessGroupAlive)
+                    continue;
+
+                // PG is gone but the wrapper never delivered the host-authenticated
+                // completion. The wrapper crashed, was killed, or could not reach
+                // the ingest listener — surface a diagnostic rather than guessing.
                 return new DetachedExitResult(
                     1,
-                    $"detached exec process group {state.ProcessGroupId} exited without writing the exit-code sidecar\n");
+                    $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
             }
         }
     }

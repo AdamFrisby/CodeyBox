@@ -7,6 +7,12 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <AnalysisLevel>latest</AnalysisLevel>
+    <!-- SQLitePCLRaw.lib.e_sqlite3 has no patched 2.x package available
+         (latest remains 2.1.11), and Microsoft.Data.Sqlite 10.0.9 still pulls
+         that native asset. Keep NU1903 visible in restore output instead of
+         hiding it with NuGetAuditSuppress; remove this demotion when the
+         SQLite provider graph can move to a patched native package. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1903</WarningsNotAsErrors>
     <!-- Suppress satellite-assembly scanning during ResolveAssemblyReference.
          This is required solution-wide because the build host is fork-heavy
          and the directory-enumeration inside RAR hits ENOMEM on multiple
@@ -17,14 +23,5 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <ResolveAssemblyReferencesFindRelatedSatellites>false</ResolveAssemblyReferencesFindRelatedSatellites>
   </PropertyGroup>
-
-  <ItemGroup>
-    <!-- Microsoft.Data.Sqlite 10.0.x still pins SQLitePCLRaw.bundle_e_sqlite3/core
-         2.1.11. SQLitePCLRaw 3.x moves the native package to SourceGear.sqlite3,
-         but adopting that graph requires a Microsoft.Data.Sqlite.Core/provider
-         migration rather than a safe patch bump. Keep restore unblocked until
-         the Microsoft.Data.Sqlite line ships a patched native dependency. -->
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-2m69-gcr7-jv3q" />
-  </ItemGroup>
 
 </Project>

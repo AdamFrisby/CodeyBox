@@ -349,8 +349,7 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         // from stdin when no positional prompt is given (per its --help). The
         // SandboxExec.Stdin is then delivered by the sandbox: attached exec uses
         // the wrapper's --keep-stdin path, while detached HTTP-ingest exec
-        // materializes the prompt in the VM and invokes the wrapper with
-        // --stdin-file.
+        // bridges a supervisor-owned stdin sidecar into that same wrapper stdin.
         if (!string.IsNullOrEmpty(sessionIdForResume))
         {
             // `--` halts clap's option parsing so a session id that somehow
