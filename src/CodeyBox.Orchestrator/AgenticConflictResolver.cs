@@ -416,6 +416,44 @@ public sealed class AgenticConflictResolver
                 }
                 catch (AgentSessionResumeExhaustedException ex)
                 {
+                    lastAgentResult = ex.LastResult;
+                    var resumeAuthDetection = _authFailureClassifier.DetectDetailed(
+                        runner.Kind,
+                        ex.LastResult.Stderr,
+                        ex.LastResult.Stdout);
+                    if (resumeAuthDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+                    {
+                        var authEvidence = await RecordAuthFailureAsync(
+                            runner,
+                            resumeAuthDetection,
+                            agentSucceeded: false,
+                            resolutionSucceeded: false,
+                            authFailures,
+                            authFailureCallback,
+                            ct);
+                        var authReason = authEvidence.Classification.Reason ?? "auth/login prompt matched";
+                        _log.LogWarning(ex,
+                            "Agentic conflict resolver: agent '{Agent}' exhausted session resume with auth/login prompt on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
+                            runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
+                        AuditLog.AgenticConflictResolverAttemptFailed(
+                            workItemId, runner.Kind, sandbox.Id, workingDirectory,
+                            attempt, maxAttemptsPerAgent,
+                            $"auth required after session resume exhausted: {authReason}",
+                            stdoutTail: RedactAuditTail(ex.LastResult.Stdout),
+                            stderrTail: RedactAuditTail(ex.LastResult.Stderr));
+                        attemptTrail.Add($"{runner.Kind.Value}#{attempt}(auth required after session resume exhausted: {Truncate(authReason, 120)})");
+                        lastFailureRunner = runner;
+                        lastFailureCredential = candidate.Credential;
+                        lastFailureClassificationResult = new AgentResult(
+                            false,
+                            $"auth required: {authReason}",
+                            ex.LastResult.Stdout,
+                            ex.LastResult.Stderr);
+                        lastVerificationError = $"auth required: {authReason}";
+                        totalIterations = Math.Max(0, totalIterations - 1);
+                        break;
+                    }
+
                     _log.LogWarning(ex,
                         "Agentic conflict resolver: agent '{Agent}' exhausted session resume on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir})",
                         runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
@@ -427,7 +465,6 @@ public sealed class AgenticConflictResolver
                         stderrTail: RedactAuditTail(ex.LastResult.Stderr));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(session resume exhausted: {RedactAndTruncate(ex.LastResult.Summary, 120)}; stderr: {RedactAndTruncate(ex.LastResult.Stderr, 200)})");
-                    lastAgentResult = ex.LastResult;
                     RecordFailureForClassification(runner, candidate.Credential, ex.LastResult, allowTransientBackoff: true);
                     break;
                 }
@@ -471,7 +508,6 @@ public sealed class AgenticConflictResolver
                 {
                     var authEvidence = await RecordAuthFailureAsync(
                         runner,
-                        agentResult,
                         authDetection,
                         agentSucceeded: agentResult.Success,
                         resolutionSucceeded: false,
@@ -481,10 +517,10 @@ public sealed class AgenticConflictResolver
                     var authReason = authEvidence.Classification.Reason ?? "auth/login prompt matched";
                     _log.LogWarning(
                         "Agentic conflict resolver: agent '{Agent}' emitted auth/login prompt on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
-                        runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, workingDirectory);
+                        runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
                     AuditLog.AgenticConflictResolverAttemptFailed(
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
-                        attempt, maxIterations,
+                        attempt, maxAttemptsPerAgent,
                         $"auth required: {authReason}",
                         stdoutTail: RedactAuditTail(agentResult.Stdout),
                         stderrTail: RedactAuditTail(agentResult.Stderr));
@@ -511,7 +547,6 @@ public sealed class AgenticConflictResolver
                     {
                         var authEvidence = await RecordAuthFailureAsync(
                             runner,
-                            agentResult,
                             authDetection,
                             agentSucceeded: false,
                             resolutionSucceeded: false,
@@ -521,10 +556,10 @@ public sealed class AgenticConflictResolver
                         var authReason = authEvidence.Classification.Reason ?? "auth/login prompt matched";
                         _log.LogWarning(
                             "Agentic conflict resolver: failed agent '{Agent}' emitted stdout auth/login prompt on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
-                            runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, workingDirectory);
+                            runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
                         AuditLog.AgenticConflictResolverAttemptFailed(
                             workItemId, runner.Kind, sandbox.Id, workingDirectory,
-                            attempt, maxIterations,
+                            attempt, maxAttemptsPerAgent,
                             $"auth required: {authReason}",
                             stdoutTail: RedactAuditTail(agentResult.Stdout),
                             stderrTail: RedactAuditTail(agentResult.Stderr));
@@ -591,7 +626,6 @@ public sealed class AgenticConflictResolver
                 {
                     var authEvidence = await RecordAuthFailureAsync(
                         runner,
-                        agentResult,
                         authDetection,
                         agentSucceeded: true,
                         resolutionSucceeded: false,
@@ -601,10 +635,10 @@ public sealed class AgenticConflictResolver
                     var authReason = authEvidence.Classification.Reason ?? "auth/login prompt matched";
                     _log.LogWarning(
                         "Agentic conflict resolver: agent '{Agent}' emitted stdout auth/login prompt and failed verification on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
-                        runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, workingDirectory);
+                        runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
                     AuditLog.AgenticConflictResolverAttemptFailed(
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
-                        attempt, maxIterations,
+                        attempt, maxAttemptsPerAgent,
                         $"auth required: {authReason}",
                         stdoutTail: RedactAuditTail(agentResult.Stdout),
                         stderrTail: RedactAuditTail(agentResult.Stderr));
@@ -699,7 +733,6 @@ public sealed class AgenticConflictResolver
 
     private async Task<AgenticConflictResolverAuthFailureEvidence> RecordAuthFailureAsync(
         IAgentRunner runner,
-        AgentResult agentResult,
         AgentAuthFailureDetection detection,
         bool agentSucceeded,
         bool resolutionSucceeded,

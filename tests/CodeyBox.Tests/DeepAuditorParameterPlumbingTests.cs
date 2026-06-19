@@ -155,6 +155,32 @@ public sealed class DeepAuditorParameterPlumbingTests
         Assert.Equal("ok", result.AgentSummary);
     }
 
+    [Theory]
+    [MemberData(nameof(DeepAuditorCases))]
+    public async Task DeepAuditors_ValidVerdict_PreserveAgentAuthMetadata(
+        IDeepAuditor auditor,
+        string resultFile)
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var runner = new CapturingAgentRunner
+        {
+            Result = new AgentResult(true, "ok", transcript, "stderr auth prompt"),
+        };
+
+        var result = await auditor.RunAsync(
+            new VerdictSandbox(resultFile),
+            "/work",
+            NewContext(runner));
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+        Assert.Equal(transcript, result.RawOutput);
+        Assert.Equal(transcript, result.AgentStdout);
+        Assert.Equal("stderr auth prompt", result.AgentStderr);
+        Assert.Equal("ok", result.AgentSummary);
+    }
+
     private sealed class CapturingAgentRunner : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;

@@ -312,7 +312,8 @@ internal static class TestSupport
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
             mechanicalFixerComposer: mechanicalComposer,
-            mechanicalFixerInputProviders: mechanicalFixerInputProviders);
+            mechanicalFixerInputProviders: mechanicalFixerInputProviders,
+            inVmSmokeGate: inVmSmokeGate);
 
         return new TestPipeline(
             pipeline,

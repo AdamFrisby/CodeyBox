@@ -127,6 +127,25 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_ExcludesAgent()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("auth/login prompt detected", availability.Reason);
+    }
+
+    [Fact]
     public async Task CacheHit_DoesNotReprovision()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));

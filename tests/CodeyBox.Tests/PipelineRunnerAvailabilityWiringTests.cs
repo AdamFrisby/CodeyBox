@@ -765,7 +765,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthFragment_DoesNotBenchAgent()
+    public async Task StdoutOnlyAuthFragment_FromNoDiffWorkRun_ExcludesAgent()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
@@ -782,13 +782,18 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("Agent produced no changes to commit", final.LastError);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.DoesNotContain("Agent produced no changes to commit", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.True(availability.Available);
-        Assert.Null(availability.Reason);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
 
-        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
     [Fact]
@@ -904,7 +909,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditStdoutOnlyAuthPrompt_WithoutInVmSmoke_BenchesAgentAndPublishesPersistentAlert()
+    public async Task AuditStdoutOnlyAuthPrompt_WithoutInVmSmoke_FailsWithoutUncorroboratedFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -925,20 +930,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
+        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.True(availability.Available, availability.Reason);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuditRawOutputOnlyAuthPrompt_WithoutInVmSmoke_BenchesAgentAndPublishesPersistentAlert()
+    public async Task AuditRawOutputOnlyAuthPrompt_WithoutInVmSmoke_FailsWithoutUncorroboratedFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -959,20 +960,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
+        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.True(availability.Available, availability.Reason);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuditStdoutOnlyAuthPrompt_WithPersistentInVmFailure_BenchesWithoutProbeCorroboration()
+    public async Task AuditStdoutOnlyAuthPrompt_WithPersistentAuthInVmFailure_BenchesAfterProbeCorroboration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -994,8 +991,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Contains("stdout corroborated by forced in-VM smoke probe", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -1008,7 +1005,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration_BenchesWithoutProbeCorroboration()
+    public async Task AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration_FailsWithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -1030,21 +1027,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.True(availability.Available, availability.Reason);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuditStdoutOnlyAuthPrompt_WithPassingInVmProbe_BenchesWithoutProbeVeto()
+    public async Task AuditStdoutOnlyAuthPrompt_WithPassingInVmProbe_FailsWithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -1066,21 +1059,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.True(availability.Available, availability.Reason);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuditStdoutOnlyAuthPrompt_WithTransientInVmFailure_BenchesWithoutProbeVeto()
+    public async Task AuditStdoutOnlyAuthPrompt_WithNonAuthInVmFailure_FailsWithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -1103,17 +1092,13 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.True(availability.Available, availability.Reason);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -1615,7 +1600,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            inVmSmokeGate: inVmSmokeGate);
 
         return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
     }

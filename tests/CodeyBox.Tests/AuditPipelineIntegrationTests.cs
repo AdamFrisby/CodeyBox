@@ -274,7 +274,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_Exit0StdoutAuthPromptWithoutResult_BenchesAgentAndPublishesAlert()
+    public async Task LlmAuditAgent_Exit0StdoutAuthPromptWithoutResult_FailsWithoutUncorroboratedFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -315,13 +315,11 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("audit:security:llm-review", final.LastError);
+        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
 
-        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
-        Assert.Contains("audit:security:llm-review", details.Reason);
+        var agentAvailability = availability.GetAvailability(AgentKind.Claude);
+        Assert.True(agentAvailability.Available, agentAvailability.Reason);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -378,7 +376,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_StdoutAuthPromptWithQuotaDiagnostic_BenchesBeforeQuotaParking()
+    public async Task LlmAuditAgent_StdoutAuthPromptWithQuotaDiagnostic_FailsBeforeQuotaParkingWithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
@@ -421,9 +419,11 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Null(final.QuotaRetryFrom);
         Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
 
-        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
-        Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var agentAvailability = availability.GetAvailability(AgentKind.Claude);
+        Assert.True(agentAvailability.Available, agentAvailability.Reason);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]

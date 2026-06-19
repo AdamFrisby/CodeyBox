@@ -423,6 +423,60 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_SessionResumeExhaustedAuthPrompt_FallbackSuccessPreservesAuthEvidence()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions
+            {
+                MaxIterations = 2,
+                MaxAttemptsPerAgent = 1,
+            }));
+
+        var authTranscript = """
+            Authentication required. Please visit the URL to log in:
+            https://accounts.google.com/o/oauth2/auth?client_id=redacted
+            Waiting for authentication (timeout 30s)...
+            Error: authentication timed out.
+            """;
+        var primary = new FakeAgentResolverRunner(_ =>
+            throw new AgentSessionResumeExhaustedException(
+                new AgentKind("primary"),
+                maxResumeAttempts: 2,
+                new AgentResult(false, "agent exited 1", authTranscript, null)))
+        { Kind = new AgentKind("primary") };
+        var fallback = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "resolved", null, null);
+        })
+        { Kind = new AgentKind("fallback") };
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [
+                new AgenticConflictResolverCandidate(primary, Credential: null),
+                new AgenticConflictResolverCandidate(fallback, Credential: null),
+            ],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Same(fallback, result.ChosenRunner);
+        var authFailure = Assert.Single(result.AuthFailures ?? []);
+        Assert.Same(primary, authFailure.Runner);
+        Assert.False(authFailure.AgentSucceeded);
+        Assert.False(authFailure.ResolutionSucceeded);
+        Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
+        Assert.True(authFailure.StdoutOnlyEvidence);
+    }
+
+    [Fact]
     public async Task ResolveAsync_SessionResumeExhausted_RedactsStderrFromSummary()
     {
         var sandbox = new ConflictSandbox();

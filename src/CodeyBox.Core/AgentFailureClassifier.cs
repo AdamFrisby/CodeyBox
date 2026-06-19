@@ -329,7 +329,7 @@ public static class AgentFailureClassifier
         var matchedStderr = ContainsAuthRequiredPatternInStderr(stderr);
         var matchedStderrAuthError = ContainsAuthErrorPattern(stderr);
         var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
-        var matchedDefaultStdout = matchedTrustedStdoutTranscript;
+        var matchedDefaultStdout = ContainsAuthRequiredPatternInStdout(stdout);
         var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
         var matchedConfiguredStdout = false;
 
@@ -532,7 +532,29 @@ public static class AgentFailureClassifier
         ContainsAny(text, AuthPatterns);
 
     public static bool ContainsAuthRequiredPatternInStdout(string? stdout) =>
-        ContainsTrustedStdoutLoginTranscript(stdout);
+        ContainsTrustedStdoutLoginTranscript(stdout) || ContainsShortAuthRequiredStdout(stdout);
+
+    private static bool ContainsShortAuthRequiredStdout(string? stdout)
+    {
+        // Stdout can be model-controlled, so accept only short outputs whose
+        // non-empty lines are themselves CLI-shaped login prompts. This catches
+        // one-line auth prompts without accepting prose that embeds the same
+        // strings as examples.
+        const int maxTrustedStdoutLoginChars = 4096;
+        const int maxTrustedStdoutLoginLines = 8;
+
+        if (string.IsNullOrWhiteSpace(stdout))
+            return false;
+        if (stdout.Length > maxTrustedStdoutLoginChars)
+            return false;
+
+        var lines = stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+        return lines.Length is > 0 and <= maxTrustedStdoutLoginLines
+            && lines.All(IsAuthRequiredStdoutLine)
+            && lines.Any(IsAuthRequiredStdoutLine);
+    }
 
     public static bool ContainsAuthRequiredFragmentInStdout(string? stdout)
     {
@@ -596,12 +618,21 @@ public static class AgentFailureClassifier
             return true;
         }
 
-        return line.Contains("run `agy login`", StringComparison.OrdinalIgnoreCase)
+        if (line.Contains("run `agy login`", StringComparison.OrdinalIgnoreCase)
             || line.Contains("run `gemini auth login`", StringComparison.OrdinalIgnoreCase)
             || line.Contains("run `agent login`", StringComparison.OrdinalIgnoreCase)
             || line.Contains("run `opencode auth login`", StringComparison.OrdinalIgnoreCase)
             || line.Contains("run `codex login`", StringComparison.OrdinalIgnoreCase)
-            || line.Contains("run `claude login`", StringComparison.OrdinalIgnoreCase);
+            || line.Contains("run `claude login`", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var lower = line.ToLowerInvariant();
+        return (lower.StartsWith("not logged into ", StringComparison.Ordinal)
+                || lower.StartsWith("not logged in", StringComparison.Ordinal))
+            && lower.Contains("run ", StringComparison.Ordinal)
+            && lower.Contains(" login", StringComparison.Ordinal);
     }
 
     private static bool ContainsStandaloneOAuthLoginUrlLine(string? text) =>

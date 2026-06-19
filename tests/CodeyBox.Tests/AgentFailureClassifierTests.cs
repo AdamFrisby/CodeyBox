@@ -126,14 +126,15 @@ public sealed class AgentFailureClassifierTests
 
     [Theory]
     [InlineData("not logged into opencode; run `opencode auth login`")]
+    [InlineData("not logged into agy; run agy login")]
     [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
     [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
     [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
     [InlineData("Error: authentication timed out.")]
-    public void LoginPromptFragments_InStdout_AreNotAuthRequiredByDefault(string snippet)
+    public void LoginPromptFragments_InStdout_AreAuthRequiredByDefault(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
-        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Theory]
@@ -172,15 +173,19 @@ public sealed class AgentFailureClassifierTests
 
     [Theory]
     [InlineData("not logged into opencode; run `opencode auth login`")]
+    [InlineData("not logged into agy; run agy login")]
     [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
-    public void AgentAuthFailureClassifier_DoesNotBenchDefaultFragments_InStdout(string snippet)
+    public void AgentAuthFailureClassifier_DetectsDefaultFragments_InStdout(string snippet)
     {
         var detection = new AgentAuthFailureClassifier().DetectDetailed(
             AgentKind.Opencode,
             stderr: null,
             stdout: snippet);
 
-        Assert.Null(detection);
+        Assert.NotNull(detection);
+        Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
+        Assert.True(detection.IsStdoutOnly);
+        Assert.True(detection.MatchedDefaultStdoutPattern);
     }
 
     [Theory]

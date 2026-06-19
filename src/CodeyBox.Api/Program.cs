@@ -2413,7 +2413,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
     mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
-    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
+    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
+    inVmSmokeGate: sp.GetService<IInVmSmokeGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

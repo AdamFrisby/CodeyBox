@@ -546,7 +546,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         AgentSmokeResult result;
         try
         {
-            result = await RunStepsInSandboxAsync(credential, target, resolvedBaselineRef, steps, sw, ct);
+            result = await RunStepsInSandboxAsync(probe.Kind, credential, target, resolvedBaselineRef, steps, sw, ct);
         }
         catch (TimeoutException ex)
         {
@@ -633,6 +633,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     }
 
     private async Task<AgentSmokeResult> RunStepsInSandboxAsync(
+        AgentKind kind,
         AgentCredential? credential,
         InVmSmokeSandboxTarget target,
         string baselineRef,
@@ -653,6 +654,21 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                 Argv = step.Argv,
                 Stdin = step.Stdin,
             }, linked.Token);
+
+            var authDetection = AgentFailureClassifier.DetectAuthRequired(
+                kind,
+                exec.Stderr,
+                exec.Stdout);
+            if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            {
+                sw.Stop();
+                var hint = step.FailureHint ?? (step.Argv.Count > 0 ? step.Argv[0] : "step");
+                return new AgentSmokeResult(
+                    false,
+                    $"{hint} (auth/login prompt detected)",
+                    sw.Elapsed,
+                    SmokeFailureCategory.Persistent);
+            }
 
             if (exec.ExitCode != 0)
             {
