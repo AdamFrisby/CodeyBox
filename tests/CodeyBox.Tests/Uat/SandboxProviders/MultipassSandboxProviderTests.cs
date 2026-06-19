@@ -622,6 +622,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void MultipassProvider_AdvertisesConservativeBatchCapabilities()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(0, "", "")));
+        var provider = NewProvider(_workspace, runner: runner);
+
+        Assert.Equal(SandboxAgentOutputTransportKind.ExecPipe, provider.AgentOutputTransportKind);
+        Assert.Equal(SandboxBatchLaunchMode.Attached, provider.BatchLaunchMode);
+    }
+
+    [Fact]
     public void MultipassSandbox_HttpIngestBindAddressAdvertisesDetachedBatchLaunch()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
@@ -691,7 +702,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Equal("prompt over stdin\n", stdin);
+                AssertDetachedLaunchStdin(stdin, "prompt over stdin\n");
                 var launchResult = await localVm.RunLaunchScriptAsync(launchScript, stdin, ct);
                 Assert.NotNull(transferredEnvContent);
                 var url = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
@@ -752,7 +763,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain(
             MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable,
             transferredEnvContent);
-        Assert.False(string.IsNullOrWhiteSpace(transferredExitTokenContent));
+        Assert.Null(transferredExitTokenContent);
         Assert.Equal("hello detached:prompt over stdin\n", result.Stdout);
         Assert.Equal("warn detached:prompt over stdin\n", result.Stderr);
         Assert.Equal(["hello detached:prompt over stdin\n"], stdoutChunks);
@@ -775,7 +786,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                  && script.Contains("/detached-", StringComparison.Ordinal));
         Assert.False(launchCall.HasStdoutChunkCallback);
         Assert.False(launchCall.HasStderrChunkCallback);
-        Assert.Equal("prompt over stdin\n", launchCall.Stdin);
+        AssertDetachedLaunchStdin(launchCall.Stdin, "prompt over stdin\n");
     }
 
     [Fact]
@@ -802,7 +813,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Equal(prompt, stdin);
+                AssertDetachedLaunchStdin(stdin, prompt);
                 return await localVm.RunLaunchScriptAsync(launchScript, stdin, ct);
             }
             if (IsDetachedOutputSidecarRead(argv))
@@ -867,8 +878,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
-                return await localVm.RunLaunchScriptAsync(launchScript, stdin: null, ct);
+                AssertDetachedLaunchStdin(stdin);
+                return await localVm.RunLaunchScriptAsync(launchScript, stdin, ct);
             }
             if (IsDetachedOutputSidecarRead(argv))
                 return await localVm.ReadOutputSidecarAsync(argv[^1], ct);
@@ -958,7 +969,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -1007,7 +1018,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupKill(argv))
@@ -1066,7 +1077,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupKill(argv))
@@ -1116,7 +1127,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("unset CODEYBOX_AGENT_RUN_ID", script);
         Assert.Contains("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"", script);
         Assert.Contains("codeybox_exit_token_file=''", script);
-        Assert.Contains("rm -f \"$codeybox_exit_token_file\" 2>/dev/null || true", script);
+        Assert.Contains("codeybox-detached: failed to publish exit token sidecar", script);
+        Assert.Contains("codeybox_output_exit_token=$(codeybox_root_sh 'cat -- \"$1\"", script);
+        Assert.Contains("codeybox_root_sh 'rm -f -- \"$1\"' \"$codeybox_exit_token_file\"", script);
         Assert.Contains("sudo -n sh -c", script);
         Assert.Contains("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"", script);
         Assert.Contains("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi", script);
@@ -1585,7 +1598,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -1642,7 +1655,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -1704,7 +1717,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -1759,7 +1772,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -1818,7 +1831,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -1878,7 +1891,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return new ProcessRunResult(0, "", "");
             }
             if (IsDetachedProcessGroupKill(argv))
@@ -1934,7 +1947,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupKill(argv))
@@ -1986,7 +1999,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -2030,7 +2043,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -2056,8 +2069,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("detached exec process group poll returned malformed output: garbage marker state", result.Stderr);
     }
 
-    [Fact]
-    public async Task ExecAsync_DetachedProcessGroupExitedWithoutAuthenticatedExitReturnsDiagnostic()
+    [Theory]
+    [InlineData("exited 12345\n")]
+    [InlineData("exited 12345 0 gone\n")]
+    public async Task ExecAsync_DetachedProcessGroupExitedWithoutAuthenticatedExitReturnsDiagnostic(string pollOutput)
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
             return;
@@ -2073,14 +2088,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
             {
                 // The PG is gone, but no host-authenticated completion arrived.
                 // The supervisor must surface a diagnostic rather than guessing.
-                return Task.FromResult(new ProcessRunResult(0, "exited 12345\n", ""));
+                return Task.FromResult(new ProcessRunResult(0, pollOutput, ""));
             }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
@@ -2118,7 +2133,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (IsDetachedProcessGroupPoll(argv))
@@ -2163,7 +2178,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 return Task.FromResult(new ProcessRunResult(
                     88,
                     "",
@@ -2323,7 +2338,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 detachedLaunchCalls++;
-                Assert.Equal("prompt over stdin", stdin);
+                AssertDetachedLaunchStdin(stdin, "prompt over stdin");
                 var launchResult = await localVm.RunLaunchScriptAsync(launchScript, stdin, ct);
                 preflightFailedInGeneratedScript =
                     launchResult.ExitCode == MultipassSandbox.AgentOutputHttpSetupFailedExitCode
@@ -2384,7 +2399,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
+                AssertDetachedLaunchStdin(stdin);
                 detachedLaunchObserved.TrySetResult();
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
@@ -5273,6 +5288,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             {
                 ["PATH"] = _fakeSudoBinDir + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
             };
+    }
+
+    private static void AssertDetachedLaunchStdin(string? stdin, string expectedAgentStdin = "")
+    {
+        Assert.NotNull(stdin);
+        var separator = stdin!.IndexOf('\n', StringComparison.Ordinal);
+        Assert.True(separator > 0, "detached launch stdin must start with an exit-token line");
+        var token = stdin[..separator];
+        Assert.Equal(64, token.Length);
+        Assert.All(token, ch => Assert.True(Uri.IsHexDigit(ch), $"non-hex detached exit token character: {ch}"));
+        Assert.Equal(expectedAgentStdin, stdin[(separator + 1)..]);
     }
 
     private static bool IsCodeyboxExecCall(MultipassCall call) => IsCodeyboxExecArgv(call.Argv);

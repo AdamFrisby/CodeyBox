@@ -187,18 +187,42 @@ public sealed class CliAgentStderrTeeTests
         Assert.Equal("fatal: token expired", doc.RootElement.GetProperty("text").GetString());
     }
 
+    [Fact]
+    public async Task ExecuteInvocation_HttpIngestAttachedSandbox_KeepsTransportAndLaunchModeIndependent()
+    {
+        var sandbox = new CapturingTeeSandbox(
+            stdoutChunks: [],
+            stderrChunks: [],
+            transportKind: SandboxAgentOutputTransportKind.HttpIngest,
+            batchLaunchMode: SandboxBatchLaunchMode.Attached);
+        var runner = new TestRunner();
+
+        await runner.RunAsync(sandbox, "/work", "go", credential: null);
+
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.Attached, sandbox.LastExec?.LaunchMode);
+    }
+
     private sealed class CapturingTeeSandbox : ISandbox
     {
         private readonly IReadOnlyList<string> _stdoutChunks;
         private readonly IReadOnlyList<string> _stderrChunks;
 
-        public CapturingTeeSandbox(IReadOnlyList<string> stdoutChunks, IReadOnlyList<string> stderrChunks)
+        public CapturingTeeSandbox(
+            IReadOnlyList<string> stdoutChunks,
+            IReadOnlyList<string> stderrChunks,
+            SandboxAgentOutputTransportKind transportKind = SandboxAgentOutputTransportKind.ExecPipe,
+            SandboxBatchLaunchMode batchLaunchMode = SandboxBatchLaunchMode.Attached)
         {
             _stdoutChunks = stdoutChunks;
             _stderrChunks = stderrChunks;
+            AgentOutputTransportKind = transportKind;
+            BatchLaunchMode = batchLaunchMode;
         }
 
         public string Id => "tee-test-sandbox";
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; }
+        public SandboxBatchLaunchMode BatchLaunchMode { get; }
         public SandboxExec? LastExec { get; private set; }
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)

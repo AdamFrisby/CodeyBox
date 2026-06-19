@@ -197,8 +197,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     }
 
     public string Name => "multipass";
-    public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
-    public SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Detached;
+    // HTTP ingest and detached launch are spec-dependent: the concrete sandbox
+    // advertises them only when its network profile resolves to a host bridge.
+    public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
+    public SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Attached;
 
     private void MarkTrackedActive(string name)
     {
@@ -4994,6 +4996,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         string? detachedExitToken = null;
         string? detachedProcessGroupMarker = null;
         string? detachedStdinFile = null;
+        string? multipassStdin = exec.Stdin;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
         var pipeEnvironment = effectiveEnvironment;
         var prefersDetachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec)
@@ -5073,7 +5076,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                             wrapped,
                             envFile,
                             detachedProcessGroupMarker!,
-                            detachedExitToken ?? "",
                             detachedStdinFile,
                             transferredVmPaths,
                             ct)
@@ -5108,6 +5110,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 detachedExitToken = null;
                 detachedProcessGroupMarker = null;
                 detachedStdinFile = null;
+                multipassStdin = exec.Stdin;
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null, stdinFile: null);
                 argv = BuildMultipassExecArgv(wrapped);
             }
@@ -5117,6 +5120,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null, stdinFile: null);
             argv = BuildMultipassExecArgv(wrapped);
         }
+
+        if (detachedHttpIngest)
+            multipassStdin = BuildDetachedLaunchStdin(detachedExitToken ?? "", exec.Stdin);
 
         var argvBytes = EstimateArgvBytes(argv);
         if (!forceEnvironmentFile && argvBytes > ArgvBytesWarningThreshold)
@@ -5150,7 +5156,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             var result = await MultipassRetry.RunWithRetryAsync(
                 action: innerCt => RunMultipassAsync(
                     argv,
-                    exec.Stdin,
+                    multipassStdin,
                     innerCt,
                     stdoutChunkCallback,
                     stderrChunkCallback,
@@ -5492,25 +5498,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return vmPath;
     }
 
-    private async Task<string> TransferDetachedExitTokenAsync(string exitToken, CancellationToken ct)
-    {
-        var fileName = $"exit-token-{Guid.NewGuid():N}";
-        var hostDir = Path.Combine(_sandboxRoot, "exec-env");
-        Directory.CreateDirectory(hostDir);
-        MultipassSandboxProvider.TryChmod0700(hostDir);
-        var hostPath = Path.Combine(hostDir, fileName);
-        await File.WriteAllTextAsync(hostPath, exitToken, ct);
-        if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-
-        const string vmDir = "/home/ubuntu/.codeybox-exec-env";
-        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
-        await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer detached exit token", ct);
-        var vmPath = $"{vmDir}/{fileName}";
-        await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
-        return vmPath;
-    }
-
     private async Task<string> TransferExecScriptAsync(IReadOnlyList<string> wrapped, CancellationToken ct)
     {
         var fileName = $"exec-{Guid.NewGuid():N}.sh";
@@ -5534,15 +5521,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         IReadOnlyList<string> wrapped,
         string envFile,
         string processGroupMarker,
-        string exitToken,
         string? stdinFile,
         List<string> transferredVmPaths,
         CancellationToken ct)
     {
         var commandScript = await TransferExecScriptAsync(wrapped, ct).ConfigureAwait(false);
         transferredVmPaths.Add(commandScript);
-        var exitTokenFile = await TransferDetachedExitTokenAsync(exitToken, ct).ConfigureAwait(false);
-        transferredVmPaths.Add(exitTokenFile);
+        var exitTokenFile = processGroupMarker + ".exit-token";
         var launchScript = await TransferDetachedLaunchScriptAsync(
             envFile,
             processGroupMarker,
@@ -5553,6 +5538,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         transferredVmPaths.Add(launchScript);
         return [_opts.MultipassBinary, "exec", _name, "--", "/bin/bash", launchScript];
     }
+
+    private static string BuildDetachedLaunchStdin(string exitToken, string? agentStdin)
+        => exitToken + "\n" + (agentStdin ?? "");
 
     private async Task<string> TransferDetachedLaunchScriptAsync(
         string envFile,
@@ -5635,7 +5623,23 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("done");
         sb.AppendLine("trap codeybox_release_lock EXIT");
         sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi");
-        sb.AppendLine("codeybox_root_sh 'rm -f \"$1.tmp\" \"$1.exit.tmp\" \"$1.stdin\" \"$1.stdin.tmp\"' \"$codeybox_pgid_marker\" || true");
+        sb.AppendLine("codeybox_root_sh 'rm -f \"$1.tmp\" \"$1.exit.tmp\" \"$1.exit-token.tmp\" \"$1.stdin\" \"$1.stdin.tmp\"' \"$codeybox_pgid_marker\" || true");
+        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ] && ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_exit_token_file\"; then");
+        sb.AppendLine("    codeybox_output_exit_token=");
+        sb.AppendLine("    IFS= read -r codeybox_output_exit_token || true");
+        sb.AppendLine("    if [ -n \"$codeybox_output_exit_token\" ]; then");
+        sb.AppendLine("        if ! printf '%s' \"$codeybox_output_exit_token\" | codeybox_root_sh 'token_file=$1");
+        sb.AppendLine("token_tmp=\"${token_file}.tmp\"");
+        sb.AppendLine("umask 077");
+        sb.AppendLine("cat > \"$token_tmp\" || exit 1");
+        sb.AppendLine("{ chown root:root \"$token_tmp\" 2>/dev/null || true; }");
+        sb.AppendLine("chmod 0600 \"$token_tmp\" || exit 1");
+        sb.AppendLine("mv -f \"$token_tmp\" \"$token_file\" || exit 1' \"$codeybox_exit_token_file\"; then");
+        sb.AppendLine("            echo \"codeybox-detached: failed to publish exit token sidecar\" >&2");
+        sb.AppendLine($"            exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("        fi");
+        sb.AppendLine("    fi");
+        sb.AppendLine("fi");
         sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
         sb.AppendLine("    if ! codeybox_root_sh 'stdin_file=$1; stdin_tmp=\"${stdin_file}.tmp\"; umask 077; cat > \"$stdin_tmp\" && mv -f \"$stdin_tmp\" \"$stdin_file\" && { chown root:root \"$stdin_file\" 2>/dev/null || true; } && chmod 0600 \"$stdin_file\"' \"$codeybox_stdin_file\"; then");
         sb.AppendLine("        echo \"codeybox-detached: failed to publish stdin sidecar\" >&2");
@@ -5706,9 +5710,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("codeybox_output_url=");
         sb.AppendLine("codeybox_output_run_id=");
         sb.AppendLine("codeybox_output_exit_token=");
-        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ] && [ -r \"$codeybox_exit_token_file\" ]; then");
-        sb.AppendLine("    IFS= read -r codeybox_output_exit_token < \"$codeybox_exit_token_file\" || true");
-        sb.AppendLine("    rm -f \"$codeybox_exit_token_file\" 2>/dev/null || true");
+        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ]; then");
+        sb.AppendLine("    codeybox_output_exit_token=$(codeybox_root_sh 'cat -- \"$1\" 2>/dev/null || true' \"$codeybox_exit_token_file\" || true)");
+        sb.AppendLine("    codeybox_root_sh 'rm -f -- \"$1\"' \"$codeybox_exit_token_file\" || true");
         sb.AppendLine("fi");
         sb.AppendLine("if [ -r \"$codeybox_env_file\" ]; then");
         sb.AppendLine("    . \"$codeybox_env_file\"");
@@ -6235,6 +6239,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 "${codeybox_pgid_marker}.tmp" \
                 "${codeybox_pgid_marker}.exit" \
                 "${codeybox_pgid_marker}.exit.tmp" \
+                "${codeybox_pgid_marker}.exit-token" \
+                "${codeybox_pgid_marker}.exit-token.tmp" \
                 "${codeybox_pgid_marker}.stdout" \
                 "${codeybox_pgid_marker}.stdout.tmp" \
                 "${codeybox_pgid_marker}.stderr" \

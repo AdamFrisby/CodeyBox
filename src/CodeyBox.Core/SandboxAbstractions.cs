@@ -436,9 +436,9 @@ public interface IActiveSandboxProvider
 
 /// <summary>
 /// Lightweight projection of a provider-owned sandbox that is still active for
-/// a work item. Static ownership alone is not watchdog progress; consumers that
-/// use this for progress monitoring should require a changing projection or a
-/// stronger provider-specific activity signal.
+/// a work item. Watchdog consumers may treat stable ownership as a progress
+/// signal for detached VM-local work and use <see cref="Status"/> to report a
+/// richer reason when providers can expose changing activity.
 /// </summary>
 public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string SandboxId, string? Status = null);
 

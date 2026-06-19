@@ -37,9 +37,9 @@ public interface IWorkerProgressActivitySource
 /// Default watchdog activity source. It combines exact host-side process CPU
 /// sampling for sandbox processes that carry
 /// <see cref="SandboxConventions.WorkItemIdEnvironmentVariable"/> with
-/// provider-owned active sandbox activity projections. Stable ownership alone
-/// is deliberately not progress; providers must expose a changing projection
-/// when VM-local work is still making observable progress.
+/// provider-owned active sandbox activity projections. Stable ownership is a
+/// progress signal for detached VM-local work, where the long-lived host-side
+/// agent process is gone and guest CPU is not visible from host <c>/proc</c>.
 /// </summary>
 public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivitySource
 {
@@ -147,10 +147,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
 
         var changed = !string.Equals(signature, previous, StringComparison.Ordinal);
         _activeSandboxSignatures[itemId] = signature;
-        if (!changed)
-            return false;
-
-        reason = "active-sandbox-change";
+        reason = changed ? "active-sandbox-change" : "active-sandbox";
         return true;
     }
 
