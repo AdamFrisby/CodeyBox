@@ -37,8 +37,9 @@ public interface IWorkerProgressActivitySource
 /// Default watchdog activity source. It combines exact host-side process CPU
 /// sampling for sandbox processes that carry
 /// <see cref="SandboxConventions.WorkItemIdEnvironmentVariable"/> with
-/// provider-owned active sandbox ownership. Active sandbox ownership is a
-/// progress signal because VM guest CPU is not visible from the host process
+/// provider-owned active sandbox activity transitions. Active sandbox presence
+/// is only useful as an initial observation; repeated identical ownership is
+/// not progress because VM guest CPU is not visible from the host process
 /// table.
 /// </summary>
 public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivitySource
@@ -138,10 +139,19 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         }
 
         var signature = string.Join("\0\0", signatureParts);
-        var changed = _activeSandboxSignatures.TryGetValue(itemId, out var previous)
-            && !string.Equals(signature, previous, StringComparison.Ordinal);
+        if (!_activeSandboxSignatures.TryGetValue(itemId, out var previous))
+        {
+            _activeSandboxSignatures[itemId] = signature;
+            reason = "active-sandbox";
+            return true;
+        }
+
+        var changed = !string.Equals(signature, previous, StringComparison.Ordinal);
         _activeSandboxSignatures[itemId] = signature;
-        reason = changed ? "active-sandbox-change" : "active-sandbox";
+        if (!changed)
+            return false;
+
+        reason = "active-sandbox-change";
         return true;
     }
 

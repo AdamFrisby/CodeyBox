@@ -622,6 +622,20 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void MultipassSandbox_HttpIngestBindAddressAdvertisesDetachedBatchLaunch()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(0, "", "")));
+        var sandbox = NewLoopbackHttpIngestSandbox(runner);
+
+        Assert.Equal(SandboxAgentOutputTransportKind.HttpIngest, sandbox.AgentOutputTransportKind);
+        Assert.Equal(SandboxBatchLaunchMode.Detached, sandbox.BatchLaunchMode);
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedBatchLaunchesWithoutAttachedCodeyboxExec()
     {
         if (OperatingSystem.IsWindows())
@@ -659,8 +673,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
-                Assert.Null(stdin);
-                var launchResult = await localVm.RunLaunchScriptAsync(launchScript, ct);
+                Assert.Equal("prompt over stdin\n", stdin);
+                var launchResult = await localVm.RunLaunchScriptAsync(launchScript, stdin, ct);
                 Assert.NotNull(transferredEnvContent);
                 var url = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
                 var token = ExtractShellEnvValue(transferredEnvContent!, MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
@@ -720,12 +734,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("warn detached:prompt over stdin\n", result.Stderr);
         Assert.Equal(["hello detached:prompt over stdin\n"], stdoutChunks);
         Assert.Equal(["warn detached:prompt over stdin\n"], stderrChunks);
-        Assert.Equal("prompt over stdin\n", transferredStdinContent);
+        Assert.Null(transferredStdinContent);
         Assert.NotNull(transferredCommandScript);
-        Assert.Contains("--stdin-file", transferredCommandScript);
-        Assert.DoesNotContain("--keep-stdin", transferredCommandScript);
+        Assert.Contains("--keep-stdin", transferredCommandScript);
+        Assert.DoesNotContain("--stdin-file", transferredCommandScript);
+        Assert.DoesNotContain(".codeybox-exec-stdin", transferredCommandScript, StringComparison.Ordinal);
         Assert.NotNull(transferredLaunchScript);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" '/bin/sh'", transferredLaunchScript);
+        Assert.Contains("codeybox_stdin_file='/run/codeybox-exec/detached-", transferredLaunchScript);
+        Assert.Contains("codeybox-detached: failed to publish stdin sidecar", transferredLaunchScript);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" '/bin/sh'", transferredLaunchScript);
         Assert.DoesNotContain("codeybox_exit_marker", transferredLaunchScript);
         Assert.DoesNotContain(runner.Calls, IsCodeyboxExecCall);
 
@@ -735,7 +752,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                  && script.Contains("/detached-", StringComparison.Ordinal));
         Assert.False(launchCall.HasStdoutChunkCallback);
         Assert.False(launchCall.HasStderrChunkCallback);
-        Assert.Null(launchCall.Stdin);
+        Assert.Equal("prompt over stdin\n", launchCall.Stdin);
     }
 
     [Fact]
@@ -762,7 +779,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 Assert.Null(stdin);
-                return await localVm.RunLaunchScriptAsync(launchScript, ct);
+                return await localVm.RunLaunchScriptAsync(launchScript, stdin: null, ct);
             }
             if (IsDetachedOutputSidecarRead(argv))
                 return await localVm.ReadOutputSidecarAsync(argv[^1], ct);
@@ -999,6 +1016,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var script = MultipassSandbox.BuildDetachedLaunchScript(
             "/home/ubuntu/.codeybox-exec-env/env file",
             "/home/ubuntu/.codeybox-exec/detached marker.pgid",
+            null,
             ["/bin/sh", "/home/ubuntu/.codeybox-exec/command script.sh"]);
 
         Assert.Contains(
@@ -1009,7 +1027,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("sudo -n sh -c", script);
         Assert.Contains("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"", script);
         Assert.Contains("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi", script);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
         Assert.Contains("codeybox_detached_pid=$!", script);
         Assert.Contains("codeybox_pgid=$$", script);
         Assert.Contains("printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\"", script);
@@ -1027,6 +1045,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var ex = Assert.Throws<ArgumentOutOfRangeException>(() => MultipassSandbox.BuildDetachedLaunchScript(
             "/home/ubuntu/.codeybox-exec-env/env",
             "/home/ubuntu/.codeybox-exec/detached.pgid",
+            null,
             ["/bin/sh", "-c", "printf should-not-run"],
             launchLockAttempts: -1));
 
@@ -1072,6 +1091,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             MultipassSandbox.BuildDetachedLaunchScript(
                 envFile,
                 processGroupMarker,
+                null,
                 ["/bin/sh", commandScript, visibleEnvironmentFile, visibleRunIdFile, doneFile]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
@@ -1123,7 +1143,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
-            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, ["/bin/sh", commandScript, doneFile]));
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var sw = Stopwatch.StartNew();
@@ -1138,6 +1158,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2.5), $"detached launch stayed attached for {sw.Elapsed}");
         Assert.True(File.Exists(processGroupMarker));
         await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
     }
 
     [Fact]
@@ -1166,7 +1187,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
-            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, ["/bin/sh", commandScript, countFile]));
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, countFile]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var first = await RunLocalProcessAsync(
@@ -1199,6 +1220,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             MultipassSandbox.BuildDetachedLaunchScript(
                 "/does/not/need/to/exist",
                 processGroupMarker,
+                null,
                 ["/bin/sh", "-c", "printf should-not-run"],
                 launchLockAttempts: 0));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -1227,6 +1249,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             MultipassSandbox.BuildDetachedLaunchScript(
                 "/does/not/need/to/exist",
                 processGroupMarker,
+                null,
                 ["/bin/sh", "-c", "printf should-not-run"]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
@@ -1269,6 +1292,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             MultipassSandbox.BuildDetachedLaunchScript(
                 envFile,
                 processGroupMarker,
+                null,
                 ["/bin/sh", "-c", "printf should-not-run"]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
@@ -1320,6 +1344,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             MultipassSandbox.BuildDetachedLaunchScript(
                 envFile,
                 processGroupMarker,
+                null,
                 ["/bin/sh", "-c", "printf should-not-run"]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
@@ -1373,6 +1398,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             MultipassSandbox.BuildDetachedLaunchScript(
                 envFile,
                 processGroupMarker,
+                null,
                 ["/bin/sh", "-c", "exit 3"]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
@@ -1859,7 +1885,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     [Theory]
     [InlineData("env-transfer")]
     [InlineData("env-chmod")]
-    [InlineData("stdin")]
     [InlineData("command")]
     [InlineData("launch")]
     public async Task ExecAsync_DetachedSetupFailureReturnsSetupFailureWithoutAttachedFallback(string failingSetup)
@@ -1878,7 +1903,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 var content = await File.ReadAllTextAsync(hostPath, ct);
                 var isFailingTransfer =
                     (failingSetup == "env-transfer" && destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    || (failingSetup == "stdin" && destination.Contains(".codeybox-exec-stdin/", StringComparison.Ordinal))
                     || (failingSetup == "command"
                         && destination.Contains(".codeybox-exec/", StringComparison.Ordinal)
                         && !content.Contains("codeybox_lock_dir=", StringComparison.Ordinal))
@@ -1978,8 +2002,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 && launchScript.Contains("/detached-", StringComparison.Ordinal))
             {
                 detachedLaunchCalls++;
-                Assert.Null(stdin);
-                var launchResult = await localVm.RunLaunchScriptAsync(launchScript, ct);
+                Assert.Equal("prompt over stdin", stdin);
+                var launchResult = await localVm.RunLaunchScriptAsync(launchScript, stdin, ct);
                 preflightFailedInGeneratedScript =
                     launchResult.ExitCode == MultipassSandbox.AgentOutputHttpSetupFailedExitCode
                     && launchResult.Stderr.Contains(MultipassSandbox.AgentOutputHttpSetupFailureMarker, StringComparison.Ordinal);
@@ -4545,13 +4569,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         IReadOnlyList<string> args,
         CancellationToken ct = default,
         IReadOnlyList<string>? environmentKeysToRemove = null,
-        IReadOnlyDictionary<string, string>? environmentOverrides = null)
+        IReadOnlyDictionary<string, string>? environmentOverrides = null,
+        string? stdin = null)
     {
         var psi = new ProcessStartInfo
         {
             FileName = fileName,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = stdin is not null,
             UseShellExecute = false,
         };
         foreach (var arg in args)
@@ -4568,6 +4594,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         }
 
         using var process = Process.Start(psi)!;
+        if (stdin is not null)
+        {
+            await process.StandardInput.WriteAsync(stdin.AsMemory(), ct);
+            await process.StandardInput.FlushAsync(ct);
+            process.StandardInput.Close();
+        }
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
         try
@@ -4741,7 +4773,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             }
         }
 
-        public async Task<ProcessRunResult> RunLaunchScriptAsync(string vmLaunchScript, CancellationToken ct)
+        public async Task<ProcessRunResult> RunLaunchScriptAsync(string vmLaunchScript, string? stdin, CancellationToken ct)
         {
             var launchScript = MapVmPath(vmLaunchScript);
             var (exit, stdout, stderr) = await RunLocalProcessAsync(
@@ -4756,7 +4788,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                     "CODEYBOX_AGENT_OUTPUT_URL",
                     "CODEYBOX_AGENT_RUN_ID",
                 ],
-                environmentOverrides: FakeSudoPathEnvironment());
+                environmentOverrides: FakeSudoPathEnvironment(),
+                stdin: stdin);
             return new ProcessRunResult(exit, stdout, stderr);
         }
 
@@ -6524,6 +6557,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             MultipassSandbox.BuildDetachedLaunchScript(
                 envFile,
                 processGroupMarker,
+                null,
                 [wrapper, _workspace, "/bin/sh", "-c", "printf launched > \"$1\"; exit 2", "codeybox-detached-no-exit-token", sentinel]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 

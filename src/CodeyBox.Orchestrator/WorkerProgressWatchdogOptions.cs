@@ -41,11 +41,11 @@ public sealed class WorkerProgressWatchdogOptions
     /// <summary>
     /// When true, the watchdog treats item-owned host processes as progress
     /// when either (a) their CPU tick counters advance between observations,
-    /// or (b) a tagged process is currently in an active kernel state
-    /// (<c>R</c> running / <c>D</c> uninterruptible sleep) — a brief
-    /// CPU-bound spike that doesn't span two samples still counts. Static
-    /// presence of a tagged process alone, without either signal, is not
-    /// enough. Sandbox providers derive <c>CODEYBOX_WORK_ITEM_ID</c> from
+    /// or (b) a tagged process is currently in the running kernel state
+    /// (<c>R</c>). A brief CPU-bound spike that doesn't span two samples still
+    /// counts. Static presence of a tagged process alone, including
+    /// uninterruptible sleep (<c>D</c>), is not enough. Sandbox providers derive
+    /// <c>CODEYBOX_WORK_ITEM_ID</c> from
     /// timing work-item context so the signal is scoped to the work item
     /// instead of all agent CLIs on the host. Default true. Hot-reloadable
     /// on the next sweep.

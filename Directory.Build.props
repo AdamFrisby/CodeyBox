@@ -18,4 +18,13 @@
     <ResolveAssemblyReferencesFindRelatedSatellites>false</ResolveAssemblyReferencesFindRelatedSatellites>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Microsoft.Data.Sqlite 10.0.x still pins SQLitePCLRaw.bundle_e_sqlite3/core
+         2.1.11. SQLitePCLRaw 3.x moves the native package to SourceGear.sqlite3,
+         but adopting that graph requires a Microsoft.Data.Sqlite.Core/provider
+         migration rather than a safe patch bump. Keep restore unblocked until
+         the Microsoft.Data.Sqlite line ships a patched native dependency. -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-2m69-gcr7-jv3q" />
+  </ItemGroup>
+
 </Project>
