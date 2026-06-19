@@ -5033,7 +5033,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                     }
                     else
                     {
-                        effectiveEnvironment = MergeExecEnvironment(effectiveEnvironment, agentOutputIngest.BuildEnvironment());
+                        effectiveEnvironment = MergeExecEnvironment(
+                            effectiveEnvironment,
+                            agentOutputIngest.BuildEnvironment(includeExitToken: false));
                     }
                     stdoutChunkCallback = null;
                     stderrChunkCallback = null;
@@ -5197,7 +5199,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             if (detachedHttpIngest)
             {
                 if (result.ExitCode != 0)
+                {
+                    await TryTerminateDetachedProcessGroupAsync(detachedProcessGroupMarker!).ConfigureAwait(false);
                     return result;
+                }
 
                 var detachedExit = await WaitForDetachedCompletionAsync(detachedProcessGroupMarker!, agentOutputIngest, ct)
                     .ConfigureAwait(false);
@@ -5624,10 +5629,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("trap codeybox_release_lock EXIT");
         sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi");
         sb.AppendLine("codeybox_root_sh 'rm -f \"$1.tmp\" \"$1.exit.tmp\" \"$1.exit-token.tmp\" \"$1.stdin\" \"$1.stdin.tmp\"' \"$codeybox_pgid_marker\" || true");
-        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ] && ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_exit_token_file\"; then");
+        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ]; then");
         sb.AppendLine("    codeybox_output_exit_token=");
         sb.AppendLine("    IFS= read -r codeybox_output_exit_token || true");
-        sb.AppendLine("    if [ -n \"$codeybox_output_exit_token\" ]; then");
+        sb.AppendLine("    if [ -n \"$codeybox_output_exit_token\" ] && ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_exit_token_file\"; then");
         sb.AppendLine("        if ! printf '%s' \"$codeybox_output_exit_token\" | codeybox_root_sh 'token_file=$1");
         sb.AppendLine("token_tmp=\"${token_file}.tmp\"");
         sb.AppendLine("umask 077");

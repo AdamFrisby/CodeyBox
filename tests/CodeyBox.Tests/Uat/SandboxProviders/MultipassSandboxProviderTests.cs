@@ -1314,6 +1314,58 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildDetachedLaunchScript_ConsumesExitTokenLineWhenTokenSidecarAlreadyExists()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "detached-existing-exit-token",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-env-existing-exit-token");
+        var launchScript = Path.Combine(_workspace, "detached-launch-existing-exit-token.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-existing-exit-token.pgid");
+        var stdinFile = processGroupMarker + ".stdin";
+        var exitTokenFile = processGroupMarker + ".exit-token";
+        var capturedPromptFile = Path.Combine(_workspace, "detached-existing-exit-token.prompt");
+
+        await File.WriteAllTextAsync(
+            envFile,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment(includeExitToken: false)));
+        await File.WriteAllTextAsync(exitTokenFile, session.ExitToken);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                stdinFile,
+                ["/bin/sh", "-c", "cat > \"$1\"", "codeybox-capture-stdin", capturedPromptFile],
+                exitTokenFile: exitTokenFile));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var (exit, stdout, stderr) = await RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            environmentOverrides: FakeSudoPathEnvironment(),
+            stdin: "retry-token-line-that-must-not-reach-agent\nagent prompt\n");
+        await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(3));
+        await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(6));
+
+        Assert.Equal(0, exit);
+        Assert.Equal("", stdout);
+        Assert.Equal("", stderr);
+        Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
+        Assert.False(File.Exists(exitTokenFile));
+    }
+
+    [Fact]
     public async Task BuildDetachedLaunchScript_TimesOutWhenLaunchLockIsHeld()
     {
         if (OperatingSystem.IsWindows())
@@ -2167,6 +2219,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             return;
 
         var pollCalls = 0;
+        var killCalls = 0;
         var runner = new RecordingMultipassRunner((argv, stdin, _) =>
         {
             if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
@@ -2189,6 +2242,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 pollCalls++;
                 return Task.FromResult(new ProcessRunResult(99, "", "poll should not run after launch failure"));
             }
+            if (IsDetachedProcessGroupKill(argv))
+            {
+                killCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
             if (argv is [_, "exec", _, "--", "rm", "-f", ..])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (IsCodeyboxExecArgv(argv))
@@ -2209,6 +2267,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(88, result.ExitCode);
         Assert.Contains("before publishing process group marker", result.Stderr);
         Assert.Equal(0, pollCalls);
+        Assert.Equal(1, killCalls);
         Assert.DoesNotContain(runner.Calls, IsCodeyboxExecCall);
     }
 
@@ -2485,6 +2544,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.True(result.Success);
         Assert.NotNull(transferredEnvContent);
+        Assert.DoesNotContain(
+            MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable,
+            transferredEnvContent,
+            StringComparison.Ordinal);
         Assert.Equal("pipe stdout\n", result.Stdout);
         Assert.Equal("pipe stderr\n", result.Stderr);
         Assert.Equal(2, execCalls);
