@@ -486,7 +486,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         var entries = _activeSandboxOwners.Values.ToList();
         var result = new List<ActiveSandboxProgress>(entries.Count);
         foreach (var entry in entries)
-            result.Add(new ActiveSandboxProgress(entry.WorkItemId, entry.Sandbox.Id, Status: "active"));
+            result.Add(entry.Sandbox.SnapshotActiveProgress(entry.WorkItemId));
         return result;
     }
 
@@ -4862,6 +4862,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
+    private long _activeProgressVersion;
+    private string _activeProgressStatus = "active";
 
     /// <summary>
     /// True once <see cref="SuspendAsync"/> has frozen this VM's RAM via
@@ -4936,6 +4938,19 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     }
 
     public string Id { get; }
+
+    internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
+    {
+        var version = Volatile.Read(ref _activeProgressVersion);
+        var status = Volatile.Read(ref _activeProgressStatus);
+        return new ActiveSandboxProgress(
+            workItemId,
+            Id,
+            version == 0
+                ? status
+                : status + ":" + version.ToString(CultureInfo.InvariantCulture));
+    }
+
     public SandboxAgentOutputTransportKind AgentOutputTransportKind =>
         TryResolveAgentOutputBindAddress() is null
             ? SandboxAgentOutputTransportKind.ExecPipe
@@ -4976,6 +4991,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         var stderrChunkCallback = exec.StderrChunkCallback;
         var forceEnvironmentFile = false;
         var detachedHttpIngest = false;
+        string? detachedExitToken = null;
         string? detachedProcessGroupMarker = null;
         string? detachedStdinFile = null;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
@@ -5004,11 +5020,21 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                     ct).ConfigureAwait(false);
                 if (agentOutputIngest is not null)
                 {
-                    effectiveEnvironment = MergeExecEnvironment(effectiveEnvironment, agentOutputIngest.BuildEnvironment());
+                    detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
+                    if (detachedHttpIngest)
+                    {
+                        detachedExitToken = agentOutputIngest.ExitToken;
+                        effectiveEnvironment = MergeExecEnvironment(
+                            effectiveEnvironment,
+                            agentOutputIngest.BuildEnvironment(includeExitToken: false));
+                    }
+                    else
+                    {
+                        effectiveEnvironment = MergeExecEnvironment(effectiveEnvironment, agentOutputIngest.BuildEnvironment());
+                    }
                     stdoutChunkCallback = null;
                     stderrChunkCallback = null;
                     forceEnvironmentFile = true;
-                    detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
                     if (detachedHttpIngest)
                     {
                         // Keep detached completion state outside the ubuntu
@@ -5043,7 +5069,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 }
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile, stdinFile: null);
                 argv = detachedHttpIngest
-                    ? await BuildDetachedMultipassExecArgvAsync(wrapped, envFile, detachedProcessGroupMarker!, detachedStdinFile, transferredVmPaths, ct)
+                    ? await BuildDetachedMultipassExecArgvAsync(
+                            wrapped,
+                            envFile,
+                            detachedProcessGroupMarker!,
+                            detachedExitToken ?? "",
+                            detachedStdinFile,
+                            transferredVmPaths,
+                            ct)
                         .ConfigureAwait(false)
                     : BuildMultipassExecArgv(wrapped);
             }
@@ -5072,6 +5105,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 effectiveEnvironment = pipeEnvironment;
                 forceEnvironmentFile = false;
                 detachedHttpIngest = false;
+                detachedExitToken = null;
                 detachedProcessGroupMarker = null;
                 detachedStdinFile = null;
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null, stdinFile: null);
@@ -5360,6 +5394,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         => exec.AgentOutputTransport == SandboxAgentOutputTransportPreference.PreferHttpIngest
             && exec.LaunchMode == SandboxExecLaunchMode.DetachedBatch;
 
+    private void MarkActiveSandboxProgress(string status)
+    {
+        Volatile.Write(ref _activeProgressStatus, status);
+        Interlocked.Increment(ref _activeProgressVersion);
+    }
+
     private System.Net.IPAddress? TryResolveAgentOutputBindAddress()
     {
         if (string.IsNullOrWhiteSpace(_spec.Network.ProfileName))
@@ -5452,6 +5492,25 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return vmPath;
     }
 
+    private async Task<string> TransferDetachedExitTokenAsync(string exitToken, CancellationToken ct)
+    {
+        var fileName = $"exit-token-{Guid.NewGuid():N}";
+        var hostDir = Path.Combine(_sandboxRoot, "exec-env");
+        Directory.CreateDirectory(hostDir);
+        MultipassSandboxProvider.TryChmod0700(hostDir);
+        var hostPath = Path.Combine(hostDir, fileName);
+        await File.WriteAllTextAsync(hostPath, exitToken, ct);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        const string vmDir = "/home/ubuntu/.codeybox-exec-env";
+        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
+        await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer detached exit token", ct);
+        var vmPath = $"{vmDir}/{fileName}";
+        await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
+        return vmPath;
+    }
+
     private async Task<string> TransferExecScriptAsync(IReadOnlyList<string> wrapped, CancellationToken ct)
     {
         var fileName = $"exec-{Guid.NewGuid():N}.sh";
@@ -5475,15 +5534,19 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         IReadOnlyList<string> wrapped,
         string envFile,
         string processGroupMarker,
+        string exitToken,
         string? stdinFile,
         List<string> transferredVmPaths,
         CancellationToken ct)
     {
         var commandScript = await TransferExecScriptAsync(wrapped, ct).ConfigureAwait(false);
         transferredVmPaths.Add(commandScript);
+        var exitTokenFile = await TransferDetachedExitTokenAsync(exitToken, ct).ConfigureAwait(false);
+        transferredVmPaths.Add(exitTokenFile);
         var launchScript = await TransferDetachedLaunchScriptAsync(
             envFile,
             processGroupMarker,
+            exitTokenFile,
             stdinFile,
             ["/bin/sh", commandScript],
             ct).ConfigureAwait(false);
@@ -5494,6 +5557,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private async Task<string> TransferDetachedLaunchScriptAsync(
         string envFile,
         string processGroupMarker,
+        string exitTokenFile,
         string? stdinFile,
         IReadOnlyList<string> command,
         CancellationToken ct)
@@ -5503,7 +5567,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         Directory.CreateDirectory(hostDir);
         MultipassSandboxProvider.TryChmod0700(hostDir);
         var hostPath = Path.Combine(hostDir, fileName);
-        await File.WriteAllTextAsync(hostPath, BuildDetachedLaunchScript(envFile, processGroupMarker, stdinFile, command), ct);
+        await File.WriteAllTextAsync(hostPath, BuildDetachedLaunchScript(envFile, processGroupMarker, stdinFile, command, exitTokenFile: exitTokenFile), ct);
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
@@ -5530,7 +5594,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         string processGroupMarker,
         string? stdinFile,
         IReadOnlyList<string> command,
-        int launchLockAttempts = 300)
+        int launchLockAttempts = 300,
+        string? exitTokenFile = null)
     {
         if (launchLockAttempts < 0)
             throw new ArgumentOutOfRangeException(nameof(launchLockAttempts), "Launch lock attempts must be non-negative.");
@@ -5541,6 +5606,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.Append("codeybox_env_file=").Append(MultipassSandboxProvider.ShellSingleQuote(envFile)).Append('\n');
         sb.Append("codeybox_pgid_marker=").Append(MultipassSandboxProvider.ShellSingleQuote(processGroupMarker)).Append('\n');
         sb.Append("codeybox_stdin_file=").Append(MultipassSandboxProvider.ShellSingleQuote(stdinFile ?? "")).Append('\n');
+        sb.Append("codeybox_exit_token_file=").Append(MultipassSandboxProvider.ShellSingleQuote(exitTokenFile ?? "")).Append('\n');
         sb.Append("codeybox_lock_max=").Append(launchLockAttempts.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.AppendLine("codeybox_supervisor_dir=$(dirname \"$codeybox_pgid_marker\")");
         sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
@@ -5582,10 +5648,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
         sb.AppendLine("codeybox_output_token=\"${CODEYBOX_AGENT_OUTPUT_TOKEN:-}\"");
         sb.AppendLine("codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
-        // Keep the completion token out of this launch shell and let the
-        // wrapper / detached supervisor source it privately from the env file.
-        // The agent run id intentionally remains visible so host-shutdown
-        // preemption can target the detached process tree by run id.
+        // Keep HTTP transport credentials out of the detached agent
+        // environment. CODEYBOX_AGENT_RUN_ID, if present in the caller's
+        // environment, is a separate work-item preemption hint and is left
+        // untouched by this output-transport scrub.
         sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
         sb.AppendLine("codeybox_http_ready() {");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
@@ -5627,6 +5693,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("codeybox_pgid_marker=$1");
         sb.AppendLine("codeybox_stdin_file=$2");
         sb.AppendLine("codeybox_env_file=$3");
+        sb.AppendLine("codeybox_exit_token_file=$4");
+        sb.AppendLine("shift");
         sb.AppendLine("shift");
         sb.AppendLine("shift");
         sb.AppendLine("shift");
@@ -5638,11 +5706,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("codeybox_output_url=");
         sb.AppendLine("codeybox_output_run_id=");
         sb.AppendLine("codeybox_output_exit_token=");
+        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ] && [ -r \"$codeybox_exit_token_file\" ]; then");
+        sb.AppendLine("    IFS= read -r codeybox_output_exit_token < \"$codeybox_exit_token_file\" || true");
+        sb.AppendLine("    rm -f \"$codeybox_exit_token_file\" 2>/dev/null || true");
+        sb.AppendLine("fi");
         sb.AppendLine("if [ -r \"$codeybox_env_file\" ]; then");
         sb.AppendLine("    . \"$codeybox_env_file\"");
         sb.AppendLine("    codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
         sb.AppendLine("    codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
-        sb.AppendLine("    codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"");
         sb.AppendLine("    unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
         sb.AppendLine("fi");
         sb.AppendLine("codeybox_http_exit() {");
@@ -5723,7 +5794,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
-        sb.Append("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\"");
+        sb.Append("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\"");
         foreach (var arg in command)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
         sb.AppendLine(" </dev/null >/dev/null 2>/dev/null &");
@@ -5802,6 +5873,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
 
             var state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (state.Status != DetachedProcessGroupStatus.PollFailed)
+                MarkActiveSandboxProgress("detached-" + state.Status.ToString().ToLowerInvariant());
             if (state.Status == DetachedProcessGroupStatus.PollFailed)
             {
                 pollFailures++;
@@ -6007,7 +6080,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             return new DetachedProcessGroupProbe(
                 DetachedProcessGroupStatus.Malformed,
                 ProcessGroupId: null,
-                ExitCode: null,
                 ProcessGroupAlive: false,
                 Error: result.Stderr.TrimEnd() + "\n");
 
@@ -6015,16 +6087,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             return new DetachedProcessGroupProbe(
                 DetachedProcessGroupStatus.PollFailed,
                 ProcessGroupId: null,
-                ExitCode: null,
                 ProcessGroupAlive: false,
                 Error: $"detached exec process group poll failed (exit {result.ExitCode}): {result.Stderr.TrimEnd()}\n");
 
         var text = result.Stdout.Trim();
         if (string.Equals(text, "missing", StringComparison.Ordinal))
-            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Missing, ProcessGroupId: null, ExitCode: null, ProcessGroupAlive: false, Error: null);
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Missing, ProcessGroupId: null, ProcessGroupAlive: false, Error: null);
         if (text.StartsWith("alive ", StringComparison.Ordinal)
             && int.TryParse(text["alive ".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var alivePgid))
-            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Alive, alivePgid, ExitCode: null, ProcessGroupAlive: true, Error: null);
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Alive, alivePgid, ProcessGroupAlive: true, Error: null);
         if (text.StartsWith("exited ", StringComparison.Ordinal))
         {
             var rest = text["exited ".Length..];
@@ -6032,24 +6103,19 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             if (spaceIdx < 0)
             {
                 if (int.TryParse(rest, NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid))
-                    return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Exited, exitedPgid, ExitCode: null, ProcessGroupAlive: false, Error: null);
+                    return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Exited, exitedPgid, ProcessGroupAlive: false, Error: null);
             }
             else
             {
                 var pgidText = rest[..spaceIdx];
                 var exitAndStateText = rest[(spaceIdx + 1)..];
                 var stateIdx = exitAndStateText.IndexOf(' ', StringComparison.Ordinal);
-                var exitCodeText = stateIdx < 0
-                    ? exitAndStateText
-                    : exitAndStateText[..stateIdx];
                 var aliveText = stateIdx < 0 ? "gone" : exitAndStateText[(stateIdx + 1)..];
-                if (int.TryParse(pgidText, NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid)
-                    && int.TryParse(exitCodeText, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var exitCode))
+                if (int.TryParse(pgidText, NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid))
                 {
                     return new DetachedProcessGroupProbe(
                         DetachedProcessGroupStatus.Exited,
                         exitedPgid,
-                        ExitCode: exitCode,
                         ProcessGroupAlive: string.Equals(aliveText, "alive", StringComparison.Ordinal),
                         Error: null);
                 }
@@ -6059,7 +6125,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return new DetachedProcessGroupProbe(
             DetachedProcessGroupStatus.Malformed,
             ProcessGroupId: null,
-            ExitCode: null,
             ProcessGroupAlive: false,
             Error: $"detached exec process group poll returned malformed output: {text}\n");
     }
@@ -6135,7 +6200,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly record struct DetachedProcessGroupProbe(
         DetachedProcessGroupStatus Status,
         int? ProcessGroupId,
-        int? ExitCode,
         bool ProcessGroupAlive,
         string? Error);
 

@@ -145,14 +145,18 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
         return null;
     }
 
-    public IReadOnlyDictionary<string, string> BuildEnvironment()
-        => new Dictionary<string, string>(StringComparer.Ordinal)
+    public IReadOnlyDictionary<string, string> BuildEnvironment(bool includeExitToken = true)
+    {
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             [UrlEnvironmentVariable] = BaseUrl,
             [TokenEnvironmentVariable] = Token,
-            [ExitTokenEnvironmentVariable] = ExitToken,
             [RunIdEnvironmentVariable] = RunId,
         };
+        if (includeExitToken)
+            environment[ExitTokenEnvironmentVariable] = ExitToken;
+        return environment;
+    }
 
     public bool TryGetExitCode(out int exitCode)
     {

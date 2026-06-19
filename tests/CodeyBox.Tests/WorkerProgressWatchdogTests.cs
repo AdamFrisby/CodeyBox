@@ -777,7 +777,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task DefaultActivitySource_StableActiveSandboxSet_RepeatsProgress()
+    public async Task DefaultActivitySource_StableActiveSandboxSet_DoesNotRepeatProgress()
     {
         var itemId = WorkItemId.New();
         var provider = new ActiveSandboxProviderStub(itemId);
@@ -792,8 +792,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
 
         Assert.NotNull(first);
         Assert.Equal("active-sandbox", first!.Reason);
-        Assert.NotNull(second);
-        Assert.Equal("active-sandbox", second!.Reason);
+        Assert.Null(second);
     }
 
     [Fact]

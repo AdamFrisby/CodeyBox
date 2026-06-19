@@ -636,6 +636,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void MultipassSandbox_WithoutHttpIngestBindAddressAdvertisesAttachedBatchLaunch()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(0, "", "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        Assert.Equal(SandboxAgentOutputTransportKind.ExecPipe, sandbox.AgentOutputTransportKind);
+        Assert.Equal(SandboxBatchLaunchMode.Attached, sandbox.BatchLaunchMode);
+        Assert.Empty(runner.Calls);
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedBatchLaunchesWithoutAttachedCodeyboxExec()
     {
         if (OperatingSystem.IsWindows())
@@ -645,6 +657,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         var localVm = new LocalDetachedVm(_workspace);
         string? transferredEnvContent = null;
+        string? transferredExitTokenContent = null;
         string? transferredStdinContent = null;
         string? transferredCommandScript = null;
         string? transferredLaunchScript = null;
@@ -657,7 +670,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             {
                 var content = await File.ReadAllTextAsync(hostPath, ct);
                 if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
-                    transferredEnvContent = content;
+                {
+                    if (content.Contains(MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable, StringComparison.Ordinal))
+                        transferredEnvContent = content;
+                    else
+                        transferredExitTokenContent = content;
+                }
                 else if (destination.Contains(".codeybox-exec-stdin/", StringComparison.Ordinal))
                     transferredStdinContent = content;
                 else if (destination.Contains(".codeybox-exec/", StringComparison.Ordinal)
@@ -730,6 +748,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.False(result.Success);
         Assert.Equal(7, result.ExitCode);
         Assert.True(forgedHttpExitRejected);
+        Assert.NotNull(transferredEnvContent);
+        Assert.DoesNotContain(
+            MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable,
+            transferredEnvContent);
+        Assert.False(string.IsNullOrWhiteSpace(transferredExitTokenContent));
         Assert.Equal("hello detached:prompt over stdin\n", result.Stdout);
         Assert.Equal("warn detached:prompt over stdin\n", result.Stderr);
         Assert.Equal(["hello detached:prompt over stdin\n"], stdoutChunks);
@@ -742,7 +765,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.NotNull(transferredLaunchScript);
         Assert.Contains("codeybox_stdin_file='/run/codeybox-exec/detached-", transferredLaunchScript);
         Assert.Contains("codeybox-detached: failed to publish stdin sidecar", transferredLaunchScript);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" '/bin/sh'", transferredLaunchScript);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh'", transferredLaunchScript);
         Assert.DoesNotContain("codeybox_exit_marker", transferredLaunchScript);
         Assert.DoesNotContain(runner.Calls, IsCodeyboxExecCall);
 
@@ -1092,10 +1115,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             script);
         Assert.DoesNotContain("unset CODEYBOX_AGENT_RUN_ID", script);
         Assert.Contains("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"", script);
+        Assert.Contains("codeybox_exit_token_file=''", script);
+        Assert.Contains("rm -f \"$codeybox_exit_token_file\" 2>/dev/null || true", script);
         Assert.Contains("sudo -n sh -c", script);
         Assert.Contains("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"", script);
         Assert.Contains("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then exit 0; fi", script);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
         Assert.Contains("codeybox_detached_pid=$!", script);
         Assert.Contains("codeybox_pgid=$$", script);
         Assert.Contains("printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\"", script);
@@ -1103,6 +1128,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("mv -f \"$stdout_tmp\" \"${marker}.stdout\"", script);
         Assert.Contains("mv -f \"$stderr_tmp\" \"${marker}.stderr\"", script);
         Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
+        Assert.DoesNotContain("codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"", script);
         Assert.DoesNotContain("codeybox_exit_marker", script);
         Assert.Contains("exit 88", script);
     }
@@ -2272,6 +2298,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 if (destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
                 {
                     var content = await File.ReadAllTextAsync(hostPath, ct);
+                    if (!content.Contains(MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable, StringComparison.Ordinal))
+                    {
+                        await localVm.TransferAsync(hostPath, destination, ct);
+                        return new ProcessRunResult(0, "", "");
+                    }
+
                     var broken = RewriteShellEnvValue(
                         content,
                         MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable,
@@ -6877,6 +6909,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         var wrapper = Path.Combine(_workspace, "codeybox-exec-launch-no-exit-token");
         var envFile = Path.Combine(_workspace, "detached-no-exit-token.env");
+        var exitTokenFile = Path.Combine(_workspace, "detached-no-exit-token.token");
         var launchScript = Path.Combine(_workspace, "detached-no-exit-token.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-no-exit-token.pgid");
         var sentinel = Path.Combine(_workspace, "detached-no-exit-token-agent-started");
@@ -6885,14 +6918,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         await File.WriteAllTextAsync(wrapper, MultipassSandboxProvider.ExecWrapperScript);
         File.SetUnixFileMode(wrapper, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        var sessionEnvironment = session.BuildEnvironment();
-        Assert.Contains(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable, sessionEnvironment.Keys);
+        var sessionEnvironment = session.BuildEnvironment(includeExitToken: false);
+        Assert.DoesNotContain(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable, sessionEnvironment.Keys);
         var lines = new List<string>();
         foreach (var (k, v) in sessionEnvironment)
             lines.Add($"{k}={MultipassSandboxProvider.ShellSingleQuote(v)}");
         lines.Add($"CODEYBOX_AGENT_EXIT_FILE={MultipassSandboxProvider.ShellSingleQuote(exitFile)}");
         lines.Add("");
         await File.WriteAllTextAsync(envFile, string.Join('\n', lines));
+        await File.WriteAllTextAsync(exitTokenFile, session.ExitToken);
 
         await File.WriteAllTextAsync(
             launchScript,
@@ -6900,7 +6934,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                [wrapper, _workspace, "/bin/sh", "-c", "printf launched > \"$1\"; exit 2", "codeybox-detached-no-exit-token", sentinel]));
+                [wrapper, _workspace, "/bin/sh", "-c", "printf launched > \"$1\"; exit 2", "codeybox-detached-no-exit-token", sentinel],
+                exitTokenFile: exitTokenFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var (exit, stdout, _) = await RunLocalProcessAsync(
@@ -6918,6 +6953,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stdout);
         Assert.True(File.Exists(processGroupMarker));
         Assert.True(File.Exists(sentinel));
+        Assert.False(File.Exists(exitTokenFile));
         Assert.Equal("2", (await File.ReadAllTextAsync(exitFile)).Trim());
     }
 

@@ -124,6 +124,87 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         AssertCredentialAndOpenNetwork(mergeSpec, "agent-merge");
     }
 
+    [Fact]
+    public async Task WorkAgentSandbox_PreservesDetachedBatchLaunchModeThroughPipeline()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var provider = new HttpIngestBatchModeProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: provider);
+
+        SandboxExec? agentObservedExec = null;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var exec = new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/pipeline-detached-before-work.txt"],
+                Stdin = "before-work\n",
+                AgentOutputTransport = sandbox.AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
+                    ? SandboxAgentOutputTransportPreference.PreferHttpIngest
+                    : SandboxAgentOutputTransportPreference.ExecPipe,
+                LaunchMode = sandbox.BatchLaunchMode == SandboxBatchLaunchMode.Detached
+                    ? SandboxExecLaunchMode.DetachedBatch
+                    : SandboxExecLaunchMode.Attached,
+            };
+            agentObservedExec = exec;
+            var result = await sandbox.ExecAsync(exec, ct);
+            Assert.True(result.Success, result.Stderr);
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("pipeline-detached-work.txt", "work\n"));
+
+        var item = NewItem("feature/pipeline-detached-batch");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(agentObservedExec);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, agentObservedExec!.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, agentObservedExec.LaunchMode);
+
+        var recorded = Assert.Single(
+            provider.RecordedExecs,
+            exec => exec.Argv.Contains($"{SandboxConventions.WorkDir}/pipeline-detached-before-work.txt", StringComparer.Ordinal));
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, recorded.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, recorded.LaunchMode);
+    }
+
+    [Fact]
+    public async Task AuditActivityTrackingSandbox_PreservesDetachedBatchLaunchModeThroughPipeline()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var provider = new HttpIngestBatchModeProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var auditor = new BatchLaunchModeAuditor();
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            sandboxProvider: provider);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("activity-tracking-work.txt", "work\n"));
+        var item = NewItem("feature/activity-tracking-detached-batch");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(auditor.ObservedExec);
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, auditor.ObservedExec!.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, auditor.ObservedExec.LaunchMode);
+
+        var recorded = Assert.Single(
+            provider.RecordedExecs,
+            exec => exec.Argv.Contains($"{SandboxConventions.WorkDir}/activity-tracking-audit.txt", StringComparer.Ordinal));
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, recorded.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, recorded.LaunchMode);
+    }
+
     private static void AssertCredentialAndOpenNetwork(SandboxSpec spec, string phaseName)
     {
         Assert.True(spec.Environment.TryGetValue(MarkerEnvKey, out var marker),
@@ -210,5 +291,101 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         public Task DisposeLeakedAsync(string name, CancellationToken ct)
             => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class HttpIngestBatchModeProvider(ISandboxProvider inner) : ISandboxProvider
+    {
+        private readonly List<SandboxExec> _recordedExecs = new();
+
+        public string Name => inner.Name;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+        public SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Detached;
+
+        public IReadOnlyList<SandboxExec> RecordedExecs
+        {
+            get
+            {
+                lock (_recordedExecs)
+                    return _recordedExecs.ToList();
+            }
+        }
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => new HttpIngestBatchModeSandbox(await inner.CreateAsync(spec, ct), this);
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => inner.DisposeLeakedAsync(name, ct);
+
+        private void Record(SandboxExec exec)
+        {
+            lock (_recordedExecs)
+                _recordedExecs.Add(exec);
+        }
+
+        private sealed class HttpIngestBatchModeSandbox(ISandbox innerSandbox, HttpIngestBatchModeProvider owner) : ISandbox
+        {
+            public string Id => innerSandbox.Id;
+            public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+            public SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Detached;
+
+            public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            {
+                owner.Record(exec);
+                return innerSandbox.ExecAsync(exec, ct);
+            }
+
+            public Task KillActiveExecsAsync(CancellationToken ct = default)
+                => innerSandbox.KillActiveExecsAsync(ct);
+
+            public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+                => innerSandbox.GetScreenshotAsync(ct);
+
+            public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+                => innerSandbox.SynthesizeInputAsync(events, ct);
+
+            public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+                => innerSandbox.GetAccessibilityAtPointAsync(x, y, ct);
+
+            public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+                => innerSandbox.GetAccessibilityTreeJsonAsync(ct);
+
+            public ValueTask DisposeAsync() => innerSandbox.DisposeAsync();
+        }
+    }
+
+    private sealed class BatchLaunchModeAuditor : IAuditor
+    {
+        public string Name => "batch-launch-mode";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public SandboxExec? ObservedExec { get; private set; }
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = context;
+            var exec = new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/activity-tracking-audit.txt"],
+                Stdin = "audit\n",
+                AgentOutputTransport = sandbox.AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
+                    ? SandboxAgentOutputTransportPreference.PreferHttpIngest
+                    : SandboxAgentOutputTransportPreference.ExecPipe,
+                LaunchMode = sandbox.BatchLaunchMode == SandboxBatchLaunchMode.Detached
+                    ? SandboxExecLaunchMode.DetachedBatch
+                    : SandboxExecLaunchMode.Attached,
+            };
+            ObservedExec = exec;
+            var result = await sandbox.ExecAsync(exec, ct);
+            return result.Success
+                ? new AuditResult(true, [])
+                : new AuditResult(false, [new AuditFinding(Name, AuditSeverity.Error, "batch launch mode exec failed", result.Stderr)]);
+        }
     }
 }
