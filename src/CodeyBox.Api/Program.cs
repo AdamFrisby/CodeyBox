@@ -2596,10 +2596,11 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<WorkerPoolHealthWa
 // the unreliable RAM-snapshot path while preserving PipelineRunner's checkpoint
 // recovery path for active work.
 // The shutdown half is lifecycle-bound (StoppingAsync). Startup resume defaults
-// to background mode so a wedged multipassd cannot keep Kestrel offline;
-// OrchestratorService waits for startup recovery input before its dead-worker
-// startup recovery sweep. Blocking resume mode still runs through
-// IHostedLifecycleService.StartingAsync, so the host awaits it natively.
+// to background mode and starts after ApplicationStarted so a wedged multipassd
+// cannot keep Kestrel offline; OrchestratorService waits for startup recovery
+// input before its dead-worker startup recovery sweep. Blocking resume mode
+// still runs through IHostedLifecycleService.StartingAsync, so the host awaits
+// it natively.
 //
 // R8.1 (incident 2026-05-29): the shutdown teardown service is wired with the
 // orchestrator as an IShutdownDispatchGate so it pauses new dispatch BEFORE
@@ -2648,7 +2649,8 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
         };
     },
     sp.GetRequiredService<IStartupRecoveryInputSink>(),
-    sp.GetRequiredService<IInfrastructureDeferralScheduler>()));
+    sp.GetRequiredService<IInfrastructureDeferralScheduler>(),
+    sp.GetRequiredService<IHostApplicationLifetime>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the
