@@ -93,14 +93,14 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
-    public async Task LoginPromptTranscript_InStdout_IsNotAuthoritativeForSharedFailureClassifier()
+    public async Task LoginPromptTranscript_InStdout_Classified_AsAuthRequired()
     {
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: transcript);
 
-        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Theory]
@@ -109,10 +109,10 @@ public sealed class AgentFailureClassifierTests
     [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
     [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
     [InlineData("Error: authentication timed out.")]
-    public void LoginPromptFragments_InStdout_NotClassified_AsAuthRequired(string snippet)
+    public void LoginPromptFragments_InStdout_Classified_AsAuthRequired(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
-        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Theory]
@@ -152,14 +152,17 @@ public sealed class AgentFailureClassifierTests
     [Theory]
     [InlineData("not logged into opencode; run `opencode auth login`")]
     [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
-    public void AgentAuthFailureClassifier_DoesNotDetectDefaultFragments_InStdout(string snippet)
+    public void AgentAuthFailureClassifier_DetectsDefaultFragments_InStdout(string snippet)
     {
         var detection = new AgentAuthFailureClassifier().DetectDetailed(
             AgentKind.Opencode,
             stderr: null,
             stdout: snippet);
 
-        Assert.Null(detection);
+        Assert.NotNull(detection);
+        Assert.True(detection.IsStdoutOnly);
+        Assert.True(detection.MatchedDefaultStdoutPattern);
+        Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
     }
 
     [Theory]

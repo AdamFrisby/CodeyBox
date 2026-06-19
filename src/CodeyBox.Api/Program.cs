@@ -1849,6 +1849,9 @@ builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
     sp.GetRequiredService<IAgentQuotaGate>(),
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
+builder.Services.AddSingleton<ICondition>(sp => new AgentAuthRequiredCondition(
+    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IAgentRegistry>()));
 builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new OrchestratorStallCondition(
     sp.GetRequiredService<OrchestratorProgressClock>(),
@@ -1860,6 +1863,9 @@ builder.Services.AddSingleton<INotificationBuilder, QueueEmptyNotificationBuilde
 builder.Services.AddSingleton<INotificationBuilder>(sp => new AllQuotasExhaustedNotificationBuilder(
     sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct));
+builder.Services.AddSingleton<INotificationBuilder>(sp => new AgentAuthRequiredNotificationBuilder(
+    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IAgentRegistry>()));
 builder.Services.AddSingleton<INotificationBuilder, WorkItemPermanentlyFailedNotificationBuilder>();
 builder.Services.AddSingleton<INotificationBuilder>(sp => new OrchestratorStallNotificationBuilder(
     sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));

@@ -115,8 +115,8 @@ public static class AgentFailureClassifier
     /// were intentionally rejected after the auditor flagged them as too
     /// broad. The orchestrator-side <c>AgentAuthFailureClassifier</c> applies
     /// operator-supplied <c>CodeyBox:AuthFailurePatterns</c> to stderr/stdout
-    /// and decides whether stdout-only transcript evidence is corroborated
-    /// strongly enough to bench the agent globally.</para>
+    /// and the pipeline benches matching no-diff CLI output before it can be
+    /// mistaken for a benign empty change.</para>
     /// </summary>
     public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]
     {
@@ -278,7 +278,7 @@ public static class AgentFailureClassifier
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
-        if (ContainsAuthRequiredPatternInStderr(stderr))
+        if (ContainsAuthRequiredPatternInStderr(stderr) || ContainsAuthRequiredPatternInStdout(stdout))
             return new AgentFailureClassification(AgentFailureKind.AuthRequired, Reason: "auth-required pattern matched");
 
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
@@ -447,7 +447,12 @@ public static class AgentFailureClassifier
         if (string.IsNullOrWhiteSpace(stdout))
             return false;
 
-        return ContainsTrustedStdoutLoginTranscript(stdout);
+        if (ContainsTrustedStdoutLoginTranscript(stdout))
+            return true;
+
+        return stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(IsAuthRequiredStdoutLine);
     }
 
     public static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
@@ -481,6 +486,29 @@ public static class AgentFailureClassifier
         || line.StartsWith("Error: authentication timed out", StringComparison.OrdinalIgnoreCase)
         || line.Equals("authentication timed out", StringComparison.OrdinalIgnoreCase)
         || IsStandaloneOAuthLoginUrl(line);
+
+    private static bool IsAuthRequiredStdoutLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return false;
+
+        if (line.StartsWith("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
+            || line.StartsWith("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase)
+            || line.StartsWith("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
+            || line.StartsWith("Error: authentication timed out", StringComparison.OrdinalIgnoreCase)
+            || line.Equals("authentication timed out", StringComparison.OrdinalIgnoreCase)
+            || IsStandaloneOAuthLoginUrl(line))
+        {
+            return true;
+        }
+
+        return line.Contains("run `agy login`", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("run `gemini auth login`", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("run `agent login`", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("run `opencode auth login`", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("run `codex login`", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("run `claude login`", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool ContainsStandaloneOAuthLoginUrlLine(string? text) =>
         !string.IsNullOrWhiteSpace(text)

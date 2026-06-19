@@ -12,21 +12,19 @@ public interface IAgentAuthFailureClassifier
 {
     /// <summary>
     /// Returns an <see cref="AgentFailureKind.AuthRequired"/> classification
-    /// when stderr contains a configured/default login-prompt signature, stdout
-    /// contains a configured signature, or stdout contains the compact trusted
-    /// CLI login transcript shape.
+    /// when stderr or stdout contains a configured/default login-prompt
+    /// signature.
     /// </summary>
     AgentFailureClassification? Detect(AgentKind kind, string? stderr, string? stdout);
 
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
     /// the evidence. Stderr is treated as CLI diagnostics and matched by
-    /// substring. Stdout defaults stay restricted to trusted transcript shapes;
-    /// operator-supplied patterns are also applied to stdout so newly observed
-    /// CLI login prompts can be configured without a rebuild. Pipeline call
-    /// sites decide whether stdout-only detections are authoritative for that
-    /// phase or require in-VM corroboration before a global auth bench is
-    /// applied.
+    /// substring. Stdout defaults use the shared guarded stdout matcher so
+    /// concrete CLI login prompts count even when they are printed without a
+    /// matching stderr line. Operator-supplied patterns are also applied to
+    /// stdout so newly observed CLI login prompts can be configured without a
+    /// rebuild.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }
@@ -74,7 +72,7 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         var matchedStderr = AgentFailureClassifier.ContainsAuthRequiredPatternInStderr(stderr);
         var matchedStderrAuthError = AgentFailureClassifier.ContainsAuthErrorPattern(stderr);
         var matchedTrustedStdoutTranscript = AgentFailureClassifier.ContainsTrustedStdoutLoginTranscript(stdout);
-        var matchedDefaultStdout = matchedTrustedStdoutTranscript;
+        var matchedDefaultStdout = AgentFailureClassifier.ContainsAuthRequiredPatternInStdout(stdout);
         var matchedConfiguredStdout = false;
 
         foreach (var pattern in AdditionalPatternsFor(kind))
@@ -132,8 +130,7 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
 /// Raised when a real agent invocation emitted an interactive login prompt.
 /// The pipeline catches this as infrastructure/auth failure instead of letting
 /// exit-0/no-diff output masquerade as a normal no-change result. Global
-/// benching is applied when the evidence is authoritative for the phase or
-/// corroborated by an in-VM probe.
+/// benching is applied when the evidence is authoritative for the phase.
 /// </summary>
 public sealed class AgentAuthRequiredException : Exception
 {

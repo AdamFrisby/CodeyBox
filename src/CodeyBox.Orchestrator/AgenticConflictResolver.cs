@@ -108,7 +108,8 @@ public enum AgenticConflictResolverOperation
 /// <see cref="AuthFailures"/> carries narrow auth/login-prompt evidence so
 /// callers can attribute the exact failed candidate without exposing every
 /// candidate's raw output through the public result API. Stdout-only evidence
-/// is flagged so the caller can require corroboration before benching.
+/// is flagged so the caller can include that detail in the operator-facing
+/// reason.
 /// </summary>
 public sealed record AgenticConflictResolverAuthFailureEvidence(
     IAgentRunner Runner,

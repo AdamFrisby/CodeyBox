@@ -2462,7 +2462,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     await ThrowIfAuthRequiredOutputAsync(
                         item, project, emittingAgent, "rebase-resolver",
                         resolveResult.Stdout, resolveResult.Stderr,
-                        benchStdoutOnlyEvidence: true,
                         ct: ct);
 
                     if (candidateResult is { HasTransientlyUnavailableStrongerAgent: true })
@@ -3540,7 +3539,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             authDetection.Classification,
                             throwOnMatch: true,
                             stdoutOnlyEvidence: false,
-                            benchStdoutOnlyEvidence: true,
                             ct: ct);
                     }
                 }
@@ -3551,7 +3549,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // print the login prompt on stdout before exiting.
                 await ThrowIfAuthRequiredOutputAsync(
                     item, project, runner.Kind, agentPhase, agentResult,
-                    benchStdoutOnlyEvidence: true,
                     ct: ct);
 
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
@@ -3683,7 +3680,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         deferredSuccessStdoutOnlyAuthDetection.Classification,
                         throwOnMatch: true,
                         stdoutOnlyEvidence: true,
-                        benchStdoutOnlyEvidence: false,
                         ct: ct);
                 }
 
@@ -4447,7 +4443,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // login transcript on stdout must bench the CLI here.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
-            benchStdoutOnlyEvidence: true,
             ct: ct);
 
         if (!result.Success)
@@ -4946,7 +4941,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // See RunCheckAndActAgentAsync above for the phase policy.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, agentRunner.Kind, "post-act-recheck", aggregatedStdout, result.Stderr,
-            benchStdoutOnlyEvidence: true,
             ct: ct);
 
         if (!result.Success)
@@ -5302,7 +5296,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? stdout,
         string? stderr,
         bool throwOnMatch,
-        bool benchStdoutOnlyEvidence,
         CancellationToken ct = default)
     {
         var detection = _authFailureClassifier.DetectDetailed(agent, stderr, stdout);
@@ -5317,7 +5310,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             detection.Classification,
             throwOnMatch,
             detection.IsStdoutOnly,
-            benchStdoutOnlyEvidence,
             ct);
     }
 
@@ -5329,70 +5321,43 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentFailureClassification classification,
         bool throwOnMatch,
         bool stdoutOnlyEvidence = false,
-        bool benchStdoutOnlyEvidence = false,
         CancellationToken ct = default)
     {
         if (classification.Kind != AgentFailureKind.AuthRequired)
             return false;
 
-        var shouldBenchAgent = !stdoutOnlyEvidence || benchStdoutOnlyEvidence;
-        string? corroborationReason = null;
-        if (stdoutOnlyEvidence && !benchStdoutOnlyEvidence)
-        {
-            var corroboration = await TryCorroborateStdoutAuthAsync(item, project, agent, phase, ct);
-            shouldBenchAgent = corroboration.Corroborated;
-            corroborationReason = corroboration.Reason;
-        }
-
         var reasonDetail = classification.Reason ?? "login prompt matched";
         if (stdoutOnlyEvidence)
-        {
-            reasonDetail = shouldBenchAgent
-                ? benchStdoutOnlyEvidence
-                    ? $"{reasonDetail}; stdout accepted as authoritative CLI output for this phase"
-                    : $"{reasonDetail}; stdout corroborated by in-VM smoke: {corroborationReason ?? "persistent failure"}"
-                : $"{reasonDetail}; stdout-only evidence was not corroborated by in-VM smoke, so the agent was not globally benched ({corroborationReason ?? "no corroboration"})";
-        }
+            reasonDetail = $"{reasonDetail}; stdout accepted as authoritative CLI output for this phase";
 
         var reason = SingleLineSummary(
             $"auth required from agent output during {phase}: {reasonDetail}");
 
-        if (shouldBenchAgent)
+        AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
+
+        // AuthRequired is intentionally outside the smoke-gate taxonomy:
+        // if the operator disables the master smoke switch
+        // (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/MissingProbe
+        // exclusions are ignored at dispatch — but authoritative runtime
+        // login-prompt evidence means the binary is broken, so
+        // AuthRequired survives the smoke-disabled gate via
+        // AgentAvailabilityRegistry.IsNonSmokeExclusion.
+        var transition = _authAvailability?.MarkAuthRequired(agent, reason);
+
+        if (transition is null || transition.SourceChanged)
         {
-            AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
-
-            // AuthRequired is intentionally outside the smoke-gate taxonomy:
-            // if the operator disables the master smoke switch
-            // (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/MissingProbe
-            // exclusions are ignored at dispatch — but authoritative runtime
-            // login-prompt evidence means the binary is broken, so
-            // AuthRequired survives the smoke-disabled gate via
-            // AgentAvailabilityRegistry.IsNonSmokeExclusion.
-            var transition = _authAvailability?.MarkAuthRequired(agent, reason);
-
-            if (transition is null || transition.SourceChanged)
+            await _webhooks.PublishAsync(new WebhookEvent
             {
-                await _webhooks.PublishAsync(new WebhookEvent
+                Event = "agent.smoke_failed",
+                WorkItem = item,
+                Project = project,
+                Details = new AgentSmokeFailedDetails
                 {
-                    Event = "agent.smoke_failed",
-                    WorkItem = item,
-                    Project = project,
-                    Details = new AgentSmokeFailedDetails
-                    {
-                        AgentKind = agent.Value,
-                        Reason = reason,
-                        Category = SmokeFailureCategory.Persistent,
-                    },
-                }, CancellationToken.None);
-            }
-        }
-        else
-        {
-            _log.LogWarning(
-                "Agent {Agent} emitted stdout-only auth/login evidence during {Phase}; failing the item but not globally benching without corroboration: {Reason}",
-                agent.Value,
-                phase,
-                corroborationReason ?? "no corroboration available");
+                    AgentKind = agent.Value,
+                    Reason = reason,
+                    Category = SmokeFailureCategory.Persistent,
+                },
+            }, CancellationToken.None);
         }
 
         if (throwOnMatch)
@@ -5401,64 +5366,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return true;
     }
 
-    private async Task<(bool Corroborated, string? Reason)> TryCorroborateStdoutAuthAsync(
-        WorkItem item,
-        Project project,
-        AgentKind agent,
-        string phase,
-        CancellationToken ct)
-    {
-        var auditPhase = IsAuditPhase(phase);
-        if (_dispatchAvailability is null)
-            return auditPhase
-                ? (true, "audit CLI stdout accepted because in-VM smoke corroboration is unavailable")
-                : (false, "no in-VM smoke gate is wired");
-
-        var smokePhase = auditPhase
-            ? "audit"
-            : phase;
-        var target = ResolvePhaseSmokeTarget(project, smokePhase, item.BaselineImageRef);
-        AgentAvailability? availability;
-        try
-        {
-            availability = await _dispatchAvailability.ForceInVmProbeAsync(agent, target, ct);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(
-                ex,
-                "Could not force in-VM smoke corroboration for stdout-only auth/login evidence from agent {Agent} during {Phase}",
-                agent.Value,
-                phase);
-            return auditPhase
-                ? (true, "audit CLI stdout accepted because in-VM smoke corroboration threw")
-                : (false, "in-VM smoke corroboration threw");
-        }
-
-        if (availability is null)
-            return auditPhase
-                ? (true, "audit CLI stdout accepted because in-VM smoke corroboration is unavailable")
-                : (false, "no in-VM smoke probe is available");
-        if (availability.Available)
-            return (false, "in-VM smoke probe passed");
-        if (IsPersistentSmokeFailure(availability))
-            return (true, availability.Reason);
-
-        return (false, availability.Reason is null
-            ? "in-VM smoke probe failed without persistent classification"
-            : $"in-VM smoke probe failed without persistent classification: {availability.Reason}");
-    }
-
-    private static bool IsAuditPhase(string phase) =>
-        phase.StartsWith("audit", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsPersistentSmokeFailure(AgentAvailability availability) =>
-        availability.Reason?.Contains("smoke probe failed [persistent]", StringComparison.OrdinalIgnoreCase) == true;
-
     private Task ThrowIfAuthRequiredOutputAsync(
         WorkItem item,
         Project project,
@@ -5466,13 +5373,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         string? stdout,
         string? stderr,
-        CancellationToken ct = default,
-        bool benchStdoutOnlyEvidence = false)
+        CancellationToken ct = default)
     {
         return HandleAuthRequiredOutputAsync(
             item, project, agent, phase, stdout, stderr,
             throwOnMatch: true,
-            benchStdoutOnlyEvidence: benchStdoutOnlyEvidence,
             ct: ct);
     }
 
@@ -5482,11 +5387,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentKind agent,
         string phase,
         AgentResult result,
-        CancellationToken ct = default,
-        bool benchStdoutOnlyEvidence = false)
+        CancellationToken ct = default)
         => ThrowIfAuthRequiredOutputAsync(
             item, project, agent, phase, result.Stdout, result.Stderr,
-            benchStdoutOnlyEvidence: benchStdoutOnlyEvidence,
             ct: ct);
 
     private async Task HandleAgenticResolverAuthRequiredOutputAsync(
@@ -5502,7 +5405,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var emittingAgent = result.LastAttemptedRunner?.Kind ?? result.ChosenRunner?.Kind ?? item.Agent ?? project.DefaultAgent;
             await ThrowIfAuthRequiredOutputAsync(
                 item, project, emittingAgent, phase, result.Stdout, result.Stderr,
-                benchStdoutOnlyEvidence: true,
                 ct: ct);
             return;
         }
@@ -5523,7 +5425,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 failure.Classification,
                 throwOnMatch,
                 failure.StdoutOnlyEvidence,
-                benchStdoutOnlyEvidence: true,
                 ct: ct);
         }
     }
@@ -5543,7 +5444,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             evidence.Classification,
             throwOnMatch: false,
             stdoutOnlyEvidence: evidence.StdoutOnlyEvidence,
-            benchStdoutOnlyEvidence: true,
             ct: ct);
     }
 
@@ -8357,7 +8257,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AuditContext ctx,
         CancellationToken ct)
     {
-        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, ct);
         // Auth/login-prompt check runs alongside the quota check: an exit-0
         // login prompt from an LLM auditor's agent that suppressed
         // audit/result.json was previously surfaced as a normal "agent did not
@@ -8365,7 +8264,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // routable for the next iteration. Inspects AgentStdout / AgentStderr
         // (now populated unconditionally by LlmReviewAuditor) plus RawOutput
         // as a fallback for any auditor that did not propagate the stream.
+        //
+        // Auth has precedence over quota because OAuth/login prompts can include
+        // 401 diagnostics that are also quota-detector inputs; the operator
+        // action is to re-authenticate, not to park the item for quota reset.
         await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, ct);
+        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, ct);
 
         if (needsCreds)
         {
@@ -8420,13 +8324,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(stderr))
             return;
 
-        // Keep stdout-only audit evidence on the corroboration path so a
-        // passing/non-persistent in-VM probe can veto false positives. The
-        // helper treats audit stdout as authoritative when that corroboration
-        // layer is unavailable or globally disabled, matching the outage mode.
+        // Auditor stdout is a real CLI output stream. A matching login prompt
+        // benches the auditor agent immediately, including exit-0/missing-result
+        // runs where in-VM smoke is disabled or only probes binary presence.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, run.Runner.Kind, $"audit:{run.Auditor.Name}", stdout, stderr,
-            benchStdoutOnlyEvidence: false,
             ct: ct);
     }
 
@@ -11004,13 +10906,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (agentResult.Success)
                 await ThrowIfAuthRequiredOutputAsync(
                     item, project, chosenMergeRunner.Kind, "merge", agentResult,
-                    benchStdoutOnlyEvidence: true,
                     ct: ct);
             if (!agentResult.Success)
             {
                 await ThrowIfAuthRequiredOutputAsync(
                     item, project, chosenMergeRunner.Kind, "merge", agentResult,
-                    benchStdoutOnlyEvidence: true,
                     ct: ct);
 
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
@@ -12903,7 +12803,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // as the breaking signal, not as the agent's own reasoned refusal.
             await ThrowIfAuthRequiredOutputAsync(
                 item, project, runner.Kind, ConflictReworkPhaseKey, agentResult,
-                benchStdoutOnlyEvidence: true,
                 ct: ct);
             if (semanticIncompatible is not null)
             {

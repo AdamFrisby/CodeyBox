@@ -35,17 +35,6 @@ public interface IAgentDispatchAvailability
 
     AgentAvailability? GetAvailability(AgentMembership member) => GetAvailability(member.Agent);
 
-    /// <summary>
-    /// Forces a fresh in-VM probe when that layer is enabled. Used only to
-    /// corroborate runtime stdout-only auth/login-prompt evidence before applying
-    /// a global auth bench. Returns <c>null</c> when no in-VM corroboration layer
-    /// is available.
-    /// </summary>
-    Task<AgentAvailability?> ForceInVmProbeAsync(
-        AgentKind kind,
-        InVmSmokeSandboxTarget target,
-        CancellationToken ct)
-        => Task.FromResult<AgentAvailability?>(null);
 }
 
 /// <summary>
@@ -141,17 +130,6 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
             return _availability.GetAvailabilityWithoutSmokeGateExclusions(member.Agent);
 
         return _availability.GetAvailability(member.Agent);
-    }
-
-    public async Task<AgentAvailability?> ForceInVmProbeAsync(
-        AgentKind kind,
-        InVmSmokeSandboxTarget target,
-        CancellationToken ct)
-    {
-        if (SmokeDisabled || _inVmSmokeGate is null)
-            return null;
-
-        return await _inVmSmokeGate.ForceProbeAsync(kind, target, ct);
     }
 
     private bool SmokeDisabled => _smokeOptions?.Enabled == false;

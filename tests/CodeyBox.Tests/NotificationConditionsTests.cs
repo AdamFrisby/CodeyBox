@@ -130,6 +130,58 @@ public sealed class NotificationConditionsTests
         Assert.False(await condition.EvaluateAsync(CancellationToken.None));
     }
 
+    // ── AgentAuthRequiredCondition ────────────────────────────────────────
+
+    [Fact]
+    public async Task AgentAuthRequired_FalseWhenRegisteredAgentsAreAvailable()
+    {
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var condition = new AgentAuthRequiredCondition(
+            availability,
+            new StubAgentRegistry(AgentKind.Codex));
+
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AgentAuthRequired_TrueWhenRegisteredAgentIsBenchedForAuth()
+    {
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        availability.MarkAuthRequired(AgentKind.Codex, "auth required from agent output during work");
+        var condition = new AgentAuthRequiredCondition(
+            availability,
+            new StubAgentRegistry(AgentKind.Codex, AgentKind.Claude));
+
+        Assert.True(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public void AgentAuthRequiredNotificationBuilder_Build_IncludesBenchedAgent()
+    {
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        availability.MarkAuthRequired(AgentKind.Codex, "auth required from agent output during work");
+        var builder = new AgentAuthRequiredNotificationBuilder(
+            availability,
+            new StubAgentRegistry(AgentKind.Codex));
+
+        var notification = builder.Build(new DateTimeOffset(2026, 6, 20, 12, 0, 0, TimeSpan.Zero));
+
+        Assert.Equal("agent_auth_required", notification.ConditionId);
+        Assert.Equal(NotificationSeverity.Critical, notification.Severity);
+        Assert.Contains("codex", notification.Title);
+        Assert.Contains("codex", notification.Body);
+        Assert.Equal("codex", notification.Fields!["agents"]);
+    }
+
     // ── WorkItemPermanentlyFailedCondition ─────────────────────────────────
 
     [Fact]
