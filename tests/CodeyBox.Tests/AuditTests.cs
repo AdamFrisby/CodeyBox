@@ -165,6 +165,38 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task ShellCommandAuditor_CapsCommandOutputAndAllowsTruncatedZeroExit()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "lint",
+            Argv = ["lint"],
+        });
+        SandboxExec? commandExec = null;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/lint\n", "");
+
+            commandExec = exec;
+            return new SandboxExecResult(
+                0,
+                "ok",
+                "",
+                StdoutLimitExceeded: true);
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Contains("stdout truncated", result.RawOutput);
+        Assert.NotNull(commandExec);
+        Assert.Equal(ShellCommandAuditor.OutputCaptureMaxBytes, commandExec!.MaxStdoutBytes);
+        Assert.Equal(ShellCommandAuditor.OutputCaptureMaxBytes, commandExec.MaxStderrBytes);
+        Assert.False(commandExec.KillOnOutputLimit);
+    }
+
+    [Fact]
     public async Task CSharpFormatCheck_FailureReportsDotnetFormatViolations()
     {
         var auditor = new PresetCatalog()
@@ -258,6 +290,40 @@ public sealed class AuditTests
         var finding = Assert.Single(result.Findings);
         Assert.Equal("dotnet format verification failed", finding.Title);
         Assert.Contains("format verification failed", finding.Description);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_RunsDiagnosticFormatterWithBoundedOutputCapture()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        SandboxExec? formatExec = null;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsLanguageMarkerProbe(exec))
+                return new SandboxExecResult(0, ".\n", "");
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+
+            formatExec = exec;
+            return new SandboxExecResult(
+                2,
+                "",
+                "format verification failed",
+                StderrLimitExceeded: true);
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.NotNull(formatExec);
+        Assert.Equal(["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"], formatExec!.Argv);
+        Assert.Equal(ShellCommandAuditor.OutputCaptureMaxBytes, formatExec.MaxStdoutBytes);
+        Assert.Equal(ShellCommandAuditor.OutputCaptureMaxBytes, formatExec.MaxStderrBytes);
+        Assert.False(formatExec.KillOnOutputLimit);
+        Assert.Contains("stderr truncated", result.RawOutput);
+        Assert.Contains("stderr truncated", Assert.Single(result.Findings).Description);
     }
 
     [Fact]

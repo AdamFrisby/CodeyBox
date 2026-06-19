@@ -5864,6 +5864,14 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             throw;
         }
+        catch (SandboxDiskDeferredException)
+        {
+            throw;
+        }
+        catch (SandboxProvisioningDeferredException)
+        {
+            throw;
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw new MechanicalFixerException($"mechanical-edit failed: {ex.Message}", ex);
@@ -5977,6 +5985,14 @@ public sealed class PipelineRunner : IPipelineRunner
             await PushSandboxWorkBranchWithReconcileAsync(sandbox, workBranch, ct);
         }
         catch (MechanicalFixerException)
+        {
+            throw;
+        }
+        catch (SandboxDiskDeferredException)
+        {
+            throw;
+        }
+        catch (SandboxProvisioningDeferredException)
         {
             throw;
         }

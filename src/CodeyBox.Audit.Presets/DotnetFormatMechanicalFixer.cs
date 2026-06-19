@@ -13,8 +13,10 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 {
     public const string FixerName = MechanicalFixerNames.DotnetFormat;
     internal const string FormatCheckAuditorName = "csharp:format-check";
+    public const int OutputCaptureMaxBytes = 1024 * 1024;
     private const int MaxRawOutputChars = 16_000;
     private const int MaxExceptionOutputChars = 1_000;
+    private const string TruncationMarker = "\n... output truncated.";
 
     public string Name => FixerName;
     public string Kind => "shell";
@@ -85,14 +87,14 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
             {
                 Argv = formatArgv,
                 WorkingDirectory = projectWorkingDirectory,
+                MaxStdoutBytes = OutputCaptureMaxBytes,
+                MaxStderrBytes = OutputCaptureMaxBytes,
+                KillOnOutputLimit = false,
             }, ct);
 
-            if (!string.IsNullOrWhiteSpace(result.Stdout))
-                output.AppendLine(result.Stdout.TrimEnd());
-            if (!string.IsNullOrWhiteSpace(result.Stderr))
-                output.AppendLine(result.Stderr.TrimEnd());
+            AppendBoundedOutput(output, CombinedOutput(result));
 
-            if (!result.Success)
+            if (result.ExitCode != 0 || result.ExecutionUnavailable)
             {
                 await RestorePreFixerTrackedChangesAsync(sandbox, workingDirectory, beforePatch, ct);
                 return new MechanicalFixerResult(
@@ -169,7 +171,19 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         {
             Argv = ["sh", "-c", markerScript],
             WorkingDirectory = workingDirectory,
+            MaxStdoutBytes = OutputCaptureMaxBytes,
+            MaxStderrBytes = OutputCaptureMaxBytes,
+            KillOnOutputLimit = false,
         }, ct);
+
+        if (discovery.OutputLimitExceeded)
+        {
+            var rawOutput = BoundedOutput(CombinedOutput(discovery));
+            return new ProjectDirectoryDiscovery(
+                [],
+                $"dotnet-format marker discovery exceeded the {OutputCaptureMaxBytes} byte output cap; skipped normalization so {FormatCheckAuditorName} can report the discovery failure",
+                rawOutput);
+        }
 
         if (discovery.ExitCode != 0)
         {
@@ -260,11 +274,43 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 
     private static string CombinedOutput(SandboxExecResult result)
     {
-        if (string.IsNullOrWhiteSpace(result.Stderr))
-            return result.Stdout;
-        if (string.IsNullOrWhiteSpace(result.Stdout))
-            return result.Stderr;
-        return result.Stdout + "\n" + result.Stderr;
+        var stdout = result.Stdout;
+        if (result.StdoutLimitExceeded)
+            stdout += $"\n[stdout truncated after {OutputCaptureMaxBytes} bytes]";
+        var stderr = result.Stderr;
+        if (result.StderrLimitExceeded)
+            stderr += $"\n[stderr truncated after {OutputCaptureMaxBytes} bytes]";
+
+        if (string.IsNullOrWhiteSpace(stderr))
+            return stdout;
+        if (string.IsNullOrWhiteSpace(stdout))
+            return stderr;
+        return stdout + "\n" + stderr;
+    }
+
+    private static void AppendBoundedOutput(StringBuilder output, string rawPart)
+    {
+        if (string.IsNullOrWhiteSpace(rawPart) || output.Length >= MaxRawOutputChars)
+            return;
+
+        rawPart = rawPart.TrimEnd();
+        var separatorLength = output.Length == 0 ? 0 : Environment.NewLine.Length;
+        var remaining = MaxRawOutputChars - output.Length - separatorLength;
+        if (remaining <= 0)
+            return;
+
+        if (separatorLength > 0)
+            output.AppendLine();
+        if (rawPart.Length <= remaining)
+        {
+            output.Append(rawPart);
+            return;
+        }
+
+        var contentChars = Math.Max(0, remaining - TruncationMarker.Length);
+        if (contentChars > 0)
+            output.Append(rawPart.AsSpan(0, contentChars));
+        output.Append(TruncationMarker.AsSpan(0, Math.Min(TruncationMarker.Length, remaining - contentChars)));
     }
 
     private static string BoundedOutput(string output)
@@ -272,7 +318,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         output = output.TrimEnd();
         return output.Length <= MaxRawOutputChars
             ? output
-            : output[..MaxRawOutputChars] + "\n... output truncated.";
+            : output[..Math.Max(0, MaxRawOutputChars - TruncationMarker.Length)] + TruncationMarker;
     }
 
     private static string ExceptionSafeOutput(SandboxExecResult result)

@@ -20,6 +20,8 @@ namespace CodeyBox.Audit.Shell;
 /// </summary>
 public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 {
+    public const int OutputCaptureMaxBytes = 1024 * 1024;
+
     private readonly ShellCommandAuditorOptions _opts;
 
     public ShellCommandAuditor(ShellCommandAuditorOptions opts)
@@ -68,13 +70,14 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         {
             Argv = _opts.Argv,
             WorkingDirectory = workingDirectory,
+            MaxStdoutBytes = OutputCaptureMaxBytes,
+            MaxStderrBytes = OutputCaptureMaxBytes,
+            KillOnOutputLimit = false,
         }, ct);
 
-        var combinedOutput = string.IsNullOrWhiteSpace(result.Stderr)
-            ? result.Stdout
-            : result.Stdout + "\n" + result.Stderr;
+        var combinedOutput = CombinedOutput(result);
 
-        if (result.Success)
+        if (result.ExitCode == 0 && !result.ExecutionUnavailable)
             return new AuditResult(true, [], RawOutput: combinedOutput);
 
         var finding = BuildCommandFinding(result, toolName);
@@ -95,7 +98,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 
     private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName)
     {
-        var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+        var description = DescriptionOutput(result);
 
         // Exit 127 is only non-blocking when it is confirmed to be the
         // auditor's tool missing from the sandbox. Some tools, notably npm,
@@ -114,6 +117,33 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             Severity: severity,
             Title: title,
             Description: description.TrimEnd());
+    }
+
+    private static string CombinedOutput(SandboxExecResult result)
+    {
+        var stdout = result.Stdout;
+        if (result.StdoutLimitExceeded)
+            stdout += $"\n[stdout truncated after {OutputCaptureMaxBytes} bytes]";
+        var stderr = result.Stderr;
+        if (result.StderrLimitExceeded)
+            stderr += $"\n[stderr truncated after {OutputCaptureMaxBytes} bytes]";
+
+        if (string.IsNullOrWhiteSpace(stderr))
+            return stdout;
+        if (string.IsNullOrWhiteSpace(stdout))
+            return stderr;
+        return stdout + "\n" + stderr;
+    }
+
+    private static string DescriptionOutput(SandboxExecResult result)
+    {
+        var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+        if (string.IsNullOrWhiteSpace(result.Stderr) && result.StdoutLimitExceeded)
+            description += $"\n[stdout truncated after {OutputCaptureMaxBytes} bytes]";
+        else if (!string.IsNullOrWhiteSpace(result.Stderr) && result.StderrLimitExceeded)
+            description += $"\n[stderr truncated after {OutputCaptureMaxBytes} bytes]";
+
+        return description;
     }
 
     private async Task<bool> IsDirectToolMissingAsync(

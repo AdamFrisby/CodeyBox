@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using Microsoft.Extensions.Configuration;
@@ -633,6 +634,116 @@ public sealed class MechanicalFixerTests : IDisposable
             "--whitespace=nowarn",
             "/tmp/codeybox-dotnet-format-before.patch",
         ]));
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_CommandFailureRestoresPreExistingTrackedDiffInRealRepo()
+    {
+        var repo = await TestSupport.CreateSeedRepoAsync(_workspace, "formatter-rollback");
+        await AddTrackedFileAsync(repo, "normalizer.txt", "base\n");
+        await AddTrackedFileAsync(repo, "formatted.txt", "clean\n");
+
+        await File.WriteAllTextAsync(Path.Combine(repo, "normalizer.txt"), "base\nprevious fixer edit\n");
+
+        var bin = Path.Combine(_workspace, "fake-dotnet-bin");
+        Directory.CreateDirectory(bin);
+        var fakeDotnet = Path.Combine(bin, "dotnet");
+        await File.WriteAllTextAsync(fakeDotnet,
+            """
+            #!/usr/bin/env sh
+            printf 'partial formatter output\n' > formatted.txt
+            exit 2
+            """);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(fakeDotnet, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var sandbox = new LocalProcessSandbox(new Dictionary<string, string>
+        {
+            ["PATH"] = bin + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? string.Empty),
+        });
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            repo,
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                [new DotnetFormatMechanicalFixerInput(["dotnet", "format", "--verify-no-changes"], "printf '.\n'")]));
+
+        Assert.False(result.Changed);
+        Assert.Contains("skipped normalization", result.Summary);
+        Assert.Equal("base\nprevious fixer edit\n", await File.ReadAllTextAsync(Path.Combine(repo, "normalizer.txt")));
+        Assert.Equal("clean\n", await File.ReadAllTextAsync(Path.Combine(repo, "formatted.txt")));
+
+        var (_, diff, _) = await TestSupport.RunGit(repo, "diff", "--", "formatted.txt");
+        Assert.Equal(string.Empty, diff);
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_CapsFormatterOutputAndTreatsTruncatedZeroExitAsSuccess()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: ["", ""],
+            formatResult: new SandboxExecResult(
+                0,
+                "formatted",
+                "",
+                StdoutLimitExceeded: true));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.False(result.Changed);
+        Assert.Equal("dotnet format made no changes", result.Summary);
+        Assert.Contains("stdout truncated", result.RawOutput);
+        var formatExec = Assert.Single(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
+        Assert.Equal(DotnetFormatMechanicalFixer.OutputCaptureMaxBytes, formatExec.MaxStdoutBytes);
+        Assert.Equal(DotnetFormatMechanicalFixer.OutputCaptureMaxBytes, formatExec.MaxStderrBytes);
+        Assert.False(formatExec.KillOnOutputLimit);
+        Assert.DoesNotContain(sandbox.Execs, e => e.Argv.SequenceEqual(["git", "-C", "/work/repo", "reset", "--hard", "HEAD"]));
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_CommandFailureRawOutputIsBounded()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: ".\n",
+            statusOutputs: [""],
+            formatResult: new SandboxExecResult(2, new string('x', 100_000), ""));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.False(result.Changed);
+        Assert.NotNull(result.RawOutput);
+        Assert.True(result.RawOutput!.Length < 20_000, $"raw output was {result.RawOutput.Length} chars");
+        Assert.Contains("output truncated", result.RawOutput);
     }
 
     [Fact]
@@ -1359,6 +1470,39 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task Pipeline_MechanicalConfiguredTimeoutIsTimeoutFailureNotTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new CountingAuditor(new AuditResult(true, []));
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [HangingMechanicalFixer.FixerName],
+            PerIterationTimeout = TimeSpan.FromSeconds(1),
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            mechanicalFixers: [new HangingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-timeout");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("timeout", final.FailureKind);
+        Assert.Equal(CancellationSources.PhaseTimeout("mechanical-edit"), final.CancellationSource);
+        Assert.Equal(0, final.TransientCancelRetries);
+        Assert.Equal(0, auditor.Calls);
+    }
+
+    [Fact]
     public async Task Pipeline_UnknownMechanicalFixerConfigFailsBeforeAgentWork()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1433,6 +1577,75 @@ public sealed class MechanicalFixerTests : IDisposable
             "--format=%s",
             item.WorkBranch!);
         Assert.DoesNotContain("chore: normalize", mechanicalLog);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Pipeline_MechanicalDiskDeferredRethrowsAndLeavesItemWorkComplete(int mechanicalSandboxOrdinal)
+    {
+        var deferred = new SandboxDiskDeferredException(
+            mountPath: "/fake/mp",
+            freeBytes: 1L * 1024 * 1024,
+            thresholdBytes: 10L * 1024 * 1024,
+            recheckIn: TimeSpan.FromMinutes(1));
+
+        await AssertMechanicalDeferralRethrownAsync(mechanicalSandboxOrdinal, deferred);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Pipeline_MechanicalProvisioningDeferredRethrowsAndLeavesItemWorkComplete(int mechanicalSandboxOrdinal)
+    {
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "start",
+            errorClass: "start-failed",
+            detail: "sandbox provisioning deferred",
+            recheckIn: TimeSpan.FromMinutes(1));
+
+        await AssertMechanicalDeferralRethrownAsync(mechanicalSandboxOrdinal, deferred);
+    }
+
+    private async Task AssertMechanicalDeferralRethrownAsync<TException>(
+        int mechanicalSandboxOrdinal,
+        TException deferred)
+        where TException : Exception
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var provider = new MechanicalSandboxDeferralProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            mechanicalSandboxOrdinal,
+            deferred);
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit,
+            sandboxProvider: provider,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem($"feature/mechanical-deferred-{mechanicalSandboxOrdinal}-{Guid.NewGuid():N}");
+        await tp.Store.CreateAsync(item);
+
+        var thrown = await Assert.ThrowsAsync<TException>(
+            () => tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        Assert.True(provider.Fired);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WorkComplete, final!.State);
+        Assert.Null(final.FailureKind);
     }
 
     public static IEnumerable<object[]> PipelineMechanicalGitFailureCases()
@@ -1952,6 +2165,27 @@ public sealed class MechanicalFixerTests : IDisposable
         }
     }
 
+    private sealed class HangingMechanicalFixer : IMechanicalFixer
+    {
+        public const string FixerName = "hanging-normalizer";
+
+        public string Name => FixerName;
+        public string Kind => "test";
+
+        public async Task<MechanicalFixerResult> ApplyAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            MechanicalFixerContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new MechanicalFixerResult(false, "unreachable");
+        }
+    }
+
     private sealed class NamedAuditor : IAuditor
     {
         public NamedAuditor(string name, string kind = "tool")
@@ -2128,6 +2362,47 @@ public sealed class MechanicalFixerTests : IDisposable
             => Task.FromResult(new AuditResult(true, []));
     }
 
+    private sealed class LocalProcessSandbox(IReadOnlyDictionary<string, string>? environment = null) : ISandbox
+    {
+        public string Id => "local-process";
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = exec.Argv[0],
+                WorkingDirectory = exec.WorkingDirectory ?? Directory.GetCurrentDirectory(),
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                RedirectStandardInput = exec.Stdin is not null,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            for (var i = 1; i < exec.Argv.Count; i++)
+                psi.ArgumentList.Add(exec.Argv[i]);
+
+            if (environment is not null)
+            {
+                foreach (var (key, value) in environment)
+                    psi.Environment[key] = value;
+            }
+
+            using var process = Process.Start(psi)!;
+            if (exec.Stdin is not null)
+            {
+                await process.StandardInput.WriteAsync(exec.Stdin);
+                await process.StandardInput.DisposeAsync();
+            }
+
+            var stdout = process.StandardOutput.ReadToEndAsync(ct);
+            var stderr = process.StandardError.ReadToEndAsync(ct);
+            await process.WaitForExitAsync(ct);
+            return new SandboxExecResult(process.ExitCode, await stdout, await stderr);
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     private sealed class DotnetFormatSandbox : ISandbox
     {
         private readonly string _markerStdout;
@@ -2263,6 +2538,48 @@ public sealed class MechanicalFixerTests : IDisposable
                 {
                     Fired = true;
                     throw new InvalidOperationException(_message);
+                }
+            }
+
+            return _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class MechanicalSandboxDeferralProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        private readonly int _deferralOrdinal;
+        private readonly Exception _exception;
+        private int _mechanicalSandboxCount;
+
+        public MechanicalSandboxDeferralProvider(
+            ISandboxProvider inner,
+            int deferralOrdinal,
+            Exception exception)
+        {
+            _inner = inner;
+            _deferralOrdinal = deferralOrdinal;
+            _exception = exception;
+        }
+
+        public string Name => _inner.Name;
+        public bool Fired { get; private set; }
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            if (string.Equals(spec.TimingPhase, "mechanical-edit", StringComparison.Ordinal))
+            {
+                var ordinal = Interlocked.Increment(ref _mechanicalSandboxCount);
+                if (ordinal == _deferralOrdinal)
+                {
+                    Fired = true;
+                    throw _exception;
                 }
             }
 
