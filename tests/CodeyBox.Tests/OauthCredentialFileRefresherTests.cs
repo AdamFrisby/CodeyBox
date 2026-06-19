@@ -484,6 +484,24 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
     }
 
     [Fact]
+    public void ResolveCliRefreshPathValue_WhenParentPathMissing_UsesOsDefault()
+    {
+        var result = GeminiOauthCredentialFileRefresher.ResolveCliRefreshPathValue(null);
+
+        if (OperatingSystem.IsWindows())
+            Assert.Contains("Windows", result, StringComparison.OrdinalIgnoreCase);
+        else
+            Assert.Contains("/usr/bin", result);
+    }
+
+    [Fact]
+    public void ResolveCliRefreshPathValue_WhenParentPathPresent_PreservesIt()
+    {
+        Assert.Equal("custom-path",
+            GeminiOauthCredentialFileRefresher.ResolveCliRefreshPathValue("custom-path"));
+    }
+
+    [Fact]
     public void ResolveExecutablePath_WhenResolverTimesOut_ReturnsNull()
     {
         var scriptPath = WriteExecutableScript("sleep 10", exitCode: 0);
