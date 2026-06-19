@@ -1668,6 +1668,7 @@ builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
 builder.Services.AddSingleton<IMechanicalFixer, DotnetFormatMechanicalFixer>();
 builder.Services.AddSingleton<IMechanicalFixerRegistry, MechanicalFixerRegistry>();
+builder.Services.AddSingleton<IMechanicalFixerInputProvider, DotnetFormatMechanicalFixerInputProvider>();
 
 // Mutation-testing rigor gate (disabled by default; per-project threshold).
 // The auditor short-circuits to pass when Enabled=false, so registering the
@@ -2358,7 +2359,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     cancellationRegistry: sp.GetRequiredService<CancellationRegistry>(),
     terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>(),
     terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>(),
-    mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>()));
+    mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
+    mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

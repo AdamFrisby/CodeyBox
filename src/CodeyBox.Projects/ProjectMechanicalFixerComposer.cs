@@ -1,6 +1,4 @@
 using CodeyBox.Core;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Projects;
 
@@ -13,16 +11,16 @@ public sealed class ProjectMechanicalFixerComposer
 {
     private readonly IReadOnlyDictionary<string, IMechanicalFixer> _fixersByName;
 
-    public ProjectMechanicalFixerComposer(
-        IMechanicalFixerRegistry registry,
-        ILogger<ProjectMechanicalFixerComposer> logger)
+    public ProjectMechanicalFixerComposer(IMechanicalFixerRegistry registry)
     {
-        _ = logger;
         _fixersByName = registry.All.ToDictionary(f => f.Name, StringComparer.OrdinalIgnoreCase);
     }
 
     public static ProjectMechanicalFixerComposer FromFixers(IEnumerable<IMechanicalFixer> fixers)
-        => new(new InlineMechanicalFixerRegistry(fixers), NullLogger<ProjectMechanicalFixerComposer>.Instance);
+        => new(new InlineMechanicalFixerRegistry(fixers));
+
+    public void Validate(Project project, string? profile = null)
+        => _ = Compose(project, profile);
 
     public IReadOnlyList<IMechanicalFixer> Compose(Project project, string? profile = null)
     {
@@ -44,7 +42,7 @@ public sealed class ProjectMechanicalFixerComposer
             }
             else
             {
-                throw new InvalidOperationException(
+                throw new ProjectMechanicalFixerConfigurationException(
                     $"Project '{project.Id.Value}' requested mechanical fixer '{name}', but that fixer is not registered.");
             }
         }
@@ -60,5 +58,13 @@ public sealed class ProjectMechanicalFixerComposer
         }
 
         public IReadOnlyList<IMechanicalFixer> All { get; }
+    }
+}
+
+public sealed class ProjectMechanicalFixerConfigurationException : InvalidOperationException
+{
+    public ProjectMechanicalFixerConfigurationException(string message)
+        : base(message)
+    {
     }
 }

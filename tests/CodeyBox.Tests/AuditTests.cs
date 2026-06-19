@@ -287,6 +287,26 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public void DotnetFormatCommandResultClassifier_IgnoresNonVerifyCommands()
+    {
+        var classifier = new DotnetFormatCommandResultClassifier();
+        var commandFinding = new AuditFinding(
+            "custom:shell",
+            AuditSeverity.Error,
+            "command exited 1",
+            "failed");
+
+        var result = classifier.ClassifyFailedCommand(new ShellCommandResultContext(
+            "custom:shell",
+            ["dotnet", "build"],
+            new SandboxExecResult(1, "", "build failed"),
+            "build failed",
+            commandFinding));
+
+        Assert.Null(result);
+    }
+
+    [Fact]
     public async Task ShellCommandAuditor_Exit127WithSpoofedMissingToolOutput_RemainsError()
     {
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions

@@ -54,6 +54,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IUpstreamRemoteFactory _upstreamFactory;
     private readonly ProjectAuditorComposer _auditorComposer;
     private readonly ProjectMechanicalFixerComposer _mechanicalFixerComposer;
+    private readonly IReadOnlyList<IMechanicalFixerInputProvider> _mechanicalFixerInputProviders;
     private readonly IWorkItemStore _store;
     private readonly IWebhookDispatcher _webhooks;
     private readonly IWorkItemTerminalTransition _terminalTransitions;
@@ -277,7 +278,8 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationRegistry? cancellationRegistry = null,
         IWorkItemTerminalTransition? terminalTransitions = null,
         IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null,
-        ProjectMechanicalFixerComposer? mechanicalFixerComposer = null)
+        ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
+        IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -288,6 +290,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _upstreamFactory = upstreamFactory;
         _auditorComposer = auditorComposer;
         _mechanicalFixerComposer = mechanicalFixerComposer ?? ProjectMechanicalFixerComposer.FromFixers([]);
+        _mechanicalFixerInputProviders = mechanicalFixerInputProviders?.ToList() ?? [];
         _store = store;
         _webhooks = webhooks;
         _opts = opts;
@@ -808,10 +811,11 @@ public sealed class PipelineRunner : IPipelineRunner
         try
         {
             project = project with { Audit = ResolveAuditProfileForWorkItem(project, item) };
+            _mechanicalFixerComposer.Validate(project);
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Work item {Id} could not resolve audit profile for project {ProjectId}", item.Id, project.Id);
+            _log.LogError(ex, "Work item {Id} could not validate audit configuration for project {ProjectId}", item.Id, project.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "configuration");
             return;
         }
@@ -1561,6 +1565,11 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             _log.LogWarning(ex, "Work item {Id} could not persist audit progress", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
+        catch (ProjectMechanicalFixerConfigurationException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} mechanical edit configuration is invalid", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "configuration");
         }
         catch (MechanicalFixerException ex)
         {
@@ -5753,7 +5762,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 baseBranch,
                 auditIteration,
                 project.Id.Value,
-                BuildMechanicalFixerShellCommands(auditors));
+                BuildMechanicalFixerInputs(auditors));
 
             var changedFixers = new List<string>();
             foreach (var fixer in fixers)
@@ -5866,22 +5875,17 @@ public sealed class PipelineRunner : IPipelineRunner
             ? mount
             : mount with { ReadOnly = true };
 
-    private static IReadOnlyList<ShellAuditorCommandDescriptor> BuildMechanicalFixerShellCommands(
+    private IReadOnlyList<IMechanicalFixerInput> BuildMechanicalFixerInputs(
         IReadOnlyList<IAuditor> auditors)
     {
-        var commands = new List<ShellAuditorCommandDescriptor>();
-        foreach (var auditor in auditors)
-        {
-            if (auditor is not IShellAuditorArgvProvider provider || provider.Argv.Count == 0)
-                continue;
+        if (_mechanicalFixerInputProviders.Count == 0)
+            return [];
 
-            commands.Add(new ShellAuditorCommandDescriptor(
-                auditor.Name,
-                provider.Argv,
-                provider.CommandMetadata));
-        }
+        var inputs = new List<IMechanicalFixerInput>();
+        foreach (var provider in _mechanicalFixerInputProviders)
+            inputs.AddRange(provider.BuildInputs(auditors));
 
-        return commands;
+        return inputs;
     }
 
     private async Task<int?> ResolveMechanicalPromptRevisionForCommitAsync(

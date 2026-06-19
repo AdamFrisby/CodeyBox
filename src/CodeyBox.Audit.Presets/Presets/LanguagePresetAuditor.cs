@@ -2,14 +2,13 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Presets.Presets;
 
-internal interface ILanguagePresetAuditorMetadata
+internal interface ILanguagePresetCommandSource
 {
     string Language { get; }
-    string MarkerDescription { get; }
     string MarkerScript { get; }
 }
 
-internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvider, ILanguagePresetAuditorMetadata
+internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvider, ILanguagePresetCommandSource
 {
     private const int MaxRawOutputChars = 1_000_000;
 
@@ -39,10 +38,7 @@ internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvide
     public BuildTestGateEvidence BuildTestGateEvidence => _inner.BuildTestGateEvidence;
     public IReadOnlyList<string> Argv => _inner is IShellAuditorArgvProvider provider ? provider.Argv : [];
     public string Language => _language;
-    public string MarkerDescription => _markerDescription;
     public string MarkerScript => _markerScript;
-    public ShellAuditorCommandMetadata? CommandMetadata
-        => new(Language: _language, MarkerDescription: _markerDescription, MarkerScript: _markerScript);
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,

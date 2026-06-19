@@ -128,6 +128,7 @@ internal static class TestSupport
         ISessionAgentRunner? sessionAgentRunnerOverride = null,
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshotOverride = null,
         IEnumerable<IMechanicalFixer>? mechanicalFixers = null,
+        IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
         // Extra registry entries — register additional agent runners alongside
         // the default ScriptedAgent so tests can exercise audit-pool routing
         // for non-work agents (e.g. asserting missing-credentials / smoke-
@@ -300,7 +301,8 @@ internal static class TestSupport
             cancellationRegistry: cancellationRegistry,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
-            mechanicalFixerComposer: mechanicalComposer);
+            mechanicalFixerComposer: mechanicalComposer,
+            mechanicalFixerInputProviders: mechanicalFixerInputProviders);
 
         return new TestPipeline(
             pipeline,

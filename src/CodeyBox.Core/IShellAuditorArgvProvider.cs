@@ -17,21 +17,4 @@ public interface IShellAuditorArgvProvider
     /// in this case should not implement the interface at all.
     /// </summary>
     IReadOnlyList<string> Argv { get; }
-
-    /// <summary>
-    /// Optional command discovery metadata. Language preset wrappers use this so
-    /// mechanical fixers can reuse the same command and project-marker discovery
-    /// without receiving the full auditor panel.
-    /// </summary>
-    ShellAuditorCommandMetadata? CommandMetadata => null;
 }
-
-public sealed record ShellAuditorCommandMetadata(
-    string? Language = null,
-    string? MarkerDescription = null,
-    string? MarkerScript = null);
-
-public sealed record ShellAuditorCommandDescriptor(
-    string Name,
-    IReadOnlyList<string> Argv,
-    ShellAuditorCommandMetadata? Metadata = null);

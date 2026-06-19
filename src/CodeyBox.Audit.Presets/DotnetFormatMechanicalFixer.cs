@@ -5,9 +5,9 @@ using CodeyBox.Audit.Presets.Presets;
 namespace CodeyBox.Audit.Presets;
 
 /// <summary>
-/// Mechanical counterpart to the <c>csharp:format-check</c> auditor. It reuses
-/// the active C# format-check auditor's command and language marker discovery,
-/// removing only flags that make the command read-only.
+/// Mechanical counterpart to the <c>csharp:format-check</c> auditor. It consumes
+/// the preset-owned dotnet-format input prepared from the active C# format-check
+/// auditor, removing only flags that make the command read-only.
 /// </summary>
 public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
 {
@@ -25,16 +25,15 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         MechanicalFixerContext context,
         CancellationToken ct = default)
     {
-        var command = context.ShellCommands.FirstOrDefault(c =>
-            c.Name.Equals(FormatCheckAuditorName, StringComparison.OrdinalIgnoreCase));
-        if (command is null || command.Argv.Count == 0)
+        var command = context.FindInput<DotnetFormatMechanicalFixerInput>();
+        if (command is null || command.FormatCheckArgv.Count == 0)
         {
             return new MechanicalFixerResult(
                 Changed: false,
                 Summary: $"{FormatCheckAuditorName} is not active; {FixerName} skipped");
         }
 
-        if (!TryToFixerArgv(command.Argv, out var formatArgv))
+        if (!TryToFixerArgv(command.FormatCheckArgv, out var formatArgv))
         {
             return new MechanicalFixerResult(
                 Changed: false,
@@ -44,7 +43,7 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
         var discovery = await DiscoverProjectDirectoriesAsync(
             sandbox,
             workingDirectory,
-            command.Metadata,
+            command.ProjectMarkerScript,
             ct);
         if (discovery.FailureSummary is not null)
         {
@@ -157,15 +156,15 @@ public sealed class DotnetFormatMechanicalFixer : IMechanicalFixer
     private static async Task<ProjectDirectoryDiscovery> DiscoverProjectDirectoriesAsync(
         ISandbox sandbox,
         string workingDirectory,
-        ShellAuditorCommandMetadata? metadata,
+        string? markerScript,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(metadata?.MarkerScript))
+        if (string.IsNullOrWhiteSpace(markerScript))
             return new ProjectDirectoryDiscovery(["."]);
 
         var discovery = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", metadata.MarkerScript],
+            Argv = ["sh", "-c", markerScript],
             WorkingDirectory = workingDirectory,
         }, ct);
 

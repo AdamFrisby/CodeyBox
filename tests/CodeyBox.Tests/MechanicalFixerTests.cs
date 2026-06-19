@@ -200,6 +200,43 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task ProjectRepository_BoundProfileMechanicalFixersPreservesConfiguredAndExplicitEmptyLists()
+    {
+        using var json = new MemoryStream(Encoding.UTF8.GetBytes(
+            """
+            {
+              "CodeyBox": {
+                "Projects": [
+                  {
+                    "Id": "p",
+                    "RepositoryUrl": "https://example.invalid/repo.git",
+                    "Audit": {
+                      "Profiles": {
+                        "ci": {
+                          "Languages": [ "csharp" ],
+                          "MechanicalFixers": [ " dotnet-format ", " custom-normalizer ", " " ]
+                        },
+                        "manual": {
+                          "Languages": [ "csharp" ],
+                          "MechanicalFixers": []
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+            """));
+        var config = new ConfigurationBuilder().AddJsonStream(json).Build();
+        var repo = new ProjectRepository(Options.Create(ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"))));
+
+        var project = await repo.GetAsync(new ProjectId("p"));
+
+        Assert.Equal(["dotnet-format", "custom-normalizer"], project!.Audit.ResolveProfile("ci").MechanicalFixers);
+        Assert.Empty(project.Audit.ResolveProfile("manual").MechanicalFixers);
+    }
+
+    [Fact]
     public async Task ProjectRepository_ProfileLanguagesDeriveMechanicalFixersWithoutLeakingFallbackCSharpDefault()
     {
         var repo = new ProjectRepository(Options.Create(new ProjectsOptions
@@ -321,7 +358,7 @@ public sealed class MechanicalFixerTests : IDisposable
             },
         };
 
-        var ex = Assert.Throws<InvalidOperationException>(() => composer.Compose(project));
+        var ex = Assert.Throws<ProjectMechanicalFixerConfigurationException>(() => composer.Compose(project));
 
         Assert.Contains("missing-normalizer", ex.Message);
         Assert.Contains("not registered", ex.Message);
@@ -353,7 +390,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                [new ShellAuditorCommandDescriptor("csharp:format-check", ["./format-wrapper", "--verify-no-changes"])]));
+                [new DotnetFormatMechanicalFixerInput(["./format-wrapper", "--verify-no-changes"], ".")]));
 
         Assert.False(result.Changed);
         Assert.Contains("dotnet-format skipped", result.Summary);
@@ -380,7 +417,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                ShellCommandsFor(auditor)));
+                InputsFor(auditor)));
 
         Assert.True(result.Changed);
         var formatExec = Assert.Single(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
@@ -389,6 +426,36 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.All(
             sandbox.Execs.Where(e => e.Argv.Count >= 2 && e.Argv[0] == "git" && e.Argv.Contains("status")),
             e => Assert.Contains("--untracked-files=no", e.Argv));
+    }
+
+    [Fact]
+    public async Task DotnetFormatFixer_FormatsAllSelectedCSharpProjectDirectories()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new DotnetFormatSandbox(
+            markerStdout: "src/App\nsrc/Lib\n",
+            statusOutputs: ["", " M src/App/Program.cs\0 M src/Lib/Program.cs\0"],
+            formatResult: new SandboxExecResult(0, "formatted", ""));
+
+        var result = await new DotnetFormatMechanicalFixer().ApplyAsync(
+            sandbox,
+            "/work/repo",
+            new MechanicalFixerContext(
+                WorkItemId.New(),
+                "feature/test",
+                "main",
+                1,
+                "project",
+                InputsFor(auditor)));
+
+        Assert.True(result.Changed);
+        var formatWorkingDirectories = sandbox.Execs
+            .Where(e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format")
+            .Select(e => e.WorkingDirectory ?? string.Empty)
+            .ToArray();
+        Assert.Equal(["/work/repo/src/App", "/work/repo/src/Lib"], formatWorkingDirectories);
     }
 
     [Fact]
@@ -411,7 +478,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                ShellCommandsFor(auditor)));
+                InputsFor(auditor)));
 
         Assert.False(result.Changed);
         Assert.Equal("dotnet format made no changes", result.Summary);
@@ -437,7 +504,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                ShellCommandsFor(auditor)));
+                InputsFor(auditor)));
 
         Assert.False(result.Changed);
         Assert.Contains("skipped normalization", result.Summary);
@@ -467,7 +534,7 @@ public sealed class MechanicalFixerTests : IDisposable
                     "main",
                     1,
                     "project",
-                    ShellCommandsFor(auditor))));
+                    InputsFor(auditor))));
 
         Assert.Contains("could not discard partial changes", ex.Message);
         Assert.Contains("reset failed with details", ex.Message);
@@ -490,8 +557,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "feature/test",
                 "main",
                 1,
-                "project",
-                []));
+                "project"));
 
         Assert.False(result.Changed);
         Assert.DoesNotContain(sandbox.Execs, e => e.Argv.Count >= 2 && e.Argv[0] == "dotnet" && e.Argv[1] == "format");
@@ -517,7 +583,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                ShellCommandsFor(auditor)));
+                InputsFor(auditor)));
 
         Assert.False(result.Changed);
         Assert.Equal("no C# project marker found; dotnet format skipped", result.Summary);
@@ -546,7 +612,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                ShellCommandsFor(auditor)));
+                InputsFor(auditor)));
 
         Assert.False(result.Changed);
         Assert.Contains("directory cap", result.Summary);
@@ -574,7 +640,7 @@ public sealed class MechanicalFixerTests : IDisposable
                 "main",
                 1,
                 "project",
-                ShellCommandsFor(auditor)));
+                InputsFor(auditor)));
 
         Assert.False(result.Changed);
         Assert.Contains("marker discovery exited 1", result.Summary);
@@ -603,7 +669,7 @@ public sealed class MechanicalFixerTests : IDisposable
                     "main",
                     1,
                     "project",
-                    ShellCommandsFor(auditor))));
+                    InputsFor(auditor))));
 
         Assert.Contains("failed to read git status", ex.Message);
         Assert.DoesNotContain('\n', ex.Message);
@@ -765,20 +831,35 @@ public sealed class MechanicalFixerTests : IDisposable
     public async Task Pipeline_DotnetFormatMechanicalFixerUsesSpecificSubjectAndProjectIdentity()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        await AddTrackedFileAsync(seed, "src/App/App.csproj",
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+                <ImplicitUsings>enable</ImplicitUsings>
+                <Nullable>enable</Nullable>
+              </PropertyGroup>
+            </Project>
+            """);
+        await AddTrackedFileAsync(seed, "src/App/Program.cs",
+            """
+            namespace App; public class Program{public static void Main(){System.Console.WriteLine("hi");}}
+            """);
         var audit = new ProjectAudit
         {
             MaxIterations = 1,
-            AuditTypes = ["scripted"],
+            Languages = ["csharp"],
+            ExcludedAuditors = ["csharp:build-WaE", "csharp:test-pass"],
             MechanicalFixers = [MechanicalFixerNames.DotnetFormat],
         };
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [new PassingAuditor()],
             projectAudit: audit,
+            presetCatalogOverride: new PresetCatalog(),
             projectGitAuthor: ("Project Bot", "project-bot@example.invalid"),
-            mechanicalFixers: [new DotnetFormatAppendingMechanicalFixer()]);
+            mechanicalFixers: [new DotnetFormatMechanicalFixer()],
+            mechanicalFixerInputProviders: [new DotnetFormatMechanicalFixerInputProvider()]);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
 
         var item = NewItem("feature/mechanical-dotnet-format");
@@ -797,6 +878,12 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Contains("chore: normalize (dotnet format)", mechanicalLog);
         Assert.DoesNotContain("chore: normalize mechanical edits", mechanicalLog);
         Assert.Contains("Project Bot <project-bot@example.invalid>", mechanicalLog);
+
+        var (_, formattedProgram, _) = await TestSupport.RunGit(
+            barePath,
+            "show",
+            $"{item.WorkBranch!}:src/App/Program.cs");
+        Assert.Contains("public class Program {", formattedProgram);
     }
 
     [Fact]
@@ -863,6 +950,35 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("mechanical-edit failed", final.LastError);
+    }
+
+    [Fact]
+    public async Task Pipeline_UnknownMechanicalFixerConfigFailsBeforeAgentWork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = ["missing-normalizer"],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            projectAudit: audit);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-config-error");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("configuration", final.FailureKind);
+        Assert.Contains("missing-normalizer", final.LastError);
+        Assert.Empty(tp.Agent.WorkPrompts);
+        Assert.Single(tp.Agent.WorkPlan);
     }
 
     public static IEnumerable<object[]> PipelineMechanicalGitFailureCases()
@@ -1083,10 +1199,9 @@ public sealed class MechanicalFixerTests : IDisposable
         return ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
     }
 
-    private static IReadOnlyList<ShellAuditorCommandDescriptor> ShellCommandsFor(IAuditor auditor)
+    private static IReadOnlyList<IMechanicalFixerInput> InputsFor(IAuditor auditor)
     {
-        var provider = Assert.IsAssignableFrom<IShellAuditorArgvProvider>(auditor);
-        return [new ShellAuditorCommandDescriptor(auditor.Name, provider.Argv, provider.CommandMetadata)];
+        return new DotnetFormatMechanicalFixerInputProvider().BuildInputs([auditor]);
     }
 
     private sealed class AppendingMechanicalFixer : IMechanicalFixer
@@ -1118,29 +1233,6 @@ public sealed class MechanicalFixerTests : IDisposable
                 throw new InvalidOperationException(result.Stderr);
 
             return new MechanicalFixerResult(true, $"appended iteration {context.AuditIteration}");
-        }
-    }
-
-    private sealed class DotnetFormatAppendingMechanicalFixer : IMechanicalFixer
-    {
-        public string Name => MechanicalFixerNames.DotnetFormat;
-        public string Kind => "test";
-
-        public async Task<MechanicalFixerResult> ApplyAsync(
-            ISandbox sandbox,
-            string workingDirectory,
-            MechanicalFixerContext context,
-            CancellationToken ct = default)
-        {
-            var result = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "printf 'formatted\n' >> \"$0\"", $"{workingDirectory}/normalizer.txt"],
-            }, ct);
-
-            if (!result.Success)
-                throw new InvalidOperationException(result.Stderr);
-
-            return new MechanicalFixerResult(true, "formatted");
         }
     }
 

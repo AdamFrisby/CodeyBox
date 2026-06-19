@@ -30,6 +30,13 @@ public interface IMechanicalFixerRegistry
     IReadOnlyList<IMechanicalFixer> All { get; }
 }
 
+/// <summary>
+/// Typed, fixer-specific input prepared by orchestration code before the
+/// mechanical-edit phase. The core fixer contract does not prescribe what an
+/// input means; concrete fixer packages own their input record types.
+/// </summary>
+public interface IMechanicalFixerInput;
+
 /// <summary>Information passed to a mechanical fixer invocation.</summary>
 public sealed record MechanicalFixerContext(
     WorkItemId WorkItemId,
@@ -37,7 +44,21 @@ public sealed record MechanicalFixerContext(
     string BaseBranch,
     int AuditIteration,
     string ProjectId,
-    IReadOnlyList<ShellAuditorCommandDescriptor> ShellCommands);
+    IReadOnlyList<IMechanicalFixerInput> Inputs)
+{
+    public MechanicalFixerContext(
+        WorkItemId workItemId,
+        string workBranch,
+        string baseBranch,
+        int auditIteration,
+        string projectId)
+        : this(workItemId, workBranch, baseBranch, auditIteration, projectId, [])
+    {
+    }
+
+    public T? FindInput<T>() where T : class, IMechanicalFixerInput
+        => Inputs.OfType<T>().FirstOrDefault();
+}
 
 /// <summary>Result from one mechanical fixer invocation.</summary>
 public sealed record MechanicalFixerResult(

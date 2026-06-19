@@ -1,6 +1,8 @@
+using System.Reflection;
 using CodeyBox.Api;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -28,6 +30,14 @@ public sealed class MechanicalFixerProgramWiringTests
             .Compose(project!);
 
         Assert.IsType<DotnetFormatMechanicalFixer>(Assert.Single(fixers));
+
+        var runner = factory.Services.GetRequiredService<PipelineRunner>();
+        var wiredComposer = typeof(PipelineRunner)
+            .GetField("_mechanicalFixerComposer", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(runner);
+        Assert.Same(
+            factory.Services.GetRequiredService<ProjectMechanicalFixerComposer>(),
+            wiredComposer);
     }
 
     private sealed class MechanicalFixerWiringFactory : WebApplicationFactory<Program>
