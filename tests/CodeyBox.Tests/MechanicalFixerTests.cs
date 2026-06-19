@@ -1511,6 +1511,49 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task Pipeline_NoChangeInitialWorkFailsBeforeMechanicalFixerCanMaskIt()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var fixer = new AppendingMechanicalFixer();
+        var auditor = new CountingAuditor(new AuditResult(true, []));
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            mechanicalFixers: [fixer]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "seed\n"));
+
+        var item = NewItem("feature/mechanical-no-change-initial");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Agent produced no changes", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(0, auditor.Calls);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, normalized, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:normalizer.txt");
+        Assert.Equal(string.Empty, normalized);
+
+        var (_, mechanicalLog, _) = await TestSupport.RunGit(
+            barePath,
+            "log",
+            "--grep=chore: normalize mechanical edits",
+            "--format=%s",
+            item.WorkBranch!);
+        Assert.DoesNotContain("chore: normalize mechanical edits", mechanicalLog);
+    }
+
+    [Fact]
     public async Task Pipeline_NoChangeReworkFailsBeforeMechanicalFixerCanMaskIt()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
