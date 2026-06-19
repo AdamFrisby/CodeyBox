@@ -37,9 +37,9 @@ public interface IWorkerProgressActivitySource
 /// Default watchdog activity source. It combines exact host-side process CPU
 /// sampling for sandbox processes that carry
 /// <see cref="SandboxConventions.WorkItemIdEnvironmentVariable"/> with
-/// provider-owned active sandbox ownership. Active sandbox ownership is a
-/// progress signal because VM guest CPU is not visible from the host process
-/// table.
+/// provider-owned active sandbox activity projections. Active sandbox
+/// projections count as progress only when the provider-reported signature
+/// changes; stable ownership alone must not keep a stalled worker alive.
 /// </summary>
 public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivitySource
 {
@@ -48,13 +48,37 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     private const int MaxAncestorWalk = 32;
     // First-seen tagged processes need enough wall time to accrue a CPU tick on
     // loaded hosts; too short a window makes the watchdog recover active workers.
-    private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(250);
+    // Confirm over multiple short samples with early-exit so the watchdog
+    // doesn't block longer than necessary on already-progressing workers.
+    private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(50);
+    private const int InitialCpuSampleAttempts = 10;
     private readonly IActiveSandboxProgressProvider? _activeSandboxProvider;
+    private readonly ProcessCpuSampleReader _processCpuSampleReader;
+    private readonly bool _requireLinuxProcFs;
     private readonly ConcurrentDictionary<WorkItemId, ProcessCpuSample> _processSamples = new();
     private readonly ConcurrentDictionary<WorkItemId, string> _activeSandboxSignatures = new();
 
     public DefaultWorkerProgressActivitySource(IActiveSandboxProgressProvider? activeSandboxProvider = null)
-        => _activeSandboxProvider = activeSandboxProvider;
+        : this(activeSandboxProvider, TryReadWorkItemCpuTicks, requireLinuxProcFs: true)
+    {
+    }
+
+    internal DefaultWorkerProgressActivitySource(
+        IActiveSandboxProgressProvider? activeSandboxProvider,
+        ProcessCpuSampleReader processCpuSampleReader)
+        : this(activeSandboxProvider, processCpuSampleReader, requireLinuxProcFs: false)
+    {
+    }
+
+    private DefaultWorkerProgressActivitySource(
+        IActiveSandboxProgressProvider? activeSandboxProvider,
+        ProcessCpuSampleReader processCpuSampleReader,
+        bool requireLinuxProcFs)
+    {
+        _activeSandboxProvider = activeSandboxProvider;
+        _processCpuSampleReader = processCpuSampleReader;
+        _requireLinuxProcFs = requireLinuxProcFs;
+    }
 
     public ValueTask<WorkerProgressActivity?> ObserveAsync(
         WorkerRegistration worker,
@@ -114,28 +138,47 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         }
 
         var signature = string.Join("\0\0", signatureParts);
-        var changed = _activeSandboxSignatures.TryGetValue(itemId, out var previous)
-            && !string.Equals(signature, previous, StringComparison.Ordinal);
+        if (!_activeSandboxSignatures.TryGetValue(itemId, out var previous))
+        {
+            _activeSandboxSignatures[itemId] = signature;
+            reason = "active-sandbox";
+            return true;
+        }
+
+        if (string.Equals(signature, previous, StringComparison.Ordinal))
+            return false;
+
         _activeSandboxSignatures[itemId] = signature;
-        reason = changed ? "active-sandbox-change" : "active-sandbox";
+        reason = "active-sandbox-change";
         return true;
     }
 
     private bool TryObserveProcessCpu(WorkItemId itemId, out string reason)
     {
         reason = "";
-        if (!OperatingSystem.IsLinux())
+        if (_requireLinuxProcFs && !OperatingSystem.IsLinux())
             return false;
 
-        if (!TryReadWorkItemCpuTicks(itemId, out var sample))
+        if (!_processCpuSampleReader(itemId, out var sample))
         {
             _processSamples.TryRemove(itemId, out _);
             return false;
         }
 
+        // A running process state is itself a progress signal; the watchdog
+        // does not need to wait for a CPU tick to accrue when a tracked process
+        // is actively scheduled. Linux D-state is deliberately excluded: it can
+        // be an unbounded storage/network wait and should not mask a stall.
+        if (sample.HasActiveProcessState)
+        {
+            _processSamples[itemId] = sample with { HasConfirmedProgress = true };
+            reason = "process-cpu";
+            return true;
+        }
+
         if (!_processSamples.TryGetValue(itemId, out var previous))
         {
-            if (TryConfirmImmediateCpuProgress(itemId, sample, out var observedSample))
+            if (TryConfirmImmediateCpuProgress(itemId, sample, _processCpuSampleReader, out var observedSample))
             {
                 _processSamples[itemId] = observedSample;
                 reason = "process-cpu";
@@ -157,7 +200,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
                 return true;
             }
 
-            if (TryConfirmImmediateCpuProgress(itemId, sample, out var observedSample))
+            if (TryConfirmImmediateCpuProgress(itemId, sample, _processCpuSampleReader, out var observedSample))
             {
                 _processSamples[itemId] = observedSample;
                 reason = "process-cpu";
@@ -182,24 +225,33 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     private static bool TryConfirmImmediateCpuProgress(
         WorkItemId itemId,
         ProcessCpuSample baseline,
+        ProcessCpuSampleReader processCpuSampleReader,
         out ProcessCpuSample observedSample)
     {
         observedSample = baseline;
 
         // Establish a CPU baseline for workers first observed after durable
         // progress is already stale without treating mere process presence as
-        // progress.
-        Thread.Sleep(InitialCpuSampleDelay);
+        // progress. A single scheduler tick is too tight under parallel-suite
+        // or host CPU contention, so confirm over a bounded short window.
+        for (var attempt = 0; attempt < InitialCpuSampleAttempts; attempt++)
+        {
+            Thread.Sleep(InitialCpuSampleDelay);
 
-        if (!TryReadWorkItemCpuTicks(itemId, out var next))
-            return false;
+            if (!processCpuSampleReader(itemId, out var next))
+                return false;
 
-        var progressed = string.Equals(next.ProcessSetSignature, baseline.ProcessSetSignature, StringComparison.Ordinal)
-            && next.CpuTicks > baseline.CpuTicks;
-        observedSample = progressed
-            ? next with { HasConfirmedProgress = true }
-            : next;
-        return progressed;
+            observedSample = next;
+            if (!string.Equals(next.ProcessSetSignature, baseline.ProcessSetSignature, StringComparison.Ordinal))
+                return false;
+            if (next.HasActiveProcessState || next.CpuTicks > baseline.CpuTicks)
+            {
+                observedSample = next with { HasConfirmedProgress = true };
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool TryReadWorkItemCpuTicks(WorkItemId itemId, out ProcessCpuSample sample)
@@ -207,6 +259,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         sample = default;
 
         long totalCpuTicks = 0;
+        var hasActiveProcessState = false;
         var processCount = 0;
         var ownPid = Environment.ProcessId;
         var envEntry = $"{WorkItemIdEnvironmentVariable}={itemId}";
@@ -225,7 +278,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
                 try { stat = File.ReadAllText(Path.Combine(procDir, "stat")); }
                 catch { continue; }
 
-                if (!TryParseStat(stat, out var cpuTicks, out _, out var startTimeTicks))
+                if (!TryParseStat(stat, out var cpuTicks, out _, out var startTimeTicks, out var processState))
                     continue;
                 if (!IsDescendantOf(pid, ownPid))
                     continue;
@@ -233,6 +286,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
                     continue;
 
                 totalCpuTicks += cpuTicks;
+                hasActiveProcessState |= IsActiveProcessState(processState);
                 processIdentities.Add($"{pid}:{startTimeTicks}");
                 processCount++;
             }
@@ -249,9 +303,13 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         sample = new ProcessCpuSample(
             totalCpuTicks,
             string.Join("\0", processIdentities),
+            hasActiveProcessState,
             HasConfirmedProgress: false);
         return true;
     }
+
+    internal static bool IsActiveProcessState(char state) =>
+        state is 'R';
 
     private static bool ProcessEnvironmentContains(string procDir, string envEntry)
     {
@@ -292,7 +350,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
             try { stat = File.ReadAllText($"/proc/{current}/stat"); }
             catch { return false; }
 
-            if (!TryParseStat(stat, out _, out var ppid, out _))
+            if (!TryParseStat(stat, out _, out var ppid, out _, out _))
                 return false;
             if (ppid == current)
                 return false;
@@ -302,16 +360,19 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         return false;
     }
 
-    private static bool TryParseStat(string stat, out long ticks, out int ppid, out long startTimeTicks)
+    private static bool TryParseStat(string stat, out long ticks, out int ppid, out long startTimeTicks, out char processState)
     {
         ticks = 0;
         ppid = 0;
         startTimeTicks = 0;
+        processState = '\0';
         var close = stat.LastIndexOf(')');
         if (close < 0) return false;
 
         var parts = stat[(close + 1)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length < 20) return false;
+        if (parts[0].Length == 0) return false;
+        processState = parts[0][0];
         if (!int.TryParse(parts[1], out ppid)) return false;
         if (!long.TryParse(parts[11], out var utime)) return false;
         if (!long.TryParse(parts[12], out var stime)) return false;
@@ -320,8 +381,11 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         return true;
     }
 
-    private readonly record struct ProcessCpuSample(
+    internal delegate bool ProcessCpuSampleReader(WorkItemId itemId, out ProcessCpuSample sample);
+
+    internal readonly record struct ProcessCpuSample(
         long CpuTicks,
         string ProcessSetSignature,
+        bool HasActiveProcessState,
         bool HasConfirmedProgress);
 }

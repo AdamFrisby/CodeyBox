@@ -22,6 +22,13 @@ public interface ISandboxProvider
     SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
 
     /// <summary>
+    /// Preferred launch mode for one-shot batch agent invocations. Providers
+    /// that can safely supervise a detached process may advertise detached
+    /// launch independently from their output transport.
+    /// </summary>
+    SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Attached;
+
+    /// <summary>
     /// Provisions a sandbox according to the given spec. The returned handle
     /// holds the running sandbox until disposed; disposal must tear it down
     /// regardless of state.
@@ -106,6 +113,13 @@ public interface ISandbox : IAsyncDisposable
     /// still fall back per invocation when setup is unavailable.
     /// </summary>
     SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
+
+    /// <summary>
+    /// Preferred launch mode for one-shot batch agent invocations on this
+    /// concrete sandbox. The default keeps the command attached to
+    /// <see cref="ExecAsync"/>.
+    /// </summary>
+    SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Attached;
 
     /// <summary>
     /// Executes a command inside the sandbox. The command is run with
@@ -422,9 +436,9 @@ public interface IActiveSandboxProvider
 
 /// <summary>
 /// Lightweight projection of a provider-owned sandbox that is still active for
-/// a work item. Static ownership alone is not watchdog progress; consumers that
-/// use this for progress monitoring should require a changing projection or a
-/// stronger provider-specific activity signal.
+/// a work item. Watchdog consumers may treat stable ownership as a progress
+/// signal for detached VM-local work and use <see cref="Status"/> to report a
+/// richer reason when providers can expose changing activity.
 /// </summary>
 public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string SandboxId, string? Status = null);
 
@@ -954,6 +968,7 @@ public sealed record SandboxExec
     public bool KillOnOutputLimit { get; init; } = true;
     public SandboxAgentOutputTransportPreference AgentOutputTransport { get; init; } =
         SandboxAgentOutputTransportPreference.ExecPipe;
+    public SandboxExecLaunchMode LaunchMode { get; init; } = SandboxExecLaunchMode.Attached;
 
     /// <summary>
     /// Optional callback invoked per stdout chunk as the process emits it.
@@ -975,6 +990,18 @@ public enum SandboxAgentOutputTransportKind
 {
     ExecPipe = 0,
     HttpIngest = 1,
+}
+
+public enum SandboxExecLaunchMode
+{
+    Attached = 0,
+    DetachedBatch = 1,
+}
+
+public enum SandboxBatchLaunchMode
+{
+    Attached = 0,
+    Detached = 1,
 }
 
 public sealed record SandboxExecResult(

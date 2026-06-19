@@ -347,8 +347,9 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         // include many audit findings can exceed that and surface as exit 126
         // from the sandbox wrapper's `exec "$@"`. `codex exec` reads instructions
         // from stdin when no positional prompt is given (per its --help). The
-        // sandbox wrapper forwards stdin automatically when SandboxExec.Stdin is
-        // non-null, via its --keep-stdin path.
+        // SandboxExec.Stdin is then delivered by the sandbox: attached exec uses
+        // the wrapper's --keep-stdin path, while detached HTTP-ingest exec
+        // bridges a supervisor-owned stdin sidecar into that same wrapper stdin.
         if (!string.IsNullOrEmpty(sessionIdForResume))
         {
             // `--` halts clap's option parsing so a session id that somehow

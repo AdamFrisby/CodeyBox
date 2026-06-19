@@ -19,6 +19,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     };
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
+    // Also guards buffered reads on this store instance: Microsoft.Data.Sqlite
+    // connections are not safe for overlapping commands from dispatcher and
+    // worker tasks, even when WAL permits file-level read/write concurrency.
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
@@ -800,17 +803,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
     }
 
+    internal IDisposable AcquireConnectionGateForTesting()
+    {
+        _writeLock.Wait();
+        return new ConnectionGateLease(_writeLock);
+    }
+
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
     {
-        WorkItem? row;
-        using (var cmd = _conn.CreateCommand())
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
-            cmd.Parameters.AddWithValue("$id", id.ToString());
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            row = await reader.ReadAsync(ct) ? Read(reader) : null;
+            WorkItem? row;
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                cmd.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                row = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+            return await EnrichOneAsync(row, ct);
         }
-        return await EnrichOneAsync(row, ct);
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<PriorityUpdateResult> UpdatePriorityAsync(
@@ -981,13 +998,22 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -995,41 +1021,58 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     public async IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
-            // queue_position = 0 (pre-migration or newly created without explicit pos) sort
-            // last via the CASE sentinel, then by creation time for stable tie-breaking.
-            // Other states: simple creation-time ordering.
-            if (state == WorkItemState.Queued)
+            using (var cmd = _conn.CreateCommand())
             {
-                cmd.CommandText = """
-                    SELECT * FROM work_items WHERE state = $state
-                    ORDER BY
-                        CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
-                        created_at ASC;
-                    """;
+                // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
+                // queue_position = 0 (pre-migration or newly created without explicit pos) sort
+                // last via the CASE sentinel, then by creation time for stable tie-breaking.
+                // Other states: simple creation-time ordering.
+                if (state == WorkItemState.Queued)
+                {
+                    cmd.CommandText = """
+                        SELECT * FROM work_items WHERE state = $state
+                        ORDER BY
+                            CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
+                            created_at ASC;
+                        """;
+                }
+                else
+                {
+                    cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
+                }
+                cmd.Parameters.AddWithValue("$state", (int)state);
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
             }
-            else
-            {
-                cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
-            }
-            cmd.Parameters.AddWithValue("$state", (int)state);
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
     public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(*) FROM work_items WHERE state = $state;";
-        cmd.Parameters.AddWithValue("$state", (int)state);
-        var result = await cmd.ExecuteScalarAsync(ct);
-        return result is long l ? (int)l : 0;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM work_items WHERE state = $state;";
+            cmd.Parameters.AddWithValue("$state", (int)state);
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result is long l ? (int)l : 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
@@ -1037,53 +1080,62 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            // Exclude terminal states and parked states. The remaining set mirrors
-            // what the FIFO dispatcher used to process via the channel: Queued plus
-            // the mid-pipeline resumable states (Working, WorkComplete, Auditing,
-            // Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
-            //
-            // Post-audit finishing phases get a phase-precedence bucket ahead of
-            // fresh Queued work regardless of item priority. These items have already
-            // spent agent/audit time and only need merge/push completion to drain,
-            // so they must not sit behind a high-priority starting backlog.
-            cmd.CommandText = $"""
-                SELECT * FROM work_items
-                WHERE state NOT IN (
-                    {(int)WorkItemState.Done},
-                    {(int)WorkItemState.Failed},
-                    {(int)WorkItemState.Cancelled},
-                    {(int)WorkItemState.AuditFailed},
-                    {(int)WorkItemState.MergeConflictResolutionFailed},
-                    {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                    {(int)WorkItemState.NeedsOperatorInput},
-                    {(int)WorkItemState.WaitingForQuotaReset},
-                    {(int)WorkItemState.WaitingForAgentResume},
-                    {(int)WorkItemState.WaitingForTransientRetry}
-                )
-                ORDER BY
-                    CASE
-                        WHEN state IN (
-                            {(int)WorkItemState.AuditPassed},
-                            {(int)WorkItemState.Merging},
-                            {(int)WorkItemState.Merged},
-                            {(int)WorkItemState.UpstreamPushing}
-                        ) THEN 0
-                        ELSE 1
-                    END ASC,
-                    priority DESC,
-                    created_at ASC;
-                """;
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
+            using (var cmd = _conn.CreateCommand())
             {
-                var item = Read(reader);
-                if (skipIds.Contains(item.Id)) continue;
-                rows.Add(item);
+                // Exclude terminal states and parked states. The remaining set mirrors
+                // what the FIFO dispatcher used to process via the channel: Queued plus
+                // the mid-pipeline resumable states (Working, WorkComplete, Auditing,
+                // Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
+                //
+                // Post-audit finishing phases get a phase-precedence bucket ahead of
+                // fresh Queued work regardless of item priority. These items have already
+                // spent agent/audit time and only need merge/push completion to drain,
+                // so they must not sit behind a high-priority starting backlog.
+                cmd.CommandText = $"""
+                    SELECT * FROM work_items
+                    WHERE state NOT IN (
+                        {(int)WorkItemState.Done},
+                        {(int)WorkItemState.Failed},
+                        {(int)WorkItemState.Cancelled},
+                        {(int)WorkItemState.AuditFailed},
+                        {(int)WorkItemState.MergeConflictResolutionFailed},
+                        {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                        {(int)WorkItemState.NeedsOperatorInput},
+                        {(int)WorkItemState.WaitingForQuotaReset},
+                        {(int)WorkItemState.WaitingForAgentResume},
+                        {(int)WorkItemState.WaitingForTransientRetry}
+                    )
+                    ORDER BY
+                        CASE
+                            WHEN state IN (
+                                {(int)WorkItemState.AuditPassed},
+                                {(int)WorkItemState.Merging},
+                                {(int)WorkItemState.Merged},
+                                {(int)WorkItemState.UpstreamPushing}
+                            ) THEN 0
+                            ELSE 1
+                        END ASC,
+                        priority DESC,
+                        created_at ASC;
+                    """;
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    var item = Read(reader);
+                    if (skipIds.Contains(item.Id)) continue;
+                    rows.Add(item);
+                }
             }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1119,17 +1171,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     public async Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT COUNT(*) FROM work_items
-            WHERE project_id = $pid
-              AND started_at IS NOT NULL
-              AND started_at >= $since;
-            """;
-        cmd.Parameters.AddWithValue("$pid", projectId.Value);
-        cmd.Parameters.AddWithValue("$since", since.ToString("O"));
-        var result = await cmd.ExecuteScalarAsync(ct);
-        return result is long l ? (int)l : 0;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT COUNT(*) FROM work_items
+                WHERE project_id = $pid
+                  AND started_at IS NOT NULL
+                  AND started_at >= $since;
+                """;
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            cmd.Parameters.AddWithValue("$since", since.ToString("O"));
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result is long l ? (int)l : 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default)
@@ -1141,31 +1201,39 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // on started_at IS NOT NULL makes the write inside the lock immediately
         // visible, preventing the concurrent cap from being exceeded.
         // Terminal states excluded; use cast enum values so renumbering is caught at compile time.
-        using var cmd = _conn.CreateCommand();
-        // NeedsOperatorInput items are parked (pipeline not running); exclude them so they
-        // don't consume a concurrent slot while operators are offline for hours/days.
-        cmd.CommandText = """
-            SELECT COUNT(*) FROM work_items
-            WHERE project_id = $pid
-              AND started_at IS NOT NULL
-              AND preempt_checkpoint IS NULL
-              AND state NOT IN (
-                  $inflight_done,
-                  $inflight_failed,
-                  $inflight_cancelled,
-                  $inflight_audit_failed,
-                  $inflight_merge_conflict_resolution_failed,
-                  $inflight_needs_operator_input,
-                  $inflight_waiting_for_quota_reset,
-                  $inflight_waiting_for_agent_resume,
-                  $inflight_waiting_for_transient_retry,
-                  $inflight_abandoned_after_recovery_attempts
-              );
-            """;
-        cmd.Parameters.AddWithValue("$pid", projectId.Value);
-        AddInFlightExcludedStateParameters(cmd);
-        var result = await cmd.ExecuteScalarAsync(ct);
-        return result is long l ? (int)l : 0;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            // NeedsOperatorInput items are parked (pipeline not running); exclude them so they
+            // don't consume a concurrent slot while operators are offline for hours/days.
+            cmd.CommandText = """
+                SELECT COUNT(*) FROM work_items
+                WHERE project_id = $pid
+                  AND started_at IS NOT NULL
+                  AND preempt_checkpoint IS NULL
+                  AND state NOT IN (
+                      $inflight_done,
+                      $inflight_failed,
+                      $inflight_cancelled,
+                      $inflight_audit_failed,
+                      $inflight_merge_conflict_resolution_failed,
+                      $inflight_needs_operator_input,
+                      $inflight_waiting_for_quota_reset,
+                      $inflight_waiting_for_agent_resume,
+                      $inflight_waiting_for_transient_retry,
+                      $inflight_abandoned_after_recovery_attempts
+                  );
+                """;
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            AddInFlightExcludedStateParameters(cmd);
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result is long l ? (int)l : 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(
@@ -1178,38 +1246,46 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // MaxConcurrentForProject gate sees. The split is done in SQL with a
         // single scan over the (project_id, state) index. job_type is stored as
         // text so we compare ordinally to JobType.Refactor.ToString().
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT
-                SUM(CASE WHEN job_type = $refactor THEN 1 ELSE 0 END) AS refactor_count,
-                SUM(CASE WHEN job_type = $refactor THEN 0 ELSE 1 END) AS other_count
-            FROM work_items
-            WHERE project_id = $pid
-              AND ($exclude_id IS NULL OR id != $exclude_id)
-              AND started_at IS NOT NULL
-              AND preempt_checkpoint IS NULL
-              AND state NOT IN (
-                  $inflight_done,
-                  $inflight_failed,
-                  $inflight_cancelled,
-                  $inflight_audit_failed,
-                  $inflight_merge_conflict_resolution_failed,
-                  $inflight_needs_operator_input,
-                  $inflight_waiting_for_quota_reset,
-                  $inflight_waiting_for_agent_resume,
-                  $inflight_waiting_for_transient_retry,
-                  $inflight_abandoned_after_recovery_attempts
-              );
-            """;
-        cmd.Parameters.AddWithValue("$pid", projectId.Value);
-        cmd.Parameters.AddWithValue("$refactor", JobType.Refactor.ToString());
-        cmd.Parameters.AddWithValue("$exclude_id", excludeId?.ToString() ?? (object)DBNull.Value);
-        AddInFlightExcludedStateParameters(cmd);
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        if (!await reader.ReadAsync(ct)) return (0, 0);
-        var refactor = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetInt64(0));
-        var other = reader.IsDBNull(1) ? 0 : Convert.ToInt32(reader.GetInt64(1));
-        return (refactor, other);
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT
+                    SUM(CASE WHEN job_type = $refactor THEN 1 ELSE 0 END) AS refactor_count,
+                    SUM(CASE WHEN job_type = $refactor THEN 0 ELSE 1 END) AS other_count
+                FROM work_items
+                WHERE project_id = $pid
+                  AND ($exclude_id IS NULL OR id != $exclude_id)
+                  AND started_at IS NOT NULL
+                  AND preempt_checkpoint IS NULL
+                  AND state NOT IN (
+                      $inflight_done,
+                      $inflight_failed,
+                      $inflight_cancelled,
+                      $inflight_audit_failed,
+                      $inflight_merge_conflict_resolution_failed,
+                      $inflight_needs_operator_input,
+                      $inflight_waiting_for_quota_reset,
+                      $inflight_waiting_for_agent_resume,
+                      $inflight_waiting_for_transient_retry,
+                      $inflight_abandoned_after_recovery_attempts
+                  );
+                """;
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            cmd.Parameters.AddWithValue("$refactor", JobType.Refactor.ToString());
+            cmd.Parameters.AddWithValue("$exclude_id", excludeId?.ToString() ?? (object)DBNull.Value);
+            AddInFlightExcludedStateParameters(cmd);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) return (0, 0);
+            var refactor = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetInt64(0));
+            var other = reader.IsDBNull(1) ? 0 : Convert.ToInt32(reader.GetInt64(1));
+            return (refactor, other);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private static void AddInFlightExcludedStateParameters(SqliteCommand cmd)
@@ -1237,21 +1313,29 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // github:PROJ-42 + linear:PROJ-42 on the same item is allowed; a
         // collision *across distinct items* shows up here too).
         var matches = new List<(WorkItemId Id, string Namespace)>();
-        using (var lookup = _conn.CreateCommand())
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            lookup.CommandText = """
-                SELECT work_item_id, namespace
-                FROM work_item_external_ids
-                WHERE project_id = $pid AND external_id = $eid;
-                """;
-            lookup.Parameters.AddWithValue("$pid", projectId.Value);
-            lookup.Parameters.AddWithValue("$eid", externalId);
-            using var reader = await lookup.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
+            using (var lookup = _conn.CreateCommand())
             {
-                if (Guid.TryParse(reader.GetString(0), out var g))
-                    matches.Add((new WorkItemId(g), reader.GetString(1)));
+                lookup.CommandText = """
+                    SELECT work_item_id, namespace
+                    FROM work_item_external_ids
+                    WHERE project_id = $pid AND external_id = $eid;
+                    """;
+                lookup.Parameters.AddWithValue("$pid", projectId.Value);
+                lookup.Parameters.AddWithValue("$eid", externalId);
+                using var reader = await lookup.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    if (Guid.TryParse(reader.GetString(0), out var g))
+                        matches.Add((new WorkItemId(g), reader.GetString(1)));
+                }
             }
+        }
+        finally
+        {
+            _writeLock.Release();
         }
 
         if (matches.Count == 0) return null;
@@ -1272,20 +1356,28 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         CancellationToken ct = default)
     {
         WorkItemId? matched = null;
-        using (var cmd = _conn.CreateCommand())
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = """
-                SELECT work_item_id
-                FROM work_item_external_ids
-                WHERE project_id = $pid AND namespace = $ns AND external_id = $eid
-                LIMIT 1;
-                """;
-            cmd.Parameters.AddWithValue("$pid", projectId.Value);
-            cmd.Parameters.AddWithValue("$ns", @namespace);
-            cmd.Parameters.AddWithValue("$eid", externalId);
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            if (await reader.ReadAsync(ct) && Guid.TryParse(reader.GetString(0), out var g))
-                matched = new WorkItemId(g);
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    SELECT work_item_id
+                    FROM work_item_external_ids
+                    WHERE project_id = $pid AND namespace = $ns AND external_id = $eid
+                    LIMIT 1;
+                    """;
+                cmd.Parameters.AddWithValue("$pid", projectId.Value);
+                cmd.Parameters.AddWithValue("$ns", @namespace);
+                cmd.Parameters.AddWithValue("$eid", externalId);
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct) && Guid.TryParse(reader.GetString(0), out var g))
+                    matched = new WorkItemId(g);
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
         }
         return matched is null ? null : await GetAsync(matched.Value, ct);
     }
@@ -1370,47 +1462,64 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     public async Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT project_id, state, COUNT(*) AS cnt, MAX(updated_at) AS max_updated_at
-            FROM work_items
-            GROUP BY project_id, state;
-            """;
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        var results = new List<(string, int, int, string)>();
-        while (await reader.ReadAsync(ct))
-            results.Add((reader.GetString(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetString(3)));
-        return results;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT project_id, state, COUNT(*) AS cnt, MAX(updated_at) AS max_updated_at
+                FROM work_items
+                GROUP BY project_id, state;
+                """;
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var results = new List<(string, int, int, string)>();
+            while (await reader.ReadAsync(ct))
+                results.Add((reader.GetString(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetString(3)));
+            return results;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = $"""
-            WITH ranked AS (
-                SELECT project_id, state,
-                       ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
-                FROM work_items
-                WHERE state IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.Cancelled})
-            )
-            SELECT project_id, state FROM ranked WHERE rn <= $per_project
-            ORDER BY project_id, rn;
-            """;
-        cmd.Parameters.AddWithValue("$per_project", perProject);
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        var results = new List<(string, int)>();
-        while (await reader.ReadAsync(ct))
-            results.Add((reader.GetString(0), reader.GetInt32(1)));
-        return results;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"""
+                WITH ranked AS (
+                    SELECT project_id, state,
+                           ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
+                    FROM work_items
+                    WHERE state IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.Cancelled})
+                )
+                SELECT project_id, state FROM ranked WHERE rn <= $per_project
+                ORDER BY project_id, rn;
+                """;
+            cmd.Parameters.AddWithValue("$per_project", perProject);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var results = new List<(string, int)>();
+            while (await reader.ReadAsync(ct))
+                results.Add((reader.GetString(0), reader.GetInt32(1)));
+            return results;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        // Column is `paused` — owned by SqliteQueueController.CREATE TABLE project_queue_state.
-        cmd.CommandText = "SELECT project_id, paused FROM project_queue_state";
+        await _writeLock.WaitAsync(ct);
         try
         {
+            using var cmd = _conn.CreateCommand();
+            // Column is `paused` — owned by SqliteQueueController.CREATE TABLE project_queue_state.
+            cmd.CommandText = "SELECT project_id, paused FROM project_queue_state";
             using var reader = await cmd.ExecuteReaderAsync(ct);
             var results = new Dictionary<string, bool>();
             while (await reader.ReadAsync(ct))
@@ -1421,6 +1530,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         {
             return new Dictionary<string, bool>();
         }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async IAsyncEnumerable<WorkItem> ListSuspendedAsync(
@@ -1430,17 +1543,26 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // suspended_vm_name WHERE suspended_vm_name IS NOT NULL) so the query
         // scales with the in-flight suspend count, not the full table.
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = """
-                SELECT * FROM work_items
-                WHERE suspended_vm_name IS NOT NULL
-                ORDER BY suspended_at IS NULL, suspended_at ASC, created_at ASC, rowid ASC;
-                """;
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    SELECT * FROM work_items
+                    WHERE suspended_vm_name IS NOT NULL
+                    ORDER BY suspended_at IS NULL, suspended_at ASC, created_at ASC, rowid ASC;
+                    """;
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1452,67 +1574,92 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // keep their baseline pinned. Hits the partial index
         // idx_work_items_baseline_image_ref so the cost scales with the number
         // of stamped items, not the full work_items table.
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = $"""
-            SELECT DISTINCT baseline_image_ref FROM work_items
-            WHERE baseline_image_ref IS NOT NULL
-              AND state NOT IN (
-                {(int)WorkItemState.Done},
-                {(int)WorkItemState.Failed},
-                {(int)WorkItemState.Cancelled},
-                {(int)WorkItemState.AuditFailed},
-                {(int)WorkItemState.MergeConflictResolutionFailed},
-                {(int)WorkItemState.AbandonedAfterRecoveryAttempts}
-              );
-            """;
-        var set = new HashSet<string>(StringComparer.Ordinal);
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            if (!reader.IsDBNull(0))
-                set.Add(reader.GetString(0));
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"""
+                SELECT DISTINCT baseline_image_ref FROM work_items
+                WHERE baseline_image_ref IS NOT NULL
+                  AND state NOT IN (
+                    {(int)WorkItemState.Done},
+                    {(int)WorkItemState.Failed},
+                    {(int)WorkItemState.Cancelled},
+                    {(int)WorkItemState.AuditFailed},
+                    {(int)WorkItemState.MergeConflictResolutionFailed},
+                    {(int)WorkItemState.AbandonedAfterRecoveryAttempts}
+                  );
+                """;
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                if (!reader.IsDBNull(0))
+                    set.Add(reader.GetString(0));
+            }
+            return set;
         }
-        return set;
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(
         string baselineImageRef, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT id, title, state FROM work_items
-            WHERE baseline_image_ref = $ref
-            ORDER BY created_at ASC;
-            """;
-        cmd.Parameters.AddWithValue("$ref", baselineImageRef);
-        var result = new List<(WorkItemId, string, WorkItemState)>();
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            var id = WorkItemId.Parse(reader.GetString(0));
-            var title = reader.GetString(1);
-            var state = (WorkItemState)reader.GetInt32(2);
-            result.Add((id, title, state));
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT id, title, state FROM work_items
+                WHERE baseline_image_ref = $ref
+                ORDER BY created_at ASC;
+                """;
+            cmd.Parameters.AddWithValue("$ref", baselineImageRef);
+            var result = new List<(WorkItemId, string, WorkItemState)>();
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                var id = WorkItemId.Parse(reader.GetString(0));
+                var title = reader.GetString(1);
+                var state = (WorkItemState)reader.GetInt32(2);
+                result.Add((id, title, state));
+            }
+            return result;
         }
-        return result;
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
         WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = """
-                SELECT * FROM work_items
-                WHERE replay_of_work_item_id = $source_id
-                ORDER BY created_at ASC;
-                """;
-            cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    SELECT * FROM work_items
+                    WHERE replay_of_work_item_id = $source_id
+                    ORDER BY created_at ASC;
+                    """;
+                cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1544,14 +1691,23 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        using (var cmd = _conn.CreateCommand())
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            cmd.CommandText = "SELECT * FROM work_items WHERE release_id = $rid ORDER BY created_at;";
-            cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT * FROM work_items WHERE release_id = $rid ORDER BY created_at;";
+                cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        finally
+        {
+            _writeLock.Release();
+        }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1642,25 +1798,33 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         WorkItemId workItemId,
         CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT iteration, prompt_revision_at_dispatch, dispatched_at
-            FROM work_item_iterations
-            WHERE work_item_id = $wi
-            ORDER BY iteration ASC;
-            """;
-        cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
-        var results = new List<WorkItemIteration>();
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            results.Add(new WorkItemIteration(
-                workItemId,
-                reader.GetInt32(0),
-                reader.GetInt32(1),
-                DateTimeOffset.Parse(reader.GetString(2), System.Globalization.CultureInfo.InvariantCulture)));
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT iteration, prompt_revision_at_dispatch, dispatched_at
+                FROM work_item_iterations
+                WHERE work_item_id = $wi
+                ORDER BY iteration ASC;
+                """;
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            var results = new List<WorkItemIteration>();
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                results.Add(new WorkItemIteration(
+                    workItemId,
+                    reader.GetInt32(0),
+                    reader.GetInt32(1),
+                    DateTimeOffset.Parse(reader.GetString(2), System.Globalization.CultureInfo.InvariantCulture)));
+            }
+            return results;
         }
-        return results;
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task RecordAuditProgressAsync(
@@ -1728,36 +1892,44 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         DateTimeOffset? workAttemptStartedAt,
         CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT iteration, max_iterations, blocking_findings, non_blocking_findings,
-                   blocking_finding_ids_json, blocking_findings_json, findings_json, work_branch_tip,
-                   status, scheduled_auditors_json, completed_auditors_json
-            FROM work_item_audit_progress
-            WHERE work_item_id = $wi AND work_attempt_started_at = $attempt
-            ORDER BY iteration ASC;
-            """;
-        cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
-        cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
-
-        var results = new List<AuditProgressRecord>();
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            results.Add(new AuditProgressRecord(
-                Iteration: reader.GetInt32(0),
-                MaxIterations: reader.GetInt32(1),
-                BlockingFindings: reader.GetInt32(2),
-                NonBlockingFindings: reader.GetInt32(3),
-                BlockingFindingIds: DeserializeStringList(reader.GetString(4)),
-                BlockingFindingsDetails: DeserializeAuditProgressFindings(reader.GetString(5)),
-                Findings: DeserializeAuditProgressFindings(reader.GetString(6)),
-                WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7),
-                Status: reader.GetString(8),
-                ScheduledAuditors: DeserializeStringList(reader.GetString(9)),
-                CompletedAuditors: DeserializeStringList(reader.GetString(10))));
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT iteration, max_iterations, blocking_findings, non_blocking_findings,
+                       blocking_finding_ids_json, blocking_findings_json, findings_json, work_branch_tip,
+                       status, scheduled_auditors_json, completed_auditors_json
+                FROM work_item_audit_progress
+                WHERE work_item_id = $wi AND work_attempt_started_at = $attempt
+                ORDER BY iteration ASC;
+                """;
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
+
+            var results = new List<AuditProgressRecord>();
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                results.Add(new AuditProgressRecord(
+                    Iteration: reader.GetInt32(0),
+                    MaxIterations: reader.GetInt32(1),
+                    BlockingFindings: reader.GetInt32(2),
+                    NonBlockingFindings: reader.GetInt32(3),
+                    BlockingFindingIds: DeserializeStringList(reader.GetString(4)),
+                    BlockingFindingsDetails: DeserializeAuditProgressFindings(reader.GetString(5)),
+                    Findings: DeserializeAuditProgressFindings(reader.GetString(6)),
+                    WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7),
+                    Status: reader.GetString(8),
+                    ScheduledAuditors: DeserializeStringList(reader.GetString(9)),
+                    CompletedAuditors: DeserializeStringList(reader.GetString(10))));
+            }
+            return results;
         }
-        return results;
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public void Dispose()
@@ -2304,5 +2476,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         if (item is null) return null;
         var extIds = await LoadExternalIdsForAsync(item.Id, tx: null, ct);
         return item with { ExternalIds = extIds };
+    }
+
+    private sealed class ConnectionGateLease(SqliteDatabaseWriteGate gate) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                gate.Release();
+        }
     }
 }

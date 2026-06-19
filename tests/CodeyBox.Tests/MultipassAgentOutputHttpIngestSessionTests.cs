@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
@@ -18,12 +19,15 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
 
         var wrongToken = new string('A', session.Token.Length);
         var wrongTokenStatus = await PostAsync(client, session, "run-x", "stdout", 0, wrongToken, "blocked");
+        var streamTokenForExitStatus = await PostAsync(client, session, "run-x", "exit", 0, session.Token, "0\n");
         var wrongRunStatus = await PostAsync(client, session, "run-y", "stdout", 0, session.Token, "blocked");
 
         Assert.Equal(HttpStatusCode.Unauthorized, wrongTokenStatus);
+        Assert.Equal(HttpStatusCode.Unauthorized, streamTokenForExitStatus);
         Assert.Equal(HttpStatusCode.Forbidden, wrongRunStatus);
         Assert.Empty(chunks);
         Assert.Equal("", session.Stdout);
+        Assert.False(session.TryGetExitCode(out _));
     }
 
     [Fact]
@@ -41,6 +45,46 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         Assert.Equal("hello\n", session.Stdout);
         Assert.Equal(["hello\n"], chunks);
         Assert.True(session.ReceivedAgentBytes);
+    }
+
+    [Fact]
+    public async Task Post_ExitStreamUsesSeparateTokenAndRecordsExitCode()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+
+        var status = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "7\n");
+        var duplicate = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "7\n");
+        var conflicting = await PostAsync(client, session, "run-x", "exit", 0, session.ExitToken, "8\n");
+
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Equal(HttpStatusCode.OK, duplicate);
+        Assert.Equal(HttpStatusCode.Conflict, conflicting);
+        Assert.True(session.TryGetExitCode(out var exitCode));
+        Assert.Equal(7, exitCode);
+        Assert.Empty(chunks);
+    }
+
+    [Fact]
+    public async Task Post_ExitStreamRejectsMalformedRequestsWithoutRecordingCompletion()
+    {
+        var chunks = new List<string>();
+        await using var session = await StartAsync(chunks.Add);
+        using var client = new HttpClient();
+        var oversizedBody = new string('1', 65);
+
+        var nonNumericSeq = await PostAsync(client, session, "run-x", "exit", "not-a-number", session.ExitToken, "7\n");
+        var nonZeroSeq = await PostAsync(client, session, "run-x", "exit", "1", session.ExitToken, "7\n");
+        var nonIntegerBody = await PostAsync(client, session, "run-x", "exit", "0", session.ExitToken, "not-an-int\n");
+        var oversized = await PostAsync(client, session, "run-x", "exit", "0", session.ExitToken, oversizedBody);
+
+        Assert.Equal(HttpStatusCode.BadRequest, nonNumericSeq);
+        Assert.Equal(HttpStatusCode.BadRequest, nonZeroSeq);
+        Assert.Equal(HttpStatusCode.BadRequest, nonIntegerBody);
+        Assert.Equal(HttpStatusCode.BadRequest, oversized);
+        Assert.False(session.TryGetExitCode(out _));
+        Assert.Empty(chunks);
     }
 
     [Fact]
@@ -112,7 +156,7 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
             CancellationToken.None)
         ?? throw new InvalidOperationException("Failed to bind test ingest listener.");
 
-    private static async Task<HttpStatusCode> PostAsync(
+    private static Task<HttpStatusCode> PostAsync(
         HttpClient client,
         MultipassAgentOutputHttpIngestSession session,
         string runId,
@@ -120,14 +164,42 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
         long seq,
         string token,
         string body)
+        => PostAsync(
+            client,
+            session,
+            runId,
+            stream,
+            seq.ToString(CultureInfo.InvariantCulture),
+            token,
+            body);
+
+    private static async Task<HttpStatusCode> PostAsync(
+        HttpClient client,
+        MultipassAgentOutputHttpIngestSession session,
+        string runId,
+        string stream,
+        string seq,
+        string token,
+        string body)
     {
-        using var request = new HttpRequestMessage(
-            HttpMethod.Post,
-            $"{session.BaseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{seq}");
-        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        using var request = NewPostRequest(session, runId, stream, seq, token);
         request.Content = new ByteArrayContent(Encoding.UTF8.GetBytes(body));
         using var response = await client.SendAsync(request);
         return response.StatusCode;
+    }
+
+    private static HttpRequestMessage NewPostRequest(
+        MultipassAgentOutputHttpIngestSession session,
+        string runId,
+        string stream,
+        string seq,
+        string token)
+    {
+        var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"{session.BaseUrl}/{Uri.EscapeDataString(runId)}/{Uri.EscapeDataString(stream)}/{Uri.EscapeDataString(seq)}");
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        return request;
     }
 
     private static void SetRateWindow(
@@ -143,4 +215,5 @@ public sealed class MultipassAgentOutputHttpIngestSessionTests
             .GetField("_rateWindowCount", flags)!
             .SetValue(session, count);
     }
+
 }

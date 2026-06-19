@@ -156,6 +156,85 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadMethods_WaitBehindSharedConnectionGate()
+    {
+        var queued = Sample();
+        var now = DateTimeOffset.UtcNow;
+        var attemptStartedAt = now.AddMinutes(-2);
+        var releaseId = ReleaseId.New();
+        var source = Sample() with { Title = "source" };
+        var working = Sample() with
+        {
+            State = WorkItemState.Working,
+            StartedAt = now.AddMinutes(-1),
+            SuspendedVmName = "vm-gated-read",
+            SuspendedAt = now,
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["jobtrack"] = "EXT-123",
+                ["legacy"] = "LEG-123",
+            },
+            BaselineImageRef = "cb-baseline-gated-read",
+            ReplayOfWorkItemId = source.Id,
+            ReleaseId = releaseId,
+        };
+        await _store.CreateAsync(queued);
+        await _store.CreateAsync(source);
+        await _store.CreateAsync(working);
+        await _store.RecordIterationDispatchAsync(working.Id, iteration: 1, promptRevisionAtDispatch: 1, dispatchedAt: now);
+        await _store.RecordAuditProgressAsync(
+            working.Id,
+            attemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 1,
+                MaxIterations: 1,
+                BlockingFindings: 0,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: [],
+                BlockingFindingsDetails: [],
+                Findings: [],
+                WorkBranchTip: null),
+            now);
+
+        using var gate = _store.AcquireConnectionGateForTesting();
+        var reads = new Dictionary<string, Task>(StringComparer.Ordinal)
+        {
+            ["GetAsync"] = _store.GetAsync(queued.Id),
+            ["ListAsync"] = DrainAsync(_store.ListAsync()),
+            ["ListByStateAsync"] = DrainAsync(_store.ListByStateAsync(WorkItemState.Working)),
+            ["CountByStateAsync"] = _store.CountByStateAsync(WorkItemState.Queued),
+            ["ListDispatchEligibleByPriorityAsync"] = DrainAsync(
+                _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>())),
+            ["CountStartedInWindowAsync"] = _store.CountStartedInWindowAsync(working.ProjectId, now.AddHours(-1)),
+            ["CountInFlightAsync"] = _store.CountInFlightAsync(working.ProjectId),
+            ["CountInFlightSplitByRefactorAsync"] = _store.CountInFlightSplitByRefactorAsync(working.ProjectId),
+            ["GetByExternalIdAsync"] = _store.GetByExternalIdAsync(working.ProjectId, "EXT-123"),
+            ["GetByNamespacedExternalIdAsync"] = _store.GetByNamespacedExternalIdAsync(working.ProjectId, "jobtrack", "EXT-123"),
+            ["GetFleetStateCountsAsync"] = _store.GetFleetStateCountsAsync(),
+            ["GetFleetRecentOutcomesAsync"] = _store.GetFleetRecentOutcomesAsync(),
+            ["GetFleetPauseStatesAsync"] = _store.GetFleetPauseStatesAsync(),
+            ["ListSuspendedAsync"] = DrainAsync(_store.ListSuspendedAsync()),
+            ["GetActiveBaselineImageRefsAsync"] = _store.GetActiveBaselineImageRefsAsync(),
+            ["ListWorkItemsForBaselineAsync"] = _store.ListWorkItemsForBaselineAsync("cb-baseline-gated-read"),
+            ["ListByReplaySourceAsync"] = DrainAsync(_store.ListByReplaySourceAsync(source.Id)),
+            ["ListByReleaseAsync"] = DrainAsync(_store.ListByReleaseAsync(releaseId)),
+            ["GetIterationsAsync"] = _store.GetIterationsAsync(working.Id),
+            ["GetAuditProgressAsync"] = _store.GetAuditProgressAsync(working.Id, attemptStartedAt),
+        };
+
+        await Task.Delay(100);
+
+        var completedBeforeRelease = reads
+            .Where(kv => kv.Value.IsCompleted)
+            .Select(kv => kv.Key)
+            .ToArray();
+        Assert.Empty(completedBeforeRelease);
+
+        gate.Dispose();
+        await Task.WhenAll(reads.Values).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task RoundTrip_NonEmptyDependsOn_Preserved()
     {
         var dep1 = Sample();
@@ -552,5 +631,12 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         // Fail closed: surfacing the corruption beats silently routing the item
         // as if no clearance were required.
         await Assert.ThrowsAsync<InvalidDataException>(() => _store.GetAsync(item.Id));
+    }
+
+    private static async Task DrainAsync(IAsyncEnumerable<WorkItem> items)
+    {
+        await foreach (var _ in items)
+        {
+        }
     }
 }

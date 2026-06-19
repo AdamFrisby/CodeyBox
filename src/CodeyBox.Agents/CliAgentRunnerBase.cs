@@ -508,7 +508,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
-            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),
+            LaunchMode = SelectBatchLaunchMode(sandbox),
         };
 
         SandboxExecResult result;
@@ -528,6 +529,19 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stdout: result.Stdout,
             Stderr: result.Stderr);
     }
+
+    // Centralised batch-runner policy. Transport chooses the output data plane;
+    // launch mode independently asks capable sandboxes to detach one-shot batch
+    // runs so a long-lived attached exec client is not kept alive for stdout.
+    protected internal static SandboxAgentOutputTransportPreference SelectBatchAgentOutputTransport(ISandbox sandbox)
+        => sandbox.AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
+            ? SandboxAgentOutputTransportPreference.PreferHttpIngest
+            : SandboxAgentOutputTransportPreference.ExecPipe;
+
+    protected internal static SandboxExecLaunchMode SelectBatchLaunchMode(ISandbox sandbox)
+        => sandbox.BatchLaunchMode == SandboxBatchLaunchMode.Detached
+            ? SandboxExecLaunchMode.DetachedBatch
+            : SandboxExecLaunchMode.Attached;
 
     /// <summary>
     /// Buffers stderr chunks up to the next newline and forwards each complete
@@ -721,6 +735,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
             Stdin = invocation.Stdin,
+            // Text-only CLI calls are also one-shot stdin-driven agent CLI
+            // runs (cursor/opencode text resolvers, review hooks) — give them
+            // the same detached HTTP transport as the main batch path so the
+            // host-side multipass exec returns immediately rather than
+            // busy-looping its SSH/gRPC pump for the call's full lifetime.
+            AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),
+            LaunchMode = SelectBatchLaunchMode(sandbox),
         }, ct);
 
         if (!result.Success)

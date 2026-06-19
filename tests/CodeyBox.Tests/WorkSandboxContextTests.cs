@@ -1,0 +1,82 @@
+using CodeyBox.Agents.Cursor;
+using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace CodeyBox.Tests;
+
+public sealed class WorkSandboxContextTests
+{
+    [Fact]
+    public async Task ReusableSandbox_ForwardsBatchLaunchModeToBatchRunner()
+    {
+        var innerSandbox = new RecordingSandbox(
+            SandboxAgentOutputTransportKind.HttpIngest,
+            SandboxBatchLaunchMode.Detached);
+        var provider = new SingleSandboxProvider(innerSandbox);
+        await using var context = new WorkSandboxContext(
+            provider,
+            new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = true }),
+            NullLogger.Instance);
+        await using var wrapped = await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        }, CancellationToken.None);
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred, sandbox: wrapped, workingDirectory: "/work");
+
+        Assert.True(result.Success, $"{result.Summary} | {result.Error}");
+        Assert.Equal(SandboxBatchLaunchMode.Detached, wrapped.BatchLaunchMode);
+        var agentExec = innerSandbox.Execs.Last(e => e.Argv.Count > 0 && e.Argv[0] == "agent");
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, agentExec.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, agentExec.LaunchMode);
+    }
+
+    private sealed class SingleSandboxProvider(ISandbox sandbox) : ISandboxProvider
+    {
+        public string Name => "single";
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => sandbox.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => sandbox.BatchLaunchMode;
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) => Task.FromResult(sandbox);
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class RecordingSandbox(
+        SandboxAgentOutputTransportKind transportKind,
+        SandboxBatchLaunchMode batchLaunchMode) : ISandbox
+    {
+        public string Id => "recording-work-context";
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; } = transportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode { get; } = batchLaunchMode;
+        public List<SandboxExec> Execs { get; } = [];
+        public bool Disposed { get; private set; }
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Execs.Add(exec);
+            if (exec.Argv.Count >= 3
+                && exec.Argv[0] == "bash"
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            return Task.FromResult(new SandboxExecResult(0, "assistant text", ""));
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Disposed = true;
+            return ValueTask.CompletedTask;
+        }
+    }
+}

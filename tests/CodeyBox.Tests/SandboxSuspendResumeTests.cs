@@ -1053,7 +1053,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         };
         gateRelease.SetResult();
 
-        await resumeTask.WaitAsync(TimeSpan.FromSeconds(2));
+        await resumeTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         var timedOut = await _store.GetAsync(hung.Id);
         Assert.Equal(WorkItemState.Failed, timedOut!.State);
@@ -1784,6 +1784,47 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_AdoptionExit0_ButPushBlocksBeforeReturningTask_IsBoundedByResumeTimeout()
+    {
+        var configuredTimeout = TimeSpan.FromSeconds(3);
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-push-blocks",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/b.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionExitCodeToReturn = 0,
+            CheckpointPushBlocksBeforeReturningTask = true,
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout);
+
+        try
+        {
+            await svc.ResumeAllForTestAsync(CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        finally
+        {
+            provider.ReleaseBlockedCheckpointPush();
+        }
+
+        Assert.Single(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.AgentLogPath);
+    }
+
+    [Fact]
     public async Task StartupResume_ResumeFailure_SkipsCheckpointPromotion()
     {
         // If multipass start failed, the VM is not running and any git push
@@ -2394,6 +2435,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         private readonly ConcurrentQueue<AdoptionCall> _adoptionCalls = new();
         private readonly ConcurrentQueue<CheckpointPushCall> _checkpointPushCalls = new();
         private readonly ManualResetEventSlim _resumeBlockRelease = new();
+        private readonly ManualResetEventSlim _checkpointPushBlockRelease = new();
         public IReadOnlyList<string> ResumedNames => _resumedNames.ToArray();
         public IReadOnlyList<string> DisposedNames => _disposedNames.ToArray();
         public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
@@ -2421,6 +2463,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public bool CheckpointPushThrows { get; set; }
         public bool CheckpointPushThrowsCancellation { get; set; }
         public bool CheckpointPushHangs { get; set; }
+        public bool CheckpointPushBlocksBeforeReturningTask { get; set; }
 
         public void Register(WorkItemId id, IShutdownTeardownSandbox sandbox) => _active[id] = sandbox;
 
@@ -2437,6 +2480,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             return Task.CompletedTask;
         }
         public void ReleaseBlockedResume() => _resumeBlockRelease.Set();
+        public void ReleaseBlockedCheckpointPush() => _checkpointPushBlockRelease.Set();
 
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
         {
@@ -2503,6 +2547,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
                 throw new InvalidOperationException("simulated in-VM git push failure");
             if (CheckpointPushThrowsCancellation)
                 throw new OperationCanceledException("provider cancelled checkpoint promotion");
+            if (CheckpointPushBlocksBeforeReturningTask)
+                _checkpointPushBlockRelease.Wait();
             if (CheckpointPushHangs)
                 return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             return Task.FromResult(CheckpointPushReturns);

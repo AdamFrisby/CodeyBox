@@ -197,7 +197,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     }
 
     public string Name => "multipass";
-    public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.HttpIngest;
+    // HTTP ingest and detached launch are spec-dependent: the concrete sandbox
+    // advertises them only when its network profile resolves to a host bridge.
+    public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
+    public SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Attached;
 
     private void MarkTrackedActive(string name)
     {
@@ -485,7 +488,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         var entries = _activeSandboxOwners.Values.ToList();
         var result = new List<ActiveSandboxProgress>(entries.Count);
         foreach (var entry in entries)
-            result.Add(new ActiveSandboxProgress(entry.WorkItemId, entry.Sandbox.Id, Status: "active"));
+            result.Add(entry.Sandbox.SnapshotActiveProgress(entry.WorkItemId));
         return result;
     }
 
@@ -3144,11 +3147,20 @@ test "$work" = present && test "$exec_wrapper" = present
         # stdin (e.g. dotnet fsi with no args, vim, ssh confirmation, apt
         # without -y, an unterminated heredoc) hits EOF immediately and
         # exits, instead of blocking the agent forever. The orchestrator
-        # passes --keep-stdin when ExecAsync.Stdin is non-null.
+        # passes --keep-stdin when an ExecAsync.Stdin pipe is required, or
+        # --stdin-file for trusted VM-local payload files.
         keep_stdin=0
+        stdin_file=
         if [ "$1" = "--keep-stdin" ]; then
             keep_stdin=1
             shift
+        elif [ "$1" = "--stdin-file" ]; then
+            if [ "$#" -lt 2 ]; then
+                echo "codeybox-exec: --stdin-file requires a path argument" >&2
+                exit 127
+            fi
+            stdin_file=$2
+            shift 2
         fi
         # Capture stderr from cd / --env-file source into a tempfile so that
         # a bare exit 126/127 is never silent: without this, the wrapper
@@ -3170,40 +3182,46 @@ test "$work" = present && test "$exec_wrapper" = present
                 rm -f "$codeybox_err_file"
                 exit 127
             fi
+            codeybox_env_file_path=$2
             set -a
-            . "$2" 2>"$codeybox_err_file"
+            . "$codeybox_env_file_path" 2>"$codeybox_err_file"
             codeybox_src_rc=$?
             set +a
             if [ "$codeybox_src_rc" -ne 0 ]; then
-                echo "codeybox-exec: failed to source env file '$2' (exit $codeybox_src_rc):" >&2
+                echo "codeybox-exec: failed to source env file '$codeybox_env_file_path' (exit $codeybox_src_rc):" >&2
                 cat "$codeybox_err_file" >&2 2>/dev/null
                 rm -f "$codeybox_err_file"
                 exit 126
             fi
             shift 2
+            rm -f "$codeybox_env_file_path" 2>/dev/null || true
         fi
         rm -f "$codeybox_err_file"
         # Optional agent-output HTTP transport. The host injects these
         # variables only for agent CLI invocations that opted into the
         # transport. Copy them into shell locals and remove them from the
-        # exported environment before launching the agent; the streamer
-        # subprocesses receive the token out-of-band, but the agent process
-        # does not inherit it.
+        # exported environment before launching the agent. The agent process
+        # inherits neither the stream token, completion token, nor the run id.
+        # Detached runs authenticate completion through a separate HTTP token;
+        # VM-side sidecars are diagnostic only because the agent has sudo inside
+        # the sandbox.
         codeybox_output_url="${CODEYBOX_AGENT_OUTPUT_URL:-}"
         codeybox_output_token="${CODEYBOX_AGENT_OUTPUT_TOKEN:-}"
+        codeybox_output_exit_token="${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}"
         codeybox_output_run_id="${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}"
-        unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID
+        codeybox_exit_file_path="${CODEYBOX_AGENT_EXIT_FILE:-}"
+        unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID CODEYBOX_AGENT_EXIT_FILE
         codeybox_http_post() {
             local codeybox_stream_name="$1"
             local codeybox_stream_seq="$2"
-            CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
-            CODEYBOX_AGENT_OUTPUT_TOKEN="$codeybox_output_token" \
+            local codeybox_post_token="$3"
+            { printf '%s\n' "$codeybox_post_token"; cat; } | CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
             CODEYBOX_AGENT_OUTPUT_RUN_ID="$codeybox_output_run_id" \
             python3 -c '
         import os, sys, time, urllib.error, urllib.parse, urllib.request
         base = os.environ["CODEYBOX_AGENT_OUTPUT_URL"].rstrip("/")
         run_id = os.environ["CODEYBOX_AGENT_OUTPUT_RUN_ID"]
-        token = os.environ["CODEYBOX_AGENT_OUTPUT_TOKEN"]
+        token = sys.stdin.buffer.readline().decode("utf-8").rstrip("\n")
         stream = sys.argv[1]
         seq = sys.argv[2]
         data = sys.stdin.buffer.read()
@@ -3293,7 +3311,35 @@ test "$work" = present && test "$exec_wrapper" = present
         ' "$codeybox_stream_name"
         }
         codeybox_http_ready() {
-            codeybox_http_post ready 0 </dev/null
+            codeybox_http_post ready 0 "$codeybox_output_token" </dev/null
+        }
+        codeybox_http_exit() {
+            if [ -z "$codeybox_output_exit_token" ]; then
+                return 0
+            fi
+            printf '%s\n' "$1" | codeybox_http_post exit 0 "$codeybox_output_exit_token"
+        }
+        # Best-effort sidecar write for diagnostic / resume paths. Detached HTTP
+        # runs never trust this value as authoritative because the sandbox user
+        # can sudo-write VM files.
+        codeybox_write_exit_file() {
+            if [ -z "$codeybox_exit_file_path" ]; then
+                return 0
+            fi
+            codeybox_exit_dir=$(dirname "$codeybox_exit_file_path")
+            mkdir -p "$codeybox_exit_dir" 2>/dev/null || true
+            codeybox_exit_tmp="${codeybox_exit_file_path}.tmp"
+            { umask 077; printf '%s\n' "$1" > "$codeybox_exit_tmp"; } 2>/dev/null
+            mv -f "$codeybox_exit_tmp" "$codeybox_exit_file_path" 2>/dev/null || true
+        }
+        codeybox_run_user_command() {
+            if [ "$keep_stdin" = "1" ]; then
+                "$@"
+            elif [ -n "$stdin_file" ]; then
+                "$@" < "$stdin_file"
+            else
+                "$@" </dev/null
+            fi
         }
         if [ -n "$codeybox_output_url$codeybox_output_token$codeybox_output_run_id" ]; then
             if [ -z "$codeybox_output_url" ] || [ -z "$codeybox_output_token" ] || [ -z "$codeybox_output_run_id" ]; then
@@ -3310,18 +3356,23 @@ test "$work" = present && test "$exec_wrapper" = present
                 mkdir -p "$codeybox_log_dir" 2>/dev/null || true
                 codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
                 rm -f "$codeybox_exit_file" 2>/dev/null || true
-                if [ "$keep_stdin" = "1" ]; then
-                    "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE" | codeybox_http_stream stdout
-                    codeybox_status=("${PIPESTATUS[@]}")
-                else
-                    "$@" </dev/null 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE" | codeybox_http_stream stdout
-                    codeybox_status=("${PIPESTATUS[@]}")
-                fi
+                codeybox_run_user_command "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE" | codeybox_http_stream stdout
+                codeybox_status=("${PIPESTATUS[@]}")
                 codeybox_user_rc=${codeybox_status[0]}
                 codeybox_stream_rc=${codeybox_status[2]}
-                printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
                 if [ "$codeybox_stream_rc" -ne 0 ]; then
                     echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
+                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
+                    codeybox_write_exit_file 87
+                    codeybox_http_exit 87 || true
+                    exit 87
+                fi
+                printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
+                codeybox_write_exit_file "$codeybox_user_rc"
+                if ! codeybox_http_exit "$codeybox_user_rc"; then
+                    echo "codeybox-exec: agent output HTTP completion failed during run" >&2
+                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
+                    codeybox_write_exit_file 87
                     exit 87
                 fi
                 exit "$codeybox_user_rc"
@@ -3339,17 +3390,20 @@ test "$work" = present && test "$exec_wrapper" = present
             codeybox_out_stream_pid=$!
             codeybox_http_stream stderr < "$codeybox_err_fifo" &
             codeybox_err_stream_pid=$!
-            if [ "$keep_stdin" = "1" ]; then
-                "$@" > "$codeybox_out_fifo" 2> "$codeybox_err_fifo"
-                codeybox_user_rc=$?
-            else
-                "$@" </dev/null > "$codeybox_out_fifo" 2> "$codeybox_err_fifo"
-                codeybox_user_rc=$?
-            fi
+            codeybox_run_user_command "$@" > "$codeybox_out_fifo" 2> "$codeybox_err_fifo"
+            codeybox_user_rc=$?
             wait "$codeybox_out_stream_pid"; codeybox_out_stream_rc=$?
             wait "$codeybox_err_stream_pid"; codeybox_err_stream_rc=$?
             if [ "$codeybox_out_stream_rc" -ne 0 ] || [ "$codeybox_err_stream_rc" -ne 0 ]; then
                 echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
+                codeybox_write_exit_file 87
+                codeybox_http_exit 87 || true
+                exit 87
+            fi
+            codeybox_write_exit_file "$codeybox_user_rc"
+            if ! codeybox_http_exit "$codeybox_user_rc"; then
+                echo "codeybox-exec: agent output HTTP completion failed during run" >&2
+                codeybox_write_exit_file 87
                 exit 87
             fi
             exit "$codeybox_user_rc"
@@ -3372,20 +3426,24 @@ test "$work" = present && test "$exec_wrapper" = present
             # ${PIPESTATUS[0]} is the agent process specifically, which is what
             # we want regardless of whether tee itself failed (it never does in
             # practice but we still prefer the agent's true exit code).
-            if [ "$keep_stdin" = "1" ]; then
-                "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
-                codeybox_user_rc=${PIPESTATUS[0]}
-            else
-                "$@" </dev/null 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
-                codeybox_user_rc=${PIPESTATUS[0]}
-            fi
+            codeybox_run_user_command "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
+            codeybox_user_rc=${PIPESTATUS[0]}
             # Best-effort sidecar; the orchestrator treats missing file as
             # "not yet finished" so we never silently swallow a write error.
             printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
+            codeybox_write_exit_file "$codeybox_user_rc"
+            exit "$codeybox_user_rc"
+        fi
+        if [ -n "$codeybox_exit_file_path" ]; then
+            codeybox_run_user_command "$@"
+            codeybox_user_rc=$?
+            codeybox_write_exit_file "$codeybox_user_rc"
             exit "$codeybox_user_rc"
         fi
         if [ "$keep_stdin" = "1" ]; then
             exec "$@"
+        elif [ -n "$stdin_file" ]; then
+            exec "$@" < "$stdin_file"
         else
             exec "$@" </dev/null
         fi
@@ -4767,9 +4825,21 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
     internal const int AgentOutputHttpSetupFailedExitCode = 86;
+    private const int DetachedProcessGroupMalformedExitCode = 73;
+    private const int DetachedSupervisorSetupFailedExitCode = 88;
+    private const int DetachedPollFailureLimit = 5;
+    private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+
+    internal delegate Task<MultipassAgentOutputHttpIngestSession?> AgentOutputHttpIngestSessionStarter(
+        System.Net.IPAddress bindAddress,
+        string runId,
+        ILogger log,
+        Action<string>? stdoutChunkCallback,
+        Action<string>? stderrChunkCallback,
+        CancellationToken ct);
 
     private readonly string _name;
     private readonly string _sandboxRoot;
@@ -4785,6 +4855,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly Action<string>? _onDisposed;
     private readonly Action<string>? _onNoLongerTrackedActive;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? _opGateAcquirer;
+    private readonly AgentOutputHttpIngestSessionStarter _agentOutputIngestSessionStarter;
     private readonly int _maxScreenshotPngBytes;
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
@@ -4793,6 +4864,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
+    private long _activeProgressVersion;
+    private string _activeProgressStatus = "active";
 
     /// <summary>
     /// True once <see cref="SuspendAsync"/> has frozen this VM's RAM via
@@ -4833,7 +4906,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         Action<string>? onDisposed = null, Action<string>? onNoLongerTrackedActive = null, IProcessRunner? runner = null,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null,
-        Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? opGateAcquirer = null)
+        Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? opGateAcquirer = null,
+        AgentOutputHttpIngestSessionStarter? agentOutputIngestSessionStarter = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -4853,6 +4927,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         // MultipassSandbox directly typically leave it null — every multipass
         // call then runs ungated (existing behaviour preserved).
         _opGateAcquirer = opGateAcquirer;
+        _agentOutputIngestSessionStarter = agentOutputIngestSessionStarter
+            ?? MultipassAgentOutputHttpIngestSession.TryStartAsync;
         _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
         _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
         if (_maxScreenshotPngBytes <= 0)
@@ -4864,10 +4940,27 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     }
 
     public string Id { get; }
+
+    internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
+    {
+        var version = Volatile.Read(ref _activeProgressVersion);
+        var status = Volatile.Read(ref _activeProgressStatus);
+        return new ActiveSandboxProgress(
+            workItemId,
+            Id,
+            version == 0
+                ? status
+                : status + ":" + version.ToString(CultureInfo.InvariantCulture));
+    }
+
     public SandboxAgentOutputTransportKind AgentOutputTransportKind =>
         TryResolveAgentOutputBindAddress() is null
             ? SandboxAgentOutputTransportKind.ExecPipe
             : SandboxAgentOutputTransportKind.HttpIngest;
+    public SandboxBatchLaunchMode BatchLaunchMode =>
+        TryResolveAgentOutputBindAddress() is null
+            ? SandboxBatchLaunchMode.Attached
+            : SandboxBatchLaunchMode.Detached;
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
@@ -4899,40 +4992,106 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         var stdoutChunkCallback = exec.StdoutChunkCallback;
         var stderrChunkCallback = exec.StderrChunkCallback;
         var forceEnvironmentFile = false;
+        var detachedHttpIngest = false;
+        string? detachedExitToken = null;
+        string? detachedProcessGroupMarker = null;
+        string? detachedStdinFile = null;
+        string? multipassStdin = exec.Stdin;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
         var pipeEnvironment = effectiveEnvironment;
-        if (ShouldUseAgentOutputHttpIngest(exec, maxStdoutBytes, maxStderrBytes)
-            && TryResolveAgentOutputBindAddress() is { } bindAddress)
+        var prefersDetachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec)
+            && maxStdoutBytes is null
+            && maxStderrBytes is null;
+        if (ShouldUseAgentOutputHttpIngest(exec, maxStdoutBytes, maxStderrBytes))
         {
-            agentOutputIngest = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
-                bindAddress,
-                Guid.NewGuid().ToString("N"),
-                _log,
-                exec.StdoutChunkCallback,
-                exec.StderrChunkCallback,
-                ct).ConfigureAwait(false);
-            if (agentOutputIngest is not null)
+            if (TryResolveAgentOutputBindAddress() is not { } bindAddress)
             {
-                effectiveEnvironment = MergeExecEnvironment(effectiveEnvironment, agentOutputIngest.BuildEnvironment());
-                stdoutChunkCallback = null;
-                stderrChunkCallback = null;
-                forceEnvironmentFile = true;
+                if (prefersDetachedHttpIngest)
+                {
+                    return BuildAgentOutputHttpSetupFailureResult(
+                        "agent output HTTP ingest has no bind address for detached launch");
+                }
+            }
+            else
+            {
+                agentOutputIngest = await _agentOutputIngestSessionStarter(
+                    bindAddress,
+                    Guid.NewGuid().ToString("N"),
+                    _log,
+                    exec.StdoutChunkCallback,
+                    exec.StderrChunkCallback,
+                    ct).ConfigureAwait(false);
+                if (agentOutputIngest is not null)
+                {
+                    detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
+                    effectiveEnvironment = MergeExecEnvironment(
+                        RemoveAgentOutputExitToken(effectiveEnvironment),
+                        agentOutputIngest.BuildEnvironment(includeExitToken: false));
+                    if (detachedHttpIngest)
+                    {
+                        detachedExitToken = agentOutputIngest.ExitToken;
+                    }
+                    stdoutChunkCallback = null;
+                    stderrChunkCallback = null;
+                    forceEnvironmentFile = true;
+                    if (detachedHttpIngest)
+                    {
+                        // Keep detached completion state outside the ubuntu
+                        // user's writable home. The generated launch script
+                        // writes this marker and its exit sidecar through
+                        // sudo from the detached supervisor process; the
+                        // wrapper/agent never receive the path.
+                        detachedProcessGroupMarker = $"{DetachedSupervisorDirectory}/detached-{Guid.NewGuid():N}.pgid";
+                    }
+                }
+                else if (prefersDetachedHttpIngest)
+                {
+                    return BuildAgentOutputHttpSetupFailureResult(
+                        "agent output HTTP ingest listener could not start for detached launch");
+                }
             }
         }
 
         List<string> wrapped;
-        List<string> argv;
+        IReadOnlyList<string> argv;
         if (forceEnvironmentFile && effectiveEnvironment is { Count: > 0 })
         {
             try
             {
                 var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
                 transferredVmPaths.Add(envFile);
-                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile);
-                argv = BuildMultipassExecArgv(wrapped);
+                if (detachedHttpIngest)
+                {
+                    detachedStdinFile = exec.Stdin is null
+                        ? null
+                        : detachedProcessGroupMarker + ".stdin";
+                }
+                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile, stdinFile: null);
+                argv = detachedHttpIngest
+                    ? await BuildDetachedMultipassExecArgvAsync(
+                            wrapped,
+                            envFile,
+                            detachedProcessGroupMarker!,
+                            detachedStdinFile,
+                            transferredVmPaths,
+                            ct)
+                        .ConfigureAwait(false)
+                    : BuildMultipassExecArgv(wrapped);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                if (detachedHttpIngest)
+                {
+                    _log.LogWarning(ex,
+                        "Detached agent output HTTP ingest setup failed before launch for {Name}",
+                        _name);
+                    if (agentOutputIngest is not null)
+                        await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+                    if (transferredVmPaths.Count > 0)
+                        await TryRemoveTransferredFilesAsync(transferredVmPaths).ConfigureAwait(false);
+                    return BuildAgentOutputHttpSetupFailureResult(ex.Message);
+                }
+
                 _log.LogWarning(ex,
                     "Agent output HTTP ingest setup failed before launch for {Name}; falling back to multipass exec pipe",
                     _name);
@@ -4943,15 +5102,23 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 stderrChunkCallback = exec.StderrChunkCallback;
                 effectiveEnvironment = pipeEnvironment;
                 forceEnvironmentFile = false;
-                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null);
+                detachedHttpIngest = false;
+                detachedExitToken = null;
+                detachedProcessGroupMarker = null;
+                detachedStdinFile = null;
+                multipassStdin = exec.Stdin;
+                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null, stdinFile: null);
                 argv = BuildMultipassExecArgv(wrapped);
             }
         }
         else
         {
-            wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null);
+            wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null, stdinFile: null);
             argv = BuildMultipassExecArgv(wrapped);
         }
+
+        if (detachedHttpIngest)
+            multipassStdin = BuildDetachedLaunchStdin(detachedExitToken ?? "", exec.Stdin);
 
         var argvBytes = EstimateArgvBytes(argv);
         if (!forceEnvironmentFile && argvBytes > ArgvBytesWarningThreshold)
@@ -4964,12 +5131,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             {
                 var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
                 transferredVmPaths.Add(envFile);
-                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile);
+                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile, stdinFile: null);
                 argv = BuildMultipassExecArgv(wrapped);
             }
         }
 
-        if (EstimateArgvBytes(argv) > ArgvBytesWarningThreshold)
+        if (!detachedHttpIngest && EstimateArgvBytes(argv) > ArgvBytesWarningThreshold)
         {
             var script = await TransferExecScriptAsync(wrapped, ct);
             transferredVmPaths.Add(script);
@@ -4985,7 +5152,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             var result = await MultipassRetry.RunWithRetryAsync(
                 action: innerCt => RunMultipassAsync(
                     argv,
-                    exec.Stdin,
+                    multipassStdin,
                     innerCt,
                     stdoutChunkCallback,
                     stderrChunkCallback,
@@ -5001,6 +5168,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
             if (IsAgentOutputHttpSetupFailure(result, agentOutputIngest))
             {
+                if (detachedHttpIngest)
+                {
+                    _log.LogWarning(
+                        "Detached agent output HTTP ingest was unreachable from sandbox {Name}; refusing attached fallback",
+                        _name);
+                    await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+                    agentOutputIngest = null;
+                    return result;
+                }
+
                 _log.LogWarning(
                     "Agent output HTTP ingest was unreachable from sandbox {Name}; falling back to multipass exec pipe",
                     _name);
@@ -5013,6 +5190,35 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                     maxStderrBytes).ConfigureAwait(false);
             }
 
+            if (detachedHttpIngest)
+            {
+                if (result.ExitCode != 0)
+                {
+                    await TryTerminateDetachedProcessGroupAsync(detachedProcessGroupMarker!).ConfigureAwait(false);
+                    return result;
+                }
+
+                var detachedExit = await WaitForDetachedCompletionAsync(detachedProcessGroupMarker!, agentOutputIngest, ct)
+                    .ConfigureAwait(false);
+                var detachedOutput = await ReadDetachedOutputSidecarsAsync(detachedProcessGroupMarker!, ct)
+                    .ConfigureAwait(false);
+                await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
+                var detachedIngested = agentOutputIngest;
+                agentOutputIngest = null;
+                var detachedExitCode = detachedExit.Error is not null && detachedExit.ExitCode == 0
+                    ? 1
+                    : detachedExit.ExitCode;
+                return result with
+                {
+                    ExitCode = detachedExitCode,
+                    Stdout = detachedOutput.Stdout + detachedIngested.Stdout + result.Stdout,
+                    Stderr = detachedOutput.Stderr
+                             + detachedIngested.Stderr
+                             + AppendDetachedMarkerError(result.Stderr, detachedExit.Error)
+                             + detachedOutput.Error,
+                };
+            }
+
             await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
             var ingested = agentOutputIngest;
             agentOutputIngest = null;
@@ -5022,12 +5228,25 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 Stderr = ingested.Stderr + result.Stderr,
             };
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            if (detachedHttpIngest && detachedProcessGroupMarker is not null)
+                await TryTerminateDetachedProcessGroupAsync(detachedProcessGroupMarker).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception) when (detachedHttpIngest && detachedProcessGroupMarker is not null)
+        {
+            await TryTerminateDetachedProcessGroupAsync(detachedProcessGroupMarker).ConfigureAwait(false);
+            throw;
+        }
         finally
         {
             if (agentOutputIngest is not null)
                 await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
             if (transferredVmPaths.Count > 0)
                 await TryRemoveTransferredFilesAsync(transferredVmPaths);
+            if (detachedHttpIngest && detachedProcessGroupMarker is not null)
+                await TryRemoveDetachedSupervisorFilesAsync(detachedProcessGroupMarker).ConfigureAwait(false);
             if (firstExecScope is not null)
                 await firstExecScope.DisposeAsync();
         }
@@ -5181,6 +5400,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             && maxStdoutBytes is null
             && maxStderrBytes is null;
 
+    private static bool ShouldDetachAgentOutputHttpIngest(SandboxExec exec)
+        => exec.AgentOutputTransport == SandboxAgentOutputTransportPreference.PreferHttpIngest
+            && exec.LaunchMode == SandboxExecLaunchMode.DetachedBatch;
+
+    private void MarkActiveSandboxProgress(string status)
+    {
+        Volatile.Write(ref _activeProgressStatus, status);
+        Interlocked.Increment(ref _activeProgressVersion);
+    }
+
     private System.Net.IPAddress? TryResolveAgentOutputBindAddress()
     {
         if (string.IsNullOrWhiteSpace(_spec.Network.ProfileName))
@@ -5202,6 +5431,20 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return merged;
     }
 
+    private static IReadOnlyDictionary<string, string>? RemoveAgentOutputExitToken(
+        IReadOnlyDictionary<string, string>? environment)
+    {
+        if (environment is null
+            || !environment.ContainsKey(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable))
+        {
+            return environment;
+        }
+
+        var scrubbed = new Dictionary<string, string>(environment, StringComparer.Ordinal);
+        scrubbed.Remove(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable);
+        return scrubbed;
+    }
+
     private static bool IsAgentOutputHttpSetupFailure(
         ProcessRunResult result,
         MultipassAgentOutputHttpIngestSession ingest)
@@ -5212,13 +5455,19 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private List<string> BuildWrappedInvocation(
         SandboxExec exec,
         IReadOnlyDictionary<string, string>? effectiveEnvironment,
-        string? extraEnvFile)
+        string? extraEnvFile,
+        string? stdinFile)
     {
         // The codeybox-exec wrapper closes stdin by default to prevent
         // tools that read stdin from hanging the sandbox. When the
         // orchestrator deliberately pipes stdin, pass --keep-stdin first.
+        // Detached batch invocations still use --keep-stdin. The short launch
+        // exec receives the payload over its pipe and the detached supervisor
+        // bridges a root-owned sidecar into the wrapper's stdin.
         var wrapped = new List<string> { "/usr/local/bin/codeybox-exec" };
-        if (exec.Stdin is not null)
+        if (stdinFile is not null)
+            wrapped.AddRange(["--stdin-file", stdinFile]);
+        else if (exec.Stdin is not null)
             wrapped.Add("--keep-stdin");
         wrapped.Add(exec.WorkingDirectory ?? _spec.WorkingDirectory);
         if (extraEnvFile is not null)
@@ -5286,6 +5535,56 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return vmPath;
     }
 
+    private async Task<IReadOnlyList<string>> BuildDetachedMultipassExecArgvAsync(
+        IReadOnlyList<string> wrapped,
+        string envFile,
+        string processGroupMarker,
+        string? stdinFile,
+        List<string> transferredVmPaths,
+        CancellationToken ct)
+    {
+        var commandScript = await TransferExecScriptAsync(wrapped, ct).ConfigureAwait(false);
+        transferredVmPaths.Add(commandScript);
+        var exitTokenFile = processGroupMarker + ".exit-token";
+        var launchScript = await TransferDetachedLaunchScriptAsync(
+            envFile,
+            processGroupMarker,
+            exitTokenFile,
+            stdinFile,
+            ["/bin/sh", commandScript],
+            ct).ConfigureAwait(false);
+        transferredVmPaths.Add(launchScript);
+        return [_opts.MultipassBinary, "exec", _name, "--", "/bin/bash", launchScript];
+    }
+
+    private static string BuildDetachedLaunchStdin(string exitToken, string? agentStdin)
+        => exitToken + "\n" + (agentStdin ?? "");
+
+    private async Task<string> TransferDetachedLaunchScriptAsync(
+        string envFile,
+        string processGroupMarker,
+        string exitTokenFile,
+        string? stdinFile,
+        IReadOnlyList<string> command,
+        CancellationToken ct)
+    {
+        var fileName = $"detached-{Guid.NewGuid():N}.sh";
+        var hostDir = Path.Combine(_sandboxRoot, "exec-scripts");
+        Directory.CreateDirectory(hostDir);
+        MultipassSandboxProvider.TryChmod0700(hostDir);
+        var hostPath = Path.Combine(hostDir, fileName);
+        await File.WriteAllTextAsync(hostPath, BuildDetachedLaunchScript(envFile, processGroupMarker, stdinFile, command, exitTokenFile: exitTokenFile), ct);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        const string vmDir = "/home/ubuntu/.codeybox-exec";
+        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
+        await TransferFileToVmAsync(hostPath, $".codeybox-exec/{fileName}", "multipass transfer detached exec script", ct);
+        var vmPath = $"{vmDir}/{fileName}";
+        await RunVmCommandAsync(["chmod", "0700", vmPath], ct);
+        return vmPath;
+    }
+
     internal static string BuildExecScript(IReadOnlyList<string> wrapped)
     {
         var sb = new StringBuilder();
@@ -5293,6 +5592,280 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         foreach (var arg in wrapped)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
         sb.Append('\n');
+        return sb.ToString();
+    }
+
+    internal static string BuildDetachedLaunchScript(
+        string envFile,
+        string processGroupMarker,
+        string? stdinFile,
+        IReadOnlyList<string> command,
+        int launchLockAttempts = 300,
+        string? exitTokenFile = null)
+    {
+        if (launchLockAttempts < 0)
+            throw new ArgumentOutOfRangeException(nameof(launchLockAttempts), "Launch lock attempts must be non-negative.");
+
+        const string detachedHttpExitPosterScript = """
+import os, sys, time, urllib.error, urllib.parse, urllib.request
+base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')
+run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')
+token = sys.stdin.buffer.readline().decode('utf-8').rstrip('\n')
+data = sys.stdin.buffer.read()
+if not base or not run_id or not token or not data:
+    sys.exit(0)
+url = base + '/' + urllib.parse.quote(run_id, safe='') + '/exit/0'
+deadline = time.monotonic() + 300.0
+attempt = 0
+while True:
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method='POST',
+        headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain; charset=utf-8'})
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            code = resp.getcode()
+            if 200 <= code < 300:
+                sys.exit(0)
+            if code in (401, 403, 409, 413):
+                sys.exit(70)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403, 409, 413):
+            sys.exit(70)
+    except Exception:
+        pass
+    if time.monotonic() >= deadline:
+        sys.exit(75)
+    time.sleep(min(5.0, 0.1 * (2 ** min(attempt, 5))))
+    attempt += 1
+""";
+
+        var sb = new StringBuilder();
+        sb.AppendLine("#!/bin/bash");
+        sb.AppendLine("set -e");
+        sb.Append("codeybox_env_file=").Append(MultipassSandboxProvider.ShellSingleQuote(envFile)).Append('\n');
+        sb.Append("codeybox_pgid_marker=").Append(MultipassSandboxProvider.ShellSingleQuote(processGroupMarker)).Append('\n');
+        sb.Append("codeybox_stdin_file=").Append(MultipassSandboxProvider.ShellSingleQuote(stdinFile ?? "")).Append('\n');
+        sb.Append("codeybox_exit_token_file=").Append(MultipassSandboxProvider.ShellSingleQuote(exitTokenFile ?? "")).Append('\n');
+        sb.Append("codeybox_lock_max=").Append(launchLockAttempts.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.AppendLine("codeybox_supervisor_dir=$(dirname \"$codeybox_pgid_marker\")");
+        sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
+        sb.AppendLine("codeybox_root_sh() {");
+        sb.AppendLine("    local codeybox_script=\"$1\"");
+        sb.AppendLine("    shift");
+        sb.AppendLine("    sudo -n sh -c \"$codeybox_script\" codeybox-root-sh \"$@\"");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_release_lock() {");
+        sb.AppendLine("    codeybox_root_sh 'rmdir \"$1\" 2>/dev/null || true' \"$codeybox_lock_dir\" || true");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_drain_stdin() {");
+        sb.AppendLine("    cat >/dev/null 2>/dev/null || true");
+        sb.AppendLine("}");
+        sb.AppendLine("if ! codeybox_root_sh 'mkdir -p \"$1\" && { chown root:root \"$1\" 2>/dev/null || true; } && chmod 0700 \"$1\"' \"$codeybox_supervisor_dir\"; then");
+        sb.AppendLine("    echo \"codeybox-detached: failed to prepare supervisor directory\" >&2");
+        sb.AppendLine("    codeybox_drain_stdin");
+        sb.AppendLine($"    exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("fi");
+        sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi");
+        sb.AppendLine("codeybox_lock_i=0");
+        sb.AppendLine("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"; do");
+        sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi");
+        sb.AppendLine("    if [ \"$codeybox_lock_i\" -ge \"$codeybox_lock_max\" ]; then");
+        sb.AppendLine("        echo \"codeybox-detached: timed out waiting for launch lock\" >&2");
+        sb.AppendLine("        codeybox_drain_stdin");
+        sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    sleep 0.1");
+        sb.AppendLine("    codeybox_lock_i=$((codeybox_lock_i + 1))");
+        sb.AppendLine("done");
+        sb.AppendLine("trap codeybox_release_lock EXIT");
+        sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi");
+        sb.AppendLine("codeybox_root_sh 'rm -f \"$1.tmp\" \"$1.exit.tmp\" \"$1.exit-token.tmp\" \"$1.stdin\" \"$1.stdin.tmp\"' \"$codeybox_pgid_marker\" || true");
+        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ]; then");
+        sb.AppendLine("    codeybox_output_exit_token=");
+        sb.AppendLine("    IFS= read -r codeybox_output_exit_token || true");
+        sb.AppendLine("    if [ -n \"$codeybox_output_exit_token\" ] && ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_exit_token_file\"; then");
+        sb.AppendLine("        if ! printf '%s' \"$codeybox_output_exit_token\" | codeybox_root_sh 'token_file=$1");
+        sb.AppendLine("token_tmp=\"${token_file}.tmp\"");
+        sb.AppendLine("umask 077");
+        sb.AppendLine("cat > \"$token_tmp\" || exit 1");
+        sb.AppendLine("{ chown root:root \"$token_tmp\" 2>/dev/null || true; }");
+        sb.AppendLine("chmod 0600 \"$token_tmp\" || exit 1");
+        sb.AppendLine("mv -f \"$token_tmp\" \"$token_file\" || exit 1' \"$codeybox_exit_token_file\"; then");
+        sb.AppendLine("            echo \"codeybox-detached: failed to publish exit token sidecar\" >&2");
+        sb.AppendLine("            codeybox_drain_stdin");
+        sb.AppendLine($"            exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("        fi");
+        sb.AppendLine("    fi");
+        sb.AppendLine("fi");
+        sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
+        sb.AppendLine("    if ! codeybox_root_sh 'stdin_file=$1; stdin_tmp=\"${stdin_file}.tmp\"; umask 077; cat > \"$stdin_tmp\" && mv -f \"$stdin_tmp\" \"$stdin_file\" && { chown root:root \"$stdin_file\" 2>/dev/null || true; } && chmod 0600 \"$stdin_file\"' \"$codeybox_stdin_file\"; then");
+        sb.AppendLine("        echo \"codeybox-detached: failed to publish stdin sidecar\" >&2");
+        sb.AppendLine("        codeybox_drain_stdin");
+        sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    fi");
+        sb.AppendLine("fi");
+        sb.AppendLine("set -a");
+        sb.AppendLine(". \"$codeybox_env_file\"");
+        sb.AppendLine("set +a");
+        sb.AppendLine("codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
+        sb.AppendLine("codeybox_output_token=\"${CODEYBOX_AGENT_OUTPUT_TOKEN:-}\"");
+        sb.AppendLine("codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
+        // Keep HTTP transport credentials out of the detached agent
+        // environment. CODEYBOX_AGENT_RUN_ID, if present in the caller's
+        // environment, is a separate work-item preemption hint and is left
+        // untouched by this output-transport scrub.
+        sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
+        sb.AppendLine("codeybox_http_ready() {");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
+        sb.AppendLine("python3 - <<'PY'");
+        sb.AppendLine("import os, sys, urllib.parse, urllib.request");
+        sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
+        sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
+        sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
+        sb.AppendLine("if not base or not run_id or not token:");
+        sb.AppendLine("    sys.exit(1)");
+        sb.AppendLine("url = base + '/' + urllib.parse.quote(run_id, safe='') + '/ready/0'");
+        sb.AppendLine("req = urllib.request.Request(url, data=b'', method='POST', headers={'Authorization': 'Bearer ' + token})");
+        sb.AppendLine("try:");
+        sb.AppendLine("    with urllib.request.urlopen(req, timeout=10.0) as resp:");
+        sb.AppendLine("        sys.exit(0 if 200 <= resp.getcode() < 300 else 1)");
+        sb.AppendLine("except Exception:");
+        sb.AppendLine("    sys.exit(1)");
+        sb.AppendLine("PY");
+        sb.AppendLine("}");
+        sb.AppendLine("if [ -z \"$codeybox_output_url\" ] || [ -z \"$codeybox_output_token\" ] || [ -z \"$codeybox_output_run_id\" ]; then");
+        sb.Append("    echo ")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(AgentOutputHttpSetupFailureMarker))
+            .AppendLine(" >&2");
+        sb.AppendLine($"    exit {AgentOutputHttpSetupFailedExitCode}");
+        sb.AppendLine("fi");
+        sb.AppendLine("if ! codeybox_http_ready; then");
+        sb.Append("    echo ")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(AgentOutputHttpSetupFailureMarker))
+            .AppendLine(" >&2");
+        sb.AppendLine($"    exit {AgentOutputHttpSetupFailedExitCode}");
+        sb.AppendLine("fi");
+        sb.AppendLine("codeybox_child_script=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-child.XXXXXX\")");
+        sb.AppendLine("cat > \"$codeybox_child_script\" <<'CODEYBOX_DETACHED_CHILD'");
+        sb.AppendLine("#!/bin/bash");
+        sb.AppendLine("set +e");
+        sb.AppendLine("rm -f \"$0\" 2>/dev/null || true");
+        sb.AppendLine("codeybox_pgid_marker=$1");
+        sb.AppendLine("codeybox_stdin_file=$2");
+        sb.AppendLine("codeybox_env_file=$3");
+        sb.AppendLine("codeybox_exit_token_file=$4");
+        sb.AppendLine("shift");
+        sb.AppendLine("shift");
+        sb.AppendLine("shift");
+        sb.AppendLine("shift");
+        sb.AppendLine("codeybox_root_sh() {");
+        sb.AppendLine("    local codeybox_script=\"$1\"");
+        sb.AppendLine("    shift");
+        sb.AppendLine("    sudo -n sh -c \"$codeybox_script\" codeybox-root-sh \"$@\"");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_output_url=");
+        sb.AppendLine("codeybox_output_run_id=");
+        sb.AppendLine("codeybox_output_exit_token=");
+        sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ]; then");
+        sb.AppendLine("    codeybox_output_exit_token=$(codeybox_root_sh 'cat -- \"$1\" 2>/dev/null || true' \"$codeybox_exit_token_file\" || true)");
+        sb.AppendLine("    codeybox_root_sh 'rm -f -- \"$1\"' \"$codeybox_exit_token_file\" || true");
+        sb.AppendLine("fi");
+        sb.AppendLine("if [ -r \"$codeybox_env_file\" ]; then");
+        sb.AppendLine("    . \"$codeybox_env_file\"");
+        sb.AppendLine("    codeybox_output_url=\"${CODEYBOX_AGENT_OUTPUT_URL:-}\"");
+        sb.AppendLine("    codeybox_output_run_id=\"${CODEYBOX_AGENT_OUTPUT_RUN_ID:-}\"");
+        sb.AppendLine("    unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
+        sb.AppendLine("fi");
+        sb.AppendLine("codeybox_http_exit() {");
+        sb.AppendLine("local codeybox_exit_code=\"$1\"");
+        sb.AppendLine("local codeybox_exit_diagnostic=\"${2:-}\"");
+        sb.AppendLine("if [ -z \"$codeybox_output_exit_token\" ]; then");
+        sb.AppendLine("    return 0");
+        sb.AppendLine("fi");
+        sb.AppendLine("{");
+        sb.AppendLine("    printf '%s\\n' \"$codeybox_output_exit_token\"");
+        sb.AppendLine("    printf '%s\\n' \"$codeybox_exit_code\"");
+        sb.AppendLine("    if [ -n \"$codeybox_exit_diagnostic\" ]; then");
+        sb.AppendLine("        printf '%s\\n' \"$codeybox_exit_diagnostic\"");
+        sb.AppendLine("    fi");
+        sb.AppendLine("} | \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
+        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
+        sb.Append("python3 -c ")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(detachedHttpExitPosterScript))
+            .Append('\n');
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_pgid=$$");
+        sb.AppendLine("if ! codeybox_root_sh 'marker=$1; pgid=$2; tmp=\"${marker}.tmp\"; umask 077; printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\" && { chown root:root \"$marker\" 2>/dev/null || true; } && chmod 0600 \"$marker\"' \"$codeybox_pgid_marker\" \"$codeybox_pgid\"; then");
+        sb.AppendLine($"    exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("fi");
+        sb.AppendLine($"codeybox_stdout_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stdout.XXXXXX\") || exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine($"codeybox_stderr_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stderr.XXXXXX\") || {{ rm -f \"$codeybox_stdout_file\"; exit {DetachedSupervisorSetupFailedExitCode}; }}");
+        sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
+        sb.AppendLine("    set -o pipefail");
+        sb.AppendLine("    codeybox_root_sh 'cat -- \"$1\"' \"$codeybox_stdin_file\" 2>>\"$codeybox_stderr_file\" | \"$@\" >\"$codeybox_stdout_file\" 2>>\"$codeybox_stderr_file\"");
+        sb.AppendLine("    codeybox_status=(\"${PIPESTATUS[@]}\")");
+        sb.AppendLine("    codeybox_wrapper_rc=${codeybox_status[1]}");
+        sb.AppendLine("else");
+        sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
+        sb.AppendLine("    codeybox_wrapper_rc=$?");
+        sb.AppendLine("fi");
+        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
+        sb.AppendLine("if ! codeybox_root_sh 'marker=$1");
+        sb.AppendLine("stdout_file=$2");
+        sb.AppendLine("stderr_file=$3");
+        sb.AppendLine("exit_code=$4");
+        sb.AppendLine("stdout_tmp=\"${marker}.stdout.tmp\"");
+        sb.AppendLine("stderr_tmp=\"${marker}.stderr.tmp\"");
+        sb.AppendLine("exit_tmp=\"${marker}.exit.tmp\"");
+        sb.AppendLine("umask 077");
+        sb.AppendLine(": > \"$stdout_tmp\" || exit 1");
+        sb.AppendLine("dd if=\"$stdout_file\" of=\"$stdout_tmp\" bs=65536 count=1 2>/dev/null || true");
+        sb.AppendLine(": > \"$stderr_tmp\" || exit 1");
+        sb.AppendLine("dd if=\"$stderr_file\" of=\"$stderr_tmp\" bs=65536 count=1 2>/dev/null || true");
+        sb.AppendLine("printf \"%s\\n\" \"$exit_code\" > \"$exit_tmp\" || exit 1");
+        sb.AppendLine("mv -f \"$stdout_tmp\" \"${marker}.stdout\" || exit 1");
+        sb.AppendLine("mv -f \"$stderr_tmp\" \"${marker}.stderr\" || exit 1");
+        sb.AppendLine("mv -f \"$exit_tmp\" \"${marker}.exit\" || exit 1");
+        sb.AppendLine("{ chown root:root \"${marker}.stdout\" \"${marker}.stderr\" \"${marker}.exit\" 2>/dev/null || true; }");
+        sb.AppendLine("chmod 0600 \"${marker}.stdout\" \"${marker}.stderr\" \"${marker}.exit\"' \"$codeybox_pgid_marker\" \"$codeybox_stdout_file\" \"$codeybox_stderr_file\" \"$codeybox_wrapper_rc\"; then");
+        sb.AppendLine("    rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
+        sb.AppendLine("    codeybox_http_exit \"$codeybox_wrapper_rc\" \"codeybox-detached: failed to publish output sidecars\" || true");
+        sb.AppendLine("    exit \"$codeybox_wrapper_rc\"");
+        sb.AppendLine("fi");
+        sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
+        sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
+        sb.AppendLine("CODEYBOX_DETACHED_CHILD");
+        sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
+        sb.Append("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\"");
+        foreach (var arg in command)
+            sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
+        sb.AppendLine(" </dev/null >/dev/null 2>/dev/null &");
+        sb.AppendLine("codeybox_detached_pid=$!");
+        sb.AppendLine("codeybox_marker_i=0");
+        sb.AppendLine("while ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; do");
+        sb.AppendLine("    if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
+        sb.AppendLine("        set +e");
+        sb.AppendLine("        wait \"$codeybox_detached_pid\"");
+        sb.AppendLine("        codeybox_child_rc=$?");
+        sb.AppendLine("        set -e");
+        sb.AppendLine("        echo \"codeybox-detached: detached child exited before publishing process group marker (exit $codeybox_child_rc)\" >&2");
+        sb.AppendLine("        exit \"$codeybox_child_rc\"");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if [ \"$codeybox_marker_i\" -ge 50 ]; then");
+        sb.AppendLine("        kill -TERM \"-$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
+        sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    sleep 0.1");
+        sb.AppendLine("    codeybox_marker_i=$((codeybox_marker_i + 1))");
+        sb.AppendLine("done");
+        sb.AppendLine("disown \"$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("exit 0");
         return sb.ToString();
     }
 
@@ -5332,6 +5905,360 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             throw new InvalidOperationException($"multipass exec setup command failed: {result.Stderr}");
     }
 
+    private async Task<DetachedExitResult> WaitForDetachedCompletionAsync(
+        string processGroupMarker,
+        MultipassAgentOutputHttpIngestSession ingest,
+        CancellationToken ct)
+    {
+        // Trust only host-observed liveness plus the authenticated HTTP exit
+        // completion. VM-side sidecars are diagnostic only: the agent can sudo
+        // inside the sandbox and must not be able to forge a successful exit.
+        var pollFailures = 0;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+
+            var state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (state.Status != DetachedProcessGroupStatus.PollFailed)
+                MarkActiveSandboxProgress("detached-" + state.Status.ToString().ToLowerInvariant());
+            if (state.Status == DetachedProcessGroupStatus.PollFailed)
+            {
+                pollFailures++;
+                _log.LogDebug(
+                    "Detached exec process group poll {Attempt}/{Limit} for {Name} failed while waiting for completion: {Error}",
+                    pollFailures,
+                    DetachedPollFailureLimit,
+                    _name,
+                    state.Error?.Trim());
+                if (pollFailures >= DetachedPollFailureLimit)
+                {
+                    await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
+                    return new DetachedExitResult(1, state.Error);
+                }
+                continue;
+            }
+            pollFailures = 0;
+            if (state.Error is not null)
+            {
+                await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
+                return new DetachedExitResult(1, state.Error);
+            }
+            if (state.Status == DetachedProcessGroupStatus.Missing)
+                return new DetachedExitResult(
+                    1,
+                    $"detached exec process group marker {processGroupMarker} was not written\n");
+            if (state.Status == DetachedProcessGroupStatus.Alive)
+            {
+                if (ingest.TryGetExitCode(out var authenticatedExitCode))
+                {
+                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    return new DetachedExitResult(authenticatedExitCode, reapError);
+                }
+
+                continue;
+            }
+            if (state.Status == DetachedProcessGroupStatus.Exited)
+            {
+                if (ingest.TryGetExitCode(out var exitCode))
+                {
+                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    return new DetachedExitResult(exitCode, reapError);
+                }
+
+                if (state.ProcessGroupAlive)
+                    continue;
+
+                // PG is gone but the wrapper never delivered the host-authenticated
+                // completion. The wrapper crashed, was killed, or could not reach
+                // the ingest listener — surface a diagnostic rather than guessing.
+                return new DetachedExitResult(
+                    1,
+                    $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
+            }
+        }
+    }
+
+    private static ProcessRunResult BuildAgentOutputHttpSetupFailureResult(string detail)
+    {
+        var suffix = string.IsNullOrWhiteSpace(detail) ? "" : $": {detail.Trim()}";
+        return new ProcessRunResult(
+            AgentOutputHttpSetupFailedExitCode,
+            "",
+            AgentOutputHttpSetupFailureMarker + suffix + "\n");
+    }
+
+    private async Task<DetachedOutputSidecars> ReadDetachedOutputSidecarsAsync(
+        string processGroupMarker,
+        CancellationToken ct)
+    {
+        var stdout = await ReadDetachedOutputSidecarAsync(processGroupMarker + ".stdout", ct).ConfigureAwait(false);
+        var stderr = await ReadDetachedOutputSidecarAsync(processGroupMarker + ".stderr", ct).ConfigureAwait(false);
+        return new DetachedOutputSidecars(
+            stdout.Output,
+            stderr.Output,
+            stdout.Error + stderr.Error);
+    }
+
+    private async Task<DetachedOutputSidecar> ReadDetachedOutputSidecarAsync(
+        string vmPath,
+        CancellationToken ct)
+    {
+        const string readCommand = """
+            codeybox_output_file=$1
+            if ! test -f "$codeybox_output_file"; then
+                exit 0
+            fi
+            dd if="$codeybox_output_file" bs=65536 count=1 2>/dev/null || true
+            exit 0
+            """;
+        var result = await RunMultipassAsync(
+            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", readCommand, "codeybox-detached-output", vmPath],
+            stdin: null,
+            ct: ct,
+            maxStdoutBytes: 65536,
+            maxStderrBytes: 4096,
+            killOnOutputLimit: false).ConfigureAwait(false);
+        if (result.ExitCode == 0)
+            return new DetachedOutputSidecar(result.Stdout, "");
+
+        return new DetachedOutputSidecar(
+            "",
+            $"failed to read detached exec output sidecar {vmPath} (exit {result.ExitCode}): {result.Stderr.TrimEnd()}\n");
+    }
+
+    private async Task<string?> EnsureDetachedProcessGroupReapedAsync(string processGroupMarker, CancellationToken ct)
+    {
+        DetachedProcessGroupProbe state = default;
+        DetachedProcessGroupProbe? lastPollFailure = null;
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (state.Status == DetachedProcessGroupStatus.PollFailed)
+            {
+                lastPollFailure = state;
+                await Task.Delay(TimeSpan.FromMilliseconds(100), ct).ConfigureAwait(false);
+                continue;
+            }
+            if (state.Error is not null)
+                return state.Error;
+            if (state.Status == DetachedProcessGroupStatus.Exited && !state.ProcessGroupAlive)
+                return null;
+            if (state.Status == DetachedProcessGroupStatus.Missing)
+                return $"detached exec process group marker {processGroupMarker} disappeared before cleanup\n";
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100), ct).ConfigureAwait(false);
+        }
+
+        await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
+        lastPollFailure = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
+            if (state.Status == DetachedProcessGroupStatus.PollFailed)
+            {
+                lastPollFailure = state;
+                await Task.Delay(TimeSpan.FromMilliseconds(100), ct).ConfigureAwait(false);
+                continue;
+            }
+            if (state.Error is not null)
+                return state.Error;
+            return state.Status == DetachedProcessGroupStatus.Alive
+                   || (state.Status == DetachedProcessGroupStatus.Exited && state.ProcessGroupAlive)
+                ? $"detached exec process group {state.ProcessGroupId} remained alive after termination\n"
+                : null;
+        }
+
+        return lastPollFailure?.Error;
+    }
+
+    private async Task<DetachedProcessGroupProbe> ProbeDetachedProcessGroupAsync(
+        string processGroupMarker,
+        CancellationToken ct)
+    {
+        // The exit sidecar lives at <marker>.exit. We read it inline so a
+        // single multipass exec yields both liveness and (when available)
+        // the wrapper-written exit code — no separate `cat` round-trip and no
+        // additional host-side multipass spin.
+        const string pollCommand = """
+            codeybox_pgid_marker=$1
+            if ! test -f "$codeybox_pgid_marker"; then
+                printf 'missing\n'
+                exit 0
+            fi
+            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
+            case "$codeybox_pgid" in
+                ''|*[!0-9]*|0)
+                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
+                    exit 73
+                    ;;
+            esac
+            codeybox_alive=gone
+            if kill -0 "-$codeybox_pgid" 2>/dev/null; then
+                codeybox_alive=alive
+            fi
+            codeybox_exit_file="${codeybox_pgid_marker}.exit"
+            if test -f "$codeybox_exit_file"; then
+                codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
+                case "$codeybox_exit_code" in
+                    ''|*[!0-9-]*)
+                        printf 'exited %s\n' "$codeybox_pgid"
+                        ;;
+                    *)
+                        printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
+                        ;;
+                esac
+            elif [ "$codeybox_alive" = "alive" ]; then
+                printf 'alive %s\n' "$codeybox_pgid"
+            else
+                printf 'exited %s\n' "$codeybox_pgid"
+            fi
+            exit 0
+            """;
+        var result = await RunMultipassAsync(
+            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", pollCommand, "codeybox-detached-poll", processGroupMarker],
+            stdin: null,
+            ct: ct,
+            maxStdoutBytes: 128,
+            maxStderrBytes: 4096,
+            killOnOutputLimit: false).ConfigureAwait(false);
+
+        if (result.ExitCode == DetachedProcessGroupMalformedExitCode)
+            return new DetachedProcessGroupProbe(
+                DetachedProcessGroupStatus.Malformed,
+                ProcessGroupId: null,
+                ProcessGroupAlive: false,
+                Error: result.Stderr.TrimEnd() + "\n");
+
+        if (result.ExitCode != 0)
+            return new DetachedProcessGroupProbe(
+                DetachedProcessGroupStatus.PollFailed,
+                ProcessGroupId: null,
+                ProcessGroupAlive: false,
+                Error: $"detached exec process group poll failed (exit {result.ExitCode}): {result.Stderr.TrimEnd()}\n");
+
+        var text = result.Stdout.Trim();
+        if (string.Equals(text, "missing", StringComparison.Ordinal))
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Missing, ProcessGroupId: null, ProcessGroupAlive: false, Error: null);
+        if (text.StartsWith("alive ", StringComparison.Ordinal)
+            && int.TryParse(text["alive ".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var alivePgid))
+            return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Alive, alivePgid, ProcessGroupAlive: true, Error: null);
+        if (text.StartsWith("exited ", StringComparison.Ordinal))
+        {
+            var rest = text["exited ".Length..];
+            var spaceIdx = rest.IndexOf(' ', StringComparison.Ordinal);
+            if (spaceIdx < 0)
+            {
+                if (int.TryParse(rest, NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid))
+                    return new DetachedProcessGroupProbe(DetachedProcessGroupStatus.Exited, exitedPgid, ProcessGroupAlive: false, Error: null);
+            }
+            else
+            {
+                var pgidText = rest[..spaceIdx];
+                var exitAndStateText = rest[(spaceIdx + 1)..];
+                var stateIdx = exitAndStateText.IndexOf(' ', StringComparison.Ordinal);
+                var aliveText = stateIdx < 0 ? "gone" : exitAndStateText[(stateIdx + 1)..];
+                if (int.TryParse(pgidText, NumberStyles.None, CultureInfo.InvariantCulture, out var exitedPgid))
+                {
+                    return new DetachedProcessGroupProbe(
+                        DetachedProcessGroupStatus.Exited,
+                        exitedPgid,
+                        ProcessGroupAlive: string.Equals(aliveText, "alive", StringComparison.Ordinal),
+                        Error: null);
+                }
+            }
+        }
+
+        return new DetachedProcessGroupProbe(
+            DetachedProcessGroupStatus.Malformed,
+            ProcessGroupId: null,
+            ProcessGroupAlive: false,
+            Error: $"detached exec process group poll returned malformed output: {text}\n");
+    }
+
+    private async Task TryTerminateDetachedProcessGroupAsync(string processGroupMarker)
+    {
+        const string killCommand = """
+            codeybox_pgid_marker=$1
+            codeybox_wait_i=0
+            while ! test -f "$codeybox_pgid_marker"; do
+                if [ "$codeybox_wait_i" -ge 50 ]; then
+                    exit 0
+                fi
+                sleep 0.1
+                codeybox_wait_i=$((codeybox_wait_i + 1))
+            done
+            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
+            case "$codeybox_pgid" in
+                ''|*[!0-9]*|0) exit 0 ;;
+            esac
+            kill -TERM "-$codeybox_pgid" 2>/dev/null || true
+            codeybox_i=0
+            while [ "$codeybox_i" -lt 20 ]; do
+                if ! kill -0 "-$codeybox_pgid" 2>/dev/null; then
+                    exit 0
+                fi
+                sleep 0.1
+                codeybox_i=$((codeybox_i + 1))
+            done
+            kill -KILL "-$codeybox_pgid" 2>/dev/null || true
+            exit 0
+            """;
+        try
+        {
+            using var killCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var result = await RunMultipassAsync(
+                [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", killCommand, "codeybox-detached-kill", processGroupMarker],
+                stdin: null,
+                ct: killCts.Token,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096,
+                killOnOutputLimit: false).ConfigureAwait(false);
+            if (result.ExitCode != 0)
+            {
+                _log.LogWarning(
+                    "Failed to terminate detached exec process group for {Name}: exit {ExitCode}: {Stderr}",
+                    _name,
+                    result.ExitCode,
+                    result.Stderr.Trim());
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to terminate detached exec process group for {Name}", _name);
+        }
+    }
+
+    private static string AppendDetachedMarkerError(string stderr, string? markerError)
+    {
+        if (string.IsNullOrEmpty(markerError))
+            return stderr;
+        var normalized = markerError.EndsWith('\n')
+            ? markerError
+            : markerError + "\n";
+        return string.IsNullOrEmpty(stderr)
+            ? normalized
+            : stderr + normalized;
+    }
+
+    private readonly record struct DetachedExitResult(int ExitCode, string? Error);
+    private readonly record struct DetachedOutputSidecars(string Stdout, string Stderr, string Error);
+    private readonly record struct DetachedOutputSidecar(string Output, string Error);
+    private readonly record struct DetachedProcessGroupProbe(
+        DetachedProcessGroupStatus Status,
+        int? ProcessGroupId,
+        bool ProcessGroupAlive,
+        string? Error);
+
+    private enum DetachedProcessGroupStatus
+    {
+        Missing = 0,
+        Alive = 1,
+        Exited = 2,
+        Malformed = 3,
+        PollFailed = 4,
+    }
+
     private async Task TryRemoveTransferredFilesAsync(IReadOnlyList<string> vmPaths)
     {
         try
@@ -5344,6 +6271,38 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Failed to clean transferred multipass exec files for {Name}", _name);
+        }
+    }
+
+    private async Task TryRemoveDetachedSupervisorFilesAsync(string processGroupMarker)
+    {
+        const string cleanupCommand = """
+            codeybox_pgid_marker=$1
+            rm -f -- "$codeybox_pgid_marker" \
+                "${codeybox_pgid_marker}.tmp" \
+                "${codeybox_pgid_marker}.exit" \
+                "${codeybox_pgid_marker}.exit.tmp" \
+                "${codeybox_pgid_marker}.exit-token" \
+                "${codeybox_pgid_marker}.exit-token.tmp" \
+                "${codeybox_pgid_marker}.stdout" \
+                "${codeybox_pgid_marker}.stdout.tmp" \
+                "${codeybox_pgid_marker}.stderr" \
+                "${codeybox_pgid_marker}.stderr.tmp" \
+                "${codeybox_pgid_marker}.stdin" \
+                "${codeybox_pgid_marker}.stdin.tmp"
+            rmdir "${codeybox_pgid_marker}.lock" 2>/dev/null || true
+            exit 0
+            """;
+        try
+        {
+            _ = await RunMultipassAsync(
+                [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", cleanupCommand, "codeybox-detached-cleanup", processGroupMarker],
+                stdin: null,
+                ct: CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Failed to clean detached supervisor files for {Name}", _name);
         }
     }
 

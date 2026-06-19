@@ -399,6 +399,24 @@ public sealed class OpencodeAgentRunnerTests
         Assert.Contains("--model", agentExec.Argv);
         Assert.Contains("deepseek-v4-flash", agentExec.Argv);
         Assert.Equal(prompt, agentExec.Stdin);
+        Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, agentExec.AgentOutputTransport);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_HttpIngestSandboxPrefersDetachedBatchLaunch()
+    {
+        var sandbox = new TextOnlyRecordingSandbox(
+            "resolved json",
+            SandboxAgentOutputTransportKind.HttpIngest);
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"token":"x"}""");
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred, sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.True(result.Success);
+        var agentExec = sandbox.Execs.Last(e => e.Argv.Count >= 2 && e.Argv[0] == "opencode" && e.Argv[1] == "run");
+        Assert.Equal(SandboxAgentOutputTransportPreference.PreferHttpIngest, agentExec.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.DetachedBatch, agentExec.LaunchMode);
     }
 
     [Fact]
@@ -458,9 +476,15 @@ public sealed class OpencodeAgentRunnerTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    private sealed class TextOnlyRecordingSandbox(string agentStdout) : ISandbox
+    private sealed class TextOnlyRecordingSandbox(
+        string agentStdout,
+        SandboxAgentOutputTransportKind transportKind = SandboxAgentOutputTransportKind.ExecPipe) : ISandbox
     {
         public string Id => "recording-text-only";
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; } = transportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => AgentOutputTransportKind == SandboxAgentOutputTransportKind.HttpIngest
+            ? SandboxBatchLaunchMode.Detached
+            : SandboxBatchLaunchMode.Attached;
         public List<SandboxExec> Execs { get; } = [];
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
