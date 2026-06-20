@@ -1671,6 +1671,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex.LastResult.Stdout);
             if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
             {
+                // Route stdout-only evidence through the corroboration policy
+                // so a single model-controlled stdout match cannot globally
+                // bench the agent without the forced in-VM probe confirming
+                // the prompt. This matches the rebase/merge/audit/check-and-act
+                // call sites; previously this branch published side effects
+                // unconditionally on the stdout-only path, defeating the
+                // corroboration safety net for resumable runners.
                 await HandleAuthRequiredDetectionAsync(
                     item,
                     project,
@@ -1679,6 +1686,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     authDetection.Classification,
                     throwOnMatch: false,
                     stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                    requireStdoutOnlyCorroboration: true,
                     ct: CancellationToken.None);
                 _log.LogWarning(
                     "Work item {Id} failed because agent {Agent} requires re-authentication after session resume exhaustion: {Reason}",
@@ -5551,23 +5559,43 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return;
         }
 
+        // Publish side effects for EVERY auth-failed candidate before throwing.
+        // Previously this loop passed throwOnMatch=!result.Success directly to
+        // HandleAuthRequiredDetectionAsync, which threw on the first iteration
+        // and skipped the remaining failures — meaning a multi-agent outage
+        // (e.g. the whole class unauthenticated) only benched and alerted on
+        // the first candidate while leaving the rest routable. Coalesce into
+        // one publish-all-then-throw sequence so the breaker reflects every
+        // affected agent.
+        AgentAuthRequiredException? firstThrow = null;
         foreach (var failure in authFailures)
         {
-            // If the resolver ultimately succeeded, a failed earlier candidate's
-            // login prompt should bench that candidate and alert the operator,
-            // but it should not discard the fallback's valid resolution.
-            var throwOnMatch = !result.Success;
             await HandleAuthRequiredDetectionAsync(
                 item,
                 project,
                 failure.Runner.Kind,
                 phase,
                 failure.Classification,
-                throwOnMatch,
+                throwOnMatch: false,
                 failure.StdoutOnlyEvidence,
                 requireStdoutOnlyCorroboration: true,
                 ct: ct);
+
+            // If the resolver ultimately succeeded, a failed earlier candidate's
+            // login prompt should bench that candidate and alert the operator,
+            // but it should not discard the fallback's valid resolution.
+            if (!result.Success && firstThrow is null)
+            {
+                var reason = _authRequiredHandler.BuildReason(
+                    phase,
+                    failure.Classification,
+                    failure.StdoutOnlyEvidence);
+                firstThrow = new AgentAuthRequiredException(failure.Runner.Kind, phase, reason);
+            }
         }
+
+        if (firstThrow is not null)
+            throw firstThrow;
     }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
@@ -9925,14 +9953,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (detection is not { Classification.Kind: AgentFailureKind.AuthRequired })
                 return null;
 
-            var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
-            await _authRequiredHandler.PublishSideEffectsAsync(
-                runner.Kind,
-                reason,
+            // Route stdout-only evidence through the shared corroboration
+            // policy so a model-controlled stdout match cannot globally bench
+            // the agent without the forced in-VM probe confirming the prompt.
+            // The exception we return still fails the work item terminally —
+            // that's the deterministic per-item handling — but the global
+            // bench side effect only fires when corroborated.
+            await HandleAuthRequiredDetectionAsync(
                 trialItem,
                 project,
+                runner.Kind,
+                phase,
+                detection.Classification,
+                throwOnMatch: false,
+                stdoutOnlyEvidence: detection.IsStdoutOnly,
+                requireStdoutOnlyCorroboration: true,
                 ct: token).ConfigureAwait(false);
 
+            var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
             return new AgentAuthRequiredException(runner.Kind, phase, reason);
         }
 
