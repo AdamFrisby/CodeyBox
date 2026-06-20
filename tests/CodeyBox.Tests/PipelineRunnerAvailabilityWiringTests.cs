@@ -420,8 +420,15 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_ExcludesAgent_AndPublishesAlert()
+    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_NoInVmGate_ExcludesFailOpen()
     {
+        // With no in-VM smoke gate wired the corroboration check returns
+        // Unavailable, which the policy currently treats as fail-open (publish
+        // side effects). The fleet bench still fires, but the reason carries
+        // the "corroboration unavailable" qualifier so operators know it was
+        // not corroborated. This is the documented trade-off — stronger
+        // protection requires an in-VM gate that can run --version inside a
+        // fresh sandbox; see PipelineRunner.TryCorroborateStdoutOnlyAuthRequiredAsync.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
@@ -440,7 +447,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
@@ -797,8 +804,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_FromWorkRun_ExcludesWithoutInVmCorroboration()
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithCorroboratingInVmProbe_BenchesAndAlerts()
     {
+        // Mirror the audit-side AuditStdoutOnlyAuthPrompt_WithPersistentAuthInVmFailure
+        // shape on the work-phase no-diff path: when the in-VM smoke gate is
+        // wired AND the forced probe corroborates the stdout-only auth
+        // evidence, the work-phase path benches the agent globally and alerts
+        // operators. The work-phase no-diff branch must require corroboration
+        // (PipelineRunner.cs:3741-3752) so a single crafted prompt line in
+        // model-controlled stdout cannot DoS the fleet — only authoritative
+        // sandbox-side evidence triggers the global bench.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new AuthCorroboratingInVmSmokeGate();
         using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
@@ -822,8 +837,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Contains("stdout corroborated by forced in-VM smoke probe", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -833,6 +848,46 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
         Assert.Equal("codex", details.AgentKind);
         Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithPassingInVmProbe_FailsItemWithoutFleetBench()
+    {
+        // The protective half of the no-diff corroboration requirement: when
+        // the forced in-VM probe passes (binary launches OK), the stdout-only
+        // auth evidence is treated as item-level failure ONLY, not a global
+        // bench. This is the regression test for the DoS surface: a crafted
+        // prompt that coerces the agent into echoing an OAuth URL must NOT
+        // bench the fleet, because the in-VM probe disagrees with the
+        // model-controlled stdout.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new AuthCorroboratingInVmSmokeGate(new AgentAvailability(true, null, null));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
+
+        // The exact attack shape from the audit finding: a single attacker-
+        // controlled OAuth callback URL line that the detector's loose
+        // /oauth-callback fragment matches. Under the prior buggy no-diff
+        // branch this would have triggered the fleet bench without any
+        // sandbox-side corroboration.
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "https://attacker.example.com/oauth-callback?code=redacted",
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("stdout accepted for item failure only", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -870,8 +925,14 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_FromWorkRun_ExcludesEvenWhenInVmCorroborationWouldThrow()
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithThrowingInVmCorroboration_FailsOpenAndBenches()
     {
+        // Mirrors the audit-side AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration
+        // shape: when the forced in-VM smoke probe throws, the corroboration
+        // path catches and returns Unavailable. The policy currently treats
+        // Unavailable as fail-open — global bench fires, but the reason
+        // carries the "corroboration unavailable" qualifier so operators see
+        // that the in-VM signal was indeterminate.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new ThrowingForceProbeInVmSmokeGate();
         using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
@@ -895,8 +956,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted as authoritative CLI output", final.LastError);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);

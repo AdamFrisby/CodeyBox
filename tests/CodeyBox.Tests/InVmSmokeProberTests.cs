@@ -44,7 +44,8 @@ public sealed class InVmSmokeProberTests
         IEnumerable<IInVmSmokeProbe>? probes = null,
         bool fillDefaultNetworkProfile = true,
         SmokeOptionsSnapshot? smokeOptions = null,
-        IAgentAuthFailureClassifier? authFailureClassifier = null)
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         var effectiveOpts = opts ?? new InVmSmokeOptions
         {
@@ -68,7 +69,8 @@ public sealed class InVmSmokeProberTests
             effectiveOpts,
             NullLogger<InVmSmokeProber>.Instance,
             smokeOptions,
-            authFailureClassifier);
+            authFailureClassifier,
+            authAvailability);
     }
 
     private static InVmSmokeCache NewCache() => new(TimeSpan.FromMinutes(60));
@@ -145,6 +147,86 @@ public sealed class InVmSmokeProberTests
         var availability = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(availability.Available);
         Assert.Contains("auth/login prompt detected", availability.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_RoutesViaAuthRegistry_PopulatesAuthRequiredChannel()
+    {
+        // The prober's documented contract: when the auth registry is wired,
+        // login-prompt detection MUST escalate via MarkAuthRequired so the
+        // exclusion lives under SmokeExclusionSource.AuthRequired — not the
+        // smoke-gate source. A regression that re-routed back through
+        // MarkSmokeResult would silently break the survive-smoke-disabled
+        // guarantee (GetAvailabilityWithoutSmokeGateExclusions would let the
+        // agent through), and the existing pre-finding tests only assert
+        // `Available==false` which the smoke-gate source also satisfies.
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            authAvailability: registry);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var authChannel = registry.GetAuthRequiredAvailability(AgentKind.Cursor);
+        Assert.True(authChannel.AuthRequired);
+        Assert.NotNull(authChannel.Reason);
+        Assert.Contains("auth/login prompt detected", authChannel.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_RoutedViaAuthRegistry_StaysGatedEvenWhenSmokeDisabled()
+    {
+        // Pair the auth-registry route with a smoke-disabled dispatch read.
+        // SmokeExclusionSource.AuthRequired is in the IsNonSmokeExclusion
+        // allowlist, so an agent benched via the auth path stays gated even
+        // when CodeyBox:Smoke:Enabled=false — the exact "survive smoke
+        // disabled" property the route exists to guarantee.
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            authAvailability: registry);
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var smokeDisabled = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var dispatch = new AgentDispatchAvailability(registry, inVmSmokeGate: null, smokeOptions: smokeDisabled);
+
+        var availability = dispatch.GetAvailability(AgentKind.Cursor);
+        Assert.NotNull(availability);
+        Assert.False(availability!.Available);
+        Assert.Contains("auth required", availability.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_NoAuthRegistry_FallsBackToSmokeSource()
+    {
+        // Documents the fallback contract: when the auth registry is NOT
+        // wired (legacy embedders / minimal tests), the prober still benches
+        // the agent — just under SmokeExclusionSource.InVmSmoke. Verifies the
+        // structured AuthRequired channel stays empty so this path doesn't
+        // accidentally satisfy the survive-smoke-disabled guarantee.
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.False(registry.GetAuthRequiredAvailability(AgentKind.Cursor).AuthRequired);
     }
 
     [Fact]

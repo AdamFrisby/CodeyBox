@@ -3740,6 +3740,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 if (deferredSuccessStdoutOnlyAuthDetection is not null)
                 {
+                    // Stdout is model-controlled: a Normal work item whose prompt
+                    // coerces the agent into emitting a one-line OAuth-callback
+                    // URL must NOT bench the whole fleet. Require the same
+                    // forced-in-VM corroboration every other stdout-only call
+                    // site uses (audit / merge / rebase / session-resume /
+                    // conflict-rework) — without it, a single crafted prompt
+                    // would dismantle availability for every member of the
+                    // class via SmokeExclusionSource.AuthRequired.
                     await HandleAuthRequiredDetectionAsync(
                         item,
                         project,
@@ -3748,6 +3756,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         deferredSuccessStdoutOnlyAuthDetection.Classification,
                         throwOnMatch: true,
                         stdoutOnlyEvidence: true,
+                        requireStdoutOnlyCorroboration: true,
                         ct: ct);
                 }
 

@@ -190,6 +190,77 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
     }
 
     [Fact]
+    public async Task PickupRebaseResolverAuthPromptOnEveryCandidate_BenchesAndAlertsEveryCandidate()
+    {
+        // Both candidates emit exit-0 auth prompts. The resolver records an
+        // AgenticConflictResolverAuthFailureEvidence entry per candidate, then
+        // HandleAgenticResolverAuthRequiredOutputAsync MUST publish side
+        // effects for EVERY entry before throwing. A regression to
+        // throw-on-first-iteration would bench only the first candidate and
+        // leave the rest of the class routable in a whole-class outage —
+        // exactly the bug the loop rewrite at PipelineRunner.cs:5570 fixes.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var claudeAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codexAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        claudeAgent.AgenticConflictResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+        codexAgent.AgenticConflictResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var fix = BuildFixture(
+            seed,
+            [claudeAgent, codexAgent],
+            new CapturingAuditReportStore(),
+            webhooks,
+            availability,
+            new AgenticConflictResolver(
+                new AgenticConflictResolverOptionsSnapshot(
+                    new AgenticConflictResolverOptions
+                    {
+                        MaxIterations = 4,
+                        MaxAttemptsPerAgent = 1,
+                    })));
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // Both candidates were tried (resolver did not short-circuit after the
+        // first auth failure).
+        Assert.Single(claudeAgent.AgenticConflictInvocations);
+        Assert.Single(codexAgent.AgenticConflictInvocations);
+
+        // BOTH agents must be benched under the auth-required source — not
+        // just the primary that threw.
+        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
+        Assert.False(availability.GetAvailability(AgentKind.Codex).Available);
+        Assert.True(availability.GetAuthRequiredAvailability(AgentKind.Claude).AuthRequired);
+        Assert.True(availability.GetAuthRequiredAvailability(AgentKind.Codex).AuthRequired);
+
+        // One webhook per benched candidate — single-throw-then-skip would
+        // emit only one event for the primary.
+        var smokeFails = webhooks.Events
+            .Where(e => e.Event == "agent.smoke_failed")
+            .Select(e => Assert.IsType<AgentSmokeFailedDetails>(e.Details))
+            .ToList();
+        Assert.Contains(smokeFails, d => d.AgentKind == "claude");
+        Assert.Contains(smokeFails, d => d.AgentKind == "codex");
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+    }
+
+    [Fact]
     public async Task PickupRebaseResolverAuthPromptWithoutFallback_FailsAsAuthRequired()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
