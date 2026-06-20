@@ -1593,12 +1593,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment());
         await WaitForFileAsync(countFile, TimeSpan.FromSeconds(3));
+        // The first invocation's parent exits once the marker is written, but the
+        // detached child keeps running: it posts the authenticated exit code and
+        // then writes the stdout/stderr/exit sidecars into the same workspace dir.
+        // Wait for the child's process group to fully exit before launching the
+        // second invocation so its supervisor-dir prep and marker re-check never
+        // race the trailing sidecar writes.
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
         var second = await RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment(),
             stdin: "retry-token-line-that-must-be-drained\n" + new string('x', 1024 * 1024));
-        await Task.Delay(200);
 
         Assert.True(
             first.Exit == 0,
