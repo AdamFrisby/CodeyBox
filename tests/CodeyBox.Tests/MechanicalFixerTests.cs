@@ -1900,6 +1900,48 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
+    public async Task Pipeline_RunsMechanicalFixerWhenNoAuditorsAreConfigured()
+    {
+        // Regression: the mechanical-edit phase used to be hosted strictly
+        // inside the audit loop, and the audit loop was gated on
+        // `auditors.Count > 0 || requiredBuildApplies`. A project that
+        // configured mechanical fixers without any auditors silently skipped
+        // the entire normalization phase even though the fixers were
+        // composable. Verify the phase runs (and the normalizer file is
+        // updated) without any auditors present.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTrackedFileAsync(seed, "normalizer.txt", "");
+        var recorder = new SpecRecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = [],
+            MechanicalFixers = [AppendingMechanicalFixer.FixerName],
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [],
+            projectAudit: audit,
+            sandboxProvider: recorder,
+            mechanicalFixers: [new AppendingMechanicalFixer()]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+
+        var item = NewItem("feature/mechanical-no-auditors");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
+        Assert.Contains(recorder.Specs, s => s.TimingPhase == "mechanical-edit");
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, normalized, _) = await TestSupport.RunGit(barePath, "show", "main:normalizer.txt");
+        Assert.Equal("1\n", normalized);
+    }
+
+    [Fact]
     public async Task Pipeline_ExplicitEmptyMechanicalFixersSkipsRegisteredFixerAndSandbox()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

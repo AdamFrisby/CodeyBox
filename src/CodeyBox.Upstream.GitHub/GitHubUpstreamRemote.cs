@@ -877,26 +877,54 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     }
 
     /// <summary>
-    /// True when the commit body carries the <see cref="CodeyBoxTrailers.MechanicalFixerTrailerKey"/>
-    /// trailer. Mechanical-fixer commits should be treated as iteration
-    /// noise regardless of their subject line, so a future fixer with a
+    /// True when the commit message's RFC-5322 trailer block carries the
+    /// <see cref="CodeyBoxTrailers.MechanicalFixerTrailerKey"/> trailer.
+    /// Mechanical-fixer commits should be treated as iteration noise
+    /// regardless of their subject line, so a future fixer with a
     /// different <c>CommitSubject</c> still drops out of the squashed PR
-    /// body.
+    /// body. The match is intentionally scoped to the last paragraph and
+    /// requires every non-empty line in that paragraph to look like a
+    /// trailer (<c>Token: value</c>, or a whitespace-led continuation),
+    /// so prose elsewhere in the body that happens to mention the trailer
+    /// key does not silently opt the commit out of the squash body.
     /// </summary>
     private static bool HasMechanicalFixerTrailer(string message)
     {
         if (string.IsNullOrWhiteSpace(message))
             return false;
 
-        foreach (var rawLine in message.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
+        var lines = message.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+
+        var end = lines.Length - 1;
+        while (end >= 0 && string.IsNullOrWhiteSpace(lines[end]))
+            end--;
+        if (end < 0)
+            return false;
+
+        var start = end;
+        while (start > 0 && !string.IsNullOrWhiteSpace(lines[start - 1]))
+            start--;
+
+        var foundMechanical = false;
+        for (var i = start; i <= end; i++)
         {
-            var trimmed = rawLine.Trim();
-            if (trimmed.StartsWith(CodeyBoxTrailers.MechanicalFixerTrailerKey + ":", StringComparison.Ordinal))
-                return true;
+            var line = lines[i];
+            if (line.Length == 0)
+                continue;
+            if (char.IsWhiteSpace(line[0]))
+                continue; // RFC-5322 trailer continuation line.
+            if (!TrailerTokenLine.IsMatch(line))
+                return false;
+            if (line.StartsWith(CodeyBoxTrailers.MechanicalFixerTrailerKey + ":", StringComparison.Ordinal))
+                foundMechanical = true;
         }
 
-        return false;
+        return foundMechanical;
     }
+
+    private static readonly Regex TrailerTokenLine = new(
+        @"^[A-Za-z][A-Za-z0-9-]*:",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static string CleanProseForCommitMessage(string? text)
         => FormatCommitBody(ExtractCleanParagraphs(text, stopAtPrFooter: true));

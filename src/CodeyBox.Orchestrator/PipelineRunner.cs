@@ -1190,7 +1190,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 requiredBuildApplies = await _requiredBuildGate.AppliesAsync(item.Id, project.Id, repoId, baseBranch, workBranch, ct);
             }
-            if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
+            // Mechanical fixers must run even when no auditors apply (and no
+            // required-build gate fires). The audit loop is the host for
+            // mechanical-edit, so a project that configures fixers without
+            // auditors still needs to enter it once to normalize the tree —
+            // the loop exits at iteration 1 because empty scheduled auditors
+            // produce zero findings and zero blocking findings.
+            var mechanicalFixersConfigured = project.Audit.MechanicalFixers.Count > 0;
+            if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies || mechanicalFixersConfigured))
             {
                 var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.

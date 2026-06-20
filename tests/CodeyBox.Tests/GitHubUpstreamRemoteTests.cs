@@ -536,6 +536,50 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
+    public async Task CompleteAsync_SquashMergeFallback_PreservesBodyWhenProseMentionsMechanicalFixerTrailer()
+    {
+        // Regression: HasMechanicalFixerTrailer used to match any body line
+        // starting with the trailer key, so an agent commit that referenced
+        // the mechanical-fixer trailer in its prose was silently treated as a
+        // mechanical-fixer commit and its entire body was dropped from the
+        // squash description. The detector must restrict itself to the
+        // RFC-5322 trailer block at the end of the message.
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(21, "https://github.com/myorg/myrepo/pull/21"));
+        handler.Enqueue(PullRequestCommitsResponse(
+            [
+                "feat: explain the trailer convention\n\n" +
+                    "Document how CodeyBox-Mechanical-Fixer: dotnet-format trailers " +
+                    "should appear at the tail of normalizer commits so reviewers can " +
+                    "tell agent work from mechanical normalization.\n\n" +
+                    "CodeyBox-Prompt-Revision: 51\n" +
+                    "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            ]));
+        handler.Enqueue(MergeOkResponse("body-preserved-sha"));
+
+        var remote = BuildRemote(
+            gitHost,
+            handler,
+            DefaultOpts with
+            {
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PrDescription = new PrDescriptionOptions { Enabled = false },
+            });
+
+        await remote.CompleteAsync(
+            SampleRequest with { PromptRevision = 51, Description = null },
+            CancellationToken.None);
+
+        using var mergeBody = JsonDocument.Parse(handler.RequestBodies[2]);
+        var message = mergeBody.RootElement.GetProperty("commit_message").GetString();
+        Assert.Contains("CodeyBox-Mechanical-Fixer: dotnet-format trailers", message);
+        Assert.Contains("Explain the trailer convention", message);
+        Assert.Contains("CodeyBox-Prompt-Revision: 51", message);
+    }
+
+    [Fact]
     public async Task CompleteAsync_SquashMergeFallback_WrapsCommitBodyParagraphs()
     {
         var gitHost = new FakeGitHost();
