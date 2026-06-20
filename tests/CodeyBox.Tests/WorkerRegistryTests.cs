@@ -105,6 +105,37 @@ public sealed class WorkerRegistryTests : IDisposable
     }
 
     [Fact]
+    public async Task Dispose_IsIdempotentAndReleasesWriteGate_AcrossReopen()
+    {
+        // End-to-end shape guard for the production Dispose() contract — built
+        // through the public constructor so the default
+        // SqliteConnectionDisposal.DisposeTolerantOfTeardownRace wiring is
+        // exercised (not a substituted seam):
+        //   1. Disposing twice is exception-free (idempotency).
+        //   2. After Dispose the write gate is released so a SECOND registry
+        //      on the same path can be constructed, take the gate during
+        //      schema setup, and complete a write. A leaked gate from the
+        //      first registry would strand the semaphore and hang the
+        //      reopened constructor — guarded here by a hard timeout.
+        var path = Path.Combine(Path.GetTempPath(), $"codeybox-regtest-teardown-{Guid.NewGuid():N}.db");
+        try
+        {
+            var registry = new SqliteWorkerRegistry(path);
+            registry.Dispose();
+            registry.Dispose(); // idempotent — no throw, no double-release.
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var reopened = await Task.Run(() => new SqliteWorkerRegistry(path), cts.Token);
+            await reopened.RegisterAsync(MakeReg(), cts.Token);
+            Assert.Single(await reopened.ListAsync(cts.Token));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Deregister_RemovesRow()
     {
         var reg = MakeReg();
@@ -180,4 +211,5 @@ public sealed class WorkerRegistryTests : IDisposable
         var claimed = await _registry.ClaimDeadWorkersAsync(DateTimeOffset.UtcNow.AddMinutes(-99999));
         Assert.Empty(claimed);
     }
+
 }

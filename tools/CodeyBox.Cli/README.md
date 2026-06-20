@@ -130,6 +130,20 @@ Cancel (DELETE) a work item:
 codeybox queue cancel aabbccdd-...
 ```
 
+### Work item queue verbs
+
+Run operator actions that return a resulting work item state:
+
+```bash
+codeybox queue abandon aabbccdd-...
+codeybox queue uncancel aabbccdd-...
+codeybox queue promote aabbccdd-...
+codeybox queue resume aabbccdd-...
+codeybox queue replay aabbccdd-...
+```
+
+Use `--quiet` for state only or `--json` for the raw API response.
+
 ### `codeybox queue retry <id>`
 
 Retry a failed work item:

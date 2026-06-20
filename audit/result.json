@@ -1,5 +1,5 @@
 {
-  "iteration": 4,
+  "iteration": 17,
   "resolvedFindings": [
     {
       "id": "completeness-001",
@@ -43,9 +43,14 @@
     }
   ],
   "notes": [
-    "security:gitleaks and security:semgrep are Info-level findings; tools not installed in sandbox.",
-    "architecture boot-stagger findings are Info-level documentation clarifications, not code defects.",
-    "tests:meaningfulness-review baseline-bake coverage is Warning; adding integration test is noted for future iteration.",
-    "BootGateReleaser double-dispose idempotency test is low-risk Info; no code change."
+    "iteration-17 security:gitleaks: Info — tool not installed in sandbox (auditor skipped).",
+    "iteration-17 security:semgrep: Info — tool not installed in sandbox (auditor skipped).",
+    "iteration-17 security:llm-review: Error — review agent failed: Unknown server error; infrastructure issue.",
+    "iteration-17 architecture:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
+    "iteration-17 quality:llm-review: Error — review agent failed: Unknown server error; infrastructure issue.",
+    "iteration-17 completeness:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
+    "iteration-17 cheating:llm-review: Error — review agent failed: Unknown server error; infrastructure issue.",
+    "iteration-17 tests:meaningfulness-review: Error — review agent failed: Unknown server error; infrastructure issue.",
+    "All Error-severity findings in iteration 17 are infrastructure failures (LLM model configuration, server errors, missing tools); no code changes required."
   ]
 }

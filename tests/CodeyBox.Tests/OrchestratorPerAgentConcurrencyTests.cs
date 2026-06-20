@@ -479,15 +479,16 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // StartedAt/Agent store write, so observedTotal==3 only proves
             // the slots are pinned — we still have to wait for the store
             // stamps to land before reading them.
-            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
-            AgentKind?[] agents;
-            while (true)
+            AgentKind?[] agents = [];
+            var assignmentDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (DateTimeOffset.UtcNow < assignmentDeadline)
             {
                 var snap1 = await _store.GetAsync(i1.Id);
                 var snap2 = await _store.GetAsync(i2.Id);
                 var snap3 = await _store.GetAsync(i3.Id);
                 agents = [snap1?.Agent, snap2?.Agent, snap3?.Agent];
-                if (agents.All(a => a is not null) || DateTimeOffset.UtcNow >= stampDeadline)
+                if (agents.Count(a => a == Codex) == 1 &&
+                    agents.Count(a => a == Claude) == 2)
                     break;
                 await Task.Delay(25);
             }
@@ -824,18 +825,20 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             Assert.Equal(1, observedCodex);
 
             // Cross-check: the work item's stamped Agent field reflects the
-            // chosen-and-reserved member from the re-pickup. The reservation
-            // counter increments inside the router before the subsequent
-            // StartedAt/Agent store write, so wait for the persisted stamp.
+            // chosen-and-reserved member from the re-pickup (router writes it
+            // via UpdateAsync alongside StartedAt). Snapshot polling observes
+            // the in-memory counters which update before the store write, so
+            // poll until the persisted stamp catches up.
+            AgentKind? agent = null;
             var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
-            WorkItem? snap = null;
             while (DateTimeOffset.UtcNow < stampDeadline)
             {
-                snap = await _store.GetAsync(item.Id);
-                if (snap?.Agent == Codex) break;
+                var snap = await _store.GetAsync(item.Id);
+                agent = snap?.Agent;
+                if (agent == Codex) break;
                 await Task.Delay(25);
             }
-            Assert.Equal(Codex, snap!.Agent);
+            Assert.Equal(Codex, agent);
         }
         finally
         {

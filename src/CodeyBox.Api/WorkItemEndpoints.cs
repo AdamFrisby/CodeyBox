@@ -13,6 +13,8 @@ internal static class WorkItemEndpoints
         var group = app.MapGroup("/workitems");
         group.MapPost("/", CreateAsync);
         group.MapPost("/reorder", ReorderWorkItemsAsync);
+        group.MapPost("/{id}/abandon", AbandonAsync);
+        group.MapPost("/{id}/promote", PromoteAsync);
         group.MapPost("/{id}/retry", RetryAsync);
         group.MapPost("/{id}/replay", ReplayAsync);
         group.MapGet("/", ListAsync);
@@ -800,6 +802,55 @@ internal static class WorkItemEndpoints
         return Results.Ok(new { id = requeued.Id.ToString(), state = requeued.State.ToString() });
     }
 
+    private static async Task<IResult> AbandonAsync(
+        string id,
+        IWorkItemStore store,
+        IAgentStreamSummaryStore? streamSummaries,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State == WorkItemState.Done)
+            return Results.Conflict(new { error = $"cannot abandon item in state {item.State}" });
+
+        if (item.State == WorkItemState.AbandonedAfterRecoveryAttempts)
+            return Results.Ok(new { id = item.Id.ToString(), state = item.State.ToString() });
+
+        if (item.State is WorkItemState.Working
+            or WorkItemState.WorkComplete
+            or WorkItemState.Auditing
+            or WorkItemState.Reworking
+            or WorkItemState.AuditPassed
+            or WorkItemState.Merging
+            or WorkItemState.Merged
+            or WorkItemState.UpstreamPushing
+            or WorkItemState.ReworkingForConflict)
+        {
+            return Results.Conflict(new
+            {
+                error = $"cannot abandon in-flight item in state {item.State}; cancel it first",
+            });
+        }
+
+        var abandoned = item.With(
+            WorkItemState.AbandonedAfterRecoveryAttempts,
+            "abandoned via API");
+        var updated = await store.TryUpdateIfStateAndUpdatedAtAsync(
+            abandoned,
+            item.State,
+            item.UpdatedAt,
+            ct);
+        if (!updated)
+            return Results.Conflict(new { error = "work item changed before it could be abandoned; retry the request" });
+
+        if (streamSummaries is not null)
+            await streamSummaries.DeleteByWorkItemAsync(abandoned.Id, ct);
+        AuditLog.WorkItemTransitioned(abandoned.Id, abandoned.State.ToString());
+
+        return Results.Ok(new { id = abandoned.Id.ToString(), state = abandoned.State.ToString() });
+    }
+
     /// <summary>
     /// Resume an operator-cancelled work item against its existing bare repo
     /// and work-branch — preserving every agent commit already made — instead
@@ -885,6 +936,63 @@ internal static class WorkItemEndpoints
             from = requestedFrom,
             state = resumed.State.ToString(),
         });
+    }
+
+    private static async Task<IResult> PromoteAsync(
+        string id,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        ITaskQueue queue,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.Queued)
+            return Results.Conflict(new { error = $"cannot promote item in state {item.State}; only Queued items can be promoted" });
+
+        var project = await projects.GetAsync(item.ProjectId, ct);
+        if (project is null)
+            return Results.BadRequest(new { error = $"unknown project '{item.ProjectId}'" });
+
+        var highestAllowedPriority = project.MaxPriority is { } cap
+            ? Math.Min(cap, GlobalMaxPriority)
+            : GlobalMaxPriority;
+        var promotedPriority = Math.Max(item.Priority, highestAllowedPriority);
+        if (item.Priority == promotedPriority)
+            return Results.Ok(new { id = item.Id.ToString(), state = item.State.ToString() });
+
+        var result = await store.UpdatePriorityIfStateAsync(
+            item.Id,
+            promotedPriority,
+            DateTimeOffset.UtcNow,
+            WorkItemState.Queued,
+            ct);
+        switch (result.Outcome)
+        {
+            case PriorityUpdateOutcome.NotFound:
+                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+            case PriorityUpdateOutcome.TerminalState:
+                return Results.Conflict(new
+                {
+                    error = $"work item transitioned to terminal state '{result.Item!.State}' before it could be promoted",
+                });
+            case PriorityUpdateOutcome.StateMismatch:
+                return Results.Conflict(new
+                {
+                    error = $"work item transitioned to state '{result.Item!.State}' before it could be promoted",
+                });
+            case PriorityUpdateOutcome.Updated:
+                break;
+            default:
+                throw new InvalidOperationException($"Unexpected priority update outcome '{result.Outcome}'.");
+        }
+
+        var promoted = result.Item!;
+        AuditLog.WorkItemPriorityChanged(promoted.Id, result.OldPriority!.Value, promoted.Priority);
+        await queue.EnqueueAsync(promoted.Id, ct);
+
+        return Results.Ok(new { id = promoted.Id.ToString(), state = promoted.State.ToString() });
     }
 
     /// <summary>

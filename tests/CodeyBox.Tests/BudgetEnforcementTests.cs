@@ -308,8 +308,10 @@ public sealed class BudgetEnforcementTests : IDisposable
     private sealed class GatedPipelineRunner(TaskCompletionSource[] gates, IWorkItemStore store) : IPipelineRunner
     {
         private int _started;
+        private int _completed;
 
         public int StartedCount => Volatile.Read(ref _started);
+        public int CompletedCount => Volatile.Read(ref _completed);
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
@@ -317,6 +319,7 @@ public sealed class BudgetEnforcementTests : IDisposable
             if (n < gates.Length)
                 await gates[n].Task.WaitAsync(ct);
             await store.UpdateAsync(item.With(WorkItemState.Done), ct);
+            Interlocked.Increment(ref _completed);
         }
     }
 
@@ -385,11 +388,11 @@ public sealed class BudgetEnforcementTests : IDisposable
         // _budgetDeferralRecheck.Current on each budget-cap deferral, not a
         // value cached at construction time.
         //
-        // Strategy: block the first item, enqueue several successors so they
-        // all defer under the initial short interval, then hot-reload to a long
-        // interval before the short deferrals expire. When the first item is
-        // released, one successor grabs the freed slot and blocks on gate2;
-        // the others defer again. The second-cycle deferral must read the
+        // Strategy: block the first item, enqueue two successors so they both
+        // defer under the initial short interval, then hot-reload to a long
+        // interval before releasing the first item. When the short deferrals
+        // expire, one successor grabs the freed slot and blocks on gate2 while
+        // the other defers again. The second-cycle deferral must read the
         // hot-reloaded snapshot value, not a value cached at construction time
         // or on the first deferral.
         var pid = new ProjectId("budget-recheck-conc");
