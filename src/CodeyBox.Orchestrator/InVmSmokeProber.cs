@@ -166,8 +166,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// </summary>
     public async Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
     {
-        if (!Enabled) return null;
-        if (_probes.All(p => p.Kind != kind)) return null;
+        if (!CanForceProbe(kind)) return null;
         if (!TryGetConfiguredTarget(out var target))
         {
             _log.LogWarning(
@@ -176,26 +175,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             return null;
         }
 
-        try
-        {
-            await EnsureProbedAsync(kind, target, ct, bypassCache: true);
-            return _availability.GetAvailability(kind);
-        }
-        catch (OperationCanceledException)
-        {
-            _log.LogWarning("In-VM smoke force-probe for {Agent} was cancelled; no verdict available", kind.Value);
-            return null;
-        }
-        catch (SandboxProvisioningDeferredException ex)
-        {
-            _log.LogWarning(ex, "In-VM smoke force-probe for {Agent} was deferred; no verdict available", kind.Value);
-            return null;
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "In-VM smoke force-probe for {Agent} failed; no verdict available", kind.Value);
-            return null;
-        }
+        return await ForceProbeTargetAsync(kind, target, ct);
     }
 
     public async Task<AgentAvailability?> ForceProbeAsync(
@@ -203,9 +183,19 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
-        if (!Enabled) return null;
-        if (_probes.All(p => p.Kind != kind)) return null;
+        if (!CanForceProbe(kind)) return null;
 
+        return await ForceProbeTargetAsync(kind, target, ct);
+    }
+
+    private bool CanForceProbe(AgentKind kind)
+        => Enabled && _probes.Any(p => p.Kind == kind);
+
+    private async Task<AgentAvailability?> ForceProbeTargetAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
         try
         {
             await EnsureProbedAsync(kind, target, ct, bypassCache: true);

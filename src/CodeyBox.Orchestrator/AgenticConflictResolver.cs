@@ -114,7 +114,6 @@ public enum AgenticConflictResolverOperation
 public sealed record AgenticConflictResolverAuthFailureEvidence(
     IAgentRunner Runner,
     bool AgentSucceeded,
-    bool ResolutionSucceeded,
     AgentFailureClassification Classification,
     bool StdoutOnlyEvidence = false);
 
@@ -292,7 +291,7 @@ public sealed class AgenticConflictResolver
             AgentFailureClassification classification;
             try
             {
-                classification = ClassifyAgentFailure(failureRunner, classificationResult);
+                classification = _authFailureClassifier.ClassifyFailure(failureRunner, classificationResult);
             }
             catch (Exception ex)
             {
@@ -325,7 +324,6 @@ public sealed class AgenticConflictResolver
                 authRunner,
                 detection,
                 agentSucceeded,
-                resolutionSucceeded: false,
                 authFailures,
                 authFailureCallback,
                 ct);
@@ -728,7 +726,6 @@ public sealed class AgenticConflictResolver
         IAgentRunner runner,
         AgentAuthFailureDetection detection,
         bool agentSucceeded,
-        bool resolutionSucceeded,
         List<AgenticConflictResolverAuthFailureEvidence> authFailures,
         Func<AgenticConflictResolverAuthFailureEvidence, CancellationToken, Task>? authFailureCallback,
         CancellationToken ct)
@@ -736,7 +733,6 @@ public sealed class AgenticConflictResolver
         var evidence = new AgenticConflictResolverAuthFailureEvidence(
             runner,
             agentSucceeded,
-            resolutionSucceeded,
             detection.Classification,
             detection.IsStdoutOnly);
         authFailures.Add(evidence);
@@ -747,17 +743,6 @@ public sealed class AgenticConflictResolver
         return evidence;
     }
 
-
-    private AgentFailureClassification ClassifyAgentFailure(IAgentRunner runner, AgentResult result)
-    {
-        var authAwareClassification = _authFailureClassifier.ClassifyFailure(runner.Kind, result);
-        if (authAwareClassification.Kind == AgentFailureKind.AuthRequired)
-        {
-            return authAwareClassification;
-        }
-
-        return runner.ClassifyFailure(result);
-    }
 
     internal sealed record VerificationOutcome(bool Success, string Reason);
 

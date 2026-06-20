@@ -4513,7 +4513,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? phase,
         string failureContext)
     {
-        var classification = ClassifyAgentFailure(runner, result);
+        var classification = _authFailureClassifier.ClassifyFailure(runner, result);
         if (classification.Kind != AgentFailureKind.TransientNetwork)
             return null;
 
@@ -4527,17 +4527,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             phase,
             classification,
             $"Agent {runner.Kind} reported transient transport failure {failureContext}{phaseSuffix}: {summary} ({reason})");
-    }
-
-    private AgentFailureClassification ClassifyAgentFailure(IAgentRunner runner, AgentResult result)
-    {
-        var authAwareClassification = _authFailureClassifier.ClassifyFailure(runner.Kind, result);
-        if (authAwareClassification.Kind == AgentFailureKind.AuthRequired)
-        {
-            return authAwareClassification;
-        }
-
-        return runner.ClassifyFailure(result);
     }
 
     /// <summary>
@@ -5214,7 +5203,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         if (!result.Success)
         {
-            var classification = ClassifyAgentFailure(runner, classificationResult ?? result);
+            var classification = _authFailureClassifier.ClassifyFailure(runner, classificationResult ?? result);
             if (classification.Kind is AgentFailureKind.Infrastructure or AgentFailureKind.TransientNetwork)
             {
                 if (classification.Kind == AgentFailureKind.Infrastructure)
@@ -5567,10 +5556,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             // If the resolver ultimately succeeded, a failed earlier candidate's
             // login prompt should bench that candidate and alert the operator,
-            // but it should not discard the fallback's valid resolution. A login
-            // prompt from the winning attempt, or any auth prompt in an overall
-            // failed resolver, remains a hard infrastructure failure.
-            var throwOnMatch = !result.Success || failure.ResolutionSucceeded;
+            // but it should not discard the fallback's valid resolution.
+            var throwOnMatch = !result.Success;
             await HandleAuthRequiredDetectionAsync(
                 item,
                 project,
@@ -10011,7 +9998,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AgentSessionResumeExhaustedException resumeEx)
         {
             var last = resumeEx.LastResult;
-            var classification = ClassifyAgentFailure(runner, last);
+            var classification = _authFailureClassifier.ClassifyFailure(runner, last);
             if (classification.Kind != AgentFailureKind.TransientNetwork)
                 return null;
 
@@ -10658,7 +10645,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (_quotaClassifier.Detect(runner.Kind, result.AgentStderr, result.AgentStdout) is not null)
             return "failure:quota";
 
-        var classification = ClassifyAgentFailure(runner, ToAgentResultForAuditFailureClassification(result));
+        var classification = _authFailureClassifier.ClassifyFailure(runner, ToAgentResultForAuditFailureClassification(result));
         if (classification.Kind == AgentFailureKind.QuotaExhausted)
             return "failure:quota";
         if (classification.Kind == AgentFailureKind.TransientNetwork)
@@ -12985,7 +12972,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (AgentSessionResumeExhaustedException ex)
             {
-                var classification = ClassifyAgentFailure(runner, ex.LastResult);
+                var classification = _authFailureClassifier.ClassifyFailure(runner, ex.LastResult);
                 var authDetection = _authFailureClassifier.DetectDetailed(
                     runner.Kind,
                     ex.LastResult.Stderr,
@@ -13043,7 +13030,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // before the generic !Success → failure:agent fallback, otherwise the
             // involvement outcome would mislabel it as a plain agent failure.
             var transientFailure = !agentResult.Success
-                && ClassifyAgentFailure(runner, agentResult).Kind == AgentFailureKind.TransientNetwork;
+                && _authFailureClassifier.ClassifyFailure(runner, agentResult).Kind == AgentFailureKind.TransientNetwork;
             await FinalizeInvolvementAsync(conflictInvolvementId,
                 semanticIncompatible is not null ? "failure:semantic-incompatible"
                 : transientFailure ? "failure:transient"

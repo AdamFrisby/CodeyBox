@@ -32,6 +32,12 @@ public interface IAgentAuthFailureClassifier
     /// per-agent auth/login-prompt patterns.
     /// </summary>
     AgentFailureClassification ClassifyFailure(AgentKind kind, AgentResult result);
+
+    /// <summary>
+    /// Classifies a runner result using configured auth/login-prompt patterns
+    /// first, then falling back to the runner's own classifier.
+    /// </summary>
+    AgentFailureClassification ClassifyFailure(IAgentRunner runner, AgentResult result);
 }
 
 public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
@@ -63,6 +69,17 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             result.Stdout,
             result.Summary,
             _additionalPatternsByAgent);
+
+    public AgentFailureClassification ClassifyFailure(IAgentRunner runner, AgentResult result)
+    {
+        var authAwareClassification = ClassifyFailure(runner.Kind, result);
+        if (authAwareClassification.Kind == AgentFailureKind.AuthRequired)
+        {
+            return authAwareClassification;
+        }
+
+        return runner.ClassifyFailure(result);
+    }
 }
 
 /// <summary>

@@ -471,7 +471,6 @@ public sealed class AgenticConflictResolverTests
         var authFailure = Assert.Single(result.AuthFailures ?? []);
         Assert.Same(primary, authFailure.Runner);
         Assert.False(authFailure.AgentSucceeded);
-        Assert.False(authFailure.ResolutionSucceeded);
         Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
         Assert.True(authFailure.StdoutOnlyEvidence);
     }
@@ -664,7 +663,6 @@ public sealed class AgenticConflictResolverTests
         var authFailure = Assert.Single(result.AuthFailures ?? []);
         Assert.Same(runner, authFailure.Runner);
         Assert.True(authFailure.AgentSucceeded);
-        Assert.False(authFailure.ResolutionSucceeded);
         Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
         Assert.True(authFailure.StdoutOnlyEvidence);
     }
@@ -733,7 +731,6 @@ public sealed class AgenticConflictResolverTests
         var authFailure = Assert.Single(result.AuthFailures ?? []);
         Assert.Same(runner, authFailure.Runner);
         Assert.False(authFailure.AgentSucceeded);
-        Assert.False(authFailure.ResolutionSucceeded);
         Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
         Assert.True(authFailure.StdoutOnlyEvidence);
 
