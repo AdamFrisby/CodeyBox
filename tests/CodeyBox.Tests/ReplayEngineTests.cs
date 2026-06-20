@@ -1743,6 +1743,681 @@ public sealed class ReplayEngineTests
     }
 
     // ------------------------------------------------------------------
+    // Real-wait predicate-as-hint contract: a non-matching predicate must
+    // still return the stable frame so the engine can run the verifier
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task VisualWait_ReturnsStableFrame_WhenPredicateNeverMatches()
+    {
+        // Production regression cover: prior to the fix, the wait gated its
+        // stability return on `predicate is null`, so a visual-match
+        // assertion whose recorded screenshot differed from the live one
+        // surfaced as WaitTimeout instead of the AssertionMismatch the
+        // verifier would have produced. Pin the documented "early-stop hint,
+        // not a hard gate" contract by exercising the real wait with a
+        // predicate that intentionally never matches.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var frames = new Queue<byte[]>(new[]
+        {
+            new byte[] { 1, 1 },
+            new byte[] { 2, 2 },
+            new byte[] { 9, 9 },
+            new byte[] { 9, 9 },
+        });
+        sandbox.GetScreenshot = _ => frames.Count > 0
+            ? Task.FromResult(frames.Dequeue())
+            : Task.FromResult<byte[]>(new byte[] { 9, 9 });
+
+        var clock = new FakeTimeProvider(FrozenNow);
+        var wait = new ScreenshotStabilityWait(clock);
+        var options = new ReplayOptions
+        {
+            VisualWaitPollInterval = TimeSpan.FromMilliseconds(50),
+            VisualWaitTimeout = TimeSpan.FromSeconds(10),
+            StableFrameCount = 2,
+        };
+
+        var task = wait.WaitAsync(
+            sandbox,
+            predicate: _ => false,
+            options,
+            CancellationToken.None);
+        for (var i = 0; i < 10 && !task.IsCompleted; i++)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(60));
+            await Task.Yield();
+        }
+        var settled = await task;
+
+        Assert.NotNull(settled);
+        Assert.Equal(new byte[] { 9, 9 }, settled);
+    }
+
+    [Fact]
+    public async Task Replay_VisualMatchMismatch_SurfacesAssertionMismatch_UnderRealWait()
+    {
+        // End-to-end pin for the same fix: wire the engine with the real
+        // ScreenshotStabilityWait (not the ImmediateWait double) and a
+        // visual-match assertion whose recorded screenshot differs from the
+        // live one. The wait must converge on stability and hand the frame
+        // to the verifier so the engine reports AssertionMismatch, not
+        // WaitTimeout.
+        var sandbox = new ScriptedSandbox(StableScreenshotB)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        var entry = ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" },
+            observationScreenshot: StableScreenshotA);
+        entry = entry with { Assertion = new TraceAssertion { Kind = "visual-match" } };
+        var trace = MakeTrace(entry);
+
+        var clock = new FakeTimeProvider(FrozenNow);
+        var bridge = new ComputerUseBridge(timeProvider: clock);
+        var engine = new ReplayEngine(
+            bridge,
+            visualWait: new ScreenshotStabilityWait(clock),
+            timeProvider: clock);
+        var options = new ReplayOptions
+        {
+            VisualWaitPollInterval = TimeSpan.FromMilliseconds(50),
+            VisualWaitTimeout = TimeSpan.FromSeconds(10),
+            StableFrameCount = 2,
+        };
+
+        var task = engine.ReplayAsync(sandbox, trace, options);
+        for (var i = 0; i < 10 && !task.IsCompleted; i++)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(60));
+            await Task.Yield();
+        }
+        var result = await task;
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.AssertionMismatch, result.FailedStep!.FailureKind);
+    }
+
+    [Fact]
+    public async Task Replay_VisualMatchSuccess_UnderRealWait_AndPerceptualComparer()
+    {
+        // Custom comparer accepts any two non-empty PNGs; even with the
+        // engine's byte-equality early-stop predicate never matching
+        // (live=B, recorded=A), the wait stabilises and hands the frame to
+        // the verifier — which accepts via the perceptual comparator. This
+        // pins the comparer-seam fix: a perceptual comparer is no longer
+        // defeated by the predicate / stability gating interaction.
+        var sandbox = new ScriptedSandbox(StableScreenshotB)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        var entry = ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" },
+            observationScreenshot: StableScreenshotA);
+        entry = entry with { Assertion = new TraceAssertion { Kind = "visual-match" } };
+        var trace = MakeTrace(entry);
+
+        var clock = new FakeTimeProvider(FrozenNow);
+        var bridge = new ComputerUseBridge(timeProvider: clock);
+        var verifier = new DefaultAssertionVerifier(
+            recordedScreenshots: new Dictionary<string, byte[]>(StringComparer.Ordinal),
+            screenshotComparer: new AlwaysMatchScreenshotComparer());
+        var engine = new ReplayEngine(
+            bridge,
+            visualWait: new ScreenshotStabilityWait(clock),
+            assertions: verifier,
+            timeProvider: clock);
+        var options = new ReplayOptions
+        {
+            VisualWaitPollInterval = TimeSpan.FromMilliseconds(50),
+            VisualWaitTimeout = TimeSpan.FromSeconds(10),
+            StableFrameCount = 2,
+        };
+
+        var task = engine.ReplayAsync(sandbox, trace, options);
+        for (var i = 0; i < 10 && !task.IsCompleted; i++)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(60));
+            await Task.Yield();
+        }
+        var result = await task;
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+    }
+
+    [Fact]
+    public async Task VisualWait_NeverSettles_ReturnsNull_Exactly_AtTimeout()
+    {
+        // Tighter off-by-one cover for the stability count: the wait must
+        // require StableFrameCount consecutive equal frames, not fewer. A
+        // queue of 3 distinct frames followed by a single repeated final
+        // frame would satisfy `stable >= StableFrameCount` (the broken
+        // off-by-one) but not the correct `stable + 1 >= StableFrameCount`.
+        var frames = new Queue<byte[]>(new[]
+        {
+            new byte[] { 1, 1 },
+            new byte[] { 2, 2 },
+            new byte[] { 3, 3 },
+        });
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        sandbox.GetScreenshot = _ => Task.FromResult(frames.Count > 0
+            ? frames.Dequeue()
+            : new byte[] { (byte)(Environment.TickCount & 0x7F), 0 });
+
+        var clock = new FakeTimeProvider(FrozenNow);
+        var wait = new ScreenshotStabilityWait(clock);
+        var options = new ReplayOptions
+        {
+            VisualWaitPollInterval = TimeSpan.FromMilliseconds(50),
+            VisualWaitTimeout = TimeSpan.FromMilliseconds(200),
+            StableFrameCount = 3, // need at least 3 consecutive identical frames
+        };
+
+        var task = wait.WaitAsync(sandbox, predicate: null, options, CancellationToken.None);
+        for (var i = 0; i < 30 && !task.IsCompleted; i++)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(60));
+            await Task.Yield();
+        }
+        var settled = await task;
+
+        Assert.Null(settled);
+    }
+
+    // ------------------------------------------------------------------
+    // Coercion contracts: throws in dispatch / verifier / scroll-shape must
+    // surface as structured ReplayStepResult, not escape ReplayAsync
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_FailsWithActionFailed_OnUnsupportedActionKind()
+    {
+        // BuildRequestForReplay throws NotSupportedException for unknown
+        // action kinds; the dispatch try/catch must coerce it into a
+        // structured ActionFailed step result, not let it abort ReplayAsync.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [],
+                Kind = "drag", // not in the dispatch switch — engine must coerce
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Accessibility = new TraceAccessibilityDescriptor { Role = "button", Name = "Login" },
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.ActionFailed, result.FailedStep!.FailureKind);
+        Assert.Contains("drag", result.FailedStep.Diagnostic);
+    }
+
+    [Fact]
+    public async Task Replay_FailsWithAssertionMismatch_WhenAssertionVerifierThrows()
+    {
+        // ReplayStepAsync's verifier-throws branch — coerced to
+        // AssertionMismatch with a "verifier threw" diagnostic instead of
+        // leaking out of ReplayAsync.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        var entry = ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" });
+        entry = entry with { Assertion = new TraceAssertion { Kind = "visual-match" } };
+        var trace = MakeTrace(entry);
+        var clock = new FakeTimeProvider(FrozenNow);
+        var engine = new ReplayEngine(
+            bridge: new ComputerUseBridge(timeProvider: clock),
+            visualWait: new ImmediateWait(),
+            assertions: new ThrowingAssertionVerifier(new InvalidOperationException("verifier offline")),
+            timeProvider: clock);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.AssertionMismatch, result.FailedStep!.FailureKind);
+        Assert.Contains("verifier threw", result.FailedStep.Diagnostic);
+        Assert.Contains("verifier offline", result.FailedStep.Diagnostic);
+    }
+
+    [Fact]
+    public async Task Replay_FailsWithAssertionMismatch_WhenScreenshotStepVerifierThrows()
+    {
+        // RunScreenshotStepAsync's verifier-throws branch — same coercion
+        // contract as ReplayStepAsync.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [],
+                Kind = "screenshot",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = StableScreenshotA, CapturedAt = FrozenNow },
+            Assertion = new TraceAssertion { Kind = "visual-match" },
+        };
+        var trace = MakeTrace(entry);
+        var clock = new FakeTimeProvider(FrozenNow);
+        var engine = new ReplayEngine(
+            bridge: new ComputerUseBridge(timeProvider: clock),
+            visualWait: new ImmediateWait(),
+            assertions: new ThrowingAssertionVerifier(new InvalidOperationException("screenshot verifier offline")),
+            timeProvider: clock);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.AssertionMismatch, result.FailedStep!.FailureKind);
+        Assert.Contains("verifier threw", result.FailedStep.Diagnostic);
+        Assert.Contains("(screenshot)", result.FailedStep.Diagnostic);
+    }
+
+    [Fact]
+    public async Task Replay_FailsWithActionFailed_OnMalformedScrollRecording_NoScrollEvent()
+    {
+        // A scroll action with no Scroll-typed event in its InputEvents is a
+        // recorder bug. Must surface a precise "malformed recording"
+        // diagnostic, not the bridge validator's generic "non-zero X or Y"
+        // wording.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 100, Y = 100 }],
+                Kind = "scroll",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.ActionFailed, result.FailedStep!.FailureKind);
+        Assert.Contains("malformed recording", result.FailedStep.Diagnostic);
+        Assert.Contains("no SandboxInputEvent of Type=Scroll", result.FailedStep.Diagnostic);
+    }
+
+    [Fact]
+    public async Task Replay_FailsWithActionFailed_OnMalformedScrollRecording_ZeroMagnitude()
+    {
+        // A Scroll event with both axes zero is dispatch-shaped but
+        // semantically a recorder bug. Must surface the precise diagnostic.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 0, Y = 0 }],
+                Kind = "scroll",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        };
+        var trace = MakeTrace(entry);
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.ActionFailed, result.FailedStep!.FailureKind);
+        Assert.Contains("zero magnitude", result.FailedStep.Diagnostic);
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage gaps: healer-miss, ring radius boundary, horizontal scroll,
+    // probe-throws → Reachable, cancellation propagation
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_FailsWithNotFound_WhenLocatorMissAndHealerAlsoReturnsNull()
+    {
+        // Healer is wired but also returns null — the engine must still
+        // surface NotFound, not crash on the second null check.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Different"),
+        };
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
+        var healer = new NullHealer();
+        var engine = NewEngineFor(sandbox, healer: healer);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.NotFound, result.FailedStep!.FailureKind);
+        Assert.Equal(1, healer.Calls);
+        // No input was dispatched.
+        Assert.Empty(sandbox.RecordedInputEvents);
+    }
+
+    [Fact]
+    public async Task Locator_WithRingSearchRadiusZero_DisablesRingScan()
+    {
+        // Boundary: RingSearchRadius=0 means the ring loop body never runs.
+        // The locator still honours the centre probe, but any miss has no
+        // recovery; without a ring hit it returns null.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (x, y) =>
+            {
+                // Only a nearby (not-centre) point answers — would be a ring
+                // hit at the default radius, but zero radius disables it.
+                if (x == 178 && y == 90) return Accessible("button", "Login");
+                return null;
+            },
+        };
+        var descriptor = new TraceTargetDescriptor
+        {
+            Accessibility = new TraceAccessibilityDescriptor { Role = "button", Name = "Login" },
+            Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 } },
+        };
+        var options = new ReplayOptions { RingSearchRadius = 0 };
+        var locator = new AccessibilityElementLocator();
+        var hit = await locator.LocateAsync(sandbox, descriptor, options, CancellationToken.None);
+
+        Assert.Null(hit);
+    }
+
+    [Fact]
+    public async Task Reachability_ScrollsHorizontally_WhenTargetIsOffScreenOnXAxis()
+    {
+        // Horizontal-scroll branch of ResolveScrollDelta. A target with
+        // X >= ScreenWidth must trigger a horizontal scroll (ScrollX), not a
+        // vertical one (ScrollY).
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Right"),
+        };
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 1500, Y = 100, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Right" }));
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.OffScreen, result.FailedStep!.FailureKind);
+        var scrolls = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Scroll).ToList();
+        Assert.NotEmpty(scrolls);
+        // Every emitted scroll must be horizontal — never vertical for an
+        // X-off-screen target. ScrollX is dispatched via the X field on the
+        // SandboxInputEvent (the bridge collapses ScrollX/Y onto X/Y at
+        // event-translation time).
+        Assert.All(scrolls, s =>
+        {
+            Assert.NotNull(s.X);
+            Assert.True((s.Y ?? 0) == 0, "horizontal-only scroll must not carry a Y magnitude");
+        });
+    }
+
+    [Fact]
+    public async Task Reachability_TreatsAccessibilityProbeThrow_AsReachable_NotOccluded()
+    {
+        // probeFailed=true branch: the top-most accessibility probe throws.
+        // The checker must treat the throw as "transient IPC blip" and fall
+        // through to Reachable, NOT report Occluded.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var probeCalls = 0;
+        sandbox.AccessibilityAtPoint = (_, _) =>
+        {
+            probeCalls++;
+            // First call (locator point probe) succeeds; second call
+            // (reachability top-most probe) throws.
+            if (probeCalls == 1) return Accessible("button", "Login");
+            throw new InvalidOperationException("probe IPC blip");
+        };
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        // Real click was dispatched at the located centre — the throw didn't
+        // gate the step.
+        Assert.Contains(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Click);
+    }
+
+    [Fact]
+    public async Task Replay_RethrowsOperationCanceledException_OnCancelledToken()
+    {
+        // The engine's catch blocks must let OperationCanceledException
+        // through (not coerce it into a structured failure). A pre-cancelled
+        // token therefore propagates instead of returning a step result.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
+        var engine = NewEngineFor(sandbox);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => engine.ReplayAsync(sandbox, trace, ct: cts.Token));
+    }
+
+    [Fact]
+    public async Task ScreenshotStabilityWait_RethrowsOperationCanceledException()
+    {
+        // The wait's screenshot-exception branch must NOT swallow
+        // OperationCanceledException — a cancelled token has to propagate so
+        // the engine can in turn rethrow it instead of polling on past the
+        // cancel point.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        sandbox.GetScreenshot = ct => Task.FromException<byte[]>(new OperationCanceledException(ct));
+        var clock = new FakeTimeProvider(FrozenNow);
+        var wait = new ScreenshotStabilityWait(clock);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => wait.WaitAsync(sandbox, predicate: null, new ReplayOptions(), cts.Token));
+    }
+
+    // ------------------------------------------------------------------
+    // Diagnostic boundaries: text truncation, named-recording predicate
+    // bypass, custom matcher
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task DiagnosticText_TruncatesLongInputs_WithEllipsis()
+    {
+        // Pin DiagnosticText.Sanitize's truncation boundary. A 400-char Name
+        // surfaced through a NotFound diagnostic must be sanitised AND
+        // truncated, not echoed verbatim.
+        var longName = new string('X', 400);
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => null,
+        };
+        var trace = MakeTrace(ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = longName }));
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        var diag = result.FailedStep!.Diagnostic!;
+        Assert.DoesNotContain(longName, diag); // truncated, not echoed verbatim
+        Assert.Contains("…", diag);
+    }
+
+    [Fact]
+    public async Task Replay_NamedRecordingVisualMatch_FallsBackToVerifierResolution()
+    {
+        // Named-recording visual-match: assertion.Detail set => engine's
+        // BuildExpectedStatePredicate returns null => no early-stop. The
+        // wait converges on stability and the verifier resolves the named
+        // recording from its map. Pins the "Detail-non-empty branch" of
+        // BuildExpectedStatePredicate against a future regression that
+        // would mis-target the per-step recorded screenshot.
+        var sandbox = new ScriptedSandbox(StableScreenshotB)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Login"),
+        };
+        var entry = ClickEntry(seq: 1,
+            region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+            accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" },
+            observationScreenshot: StableScreenshotA);
+        entry = entry with { Assertion = new TraceAssertion { Kind = "visual-match", Detail = "after-checkout" } };
+        var trace = MakeTrace(entry);
+
+        var clock = new FakeTimeProvider(FrozenNow);
+        var bridge = new ComputerUseBridge(timeProvider: clock);
+        var verifier = new DefaultAssertionVerifier(new Dictionary<string, byte[]>(StringComparer.Ordinal)
+        {
+            // Named recording matches the LIVE screen — engine must compare
+            // current against this, not against entry.Observation.ScreenshotPng.
+            ["after-checkout"] = StableScreenshotB,
+        });
+        var engine = new ReplayEngine(
+            bridge,
+            visualWait: new ImmediateWait(),
+            assertions: verifier,
+            timeProvider: clock);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+    }
+
+    [Fact]
+    public async Task ReplayEngine_AcceptsCustomAccessibilityMatcher()
+    {
+        // Pins the new matcher ctor seam: a custom IAccessibilityMatcher
+        // wired through the engine must change the matching policy of the
+        // default locator AND the default reachability checker without the
+        // caller having to wire either component explicitly.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            // Sandbox returns "Different" role/name; default matcher would
+            // refuse, but the custom matcher below trusts the role only.
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Different"),
+        };
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
+
+        var clock = new FakeTimeProvider(FrozenNow);
+        var bridge = new ComputerUseBridge(timeProvider: clock);
+        var engine = new ReplayEngine(
+            bridge,
+            visualWait: new ImmediateWait(),
+            accessibilityMatcher: new RoleOnlyAccessibilityMatcher(),
+            timeProvider: clock);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+    }
+
+    // ------------------------------------------------------------------
+    // CompositeElementLocator constructor validation
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void CompositeLocator_Rejects_EmptyLocatorArray()
+    {
+        Assert.Throws<ArgumentException>(() => new CompositeElementLocator(Array.Empty<IElementLocator>()));
+    }
+
+    [Fact]
+    public void CompositeLocator_Rejects_NullInnerLocator()
+    {
+        Assert.Throws<ArgumentException>(() => new CompositeElementLocator(
+            new AccessibilityElementLocator(), null!));
+    }
+
+    // ------------------------------------------------------------------
+    // VisualSignatureElementLocator: zero region + screenshot exception
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task VisualSignatureLocator_ReturnsNull_OnZeroRegion()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var descriptor = new TraceTargetDescriptor
+        {
+            Visual = new TraceVisualDescriptor
+            {
+                Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 },
+                SourceScreenshotPng = StableScreenshotA,
+            },
+        };
+
+        var locator = new VisualSignatureElementLocator();
+        var hit = await locator.LocateAsync(sandbox, descriptor, new ReplayOptions(), CancellationToken.None);
+
+        Assert.Null(hit);
+    }
+
+    [Fact]
+    public async Task VisualSignatureLocator_ReturnsNull_WhenScreenshotThrows()
+    {
+        // Defends against a regression that would trust the recorded centre
+        // on a thrown screenshot (silent stale-coordinate trust).
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        sandbox.GetScreenshot = _ => Task.FromException<byte[]>(new InvalidOperationException("framebuffer torn"));
+        var descriptor = new TraceTargetDescriptor
+        {
+            Visual = new TraceVisualDescriptor
+            {
+                Region = new TraceBoundingRegion { X = 100, Y = 200, Width = 50, Height = 40 },
+                SourceScreenshotPng = StableScreenshotA,
+            },
+        };
+
+        var locator = new VisualSignatureElementLocator();
+        var hit = await locator.LocateAsync(sandbox, descriptor, new ReplayOptions(), CancellationToken.None);
+
+        Assert.Null(hit);
+    }
+
+    // ------------------------------------------------------------------
     // Helpers / doubles
     // ------------------------------------------------------------------
 
@@ -1872,12 +2547,11 @@ public sealed class ReplayEngineTests
 
     private sealed class ImmediateWait : IVisualWait
     {
-        // Models the real wait's contract: settle synchronously to the current
-        // frame and return it. A non-null predicate is an early-stop hint, not
-        // a hard gate — the real ScreenshotStabilityWait still returns the
-        // settled frame even when the predicate never matched, so the engine
-        // can run the assertion verifier and produce a precise
-        // AssertionMismatch diagnostic rather than a misleading WaitTimeout.
+        // Mirrors the real ScreenshotStabilityWait contract: a non-null
+        // predicate is an early-stop hint, not a hard gate — even when the
+        // predicate never matches, the wait returns the settled frame so the
+        // engine can run the assertion verifier and produce a precise
+        // AssertionMismatch diagnostic instead of a misleading WaitTimeout.
         public async Task<byte[]?> WaitAsync(ISandbox sandbox, Func<byte[], bool>? predicate, ReplayOptions options, CancellationToken ct)
         {
             _ = predicate;
@@ -1925,5 +2599,38 @@ public sealed class ReplayEngineTests
     {
         public ScreenshotComparison Compare(byte[] recorded, byte[] current)
             => new ScreenshotComparison(true);
+    }
+
+    private sealed class NullHealer : ILocatorHealer
+    {
+        public int Calls { get; private set; }
+        public Task<LocatedTarget?> HealAsync(ISandbox sandbox, TraceEntry entry, ReplayOptions options, CancellationToken ct)
+        {
+            Calls++;
+            return Task.FromResult<LocatedTarget?>(null);
+        }
+    }
+
+    private sealed class ThrowingAssertionVerifier : IAssertionVerifier
+    {
+        private readonly Exception _toThrow;
+        public ThrowingAssertionVerifier(Exception toThrow) => _toThrow = toThrow;
+        public Task<string?> VerifyAsync(
+            ISandbox sandbox,
+            TraceAssertion assertion,
+            byte[]? currentScreenshotPng,
+            byte[]? recordedScreenshotPng,
+            string? accessibilitySnapshotJson,
+            CancellationToken ct)
+            => throw _toThrow;
+    }
+
+    private sealed class RoleOnlyAccessibilityMatcher : IAccessibilityMatcher
+    {
+        public bool Matches(SandboxAccessibilitySnapshot snap, TraceAccessibilityDescriptor expected)
+            => string.Equals(snap.Role, expected.Role, StringComparison.Ordinal);
+
+        public bool HasAnyAccessibilitySignal(TraceAccessibilityDescriptor expected)
+            => !string.IsNullOrEmpty(expected.Role);
     }
 }

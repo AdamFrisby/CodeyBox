@@ -66,6 +66,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         ArgumentNullException.ThrowIfNull(options);
 
         var current = target;
+        var consecutiveRelocateMisses = 0;
         for (var attempt = 0; attempt <= options.MaxScrollAttempts; attempt++)
         {
             if (InViewport(current, options))
@@ -92,17 +93,38 @@ public sealed class ReachabilityChecker : IReachabilityChecker
             await _bridge.ExecuteAsync(sandbox, scrollRequest, ct).ConfigureAwait(false);
 
             // Re-locate on the CURRENT screen — the brief mandates recognition,
-            // not arithmetic on stale coordinates. If the locator now can't see
-            // the target, the next loop iteration's viewport check still acts on
-            // the prior `current` and either finishes the attempt budget or
-            // tries another scroll in the same direction.
+            // not arithmetic on stale coordinates.
             var relocated = await _locator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
             if (relocated is not null)
+            {
                 current = relocated;
+                consecutiveRelocateMisses = 0;
+                continue;
+            }
+
+            // Locator missed after the scroll. The real failure mode here is
+            // "the post-scroll layout broke recognition", not "still
+            // off-screen" — continuing to scroll the same direction (based on
+            // the stale pre-scroll `current`) would just burn the remaining
+            // attempt budget on a target the engine can no longer see anyway.
+            // After a small grace window we surface a distinct lost-after-
+            // scroll diagnostic so operators can triage the real cause
+            // (layout reflow / element re-themed) instead of chasing a
+            // misleading OffScreen.
+            consecutiveRelocateMisses++;
+            if (consecutiveRelocateMisses >= 2)
+            {
+                return new ReachabilityOutcome
+                {
+                    Status = ReachabilityStatus.OffScreen,
+                    Target = current,
+                    Diagnostic = $"target centre ({current.CenterX},{current.CenterY}) outside viewport ({options.ScreenWidth}x{options.ScreenHeight}); locator could not re-find the target after {consecutiveRelocateMisses} post-scroll attempts (layout likely reflowed)",
+                };
+            }
         }
 
         var expectedAccessibility = descriptor.Accessibility;
-        if (expectedAccessibility is not null && AccessibilityElementLocator.HasAnyAccessibilitySignal(expectedAccessibility))
+        if (expectedAccessibility is not null && _matcher.HasAnyAccessibilitySignal(expectedAccessibility))
         {
             SandboxAccessibilitySnapshot? snap;
             var probeFailed = false;

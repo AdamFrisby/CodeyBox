@@ -35,6 +35,13 @@ public sealed class AccessibilityElementLocator : IElementLocator
     // Surfaced for diagnostics only — the engine does not gate on confidence.
     internal const double RingHitConfidence = 0.85;
 
+    private readonly IAccessibilityMatcher _matcher;
+
+    public AccessibilityElementLocator(IAccessibilityMatcher? matcher = null)
+    {
+        _matcher = matcher ?? DefaultAccessibilityMatcher.Instance;
+    }
+
     public async Task<LocatedTarget?> LocateAsync(
         ISandbox sandbox,
         TraceTargetDescriptor descriptor,
@@ -53,7 +60,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
         // (StringMatches treats null/empty as 'matches anything'), which is a
         // false-positive failure class the brief explicitly calls out.
         if (expected is null) return null;
-        if (!HasAnyAccessibilitySignal(expected)) return null;
+        if (!_matcher.HasAnyAccessibilitySignal(expected)) return null;
 
         var region = descriptor.Visual.Region;
         var hasPoint = region.Width > 0 && region.Height > 0;
@@ -111,7 +118,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
     private static bool InScreen(int x, int y, ReplayOptions options) =>
         x >= 0 && x < options.ScreenWidth && y >= 0 && y < options.ScreenHeight;
 
-    private static async Task<SandboxAccessibilitySnapshot?> ProbeAccessibilityAsync(
+    private async Task<SandboxAccessibilitySnapshot?> ProbeAccessibilityAsync(
         ISandbox sandbox,
         int x,
         int y,
@@ -137,29 +144,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
             return null;
         }
         if (snap is null) return null;
-        return Matches(snap, expected) ? snap : null;
-    }
-
-    internal static bool Matches(SandboxAccessibilitySnapshot snap, TraceAccessibilityDescriptor expected)
-    {
-        if (!HasAnyAccessibilitySignal(expected)) return false;
-        if (!StringMatches(snap.Role, expected.Role)) return false;
-        if (!StringMatches(snap.Name, expected.Name)) return false;
-        if (!StringMatches(snap.Text, expected.Text)) return false;
-        if (!StringMatches(snap.ElementType, expected.ElementType)) return false;
-        return true;
-    }
-
-    internal static bool HasAnyAccessibilitySignal(TraceAccessibilityDescriptor expected) =>
-        !string.IsNullOrEmpty(expected.Role)
-        || !string.IsNullOrEmpty(expected.Name)
-        || !string.IsNullOrEmpty(expected.Text)
-        || !string.IsNullOrEmpty(expected.ElementType);
-
-    private static bool StringMatches(string? actual, string? expected)
-    {
-        if (string.IsNullOrEmpty(expected)) return true;
-        return string.Equals(actual ?? "", expected, StringComparison.Ordinal);
+        return _matcher.Matches(snap, expected) ? snap : null;
     }
 
     // Yields every (dx, dy) on the square ring at max(|dx|, |dy|) == radius,

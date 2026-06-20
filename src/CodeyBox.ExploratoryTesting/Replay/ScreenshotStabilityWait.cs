@@ -11,10 +11,17 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// byte-identical, mirroring how a human says "ok the spinner stopped, now
 /// I can read it."
 ///
-/// <para>When <paramref name="predicate"/> is supplied, success is the
-/// predicate returning true on any captured frame — the predicate short-
-/// circuits stability so the engine can wait for a specific expected state
-/// without paying the full settle window.</para>
+/// <para>When a <c>predicate</c> is supplied it is an <b>early-stop hint</b>,
+/// not a hard gate: a matching frame returns immediately (the engine can
+/// stop waiting once the expected state appears), but the stability fallback
+/// still applies, so a frame that never matches the predicate still returns
+/// once the screen settles — that lets a downstream assertion verifier run
+/// against the stable frame and produce a precise
+/// <see cref="ReplayFailureKind.AssertionMismatch"/> diagnostic instead of a
+/// misleading <see cref="ReplayFailureKind.WaitTimeout"/>. Treating the
+/// predicate as a hard gate would also defeat any verifier wired with a
+/// non-byte-equality <see cref="IScreenshotComparer"/>, since the engine's
+/// byte-equality predicate would never agree with a perceptual comparator.</para>
 ///
 /// <para>Byte-equality is intentionally conservative: a single pixel of
 /// noise restarts the stable count. That's what we want — the cursor blink
@@ -80,9 +87,11 @@ public sealed class ScreenshotStabilityWait : IVisualWait
                     // Account for both the current frame and the prior frame —
                     // a "2 consecutive identical screenshots" requirement is
                     // satisfied the first time we observe one match, not after
-                    // two matches.
+                    // two matches. Stability returns the frame regardless of
+                    // whether a predicate was supplied: the predicate is an
+                    // early-stop hint, not a hard gate (see type docs).
                     stable++;
-                    if (predicate is null && stable + 1 >= options.StableFrameCount)
+                    if (stable + 1 >= options.StableFrameCount)
                         return current;
                 }
                 else

@@ -56,18 +56,20 @@ public sealed class ReplayEngine
         IVisualWait? visualWait = null,
         IAssertionVerifier? assertions = null,
         ILocatorHealer? healer = null,
+        IAccessibilityMatcher? accessibilityMatcher = null,
         TimeProvider? timeProvider = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
+        var matcher = accessibilityMatcher ?? DefaultAccessibilityMatcher.Instance;
         // Default chain: accessibility-tree recognition first (cheap, exact),
         // then visual-signature recognition for canvas / 3D / untagged targets
         // — the brief's "accessibility tree when present, ELSE visual /
         // OCR / template" contract. Richer template / OCR / vision-LLM
         // locators plug into the same chain via CompositeElementLocator.
         _locator = locator ?? new CompositeElementLocator(
-            new AccessibilityElementLocator(),
+            new AccessibilityElementLocator(matcher),
             new VisualSignatureElementLocator());
-        _reachability = reachability ?? new ReachabilityChecker(_bridge, _locator);
+        _reachability = reachability ?? new ReachabilityChecker(_bridge, _locator, matcher);
         _visualWait = visualWait ?? new ScreenshotStabilityWait(timeProvider);
         _assertions = assertions ?? new DefaultAssertionVerifier();
         _healer = healer;
@@ -194,6 +196,17 @@ public sealed class ReplayEngine
         {
             throw;
         }
+        catch (MalformedTraceException ex)
+        {
+            // Recorder bug, not a dispatch failure — surface the recording-
+            // shape diagnostic verbatim so triage doesn't dead-end on the
+            // generic "input dispatch failed" prefix.
+            return await FailAsync(
+                sandbox, entry, ReplayFailureKind.ActionFailed,
+                $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): malformed recording: {DiagnosticText.Sanitize(ex.Message)}",
+                locatedTarget: located,
+                ct).ConfigureAwait(false);
+        }
         catch (Exception ex)
         {
             return await FailAsync(
@@ -203,12 +216,16 @@ public sealed class ReplayEngine
                 ct).ConfigureAwait(false);
         }
 
-        // Short-circuit the stability wait when the assertion is a visual-match
-        // and we have the expected screenshot in hand — this is the brief's
-        // 'wait until expected element/state appears' leg, not the pure
-        // 'animation has settled' fallback. Other assertion kinds rely on the
-        // accessibility tree (re-fetched after the wait) so they do not gain a
-        // useful per-frame predicate.
+        // Early-stop hint for the stability wait when the assertion is a
+        // visual-match and we have the expected screenshot in hand — the
+        // brief's 'wait until expected element/state appears' leg. The wait
+        // treats this as a hint, not a hard gate: a matching frame returns
+        // immediately, but a non-matching frame still gets returned once the
+        // screen settles so the verifier (with its configured
+        // IScreenshotComparer) can produce a precise AssertionMismatch
+        // diagnostic instead of a misleading WaitTimeout. Other assertion
+        // kinds rely on the accessibility tree (re-fetched after the wait)
+        // so they do not gain a useful per-frame predicate.
         var predicate = BuildExpectedStatePredicate(entry);
         var settled = await _visualWait.WaitAsync(sandbox, predicate, options, ct).ConfigureAwait(false);
         if (settled is null)
@@ -447,8 +464,25 @@ public sealed class ReplayEngine
                 break;
             }
         }
-        var sx = scrollEvent?.X ?? 0;
-        var sy = scrollEvent?.Y ?? 0;
+        if (scrollEvent is null)
+        {
+            // Recorder bug: a scroll action with no Scroll-typed event in its
+            // InputEvents. Surface as a categorical recording-shape failure
+            // upfront so operators see "recording has no Scroll event" instead
+            // of the bridge validator's generic "Scroll events require a
+            // non-zero X or Y amount" once it tries to dispatch null axes.
+            throw new MalformedTraceException(
+                "scroll action carries no SandboxInputEvent of Type=Scroll (recorder bug)");
+        }
+        var sx = scrollEvent.X ?? 0;
+        var sy = scrollEvent.Y ?? 0;
+        if (sx == 0 && sy == 0)
+        {
+            // Recorder bug: a Scroll event with zero magnitude on both axes
+            // would dispatch as a no-op the validator rejects.
+            throw new MalformedTraceException(
+                "scroll action's Scroll event has zero magnitude on both axes (recorder bug)");
+        }
         if (sx != 0 && sy != 0)
         {
             // Drop the smaller-magnitude axis — vertical wins on ties.
