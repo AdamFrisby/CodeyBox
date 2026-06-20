@@ -20,8 +20,8 @@ public sealed record ReplayOptions
     private readonly TimeSpan _visualWaitTimeout = TimeSpan.FromSeconds(15);
     private readonly TimeSpan _visualWaitPollInterval = TimeSpan.FromMilliseconds(250);
     private readonly int _stableFrameCount = 2;
-    private readonly int _spiralSearchRadius = 24;
-    private readonly int _spiralSearchStep = 8;
+    private readonly int _ringSearchRadius = 24;
+    private readonly int _ringSearchStep = 8;
 
     /// <summary>
     /// Width of the captured screen, in pixels. Used by the default
@@ -118,47 +118,54 @@ public sealed record ReplayOptions
     /// <summary>
     /// Number of consecutive identical screenshots required before the
     /// visual wait declares the screen "settled". Two is enough for a
-    /// genuine settle; bump higher on noisy displays.
+    /// genuine settle (one frame to capture + one equal follower); bump
+    /// higher on noisy displays. Rejects <c>&lt; 2</c> because the wait
+    /// needs at least one prior frame to compare against — a single-frame
+    /// settle is indistinguishable from "I just captured for the first time
+    /// and have nothing to compare to."
     /// </summary>
     public int StableFrameCount
     {
         get => _stableFrameCount;
         init
         {
-            if (value < 1)
-                throw new ArgumentOutOfRangeException(nameof(value), value, "StableFrameCount must be at least 1.");
+            if (value < 2)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "StableFrameCount must be at least 2 — the wait needs a prior frame to compare against.");
             _stableFrameCount = value;
         }
     }
 
     /// <summary>
-    /// Half-size of the accessibility search around the recorded click
+    /// Half-size of the accessibility ring search around the recorded click
     /// centre, in pixels. The locator scans concentric square rings outward
-    /// to this radius and returns the first accessibility match.
+    /// to this radius and returns the first accessibility match. (Named
+    /// "ring" rather than "spiral" because the implementation is a square-
+    /// ring scan, not a true spiral; the prior "Spiral*" names rotted as
+    /// the implementation crystallised.)
     /// </summary>
-    public int SpiralSearchRadius
+    public int RingSearchRadius
     {
-        get => _spiralSearchRadius;
+        get => _ringSearchRadius;
         init
         {
             if (value < 0)
-                throw new ArgumentOutOfRangeException(nameof(value), value, "SpiralSearchRadius cannot be negative.");
-            _spiralSearchRadius = value;
+                throw new ArgumentOutOfRangeException(nameof(value), value, "RingSearchRadius cannot be negative.");
+            _ringSearchRadius = value;
         }
     }
 
     /// <summary>
-    /// Pixel step of the accessibility search grid. Must be &gt; 0 so the
-    /// search loop is guaranteed to advance.
+    /// Pixel step of the accessibility ring search grid. Must be &gt; 0 so
+    /// the search loop is guaranteed to advance.
     /// </summary>
-    public int SpiralSearchStep
+    public int RingSearchStep
     {
-        get => _spiralSearchStep;
+        get => _ringSearchStep;
         init
         {
             if (value <= 0)
-                throw new ArgumentOutOfRangeException(nameof(value), value, "SpiralSearchStep must be positive.");
-            _spiralSearchStep = value;
+                throw new ArgumentOutOfRangeException(nameof(value), value, "RingSearchStep must be positive.");
+            _ringSearchStep = value;
         }
     }
 }

@@ -59,7 +59,14 @@ public sealed class ReplayEngine
         TimeProvider? timeProvider = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
-        _locator = locator ?? new AccessibilityElementLocator();
+        // Default chain: accessibility-tree recognition first (cheap, exact),
+        // then visual-signature recognition for canvas / 3D / untagged targets
+        // — the brief's "accessibility tree when present, ELSE visual /
+        // OCR / template" contract. Richer template / OCR / vision-LLM
+        // locators plug into the same chain via CompositeElementLocator.
+        _locator = locator ?? new CompositeElementLocator(
+            new AccessibilityElementLocator(),
+            new VisualSignatureElementLocator());
         _reachability = reachability ?? new ReachabilityChecker(_bridge, _locator);
         _visualWait = visualWait ?? new ScreenshotStabilityWait(timeProvider);
         _assertions = assertions ?? new DefaultAssertionVerifier();
@@ -121,7 +128,7 @@ public sealed class ReplayEngine
 
         if (action.Kind == "screenshot")
         {
-            return await RunScreenshotStepAsync(sandbox, entry, options, ct).ConfigureAwait(false);
+            return await RunScreenshotStepAsync(sandbox, entry, ct).ConfigureAwait(false);
         }
 
         LocatedTarget? located = null;
@@ -196,7 +203,14 @@ public sealed class ReplayEngine
                 ct).ConfigureAwait(false);
         }
 
-        var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct).ConfigureAwait(false);
+        // Short-circuit the stability wait when the assertion is a visual-match
+        // and we have the expected screenshot in hand — this is the brief's
+        // 'wait until expected element/state appears' leg, not the pure
+        // 'animation has settled' fallback. Other assertion kinds rely on the
+        // accessibility tree (re-fetched after the wait) so they do not gain a
+        // useful per-frame predicate.
+        var predicate = BuildExpectedStatePredicate(entry);
+        var settled = await _visualWait.WaitAsync(sandbox, predicate, options, ct).ConfigureAwait(false);
         if (settled is null)
         {
             return await FailAsync(
@@ -208,10 +222,42 @@ public sealed class ReplayEngine
 
         if (entry.Assertion is { } assertion)
         {
-            var accessibility = await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false);
-            var diag = await _assertions
-                .VerifyAsync(sandbox, assertion, settled, entry.Observation.ScreenshotPng, accessibility, ct)
-                .ConfigureAwait(false);
+            // Fetch the accessibility tree only for assertion kinds that
+            // consume it. Visual-match looks at screenshots only — issuing
+            // an extra accessibility-tree IPC roundtrip per step burns cost
+            // for no diagnostic value.
+            var accessibility = AssertionConsumesAccessibilityTree(assertion)
+                ? await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
+                : null;
+            string? diag;
+            try
+            {
+                diag = await _assertions
+                    .VerifyAsync(sandbox, assertion, settled, entry.Observation.ScreenshotPng, accessibility, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // A throwing verifier must not leak out of ReplayAsync and
+                // abort the structured-step contract; coerce into an
+                // AssertionMismatch so the rest of the result envelope still
+                // surfaces, matching how reachability / dispatch errors are
+                // handled.
+                return new ReplayStepResult
+                {
+                    Sequence = entry.Sequence,
+                    ActionKind = action.Kind,
+                    Passed = false,
+                    FailureKind = ReplayFailureKind.AssertionMismatch,
+                    Diagnostic = $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' verifier threw: {DiagnosticText.Sanitize(ex.Message)}",
+                    DiagnosticScreenshotPng = settled,
+                    LocatedTarget = located,
+                };
+            }
             if (diag is not null)
             {
                 return new ReplayStepResult
@@ -239,11 +285,8 @@ public sealed class ReplayEngine
     private async Task<ReplayStepResult> RunScreenshotStepAsync(
         ISandbox sandbox,
         TraceEntry entry,
-        ReplayOptions options,
         CancellationToken ct)
     {
-        _ = options;
-
         ComputerUseResult bridgeResult;
         try
         {
@@ -269,10 +312,32 @@ public sealed class ReplayEngine
             // GetScreenshotAsync — two captures can disagree on a moving UI
             // and the user only asked for one screenshot at this checkpoint.
             var current = bridgeResult.ScreenshotPng;
-            var accessibility = await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false);
-            var diag = await _assertions
-                .VerifyAsync(sandbox, assertion, current, entry.Observation.ScreenshotPng, accessibility, ct)
-                .ConfigureAwait(false);
+            var accessibility = AssertionConsumesAccessibilityTree(assertion)
+                ? await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
+                : null;
+            string? diag;
+            try
+            {
+                diag = await _assertions
+                    .VerifyAsync(sandbox, assertion, current, entry.Observation.ScreenshotPng, accessibility, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return new ReplayStepResult
+                {
+                    Sequence = entry.Sequence,
+                    ActionKind = entry.Action.Kind,
+                    Passed = false,
+                    FailureKind = ReplayFailureKind.AssertionMismatch,
+                    Diagnostic = $"step {entry.Sequence} (screenshot): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' verifier threw: {DiagnosticText.Sanitize(ex.Message)}",
+                    DiagnosticScreenshotPng = current,
+                };
+            }
             if (diag is not null)
             {
                 return new ReplayStepResult
@@ -293,6 +358,23 @@ public sealed class ReplayEngine
             ActionKind = entry.Action.Kind,
             Passed = true,
         };
+    }
+
+    private static bool AssertionConsumesAccessibilityTree(TraceAssertion assertion) =>
+        assertion.Kind is "text-contains" or "element-present";
+
+    private static Func<byte[], bool>? BuildExpectedStatePredicate(TraceEntry entry)
+    {
+        if (entry.Assertion is not { Kind: "visual-match" } assertion) return null;
+        var expected = entry.Observation.ScreenshotPng;
+        if (expected is null || expected.Length == 0) return null;
+        // Detail-named recordings are resolved by the verifier, not by the
+        // wait — building a predicate would require duplicating the named-
+        // recording map here. The wait still stops on stability, the verifier
+        // still runs on the stable frame, so this only loses the short-
+        // circuit, not the verification.
+        if (!string.IsNullOrEmpty(assertion.Detail)) return null;
+        return current => current.Length == expected.Length && current.AsSpan().SequenceEqual(expected);
     }
 
     private async Task DispatchActionAsync(
@@ -350,16 +432,34 @@ public sealed class ReplayEngine
     private static ComputerUseRequest BuildScrollRequest(TraceAction action)
     {
         // The bridge resolves the scroll event from (ScrollX ?? X, ScrollY ?? Y)
-        // and the validator rejects two-axis scroll events. We pass the scroll
-        // magnitude exclusively on the Scroll* axes (one of them zero) and
-        // leave X/Y null so a non-zero located.CenterX can't sneak in and
-        // produce a "both axes set" validator rejection.
-        var first = action.InputEvents.Count > 0 ? action.InputEvents[0] : null;
+        // and the validator rejects events with both axes non-zero. We:
+        //   - pull the magnitude from the first SandboxInputEvent of Type=Scroll,
+        //     not action.InputEvents[0] verbatim (a malformed recording whose
+        //     first event is a Click could push pixel coords as scroll units);
+        //   - zero the smaller axis when the recording emits a two-axis scroll,
+        //     so the validator never rejects a real recording for shape.
+        SandboxInputEvent? scrollEvent = null;
+        foreach (var e in action.InputEvents)
+        {
+            if (e.Type == SandboxInputEventType.Scroll)
+            {
+                scrollEvent = e;
+                break;
+            }
+        }
+        var sx = scrollEvent?.X ?? 0;
+        var sy = scrollEvent?.Y ?? 0;
+        if (sx != 0 && sy != 0)
+        {
+            // Drop the smaller-magnitude axis — vertical wins on ties.
+            if (Math.Abs(sx) > Math.Abs(sy)) sy = 0;
+            else sx = 0;
+        }
         return new ComputerUseRequest
         {
             Action = "scroll",
-            ScrollX = first?.X,
-            ScrollY = first?.Y,
+            ScrollX = sx == 0 ? null : sx,
+            ScrollY = sy == 0 ? null : sy,
         };
     }
 

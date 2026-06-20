@@ -77,6 +77,10 @@ public sealed class ScreenshotStabilityWait : IVisualWait
 
                 if (previous is not null && ByteSpansEqual(previous, current))
                 {
+                    // Account for both the current frame and the prior frame —
+                    // a "2 consecutive identical screenshots" requirement is
+                    // satisfied the first time we observe one match, not after
+                    // two matches.
                     stable++;
                     if (predicate is null && stable + 1 >= options.StableFrameCount)
                         return current;

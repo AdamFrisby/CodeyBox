@@ -75,8 +75,10 @@ public sealed record ReplayStepResult
 /// The bounds + provenance of a re-located target on the current screen.
 /// Returned by <see cref="IElementLocator.LocateAsync"/> and consumed by the
 /// engine to drive real input. The <see cref="CenterX"/> / <see cref="CenterY"/>
-/// pair is the engine's click target; <see cref="Region"/> describes the
-/// element's full bounds so reachability checks can reason about it.
+/// pair is the engine's click target; <see cref="Region"/> is the recorded
+/// descriptor's region — locators that snap to a nearby point preserve the
+/// recorded region rather than synthesising a fresh one, so consumers should
+/// treat it as the recorded shape, not as live geometry of the located hit.
 /// </summary>
 public sealed record LocatedTarget
 {
@@ -85,16 +87,23 @@ public sealed record LocatedTarget
     public required TraceBoundingRegion Region { get; init; }
 
     /// <summary>
-    /// Provenance: how the target was re-located. One of
-    /// <c>accessibility-point</c>, <c>accessibility-spiral</c>,
-    /// <c>visual-template</c>, <c>recorded-region</c>.
+    /// Provenance: how the target was re-located. Shipped values from the
+    /// default locators are <c>accessibility-point</c> (the recorded centre
+    /// matched on the accessibility tree), <c>accessibility-ring</c> (a
+    /// nearby probe in the square-ring search matched), and
+    /// <c>visual-signature</c> (the full current screen byte-matches the
+    /// recorded source screenshot). Custom <see cref="IElementLocator"/>
+    /// implementations and <see cref="ILocatorHealer"/>s may introduce
+    /// additional source strings.
     /// </summary>
     public required string Source { get; init; }
 
     /// <summary>
     /// Locator-supplied confidence in [0, 1]. The default accessibility
-    /// locator returns 1.0 on an exact role/name match and 0.5 on a
-    /// fall-back to the recorded region.
+    /// locator returns 1.0 on an exact role/name/text/element-type match at
+    /// the recorded centre and 0.85 on a ring-scan hit at a nearby cell.
+    /// Confidence is informational only — the engine does not compare it
+    /// against a threshold today.
     /// </summary>
     public required double Confidence { get; init; }
 }

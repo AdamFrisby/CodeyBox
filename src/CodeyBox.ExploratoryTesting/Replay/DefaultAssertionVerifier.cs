@@ -30,23 +30,46 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// </summary>
 public sealed class DefaultAssertionVerifier : IAssertionVerifier
 {
-    private readonly IReadOnlyDictionary<string, byte[]?> _recordedScreenshots;
+    private readonly IReadOnlyDictionary<string, byte[]> _recordedScreenshots;
+    private readonly IScreenshotComparer _screenshotComparer;
 
-    public DefaultAssertionVerifier() : this(new Dictionary<string, byte[]?>(StringComparer.Ordinal))
+    public DefaultAssertionVerifier()
+        : this(
+            recordedScreenshots: new Dictionary<string, byte[]>(StringComparer.Ordinal),
+            screenshotComparer: ExactBytesScreenshotComparer.Instance)
     {
     }
 
     /// <summary>
     /// Creates a verifier that can resolve <c>visual-match</c> assertions
     /// against recorded screenshots keyed by the assertion's
-    /// <see cref="TraceAssertion.Detail"/>. When no named entry matches, the
-    /// per-step recorded screenshot passed to <see cref="VerifyAsync"/> is the
-    /// comparison target.
+    /// <see cref="TraceAssertion.Detail"/>. When the assertion has no
+    /// <c>Detail</c> the per-step recorded screenshot passed to
+    /// <see cref="VerifyAsync"/> is the comparison target; when
+    /// <c>Detail</c> is set but the map does not contain that key, the
+    /// verifier returns a configuration-error diagnostic instead of silently
+    /// falling back to the per-step screenshot (which would compare against
+    /// the wrong reference image).
     /// </summary>
-    public DefaultAssertionVerifier(IReadOnlyDictionary<string, byte[]?> recordedScreenshots)
+    public DefaultAssertionVerifier(IReadOnlyDictionary<string, byte[]> recordedScreenshots)
+        : this(recordedScreenshots, ExactBytesScreenshotComparer.Instance)
+    {
+    }
+
+    /// <summary>
+    /// Like the dictionary-only constructor but accepts a custom
+    /// <see cref="IScreenshotComparer"/> — wire in a perceptual-diff or
+    /// tolerance-window comparator for production renders where PNG bytes
+    /// are non-deterministic across runs / hosts.
+    /// </summary>
+    public DefaultAssertionVerifier(
+        IReadOnlyDictionary<string, byte[]> recordedScreenshots,
+        IScreenshotComparer screenshotComparer)
     {
         ArgumentNullException.ThrowIfNull(recordedScreenshots);
+        ArgumentNullException.ThrowIfNull(screenshotComparer);
         _recordedScreenshots = recordedScreenshots;
+        _screenshotComparer = screenshotComparer;
     }
 
     public Task<string?> VerifyAsync(
@@ -73,14 +96,17 @@ public sealed class DefaultAssertionVerifier : IAssertionVerifier
         {
             case "visual-match":
                 {
-                    var expected = ResolveExpectedScreenshot(assertion, recordedScreenshotPng);
-                    if (expected is null)
+                    var resolution = ResolveExpectedScreenshot(assertion, recordedScreenshotPng);
+                    if (resolution.MissingNamedKey)
+                        return $"visual-match assertion references unknown named recording '{DiagnosticText.Sanitize(assertion.Detail)}'";
+                    if (resolution.Bytes is null)
                         return "visual-match assertion has no recorded screenshot to compare against";
                     if (currentScreenshotPng is null)
                         return "visual-match assertion: current observation has no screenshot";
-                    return ScreenshotsEqual(expected, currentScreenshotPng)
+                    var verdict = _screenshotComparer.Compare(resolution.Bytes, currentScreenshotPng);
+                    return verdict.Matches
                         ? null
-                        : $"visual-match assertion: current screenshot ({currentScreenshotPng.Length} bytes) differs from recorded ({expected.Length} bytes)";
+                        : verdict.Diagnostic ?? $"visual-match assertion: current screenshot ({currentScreenshotPng.Length} bytes) differs from recorded ({resolution.Bytes.Length} bytes)";
                 }
             case "text-contains":
                 {
@@ -107,19 +133,21 @@ public sealed class DefaultAssertionVerifier : IAssertionVerifier
         }
     }
 
-    private byte[]? ResolveExpectedScreenshot(TraceAssertion assertion, byte[]? recordedScreenshotPng)
+    private ScreenshotResolution ResolveExpectedScreenshot(TraceAssertion assertion, byte[]? recordedScreenshotPng)
     {
-        if (!string.IsNullOrEmpty(assertion.Detail) &&
-            _recordedScreenshots.TryGetValue(assertion.Detail, out var named) && named is not null)
-        {
-            return named;
-        }
-        return recordedScreenshotPng;
+        if (string.IsNullOrEmpty(assertion.Detail))
+            return new ScreenshotResolution(recordedScreenshotPng, MissingNamedKey: false);
+
+        // Detail names a specific recording: insist on a hit so a typo'd key
+        // surfaces as a configuration error rather than silently comparing
+        // against the per-step recorded screenshot (which would be the wrong
+        // reference image for an assertion that explicitly named a different
+        // one).
+        if (_recordedScreenshots.TryGetValue(assertion.Detail, out var named))
+            return new ScreenshotResolution(named, MissingNamedKey: false);
+
+        return new ScreenshotResolution(Bytes: null, MissingNamedKey: true);
     }
 
-    private static bool ScreenshotsEqual(byte[] a, byte[] b)
-    {
-        if (a.Length != b.Length) return false;
-        return a.AsSpan().SequenceEqual(b);
-    }
+    private readonly record struct ScreenshotResolution(byte[]? Bytes, bool MissingNamedKey);
 }

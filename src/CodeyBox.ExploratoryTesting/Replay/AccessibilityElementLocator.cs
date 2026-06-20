@@ -6,18 +6,20 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// Default <see cref="IElementLocator"/>. Recognition strategy:
 ///
 /// <list type="number">
-///   <item>If the descriptor has accessibility role/name, probe at the recorded
-///   centre with <see cref="ISandbox.GetAccessibilityAtPointAsync"/>. On a
-///   role/name match, return a high-confidence hit at the recorded centre.</item>
+///   <item>If the descriptor carries at least one non-empty accessibility
+///   field (role, name, text, or element-type), probe at the recorded centre
+///   with <see cref="ISandbox.GetAccessibilityAtPointAsync"/>. On a match,
+///   return a high-confidence hit at the recorded centre.</item>
 ///   <item>If the point probe misses, scan outward in concentric square rings
-///   at <see cref="ReplayOptions.SpiralSearchStep"/>-pixel granularity up to
-///   <see cref="ReplayOptions.SpiralSearchRadius"/> — every step-aligned cell
+///   at <see cref="ReplayOptions.RingSearchStep"/>-pixel granularity up to
+///   <see cref="ReplayOptions.RingSearchRadius"/> — every step-aligned cell
 ///   in each ring is probed, not just the corners — returning the first
 ///   accessibility match.</item>
-///   <item>If the descriptor has no accessibility signal, return null —
-///   the brief forbids trusting raw recorded coordinates. Once visual-
-///   template / OCR fallback locators land they will plug in via additional
-///   <see cref="IElementLocator"/> implementations chained behind this one.</item>
+///   <item>If the descriptor has no accessibility signal (or all
+///   accessibility fields are null/empty), return null. Non-accessibility
+///   recognition is the responsibility of a sibling locator chained behind
+///   this one via <see cref="CompositeElementLocator"/> (the default engine
+///   wiring includes <see cref="VisualSignatureElementLocator"/>).</item>
 /// </list>
 ///
 /// <para>The recorded centre is the central anchor for the point probe; it
@@ -28,6 +30,11 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// </summary>
 public sealed class AccessibilityElementLocator : IElementLocator
 {
+    // Ring-hit confidence: lower than the centre-hit's 1.0 because nearby
+    // matches reflect a small layout nudge, not the exact recorded geometry.
+    // Surfaced for diagnostics only — the engine does not gate on confidence.
+    internal const double RingHitConfidence = 0.85;
+
     public async Task<LocatedTarget?> LocateAsync(
         ISandbox sandbox,
         TraceTargetDescriptor descriptor,
@@ -39,12 +46,14 @@ public sealed class AccessibilityElementLocator : IElementLocator
         ArgumentNullException.ThrowIfNull(options);
 
         var expected = descriptor.Accessibility;
-        // Strict policy: with no accessibility signature on the descriptor,
-        // the brief forbids us from trusting the recorded raw coordinates.
-        // Surfaces NotFound so a canvas/3D/untagged target without a visual-
-        // template locator wired in fails deterministically instead of
-        // silently driving input at a stale pixel.
+        // Strict policy: with no usable accessibility signature, leave it for
+        // the chained non-accessibility locator (e.g.
+        // VisualSignatureElementLocator) to handle. An all-null descriptor
+        // would silently match any element returned at the recorded centre
+        // (StringMatches treats null/empty as 'matches anything'), which is a
+        // false-positive failure class the brief explicitly calls out.
         if (expected is null) return null;
+        if (!HasAnyAccessibilitySignal(expected)) return null;
 
         var region = descriptor.Visual.Region;
         var hasPoint = region.Width > 0 && region.Height > 0;
@@ -71,11 +80,11 @@ public sealed class AccessibilityElementLocator : IElementLocator
             };
         }
 
-        for (var radius = options.SpiralSearchStep;
-             radius <= options.SpiralSearchRadius;
-             radius += options.SpiralSearchStep)
+        for (var radius = options.RingSearchStep;
+             radius <= options.RingSearchRadius;
+             radius += options.RingSearchStep)
         {
-            foreach (var (dx, dy) in SquareRingOffsets(radius, options.SpiralSearchStep))
+            foreach (var (dx, dy) in SquareRingOffsets(radius, options.RingSearchStep))
             {
                 ct.ThrowIfCancellationRequested();
                 var px = cx + dx;
@@ -89,8 +98,8 @@ public sealed class AccessibilityElementLocator : IElementLocator
                         CenterX = px,
                         CenterY = py,
                         Region = region,
-                        Source = "accessibility-spiral",
-                        Confidence = 0.85,
+                        Source = "accessibility-ring",
+                        Confidence = RingHitConfidence,
                     };
                 }
             }
@@ -133,12 +142,19 @@ public sealed class AccessibilityElementLocator : IElementLocator
 
     internal static bool Matches(SandboxAccessibilitySnapshot snap, TraceAccessibilityDescriptor expected)
     {
+        if (!HasAnyAccessibilitySignal(expected)) return false;
         if (!StringMatches(snap.Role, expected.Role)) return false;
         if (!StringMatches(snap.Name, expected.Name)) return false;
         if (!StringMatches(snap.Text, expected.Text)) return false;
         if (!StringMatches(snap.ElementType, expected.ElementType)) return false;
         return true;
     }
+
+    internal static bool HasAnyAccessibilitySignal(TraceAccessibilityDescriptor expected) =>
+        !string.IsNullOrEmpty(expected.Role)
+        || !string.IsNullOrEmpty(expected.Name)
+        || !string.IsNullOrEmpty(expected.Text)
+        || !string.IsNullOrEmpty(expected.ElementType);
 
     private static bool StringMatches(string? actual, string? expected)
     {
@@ -147,9 +163,9 @@ public sealed class AccessibilityElementLocator : IElementLocator
     }
 
     // Yields every (dx, dy) on the square ring at max(|dx|, |dy|) == radius,
-    // stepping by `step`. Not a true spiral — concentric square rings — but
-    // far denser than the previous 8-corner sample (~3R/step cells per ring),
-    // so a small layout nudge that misses the centre point still gets probed.
+    // stepping by `step`. Probes every step-aligned cell in the ring (not
+    // only the corners), so a small layout nudge that misses the centre
+    // point still gets sampled within the configured radius.
     private static IEnumerable<(int Dx, int Dy)> SquareRingOffsets(int radius, int step)
     {
         if (radius <= 0) yield break;

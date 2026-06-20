@@ -4,11 +4,13 @@ using CodeyBox.Sandbox.Graphical;
 namespace CodeyBox.ExploratoryTesting.Replay;
 
 /// <summary>
-/// Default <see cref="IReachabilityChecker"/>.
+/// Default <see cref="IReachabilityChecker"/>. Implements the three
+/// reachability dimensions the brief calls out — in-viewport, visible, and
+/// top-most.
 ///
 /// <list type="bullet">
 ///   <item><b>Viewport</b>: target's centre must lie inside
-///   <c>(0, ScreenWidth) × (0, ScreenHeight)</c>. When it doesn't, we issue
+///   <c>[0, ScreenWidth) × [0, ScreenHeight)</c>. When it doesn't, we issue
 ///   real scroll events through <see cref="ComputerUseBridge"/> and then
 ///   <b>re-locate via the locator</b> — never by arithmetic on stale
 ///   coordinates, because the recorder's "scroll units" do not have a stable
@@ -16,10 +18,22 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 ///   scroll; vertical-only triggers a vertical scroll. After
 ///   <see cref="ReplayOptions.MaxScrollAttempts"/>, report
 ///   <see cref="ReachabilityStatus.OffScreen"/>.</item>
-///   <item><b>Top-most</b>: when the descriptor carries an accessibility
-///   signature, probe <see cref="ISandbox.GetAccessibilityAtPointAsync"/>
-///   at the centre. If a different element answers, report
-///   <see cref="ReachabilityStatus.Occluded"/>.</item>
+///   <item><b>Visible</b>: an accessibility-tagged descriptor that no longer
+///   answers at the located centre is reported as
+///   <see cref="ReachabilityStatus.Occluded"/> — display:none, opacity:0,
+///   and other invisibility classes drop the element out of the
+///   accessibility tree, so a null probe is equivalent to "user can't see
+///   it." A non-accessibility descriptor's visibility is implicit in its
+///   locator hit: the only shipped non-accessibility locator
+///   (<see cref="VisualSignatureElementLocator"/>) only returns when the
+///   current screen matches the recorded screen pixel-for-pixel, which
+///   carries its own visibility guarantee.</item>
+///   <item><b>Top-most</b>: when the descriptor carries a usable
+///   accessibility signature, probe
+///   <see cref="ISandbox.GetAccessibilityAtPointAsync"/> at the centre and
+///   compare against the recorded descriptor via
+///   <see cref="IAccessibilityMatcher"/>. If a different element answers,
+///   report <see cref="ReachabilityStatus.Occluded"/>.</item>
 ///   <item>Otherwise, <see cref="ReachabilityStatus.Reachable"/>.</item>
 /// </list>
 /// </summary>
@@ -27,11 +41,16 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 {
     private readonly ComputerUseBridge _bridge;
     private readonly IElementLocator _locator;
+    private readonly IAccessibilityMatcher _matcher;
 
-    public ReachabilityChecker(ComputerUseBridge bridge, IElementLocator? locator = null)
+    public ReachabilityChecker(
+        ComputerUseBridge bridge,
+        IElementLocator? locator = null,
+        IAccessibilityMatcher? matcher = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _locator = locator ?? new AccessibilityElementLocator();
+        _matcher = matcher ?? DefaultAccessibilityMatcher.Instance;
     }
 
     public async Task<ReachabilityOutcome> EnsureReachableAsync(
@@ -83,9 +102,10 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         }
 
         var expectedAccessibility = descriptor.Accessibility;
-        if (expectedAccessibility is not null)
+        if (expectedAccessibility is not null && AccessibilityElementLocator.HasAnyAccessibilitySignal(expectedAccessibility))
         {
             SandboxAccessibilitySnapshot? snap;
+            var probeFailed = false;
             try
             {
                 snap = await sandbox.GetAccessibilityAtPointAsync(current.CenterX, current.CenterY, ct)
@@ -97,10 +117,34 @@ public sealed class ReachabilityChecker : IReachabilityChecker
             }
             catch (Exception)
             {
+                // A transient accessibility-probe failure cannot be
+                // distinguished from "no element here". Fall through to
+                // Reachable so a flaky IPC blip does not falsely report
+                // Occluded; the input dispatch that follows will surface a
+                // real failure if the element is genuinely gone.
                 snap = null;
+                probeFailed = true;
             }
 
-            if (snap is not null && !AccessibilityElementLocator.Matches(snap, expectedAccessibility))
+            if (snap is null && !probeFailed)
+            {
+                // No element answers at the located centre even though the
+                // recorded descriptor had a clear accessibility signature.
+                // Display:none / opacity:0 / removed-from-DOM all drop a
+                // node out of the accessibility tree, so this is the
+                // "visible" leg of the reachability check: a vanished
+                // target is not user-reachable. Report as Occluded —
+                // categorically a "the element the recording trusted is no
+                // longer here at click time" failure class.
+                return new ReachabilityOutcome
+                {
+                    Status = ReachabilityStatus.Occluded,
+                    Target = current,
+                    Diagnostic = $"expected element ({Describe(expectedAccessibility)}) is no longer visible at ({current.CenterX},{current.CenterY}) — display:none / opacity:0 / removed-from-tree",
+                };
+            }
+
+            if (snap is not null && !_matcher.Matches(snap, expectedAccessibility))
             {
                 return new ReachabilityOutcome
                 {
@@ -126,9 +170,13 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         if (t.CenterY >= o.ScreenHeight) return (0, o.ScrollStep);
         if (t.CenterX < 0) return (-o.ScrollStep, 0);
         if (t.CenterX >= o.ScreenWidth) return (o.ScrollStep, 0);
-        // In-viewport on both axes — shouldn't be called in this case, but if
-        // it is, treat as "no useful scroll" and let the caller exhaust attempts.
-        return (0, 0);
+        // The caller gates this call on !InViewport, so a both-axes-in-bounds
+        // target is a logic error. Throw rather than emit a (0, 0) scroll —
+        // the bridge would reject it with "Scroll events require a non-zero
+        // X or Y amount" and that diagnostic would be reported against the
+        // wrong layer.
+        throw new InvalidOperationException(
+            $"ResolveScrollDelta invoked for in-viewport target ({t.CenterX},{t.CenterY}).");
     }
 
     private static string Describe(SandboxAccessibilitySnapshot s) =>
