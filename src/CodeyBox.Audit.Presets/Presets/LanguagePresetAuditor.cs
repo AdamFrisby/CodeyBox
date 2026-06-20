@@ -2,13 +2,7 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Presets.Presets;
 
-internal interface ILanguagePresetCommandSource
-{
-    string Language { get; }
-    string MarkerScript { get; }
-}
-
-internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvider, ILanguagePresetCommandSource
+internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvider, IAuditorLanguageContext
 {
     private const int MaxRawOutputChars = 1_000_000;
 

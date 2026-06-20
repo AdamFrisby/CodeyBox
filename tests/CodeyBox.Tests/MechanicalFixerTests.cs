@@ -560,11 +560,21 @@ public sealed class MechanicalFixerTests : IDisposable
         Assert.Empty(provider.BuildInputs(
             [new NamedAuditor("csharp:format-check")]));
         Assert.Empty(provider.BuildInputs(
-            [new NamedShellAuditor("csharp:format-check", ["dotnet", "format", "--verify-no-changes"])]));
-        Assert.Empty(provider.BuildInputs(
             [CreateLanguagePresetAuditor("python", new NamedShellAuditor("csharp:format-check", ["dotnet", "format", "--verify-no-changes"]))]));
         Assert.Empty(provider.BuildInputs(
             [CreateLanguagePresetAuditor("csharp", new NamedAuditor("csharp:format-check"))]));
+    }
+
+    [Fact]
+    public void DotnetFormatInputProvider_AcceptsCustomCsharpFormatCheckShellAuditorWithDefaultMarker()
+    {
+        var provider = new DotnetFormatMechanicalFixerInputProvider();
+
+        var inputs = provider.BuildInputs(
+            [new NamedShellAuditor("csharp:format-check", ["dotnet", "format", "--verify-no-changes"])]);
+        var input = Assert.IsType<DotnetFormatMechanicalFixerInput>(Assert.Single(inputs));
+        Assert.Equal(["dotnet", "format", "--verify-no-changes"], input.FormatCheckArgv);
+        Assert.Equal(DotnetFormatMechanicalFixerInputProvider.DefaultCsharpMarkerScript, input.ProjectMarkerScript);
     }
 
     [Fact]

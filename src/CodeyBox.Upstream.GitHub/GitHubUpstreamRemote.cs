@@ -866,11 +866,36 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
     private static IEnumerable<string> ExtractCommitMessageParagraphs(string message)
     {
+        if (HasMechanicalFixerTrailer(message))
+            yield break;
+
         foreach (var paragraph in ExtractCleanParagraphs(message, stopAtPrFooter: false))
         {
             if (!IsPureIterationNoise(paragraph))
                 yield return paragraph;
         }
+    }
+
+    /// <summary>
+    /// True when the commit body carries the <see cref="CodeyBoxTrailers.MechanicalFixerTrailerKey"/>
+    /// trailer. Mechanical-fixer commits should be treated as iteration
+    /// noise regardless of their subject line, so a future fixer with a
+    /// different <c>CommitSubject</c> still drops out of the squashed PR
+    /// body.
+    /// </summary>
+    private static bool HasMechanicalFixerTrailer(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        foreach (var rawLine in message.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
+        {
+            var trimmed = rawLine.Trim();
+            if (trimmed.StartsWith(CodeyBoxTrailers.MechanicalFixerTrailerKey + ":", StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
     }
 
     private static string CleanProseForCommitMessage(string? text)
@@ -1057,9 +1082,6 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             return true;
         if (lower.StartsWith("merge branch ", StringComparison.Ordinal)) return true;
         if (lower.StartsWith("merge main", StringComparison.Ordinal)) return true;
-        if (lower is "chore: normalize (dotnet format)" or "chore: normalize mechanical edits" or
-            "normalize (dotnet format)" or "normalize mechanical edits")
-            return true;
         if (lower.Contains("merge conflict", StringComparison.Ordinal) &&
             (lower.StartsWith("chore:", StringComparison.Ordinal) ||
              lower.StartsWith("fix:", StringComparison.Ordinal) ||
