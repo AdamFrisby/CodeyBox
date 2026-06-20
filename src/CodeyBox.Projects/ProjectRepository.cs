@@ -448,6 +448,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var mergedFrameTemplate = project?.LlmPromptFrameTemplate ?? defaults?.LlmPromptFrameTemplate;
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
         var mergedExcludedAuditors = project?.ExcludedAuditors ?? defaults?.ExcludedAuditors ?? [];
+        var mergedMechanicalFixers = ResolveMechanicalFixers(project, defaults, mergedLanguages);
 
         // Stuck-probe config. null in config = -1 (inherit from PipelineOptions global).
         // 0 = explicitly disabled for this project. >0 = explicit threshold.
@@ -493,6 +494,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             LlmPromptFrameTemplate = mergedFrameTemplate,
             Custom = mergedCustom,
             ExcludedAuditors = mergedExcludedAuditors,
+            MechanicalFixers = mergedMechanicalFixers,
             AuditAgent = mergedAuditAgent,
             PerAuditorAgent = mergedPerAuditorAgent,
             MaxLlmAuditorParallelism = mergedMaxLlmPar,
@@ -504,18 +506,32 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         ProjectAuditConfig? defaults,
         ProjectAudit baseAudit)
     {
-        var profiles = AuditProfilePresets.CreateBuiltIns()
-            .ToDictionary(
-                kvp => kvp.Key,
-                kvp => InheritGlobalProfilePolicy(kvp.Value, baseAudit),
-                StringComparer.OrdinalIgnoreCase);
+        var baseMechanicalFixersConfigured = project?.MechanicalFixers is not null || defaults?.MechanicalFixers is not null;
+        var profilePreservesMechanicalFixers = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var profiles = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, profile) in AuditProfilePresets.CreateBuiltIns())
+        {
+            var profileMechanicalFixersConfigured = profile.MechanicalFixers.Count > 0;
+            profiles[name] = InheritGlobalProfilePolicy(
+                profile,
+                baseAudit,
+                baseMechanicalFixersConfigured: baseMechanicalFixersConfigured);
+            profilePreservesMechanicalFixers[name] =
+                baseMechanicalFixersConfigured || profileMechanicalFixersConfigured;
+        }
 
         if (defaults?.Profiles is not null)
         {
             foreach (var (name, config) in defaults.Profiles)
             {
                 var fallback = profiles.TryGetValue(name, out var existing) ? existing : baseAudit;
-                profiles[name] = ResolveAuditProfileBundle(config, fallback, name);
+                var preserveFallbackFixers = profilePreservesMechanicalFixers.TryGetValue(name, out var preserve)
+                    ? preserve
+                    : baseMechanicalFixersConfigured;
+                profiles[name] = ResolveAuditProfileBundle(config, fallback, name, preserveFallbackFixers);
+                profilePreservesMechanicalFixers[name] =
+                    config.MechanicalFixers is not null ||
+                    preserveFallbackFixers;
             }
         }
 
@@ -524,26 +540,49 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             foreach (var (name, config) in project.Profiles)
             {
                 var fallback = profiles.TryGetValue(name, out var existing) ? existing : baseAudit;
-                profiles[name] = ResolveAuditProfileBundle(config, fallback, name);
+                var preserveFallbackFixers = profilePreservesMechanicalFixers.TryGetValue(name, out var preserve)
+                    ? preserve
+                    : baseMechanicalFixersConfigured;
+                profiles[name] = ResolveAuditProfileBundle(config, fallback, name, preserveFallbackFixers);
+                profilePreservesMechanicalFixers[name] =
+                    config.MechanicalFixers is not null ||
+                    preserveFallbackFixers;
             }
         }
 
         return profiles;
     }
 
-    private ProjectAudit ResolveAuditProfileBundle(ProjectAuditConfig config, ProjectAudit fallback, string profileName)
+    private ProjectAudit ResolveAuditProfileBundle(
+        ProjectAuditConfig config,
+        ProjectAudit fallback,
+        string profileName,
+        bool preserveFallbackMechanicalFixers)
     {
-        var resolved = ResolveAuditBundle(config, ProjectAuditToConfig(fallback), profileName);
+        var resolved = ResolveAuditBundle(
+            config,
+            ProjectAuditToConfig(fallback, preserveFallbackMechanicalFixers),
+            profileName);
         return resolved with { Profile = profileName };
     }
 
-    private static ProjectAudit InheritGlobalProfilePolicy(ProjectAudit profile, ProjectAudit fallback)
+    private static ProjectAudit InheritGlobalProfilePolicy(
+        ProjectAudit profile,
+        ProjectAudit fallback,
+        bool baseMechanicalFixersConfigured)
         => profile with
         {
             BuildScriptRequired = fallback.BuildScriptRequired,
+            MechanicalFixers = profile.MechanicalFixers.Count > 0
+                ? profile.MechanicalFixers
+                : baseMechanicalFixersConfigured
+                    ? fallback.MechanicalFixers
+                    : ResolveMechanicalFixers(project: null, defaults: null, profile.Languages),
         };
 
-    private static ProjectAuditConfig ProjectAuditToConfig(ProjectAudit audit)
+    private static ProjectAuditConfig ProjectAuditToConfig(
+        ProjectAudit audit,
+        bool preserveMechanicalFixers)
         => new()
         {
             Profile = audit.Profile,
@@ -590,6 +629,9 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             LlmPromptFrameTemplate = audit.LlmPromptFrameTemplate,
             Custom = audit.Custom.Select(CustomAuditorToConfig).ToList(),
             ExcludedAuditors = [.. audit.ExcludedAuditors],
+            MechanicalFixers = preserveMechanicalFixers
+                ? [.. audit.MechanicalFixers]
+                : null,
             AuditAgent = audit.AuditAgent?.Value,
             PerAuditorAgent = audit.PerAuditorAgent.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Value),
             MaxLlmAuditorParallelism = audit.MaxLlmAuditorParallelism,
@@ -625,6 +667,33 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 Severity = p.Severity,
             }).ToList(),
         };
+
+    private static IReadOnlyList<string> ResolveMechanicalFixers(
+        ProjectAuditConfig? project,
+        ProjectAuditConfig? defaults,
+        IReadOnlyList<string> languages)
+    {
+        if (project?.MechanicalFixers is not null)
+            return FilterConfiguredNames(project.MechanicalFixers);
+        if (defaults?.MechanicalFixers is not null)
+            return FilterConfiguredNames(defaults.MechanicalFixers);
+
+        return languages.Contains("csharp", StringComparer.OrdinalIgnoreCase)
+            ? [MechanicalFixerNames.DotnetFormat]
+            : [];
+    }
+
+    private static IReadOnlyList<string> FilterConfiguredNames(IEnumerable<string> names)
+    {
+        var filtered = new List<string>();
+        foreach (var name in names)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+            filtered.Add(name.Trim());
+        }
+        return filtered;
+    }
 
     private static IReadOnlyDictionary<string, int> MergeComplexityIterationBudgets(
         Dictionary<string, int>? defaults,

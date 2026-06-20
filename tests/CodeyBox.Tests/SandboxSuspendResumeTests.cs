@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
@@ -1091,6 +1092,110 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
 
         await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(5));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupResume_BackgroundResume_WithHostLifetimeWaitsForApplicationStarted()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-after-listener",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider();
+        var barrier = new StartupRecoveryBarrier();
+        var lifetime = new ControllableHostApplicationLifetime();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            applicationLifetime: lifetime);
+
+        await svc.StartAsync(CancellationToken.None);
+        await Task.Delay(TimeSpan.FromMilliseconds(50));
+
+        Assert.Empty(provider.ResumedNames);
+        Assert.False(barrier.RecoveryInputReady.IsCompleted);
+
+        lifetime.MarkStarted();
+
+        await WaitUntilAsync(() => provider.ResumedNames.Contains("vm-after-listener"));
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupResume_StopBeforeApplicationStarted_DisposesDelayedResumeRegistration()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-start-never-fired",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider();
+        var barrier = new StartupRecoveryBarrier();
+        var lifetime = new ControllableHostApplicationLifetime();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            applicationLifetime: lifetime);
+
+        await svc.StartAsync(CancellationToken.None);
+        await svc.StopAsync(CancellationToken.None);
+
+        lifetime.MarkStarted();
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+        Assert.Empty(provider.ResumedNames);
+        Assert.False(barrier.RecoveryInputReady.IsCompleted);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-start-never-fired", after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_CanceledStartupTokenBeforeApplicationStarted_ReturnsCanceledTaskAndDoesNotRegister()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-canceled-before-started",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider();
+        var barrier = new StartupRecoveryBarrier();
+        var lifetime = new ControllableHostApplicationLifetime();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            applicationLifetime: lifetime);
+
+        using var startupCts = new CancellationTokenSource();
+        startupCts.Cancel();
+
+        var startTask = svc.StartAsync(startupCts.Token);
+
+        Assert.True(startTask.IsCanceled);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => startTask);
+
+        lifetime.MarkStarted();
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+        Assert.Empty(provider.ResumedNames);
+        Assert.False(barrier.RecoveryInputReady.IsCompleted);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-canceled-before-started", after!.SuspendedVmName);
+
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -2267,6 +2372,20 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         private NoopStartupRecoveryInputSink() { }
 
         public void MarkRecoveryInputReady() { }
+    }
+
+    private sealed class ControllableHostApplicationLifetime : IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource _started = new();
+        private readonly CancellationTokenSource _stopping = new();
+        private readonly CancellationTokenSource _stopped = new();
+
+        public CancellationToken ApplicationStarted => _started.Token;
+        public CancellationToken ApplicationStopping => _stopping.Token;
+        public CancellationToken ApplicationStopped => _stopped.Token;
+
+        public void MarkStarted() => _started.Cancel();
+        public void StopApplication() => _stopping.Cancel();
     }
 
     private sealed class RecordingInfrastructureDeferralScheduler : IInfrastructureDeferralScheduler

@@ -152,6 +152,7 @@ See `docs/audit-types.md` for prompt schemas and precedence.
   "MaxLlmAuditorParallelism": 3,
   "Languages": ["python", "node"],
   "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"],
+  "MechanicalFixers": ["dotnet-format"],
   "Profiles": {
     "uat": {
       "MaxIterations": 5,
@@ -177,6 +178,12 @@ The orchestrator's effective auditor list for each project is:
 Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 ```
 
+Mechanical fixers are composed separately from auditors. They run after work
+and after each rework, before the next audit iteration. A fixer may mutate the
+work tree, but it does not call an LLM and does not consume an audit iteration.
+When it changes files, CodeyBox commits the delta as a mechanical commit with
+normal prompt-revision trailers before auditors inspect the tree.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `Profile` | string | `"default"` | Project-default named audit profile. `"default"` uses the top-level `Audit` fields. |
@@ -186,6 +193,7 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 | `PerIterationTimeoutMinutes` | int | `10` | Wall-clock cap on a single audit iteration's sandbox |
 | `StopOnFirstFailure` | bool | `false` | Stop running auditors as soon as one returns a blocking finding — useful when cheap linters precede expensive LLM auditors |
 | `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors one item may try to run concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time, subject to the process-wide `CodeyBox:WorkerPool:MaxConcurrentSandboxes` ceiling. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
+| `MechanicalFixers` | string[] | derived from `Languages` | Deterministic no-model normalizers to run before audit. Omit to inherit or derive defaults; `["dotnet-format"]` is derived when C# language audit is enabled. Set `[]` to disable. |
 
 Declared short-circuit gates are controlled globally with
 `CodeyBox:PipelineTuning:AuditShortCircuitEnabled` (default `true`,
@@ -231,6 +239,13 @@ LLM panel because the configured build/test evidence was not verified.
 All language presets are tool-only (no agent credentials). A buggy linter
 cannot exfiltrate the agent's API key — the audit phase runs them in a
 credential-free sandbox.
+
+For C# projects, the built-in `dotnet-format` mechanical fixer reuses the
+active `csharp:format-check` auditor command, removing only read-only flags
+such as `--verify-no-changes`. This keeps the fixer on the same SDK, config,
+working-directory discovery, and sandbox baseline as the auditor, so
+`csharp:format-check` becomes a defense-in-depth assertion rather than a
+source of format-only rework loops.
 
 ### Audit types (built-in presets)
 

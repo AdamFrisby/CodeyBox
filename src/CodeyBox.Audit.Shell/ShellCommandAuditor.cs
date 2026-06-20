@@ -70,11 +70,9 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             WorkingDirectory = workingDirectory,
         }, ct);
 
-        var combinedOutput = string.IsNullOrWhiteSpace(result.Stderr)
-            ? result.Stdout
-            : result.Stdout + "\n" + result.Stderr;
+        var combinedOutput = CombinedOutput(result);
 
-        if (result.Success)
+        if (result.ExitCode == 0 && !result.ExecutionUnavailable)
             return new AuditResult(true, [], RawOutput: combinedOutput);
 
         var finding = BuildCommandFinding(result, toolName);
@@ -95,7 +93,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 
     private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName)
     {
-        var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+        var description = DescriptionOutput(result);
 
         // Exit 127 is only non-blocking when it is confirmed to be the
         // auditor's tool missing from the sandbox. Some tools, notably npm,
@@ -115,6 +113,20 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             Title: title,
             Description: description.TrimEnd());
     }
+
+    private static string CombinedOutput(SandboxExecResult result)
+    {
+        var stdout = result.Stdout;
+        var stderr = result.Stderr;
+        if (string.IsNullOrWhiteSpace(stderr))
+            return stdout;
+        if (string.IsNullOrWhiteSpace(stdout))
+            return stderr;
+        return stdout + "\n" + stderr;
+    }
+
+    private static string DescriptionOutput(SandboxExecResult result)
+        => string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
     private async Task<bool> IsDirectToolMissingAsync(
         ISandbox sandbox,

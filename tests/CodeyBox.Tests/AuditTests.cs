@@ -1,5 +1,6 @@
 using System.Text;
 using CodeyBox.Audit;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 
@@ -161,6 +162,246 @@ public sealed class AuditTests
         Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, result.Findings[0].Severity);
         Assert.Contains("lint error: bad", result.Findings[0].Description);
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_PassesUnboundedExecBudget()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "lint",
+            Argv = ["lint"],
+        });
+        SandboxExec? commandExec = null;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/lint\n", "");
+
+            commandExec = exec;
+            return new SandboxExecResult(0, "ok", "");
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(commandExec);
+        Assert.Null(commandExec!.MaxStdoutBytes);
+        Assert.Null(commandExec.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_FailsWhenExecutionUnavailableEvenWithZeroExit()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "lint",
+            Argv = ["lint"],
+        });
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/lint\n", "")
+                : new SandboxExecResult(
+                    0,
+                    "",
+                    "sandbox process launcher unavailable",
+                    ExecutionUnavailable: true));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("command exited 0: lint", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("sandbox process launcher unavailable", finding.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_FailureReportsDotnetFormatViolations()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string stderr = """
+            /work/src/App/Program.cs(4,12): error WHITESPACE: Fix whitespace formatting. Insert '\s'. [/work/src/App/App.csproj]
+            /work/src/App/Program.cs(8,1): error IDE0055: Fix formatting. [/work/src/App/App.csproj]
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format would change files", finding.Title);
+        Assert.Contains("Run `dotnet format`", finding.Description);
+        Assert.Contains("Program.cs(4,12)", finding.Description);
+        Assert.Contains("IDE0055", finding.Description);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_FailureReportsAnalyzerViolations()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string stderr = """
+            /work/src/App/Program.cs(12,18): error CA1822: Member does not access instance data and can be marked as static [/work/src/App/App.csproj]
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format would change files", finding.Title);
+        Assert.Contains("CA1822", finding.Description);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_TruncatesViolationLines()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var stderr = string.Join('\n', Enumerable.Range(1, 45)
+            .Select(i => $"/work/src/App/Program.cs({i},1): error WHITESPACE: Fix whitespace formatting. [/work/src/App/App.csproj]"));
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Contains("omitted after 40 lines", finding.Description);
+        Assert.Contains("Program.cs(40,1)", finding.Description);
+        Assert.DoesNotContain("Program.cs(41,1)", finding.Description);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_FailureWithoutViolationLinesStillClassifiesDotnetFormat()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", "format verification failed"));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format verification failed", finding.Title);
+        Assert.Contains("format verification failed", finding.Description);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_RunsDiagnosticFormatter()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        SandboxExec? formatExec = null;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsLanguageMarkerProbe(exec))
+                return new SandboxExecResult(0, ".\n", "");
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+
+            formatExec = exec;
+            return new SandboxExecResult(2, "", "format verification failed");
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.NotNull(formatExec);
+        Assert.Equal(["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"], formatExec!.Argv);
+    }
+
+    [Fact]
+    public async Task CSharpFormatCheck_CompilerErrorsAreReportedAsCommandFailureNotFormattingChanges()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == "csharp:format-check");
+        const string stderr = """
+            /work/src/Program.cs(7,13): error CS0103: The name 'missing' does not exist in the current context [/work/src/App.csproj]
+            Build FAILED.
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsLanguageMarkerProbe(exec)
+                ? new SandboxExecResult(0, ".\n", "")
+                : IsToolProbe(exec)
+                    ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                    : new SandboxExecResult(2, "", stderr));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("dotnet format command failed", finding.Title);
+        Assert.Contains("CS0103", finding.Description);
+        Assert.DoesNotContain("Run `dotnet format`", finding.Description);
+    }
+
+    [Fact]
+    public void DotnetFormatCommandResultClassifier_IgnoresNonVerifyCommands()
+    {
+        var classifier = new DotnetFormatCommandResultClassifier();
+        var commandFinding = new AuditFinding(
+            "custom:shell",
+            AuditSeverity.Error,
+            "command exited 1",
+            "failed");
+
+        var result = classifier.ClassifyFailedCommand(new ShellCommandResultContext(
+            "custom:shell",
+            ["dotnet", "build"],
+            new SandboxExecResult(1, "", "build failed"),
+            "build failed",
+            commandFinding));
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void DotnetFormatCommandResultClassifier_IgnoresDotnetFormatWithoutVerifyNoChanges()
+    {
+        var classifier = new DotnetFormatCommandResultClassifier();
+        var commandFinding = new AuditFinding(
+            "custom:shell",
+            AuditSeverity.Error,
+            "command exited 2",
+            "failed");
+        const string output = "/work/Program.cs(1,1): error WHITESPACE: Fix whitespace formatting. [/work/App.csproj]";
+
+        var result = classifier.ClassifyFailedCommand(new ShellCommandResultContext(
+            "custom:shell",
+            ["dotnet", "format", "--verbosity", "diagnostic"],
+            new SandboxExecResult(2, "", output),
+            output,
+            commandFinding));
+
+        Assert.Null(result);
     }
 
     [Fact]
@@ -582,6 +823,12 @@ public sealed class AuditTests
         exec.Argv[0] == "sh" &&
         exec.Argv[1] == "-c" &&
         exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
+
+    private static bool IsLanguageMarkerProbe(SandboxExec exec) =>
+        exec.Argv.Count >= 3 &&
+        exec.Argv[0] == "sh" &&
+        exec.Argv[1] == "-c" &&
+        !exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private static string BuildRepeatedDotnetFailureOutput(int count)
     {

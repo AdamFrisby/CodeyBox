@@ -1,6 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <InternalsVisibleTo Include="CodeyBox.Tests" />
     <PackageReference Include="JsonSchema.Net" Version="9.2.0" />
     <ProjectReference Include="..\CodeyBox.Audit\CodeyBox.Audit.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />

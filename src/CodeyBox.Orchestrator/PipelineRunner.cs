@@ -35,7 +35,7 @@ namespace CodeyBox.Orchestrator;
 /// deterministic scope fence shows the resolver changed conflicted hunks
 /// and the configured buffer.
 /// </summary>
-public sealed class PipelineRunner : IPipelineRunner
+public sealed partial class PipelineRunner : IPipelineRunner
 {
     private const int AuditEscalationHistoryLimit = 25;
     private const int AuditEscalationFindingsPerIterationLimit = 20;
@@ -53,6 +53,8 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IProjectRepository _projects;
     private readonly IUpstreamRemoteFactory _upstreamFactory;
     private readonly ProjectAuditorComposer _auditorComposer;
+    private readonly ProjectMechanicalFixerComposer _mechanicalFixerComposer;
+    private readonly IReadOnlyList<IMechanicalFixerInputProvider> _mechanicalFixerInputProviders;
     private readonly IWorkItemStore _store;
     private readonly IWebhookDispatcher _webhooks;
     private readonly IWorkItemTerminalTransition _terminalTransitions;
@@ -275,7 +277,9 @@ public sealed class PipelineRunner : IPipelineRunner
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null,
         CancellationRegistry? cancellationRegistry = null,
         IWorkItemTerminalTransition? terminalTransitions = null,
-        IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null)
+        IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null,
+        ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
+        IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -285,6 +289,8 @@ public sealed class PipelineRunner : IPipelineRunner
         _projects = projects;
         _upstreamFactory = upstreamFactory;
         _auditorComposer = auditorComposer;
+        _mechanicalFixerComposer = mechanicalFixerComposer ?? ProjectMechanicalFixerComposer.FromFixers([]);
+        _mechanicalFixerInputProviders = mechanicalFixerInputProviders?.ToList() ?? [];
         _store = store;
         _webhooks = webhooks;
         _opts = opts;
@@ -805,10 +811,11 @@ public sealed class PipelineRunner : IPipelineRunner
         try
         {
             project = project with { Audit = ResolveAuditProfileForWorkItem(project, item) };
+            _mechanicalFixerComposer.Validate(project);
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Work item {Id} could not resolve audit profile for project {ProjectId}", item.Id, project.Id);
+            _log.LogError(ex, "Work item {Id} could not validate audit configuration for project {ProjectId}", item.Id, project.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "configuration");
             return;
         }
@@ -1183,7 +1190,14 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 requiredBuildApplies = await _requiredBuildGate.AppliesAsync(item.Id, project.Id, repoId, baseBranch, workBranch, ct);
             }
-            if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
+            // Mechanical fixers must run even when no auditors apply (and no
+            // required-build gate fires). The audit loop is the host for
+            // mechanical-edit, so a project that configures fixers without
+            // auditors still needs to enter it once to normalize the tree —
+            // the loop exits at iteration 1 because empty scheduled auditors
+            // produce zero findings and zero blocking findings.
+            var mechanicalFixersConfigured = project.Audit.MechanicalFixers.Count > 0;
+            if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies || mechanicalFixersConfigured))
             {
                 var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
@@ -1558,6 +1572,31 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             _log.LogWarning(ex, "Work item {Id} could not persist audit progress", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
+        catch (ProjectMechanicalFixerConfigurationException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} mechanical edit configuration is invalid", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "configuration");
+        }
+        catch (MechanicalFixerException ex)
+        {
+            // The mechanical-edit phase is infrastructure-level (sandbox
+            // clone / git plumbing / patch import) and is NOT a substitute
+            // for the audit gate — csharp:format-check still runs as a
+            // safety net. Park as a transient retry instead of failing the
+            // item terminally so an isolated infra hiccup (bare-repo
+            // contention, sandbox provisioning glitch, patch race) gets a
+            // bounded retry budget; if the budget exhausts the scheduler
+            // surfaces it as a real failure. ResumeStateForTransientRetry
+            // maps "mechanical-edit" → WorkComplete so the retry replays
+            // the same phase boundary the cancellation path uses.
+            _log.LogWarning(ex, "Work item {Id} mechanical edit phase failed; scheduling transient retry", item.Id);
+            await TransitionWaitingForTransientRetryAsync(
+                item,
+                ex.Message,
+                project,
+                phase: "mechanical-edit",
+                agent: null);
         }
         catch (TerminalQuotaError ex)
         {
@@ -5374,6 +5413,17 @@ public sealed class PipelineRunner : IPipelineRunner
             if (iteration > 1)
                 await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
 
+            await RunMechanicalFixersAsync(
+                item,
+                project,
+                repoId,
+                baseBranch,
+                workBranch,
+                auditors,
+                iteration,
+                ct,
+                hostShutdownToken);
+
             // Per-iteration audit phase scope. Disposed explicitly before the
             // rework scope (below) so codeybox.phase.duration_ms{phase=audit}
             // measures only the auditing work — not nested rework or later
@@ -5671,6 +5721,11 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         return false;
     }
+
+    // RunMechanicalFixersAsync and its helpers (MakeReadOnlyRepositoryMount,
+    // BuildMechanicalFixerInputs, ResolveMechanicalPromptRevisionForCommitAsync,
+    // ImportMechanicalCommitPatchAsync) live in PipelineRunner.MechanicalEdit.cs
+    // so the mechanical-edit phase is editable in isolation from this file.
 
     private async Task<bool> HandleExhaustedPersistedAuditHistoryAsync(
         WorkItem item,
@@ -13181,7 +13236,12 @@ Original merge-phase failure (for context):
     // audit-tier logs.
     private static async Task RunMasked(ISandbox sandbox, params string[] argv)
     {
-        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv });
+        await RunMasked(sandbox, CancellationToken.None, argv);
+    }
+
+    private static async Task RunMasked(ISandbox sandbox, CancellationToken ct, params string[] argv)
+    {
+        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
         if (!r.Success)
         {
             var masked = argv.Length > 0
@@ -13830,6 +13890,7 @@ Original merge-phase failure (for context):
         "work" => WorkItemState.Queued,
         "rework-resume" => WorkItemState.WorkComplete,
         "rework" => WorkItemState.WorkComplete,
+        "mechanical-edit" => WorkItemState.WorkComplete,
         "audit" => WorkItemState.WorkComplete,
         "merge" => WorkItemState.AuditPassed,
         "upstream" => WorkItemState.Merged,
@@ -14718,6 +14779,19 @@ internal sealed class SandboxPushReconcileConflictException : InvalidOperationEx
 
     public string Branch { get; }
     public string Strategy { get; }
+}
+
+internal sealed class MechanicalFixerException : InvalidOperationException
+{
+    public MechanicalFixerException(string message)
+        : base(message)
+    {
+    }
+
+    public MechanicalFixerException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
 }
 
 internal sealed record QuestionAskedDetails(

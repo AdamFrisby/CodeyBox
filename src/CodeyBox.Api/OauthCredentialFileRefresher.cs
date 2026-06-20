@@ -497,6 +497,7 @@ public sealed class GeminiOauthCredentialFileRefresher
                 var psi = new ProcessStartInfo
                 {
                     FileName = cliPath,
+                    WorkingDirectory = ResolveCliRefreshWorkingDirectory(),
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
@@ -504,17 +505,13 @@ public sealed class GeminiOauthCredentialFileRefresher
                 };
                 psi.ArgumentList.Add("-p");
                 psi.ArgumentList.Add(".");
-                psi.Environment.Clear();
-                foreach (var key in new[] { "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL" })
-                {
-                    var val = Environment.GetEnvironmentVariable(key);
-                    if (val is not null) psi.Environment[key] = val;
-                }
+                PopulateCliRefreshEnvironment(psi);
                 proc = Process.Start(psi);
                 if (proc is null) return false;
-                _ = proc.StandardOutput.ReadToEndAsync(CancellationToken.None);
-                _ = proc.StandardError.ReadToEndAsync(CancellationToken.None);
+                var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
+                var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
                 await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+                await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
                 return proc.ExitCode == 0;
             }
             catch (Exception ex) when (ex is OperationCanceledException or IOException
@@ -528,6 +525,43 @@ public sealed class GeminiOauthCredentialFileRefresher
                 proc?.Dispose();
             }
         };
+    }
+
+    internal static string ResolveCliRefreshPathValue(string? inheritedPath)
+    {
+        if (!string.IsNullOrWhiteSpace(inheritedPath))
+            return inheritedPath;
+
+        return OperatingSystem.IsWindows()
+            ? @"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
+            : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    }
+
+    private static string ResolveCliRefreshWorkingDirectory()
+    {
+        var home = Environment.GetEnvironmentVariable("HOME");
+        if (!string.IsNullOrWhiteSpace(home) && Directory.Exists(home))
+            return home;
+
+        var temp = Path.GetTempPath();
+        return Directory.Exists(temp) ? temp : Path.DirectorySeparatorChar.ToString();
+    }
+
+    private static void PopulateCliRefreshEnvironment(ProcessStartInfo psi)
+    {
+        psi.Environment.Clear();
+        foreach (var key in new[]
+                 {
+                     "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL",
+                     "SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP",
+                 })
+        {
+            var val = Environment.GetEnvironmentVariable(key);
+            if (val is not null) psi.Environment[key] = val;
+        }
+
+        psi.Environment["PATH"] = ResolveCliRefreshPathValue(
+            psi.Environment.TryGetValue("PATH", out var path) ? path : null);
     }
 
     internal static readonly TimeSpan WhichTimeout = TimeSpan.FromSeconds(5);

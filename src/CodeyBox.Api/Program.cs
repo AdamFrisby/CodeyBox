@@ -1666,6 +1666,9 @@ builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
+builder.Services.AddSingleton<IMechanicalFixer, DotnetFormatMechanicalFixer>();
+builder.Services.AddSingleton<IMechanicalFixerRegistry, MechanicalFixerRegistry>();
+builder.Services.AddSingleton<IMechanicalFixerInputProvider, DotnetFormatMechanicalFixerInputProvider>();
 
 // Mutation-testing rigor gate (disabled by default; per-project threshold).
 // The auditor short-circuits to pass when Enabled=false, so registering the
@@ -1703,6 +1706,7 @@ builder.Services.AddSingleton<IAuditor>(sp =>
 });
 
 builder.Services.AddSingleton<ProjectAuditorComposer>();
+builder.Services.AddSingleton<ProjectMechanicalFixerComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------
 // Registered as IDeepAuditor; ReleaseService resolves the subset configured per
@@ -2354,7 +2358,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
         : null,
     cancellationRegistry: sp.GetRequiredService<CancellationRegistry>(),
     terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>(),
-    terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>()));
+    terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>(),
+    mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
+    mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2590,10 +2596,11 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<WorkerPoolHealthWa
 // the unreliable RAM-snapshot path while preserving PipelineRunner's checkpoint
 // recovery path for active work.
 // The shutdown half is lifecycle-bound (StoppingAsync). Startup resume defaults
-// to background mode so a wedged multipassd cannot keep Kestrel offline;
-// OrchestratorService waits for startup recovery input before its dead-worker
-// startup recovery sweep. Blocking resume mode still runs through
-// IHostedLifecycleService.StartingAsync, so the host awaits it natively.
+// to background mode and starts after ApplicationStarted so a wedged multipassd
+// cannot keep Kestrel offline; OrchestratorService waits for startup recovery
+// input before its dead-worker startup recovery sweep. Blocking resume mode
+// still runs through IHostedLifecycleService.StartingAsync, so the host awaits
+// it natively.
 //
 // R8.1 (incident 2026-05-29): the shutdown teardown service is wired with the
 // orchestrator as an IShutdownDispatchGate so it pauses new dispatch BEFORE
@@ -2642,7 +2649,8 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
         };
     },
     sp.GetRequiredService<IStartupRecoveryInputSink>(),
-    sp.GetRequiredService<IInfrastructureDeferralScheduler>()));
+    sp.GetRequiredService<IInfrastructureDeferralScheduler>(),
+    sp.GetRequiredService<IHostApplicationLifetime>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the

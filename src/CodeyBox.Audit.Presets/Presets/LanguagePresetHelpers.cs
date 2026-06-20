@@ -60,6 +60,15 @@ internal static class LanguagePresetHelpers
         IReadOnlyList<string> argv)
     {
         if (string.Equals(language, "csharp", StringComparison.Ordinal)
+            && string.Equals(name, "csharp:format-check", StringComparison.Ordinal)
+            && argv.Count >= 2
+            && string.Equals(argv[0], "dotnet", StringComparison.Ordinal)
+            && string.Equals(argv[1], "format", StringComparison.Ordinal))
+        {
+            return new DotnetFormatCommandResultClassifier();
+        }
+
+        if (string.Equals(language, "csharp", StringComparison.Ordinal)
             && string.Equals(name, "csharp:test-pass", StringComparison.Ordinal)
             && argv.Count >= 2
             && string.Equals(argv[0], "dotnet", StringComparison.Ordinal)

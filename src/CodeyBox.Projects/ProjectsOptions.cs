@@ -175,6 +175,11 @@ public sealed class ProjectAuditConfig
     public string? LlmPromptFrameTemplate { get; set; }
     public List<CustomAuditorConfig>? Custom { get; set; }
     public List<string>? ExcludedAuditors { get; set; }
+    /// <summary>
+    /// Deterministic normalizers to run after work/rework and before audit.
+    /// Null = inherit or derive from languages; empty list = disabled.
+    /// </summary>
+    public List<string>? MechanicalFixers { get; set; }
 
     /// <summary>
     /// Agent used for LLM-based auditors. Null = use the project's primary agent.
@@ -256,6 +261,7 @@ public static class ProjectsOptionsBinder
 
         ApplyLanguageMap(auditSection, audit);
         ApplyAuditTypeMap(auditSection, audit);
+        ApplyMechanicalFixersList(auditSection, audit);
 
         var profileSections = auditSection.GetSection("Profiles").GetChildren().ToList();
         foreach (var profileSection in profileSections)
@@ -264,6 +270,19 @@ public static class ProjectsOptionsBinder
                 continue;
             ApplyAuditMaps(profileSection, profile);
         }
+    }
+
+    private static void ApplyMechanicalFixersList(IConfigurationSection auditSection, ProjectAuditConfig audit)
+    {
+        if (!auditSection.GetChildren().Any(c => string.Equals(c.Key, "MechanicalFixers", StringComparison.OrdinalIgnoreCase)))
+            return;
+
+        var fixersSection = auditSection.GetSection("MechanicalFixers");
+        var children = fixersSection.GetChildren().ToList();
+        audit.MechanicalFixers = children
+            .OrderBy(c => int.TryParse(c.Key, out var index) ? index : int.MaxValue)
+            .Select(c => c.Value ?? string.Empty)
+            .ToList();
     }
 
     private static void ApplyLanguageMap(IConfigurationSection auditSection, ProjectAuditConfig? audit)

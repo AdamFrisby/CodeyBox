@@ -21,7 +21,7 @@ namespace CodeyBox.Tests;
 /// calculator without a restart, and in-flight items already past the
 /// dispatch gate keep the snapshot they started on.
 /// </summary>
-[Collection("Session resume options")]
+[Collection("GlobalSerilog")]
 public sealed class AgentConfigHotReloadTests
 {
     private static readonly AgentKind Claude = AgentKind.Claude;

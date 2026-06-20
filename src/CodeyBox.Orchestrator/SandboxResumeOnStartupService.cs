@@ -29,8 +29,10 @@ public sealed record SandboxStartupResumeOptions
 ///
 /// <para>Implemented as <see cref="IHostedLifecycleService.StartingAsync"/>
 /// (sibling of <see cref="SandboxShutdownTeardownService.StoppingAsync"/>)
-/// only when configured for blocking mode. The default background mode starts
-/// the resume sweep from <see cref="StartAsync"/> and signals
+/// only when configured for blocking mode. In a full host, the default
+/// background mode arms the resume sweep from <see cref="StartAsync"/> but
+/// starts it after <see cref="IHostApplicationLifetime.ApplicationStarted"/>,
+/// then signals
 /// <see cref="IStartupRecoveryInputSink"/> when done, so the HTTP listener can
 /// bind while <see cref="OrchestratorService.ExecuteAsync"/> waits before its
 /// dead-worker startup sweep. Sequencing matters: the leak reaper sees a
@@ -99,9 +101,11 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
     private readonly IStartupRecoveryInputSink _startupRecovery;
     private readonly IInfrastructureDeferralScheduler? _infrastructureDeferrals;
+    private readonly IHostApplicationLifetime? _applicationLifetime;
     private readonly Lock _resumeStartGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
+    private CancellationTokenRegistration? _applicationStartedRegistration;
     private bool _resumeStarted;
 
     public SandboxResumeOnStartupService(
@@ -113,7 +117,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         TimeSpan? adoptionDeadline = null,
         TimeSpan? resumeTimeout = null,
         SandboxStartupResumeMode? mode = null,
-        IInfrastructureDeferralScheduler? infrastructureDeferrals = null)
+        IInfrastructureDeferralScheduler? infrastructureDeferrals = null,
+        IHostApplicationLifetime? applicationLifetime = null)
         : this(
             provider,
             store,
@@ -130,7 +135,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 Mode = mode ?? SandboxStartupResumeMode.Background,
             },
             recoveryInput,
-            infrastructureDeferrals)
+            infrastructureDeferrals,
+            applicationLifetime)
     {
     }
 
@@ -140,7 +146,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         ILogger<SandboxResumeOnStartupService> log,
         Func<SandboxStartupResumeOptions> optionsAccessor,
         IStartupRecoveryInputSink recoveryInput,
-        IInfrastructureDeferralScheduler? infrastructureDeferrals = null)
+        IInfrastructureDeferralScheduler? infrastructureDeferrals = null,
+        IHostApplicationLifetime? applicationLifetime = null)
     {
         ArgumentNullException.ThrowIfNull(recoveryInput);
         _provider = provider;
@@ -149,24 +156,34 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         _optionsAccessor = optionsAccessor;
         _startupRecovery = recoveryInput;
         _infrastructureDeferrals = infrastructureDeferrals;
+        _applicationLifetime = applicationLifetime;
     }
 
     public Task StartAsync(CancellationToken ct)
     {
         var mode = CurrentOptions().Mode;
         if (mode == SandboxStartupResumeMode.Background)
-            return StartResumeOnceAsync(background: true, ct);
+            return StartBackgroundResumeAsync(ct);
 
         // If configuration reloads from Background to Blocking between
         // StartingAsync and StartAsync, honor the latest value by running the
         // one-shot sweep here. The _resumeStartGate lock + _resumeStarted bool
         // in StartResumeOnceAsync keep the normal Blocking path from executing
         // twice.
-        return StartResumeOnceAsync(background: false, ct);
+        return StartResumeOnceAsync(background: false, inline: false, ct);
     }
 
-    public Task StopAsync(CancellationToken ct) =>
-        HostedLifecycleTask.StopAsync(
+    public async Task StopAsync(CancellationToken ct)
+    {
+        CancellationTokenRegistration? applicationStartedRegistration;
+        lock (_resumeStartGate)
+        {
+            applicationStartedRegistration = _applicationStartedRegistration;
+            _applicationStartedRegistration = null;
+        }
+        applicationStartedRegistration?.Dispose();
+
+        await HostedLifecycleTask.StopAsync(
             () =>
             {
                 lock (_resumeStartGate)
@@ -185,6 +202,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 }
             },
             ct);
+    }
 
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppingAsync(CancellationToken ct) => Task.CompletedTask;
@@ -196,7 +214,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         if (mode != SandboxStartupResumeMode.Blocking)
             return Task.CompletedTask;
 
-        return StartResumeOnceAsync(background: false, ct);
+        return StartResumeOnceAsync(background: false, inline: true, ct);
     }
 
     /// <summary>
@@ -205,7 +223,44 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     /// </summary>
     internal Task ResumeAllForTestAsync(CancellationToken ct) => ResumeAllAsync(ct);
 
-    private Task StartResumeOnceAsync(bool background, CancellationToken ct)
+    private Task StartBackgroundResumeAsync(CancellationToken ct)
+    {
+        if (_applicationLifetime is null
+            || _applicationLifetime.ApplicationStarted.IsCancellationRequested)
+        {
+            return StartResumeOnceAsync(background: true, inline: false, ct);
+        }
+
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled(ct);
+
+        lock (_resumeStartGate)
+        {
+            if (_resumeStarted)
+                return Task.CompletedTask;
+
+            _applicationStartedRegistration ??= _applicationLifetime.ApplicationStarted.Register(
+                static state =>
+                {
+                    ThreadPool.QueueUserWorkItem(
+                        static queuedState =>
+                        {
+                            var service = (SandboxResumeOnStartupService)queuedState!;
+                            _ = service.StartResumeOnceAsync(
+                                background: true,
+                                inline: false,
+                                CancellationToken.None);
+                        },
+                        state,
+                        preferLocal: false);
+                },
+                this);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task StartResumeOnceAsync(bool background, bool inline, CancellationToken ct)
     {
         lock (_resumeStartGate)
         {
@@ -224,7 +279,9 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 return Task.CompletedTask;
             }
 
-            _resumeTask = ResumeAllAndSignalAsync(ct);
+            _resumeTask = inline
+                ? ResumeAllAndSignalAsync(ct)
+                : RunLongRunningAsync(() => ResumeAllAndSignalAsync(ct));
             return _resumeTask;
         }
     }

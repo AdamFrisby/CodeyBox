@@ -148,6 +148,7 @@ public sealed class TransientCancellationRetryTests : IDisposable
     [InlineData("work", WorkItemState.Queued)]
     [InlineData("rework-resume", WorkItemState.WorkComplete)]
     [InlineData("rework", WorkItemState.WorkComplete)]
+    [InlineData("mechanical-edit", WorkItemState.WorkComplete)]
     [InlineData("audit", WorkItemState.WorkComplete)]
     [InlineData("merge", WorkItemState.AuditPassed)]
     [InlineData("upstream", WorkItemState.Merged)]

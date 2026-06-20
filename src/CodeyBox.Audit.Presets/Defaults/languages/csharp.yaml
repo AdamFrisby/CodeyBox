@@ -6,7 +6,7 @@ marker:
     find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o \( -name '*.csproj' -o -name '*.sln' -o -name '*.slnx' \) -exec dirname {} \; | sort -u
 auditors:
   - name: csharp:format-check
-    argv: ["dotnet", "format", "--verify-no-changes"]
+    argv: ["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"]
   - name: csharp:build-WaE
     canShortCircuitOnBlockingFinding: true
     argv: ["dotnet", "build", "--no-incremental", "/warnaserror"]

@@ -35,9 +35,11 @@ internal static class TestAssemblyInitializer
 
         SetIfMissing("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing("ASPNETCORE_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
+        SetIfMissing("DOTNET_USE_POLLING_FILE_WATCHER", "1");
         SetIfMissing(CredentialFileWatcherSettings.EnvironmentVariable, "false");
 
-        WarnOnLowInotifyLimits(Console.Error);
+        if (!UsePollingFileWatcher())
+            WarnOnLowInotifyLimits(Console.Error);
 
         TestFileSystemWatcherLeakTracker.Install();
 
@@ -52,6 +54,12 @@ internal static class TestAssemblyInitializer
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name)))
             Environment.SetEnvironmentVariable(name, value);
     }
+
+    private static bool UsePollingFileWatcher()
+        => string.Equals(
+            Environment.GetEnvironmentVariable("DOTNET_USE_POLLING_FILE_WATCHER"),
+            "1",
+            StringComparison.OrdinalIgnoreCase);
 
     internal static void WarnOnLowInotifyLimits(TextWriter writer)
     {

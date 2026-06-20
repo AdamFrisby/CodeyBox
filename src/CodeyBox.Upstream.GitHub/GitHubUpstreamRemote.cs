@@ -866,12 +866,65 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
     private static IEnumerable<string> ExtractCommitMessageParagraphs(string message)
     {
+        if (HasMechanicalFixerTrailer(message))
+            yield break;
+
         foreach (var paragraph in ExtractCleanParagraphs(message, stopAtPrFooter: false))
         {
             if (!IsPureIterationNoise(paragraph))
                 yield return paragraph;
         }
     }
+
+    /// <summary>
+    /// True when the commit message's RFC-5322 trailer block carries the
+    /// <see cref="CodeyBoxTrailers.MechanicalFixerTrailerKey"/> trailer.
+    /// Mechanical-fixer commits should be treated as iteration noise
+    /// regardless of their subject line, so a future fixer with a
+    /// different <c>CommitSubject</c> still drops out of the squashed PR
+    /// body. The match is intentionally scoped to the last paragraph and
+    /// requires every non-empty line in that paragraph to look like a
+    /// trailer (<c>Token: value</c>, or a whitespace-led continuation),
+    /// so prose elsewhere in the body that happens to mention the trailer
+    /// key does not silently opt the commit out of the squash body.
+    /// </summary>
+    private static bool HasMechanicalFixerTrailer(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        var lines = message.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+
+        var end = lines.Length - 1;
+        while (end >= 0 && string.IsNullOrWhiteSpace(lines[end]))
+            end--;
+        if (end < 0)
+            return false;
+
+        var start = end;
+        while (start > 0 && !string.IsNullOrWhiteSpace(lines[start - 1]))
+            start--;
+
+        var foundMechanical = false;
+        for (var i = start; i <= end; i++)
+        {
+            var line = lines[i];
+            if (line.Length == 0)
+                continue;
+            if (char.IsWhiteSpace(line[0]))
+                continue; // RFC-5322 trailer continuation line.
+            if (!TrailerTokenLine.IsMatch(line))
+                return false;
+            if (line.StartsWith(CodeyBoxTrailers.MechanicalFixerTrailerKey + ":", StringComparison.Ordinal))
+                foundMechanical = true;
+        }
+
+        return foundMechanical;
+    }
+
+    private static readonly Regex TrailerTokenLine = new(
+        @"^[A-Za-z][A-Za-z0-9-]*:",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static string CleanProseForCommitMessage(string? text)
         => FormatCommitBody(ExtractCleanParagraphs(text, stopAtPrFooter: true));

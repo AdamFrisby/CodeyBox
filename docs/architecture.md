@@ -29,8 +29,9 @@ shepherd state.
    │  Phase 1: Work sandbox      ───► branch + agent commits │
    │     ▼                                                   │
    │  Phase 2: Audit + rework loop (skipped if no auditors)  │
-   │     │   tool auditors  → credential-free sandbox        │
-   │     │   LLM auditors   → sandbox with agent creds       │
+   │     │   mechanical fixers → credential-free sandbox     │
+   │     │   tool auditors     → credential-free sandbox     │
+   │     │   LLM auditors      → sandbox with agent creds    │
    │     │   on fail: rework sandbox → loop until pass       │
    │     ▼   or AuditFailed at MaxIterations                 │
    │  Phase 3: Merge sandbox     ───► merge → host bare repo │
@@ -72,6 +73,7 @@ cycles tend to plateau quickly.
 |------------------------------|--------------------|--------------------|-----------------------|-----------------------|
 | Orchestrator (REST + workers)| Host               | Host OS only       | **Yes**               | Yes (to inject)       |
 | Work / Rework sandbox        | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
+| Mechanical-edit sandbox      | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
 | Audit-tool sandbox           | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
 | Audit-LLM / clean-merge sandbox | VM (Multipass/KVM) | Nothing         | No                    | Yes (only its own)    |
 | Conflict resolver            | Work-item sandbox    | In-sandbox repo CLI | Yes (resolver only) | Yes (resolver only) |
@@ -126,9 +128,9 @@ host git verification and the scope fence gate the push.
 ## State machine
 
 ```
-Queued → Working → WorkComplete ─┬─→ Auditing ─pass─→ AuditPassed ─→ Merging ─→ Merged ─→ UpstreamPushing ─→ Done
+Queued → Working → WorkComplete ─┬─→ Auditing* ─pass─→ AuditPassed ─→ Merging ─→ Merged ─→ UpstreamPushing ─→ Done
                                  │      │
-                                 │      └─fail─→ Reworking ─→ Auditing (loop)
+                                 │      └─fail─→ Reworking ─→ Auditing* (loop)
                                  │                  │
                                  │                  └─no-changes─→ Failed
                                  │      │
@@ -153,6 +155,10 @@ third-line fallback is burning.
 Cancelled (via DELETE /workitems/{id}) is reachable from any non-terminal state.
 ```
 
+`*` Before each `Auditing` run, configured mechanical fixers may run in a
+credential-free sandbox and commit deterministic normalizations. This is a
+phase action, not a durable work-item state.
+
 Work + Audit + Merge are the atomic unit: failure of any of them flips the
 item to `Failed` (or `AuditFailed` for the specific case of audit not
 converging). UpstreamPushing is a separate retryable step — its failures
@@ -171,6 +177,7 @@ intent is that you can swap any of these without touching the orchestrator:
 | `IAgentRegistry`         | `AgentRegistry`                      | Multi-tenant routing                   |
 | `IAuditor`               | (none — opt-in)                      | Adding code-quality / security review  |
 | `IAuditorRegistry`       | `AuditorRegistry`                    | Custom ordering or filtering           |
+| `IMechanicalFixer`       | `dotnet-format`                      | Adding deterministic no-model normalizers |
 | `ICredentialProvider`    | `EnvironmentCredentialProvider`      | Vault, AWS Secrets Manager, etc.       |
 | `IPullRequestService`    | `InMemoryPullRequestService`         | You want PR records in SQLite/Gitea    |
 | `IUpstreamRemote`        | `Noop` / `GitGeneric` / `GitHub`     | New forge integration (Gitea, Forgejo) |

@@ -476,11 +476,49 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
     }
 
     [Fact]
+    public async Task TryCreateCliRefreshHandler_StartsSubprocessInHomeOrTempDirectory()
+    {
+        var expected = ResolveExpectedCliRefreshWorkingDirectory();
+        var sentinel = Path.Combine(_dir, $"cwd-{Guid.NewGuid():N}.txt");
+        var body = OperatingSystem.IsWindows()
+            ? $"cd > \"{sentinel}\""
+            : $"pwd > \"{sentinel}\"";
+        var scriptPath = WriteExecutableScript(body, exitCode: 0);
+        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+
+        Assert.True(await handler(CancellationToken.None));
+
+        Assert.True(File.Exists(sentinel));
+        var captured = File.ReadAllText(sentinel).Trim();
+        Assert.Equal(NormalizePath(expected), NormalizePath(captured));
+    }
+
+    [Fact]
     public void ResolveExecutablePath_WhenResolverFails_ReturnsNull()
     {
         var result = GeminiOauthCredentialFileRefresher.ResolveExecutablePath(
             "no-such-resolver-command-hopefully-not-on-path", "gemini");
         Assert.Null(result);
+    }
+
+    [Fact]
+    public void ResolveCliRefreshPathValue_WhenParentPathMissing_UsesOsDefault()
+    {
+        var result = GeminiOauthCredentialFileRefresher.ResolveCliRefreshPathValue(null);
+
+        if (OperatingSystem.IsWindows())
+            Assert.Contains("Windows", result, StringComparison.OrdinalIgnoreCase);
+        else
+            Assert.Contains("/usr/bin", result);
+    }
+
+    [Fact]
+    public void ResolveCliRefreshPathValue_WhenParentPathPresent_PreservesIt()
+    {
+        Assert.Equal("custom-path",
+            GeminiOauthCredentialFileRefresher.ResolveCliRefreshPathValue("custom-path"));
     }
 
     [Fact]
@@ -507,6 +545,20 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         }
         return scriptPath;
     }
+
+    private static string ResolveExpectedCliRefreshWorkingDirectory()
+    {
+        var home = Environment.GetEnvironmentVariable("HOME");
+        if (!string.IsNullOrWhiteSpace(home) && Directory.Exists(home))
+            return home;
+
+        var temp = Path.GetTempPath();
+        return Directory.Exists(temp) ? temp : Path.DirectorySeparatorChar.ToString();
+    }
+
+    private static string NormalizePath(string path)
+        => Path.GetFullPath(path)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
     // ── Claude ───────────────────────────────────────────────────────────────
 

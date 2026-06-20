@@ -2,7 +2,7 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Presets.Presets;
 
-internal sealed class LanguagePresetAuditor : IAuditor
+internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvider, IAuditorLanguageContext
 {
     private const int MaxRawOutputChars = 1_000_000;
 
@@ -30,6 +30,9 @@ internal sealed class LanguagePresetAuditor : IAuditor
     public string? SelfReviewGuidance => _inner.SelfReviewGuidance;
     public AuditorRole Role => _inner.Role;
     public BuildTestGateEvidence BuildTestGateEvidence => _inner.BuildTestGateEvidence;
+    public IReadOnlyList<string> Argv => _inner is IShellAuditorArgvProvider provider ? provider.Argv : [];
+    public string Language => _language;
+    public string MarkerScript => _markerScript;
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
@@ -50,7 +53,7 @@ internal sealed class LanguagePresetAuditor : IAuditor
                 Title: $"{_language} preset discovery failed; treating as blocking",
                 Description: $"The {_language} preset could not discover project marker files. Discovery exited with code {discovery.ExitCode}. Stderr: {discovery.Stderr}")]);
 
-        var projectDirectories = ParseProjectDirectories(discovery.Stdout);
+        var projectDirectories = LanguagePresetProjectDiscovery.ParseProjectDirectories(discovery.Stdout);
         if (projectDirectories.Count > 0)
             return await RunInnerForProjectDirectoriesAsync(sandbox, workingDirectory, context, projectDirectories, ct);
 
@@ -85,7 +88,7 @@ internal sealed class LanguagePresetAuditor : IAuditor
         {
             var result = await _inner.RunAsync(
                 sandbox,
-                ResolveWorkingDirectory(workingDirectory, projectDirectory),
+                LanguagePresetProjectDiscovery.ResolveWorkingDirectory(workingDirectory, projectDirectory),
                 context,
                 ct);
 
@@ -134,12 +137,6 @@ internal sealed class LanguagePresetAuditor : IAuditor
         return null;
     }
 
-    private static IReadOnlyList<string> ParseProjectDirectories(string output)
-        => output
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-
     private static void AppendRawPart(
         List<string> rawParts,
         string rawPart,
@@ -167,23 +164,47 @@ internal sealed class LanguagePresetAuditor : IAuditor
         rawParts.Add(rawPart);
         rawOutputChars += rawPart.Length;
     }
+}
 
-    private static string ResolveWorkingDirectory(string workingDirectory, string projectDirectory)
+internal static class LanguagePresetProjectDiscovery
+{
+    public static IReadOnlyList<string> ParseProjectDirectories(string output)
+        => output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+    public static string ResolveWorkingDirectory(string workingDirectory, string projectDirectory)
     {
         if (projectDirectory == "." || string.IsNullOrWhiteSpace(projectDirectory))
             return workingDirectory;
 
-        var relativeProjectDirectory = projectDirectory.Replace('\\', '/');
+        var relativeProjectDirectory = projectDirectory.Replace('\\', '/').Trim();
         if (relativeProjectDirectory.StartsWith("./", StringComparison.Ordinal))
             relativeProjectDirectory = relativeProjectDirectory[2..];
-        relativeProjectDirectory = relativeProjectDirectory.Trim('/');
 
         if (string.IsNullOrWhiteSpace(relativeProjectDirectory) || relativeProjectDirectory == ".")
             return workingDirectory;
 
-        if (relativeProjectDirectory.Contains("..", StringComparison.Ordinal) || relativeProjectDirectory.StartsWith('/') || Path.IsPathRooted(relativeProjectDirectory))
-            throw new InvalidOperationException($"Language preset discovery returned an unsafe project directory: '{projectDirectory}'. Project directories must be relative and stay within the repository root.");
+        if (relativeProjectDirectory.Contains("..", StringComparison.Ordinal) ||
+            relativeProjectDirectory.StartsWith("/", StringComparison.Ordinal) ||
+            LooksLikeWindowsRootedPath(relativeProjectDirectory) ||
+            Path.IsPathRooted(relativeProjectDirectory))
+        {
+            throw new InvalidOperationException(
+                $"Language preset discovery returned an unsafe project directory: '{projectDirectory}'. Project directories must be relative and stay within the repository root.");
+        }
+
+        relativeProjectDirectory = relativeProjectDirectory.Trim('/');
+        if (string.IsNullOrWhiteSpace(relativeProjectDirectory) || relativeProjectDirectory == ".")
+            return workingDirectory;
 
         return workingDirectory.TrimEnd('/') + "/" + relativeProjectDirectory;
     }
+
+    private static bool LooksLikeWindowsRootedPath(string path)
+        => path.Length >= 3 &&
+           char.IsLetter(path[0]) &&
+           path[1] == ':' &&
+           path[2] == '/';
 }
