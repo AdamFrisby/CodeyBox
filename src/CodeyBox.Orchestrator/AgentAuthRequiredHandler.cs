@@ -41,7 +41,7 @@ public interface IAgentAuthRequiredHandler
         CancellationToken ct = default);
 }
 
-internal sealed class AgentAuthRequiredHandler : IAgentAuthRequiredHandler
+public sealed class AgentAuthRequiredHandler : IAgentAuthRequiredHandler
 {
     private readonly IAgentAuthAvailabilityRegistry _availability;
     private readonly IWebhookDispatcher _webhooks;
@@ -80,10 +80,19 @@ internal sealed class AgentAuthRequiredHandler : IAgentAuthRequiredHandler
         Release? release = null,
         CancellationToken ct = default)
     {
-        // The webhook publish below intentionally uses CancellationToken.None
-        // so terminal auth-bench delivery survives an operator-driven worker
-        // cancel; the parameter is honored only for the registry mark above.
-        ct.ThrowIfCancellationRequested();
+        // The ct parameter is intentionally NOT consulted here. Auth-required
+        // benching MUST survive an operator-driven worker cancel: the brief
+        // requires that the agent stop receiving dispatches the moment auth
+        // evidence is observed (whether the work item itself is being torn
+        // down or not). Dropping the bench on cancellation reopens the
+        // silent-outage failure mode this handler exists to close. The
+        // webhook publish uses CancellationToken.None for the same reason —
+        // the terminal alert must land even if the work item is being
+        // cancelled. ct is retained on the signature for future use (e.g.
+        // an operator-controlled shutdown that genuinely wants to abandon a
+        // bench delivery) but no current call site sets it to a value that
+        // should suppress the bench.
+        _ = ct;
 
         AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
 

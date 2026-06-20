@@ -421,15 +421,17 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         bool HasActiveProcessState,
         bool HasConfirmedProgress)
     {
+        // Test-only convenience overload. Existing fixtures script samples
+        // using a 0/1 "runnable processes seen this tick" sentinel; we
+        // collapse it to the persistent HasActiveProcessState bool because
+        // the watchdog only ever consults presence, not the count.
         public ProcessCpuSample(long cpuTicks, string processSetSignature, int runnableProcessCount)
             : this(
                 cpuTicks,
                 processSetSignature,
-                runnableProcessCount > 0,
+                HasActiveProcessState: runnableProcessCount > 0,
                 HasConfirmedProgress: false)
         {
         }
-
-        public int RunnableProcessCount => HasActiveProcessState ? 1 : 0;
     }
 }

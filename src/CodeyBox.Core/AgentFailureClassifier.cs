@@ -357,8 +357,12 @@ public static class AgentFailureClassifier
 
         var matchedStderr = ContainsAuthRequiredPatternInStderr(stderr);
         var matchedStderrAuthError = ContainsAuthErrorPattern(stderr);
+        // Compute the trusted-transcript hit once and reuse it: the public
+        // ContainsAuthRequiredPatternInStdout helper would otherwise re-split
+        // the stdout buffer line-by-line a second time on the hot path.
         var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
-        var matchedDefaultStdout = ContainsAuthRequiredPatternInStdout(stdout);
+        var matchedDefaultStdout = matchedTrustedStdoutTranscript
+            || ContainsShortAuthRequiredStdout(stdout);
         var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
         var matchedConfiguredStdout = false;
 
@@ -654,9 +658,10 @@ public static class AgentFailureClassifier
             return true;
         }
 
+        // "not logged into ..." is a strict prefix of "not logged in", so a
+        // single startswith check covers both shapes.
         var lower = line.ToLowerInvariant();
-        return (lower.StartsWith("not logged into ", StringComparison.Ordinal)
-                || lower.StartsWith("not logged in", StringComparison.Ordinal))
+        return lower.StartsWith("not logged in", StringComparison.Ordinal)
             && lower.Contains("run ", StringComparison.Ordinal)
             && lower.Contains(" login", StringComparison.Ordinal);
     }

@@ -56,6 +56,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IInVmSmokeProbe> _probes;
     private readonly ISmokeAvailabilityRegistry _availability;
+    private readonly IAgentAuthAvailabilityRegistry? _authAvailability;
     private readonly IInVmSmokeCache _cache;
     private readonly IWebhookDispatcher _webhooks;
     private readonly InVmSmokeOptions _opts;
@@ -75,7 +76,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         InVmSmokeOptions opts,
         ILogger<InVmSmokeProber> log,
         SmokeOptionsSnapshot? smokeOptions = null,
-        IAgentAuthFailureClassifier? authFailureClassifier = null)
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         _provider = provider;
         _resolver = resolver;
@@ -83,6 +85,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _credentials = credentials;
         _probes = probes.ToList();
         _availability = availability;
+        _authAvailability = authAvailability;
         _cache = cache;
         _webhooks = webhooks;
         _opts = opts;
@@ -537,9 +540,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 
         var sw = Stopwatch.StartNew();
         AgentSmokeResult result;
+        bool authRequired;
         try
         {
-            result = await RunStepsInSandboxAsync(probe.Kind, credential, target, resolvedBaselineRef, steps, sw, ct);
+            (result, authRequired) = await RunStepsInSandboxAsync(probe.Kind, credential, target, resolvedBaselineRef, steps, sw, ct);
         }
         catch (TimeoutException ex)
         {
@@ -593,11 +597,31 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             _cache.Set(probe.Kind, resolvedBaselineRef, result);
         else
             _cache.Invalidate(probe.Kind, resolvedBaselineRef);
-        // clearsFastFail:true — this verdict comes from a freshly executed in-VM
-        // probe that actually ran the binary in a sandbox, so a pass is valid
-        // evidence the CLI launches and may lift the fast-fail circuit breaker.
-        var transition = _availability.MarkSmokeResult(
-            probe.Kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
+
+        // Auth-required detection during the in-VM probe must be benched under
+        // SmokeExclusionSource.AuthRequired (not InVmSmoke): the operator may
+        // run with CodeyBox:Smoke:Enabled=false, and IsNonSmokeExclusion filters
+        // every smoke-gate source out of GetAvailabilityWithoutSmokeGateExclusions
+        // — defeating exactly the protection this signal exists to provide. The
+        // AuthRequired source is the documented outside-the-smoke-gate channel
+        // for authoritative login-prompt evidence (see SmokeExclusionSource
+        // doc-comments). Fall back to the smoke source only when the auth
+        // registry is not wired (legacy embedders / minimal tests) so behaviour
+        // doesn't regress for them.
+        AvailabilityTransition transition;
+        if (authRequired && _authAvailability is not null)
+        {
+            transition = _authAvailability.MarkAuthRequired(
+                probe.Kind, result.FailureReason ?? "in-VM smoke step detected auth/login prompt");
+        }
+        else
+        {
+            // clearsFastFail:true — this verdict comes from a freshly executed in-VM
+            // probe that actually ran the binary in a sandbox, so a pass is valid
+            // evidence the CLI launches and may lift the fast-fail circuit breaker.
+            transition = _availability.MarkSmokeResult(
+                probe.Kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
+        }
         await EmitTransitionEventsAsync(probe.Kind, result, transition);
         return result;
     }
@@ -625,7 +649,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         return result;
     }
 
-    private async Task<AgentSmokeResult> RunStepsInSandboxAsync(
+    private async Task<(AgentSmokeResult Result, bool AuthRequired)> RunStepsInSandboxAsync(
         AgentKind kind,
         AgentCredential? credential,
         InVmSmokeSandboxTarget target,
@@ -656,11 +680,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             {
                 sw.Stop();
                 var hint = step.FailureHint ?? (step.Argv.Count > 0 ? step.Argv[0] : "step");
-                return new AgentSmokeResult(
+                var smokeResult = new AgentSmokeResult(
                     false,
                     $"{hint} (auth/login prompt detected)",
                     sw.Elapsed,
                     SmokeFailureCategory.Persistent);
+                return (smokeResult, true);
             }
 
             if (exec.ExitCode != 0)
@@ -671,13 +696,13 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                 // any other nonzero exit from a smoke step (e.g. --version
                 // returning 1 due to auth failure) is also operator-actionable —
                 // the binary IS launching, so the bench is not a network blip.
-                return new AgentSmokeResult(
-                    false, $"{hint} (exit {exec.ExitCode})", sw.Elapsed, SmokeFailureCategory.Persistent);
+                return (new AgentSmokeResult(
+                    false, $"{hint} (exit {exec.ExitCode})", sw.Elapsed, SmokeFailureCategory.Persistent), false);
             }
         }
 
         sw.Stop();
-        return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
+        return (new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None), false);
     }
 
     /// <summary>

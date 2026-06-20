@@ -1592,6 +1592,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             },
             TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
+        // The fake gate is constructed before the registry exists; wire the
+        // registry in now so MarkAuthRequired flows the same way the real
+        // InVmSmokeProber does when it detects an auth/login prompt in-VM.
+        if (inVmSmokeGate is AuthCorroboratingInVmSmokeGate corroboratingGate)
+            corroboratingGate.AttachAuthRegistry(availability, webhooks);
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
@@ -1724,11 +1729,36 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     private sealed class AuthCorroboratingInVmSmokeGate : IInVmSmokeGate
     {
         private readonly AgentAvailability _forcedAvailability;
+        // Mirrors what the real InVmSmokeProber now does on auth detection:
+        // populates the structured AuthRequired channel on the availability
+        // registry AND emits the agent.smoke_failed webhook directly, so the
+        // pipeline's corroboration check (which now reads
+        // IAgentAuthRequiredAvailabilityReader directly instead of substring-
+        // matching the freeform reason) sees the corroboration signal and
+        // the test's existing webhook assertion still holds. The registry
+        // and webhook dispatcher are attached post-construction by
+        // BuildPipeline because the gate is constructed before they exist.
+        private IAgentAuthAvailabilityRegistry? _authAvailability;
+        private IWebhookDispatcher? _webhooks;
+        private readonly bool _corroboratesAuth;
 
         public AuthCorroboratingInVmSmokeGate(AgentAvailability? forcedAvailability = null)
         {
             _forcedAvailability = forcedAvailability
                 ?? new AgentAvailability(false, "smoke probe failed [persistent]: credential login required", null);
+            // The default forced-availability simulates the in-VM probe seeing
+            // an auth/login prompt; an explicit failing availability is taken
+            // as the non-auth (transient or other smoke) path. A passing
+            // availability never corroborates.
+            _corroboratesAuth = forcedAvailability is null;
+        }
+
+        public void AttachAuthRegistry(
+            IAgentAuthAvailabilityRegistry authAvailability,
+            IWebhookDispatcher webhooks)
+        {
+            _authAvailability = authAvailability;
+            _webhooks = webhooks;
         }
 
         public int EnsureCalls { get; private set; }
@@ -1751,6 +1781,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
         {
             ForceProbeCalls++;
+            MarkAuthIfNeeded(kind);
             return Task.FromResult<AgentAvailability?>(_forcedAvailability);
         }
 
@@ -1761,7 +1792,28 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         {
             ForceProbeCalls++;
             ForceProbeTargets.Add(target);
+            MarkAuthIfNeeded(kind);
             return Task.FromResult<AgentAvailability?>(_forcedAvailability);
+        }
+
+        private void MarkAuthIfNeeded(AgentKind kind)
+        {
+            if (!_corroboratesAuth || _authAvailability is null) return;
+            var reason = _forcedAvailability.Reason ?? "in-VM smoke detected auth/login prompt";
+            var transition = _authAvailability.MarkAuthRequired(kind, reason);
+            if (transition is { PreviouslyExcluded: false, NowExcluded: true } && _webhooks is not null)
+            {
+                _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_failed",
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = kind.Value,
+                        Reason = reason,
+                        Category = SmokeFailureCategory.Persistent,
+                    },
+                }, CancellationToken.None).GetAwaiter().GetResult();
+            }
         }
     }
 

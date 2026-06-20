@@ -71,7 +71,12 @@ public sealed class ReleaseService
         IAgentStreamStore? agentStreams = null,
         AgentPromptPreprocessorChain? promptPreprocessors = null,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
-        IAgentAuthAvailabilityRegistry authAvailability = null!)
+        IAgentAuthAvailabilityRegistry? authAvailability = null,
+        // Composition-root path. When supplied, the registry plumbing is owned
+        // by the host's DI graph and not rebuilt here, removing the duplication
+        // between this class and PipelineRunner. Legacy embedders / tests that
+        // don't wire this still get the registry-built path below.
+        IAgentAuthRequiredHandler? authRequiredHandler = null)
     {
         _releases = releases;
         _workItems = workItems;
@@ -93,8 +98,11 @@ public sealed class ReleaseService
         _agentStreams = agentStreams;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
-        var resolvedAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
-        _authRequiredHandler = new AgentAuthRequiredHandler(resolvedAvailability, _webhooks, _log);
+        _authRequiredHandler = authRequiredHandler
+            ?? new AgentAuthRequiredHandler(
+                authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance,
+                _webhooks,
+                _log);
     }
 
     private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)

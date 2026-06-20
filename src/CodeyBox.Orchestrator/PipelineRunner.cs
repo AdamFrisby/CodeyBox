@@ -155,6 +155,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
     private readonly IAgentAuthRequiredHandler _authRequiredHandler;
+    // Structured port replacing the freeform AgentAvailability.Reason
+    // substring sniff in IsAuthCorroboratingSmokeFailure. Wired through DI in
+    // production (same singleton as the registry); legacy embedders that pass
+    // the registry positionally fall through to the registry-as-reader cast.
+    private readonly IAgentAuthRequiredAvailabilityReader? _authRequiredReader;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
@@ -285,8 +290,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
         IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
-        IAgentAuthAvailabilityRegistry authAvailability = null!,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IAgentAuthAvailabilityRegistry? authAvailability = null,
+        IInVmSmokeGate? inVmSmokeGate = null,
+        // Composition-root path. When supplied, the registry plumbing is owned
+        // by the host's DI graph and not rebuilt here, removing the two-class
+        // duplication. Legacy embedders / tests that don't wire this still get
+        // the registry-built path below.
+        IAgentAuthRequiredHandler? authRequiredHandler = null,
+        IAgentAuthRequiredAvailabilityReader? authRequiredReader = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -361,8 +372,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _cancellations = cancellationRegistry;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
+        // Prefer the DI-injected handler when supplied: keeps the registry
+        // plumbing in one place (the composition root) rather than duplicated
+        // here and in ReleaseService. When neither the handler nor the
+        // registry is wired, fall back to a fail-loud placeholder so a
+        // legacy embedder that never trips an auth-required side effect keeps
+        // working while a regression that does silently rely on it surfaces
+        // an InvalidOperationException at the first publish.
         _authAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
-        _authRequiredHandler = new AgentAuthRequiredHandler(_authAvailability, _webhooks, _log);
+        _authRequiredReader = authRequiredReader
+            ?? (authAvailability as IAgentAuthRequiredAvailabilityReader);
+        _authRequiredHandler = authRequiredHandler
+            ?? new AgentAuthRequiredHandler(_authAvailability, _webhooks, _log);
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
         _agentSupervision = agentSupervision;
@@ -2459,6 +2480,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         project);
                 }
 
+                // The post-resolver HandleAgenticResolverAuthRequiredOutputAsync
+                // call below is the single, deduplicated side-effect path for
+                // auth-required evidence — it iterates the resolver's
+                // AuthFailures with full result.Success context (so a fallback
+                // success doesn't bench a candidate that produced a benign
+                // login-prompt string in its diagnostics). The in-flight
+                // callback is intentionally not wired here: it would double
+                // every AuditLog.AgentSmokeFailed entry because the webhook
+                // dedup gates only the publish, not the audit-log write.
                 var resolveResult = await _agenticConflictResolver.ResolveAsync(
                     sandbox,
                     SandboxConventions.WorkDir,
@@ -2468,9 +2498,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         ProjectId = project.Id,
                     },
                     candidates,
-                    ct,
-                    (evidence, callbackCt) => HandleAgenticResolverAuthRequiredEvidenceAsync(
-                        item, project, "rebase-resolver", evidence, callbackCt));
+                    ct);
 
                 foreach (var path in resolveResult.ConflictFiles)
                     conflictFiles.Add(path);
@@ -4100,8 +4128,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (AgentAuthRequiredException authEx)
         {
+            // TerminalFailureClassifier treats AuthRequired as Deterministic
+            // (no auto-retry), so this is a terminal failure, not a pause —
+            // word the log accordingly so operators grepping for "paused"
+            // don't think the item is parked awaiting auth.
             _log.LogWarning(
-                "Work item {Id} check-and-act paused because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
+                "Work item {Id} check-and-act failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
                 item.Id, authEx.Agent.Value, authEx.Phase, authEx.Message);
             await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
         }
@@ -5411,7 +5443,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var availability = await _inVmSmokeGate.ForceProbeAsync(agent, target, ct);
             if (availability is null)
                 return StdoutOnlyAuthCorroboration.Unavailable;
-            return IsAuthCorroboratingSmokeFailure(availability)
+            return IsAuthCorroboratingSmokeFailure(agent, availability)
                 ? StdoutOnlyAuthCorroboration.Corroborated
                 : StdoutOnlyAuthCorroboration.NotCorroborated;
         }
@@ -5446,16 +5478,31 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return ResolvePhaseSmokeTarget(project, normalizedPhase, baselineRef);
     }
 
-    private static bool IsAuthCorroboratingSmokeFailure(AgentAvailability? availability)
+    private bool IsAuthCorroboratingSmokeFailure(AgentKind agent, AgentAvailability? availability)
     {
-        if (availability is not { Available: false } || string.IsNullOrWhiteSpace(availability.Reason))
-            return false;
+        // The forced in-VM probe ran just before this check. If it observed an
+        // auth/login prompt, InVmSmokeProber escalates via MarkAuthRequired
+        // (not MarkSmokeResult), so the structured AuthRequired channel is now
+        // populated. Read that channel directly instead of substring-sniffing
+        // AgentAvailability.Reason — the freeform text is operator-facing and
+        // any future reword would silently break corroboration without a test
+        // signal.
+        if (_authRequiredReader is not null
+            && _authRequiredReader.GetAuthRequiredAvailability(agent).AuthRequired)
+        {
+            return true;
+        }
 
-        var reason = availability.Reason;
-        return reason.Contains("auth", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("login", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("credential", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("unauthoriz", StringComparison.OrdinalIgnoreCase);
+        // Backstop for legacy/embedded paths where the auth registry isn't
+        // wired or the prober ran without the auth-routing patch: any other
+        // probe failure here is NOT treated as corroboration, because a
+        // generic smoke-fail reason ("credential file path missing", future
+        // "authoring policy mismatch", etc.) is not authoritative login-prompt
+        // evidence. Silence over false-positive: a misbehaving agent will
+        // still be benched per-item, just not globally without a structured
+        // AuthRequired signal.
+        _ = availability;
+        return false;
     }
 
     private Task ThrowIfAuthRequiredOutputAsync(
@@ -5521,25 +5568,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 requireStdoutOnlyCorroboration: true,
                 ct: ct);
         }
-    }
-
-    private Task HandleAgenticResolverAuthRequiredEvidenceAsync(
-        WorkItem item,
-        Project project,
-        string phase,
-        AgenticConflictResolverAuthFailureEvidence evidence,
-        CancellationToken ct)
-    {
-        return HandleAuthRequiredDetectionAsync(
-            item,
-            project,
-            evidence.Runner.Kind,
-            phase,
-            evidence.Classification,
-            throwOnMatch: false,
-            stdoutOnlyEvidence: evidence.StdoutOnlyEvidence,
-            requireStdoutOnlyCorroboration: true,
-            ct: ct);
     }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
@@ -10872,6 +10900,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         AgentPromptPhase.Merge,
                         iteration: 1,
                         project);
+                    // Single auth-required side-effect path: post-resolver,
+                    // not in-flight. See HandleAgenticResolverAuthRequiredOutputAsync
+                    // and the matching rebase-resolver call for why we drop
+                    // the callback wiring (dedup of AuditLog.AgentSmokeFailed).
                     var resolverResult = await _agenticConflictResolver.ResolveAsync(
                         sandbox,
                         SandboxConventions.WorkDir,
@@ -10881,9 +10913,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             ProjectId = project.Id,
                         },
                         candidates,
-                        ct,
-                        (evidence, callbackCt) => HandleAgenticResolverAuthRequiredEvidenceAsync(
-                            item, project, "merge-resolver", evidence, callbackCt));
+                        ct);
                     await HandleAgenticResolverAuthRequiredOutputAsync(
                         item, project, "merge-resolver", resolverResult, ct);
                     agentResult = new AgentResult(
@@ -11040,16 +11070,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AuditLog.AgentFinished(chosenMergeRunner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
             LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
-            if (agentResult.Success)
-                await ThrowIfAuthRequiredOutputAsync(
-                    item, project, chosenMergeRunner.Kind, "merge", agentResult,
-                    ct: ct);
+            // Scan for a login prompt regardless of agent exit status: a
+            // success-exit auth-prompt is the OG outage shape (exit 0, no
+            // diff) and a failure-exit auth-prompt must also bench the agent
+            // before downstream classifiers convert it into a quota / transient
+            // error and lose the auth signal.
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, chosenMergeRunner.Kind, "merge", agentResult,
+                ct: ct);
             if (!agentResult.Success)
             {
-                await ThrowIfAuthRequiredOutputAsync(
-                    item, project, chosenMergeRunner.Kind, "merge", agentResult,
-                    ct: ct);
-
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
                 var classificationResult = agentResultForAvailabilityClassification ?? agentResult;

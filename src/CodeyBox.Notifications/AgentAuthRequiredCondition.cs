@@ -6,7 +6,7 @@ namespace CodeyBox.Notifications;
 /// Evaluates true when any registered agent is excluded because a runtime
 /// invocation emitted an interactive auth/login prompt.
 /// </summary>
-public sealed class AgentAuthRequiredCondition : ICondition, IDisposable
+public sealed class AgentAuthRequiredCondition : ICondition
 {
     public const string Condition = "agent_auth_required";
 
@@ -43,8 +43,6 @@ public sealed class AgentAuthRequiredCondition : ICondition, IDisposable
 
         return matches;
     }
-
-    public void Dispose() { }
 }
 
 /// <summary>

@@ -1654,7 +1654,8 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<InVmSmokeOptions>(),
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>(),
     sp.GetRequiredService<SmokeOptionsSnapshot>(),
-    sp.GetRequiredService<IAgentAuthFailureClassifier>()));
+    sp.GetRequiredService<IAgentAuthFailureClassifier>(),
+    sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
 // The router consults the prober as a dispatch gate (IInVmSmokeGate) so the
 // first work item per baseline is verified in-VM before routing; share the
 // single InVmSmokeProber instance so the gate, the background sweep service,
@@ -2288,6 +2289,14 @@ builder.Services.AddSingleton<IAgentAuthFailureClassifier>(sp =>
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return AuthFailurePatternBinder.Build(cbOpts);
 });
+// Single composition-root point for the auth-required side-effect handler.
+// PipelineRunner and ReleaseService consume the abstraction directly so the
+// registry / webhook / logger plumbing is not duplicated across both classes.
+builder.Services.AddSingleton<IAgentAuthRequiredHandler>(sp =>
+    new AgentAuthRequiredHandler(
+        sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
+        sp.GetRequiredService<IWebhookDispatcher>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentAuthRequiredHandler>()));
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
@@ -2415,7 +2424,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
     authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
-    inVmSmokeGate: sp.GetService<IInVmSmokeGate>()));
+    inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
+    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
+    authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2561,7 +2572,8 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     agentStreams: sp.GetService<IAgentStreamStore>(),
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
-    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
+    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
+    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
