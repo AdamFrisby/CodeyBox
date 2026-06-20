@@ -3614,9 +3614,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (!agentResult.Success)
             {
                 // Same policy as the success branch: a nonzero CLI can also
-                // print the login prompt on stdout before exiting.
+                // print the login prompt on stdout before exiting. Require
+                // forced in-VM probe corroboration before publishing the
+                // global bench — the auth-failure detector matches a CLI-
+                // login-shaped substring, and a nonzero work-phase exit
+                // whose stderr is a generic CLI failure with stdout
+                // containing one OAuth-callback URL line would otherwise
+                // bench the agent fleet-wide on model-controllable evidence.
                 await ThrowIfAuthRequiredOutputAsync(
                     item, project, runner.Kind, agentPhase, agentResult,
+                    requireStdoutOnlyCorroboration: true,
                     ct: ct);
 
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
@@ -5539,15 +5546,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ct: ct);
     }
 
+    // The AgentResult-form wrapper mirrors the explicit-stream overload's
+    // requireStdoutOnlyCorroboration knob so callers don't silently fall back
+    // to the policy default by passing an AgentResult instead of (stdout,
+    // stderr). Every retrofit call site that runs on model-controlled stdout
+    // (audit / merge / rebase-resolver / session-resume / conflict-rework /
+    // check / post-act-recheck / work-phase failure) opts into corroboration;
+    // leaving the AgentResult overload at the false default reintroduces the
+    // single-crafted-prompt fleet-wide bench the corroboration path exists
+    // to prevent. Keep the parameter explicit at every call site rather than
+    // flipping the default so the security-relevant choice is visible in diff.
     private Task ThrowIfAuthRequiredOutputAsync(
         WorkItem item,
         Project project,
         AgentKind agent,
         string phase,
         AgentResult result,
+        bool requireStdoutOnlyCorroboration,
         CancellationToken ct = default)
         => ThrowIfAuthRequiredOutputAsync(
             item, project, agent, phase, result.Stdout, result.Stderr,
+            requireStdoutOnlyCorroboration: requireStdoutOnlyCorroboration,
             ct: ct);
 
     private async Task HandleAgenticResolverAuthRequiredOutputAsync(
@@ -11121,9 +11140,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // success-exit auth-prompt is the OG outage shape (exit 0, no
             // diff) and a failure-exit auth-prompt must also bench the agent
             // before downstream classifiers convert it into a quota / transient
-            // error and lose the auth signal.
+            // error and lose the auth signal. Require forced in-VM probe
+            // corroboration before publishing the global bench so a single
+            // crafted merge-agent stdout cannot dismantle availability for
+            // every class member.
             await ThrowIfAuthRequiredOutputAsync(
                 item, project, chosenMergeRunner.Kind, "merge", agentResult,
+                requireStdoutOnlyCorroboration: true,
                 ct: ct);
             if (!agentResult.Success)
             {
@@ -13056,8 +13079,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // the unauthenticated agent routable. Detection runs before the
             // semantic-incompatible branch so an auth break is always reported
             // as the breaking signal, not as the agent's own reasoned refusal.
+            // Require forced in-VM probe corroboration before publishing the
+            // global bench — the session-resume catch sibling at line ~12929
+            // is already corroborated; pairing this steady-state scan
+            // preserves the symmetry the b946c6f / b8d9d09 retrofit work
+            // established.
             await ThrowIfAuthRequiredOutputAsync(
                 item, project, runner.Kind, ConflictReworkPhaseKey, agentResult,
+                requireStdoutOnlyCorroboration: true,
                 ct: ct);
             if (semanticIncompatible is not null)
             {
