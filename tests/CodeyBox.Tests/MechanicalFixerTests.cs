@@ -1930,8 +1930,12 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
-    public async Task Pipeline_MechanicalFailureIsInfrastructureFailure()
+    public async Task Pipeline_MechanicalFailureParksWaitingForTransientRetry()
     {
+        // The mechanical-edit phase wraps deterministic infra (sandbox /
+        // git plumbing); an isolated failure must not terminate the work
+        // item — csharp:format-check still gates as a safety net and the
+        // retry scheduler will replay from WorkComplete.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var audit = new ProjectAudit
         {
@@ -1952,8 +1956,8 @@ public sealed class MechanicalFixerTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
         Assert.Contains("mechanical-edit failed", final.LastError);
     }
 
@@ -2056,7 +2060,7 @@ public sealed class MechanicalFixerTests : IDisposable
     [Theory]
     [InlineData("normalizer-create", 1)]
     [InlineData("import-create", 2)]
-    public async Task Pipeline_MechanicalSandboxCreationFailurePathsAreInfrastructureFailures(
+    public async Task Pipeline_MechanicalSandboxCreationFailurePathsParkWaitingForTransientRetry(
         string branchSuffix,
         int mechanicalSandboxOrdinal)
     {
@@ -2086,8 +2090,8 @@ public sealed class MechanicalFixerTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
         Assert.Contains("mechanical sandbox create failed", final.LastError);
         Assert.True(provider.Fired);
 
@@ -2329,7 +2333,7 @@ public sealed class MechanicalFixerTests : IDisposable
 
     [Theory]
     [MemberData(nameof(PipelineMechanicalGitFailureCases))]
-    public async Task Pipeline_MechanicalGitFailurePathsAreInfrastructureFailures(
+    public async Task Pipeline_MechanicalGitFailurePathsParkWaitingForTransientRetry(
         string branchSuffix,
         MechanicalCommandFailureRule failure,
         string expectedError)
@@ -2359,8 +2363,8 @@ public sealed class MechanicalFixerTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
         Assert.Contains(expectedError, final.LastError);
         Assert.True(failure.Fired);
 
@@ -2456,8 +2460,12 @@ public sealed class MechanicalFixerTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
+        // Oversized-patch rejection rides the same MechanicalFixerException
+        // surface as other infra failures and therefore parks for transient
+        // retry. The retry budget will eventually exhaust if the patch stays
+        // oversized, but a single hit must not terminate the work item.
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
         Assert.Contains("patch cap", final.LastError);
         Assert.True(patchExportExceeded.Fired);
         Assert.NotNull(patchExportExec);
