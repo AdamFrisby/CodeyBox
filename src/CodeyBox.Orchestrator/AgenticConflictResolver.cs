@@ -229,8 +229,7 @@ public sealed class AgenticConflictResolver
         WorkItemId workItemId,
         AgenticConflictResolverContext context,
         IReadOnlyList<AgenticConflictResolverCandidate> candidates,
-        CancellationToken ct = default,
-        Func<AgenticConflictResolverAuthFailureEvidence, CancellationToken, Task>? authFailureCallback = null)
+        CancellationToken ct = default)
     {
         if (sandbox is null) throw new ArgumentNullException(nameof(sandbox));
         if (string.IsNullOrWhiteSpace(workingDirectory)) throw new ArgumentException("workingDirectory must be non-empty", nameof(workingDirectory));
@@ -310,7 +309,7 @@ public sealed class AgenticConflictResolver
             transientFailureClassificationResult = classificationResult;
         }
 
-        async Task RecordAuthRequiredAttemptFailureAsync(
+        void RecordAuthRequiredAttemptFailure(
             IAgentRunner authRunner,
             AgentCredential? authCredential,
             int attemptNumber,
@@ -320,13 +319,11 @@ public sealed class AgenticConflictResolver
             AuthRequiredAttemptFailure failureKind,
             Exception? exception = null)
         {
-            var authEvidence = await RecordAuthFailureAsync(
+            var authEvidence = RecordAuthFailure(
                 authRunner,
                 detection,
                 agentSucceeded,
-                authFailures,
-                authFailureCallback,
-                ct);
+                authFailures);
             var authReason = authEvidence.Classification.Reason ?? "auth/login prompt matched";
 
             switch (failureKind)
@@ -497,7 +494,7 @@ public sealed class AgenticConflictResolver
                         ex.LastResult.Stdout);
                     if (resumeAuthDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
                     {
-                        await RecordAuthRequiredAttemptFailureAsync(
+                        RecordAuthRequiredAttemptFailure(
                             runner,
                             candidate.Credential,
                             attempt,
@@ -561,7 +558,7 @@ public sealed class AgenticConflictResolver
                 var authDetection = _authFailureClassifier.DetectDetailed(runner.Kind, agentResult.Stderr, agentResult.Stdout);
                 if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired, IsStdoutOnly: false })
                 {
-                    await RecordAuthRequiredAttemptFailureAsync(
+                    RecordAuthRequiredAttemptFailure(
                         runner,
                         candidate.Credential,
                         attempt,
@@ -576,7 +573,7 @@ public sealed class AgenticConflictResolver
                 {
                     if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired, IsStdoutOnly: true })
                     {
-                        await RecordAuthRequiredAttemptFailureAsync(
+                        RecordAuthRequiredAttemptFailure(
                             runner,
                             candidate.Credential,
                             attempt,
@@ -635,7 +632,7 @@ public sealed class AgenticConflictResolver
                 lastVerificationError = verification.Reason;
                 if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired, IsStdoutOnly: true })
                 {
-                    await RecordAuthRequiredAttemptFailureAsync(
+                    RecordAuthRequiredAttemptFailure(
                         runner,
                         candidate.Credential,
                         attempt,
@@ -722,13 +719,11 @@ public sealed class AgenticConflictResolver
             ct);
     }
 
-    private async Task<AgenticConflictResolverAuthFailureEvidence> RecordAuthFailureAsync(
+    private static AgenticConflictResolverAuthFailureEvidence RecordAuthFailure(
         IAgentRunner runner,
         AgentAuthFailureDetection detection,
         bool agentSucceeded,
-        List<AgenticConflictResolverAuthFailureEvidence> authFailures,
-        Func<AgenticConflictResolverAuthFailureEvidence, CancellationToken, Task>? authFailureCallback,
-        CancellationToken ct)
+        List<AgenticConflictResolverAuthFailureEvidence> authFailures)
     {
         var evidence = new AgenticConflictResolverAuthFailureEvidence(
             runner,
@@ -736,10 +731,6 @@ public sealed class AgenticConflictResolver
             detection.Classification,
             detection.IsStdoutOnly);
         authFailures.Add(evidence);
-
-        if (authFailureCallback is not null)
-            await authFailureCallback(evidence, ct);
-
         return evidence;
     }
 

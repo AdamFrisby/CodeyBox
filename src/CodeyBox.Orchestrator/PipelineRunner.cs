@@ -2493,10 +2493,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // auth-required evidence — it iterates the resolver's
                 // AuthFailures with full result.Success context (so a fallback
                 // success doesn't bench a candidate that produced a benign
-                // login-prompt string in its diagnostics). The in-flight
-                // callback is intentionally not wired here: it would double
-                // every AuditLog.AgentSmokeFailed entry because the webhook
-                // dedup gates only the publish, not the audit-log write.
+                // login-prompt string in its diagnostics).
                 var resolveResult = await _agenticConflictResolver.ResolveAsync(
                     sandbox,
                     SandboxConventions.WorkDir,
@@ -10966,10 +10963,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         AgentPromptPhase.Merge,
                         iteration: 1,
                         project);
-                    // Single auth-required side-effect path: post-resolver,
-                    // not in-flight. See HandleAgenticResolverAuthRequiredOutputAsync
-                    // and the matching rebase-resolver call for why we drop
-                    // the callback wiring (dedup of AuditLog.AgentSmokeFailed).
+                    // Single auth-required side-effect path: post-resolver.
+                    // See HandleAgenticResolverAuthRequiredOutputAsync.
                     var resolverResult = await _agenticConflictResolver.ResolveAsync(
                         sandbox,
                         SandboxConventions.WorkDir,
