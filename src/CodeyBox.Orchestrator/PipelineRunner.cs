@@ -12981,6 +12981,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
                 {
                     await FinalizeInvolvementAsync(conflictInvolvementId, "failure:agent");
+                    // Match the work-phase session-resume catch (see RunWorkAgentAsync):
+                    // a single model-controlled stdout match must not globally bench
+                    // the agent without forced in-VM probe corroboration.
                     await HandleAuthRequiredDetectionAsync(
                         item,
                         project,
@@ -12989,6 +12992,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         authDetection.Classification,
                         throwOnMatch: true,
                         stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                        requireStdoutOnlyCorroboration: true,
                         ct: ct);
                 }
 
