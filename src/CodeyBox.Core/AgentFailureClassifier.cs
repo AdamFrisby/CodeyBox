@@ -101,6 +101,43 @@ public static class AgentFailureClassifier
         "OAuth token expired",
     };
 
+    private static readonly IReadOnlyList<string> AuthRequiredLoginPromptPrefixes = new[]
+    {
+        "Authentication required. Please visit",
+        "Please visit the URL to log in",
+    };
+
+    private static readonly IReadOnlyList<string> AuthRequiredWaitOrTimeoutLinePrefixes = new[]
+    {
+        "Waiting for authentication (timeout",
+        "Error: authentication timed out",
+    };
+
+    private static readonly IReadOnlyList<string> AuthRequiredLinePrefixes =
+        AuthRequiredLoginPromptPrefixes
+            .Concat(AuthRequiredWaitOrTimeoutLinePrefixes)
+            .ToArray();
+
+    private static readonly IReadOnlyList<string> AuthRequiredExactLines = new[]
+    {
+        "authentication timed out",
+    };
+
+    private static readonly IReadOnlyList<string> OAuthLoginUrlFragments = new[]
+    {
+        "accounts.google.com/o/oauth2",
+    };
+
+    private static readonly IReadOnlyList<string> CliLoginCommandFragments = new[]
+    {
+        "run `agy login`",
+        "run `gemini auth login`",
+        "run `agent login`",
+        "run `opencode auth login`",
+        "run `codex login`",
+        "run `claude login`",
+    };
+
     /// <summary>
     /// Substrings that signal a CLI is prompting for interactive login rather
     /// than running the task. These are separated from <see cref="AuthPatterns"/>
@@ -118,20 +155,12 @@ public static class AgentFailureClassifier
     /// with stream scoping; stdout additions should remain tightly formed CLI
     /// transcript signatures.</para>
     /// </summary>
-    public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]
-    {
-        "Authentication required. Please visit",
-        "Please visit the URL to log in",
-        "Waiting for authentication (timeout",
-        "authentication timed out",
-        "accounts.google.com/o/oauth2",
-        "run `agy login`",
-        "run `gemini auth login`",
-        "run `agent login`",
-        "run `opencode auth login`",
-        "run `codex login`",
-        "run `claude login`",
-    };
+    public static readonly IReadOnlyList<string> AuthRequiredPatterns =
+        AuthRequiredLinePrefixes
+            .Concat(AuthRequiredExactLines)
+            .Concat(OAuthLoginUrlFragments)
+            .Concat(CliLoginCommandFragments)
+            .ToArray();
 
     /// <summary>
     /// Substrings that signal a transient connectivity failure where a retry
@@ -528,7 +557,7 @@ public static class AgentFailureClassifier
     public static bool ContainsAuthRequiredPatternInStderr(string? stderr) =>
         ContainsAny(stderr, AuthRequiredPatterns)
         || ContainsStandaloneOAuthLoginUrlLine(stderr)
-        || ContainsAuthRequiredCliLoginLine(stderr);
+        || ContainsCliLoginLine(stderr);
 
     public static bool ContainsAuthErrorPattern(string? text) =>
         ContainsAny(text, AuthPatterns);
@@ -536,11 +565,11 @@ public static class AgentFailureClassifier
     public static bool ContainsAuthRequiredPatternInStdout(string? stdout) =>
         ContainsTrustedStdoutLoginTranscript(stdout) || ContainsShortAuthRequiredStdout(stdout);
 
-    private static bool ContainsAuthRequiredCliLoginLine(string? text) =>
+    private static bool ContainsCliLoginLine(string? text) =>
         !string.IsNullOrWhiteSpace(text)
         && text
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Any(IsAuthRequiredStdoutLine);
+            .Any(IsCliLoginLine);
 
     private static bool ContainsShortAuthRequiredStdout(string? stdout)
     {
@@ -560,8 +589,7 @@ public static class AgentFailureClassifier
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToArray();
         return lines.Length is > 0 and <= maxTrustedStdoutLoginLines
-            && lines.All(IsAuthRequiredStdoutLine)
-            && lines.Any(IsAuthRequiredStdoutLine);
+            && lines.All(IsCliLoginLine);
     }
 
     public static bool ContainsAuthRequiredFragmentInStdout(string? stdout)
@@ -571,7 +599,7 @@ public static class AgentFailureClassifier
 
         return stdout
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Any(IsAuthRequiredStdoutLine);
+            .Any(IsCliLoginLine);
     }
 
     public static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
@@ -594,44 +622,34 @@ public static class AgentFailureClassifier
         if (lines.Any(static line => !IsTrustedStdoutLoginTranscriptLine(line)))
             return false;
 
-        var hasLoginPrompt =
-            stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase);
+        var hasLoginPrompt = AuthRequiredLoginPromptPrefixes
+            .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase));
         var hasWaitOrTimeout =
-            stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("authentication timed out", StringComparison.OrdinalIgnoreCase);
+            AuthRequiredWaitOrTimeoutLinePrefixes
+                .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            || AuthRequiredExactLines
+                .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase));
         return hasLoginPrompt && hasWaitOrTimeout;
     }
 
     private static bool IsTrustedStdoutLoginTranscriptLine(string line) =>
-        line.StartsWith("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
-        || line.StartsWith("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase)
-        || line.StartsWith("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
-        || line.StartsWith("Error: authentication timed out", StringComparison.OrdinalIgnoreCase)
-        || line.Equals("authentication timed out", StringComparison.OrdinalIgnoreCase)
+        AuthRequiredLinePrefixes.Any(pattern => line.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
+        || AuthRequiredExactLines.Any(pattern => line.Equals(pattern, StringComparison.OrdinalIgnoreCase))
         || IsStandaloneOAuthLoginUrl(line);
 
-    private static bool IsAuthRequiredStdoutLine(string line)
+    private static bool IsCliLoginLine(string line)
     {
         if (string.IsNullOrWhiteSpace(line))
             return false;
 
-        if (line.StartsWith("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
-            || line.StartsWith("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase)
-            || line.StartsWith("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
-            || line.StartsWith("Error: authentication timed out", StringComparison.OrdinalIgnoreCase)
-            || line.Equals("authentication timed out", StringComparison.OrdinalIgnoreCase)
+        if (AuthRequiredLinePrefixes.Any(pattern => line.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
+            || AuthRequiredExactLines.Any(pattern => line.Equals(pattern, StringComparison.OrdinalIgnoreCase))
             || IsStandaloneOAuthLoginUrl(line))
         {
             return true;
         }
 
-        if (line.Contains("run `agy login`", StringComparison.OrdinalIgnoreCase)
-            || line.Contains("run `gemini auth login`", StringComparison.OrdinalIgnoreCase)
-            || line.Contains("run `agent login`", StringComparison.OrdinalIgnoreCase)
-            || line.Contains("run `opencode auth login`", StringComparison.OrdinalIgnoreCase)
-            || line.Contains("run `codex login`", StringComparison.OrdinalIgnoreCase)
-            || line.Contains("run `claude login`", StringComparison.OrdinalIgnoreCase))
+        if (CliLoginCommandFragments.Any(pattern => line.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
