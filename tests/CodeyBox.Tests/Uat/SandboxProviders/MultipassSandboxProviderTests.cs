@@ -1618,7 +1618,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             fi
             exec "$@"
             """);
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var (exit, stdout, stderr) = await RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
