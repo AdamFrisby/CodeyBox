@@ -117,7 +117,23 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
     }
 
     private IEnumerable<Measurement<long>> ObserveWorkersMax()
-        => _disposed ? [] : [new Measurement<long>(_maxWorkers)];
+    {
+        if (_disposed) return [];
+
+        // Read the live ceiling from the worker-pool snapshot so a hot-reload
+        // of CodeyBox:WorkerPool:MaxConcurrentWorkers is reflected on the
+        // dashboard immediately. Fall back to the construction-time value
+        // when no occupancy provider was wired (e.g. lightweight test hosts).
+        try
+        {
+            var live = _workerPool?.MaxConcurrent ?? _maxWorkers;
+            return [new Measurement<long>(live)];
+        }
+        catch (ObjectDisposedException)
+        {
+            return [];
+        }
+    }
 
     private IEnumerable<Measurement<long>> ObserveSandboxMax()
         => _disposed ? [] : [new Measurement<long>(_maxSandboxes)];

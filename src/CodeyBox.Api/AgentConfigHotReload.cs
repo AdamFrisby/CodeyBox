@@ -17,6 +17,10 @@ namespace CodeyBox.Api;
 /// <para>
 /// Several blocks are hot-reloadable here:
 /// <list type="bullet">
+/// <item><c>CodeyBox:WorkerPool:MaxConcurrentWorkers</c> →
+///   <see cref="OrchestratorService.ApplyWorkerPoolReload"/>. The other
+///   <c>WorkerPool</c> fields (<c>MaxConcurrentSandboxes</c>, <c>MinSpawnInterval</c>)
+///   are captured at startup and not re-bound here.</item>
 /// <item><c>CodeyBox:AgentConcurrency</c> → <see cref="OrchestratorService.ApplyAgentConcurrencyReload"/>.</item>
 /// <item><c>CodeyBox:AgentClasses</c> + <c>CodeyBox:AgentScoreModifiers</c> →
 ///   <see cref="AgentClassRouter.ApplyConfigReload"/>. Both are bundled because
@@ -83,6 +87,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     // Last-applied serialised forms; used as both the equality check and the
     // value reported back to AuditLog.ConfigReloaded.
+    private string _lastWorkerPool = "";
     private string _lastConcurrency = "";
     private string _lastBurn = "";
     private string _lastRouter = "";
@@ -158,6 +163,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         // only fires audit entries for fields that actually changed against
         // the snapshot the router / orchestrator were built with.
         var initial = _monitor.CurrentValue;
+        _lastWorkerPool = SerializeWorkerPool(initial.WorkerPool, initial.Concurrency);
         _lastConcurrency = SerializeConcurrency(initial.AgentConcurrency);
         _lastBurn = SerializeBurn(initial.AgentBurnEstimator);
         _lastRouter = SerializeRouterInputs(initial.AgentClasses, initial.AgentInstances, initial.AgentScoreModifiers);
@@ -200,6 +206,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     {
         lock (_gate)
         {
+            ApplyWorkerPoolIfChanged(opts);
             ApplyConcurrencyIfChanged(opts);
             ApplySmokeIfChanged(opts);
             ApplyTransitionHealthIfChanged(opts);
@@ -474,6 +481,46 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         }
     }
 
+    private void ApplyWorkerPoolIfChanged(CodeyBoxOptions opts)
+    {
+        var next = SerializeWorkerPool(opts.WorkerPool, opts.Concurrency);
+        if (string.Equals(_lastWorkerPool, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastWorkerPool;
+        try
+        {
+            var resolved = ResolveEffectiveMaxConcurrentWorkers(opts.WorkerPool, opts.Concurrency);
+            _orchestrator.ApplyWorkerPoolReload(resolved);
+            _lastWorkerPool = next;
+            AuditLog.ConfigReloaded("WorkerPool", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of WorkerPool rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    /// <summary>
+    /// Resolves the same effective <c>MaxConcurrentWorkers</c> value that the
+    /// startup factory in <see cref="OrchestratorOptionsFactory.Build(int?, WorkerPoolOptions, ILogger)"/>
+    /// produces: <c>WorkerPool.MaxConcurrentWorkers</c> wins when set; the
+    /// deprecated top-level <c>Concurrency</c> is the fallback; default is 1.
+    /// </summary>
+    private static int ResolveEffectiveMaxConcurrentWorkers(
+        WorkerPoolOptions workerPool,
+        int? legacyConcurrency)
+    {
+        if (workerPool.MaxConcurrentWorkers is { } explicitValue)
+            return explicitValue;
+        if (legacyConcurrency is { } legacyValue)
+            return legacyValue;
+        return 1;
+    }
+
     private void ApplyConcurrencyIfChanged(CodeyBoxOptions opts)
     {
         var next = SerializeConcurrency(opts.AgentConcurrency);
@@ -672,6 +719,22 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 prev);
         }
     }
+
+    /// <summary>
+    /// Hot-reload fingerprint for the worker-pool block. Only includes the
+    /// hot-reloadable fields — <c>MaxConcurrentSandboxes</c> and
+    /// <c>MinSpawnInterval</c> are captured at startup and are explicitly out
+    /// of scope here, so an unrelated edit to them does not trigger a
+    /// no-op resize call.
+    /// </summary>
+    private static string SerializeWorkerPool(WorkerPoolOptions opts, int? legacyConcurrency) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.MaxConcurrentWorkers,
+                LegacyConcurrency = legacyConcurrency,
+            },
+            JsonOpts);
 
     private static string SerializeConcurrency(AgentConcurrencyOptions opts) =>
         JsonSerializer.Serialize(
