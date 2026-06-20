@@ -2491,6 +2491,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     await ThrowIfAuthRequiredOutputAsync(
                         item, project, emittingAgent, "rebase-resolver",
                         resolveResult.Stdout, resolveResult.Stderr,
+                        requireStdoutOnlyCorroboration: true,
                         ct: ct);
 
                     if (candidateResult is { HasTransientlyUnavailableStrongerAgent: true })
@@ -4463,8 +4464,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         // Check-and-act stdout is parsed model output. Detect auth evidence so
         // the item fails as infrastructure instead of verdict-parse noise, but
-        // require in-VM corroboration before turning stdout-only evidence into a
-        // fleet-wide auth bench.
+        // force an in-VM corroboration attempt before publishing the fleet-wide
+        // auth bench reason. A missing/inconclusive probe must not suppress the
+        // fail-fast auth exclusion because smoke can be disabled during the exact
+        // outage this detector is meant to catch.
         await ThrowIfAuthRequiredOutputAsync(
             item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
             requireStdoutOnlyCorroboration: true,
@@ -5370,11 +5373,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? stdoutOnlyNote = null;
         if (stdoutOnlyEvidence && requireStdoutOnlyCorroboration)
         {
-            var corroborated = await TryCorroborateStdoutOnlyAuthRequiredAsync(agent, phase, ct);
-            publishSideEffects = corroborated;
-            stdoutOnlyNote = corroborated
-                ? "stdout corroborated by forced in-VM smoke probe for global benching"
-                : "stdout accepted for item failure only; global bench suppressed without in-VM corroboration";
+            var corroboration = await TryCorroborateStdoutOnlyAuthRequiredAsync(item, project, agent, phase, ct);
+            publishSideEffects = corroboration != StdoutOnlyAuthCorroboration.NotCorroborated;
+            stdoutOnlyNote = corroboration switch
+            {
+                StdoutOnlyAuthCorroboration.Corroborated =>
+                    "stdout corroborated by forced in-VM smoke probe for global benching",
+                StdoutOnlyAuthCorroboration.NotCorroborated =>
+                    "stdout accepted for item failure only; forced in-VM smoke probe did not corroborate auth",
+                _ =>
+                    "stdout auth evidence accepted for global benching; forced in-VM smoke corroboration unavailable",
+            };
         }
 
         var reason = BuildAuthRequiredReason(phase, classification, stdoutOnlyEvidence, stdoutOnlyNote);
@@ -5388,18 +5397,32 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return true;
     }
 
-    private async Task<bool> TryCorroborateStdoutOnlyAuthRequiredAsync(
+    private enum StdoutOnlyAuthCorroboration
+    {
+        Unavailable,
+        NotCorroborated,
+        Corroborated,
+    }
+
+    private async Task<StdoutOnlyAuthCorroboration> TryCorroborateStdoutOnlyAuthRequiredAsync(
+        WorkItem? item,
+        Project project,
         AgentKind agent,
         string phase,
         CancellationToken ct)
     {
         if (_inVmSmokeGate is not { Enabled: true })
-            return false;
+            return StdoutOnlyAuthCorroboration.Unavailable;
 
         try
         {
-            var availability = await _inVmSmokeGate.ForceProbeAsync(agent, ct);
-            return IsAuthCorroboratingSmokeFailure(availability);
+            var target = ResolveAuthCorroborationSmokeTarget(project, phase, item?.BaselineImageRef);
+            var availability = await _inVmSmokeGate.ForceProbeAsync(agent, target, ct);
+            if (availability is null)
+                return StdoutOnlyAuthCorroboration.Unavailable;
+            return IsAuthCorroboratingSmokeFailure(availability)
+                ? StdoutOnlyAuthCorroboration.Corroborated
+                : StdoutOnlyAuthCorroboration.NotCorroborated;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -5409,11 +5432,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             _log.LogWarning(
                 ex,
-                "Forced in-VM smoke corroboration failed for stdout-only auth evidence from agent {Agent} during {Phase}; suppressing global auth bench",
+                "Forced in-VM smoke corroboration failed for stdout-only auth evidence from agent {Agent} during {Phase}; continuing global auth bench from matched output",
                 agent.Value,
                 phase);
-            return false;
+            return StdoutOnlyAuthCorroboration.Unavailable;
         }
+    }
+
+    private static InVmSmokeSandboxTarget ResolveAuthCorroborationSmokeTarget(
+        Project project,
+        string phase,
+        string? baselineRef)
+    {
+        var normalizedPhase =
+            phase.StartsWith("audit:", StringComparison.OrdinalIgnoreCase) ? "audit"
+            : phase.Contains("check", StringComparison.OrdinalIgnoreCase) ? "check"
+            : phase.Contains("rework", StringComparison.OrdinalIgnoreCase) ? "rework"
+            : phase.Contains("merge", StringComparison.OrdinalIgnoreCase) ? "merge"
+            : phase.Contains("rebase", StringComparison.OrdinalIgnoreCase) ? "rebase"
+            : phase;
+
+        return ResolvePhaseSmokeTarget(project, normalizedPhase, baselineRef);
     }
 
     private static bool IsAuthCorroboratingSmokeFailure(AgentAvailability? availability)
@@ -5519,6 +5558,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var emittingAgent = result.LastAttemptedRunner?.Kind ?? result.ChosenRunner?.Kind ?? item.Agent ?? project.DefaultAgent;
             await ThrowIfAuthRequiredOutputAsync(
                 item, project, emittingAgent, phase, result.Stdout, result.Stderr,
+                requireStdoutOnlyCorroboration: true,
                 ct: ct);
             return;
         }
@@ -5539,6 +5579,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 failure.Classification,
                 throwOnMatch,
                 failure.StdoutOnlyEvidence,
+                requireStdoutOnlyCorroboration: true,
                 ct: ct);
         }
     }
@@ -5558,6 +5599,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             evidence.Classification,
             throwOnMatch: false,
             stdoutOnlyEvidence: evidence.StdoutOnlyEvidence,
+            requireStdoutOnlyCorroboration: true,
             ct: ct);
     }
 
@@ -8457,8 +8499,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // LLM audit-agent execution failures report CLI diagnostics through
         // AgentStdout/AgentStderr, not source-code review prose. Accept guarded
         // stdout login fragments here so auth wins over a companion quota
-        // diagnostic for the item outcome. Fleet benching still requires
-        // stderr or auth-specific forced smoke corroboration.
+        // diagnostic for the item outcome. Forced smoke corroboration is attempted
+        // for stdout-only evidence, but an unavailable probe cannot leave a matched
+        // login prompt routable.
         if (IsLlmAgentExecutionFailure(run.Result)
             && AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout))
         {

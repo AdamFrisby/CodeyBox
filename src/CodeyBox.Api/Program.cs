@@ -1653,7 +1653,8 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>(),
-    sp.GetRequiredService<SmokeOptionsSnapshot>()));
+    sp.GetRequiredService<SmokeOptionsSnapshot>(),
+    sp.GetRequiredService<IAgentAuthFailureClassifier>()));
 // The router consults the prober as a dispatch gate (IInVmSmokeGate) so the
 // first work item per baseline is verified in-VM before routing; share the
 // single InVmSmokeProber instance so the gate, the background sweep service,

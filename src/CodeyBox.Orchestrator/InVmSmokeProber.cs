@@ -60,6 +60,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private readonly IWebhookDispatcher _webhooks;
     private readonly InVmSmokeOptions _opts;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
     private readonly ILogger<InVmSmokeProber> _log;
 
     public InVmSmokeProber(
@@ -73,7 +74,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         IWebhookDispatcher webhooks,
         InVmSmokeOptions opts,
         ILogger<InVmSmokeProber> log,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null)
     {
         _provider = provider;
         _resolver = resolver;
@@ -85,6 +87,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _webhooks = webhooks;
         _opts = opts;
         _smokeOptions = smokeOptions;
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
         _log = log;
     }
 
@@ -655,7 +658,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                 Stdin = step.Stdin,
             }, linked.Token);
 
-            var authDetection = AgentFailureClassifier.DetectAuthRequired(
+            var authDetection = _authFailureClassifier.DetectDetailed(
                 kind,
                 exec.Stderr,
                 exec.Stdout);

@@ -274,7 +274,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_Exit0StdoutAuthPromptWithoutResult_FailsWithoutUncorroboratedFleetBench()
+    public async Task LlmAuditAgent_Exit0StdoutAuthPromptWithoutResult_FailsBenchesAndAlerts()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -315,11 +315,13 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("audit:security:llm-review", final.LastError);
-        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
 
         var agentAvailability = availability.GetAvailability(AgentKind.Claude);
-        Assert.True(agentAvailability.Available, agentAvailability.Reason);
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        Assert.False(agentAvailability.Available, agentAvailability.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
     }
 
     [Fact]
@@ -376,7 +378,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_StdoutAuthPromptWithQuotaDiagnostic_FailsBeforeQuotaParkingWithoutFleetBench()
+    public async Task LlmAuditAgent_StdoutAuthPromptWithQuotaDiagnostic_FailsBeforeQuotaParkingAndBenches()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
@@ -419,11 +421,13 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Null(final.QuotaRetryFrom);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
 
         var agentAvailability = availability.GetAvailability(AgentKind.Claude);
-        Assert.True(agentAvailability.Available, agentAvailability.Reason);
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        Assert.False(agentAvailability.Available, agentAvailability.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
     }
 
     [Fact]

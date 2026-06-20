@@ -79,6 +79,28 @@ public sealed class AuthFailurePatternBindingTests
     }
 
     [Fact]
+    public void Build_AppliesAdditionalPerAgentPattern_ToStderrAndStdout()
+    {
+        var classifier = BindAndBuild(new Dictionary<string, string?>
+        {
+            ["CodeyBox:AuthFailurePatterns:antigravity:0:Pattern"] = "either stream says: needs login",
+            ["CodeyBox:AuthFailurePatterns:antigravity:0:Stream"] = "StderrAndStdout",
+        });
+
+        Assert.NotNull(classifier.Detect(
+            AgentKind.Antigravity,
+            stderr: "either stream says: needs login",
+            stdout: null));
+        var stdoutHit = classifier.DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: "either stream says: needs login");
+        Assert.NotNull(stdoutHit);
+        Assert.True(stdoutHit.IsStdoutOnly);
+        Assert.True(stdoutHit.MatchedConfiguredStdoutPattern);
+    }
+
+    [Fact]
     public void Build_NullOptions_ThrowsArgumentNullException()
     {
         Assert.Throws<ArgumentNullException>(() => AuthFailurePatternBinder.Build(null!));

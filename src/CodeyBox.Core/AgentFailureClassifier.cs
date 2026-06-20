@@ -526,13 +526,21 @@ public static class AgentFailureClassifier
     }
 
     public static bool ContainsAuthRequiredPatternInStderr(string? stderr) =>
-        ContainsAny(stderr, AuthRequiredPatterns) || ContainsStandaloneOAuthLoginUrlLine(stderr);
+        ContainsAny(stderr, AuthRequiredPatterns)
+        || ContainsStandaloneOAuthLoginUrlLine(stderr)
+        || ContainsAuthRequiredCliLoginLine(stderr);
 
     public static bool ContainsAuthErrorPattern(string? text) =>
         ContainsAny(text, AuthPatterns);
 
     public static bool ContainsAuthRequiredPatternInStdout(string? stdout) =>
         ContainsTrustedStdoutLoginTranscript(stdout) || ContainsShortAuthRequiredStdout(stdout);
+
+    private static bool ContainsAuthRequiredCliLoginLine(string? text) =>
+        !string.IsNullOrWhiteSpace(text)
+        && text
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(IsAuthRequiredStdoutLine);
 
     private static bool ContainsShortAuthRequiredStdout(string? stdout)
     {

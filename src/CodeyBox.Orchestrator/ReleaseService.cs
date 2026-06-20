@@ -676,26 +676,29 @@ public sealed class ReleaseService
         var phase = $"release-deep-audit:{auditor.Name}";
         var reasonDetail = detection.Classification.Reason ?? "login prompt matched";
         if (detection.IsStdoutOnly)
-            reasonDetail = $"{reasonDetail}; stdout accepted as authoritative CLI output for this phase";
+            reasonDetail = $"{reasonDetail}; stdout accepted for release failure only because deep-audit stdout is model-controlled";
         var reason = SingleLineSummary(
             $"auth required from agent output during {phase} for release {release.Id}: {reasonDetail}");
 
-        AuditLog.AgentSmokeFailed(runner.Kind, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
-        var transition = _authAvailability.MarkAuthRequired(runner.Kind, reason);
-        if (transition.SourceChanged)
+        if (!detection.IsStdoutOnly)
         {
-            await _webhooks.PublishAsync(new WebhookEvent
+            AuditLog.AgentSmokeFailed(runner.Kind, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
+            var transition = _authAvailability.MarkAuthRequired(runner.Kind, reason);
+            if (transition.SourceChanged)
             {
-                Event = "agent.smoke_failed",
-                Project = project,
-                Release = release,
-                Details = new AgentSmokeFailedDetails
+                await _webhooks.PublishAsync(new WebhookEvent
                 {
-                    AgentKind = runner.Kind.Value,
-                    Reason = reason,
-                    Category = SmokeFailureCategory.Persistent,
-                },
-            }, CancellationToken.None);
+                    Event = "agent.smoke_failed",
+                    Project = project,
+                    Release = release,
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = runner.Kind.Value,
+                        Reason = reason,
+                        Category = SmokeFailureCategory.Persistent,
+                    },
+                }, CancellationToken.None);
+            }
         }
 
         throw new AgentAuthRequiredException(runner.Kind, phase, reason);

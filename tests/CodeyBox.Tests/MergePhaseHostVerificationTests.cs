@@ -449,7 +449,7 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
     }
 
     [Fact]
-    public async Task AdvisoryAgentAuthPrompt_RaisesAuthRequiredWithoutUncorroboratedFleetBench()
+    public async Task AdvisoryAgentAuthPrompt_RaisesAuthRequiredBenchesAndAlerts()
     {
         var (gitHost, repoId) = await CreateConflictingRepoAsync();
         var preMergeMain = await gitHost.ResolveCommitAsync(repoId, "main");
@@ -516,10 +516,12 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
                 conflictsResolvedByConstrainedResolver: true));
 
         Assert.Contains("merge-security-review", ex.Message);
-        Assert.Contains("global bench suppressed without in-VM corroboration", ex.Message);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", ex.Message);
         var current = availability.GetAvailability(AgentKind.Claude);
-        Assert.True(current.Available, current.Reason);
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        Assert.False(current.Available, current.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
     }
 
     private async Task<(LocalGitHost GitHost, string RepoId)> CreateConflictingRepoAsync()

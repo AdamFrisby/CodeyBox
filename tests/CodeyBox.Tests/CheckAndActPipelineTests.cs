@@ -416,7 +416,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthPromptDuringCheck_FailsItemWithoutUncorroboratedFleetBench()
+    public async Task AuthPromptDuringCheck_FailsItemBenchesAgentAndAlerts()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var registry = NewAvailabilityRegistry();
@@ -455,9 +455,11 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("check", final.LastError);
-        Assert.Contains("global bench suppressed without in-VM corroboration", final.LastError);
-        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
     }
 
     [Fact]
@@ -1091,7 +1093,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthPromptDuringPostActRecheck_FailsItemWithoutUncorroboratedFleetBench()
+    public async Task AuthPromptDuringPostActRecheck_FailsItemBenchesAgentAndAlerts()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var registry = NewAvailabilityRegistry();
@@ -1139,9 +1141,11 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, finalFollowup.FailureKind);
         Assert.Contains("auth required from agent output", finalFollowup.LastError);
         Assert.Contains("post-act-recheck", finalFollowup.LastError);
-        Assert.Contains("global bench suppressed without in-VM corroboration", finalFollowup.LastError);
-        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        Assert.Contains("forced in-VM smoke corroboration unavailable", finalFollowup.LastError);
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
     }
 
     [Fact]

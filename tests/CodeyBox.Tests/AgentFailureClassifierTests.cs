@@ -84,6 +84,7 @@ public sealed class AgentFailureClassifierTests
     [InlineData("Authentication required. Please visit the URL to log in:")]
     [InlineData("Waiting for authentication (timeout 30s)... Error: authentication timed out.")]
     [InlineData("not logged into agy; run `agy login`")]
+    [InlineData("not logged into agy; run agy login")]
     [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
     [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
     public void LoginPromptPatterns_InStderr_Classified_AsAuthRequired(string snippet)
@@ -295,6 +296,31 @@ public sealed class AgentFailureClassifierTests
 
         Assert.NotEqual(AgentFailureKind.AuthRequired, stderr.Kind);
         Assert.NotEqual(AgentFailureKind.AuthRequired, stdout.Kind);
+    }
+
+    [Fact]
+    public void AuthFailurePatternStreamStderrAndStdout_MatchesBothStreams()
+    {
+        var extras = new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["custom"] = [new AuthFailurePattern("custom auth ceremony required", AuthFailurePatternStream.StderrAndStdout)],
+        };
+
+        var stderr = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+        var stdout = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: null,
+            stdout: "custom auth ceremony required",
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+
+        Assert.Equal(AgentFailureKind.AuthRequired, stderr.Kind);
+        Assert.Equal(AgentFailureKind.AuthRequired, stdout.Kind);
     }
 
     [Fact]

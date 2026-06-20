@@ -43,7 +43,8 @@ public sealed class InVmSmokeProberTests
         ICredentialProvider? credentials = null,
         IEnumerable<IInVmSmokeProbe>? probes = null,
         bool fillDefaultNetworkProfile = true,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null)
     {
         var effectiveOpts = opts ?? new InVmSmokeOptions
         {
@@ -66,7 +67,8 @@ public sealed class InVmSmokeProberTests
             new NullWebhookDispatcher(),
             effectiveOpts,
             NullLogger<InVmSmokeProber>.Instance,
-            smokeOptions);
+            smokeOptions,
+            authFailureClassifier);
     }
 
     private static InVmSmokeCache NewCache() => new(TimeSpan.FromMinutes(60));
@@ -137,6 +139,38 @@ public sealed class InVmSmokeProberTests
                 : new SandboxExecResult(0, "ok", ""));
         var registry = NewRegistry();
         var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("auth/login prompt detected", availability.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithConfiguredAuthPrompt_ExcludesAgent()
+    {
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, "operator-only cursor login prompt", "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var classifier = new AgentAuthFailureClassifier(
+            new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["cursor"] =
+                [
+                    new AuthFailurePattern(
+                        "operator-only cursor login prompt",
+                        AuthFailurePatternStream.Stdout),
+                ],
+            });
+        var prober = Build(
+            provider,
+            registry,
+            NewCache(),
+            new FakeBaselineResolver("base-A"),
+            authFailureClassifier: classifier);
 
         await prober.ProbeAllAsync(CancellationToken.None);
 
