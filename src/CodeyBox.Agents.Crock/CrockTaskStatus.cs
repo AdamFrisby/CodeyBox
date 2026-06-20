@@ -8,9 +8,11 @@ namespace CodeyBox.Agents.Crock;
 /// </summary>
 public enum CrockTaskStateKind
 {
-    /// <summary>State could not be parsed from the CLI output — treated as
-    /// in-progress for liveness, but counted toward the unknown-streak limit so
-    /// the poll loop does not hang on a permanently mute CLI.</summary>
+    /// <summary>State could not be parsed from the CLI output. The poll loop
+    /// keeps polling on Unknown (liveness) but counts each consecutive
+    /// Unknown observation toward <c>MaxUnknownStreak</c>; on InProgress the
+    /// streak resets to zero, so a permanently mute or reshaped CLI is
+    /// failed deterministically while an in-flight task is not.</summary>
     Unknown,
 
     /// <summary>Task is queued, submitted, running, or otherwise still

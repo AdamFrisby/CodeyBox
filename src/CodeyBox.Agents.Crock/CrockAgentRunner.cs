@@ -1,7 +1,6 @@
 using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Core;
-using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents.Crock;
 
@@ -13,7 +12,7 @@ namespace CodeyBox.Agents.Crock;
 /// <para>Wire-protocol summary the runner implements:</para>
 /// <list type="number">
 ///   <item><c>crock submit -p &lt;prompt&gt; [-C &lt;working-dir&gt;]</c> — prints a task-id then detaches.</item>
-///   <item><c>crock status &lt;task-id&gt;</c> — polled on a bounded exponential backoff until terminal.</item>
+///   <item><c>crock status -- &lt;task-id&gt;</c> — polled on a bounded exponential backoff until terminal.</item>
 /// </list>
 ///
 /// <para>Per-task latency is minutes-to-hours (vs. seconds-to-minutes for the
@@ -45,6 +44,15 @@ namespace CodeyBox.Agents.Crock;
 ///     follow-up. <see cref="PrepareSandboxAsync"/> here only materialises
 ///     the credential file; the tunnel side is intentionally NOT wired.
 ///   </item>
+///   <item>
+///     <see cref="RunResumedAsync"/> is overridden to fail-explicit until
+///     a checkpoint shape (task-id persistence + re-attach via
+///     <c>crock status</c>) is wired. Without that override the base class
+///     would call <see cref="BuildInvocation"/> directly, which would
+///     re-SUBMIT a fresh Anthropic batch on every resume and report success
+///     on the bare submit exit — silently double-billing while never polling
+///     the original task.
+///   </item>
 /// </list>
 /// </summary>
 public sealed class CrockAgentRunner : CliAgentRunnerBase
@@ -63,20 +71,32 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     public const string ConfigEnvVar = "CROCK_CONFIG_JSON";
 
     /// <summary>
+    /// Marker the unavailability AgentResult surfaces in its Summary and
+    /// Stderr so the shared <see cref="AgentFailureClassifier"/> classifies
+    /// a missing credential as <c>AgentFailureKind.AuthError</c>. The
+    /// classifier matches on <c>credentials are invalid</c>; the leading
+    /// "crock: " gives the operator one-glance attribution.
+    /// </summary>
+    private const string MissingCredentialMarker =
+        "crock: credentials are invalid (CROCK_CONFIG_JSON not set)";
+
+    /// <summary>
     /// Bash that materialises crock's <c>~/.crockcode/config.json</c> from
     /// <see cref="ConfigEnvVar"/>. Mirrors the umask-077 / chmod-600 pattern
     /// used by <see cref="OpencodeAgentRunner"/> and the Codex runner so the
     /// credential never sits at world-readable modes inside the VM. Exposed
     /// as a constant so an in-VM smoke probe can run it verbatim and stay in
-    /// lock-step with the runner.
+    /// lock-step with the runner. The bash literal references the env-var
+    /// name via the interpolation site below; a rename of
+    /// <see cref="ConfigEnvVar"/> updates both at once.
     /// </summary>
-    public const string ConfigMaterialiseScript =
+    public static readonly string ConfigMaterialiseScript =
         "set -eu\n" +
         "dest=\"$HOME/.crockcode/config.json\"\n" +
         "umask 077\n" +
         "mkdir -p \"$(dirname \"$dest\")\"\n" +
-        "if [ -n \"${CROCK_CONFIG_JSON:-}\" ]; then\n" +
-        "  printf '%s' \"$CROCK_CONFIG_JSON\" > \"$dest\"\n" +
+        $"if [ -n \"${{{ConfigEnvVar}:-}}\" ]; then\n" +
+        $"  printf '%s' \"${ConfigEnvVar}\" > \"$dest\"\n" +
         "  chmod 600 \"$dest\"\n" +
         "fi\n";
 
@@ -90,7 +110,15 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// </summary>
     public TimeSpan InitialPollInterval { get; init; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>Ceiling for the exponential backoff between polls.</summary>
+    /// <summary>
+    /// Ceiling for the exponential backoff between polls. With the default
+    /// initial=10s and doubling, the loop reaches the ceiling after roughly
+    /// four polls (~40s wall-clock) and then polls steadily at the ceiling.
+    /// For crock's documented minutes-to-hours latency profile a 2-minute
+    /// floor on the poll gap keeps each long batch at ~30 polls per hour
+    /// rather than ten-fold more — light enough for an overflow path,
+    /// still inside the watchdog's progress window.
+    /// </summary>
     public TimeSpan MaxPollInterval { get; init; } = TimeSpan.FromMinutes(2);
 
     /// <summary>
@@ -98,10 +126,27 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// the runner tolerates before failing the work item. A mute or
     /// reshaped CLI would otherwise keep the poll loop alive forever; the
     /// cancellation token is the primary stop signal, this is the backstop.
+    /// Default 20 at the ceiling poll interval is roughly 40 minutes of
+    /// unparseable output — long enough to ride out a daemon restart but
+    /// not so long that an item silently strands forever.
     /// </summary>
     public int MaxUnknownStreak { get; init; } = 20;
 
     public override AgentKind Kind => AgentKind.Crock;
+
+    /// <summary>
+    /// Defeats the base class's cmdline-grep preempt fallback. The default
+    /// <see cref="CliAgentRunnerBase.PreemptProcessPattern"/> is
+    /// <c>Kind.Value</c> = <c>"crock"</c>, which would match every
+    /// crock-related process — including the persistent <c>crock daemon</c>
+    /// that owns in-flight batch work for OTHER work items sharing the
+    /// sandbox. Until <see cref="CliAgentRunnerBase.RequestPreemptAsync"/>
+    /// is wired to a poll-loop-aware abort (<c>crock cancel &lt;task-id&gt;</c>),
+    /// set the pattern to a literal that cannot match any real process.
+    /// Cancellation still works through the <see cref="CancellationToken"/>
+    /// path.
+    /// </summary>
+    protected override string PreemptProcessPattern => "__crock_preempt_disabled__";
 
     /// <summary>
     /// Materialises <c>~/.crockcode/config.json</c> from <see cref="ConfigEnvVar"/>.
@@ -123,9 +168,9 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
         {
             return new AgentResult(
                 Success: false,
-                Summary: $"{ConfigEnvVar} is required to run crock",
+                Summary: MissingCredentialMarker,
                 Stdout: null,
-                Stderr: null);
+                Stderr: MissingCredentialMarker);
         }
 
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -151,6 +196,13 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// <para>The exact stdin-marker convention for <c>crock submit</c> has
     /// not been verified against a live binary; the follow-up will swap this
     /// for whatever shape <c>crock submit --help</c> documents.</para>
+    ///
+    /// <para><paramref name="modelId"/>, <paramref name="reasoningMode"/>, and
+    /// <paramref name="captureStructuredStream"/> are intentionally dropped
+    /// today: crock's per-call model selection is expected to flow through
+    /// <c>~/.crockcode/config.json</c> (set by the host credential bundle)
+    /// rather than argv, and crock has no structured-stream contract to
+    /// honour. The follow-up wires real model / reasoning plumbing.</para>
     /// </summary>
     protected override AgentInvocation BuildInvocation(
         string prompt,
@@ -168,6 +220,39 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
         _ = reasoningMode;
         _ = captureStructuredStream;
         return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    /// <summary>
+    /// Fails resumed runs explicitly. The base class implementation would
+    /// route through <see cref="BuildInvocation"/> and exec <c>crock submit</c>
+    /// once via <c>ExecuteWithSuspendResilienceAsync</c> — which (a) submits
+    /// a duplicate Anthropic batch on every resume (real $$ leak), and (b)
+    /// reports success on the bare submit exit without ever polling the
+    /// original task. Until checkpoint persistence of the task-id and a
+    /// re-attach path through <c>crock status</c> are wired by the
+    /// dependent follow-up, the safer behaviour is to fail explicitly so
+    /// the orchestrator routes the work item back through its normal
+    /// retry / fallback chain.
+    /// </summary>
+    public override Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        _ = sandbox; _ = workingDirectory; _ = prompt; _ = credential;
+        _ = resume; _ = modelId; _ = reasoningMode; _ = stdoutChunkCallback;
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(new AgentResult(
+            Success: false,
+            Summary: "crock resume not yet supported — submit/poll lifecycle has no checkpoint shape wired",
+            Stdout: null,
+            Stderr: null));
     }
 
     /// <summary>
@@ -194,13 +279,21 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
         // STEP 1 — Submit the task. Stdin carries the prompt; argv is short.
         var submitInvocation = BuildInvocation(
             prompt, credential, modelId, reasoningMode, captureStructuredStream);
-        var submit = await sandbox.ExecAsync(new SandboxExec
+        SandboxExecResult submit;
+        try
         {
-            Argv = submitInvocation.Argv,
-            WorkingDirectory = workingDirectory,
-            Stdin = submitInvocation.Stdin,
-            ExtraEnvironment = submitInvocation.ExtraEnvironment,
-        }, ct);
+            submit = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = submitInvocation.Argv,
+                WorkingDirectory = workingDirectory,
+                Stdin = submitInvocation.Stdin,
+                ExtraEnvironment = submitInvocation.ExtraEnvironment,
+            }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            return CancellationResult(taskId: null, lastStatus: null);
+        }
 
         if (!submit.Success)
         {
@@ -242,26 +335,26 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
 
         while (true)
         {
-            ct.ThrowIfCancellationRequested();
             try
             {
+                ct.ThrowIfCancellationRequested();
                 await Task.Delay(delay, ct);
+
+                pollCount++;
+                // `--` separates the task-id from any prior argv flags so a
+                // malformed task-id starting with '-' (defence-in-depth; the
+                // parser already rejects dash-prefixed shapes) can never be
+                // interpreted as a flag by `crock status`.
+                lastStatus = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = [Binary, "status", "--", taskId],
+                    WorkingDirectory = workingDirectory,
+                }, ct);
             }
             catch (OperationCanceledException)
             {
-                return new AgentResult(
-                    Success: false,
-                    Summary: $"crock poll cancelled while waiting on task {taskId}",
-                    Stdout: lastStatus?.Stdout,
-                    Stderr: lastStatus?.Stderr);
+                return CancellationResult(taskId, lastStatus);
             }
-
-            pollCount++;
-            lastStatus = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = [Binary, "status", taskId],
-                WorkingDirectory = workingDirectory,
-            }, ct);
 
             // A non-zero exit on `crock status` may be transient (daemon
             // hiccup) or terminal (task gone); rather than guess, we feed
@@ -312,12 +405,24 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
                     break;
             }
 
-            // Exponential backoff with the configured ceiling. Bounded ticks
-            // come from doubling InitialPollInterval; capping at MaxPollInterval
-            // keeps a long batch from drifting to multi-minute poll gaps.
+            // Exponential backoff with the configured ceiling. The ceiling
+            // (MaxPollInterval) bounds the steady-state poll rate so a
+            // long-running batch does not drift to ever-larger gaps.
             var next = TimeSpan.FromTicks(delay.Ticks * 2);
             delay = next > MaxPollInterval ? MaxPollInterval : next;
         }
+    }
+
+    private static AgentResult CancellationResult(string? taskId, SandboxExecResult? lastStatus)
+    {
+        var subject = taskId is null
+            ? "crock submit cancelled before task-id was captured"
+            : $"crock poll cancelled while waiting on task {taskId}";
+        return new AgentResult(
+            Success: false,
+            Summary: subject,
+            Stdout: lastStatus?.Stdout,
+            Stderr: lastStatus?.Stderr);
     }
 
     private static void EmitProgress(Action<string>? sink, string message)
@@ -332,9 +437,11 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
             }) + "\n";
             sink(envelope);
         }
-        catch
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Progress emission is observability-only; never block the poll loop.
+            // Progress emission is observability-only; never block the poll
+            // loop on a serializer/sink fault. Cancellation propagates so
+            // the surrounding try/catch in PollUntilTerminalAsync wins.
         }
     }
 }
