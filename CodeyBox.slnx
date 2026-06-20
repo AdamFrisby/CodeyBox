@@ -8,6 +8,7 @@
     <Project Path="src/CodeyBox.Agents.Opencode/CodeyBox.Agents.Opencode.csproj" />
     <Project Path="src/CodeyBox.Agents.Copilot/CodeyBox.Agents.Copilot.csproj" />
     <Project Path="src/CodeyBox.Agents.Antigravity/CodeyBox.Agents.Antigravity.csproj" />
+    <Project Path="src/CodeyBox.Agents.Crock/CodeyBox.Agents.Crock.csproj" />
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
     <Project Path="src/CodeyBox.Api/CodeyBox.Api.csproj" />
     <Project Path="src/CodeyBox.Audit.Llm/CodeyBox.Audit.Llm.csproj" />
