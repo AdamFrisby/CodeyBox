@@ -141,7 +141,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly ConcurrentDictionary<string, RefactorDrainClaim> _refactorDrainClaims = new(StringComparer.Ordinal);
 
     // Concurrency gate: at most MaxConcurrentWorkers items running at once.
-    private readonly SemaphoreSlim _concurrencyGate;
+    // Resizable at runtime via ApplyWorkerPoolReload so the operator can
+    // hot-adjust the global pool size without restarting the orchestrator —
+    // SemaphoreSlim has no in-place resize primitive, hence the wrapper.
+    private readonly ResizableConcurrencyGate _concurrencyGate;
 
     // Spawn pacing: UTC ticks of the last worker spawn (0 = never).
     // Written under a lock so the read-modify-write is atomic.
@@ -260,7 +263,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // on every hot-reload via ApplyAgentConcurrencyReload — keeping the
         // semantics identical between cold-start and config-edit paths.
         AgentConcurrencyOptions.ValidateAndThrow(_concurrencySnapshot.Current);
-        _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
+        _concurrencyGate = new ResizableConcurrencyGate(opts.MaxConcurrentWorkers);
         LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "startup");
     }
 
@@ -374,6 +377,51 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     /// <summary>
+    /// Hot-reloads the global worker-pool concurrency ceiling
+    /// (<c>CodeyBox:WorkerPool:MaxConcurrentWorkers</c>). Mirrors the existing
+    /// <see cref="ApplyAgentConcurrencyReload"/> path:
+    /// <list type="bullet">
+    /// <item>Reject <c>&lt;= 0</c> with the same semantics as the cold-start
+    /// validation in <see cref="OrchestratorOptionsFactory.Build(int?, WorkerPoolOptions, ILogger)"/>;
+    /// the coordinator catches and leaves the prior value in effect.</item>
+    /// <item>Grow admits queued waiters immediately; shrink converges down as
+    /// in-flight items finish naturally and is never allowed to abort
+    /// already-running work.</item>
+    /// <item>Emits an old→new log line and updates the resolved-caps log so
+    /// operators can confirm the new global ceiling. The <c>/concurrency</c>
+    /// endpoint reads the same live value via <see cref="GetConcurrencyState"/>.</item>
+    /// </list>
+    /// <para>
+    /// Idempotent: a reload with the same value is a no-op (no log, no
+    /// resize). <see cref="WorkerPoolOptions.MaxConcurrentSandboxes"/> and
+    /// <see cref="WorkerPoolOptions.MinSpawnInterval"/> remain startup-bound
+    /// — only the worker-pool size is hot-reloaded here.
+    /// </para>
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="newMaxConcurrentWorkers"/> is &lt; 1.
+    /// </exception>
+    public void ApplyWorkerPoolReload(int newMaxConcurrentWorkers)
+    {
+        if (newMaxConcurrentWorkers < 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(newMaxConcurrentWorkers),
+                newMaxConcurrentWorkers,
+                "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
+
+        var result = _concurrencyGate.Resize(newMaxConcurrentWorkers);
+        if (result.OldTarget == result.NewTarget)
+            return;
+
+        _log.LogInformation(
+            "Hot-reloaded WorkerPool:MaxConcurrentWorkers: {OldValue} → {NewValue} (in-flight={InFlight})",
+            result.OldTarget,
+            result.NewTarget,
+            result.InFlight);
+        LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "worker-pool-reload");
+    }
+
+    /// <summary>
     /// Emits the effective per-agent caps to the log so operators can confirm
     /// (a) what the config-binder actually produced at startup, and (b) what a
     /// hot-reload landed. Agents with no entry are listed as "unlimited" so
@@ -391,7 +439,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var summary = rendered.Count == 0 ? "<none>" : string.Join(", ", rendered);
         _log.LogInformation(
             "AgentConcurrency caps resolved ({Reason}): {Caps} (agents not listed are uncapped within global pool of {GlobalCap})",
-            reason, summary, _opts.MaxConcurrentWorkers);
+            reason, summary, _concurrencyGate.CurrentTarget);
     }
 
     /// <inheritdoc />
@@ -418,7 +466,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (kv.Value > 0) running[kv.Key] = kv.Value;
 
         return new ConcurrencyStateSnapshot(
-            GlobalMaxConcurrent: _opts.MaxConcurrentWorkers,
+            GlobalMaxConcurrent: _concurrencyGate.CurrentTarget,
             CurrentlyRunningTotal: Volatile.Read(ref _currentlyRunning),
             PerAgentCaps: caps,
             CurrentlyRunningPerAgent: running);
@@ -518,7 +566,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var ticks = Interlocked.Read(ref _lastSpawnAtTicks);
         var queuedCount = await _store.CountByStateAsync(WorkItemState.Queued, ct);
         return new(
-            _opts.MaxConcurrentWorkers,
+            _concurrencyGate.CurrentTarget,
             Volatile.Read(ref _currentlyRunning),
             queuedCount,
             ticks == 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero));
@@ -1009,7 +1057,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         break;
                     }
                 }
-                else if (!_concurrencyGate.Wait(0))
+                else if (!_concurrencyGate.TryEnter())
                 {
                     break;
                 }
