@@ -18,7 +18,6 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly ILogger<SqliteWorkerRegistry>? _logger;
-    private readonly Action<IDisposable> _disposeConnection;
     private readonly int _commandTimeoutSeconds;
     private int _disposed;
 
@@ -26,22 +25,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         string path,
         ILogger<SqliteWorkerRegistry>? logger = null,
         int busyTimeoutMilliseconds = 30000)
-        : this(
-            path,
-            logger,
-            busyTimeoutMilliseconds,
-            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace)
-    {
-    }
-
-    internal SqliteWorkerRegistry(
-        string path,
-        ILogger<SqliteWorkerRegistry>? logger,
-        int busyTimeoutMilliseconds,
-        Action<IDisposable> disposeConnection)
     {
         _logger = logger;
-        _disposeConnection = disposeConnection ?? throw new ArgumentNullException(nameof(disposeConnection));
         _commandTimeoutSeconds = Math.Max(1, (int)Math.Ceiling(Math.Max(1, busyTimeoutMilliseconds) / 1000.0));
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
@@ -277,7 +262,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
         try
         {
-            _disposeConnection(_conn);
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(_conn);
         }
         finally
         {

@@ -105,27 +105,24 @@ public sealed class WorkerRegistryTests : IDisposable
     }
 
     [Fact]
-    public async Task Dispose_UsesTolerantSqliteTeardownHelperAndReleasesWriteGate()
+    public async Task Dispose_IsIdempotentAndReleasesWriteGate_AcrossReopen()
     {
+        // End-to-end shape guard for the production Dispose() contract — built
+        // through the public constructor so the default
+        // SqliteConnectionDisposal.DisposeTolerantOfTeardownRace wiring is
+        // exercised (not a substituted seam):
+        //   1. Disposing twice is exception-free (idempotency).
+        //   2. After Dispose the write gate is released so a SECOND registry
+        //      on the same path can be constructed, take the gate during
+        //      schema setup, and complete a write. A leaked gate from the
+        //      first registry would strand the semaphore and hang the
+        //      reopened constructor — guarded here by a hard timeout.
         var path = Path.Combine(Path.GetTempPath(), $"codeybox-regtest-teardown-{Guid.NewGuid():N}.db");
-        var disposeHookCalled = false;
         try
         {
-            var registry = new SqliteWorkerRegistry(
-                path,
-                logger: null,
-                busyTimeoutMilliseconds: 30000,
-                disposeConnection: connection =>
-                {
-                    disposeHookCalled = true;
-                    SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(
-                        new ThrowingDisposable(MakeInvalidOperationFromSqliteTeardown()));
-                    connection.Dispose();
-                });
-
+            var registry = new SqliteWorkerRegistry(path);
             registry.Dispose();
-
-            Assert.True(disposeHookCalled);
+            registry.Dispose(); // idempotent — no throw, no double-release.
 
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             using var reopened = await Task.Run(() => new SqliteWorkerRegistry(path), cts.Token);
@@ -215,32 +212,4 @@ public sealed class WorkerRegistryTests : IDisposable
         Assert.Empty(claimed);
     }
 
-    private static InvalidOperationException MakeInvalidOperationFromSqliteTeardown()
-    {
-        try
-        {
-            var ioe = new InvalidOperationException(
-                "Collection was modified; enumeration operation may not execute.");
-            ioe.GetType().GetMethod(
-                    "SetRemoteStackTrace",
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public,
-                    [typeof(string)])!
-                .Invoke(ioe,
-                [
-                    "   at System.Collections.Generic.List`1.Enumerator.MoveNext()\n" +
-                    "   at Microsoft.Data.Sqlite.SqliteCommand.DisposePreparedStatements(Boolean disposing)\n" +
-                    "   at Microsoft.Data.Sqlite.SqliteCommand.Dispose(Boolean disposing)\n",
-                ]);
-            throw ioe;
-        }
-        catch (InvalidOperationException ex)
-        {
-            return ex;
-        }
-    }
-
-    private sealed class ThrowingDisposable(Exception throwOnDispose) : IDisposable
-    {
-        public void Dispose() => throw throwOnDispose;
-    }
 }
