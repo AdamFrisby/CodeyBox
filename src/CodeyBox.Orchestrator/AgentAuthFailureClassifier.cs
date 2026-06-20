@@ -38,6 +38,15 @@ public interface IAgentAuthFailureClassifier
     /// first, then falling back to the runner's own classifier.
     /// </summary>
     AgentFailureClassification ClassifyFailure(IAgentRunner runner, AgentResult result);
+
+    /// <summary>
+    /// Loose stdout fragment check: returns true when any line of stdout looks
+    /// like a CLI login prompt OR any operator-configured stdout pattern for
+    /// this agent matches. Used by the LLM-audit-execution-failure fallback,
+    /// where the structured classifier's trusted-transcript guard would
+    /// otherwise miss an auth prompt buried in audit-tool diagnostics.
+    /// </summary>
+    bool ContainsAuthRequiredFragmentInStdout(AgentKind kind, string? stdout);
 }
 
 public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
@@ -79,6 +88,28 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         }
 
         return runner.ClassifyFailure(result);
+    }
+
+    public bool ContainsAuthRequiredFragmentInStdout(AgentKind kind, string? stdout)
+    {
+        if (AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout))
+            return true;
+
+        if (string.IsNullOrEmpty(stdout)
+            || string.IsNullOrWhiteSpace(kind.Value)
+            || !_additionalPatternsByAgent.TryGetValue(kind.Value, out var patterns))
+        {
+            return false;
+        }
+
+        foreach (var pattern in patterns)
+        {
+            if (!pattern.MatchesStdout || string.IsNullOrWhiteSpace(pattern.Pattern))
+                continue;
+            if (stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 }
 

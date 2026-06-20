@@ -154,6 +154,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IQuotaFailureClassifier _quotaClassifier;
     private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
+    private readonly IAgentAuthRequiredHandler _authRequiredHandler;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
@@ -361,6 +362,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
         _authAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
+        _authRequiredHandler = new AgentAuthRequiredHandler(_authAvailability, _webhooks, _log);
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
         _agentSupervision = agentSupervision;
@@ -1662,7 +1664,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     item.Id, exhaustedRunner.Kind.Value, ex.Message);
                 await TransitionFailed(
                     item,
-                    BuildAuthRequiredReason("session-resume", authDetection.Classification, authDetection.IsStdoutOnly),
+                    _authRequiredHandler.BuildReason("session-resume", authDetection.Classification, authDetection.IsStdoutOnly),
                     CancellationToken.None,
                     project,
                     failureKind: WorkItemFailureKinds.AuthRequired);
@@ -5375,10 +5377,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             };
         }
 
-        var reason = BuildAuthRequiredReason(phase, classification, stdoutOnlyEvidence, stdoutOnlyNote);
+        var reason = _authRequiredHandler.BuildReason(phase, classification, stdoutOnlyEvidence, stdoutOnlyNote);
 
         if (publishSideEffects)
-            await PublishAuthRequiredSideEffectsAsync(item, project, agent, reason, ct);
+            await _authRequiredHandler.PublishSideEffectsAsync(agent, reason, item, project, ct: ct);
 
         if (throwOnMatch)
             throw new AgentAuthRequiredException(agent, phase, reason);
@@ -5454,56 +5456,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             || reason.Contains("login", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("credential", StringComparison.OrdinalIgnoreCase)
             || reason.Contains("unauthoriz", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private async Task PublishAuthRequiredSideEffectsAsync(
-        WorkItem? item,
-        Project project,
-        AgentKind agent,
-        string reason,
-        CancellationToken ct)
-    {
-        _ = ct;
-        AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
-
-        // AuthRequired is intentionally outside the smoke-gate taxonomy:
-        // if the operator disables the master smoke switch
-        // (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/MissingProbe
-        // exclusions are ignored at dispatch — but authoritative runtime
-        // login-prompt evidence means the binary is broken, so
-        // AuthRequired survives the smoke-disabled gate via
-        // AgentAvailabilityRegistry.IsNonSmokeExclusion.
-        var transition = _authAvailability.MarkAuthRequired(agent, reason);
-
-        if (transition.SourceChanged)
-        {
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "agent.smoke_failed",
-                WorkItem = item,
-                Project = project,
-                Details = new AgentSmokeFailedDetails
-                {
-                    AgentKind = agent.Value,
-                    Reason = reason,
-                    Category = SmokeFailureCategory.Persistent,
-                },
-            }, CancellationToken.None);
-        }
-    }
-
-    private static string BuildAuthRequiredReason(
-        string phase,
-        AgentFailureClassification classification,
-        bool stdoutOnlyEvidence,
-        string? stdoutOnlyNote = null)
-    {
-        var reasonDetail = classification.Reason ?? "login prompt matched";
-        if (stdoutOnlyEvidence)
-            reasonDetail = $"{reasonDetail}; {stdoutOnlyNote ?? "stdout accepted as authoritative CLI output for this phase"}";
-
-        return SingleLineSummary(
-            $"auth required from agent output during {phase}: {reasonDetail}");
     }
 
     private Task ThrowIfAuthRequiredOutputAsync(
@@ -8488,9 +8440,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // stdout login fragments here so auth wins over a companion quota
         // diagnostic for the item outcome. Forced smoke corroboration is attempted
         // for stdout-only evidence, but an unavailable probe cannot leave a matched
-        // login prompt routable.
+        // login prompt routable. Routed through the injected classifier so
+        // operator-configured stdout patterns participate alongside defaults.
         if (IsLlmAgentExecutionFailure(run.Result)
-            && AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout))
+            && _authFailureClassifier.ContainsAuthRequiredFragmentInStdout(run.Runner.Kind, stdout))
         {
             await HandleAuthRequiredDetectionAsync(
                 item,
@@ -9944,13 +9897,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (detection is not { Classification.Kind: AgentFailureKind.AuthRequired })
                 return null;
 
-            var reason = BuildAuthRequiredReason(phase, detection.Classification, detection.IsStdoutOnly);
-            await PublishAuthRequiredSideEffectsAsync(
-                trialItem,
-                project,
+            var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
+            await _authRequiredHandler.PublishSideEffectsAsync(
                 runner.Kind,
                 reason,
-                token).ConfigureAwait(false);
+                trialItem,
+                project,
+                ct: token).ConfigureAwait(false);
 
             return new AgentAuthRequiredException(runner.Kind, phase, reason);
         }
@@ -10785,34 +10738,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Normalises a reason string for log / webhook serialisation: strips
-    /// CR/LF and other control characters (replaced with spaces) so plain-text
-    /// log sinks cannot be spoofed by embedded newlines (CWE-117), collapses
-    /// runs of whitespace, and trims. Returns an empty string for null input.
+    /// Reason-string normaliser shared with <see cref="ReleaseService"/> via the
+    /// auth-required handler. Strips CR/LF and other control characters (replaced
+    /// with spaces) so plain-text log sinks cannot be spoofed by embedded
+    /// newlines (CWE-117), collapses runs of whitespace, and trims. Returns an
+    /// empty string for null input.
     /// </summary>
     internal static string SingleLineSummary(string? text)
-    {
-        if (string.IsNullOrEmpty(text)) return "";
-        var sb = new StringBuilder(text.Length);
-        var lastWasSpace = false;
-        foreach (var ch in text)
-        {
-            if (ch is '\r' or '\n' or '\t' || char.IsControl(ch))
-            {
-                if (!lastWasSpace) { sb.Append(' '); lastWasSpace = true; }
-            }
-            else if (ch == ' ')
-            {
-                if (!lastWasSpace) { sb.Append(' '); lastWasSpace = true; }
-            }
-            else
-            {
-                sb.Append(ch);
-                lastWasSpace = false;
-            }
-        }
-        return sb.ToString().Trim();
-    }
+        => AgentAuthRequiredHandler.SingleLineSummary(text);
 
     /// <summary>
     /// Merge phase: invoke the work-item's agent inside a sandbox to perform

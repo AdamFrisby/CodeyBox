@@ -517,6 +517,11 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
 
         Assert.Contains("merge-security-review", ex.Message);
         Assert.Contains("forced in-VM smoke corroboration unavailable", ex.Message);
+        // ex.Agent and ex.Phase are load-bearing for downstream catch sites that
+        // attribute benching/webhook publishing — pin them so a regression that
+        // stamps the fallback runner or a wrong phase string surfaces here.
+        Assert.Equal(AgentKind.Claude, ex.Agent);
+        Assert.Equal("merge-security-review", ex.Phase);
         var current = availability.GetAvailability(AgentKind.Claude);
         Assert.False(current.Available, current.Reason);
         var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");

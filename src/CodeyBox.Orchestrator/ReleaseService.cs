@@ -42,7 +42,7 @@ public sealed class ReleaseService
     private readonly IAgentStreamStore? _agentStreams;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
-    private readonly IAgentAuthAvailabilityRegistry _authAvailability;
+    private readonly IAgentAuthRequiredHandler _authRequiredHandler;
 
     // Hot-reloadable deep-audit concurrency gate — resolved from IOptionsMonitor on every
     // acquire/remediate call so config edits take effect without restart.
@@ -93,7 +93,8 @@ public sealed class ReleaseService
         _agentStreams = agentStreams;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
-        _authAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
+        var resolvedAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
+        _authRequiredHandler = new AgentAuthRequiredHandler(resolvedAvailability, _webhooks, _log);
     }
 
     private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)
@@ -674,31 +675,28 @@ public sealed class ReleaseService
             return;
 
         var phase = $"release-deep-audit:{auditor.Name}";
-        var reasonDetail = detection.Classification.Reason ?? "login prompt matched";
-        if (detection.IsStdoutOnly)
-            reasonDetail = $"{reasonDetail}; stdout accepted for release failure only because deep-audit stdout is model-controlled";
-        var reason = SingleLineSummary(
-            $"auth required from agent output during {phase} for release {release.Id}: {reasonDetail}");
+        // Deep-audit stdout is model-controlled prose, so a stdout-only login-
+        // prompt match fails the release but does not bench the agent globally —
+        // override the handler's default stdout-only annotation to record that
+        // distinction in the reason string.
+        var stdoutOnlyNote = detection.IsStdoutOnly
+            ? "stdout accepted for release failure only because deep-audit stdout is model-controlled"
+            : null;
+        var reason = _authRequiredHandler.BuildReason(
+            phase,
+            detection.Classification,
+            detection.IsStdoutOnly,
+            stdoutOnlyNote,
+            release);
 
         if (!detection.IsStdoutOnly)
         {
-            AuditLog.AgentSmokeFailed(runner.Kind, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
-            var transition = _authAvailability.MarkAuthRequired(runner.Kind, reason);
-            if (transition.SourceChanged)
-            {
-                await _webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = "agent.smoke_failed",
-                    Project = project,
-                    Release = release,
-                    Details = new AgentSmokeFailedDetails
-                    {
-                        AgentKind = runner.Kind.Value,
-                        Reason = reason,
-                        Category = SmokeFailureCategory.Persistent,
-                    },
-                }, CancellationToken.None);
-            }
+            await _authRequiredHandler.PublishSideEffectsAsync(
+                runner.Kind,
+                reason,
+                project: project,
+                release: release,
+                ct: ct);
         }
 
         throw new AgentAuthRequiredException(runner.Kind, phase, reason);
@@ -767,16 +765,6 @@ public sealed class ReleaseService
         providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase) ||
         providerName.Equals("process", StringComparison.OrdinalIgnoreCase);
 
-    private static string SingleLineSummary(string value)
-    {
-        var normalized = value
-            .Replace("\r", " ", StringComparison.Ordinal)
-            .Replace("\n", " ", StringComparison.Ordinal)
-            .Replace("\t", " ", StringComparison.Ordinal);
-        while (normalized.Contains("  ", StringComparison.Ordinal))
-            normalized = normalized.Replace("  ", " ", StringComparison.Ordinal);
-        return normalized.Length <= 500 ? normalized : normalized[..500] + "...";
-    }
 
     private IAgentRunner WrapPromptPreprocessedRunner(
         IAgentRunner runner,

@@ -5041,7 +5041,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
     internal const int AgentOutputHttpSetupFailedExitCode = 86;
     private const int DetachedProcessGroupMalformedExitCode = 73;
-    private const int DetachedSupervisorSetupFailedExitCode = 88;
+    internal const int DetachedSupervisorSetupFailedExitCode = 88;
+    // Wall-clock seconds the supervisor will wait for the detached child to
+    // publish its process-group marker file before SIGTERM/SIGKILL'ing the
+    // child and reporting the supervisor-setup failure. Replaces the prior
+    // iteration-count loop (50 × 0.1s sleeps) so that a hung `multipass exec`
+    // round-trip can't silently extend the wait beyond a bounded budget.
+    internal const int DetachedMarkerTimeoutSeconds = 5;
     private const int DetachedPollFailureLimit = 5;
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
     internal const string AgentOutputHttpSetupFailureMarker =
