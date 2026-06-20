@@ -599,6 +599,30 @@ from the walk by default so a vanilla config does not trip the check:
 - `CodeyBox:Plugins`
 - `CodeyBox:DangerouslyDisableAuth` — read directly via
   `IConfiguration.GetValue<bool>` for the bearer-token middleware.
+- Per-agent credential-file leaf keys read directly via
+  `builder.Configuration["CodeyBox:…"]` when the matching `CODEYBOX_…_FILE`
+  env var is unset: `CodeyBox:ClaudeOAuthFile`, `CodeyBox:CodexOAuthFile`,
+  `CodeyBox:GeminiOAuthFile`, `CodeyBox:GeminiSettingsFile`,
+  `CodeyBox:CursorAuthFile`, `CodeyBox:OpencodeAuthFile`,
+  `CodeyBox:OpencodeAuthDestPath`, `CodeyBox:GeminiOauthClientId`,
+  `CodeyBox:GeminiOauthClientSecret`.
+
+The inspector also understands the two operator-keyed map shapes that
+`ProjectsOptionsBinder.ApplyCustomMaps` reads:
+
+- `Audit:Languages:Overrides:<lang-id>:…` — the per-language override map
+  documented in [`docs/languages.md`](languages.md). Operator-defined
+  language ids are accepted as dictionary keys; typos *inside* the
+  override value (e.g. `Replce` instead of `Replace`) are still flagged.
+- `Audit:AuditTypes:<id>:…` — the per-audit-type override map documented
+  in [`docs/audit-types.md`](audit-types.md). The inspector detects the
+  shape automatically (all-numeric keys → list form, any non-numeric key
+  → map form) and walks the override POCO under each id so unknown
+  sub-fields still surface.
+
+These two exemptions cascade through `Defaults:Audit`, every
+`Projects:<n>:Audit`, and every `…Audit:Profiles:<profile-id>:…` subtree
+because the binder applies the same custom-map logic at every depth.
 
 To exempt an operator extension namespace, add it to
 `ConfigValidation.UnboundKeys.AdditionalExemptPathPrefixes`. The whole

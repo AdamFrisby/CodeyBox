@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Reflection;
+using CodeyBox.Projects;
 using Microsoft.Extensions.Configuration;
 
 namespace CodeyBox.Api;
@@ -106,6 +107,8 @@ public static class UnboundConfigKeyInspector
 
             if (properties.TryGetValue(child.Key, out var prop))
             {
+                if (TryWalkCustomBoundSection(child, prop, reports, exempt))
+                    continue;
                 Walk(child, prop.PropertyType, reports, exempt);
             }
             else
@@ -116,6 +119,109 @@ public static class UnboundConfigKeyInspector
                     NearestProperty = NearestPropertyName(child.Key, properties.Keys),
                 });
             }
+        }
+    }
+
+    /// <summary>
+    /// Sections whose typed property does not match the shape
+    /// <see cref="ProjectsOptionsBinder.ApplyCustomMaps"/> actually accepts at
+    /// runtime. The property is declared as <c>List&lt;string&gt;?</c> but the
+    /// binder also reads a string-keyed map under it; the naive walker would
+    /// flag every documented operator key as unbound. Dispatch to a custom
+    /// walker that mirrors the binder's detection rules.
+    /// </summary>
+    private static bool TryWalkCustomBoundSection(
+        IConfigurationSection child,
+        PropertyInfo prop,
+        List<UnboundConfigKeyReport> reports,
+        HashSet<string> exempt)
+    {
+        if (prop.DeclaringType != typeof(ProjectAuditConfig))
+            return false;
+
+        if (string.Equals(prop.Name, nameof(ProjectAuditConfig.Languages), StringComparison.Ordinal))
+        {
+            WalkLanguagesSection(child, reports, exempt);
+            return true;
+        }
+
+        if (string.Equals(prop.Name, nameof(ProjectAuditConfig.AuditTypes), StringComparison.Ordinal))
+        {
+            WalkAuditTypesSection(child, reports, exempt);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Walks <c>Audit:Languages</c>, which the binder accepts in two shapes
+    /// simultaneously: numeric-indexed string entries (the typed
+    /// <see cref="List{T}"/> form) plus an <c>Overrides</c> sub-section that
+    /// <see cref="ProjectsOptionsBinder.ApplyLanguageMap"/> reads as
+    /// <c>Dictionary&lt;string, <see cref="ProjectLanguagePresetOverrideConfig"/>&gt;</c>.
+    /// </summary>
+    private static void WalkLanguagesSection(
+        IConfigurationSection node,
+        List<UnboundConfigKeyReport> reports,
+        HashSet<string> exempt)
+    {
+        foreach (var child in node.GetChildren())
+        {
+            if (exempt.Contains(child.Path))
+                continue;
+
+            if (int.TryParse(child.Key, out _))
+            {
+                // List form — element is a string leaf; any sub-key is junk.
+                Walk(child, typeof(string), reports, exempt);
+                continue;
+            }
+
+            if (string.Equals(child.Key, "Overrides", StringComparison.OrdinalIgnoreCase))
+            {
+                // Map form — operator-keyed dict of language id to override
+                // POCO. Keys are arbitrary; recurse with the override type so
+                // typos inside the override (e.g. "Replce") still flag.
+                foreach (var langChild in child.GetChildren())
+                {
+                    if (exempt.Contains(langChild.Path))
+                        continue;
+                    Walk(langChild, typeof(ProjectLanguagePresetOverrideConfig), reports, exempt);
+                }
+                continue;
+            }
+
+            // Any other sub-key under Languages is junk (neither a list index
+            // nor the documented Overrides map).
+            reports.Add(new UnboundConfigKeyReport { Path = child.Path });
+        }
+    }
+
+    /// <summary>
+    /// Walks <c>Audit:AuditTypes</c>, which the binder reads as either a
+    /// numeric-indexed list of audit-type ids or, via
+    /// <see cref="ProjectsOptionsBinder.ApplyAuditTypeMap"/>, a string-keyed
+    /// map of audit-type id to <see cref="ProjectAuditTypeOverrideConfig"/>.
+    /// </summary>
+    private static void WalkAuditTypesSection(
+        IConfigurationSection node,
+        List<UnboundConfigKeyReport> reports,
+        HashSet<string> exempt)
+    {
+        var children = node.GetChildren().ToList();
+        if (children.Count == 0)
+            return;
+
+        // Detection mirrors ApplyAuditTypeMap: all-numeric → list, any
+        // non-numeric → map. Walk each surface accordingly.
+        var allNumeric = children.All(c => int.TryParse(c.Key, out _));
+        var elementType = allNumeric ? typeof(string) : typeof(ProjectAuditTypeOverrideConfig);
+        foreach (var child in children)
+        {
+            if (exempt.Contains(child.Path))
+                continue;
+            Walk(child, elementType, reports, exempt);
         }
     }
 

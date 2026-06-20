@@ -43,6 +43,19 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
         // Read directly via IConfiguration.GetValue<bool>(ApiKeyAuth.DisableConfigKey)
         // rather than through the typed options graph.
         "CodeyBox:DangerouslyDisableAuth",
+        // Direct-config leaf keys for per-agent credential file paths and
+        // OAuth client secrets. Read via builder.Configuration["CodeyBox:…"]
+        // when the matching CODEYBOX_…_FILE env var is unset; no matching
+        // property exists on CodeyBoxOptions / ProjectsOptions.
+        "CodeyBox:ClaudeOAuthFile",
+        "CodeyBox:CodexOAuthFile",
+        "CodeyBox:GeminiOAuthFile",
+        "CodeyBox:GeminiSettingsFile",
+        "CodeyBox:CursorAuthFile",
+        "CodeyBox:OpencodeAuthFile",
+        "CodeyBox:OpencodeAuthDestPath",
+        "CodeyBox:GeminiOauthClientId",
+        "CodeyBox:GeminiOauthClientSecret",
     };
 
     private readonly IConfiguration _config;

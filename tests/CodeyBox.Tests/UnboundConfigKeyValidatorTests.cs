@@ -192,6 +192,153 @@ public sealed class UnboundConfigKeyValidatorTests
     }
 
     [Fact]
+    public void Inspect_ExemptsDirectConfigOAuthLeafKeys()
+    {
+        // CodeyBox:ClaudeOAuthFile / CodexOAuthFile / GeminiOAuthFile /
+        // GeminiSettingsFile / CursorAuthFile / OpencodeAuthFile /
+        // OpencodeAuthDestPath / GeminiOauthClientId / GeminiOauthClientSecret
+        // are read directly via builder.Configuration["CodeyBox:…"] in
+        // Program.cs; they have no matching property on CodeyBoxOptions or
+        // ProjectsOptions. Strict-mode startup must NOT fail for operators
+        // who set these documented credential-file pointers in appsettings.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:ClaudeOAuthFile"] = "/home/op/.claude/.credentials.json",
+            ["CodeyBox:CodexOAuthFile"] = "/home/op/.codex/auth.json",
+            ["CodeyBox:GeminiOAuthFile"] = "/home/op/.gemini/oauth_creds.json",
+            ["CodeyBox:GeminiSettingsFile"] = "/home/op/.gemini/settings.json",
+            ["CodeyBox:CursorAuthFile"] = "/home/op/.config/cursor/auth.json",
+            ["CodeyBox:OpencodeAuthFile"] = "/home/op/.local/share/opencode/auth.json",
+            ["CodeyBox:OpencodeAuthDestPath"] = "/home/ubuntu/.local/share/opencode/auth.json",
+            ["CodeyBox:GeminiOauthClientId"] = "client-id",
+            ["CodeyBox:GeminiOauthClientSecret"] = "client-secret",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
+    public void Inspect_ExemptsLanguagesOverridesMapShape()
+    {
+        // ProjectsOptionsBinder.ApplyLanguageMap reads Audit:Languages:Overrides
+        // as a dict<lang-id, ProjectLanguagePresetOverrideConfig> even though
+        // ProjectAuditConfig.Languages is typed List<string>?. Documented in
+        // docs/languages.md:65-90. Default-strict startup must NOT flag the
+        // documented map shape.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Defaults:Audit:Languages:0"] = "csharp",
+            ["CodeyBox:Defaults:Audit:Languages:Overrides:csharp:Replace"] = "true",
+            ["CodeyBox:Defaults:Audit:Languages:Overrides:csharp:Auditors:0:Name"] = "csharp:test-pass",
+            ["CodeyBox:Defaults:Audit:Languages:Overrides:csharp:Auditors:0:Argv:0"] = "dotnet",
+            ["CodeyBox:Defaults:Audit:Languages:Overrides:csharp:Auditors:0:Argv:1"] = "test",
+            ["CodeyBox:Projects:0:Id"] = "alpha",
+            ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example/repo.git",
+            ["CodeyBox:Projects:0:Audit:Languages:Overrides:python:Replace"] = "false",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
+    public void Inspect_FlagsTypoInsideLanguagesOverridesOverrideValue()
+    {
+        // Map shape is exempt at the key level (lang ids are operator-defined),
+        // but the override VALUE must still be validated — a typo like
+        // "Replce" or an unknown sub-field has to surface.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Defaults:Audit:Languages:Overrides:csharp:NotARealField"] = "x",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal(
+            "CodeyBox:Defaults:Audit:Languages:Overrides:csharp:NotARealField",
+            report.Path);
+    }
+
+    [Fact]
+    public void Inspect_ExemptsAuditTypesMapShape()
+    {
+        // ProjectsOptionsBinder.ApplyAuditTypeMap accepts Audit:AuditTypes as
+        // a string-keyed dict of audit-type id to ProjectAuditTypeOverrideConfig
+        // even though the typed property is List<string>?. Documented in
+        // docs/audit-types.md:43-65 and docs/projects.md:118-133.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Defaults:Audit:AuditTypes:security:ReviewFocus"] = "- Project-specific auth checks",
+            ["CodeyBox:Defaults:Audit:AuditTypes:security:Auditors:0:Name"] = "security:custom-scanner",
+            ["CodeyBox:Defaults:Audit:AuditTypes:security:Auditors:0:Argv:0"] = "custom-scan",
+            ["CodeyBox:Defaults:Audit:AuditTypes:completeness:ReviewFocus"] = "- Acceptance criteria",
+            ["CodeyBox:Projects:0:Id"] = "alpha",
+            ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example/repo.git",
+            ["CodeyBox:Projects:0:Audit:AuditTypes:security:Replace"] = "true",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
+    public void Inspect_ExemptsAuditTypesListShape()
+    {
+        // The legacy list form (all-numeric keys) must keep working alongside
+        // the map shape exemption.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Defaults:Audit:AuditTypes:0"] = "security",
+            ["CodeyBox:Defaults:Audit:AuditTypes:1"] = "completeness",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
+    public void Inspect_FlagsTypoInsideAuditTypesMapOverrideValue()
+    {
+        // Map shape is exempt at the key level, but the override VALUE must
+        // still be validated. A typo inside the per-audit-type override must
+        // still surface.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Defaults:Audit:AuditTypes:security:NotARealField"] = "x",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal(
+            "CodeyBox:Defaults:Audit:AuditTypes:security:NotARealField",
+            report.Path);
+    }
+
+    [Fact]
+    public void Inspect_ExemptsMapShapesInsideProfilesSubsection()
+    {
+        // Profiles<id> is Dictionary<string, ProjectAuditConfig>, so the
+        // custom-binder map handling has to cascade — i.e. the same exemption
+        // must apply inside named profiles.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Defaults:Audit:Profiles:default:Languages:Overrides:csharp:Replace"] = "true",
+            ["CodeyBox:Defaults:Audit:Profiles:default:AuditTypes:security:ReviewFocus"] = "x",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
     public void Inspect_LeafSectionsWithChildKeysAreFlagged()
     {
         // MaxTemplateChecks is int; any subkey is junk.
