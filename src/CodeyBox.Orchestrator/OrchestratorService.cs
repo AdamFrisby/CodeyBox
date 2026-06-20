@@ -419,6 +419,23 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             result.NewTarget,
             result.InFlight);
         LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "worker-pool-reload");
+
+        // Grow path: the gate's DrainWaiters only wakes callers parked on
+        // _concurrencyGate.WaitAsync. In the typical steady state the
+        // dispatcher has filled the inner loop (TryEnter returned false),
+        // exited it, and is parked back on DequeueDispatchSignalAsync — NOT
+        // on the gate. Without an explicit kick, the new capacity wouldn't
+        // be used until the next slot-release fans wakes out. Enqueue one
+        // wake per new slot so the dispatcher exits its sleep on the kick
+        // channel and re-evaluates against the freshly-grown ceiling. Each
+        // wake is a "rescan the store" signal; surplus wakes when nothing
+        // is queued cost only a no-op dispatcher pass.
+        if (result.NewTarget > result.OldTarget)
+        {
+            var delta = result.NewTarget - result.OldTarget;
+            for (var i = 0; i < delta; i++)
+                _ = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
+        }
     }
 
     /// <summary>
@@ -444,6 +461,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     /// <inheritdoc />
     public int CurrentlyRunningTotal => Volatile.Read(ref _currentlyRunning);
+
+    /// <inheritdoc />
+    public int MaxConcurrent => _concurrencyGate.CurrentTarget;
 
     /// <summary>
     /// Snapshot of concurrency state for the <c>/concurrency</c> endpoint:
@@ -852,11 +872,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private async ValueTask EnqueueSlotReleasedDispatchWakeAsync(WorkerSlotLease lease, CancellationToken ct)
     {
         await ClearReadyRefactorGateDeferralsForSlotReleaseAsync(lease, ct);
-
-        var freeSlots = Math.Max(1, _opts.MaxConcurrentWorkers - Math.Max(0, Volatile.Read(ref _currentlyRunning)));
+        var freeSlots = ComputeSlotReleaseWakeBudget();
         for (var wake = 0; wake < freeSlots; wake++)
             await EnqueueRequiredDispatchWakeAsync(lease, ct);
     }
+
+    // Read the live ceiling from the gate so the wake fan-out honors a
+    // hot-reload of WorkerPool:MaxConcurrentWorkers. Reading the captured
+    // _opts.MaxConcurrentWorkers here would under-enqueue wakes after a
+    // grow (newly-available slots wouldn't refill until later releases)
+    // and over-enqueue after a shrink.
+    private int ComputeSlotReleaseWakeBudget() =>
+        Math.Max(1, _concurrencyGate.CurrentTarget - Math.Max(0, Volatile.Read(ref _currentlyRunning)));
 
     private async ValueTask ClearReadyRefactorGateDeferralsForSlotReleaseAsync(
         WorkerSlotLease lease,
@@ -1589,6 +1616,28 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // PinnedPipelineRunner-based integration tests do not produce.
     internal bool TryReserveAgentSlotForTest(AgentKind agent) => TryReserve(agent);
     internal void ReleaseAgentSlotForTest(AgentKind agent) => Release(agent);
+
+    // Loads/releases the global ResizableConcurrencyGate the dispatcher uses,
+    // distinct from the per-route TryReserve path above. Tests that exercise
+    // the shrink-doesn't-abort-in-flight contract at the orchestrator level
+    // need to actually occupy the global gate, not just the per-agent counters
+    // (the gate is the surface the resize operates on).
+    internal bool TryEnterGlobalConcurrencyGateForTest() => _concurrencyGate.TryEnter();
+    internal void ReleaseGlobalConcurrencyGateForTest() => _concurrencyGate.Release();
+    internal int GlobalConcurrencyGateInFlightForTest => _concurrencyGate.CurrentInFlight;
+
+    // Fires the same slot-release dispatch-wake fan-out the worker-completion
+    // path runs (EnqueueSlotReleasedDispatchWakeAsync), without requiring a
+    // real WorkerSlotLease. Tests use this to assert that the fan-out honors
+    // the live ceiling after a WorkerPool hot-reload — the regression that
+    // earlier read the captured _opts.MaxConcurrentWorkers would surface here
+    // as an off-by-(newTarget - oldTarget) wake count.
+    internal async ValueTask FireSlotReleasedWakeForTestAsync(CancellationToken ct = default)
+    {
+        var freeSlots = ComputeSlotReleaseWakeBudget();
+        for (var wake = 0; wake < freeSlots; wake++)
+            await _queue.EnqueueDispatchWakeAsync(ct);
+    }
 
     /// <summary>
     /// On startup, re-enqueue work items that were mid-flight when we last

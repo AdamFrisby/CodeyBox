@@ -15,6 +15,14 @@ public interface IWorkerPoolOccupancy
     /// Number of worker slots currently occupied by an in-flight pipeline run.
     /// </summary>
     int CurrentlyRunningTotal { get; }
+
+    /// <summary>
+    /// Live admission ceiling — equivalent to the current
+    /// <c>CodeyBox:WorkerPool:MaxConcurrentWorkers</c> after any hot-reload.
+    /// The <c>codeybox.workers.max</c> gauge reads this so dashboards
+    /// reflect a resized pool without an orchestrator restart.
+    /// </summary>
+    int MaxConcurrent { get; }
 }
 
 /// <summary>
@@ -41,6 +49,15 @@ public sealed class DeferredWorkerPoolOccupancy : IWorkerPoolOccupancy
             // surface that as zero rather than propagating an ObjectDisposedException
             // through every concurrent listener.
             try { return _resolve().CurrentlyRunningTotal; }
+            catch (ObjectDisposedException) { return 0; }
+        }
+    }
+
+    public int MaxConcurrent
+    {
+        get
+        {
+            try { return _resolve().MaxConcurrent; }
             catch (ObjectDisposedException) { return 0; }
         }
     }

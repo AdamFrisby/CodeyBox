@@ -51,21 +51,35 @@ public sealed class WorkerPoolHotReloadTests
     {
         using var fixture = OrchFixture.Build(initialMaxConcurrent: 3);
 
-        // Reserve all three agent slots — these stand in for in-flight work
-        // items past the global gate. The reservation surface is the same one
-        // the dispatch loop uses.
-        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(AgentKind.Claude));
-        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(AgentKind.Claude));
-        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(AgentKind.Codex));
+        // Load the GLOBAL concurrency gate — the surface ApplyWorkerPoolReload
+        // resizes. Per-agent TryReserve calls would not exercise the gate at
+        // all, so a regression that reset gate state during Resize (instead
+        // of preserving in-flight permits) would still pass against the
+        // per-route dictionary.
+        Assert.True(fixture.Orchestrator.TryEnterGlobalConcurrencyGateForTest());
+        Assert.True(fixture.Orchestrator.TryEnterGlobalConcurrencyGateForTest());
+        Assert.True(fixture.Orchestrator.TryEnterGlobalConcurrencyGateForTest());
+        Assert.Equal(3, fixture.Orchestrator.GlobalConcurrencyGateInFlightForTest);
 
-        // Shrink the global pool well below the running count. The contract:
-        // running items stay running; only future admission is constrained.
+        // Shrink the global pool well below the in-flight count. The contract:
+        // existing permits keep their slots; only future admission is constrained.
         fixture.Orchestrator.ApplyWorkerPoolReload(1);
 
-        var state = fixture.Orchestrator.GetConcurrencyState();
-        Assert.Equal(1, state.GlobalMaxConcurrent);
-        Assert.Equal(3, state.CurrentlyRunningPerAgent["claude"]
-            + state.CurrentlyRunningPerAgent["codex"]);
+        Assert.Equal(1, fixture.Orchestrator.GetConcurrencyState().GlobalMaxConcurrent);
+        Assert.Equal(3, fixture.Orchestrator.GlobalConcurrencyGateInFlightForTest);
+
+        // Drain one permit and confirm the gate refuses to re-admit above
+        // the new ceiling until in-flight drops below it.
+        fixture.Orchestrator.ReleaseGlobalConcurrencyGateForTest();
+        Assert.Equal(2, fixture.Orchestrator.GlobalConcurrencyGateInFlightForTest);
+        Assert.False(fixture.Orchestrator.TryEnterGlobalConcurrencyGateForTest());
+
+        fixture.Orchestrator.ReleaseGlobalConcurrencyGateForTest();
+        fixture.Orchestrator.ReleaseGlobalConcurrencyGateForTest();
+        Assert.Equal(0, fixture.Orchestrator.GlobalConcurrencyGateInFlightForTest);
+        Assert.True(fixture.Orchestrator.TryEnterGlobalConcurrencyGateForTest());
+        Assert.False(fixture.Orchestrator.TryEnterGlobalConcurrencyGateForTest());
+        fixture.Orchestrator.ReleaseGlobalConcurrencyGateForTest();
     }
 
     [Theory]
@@ -134,6 +148,106 @@ public sealed class WorkerPoolHotReloadTests
         Assert.Equal(3, ctx.Orchestrator.GetConcurrencyState().GlobalMaxConcurrent);
     }
 
+    // ── Grow path kicks the dispatcher (dispatch-wake fan-out) ──────────────
+
+    [Fact]
+    public void ApplyWorkerPoolReload_Grow_EnqueuesDispatchWakesForNewSlots()
+    {
+        // The dispatcher's typical steady state is parked on
+        // DequeueDispatchSignalAsync (the kick channel), NOT on the gate. The
+        // gate's DrainWaiters does NOT kick the dispatcher in that state, so
+        // a grow that only resized the gate would leave the new capacity
+        // idle until the next slot-release. ApplyWorkerPoolReload must
+        // therefore enqueue (newTarget - oldTarget) dispatch wakes on grow.
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 2);
+        var before = fixture.Queue.Count;
+
+        fixture.Orchestrator.ApplyWorkerPoolReload(5);
+
+        var added = fixture.Queue.Count - before;
+        Assert.Equal(3, added);
+    }
+
+    [Fact]
+    public void ApplyWorkerPoolReload_Shrink_DoesNotEnqueueDispatchWakes()
+    {
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 5);
+        var before = fixture.Queue.Count;
+
+        fixture.Orchestrator.ApplyWorkerPoolReload(2);
+
+        var added = fixture.Queue.Count - before;
+        Assert.Equal(0, added);
+    }
+
+    [Fact]
+    public void ApplyWorkerPoolReload_SameValue_DoesNotEnqueueDispatchWakes()
+    {
+        // Idempotent reload (same value) must be a true no-op — no kick spam
+        // on every config-file save.
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 3);
+        var before = fixture.Queue.Count;
+
+        fixture.Orchestrator.ApplyWorkerPoolReload(3);
+
+        Assert.Equal(before, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task SlotReleaseWakeBudget_HonorsResizedCeiling_AfterShrink()
+    {
+        // The slot-released wake fan-out (EnqueueSlotReleasedDispatchWakeAsync)
+        // sizes itself off the live ceiling so a shrink visibly reduces the
+        // fan-out. The dispatch loop's TryEnter would converge regardless, but
+        // a stale read of _opts.MaxConcurrentWorkers here would over-enqueue
+        // after a shrink — the exact pattern the task brief flagged.
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 5);
+        fixture.Orchestrator.ApplyWorkerPoolReload(2);
+
+        // Drain the grow-wake buffer (if any) and the wakes the shrink
+        // itself did not enqueue, so the next reading isolates the
+        // slot-release fan-out cleanly.
+        await DrainQueueAsync(fixture.Queue);
+
+        // Mint one in-flight permit on the gate and release it through the
+        // same code path the dispatcher uses on worker completion.
+        Assert.True(fixture.Orchestrator.TryEnterGlobalConcurrencyGateForTest());
+        fixture.Orchestrator.ReleaseGlobalConcurrencyGateForTest();
+        // Fire one slot-released wake directly (the orchestrator's own
+        // completion path runs ReleaseCompletedWorkerSlotLeaseAsync, which
+        // is internal; the public observable is the wake count this method
+        // produces). The internal helper exposed for this test mirrors the
+        // production fan-out.
+        await fixture.Orchestrator.FireSlotReleasedWakeForTestAsync();
+
+        // freeSlots = max(1, target - inFlight) = max(1, 2 - 0) = 2.
+        Assert.Equal(2, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task SlotReleaseWakeBudget_HonorsResizedCeiling_AfterGrow()
+    {
+        // After a grow from 2 to 5, the slot-release wake fan-out must use
+        // the new ceiling (5) — a stale read of _opts.MaxConcurrentWorkers
+        // would only fan out 2 wakes, blunting the reload.
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 2);
+        fixture.Orchestrator.ApplyWorkerPoolReload(5);
+
+        await DrainQueueAsync(fixture.Queue);
+
+        await fixture.Orchestrator.FireSlotReleasedWakeForTestAsync();
+
+        // freeSlots = max(1, 5 - 0) = 5.
+        Assert.Equal(5, fixture.Queue.Count);
+    }
+
+    private static async Task DrainQueueAsync(InMemoryTaskQueue queue)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        while (queue.Count > 0)
+            await queue.DequeueDispatchSignalAsync(cts.Token);
+    }
+
     [Fact]
     public async Task Coordinator_OnChange_LegacyConcurrencyFallback_Applies()
     {
@@ -163,6 +277,7 @@ public sealed class WorkerPoolHotReloadTests
     private sealed class OrchFixture : IDisposable
     {
         public OrchestratorService Orchestrator { get; private init; } = null!;
+        public InMemoryTaskQueue Queue { get; private init; } = null!;
         private SqliteWorkItemStore? _store;
         private string? _dbPath;
 
@@ -172,15 +287,16 @@ public sealed class WorkerPoolHotReloadTests
                 Path.GetTempPath(),
                 $"cb-wp-hotreload-{Guid.NewGuid():N}.db");
             var store = new SqliteWorkItemStore(dbPath);
+            var queue = new InMemoryTaskQueue();
             var orch = new OrchestratorService(
-                new InMemoryTaskQueue(),
+                queue,
                 store,
                 new NoopPipeline(),
                 new CancellationRegistry(CancellationToken.None),
                 new OrchestratorOptions { MaxConcurrentWorkers = initialMaxConcurrent },
                 NullLogger<OrchestratorService>.Instance,
                 agentConcurrency: new AgentConcurrencyOptions());
-            return new OrchFixture { Orchestrator = orch, _store = store, _dbPath = dbPath };
+            return new OrchFixture { Orchestrator = orch, Queue = queue, _store = store, _dbPath = dbPath };
         }
 
         public void Dispose()

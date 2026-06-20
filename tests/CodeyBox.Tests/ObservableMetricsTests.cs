@@ -70,7 +70,7 @@ public sealed class ObservableMetricsTests : IDisposable
             new InertSandboxProvider(),
             new OrchestratorOptions { MaxConcurrentWorkers = 8 },
             NullLogger<CodeyBoxObservableMetrics>.Instance,
-            workerPool: new FakeWorkerPool(3),
+            workerPool: new FakeWorkerPool(3, max: 8),
             quotaSnapshot: null,
             refreshInterval: TimeSpan.FromMinutes(10));
         await svc.StartAsync(CancellationToken.None);
@@ -242,6 +242,37 @@ public sealed class ObservableMetricsTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkersMaxGauge_ReflectsHotReloadedPoolSize()
+    {
+        // codeybox.workers.max must observe the LIVE worker-pool ceiling so
+        // dashboards stay correct after a CodeyBox:WorkerPool:MaxConcurrentWorkers
+        // hot-reload. A regression that captured MaxConcurrentWorkers at
+        // construction would leave the gauge pinned to the startup value
+        // forever.
+        var store = new SqliteWorkItemStore(_dbPath);
+        var pool = new MutableWorkerPool(currentlyRunning: 0, maxConcurrent: 4);
+        using var svc = new CodeyBoxObservableMetrics(
+            store,
+            new InertSandboxProvider(),
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<CodeyBoxObservableMetrics>.Instance,
+            workerPool: pool,
+            quotaSnapshot: null,
+            refreshInterval: TimeSpan.FromMinutes(10));
+        await svc.StartAsync(CancellationToken.None);
+
+        var before = CollectLong(svc, "state", "codeybox.workers.max");
+        Assert.Contains(before, m => m.Instrument == "codeybox.workers.max" && m.Value == 4);
+
+        // Simulate a hot-reload that grew the pool.
+        pool.MaxConcurrent = 9;
+        var after = CollectLong(svc, "state", "codeybox.workers.max");
+        Assert.Contains(after, m => m.Instrument == "codeybox.workers.max" && m.Value == 9);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task ObservableCallbacks_ReturnNoMeasurements_AfterDispose()
     {
         var store = new FlakyFleetCountsStore(
@@ -344,14 +375,28 @@ public sealed class ObservableMetricsTests : IDisposable
 
     // ── Fakes ─────────────────────────────────────────────────────────────────
 
-    private sealed class FakeWorkerPool(int total) : IWorkerPoolOccupancy
+    private sealed class FakeWorkerPool(int total, int max = 0) : IWorkerPoolOccupancy
     {
         public int CurrentlyRunningTotal => total;
+        public int MaxConcurrent => max;
     }
 
     private sealed class ThrowingWorkerPool : IWorkerPoolOccupancy
     {
         public int CurrentlyRunningTotal => throw new ObjectDisposedException("worker-pool");
+        public int MaxConcurrent => throw new ObjectDisposedException("worker-pool");
+    }
+
+    private sealed class MutableWorkerPool : IWorkerPoolOccupancy
+    {
+        public MutableWorkerPool(int currentlyRunning, int maxConcurrent)
+        {
+            CurrentlyRunningTotal = currentlyRunning;
+            MaxConcurrent = maxConcurrent;
+        }
+
+        public int CurrentlyRunningTotal { get; set; }
+        public int MaxConcurrent { get; set; }
     }
 
     private sealed class FakeQuotaSnapshot(IReadOnlyList<(AgentKind, string?, double)> rows)
