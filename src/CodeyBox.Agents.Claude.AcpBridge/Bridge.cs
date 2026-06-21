@@ -30,6 +30,7 @@ internal sealed class Bridge : IAsyncDisposable
     private readonly Stream? _stdinOverride;
 
     private BridgeConfig _config = BridgeConfig.Default;
+    private Stream? _stdinStream;
     private TcpListener? _listener;
     private WebSocketConnection? _peer;
     private int _port;
@@ -73,18 +74,14 @@ internal sealed class Bridge : IAsyncDisposable
         // tear-down would silently leak the ~/.claude/ide/<port>.lock file
         // and the claude --ide subprocess tree.
         //
-        // Shutdown(0) cancels _cts which tells ReadStdinAsync's loop to
-        // exit, BUT StreamReader.ReadLineAsync(ct) over a stdin pipe on
-        // Linux is parked inside the read() syscall on the pipe fd, which
-        // does NOT honour managed cancellation — the read() only returns
-        // when bytes arrive or the writer closes the fd. For a signal-
-        // driven shutdown (sandbox tear-down via SIGTERM, terminal hangup
-        // via SIGHUP), the host has no reason to also close its end of the
-        // stdin pipe, so the cooperative path would hang RunAsync
-        // indefinitely. After Shutdown completes its cleanup we therefore
-        // start a watchdog that Environment.Exit's the process once the
-        // grace window expires. RunAsync still gets a chance to return
-        // cooperatively first; the watchdog is the belt-and-braces backstop.
+        // Shutdown(0) cancels _cts and closes the stdin stream to unblock
+        // ReadStdinAsync. StreamReader.ReadLineAsync(ct) over a stdin pipe on
+        // Linux can be parked inside a read() syscall that does not honour
+        // managed cancellation, and for signal-driven shutdown the host has no
+        // reason to also close its end of the pipe. After Shutdown completes
+        // cleanup we therefore start a watchdog that Environment.Exit's the
+        // process once the grace window expires. RunAsync still gets a chance
+        // to return cooperatively first; the watchdog is the backstop.
         _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
@@ -114,12 +111,15 @@ internal sealed class Bridge : IAsyncDisposable
     private async Task ReadStdinAsync(CancellationToken ct)
     {
         var inputStream = _stdinOverride ?? Console.OpenStandardInput();
+        _stdinStream = inputStream;
         using var stdin = new StreamReader(inputStream, Encoding.UTF8);
         while (!ct.IsCancellationRequested && !ShutdownStarted)
         {
             string? line;
             try { line = await stdin.ReadLineAsync(ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
+            catch (ObjectDisposedException) { return; }
+            catch (IOException) when (ShutdownStarted) { return; }
             if (line is null) return; // EOF
             if (line.Length == 0) continue;
             DispatchEnvelope(line);
@@ -512,10 +512,12 @@ internal sealed class Bridge : IAsyncDisposable
             catch (OperationCanceledException)
             {
                 // _cts cancelled by Shutdown — but Shutdown also terminates
-                // claude, so the WaitForExitAsync without the ct should
-                // succeed shortly. Fall through to the exit emit below.
-                try { await proc.WaitForExitAsync().ConfigureAwait(false); }
-                catch { return; }
+                // claude, so a short uncancelled wait should normally succeed.
+                // Keep it bounded: if SIGTERM/SIGKILL failed for any reason,
+                // cleanup must still release the bridge process instead of
+                // pinning RunAsync forever.
+                if (!await WaitForProcessExitAfterShutdownAsync(proc).ConfigureAwait(false))
+                    return;
             }
             catch (Exception) { return; }
             EmitClaudeExitOnce(proc);
@@ -626,6 +628,21 @@ internal sealed class Bridge : IAsyncDisposable
         try { _listener?.Stop(); } catch { }
         try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
         try { _cts.Cancel(); } catch { }
+        try { _stdinStream?.Dispose(); } catch { }
+    }
+
+    private static async Task<bool> WaitForProcessExitAfterShutdownAsync(Process proc)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
