@@ -68,9 +68,22 @@ internal sealed class Bridge : IAsyncDisposable
         // PosixSignalRegistration to be observed. Without these, an in-VM
         // tear-down would silently leak the ~/.claude/ide/<port>.lock file
         // and the claude --ide subprocess tree.
-        _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); });
-        _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); });
-        _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); });
+        //
+        // Shutdown(0) cancels _cts which tells ReadStdinAsync's loop to
+        // exit, BUT StreamReader.ReadLineAsync(ct) over a stdin pipe on
+        // Linux is parked inside the read() syscall on the pipe fd, which
+        // does NOT honour managed cancellation — the read() only returns
+        // when bytes arrive or the writer closes the fd. For a signal-
+        // driven shutdown (sandbox tear-down via SIGTERM, terminal hangup
+        // via SIGHUP), the host has no reason to also close its end of the
+        // stdin pipe, so the cooperative path would hang RunAsync
+        // indefinitely. After Shutdown completes its cleanup we therefore
+        // start a watchdog that Environment.Exit's the process once the
+        // grace window expires. RunAsync still gets a chance to return
+        // cooperatively first; the watchdog is the belt-and-braces backstop.
+        _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
+        _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
+        _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
 
         try
@@ -609,6 +622,28 @@ internal sealed class Bridge : IAsyncDisposable
             // hung child can never pin shutdown.
             try { p.Kill(entireProcessTree: true); } catch { }
         }
+    }
+
+    /// <summary>
+    /// Belt-and-braces watchdog the SIGTERM/SIGINT/SIGHUP handlers schedule
+    /// after running <see cref="Shutdown(int)"/>. Cooperative exit (RunAsync
+    /// returning normally after <c>_cts.Cancel()</c> unblocks the stdin read)
+    /// is preferred and happens first when the read does unblock; the
+    /// watchdog only fires if the read stayed parked past the grace window —
+    /// the regression mode this guards against. By the time this delay
+    /// elapses Shutdown has already deleted the lockfile, SIGTERM'd claude,
+    /// stopped the TCP listener and cancelled the CTS, so force-exit is
+    /// safe — the process simply leaves no half-cleaned state behind.
+    /// </summary>
+    private void ScheduleForceExitAfterSignal()
+    {
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(1500).ConfigureAwait(false); }
+            catch { }
+            try { Environment.Exit(_exitCode); }
+            catch { }
+        });
     }
 
     private static class NativeMethods
