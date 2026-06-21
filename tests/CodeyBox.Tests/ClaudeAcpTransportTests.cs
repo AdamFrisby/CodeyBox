@@ -653,23 +653,36 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
-    public async Task AcpClaudeTransport_OpenAsync_NoOverride_LoadsEmbeddedBridgeResource()
+    public async Task AcpClaudeTransport_OpenAsync_ProductionResourcePath_UsesActualEmbeddedResourceSentinel()
     {
         var sandbox = new BridgeSandbox();
-        var transport = new AcpClaudeTransport
-        {
-            // Force the transport through the production no-override path. The
-            // bytes come from AcpBridgeBinary.LoadBinary(), not BridgeBinaryOverride.
-            BridgePlaceholderOverride = false,
-        };
+        var transport = new AcpClaudeTransport();
         var request = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-embedded");
 
+        var resourceNames = typeof(AcpBridgeBinary).Assembly.GetManifestResourceNames();
+        Assert.Contains(AcpBridgeBinary.EmbeddedResourceName, resourceNames);
+
+        if (AcpBridgeBinary.IsPlaceholderBuild)
+        {
+            var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+                () => transport.OpenAsync(request, CancellationToken.None));
+            Assert.Contains("placeholder", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Empty(sandbox.AllExecs);
+            return;
+        }
+
         await using var session = await transport.OpenAsync(request, CancellationToken.None);
 
         var materialise = sandbox.AllExecs.Single();
-        Assert.Equal(Convert.ToBase64String(AcpBridgeBinary.LoadBinary()), materialise.Stdin);
+        var materialisedBytes = Convert.FromBase64String(materialise.Stdin!);
+        Assert.True(materialisedBytes.Length > 4);
+        Assert.Equal(0x7f, materialisedBytes[0]);
+        Assert.Equal((byte)'E', materialisedBytes[1]);
+        Assert.Equal((byte)'L', materialisedBytes[2]);
+        Assert.Equal((byte)'F', materialisedBytes[3]);
+        Assert.Equal(2, materialisedBytes[4]); // 64-bit ELF class.
     }
 
     [Fact]

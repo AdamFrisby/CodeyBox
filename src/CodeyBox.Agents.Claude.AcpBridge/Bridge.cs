@@ -617,11 +617,28 @@ internal sealed class Bridge : IAsyncDisposable
         if (Interlocked.Exchange(ref _claudeExitEmitted, 1) != 0) return;
         int exit;
         try { exit = proc.ExitCode; } catch { exit = -1; }
+        var signal = TryMapUnixSignalExit(exit);
         Emitter.Emit("claude_exit", w =>
         {
-            w.WriteNumber("code", exit);
-            w.WriteNull("signal");
+            if (signal is null) w.WriteNumber("code", exit);
+            else w.WriteNull("code");
+
+            if (signal is null) w.WriteNull("signal");
+            else w.WriteString("signal", signal);
         });
+    }
+
+    private static string? TryMapUnixSignalExit(int exitCode)
+    {
+        if (OperatingSystem.IsWindows()) return null;
+        return (exitCode - 128) switch
+        {
+            1 => "SIGHUP",
+            2 => "SIGINT",
+            9 => "SIGKILL",
+            15 => "SIGTERM",
+            _ => null,
+        };
     }
 
     private void MaybeFinish()
@@ -744,6 +761,7 @@ internal sealed class Bridge : IAsyncDisposable
             // wedged. Fall back to the original SIGKILL behaviour so a
             // hung child can never pin shutdown.
             try { p.Kill(entireProcessTree: true); } catch { }
+            try { p.WaitForExit(milliseconds: 500); } catch { }
         }
     }
 

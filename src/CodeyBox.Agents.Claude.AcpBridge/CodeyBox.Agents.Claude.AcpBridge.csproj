@@ -44,8 +44,7 @@
     <!-- Reflection-free JSON: source-generation only. -->
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
 
-    <!-- This binary never references InternalsVisibleTo into CodeyBox.Tests
-         and the solution-wide warnings-as-errors settings come from
+    <!-- The solution-wide warnings-as-errors settings come from
          Directory.Build.props. Keep nullable + analysis on so any port bug
          that survives the JS → C# rewrite gets caught by the analyser. -->
   </PropertyGroup>

@@ -12,6 +12,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using CodeyBox.Agents.Claude.AcpBridge;
 
 namespace CodeyBox.Tests;
@@ -2875,7 +2876,7 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
-    public void AcpBridge_PublishScript_RemovesStaleResourceAndRunsMultipassVerification()
+    public void AcpBridge_PublishScript_RemovesStaleResourceAndRunsEndToEndMultipassVerification()
     {
         var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
             ?? throw new InvalidOperationException(
@@ -2888,9 +2889,17 @@ public sealed class AcpBridgeUnitTests
 
         Assert.Contains("rm -f \"$RESOURCE_PATH\" \"$TMP_RESOURCE\"", script);
         Assert.Contains("ldd \"$TMP_RESOURCE\"", script);
+        Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_VM must name an already-baked CodeyBox sandbox baseline VM", script);
+        Assert.DoesNotContain("CODEYBOX_ACP_BRIDGE_VERIFY_IMAGE", script);
+        Assert.DoesNotContain("multipass launch", script);
         Assert.Contains("multipass transfer \"$TMP_RESOURCE\"", script);
-        Assert.Contains("multipass exec \"$VERIFY_VM\" -- sh -c", script);
-        Assert.Contains("\"type\":\"bridge_started\"", script);
+        Assert.Contains("expected bridge to spawn claude with --ide", script);
+        Assert.Contains("x-claude-code-ide-authorization", script);
+        Assert.Contains("wait_for_type(seen, \"peer_connected\"", script);
+        Assert.Contains("\"method\": session_method", script);
+        Assert.Contains("run_turn(bridge_path, \"session/load\")", script);
+        Assert.Contains("wait_for_type(seen, \"turn_complete\"", script);
+        Assert.Contains("ACP bridge end-to-end verification passed", script);
     }
 
     [Fact]
@@ -2909,13 +2918,34 @@ public sealed class AcpBridgeUnitTests
         Assert.True(File.Exists(csprojPath), "Claude csproj missing at " + csprojPath);
 
         var csprojText = File.ReadAllText(csprojPath);
+        var project = XDocument.Parse(csprojText).Root
+            ?? throw new InvalidOperationException("Claude csproj has no root element.");
 
         Assert.Contains("PublishAcpBridgeNativeResource", csprojText);
         Assert.Contains("'$(Configuration)' == 'Release'\">true</PublishAcpBridgeNativeResource>", csprojText);
         Assert.Contains("scripts/publish-acp-bridge.sh", csprojText);
         Assert.Contains("RequireAcpBridgeNativeResource", csprojText);
         Assert.Contains("Release builds of CodeyBox.Agents.Claude require a real ACP bridge resource", csprojText);
-        Assert.Contains("Condition=\"!Exists('$(AcpBridgeResourcePath)') and '$(RequireAcpBridgeNativeResource)' != 'true'\"", csprojText);
+
+        var topLevelEmbeddedResources = project.Elements("ItemGroup")
+            .Elements("EmbeddedResource")
+            .Where(e => (string?)e.Attribute("LogicalName") == "acp-bridge")
+            .ToList();
+        Assert.Empty(topLevelEmbeddedResources);
+
+        var selectTarget = Assert.Single(project.Elements("Target"),
+            e => (string?)e.Attribute("Name") == "SelectAcpBridgeEmbeddedResource");
+        Assert.Equal("AssignTargetPaths", (string?)selectTarget.Attribute("BeforeTargets"));
+
+        var targetResources = selectTarget.Elements("ItemGroup")
+            .Elements("EmbeddedResource")
+            .ToList();
+        Assert.Contains(targetResources, e =>
+            (string?)e.Attribute("Include") == "$(AcpBridgeResourcePath)"
+            && (string?)e.Attribute("LogicalName") == "acp-bridge");
+        Assert.Contains(targetResources, e =>
+            (string?)e.Attribute("Include") == "$(AcpBridgePlaceholderResourcePath)"
+            && (string?)e.Attribute("LogicalName") == "acp-bridge");
     }
 
     private static string? FindAncestorContaining(string start, string fileName)

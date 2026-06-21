@@ -120,6 +120,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
+          # The revalidate-build job executes PR-controlled scripts after the
+          # fetch/rebase. Do not leave the checkout token in git config where
+          # that untrusted code can read the credential extraheader.
+          persist-credentials: false
           # Need full history so the rebase has the merge-base available.
           fetch-depth: 0
 
@@ -135,7 +139,9 @@ jobs:
           # `pull/<num>/head` is the merged-from ref GitHub maintains for
           # every open PR, including forks. We fetch into a local
           # ref so the subsequent rebase has something to operate on.
-          git fetch origin "pull/${{ matrix.pr.number }}/head:codeybox/pr-${{ matrix.pr.number }}"
+          auth_header="$(printf 'AUTHORIZATION: bearer %s' "${GITHUB_TOKEN}")"
+          git -c "http.https://github.com/.extraheader=${auth_header}" \
+              fetch origin "pull/${{ matrix.pr.number }}/head:codeybox/pr-${{ matrix.pr.number }}"
           git checkout "codeybox/pr-${{ matrix.pr.number }}"
 
       - name: rebase onto current main

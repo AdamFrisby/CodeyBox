@@ -31,6 +31,7 @@
   -->
   <PropertyGroup>
     <AcpBridgeResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge</AcpBridgeResourcePath>
+    <AcpBridgePlaceholderResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge.placeholder</AcpBridgePlaceholderResourcePath>
     <PublishAcpBridgeNativeResource Condition="'$(PublishAcpBridgeNativeResource)' == '' and '$(Configuration)' == 'Release'">true</PublishAcpBridgeNativeResource>
     <PublishAcpBridgeNativeResource Condition="'$(PublishAcpBridgeNativeResource)' == ''">false</PublishAcpBridgeNativeResource>
     <RequireAcpBridgeNativeResource Condition="'$(RequireAcpBridgeNativeResource)' == '' and '$(Configuration)' == 'Release'">true</RequireAcpBridgeNativeResource>
@@ -44,21 +45,22 @@
           Command="scripts/publish-acp-bridge.sh" />
   </Target>
 
-  <Target Name="RequireAcpBridgeNativeResource"
-          BeforeTargets="CoreCompile"
-          Condition="'$(RequireAcpBridgeNativeResource)' == 'true'">
-    <Error Condition="!Exists('$(AcpBridgeResourcePath)')"
+  <Target Name="SelectAcpBridgeEmbeddedResource"
+          BeforeTargets="AssignTargetPaths">
+    <Error Condition="'$(RequireAcpBridgeNativeResource)' == 'true' and !Exists('$(AcpBridgeResourcePath)')"
            Text="Release builds of CodeyBox.Agents.Claude require a real ACP bridge resource at $(AcpBridgeResourcePath). Run scripts/publish-acp-bridge.sh on a host with musl-tools and Multipass, or leave PublishAcpBridgeNativeResource enabled for Release builds." />
-  </Target>
 
-  <ItemGroup>
-    <EmbeddedResource Include="Resources/acp-bridge"
-                      LogicalName="acp-bridge"
-                      Condition="Exists('$(AcpBridgeResourcePath)')" />
-    <EmbeddedResource Include="Resources/acp-bridge.placeholder"
-                      LogicalName="acp-bridge"
-                      Condition="!Exists('$(AcpBridgeResourcePath)') and '$(RequireAcpBridgeNativeResource)' != 'true'" />
-  </ItemGroup>
+    <ItemGroup Condition="Exists('$(AcpBridgeResourcePath)')">
+      <EmbeddedResource Include="$(AcpBridgeResourcePath)"
+                        LogicalName="acp-bridge"
+                        Link="Resources/acp-bridge" />
+    </ItemGroup>
+    <ItemGroup Condition="!Exists('$(AcpBridgeResourcePath)') and '$(RequireAcpBridgeNativeResource)' != 'true'">
+      <EmbeddedResource Include="$(AcpBridgePlaceholderResourcePath)"
+                        LogicalName="acp-bridge"
+                        Link="Resources/acp-bridge.placeholder" />
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <InternalsVisibleTo Include="CodeyBox.Tests" />
