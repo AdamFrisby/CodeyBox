@@ -5,6 +5,19 @@ namespace CodeyBox.Tests;
 public sealed class KnobRegistryTests
 {
     [Fact]
+    public void All_ReturnsKnobsOrderedByCanonicalKey()
+    {
+        var registry = new KnobRegistry(
+        [
+            new TestEnumKnob("zeta", "on", ["on", "off"]),
+            new TestEnumKnob("Alpha", "on", ["on", "off"]),
+            new TestEnumKnob("middle", "on", ["on", "off"]),
+        ]);
+
+        Assert.Equal(["Alpha", "middle", "zeta"], registry.All.Select(k => k.Key));
+    }
+
+    [Fact]
     public void Resolve_FallsBackToKnobDefault_WhenNeitherItemNorProjectSetsValue()
     {
         var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);

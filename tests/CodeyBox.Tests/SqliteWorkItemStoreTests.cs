@@ -782,6 +782,103 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task TryReplaceKnobsIfStateAndUpdatedAtAsync_GuardMissesReturnFalseWithoutWriting()
+    {
+        var item = Sample() with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["changeScope"] = "refactor",
+            },
+        };
+        await _store.CreateAsync(item);
+        var persisted = await _store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+
+        var replacement = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["changeScope"] = "surgical",
+        };
+        var nextUpdatedAt = persisted!.UpdatedAt.AddSeconds(1);
+
+        var staleUpdatedAt = await _store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
+            item.Id,
+            replacement,
+            nextUpdatedAt,
+            WorkItemState.Queued,
+            persisted.UpdatedAt.AddTicks(-1));
+        var wrongState = await _store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
+            item.Id,
+            replacement,
+            nextUpdatedAt,
+            WorkItemState.Working,
+            persisted.UpdatedAt);
+        var missingRow = await _store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
+            WorkItemId.New(),
+            replacement,
+            nextUpdatedAt,
+            WorkItemState.Queued,
+            persisted.UpdatedAt);
+
+        Assert.False(staleUpdatedAt);
+        Assert.False(wrongState);
+        Assert.False(missingRow);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(persisted.UpdatedAt, read!.UpdatedAt);
+        Assert.Single(read.Knobs);
+        Assert.Equal("refactor", read.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync_GuardMissesReturnFalseWithoutWriting()
+    {
+        var item = Sample() with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["changeScope"] = "refactor",
+            },
+        };
+        await _store.CreateAsync(item);
+        var persisted = await _store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+
+        var update = persisted! with
+        {
+            Title = "patched title",
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["changeScope"] = "surgical",
+            },
+            UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
+        };
+
+        var staleUpdatedAt = await _store.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+            update,
+            WorkItemState.Queued,
+            persisted.UpdatedAt.AddTicks(-1));
+        var wrongState = await _store.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+            update,
+            WorkItemState.Working,
+            persisted.UpdatedAt);
+        var missingRow = await _store.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+            update with { Id = WorkItemId.New() },
+            WorkItemState.Queued,
+            persisted.UpdatedAt);
+
+        Assert.False(staleUpdatedAt);
+        Assert.False(wrongState);
+        Assert.False(missingRow);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal("t", read!.Title);
+        Assert.Equal(persisted.UpdatedAt, read.UpdatedAt);
+        Assert.Single(read.Knobs);
+        Assert.Equal("refactor", read.Knobs["changeScope"]);
+    }
+
+    [Fact]
     public async Task UpdateAsync_DoesNotClobberQueuedKnobEditFromStaleSnapshot()
     {
         var item = Sample() with

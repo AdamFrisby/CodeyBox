@@ -9,9 +9,6 @@ internal sealed class WorkItemCreationService
     private const int GlobalMaxPriority = 1000;
     private const int MaxRequiredCapabilities = 16;
     private const int MaxCapabilityLength = 64;
-    private const int MaxKnobEntries = 32;
-    private const int MaxKnobKeyLength = 64;
-    private const int MaxKnobValueLength = 128;
 
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
@@ -525,40 +522,9 @@ internal sealed class WorkItemCreationService
         IReadOnlyDictionary<string, string> raw,
         IKnobRegistry registry)
     {
-        if (raw.Count > MaxKnobEntries)
-            return (null, Results.BadRequest(new
-            {
-                error = $"knobs may contain at most {MaxKnobEntries} entries",
-            }));
-
         var normalised = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (rawKey, rawValue) in raw)
         {
-            if (string.IsNullOrWhiteSpace(rawKey))
-                return (null, Results.BadRequest(new { error = "knob key must not be empty" }));
-            if (rawKey.Length > MaxKnobKeyLength)
-                return (null, Results.BadRequest(new
-                {
-                    error = $"knob keys must be <= {MaxKnobKeyLength} chars",
-                }));
-            if (rawKey.Any(char.IsControl))
-                return (null, Results.BadRequest(new
-                {
-                    error = "knob keys must not contain control characters",
-                }));
-            if (rawValue is null)
-                return (null, Results.BadRequest(new { error = $"knob '{rawKey}' value must not be null" }));
-            if (rawValue.Length > MaxKnobValueLength)
-                return (null, Results.BadRequest(new
-                {
-                    error = $"knob '{rawKey}' value must be <= {MaxKnobValueLength} chars",
-                }));
-            if (rawValue.Any(char.IsControl))
-                return (null, Results.BadRequest(new
-                {
-                    error = $"knob '{rawKey}' value must not contain control characters",
-                }));
-
             var verdict = registry.Normalize(rawKey, rawValue);
             if (!verdict.Ok)
                 return (null, Results.BadRequest(new { error = verdict.Error }));

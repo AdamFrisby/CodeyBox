@@ -7,6 +7,8 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Sandbox;
 using Microsoft.Extensions.DependencyInjection;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -100,22 +102,31 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
-    public async Task Create_WithTooManyKnobs_Returns400BeforeDescriptorLookup()
+    public async Task Create_WithManyDescriptorRegisteredKnobs_RoundTripsThroughApi()
     {
-        var knobs = Enumerable.Range(0, 33)
-            .ToDictionary(i => $"unknownKnob{i}", i => "value");
+        using var factory = new WorkItemApiFactory();
+        var knobs = Enumerable.Range(0, 40)
+            .ToDictionary(i => $"freeForm{i}", i => $"value-{i}");
+        factory.AdditionalKnobs.AddRange(
+            knobs.Keys.Select(k => new DescriptorLocalStringKnob(k)));
+        using var client = factory.CreateClient();
 
-        var resp = await _client.PostAsJsonAsync("/workitems", new
+        var resp = await client.PostAsJsonAsync("/workitems", new
         {
             projectId = "test-project",
-            title = "too many knobs",
+            title = "many knobs",
             prompt = "p",
             knobs,
         });
 
-        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
-        var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("at most 32 entries", body);
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        Assert.Equal(40, body!.Knobs!.Count);
+
+        var stored = await factory.Store.GetAsync(WorkItemId.Parse(body.Id));
+        Assert.NotNull(stored);
+        Assert.Equal(40, stored!.Knobs.Count);
+        Assert.Equal("value-39", stored.Knobs["freeForm39"]);
     }
 
     [Fact]
@@ -234,6 +245,37 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         Assert.Single(stored!.DependsOn);
         Assert.Equal(WorkItemId.Parse(dep.Id), stored.DependsOn[0]);
         Assert.Equal(ChangeScopeKnob.ValueSurgical, stored.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_KnobsCombinedWithAuditBudget_PersistsBothAndAuditsKnobsChanged()
+    {
+        var created = await CreatePlainQueuedItemAsync("knob audit budget");
+        var sink = new TestSink();
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created.Id}", new
+        {
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+            auditMaxIterations = 7,
+            auditComplexity = "hard",
+        });
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, stored!.Knobs[ChangeScopeKnob.KeyName]);
+        Assert.Equal(7, stored.AuditMaxIterations);
+        Assert.Equal("hard", stored.AuditComplexity);
+
+        var auditEvent = Assert.Single(sink.Events, e =>
+            GetScalar<string>(e, "EventName") == "work_item.patched"
+            && GetScalar<string>(e, "WorkItemId") == created.Id);
+        Assert.True(GetScalar<bool>(auditEvent, "KnobsChanged"));
+        Assert.True(GetScalar<bool>(auditEvent, "AuditBudgetChanged"));
     }
 
     [Fact]
@@ -411,9 +453,9 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
-    public async Task Patch_WithLengthAndControlViolations_Returns400()
+    public async Task Patch_ChangeScopeValuesRejectedByDescriptor_Returns400()
     {
-        var created = await CreatePlainQueuedItemAsync("patch caps");
+        var created = await CreatePlainQueuedItemAsync("patch descriptor rejection");
         var longValue = new string('v', 129);
         var tooLong = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
         {
@@ -424,6 +466,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         };
         var tooLongResp = await _client.SendAsync(tooLong);
         Assert.Equal(HttpStatusCode.BadRequest, tooLongResp.StatusCode);
+        Assert.Contains("not allowed", await tooLongResp.Content.ReadAsStringAsync());
 
         var control = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
         {
@@ -434,10 +477,11 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         };
         var controlResp = await _client.SendAsync(control);
         Assert.Equal(HttpStatusCode.BadRequest, controlResp.StatusCode);
+        Assert.Contains("not allowed", await controlResp.Content.ReadAsStringAsync());
     }
 
     [Fact]
-    public void NormaliseKnobs_EnforcesSharedEntryCountBeforeDescriptors()
+    public void NormaliseKnobs_AllowsMapSizeAcceptedByDescriptors()
     {
         var descriptors = Enumerable.Range(0, 40)
             .Select(i => new DescriptorLocalStringKnob($"freeForm{i}"))
@@ -450,8 +494,10 @@ public sealed class WorkItemKnobsApiTests : IDisposable
 
         var (normalised, error) = WorkItemCreationService.NormaliseKnobs(knobs, registry);
 
-        Assert.Null(normalised);
-        Assert.NotNull(error);
+        Assert.Null(error);
+        Assert.NotNull(normalised);
+        Assert.Equal(40, normalised!.Count);
+        Assert.Equal("value-39", normalised["freeForm39"]);
     }
 
     [Fact]
@@ -470,35 +516,38 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
-    public async Task Create_KnobKeyExceedsLengthCap_Returns400()
+    public async Task Create_UnknownLongKnobKey_ReturnsRegistryUnknownKeyError()
     {
         var longKey = new string('k', 65);
         var resp = await _client.PostAsJsonAsync("/workitems", new
         {
             projectId = "test-project",
-            title = "key too long",
+            title = "unknown long key",
             prompt = "p",
             knobs = new Dictionary<string, string> { [longKey] = "v" },
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("64 chars", body);
+        Assert.Contains("unknown knob", body);
     }
 
     [Fact]
-    public async Task Create_KnobValueExceedsLengthCap_Returns400()
+    public async Task Create_DescriptorLocalLongValue_RoundTrips()
     {
+        using var factory = new WorkItemApiFactory();
+        factory.AdditionalKnobs.Add(new DescriptorLocalStringKnob("longText"));
+        using var client = factory.CreateClient();
         var longValue = new string('v', 129);
-        var resp = await _client.PostAsJsonAsync("/workitems", new
+        var resp = await client.PostAsJsonAsync("/workitems", new
         {
             projectId = "test-project",
-            title = "value too long",
+            title = "descriptor long value",
             prompt = "p",
-            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = longValue },
+            knobs = new Dictionary<string, string> { ["longText"] = longValue },
         });
-        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
-        var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("128 chars", body);
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        Assert.Equal(longValue, body!.Knobs!["longText"]);
     }
 
     [Fact]
@@ -533,7 +582,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("control characters", body);
+        Assert.Contains("unknown knob", body);
     }
 
     [Fact]
@@ -548,7 +597,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("control characters", body);
+        Assert.Contains("not allowed", body);
     }
 
     [Fact]
@@ -731,6 +780,13 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         Assert.Equal(HttpStatusCode.Created, create.StatusCode);
         var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
         return created!;
+    }
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        return sv.Value is T t ? t : default;
     }
 
     private sealed class WorkItemWithKnobsResponse
