@@ -37,6 +37,8 @@ namespace CodeyBox.Tests;
 [SupportedOSPlatform("linux")]
 public sealed class AcpBridgeUnitTests
 {
+    private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
+
     // ── BridgeConfig.FromHello ─────────────────────────────────────────────────
 
     [Fact]
@@ -780,6 +782,59 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Bridge_RunAsync_WithoutLockDir_WritesDefaultHomeClaudeIdeLockfile()
+    {
+        if (!File.Exists("/bin/bash"))
+            return;
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-default-lockdir-").FullName;
+        await EnvironmentVariableGate.WaitAsync();
+        var oldHome = Environment.GetEnvironmentVariable("HOME");
+        try
+        {
+            var home = Path.Combine(tmpDir, "home");
+            var workDir = Path.Combine(tmpDir, "work");
+            Directory.CreateDirectory(home);
+            Directory.CreateDirectory(workDir);
+            Environment.SetEnvironmentVariable("HOME", home);
+
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var defaultLockDir = Path.Combine(home, ".claude", "ide");
+
+            Assert.Equal(defaultLockDir, Path.GetDirectoryName(lockPath));
+            Assert.Equal(Path.Combine(defaultLockDir, port + ".lock"), lockPath);
+            Assert.True(Directory.Exists(defaultLockDir));
+            Assert.True(File.Exists(lockPath),
+                "The production hello envelope omits lockDir, so the HOME-based lockfile must exist after ready.");
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                File.GetUnixFileMode(defaultLockDir));
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                File.GetUnixFileMode(lockPath));
+
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+            Assert.False(File.Exists(lockPath),
+                "Default-path lockfile must be cleaned up on bridge shutdown.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("HOME", oldHome);
+            EnvironmentVariableGate.Release();
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
     }
@@ -2816,6 +2871,158 @@ public sealed class AcpBridgeUnitTests
         }
     }
 
+    private static PublishScriptFixture CreatePublishScriptFixture()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " — ensure CodeyBox.slnx exists in an ancestor directory.");
+
+        var sourceScript = Path.Combine(solutionRoot, "scripts", "publish-acp-bridge.sh");
+        Assert.True(File.Exists(sourceScript), "Publish script missing at " + sourceScript);
+
+        var tempRoot = Directory.CreateTempSubdirectory("cb-acp-publish-script-").FullName;
+        var scriptsDir = Path.Combine(tempRoot, "scripts");
+        var resourceDir = Path.Combine(tempRoot, "src", "CodeyBox.Agents.Claude", "Resources");
+        var toolsDir = Path.Combine(tempRoot, "tools");
+        Directory.CreateDirectory(scriptsDir);
+        Directory.CreateDirectory(resourceDir);
+        Directory.CreateDirectory(toolsDir);
+
+        var scriptPath = Path.Combine(scriptsDir, "publish-acp-bridge.sh");
+        File.Copy(sourceScript, scriptPath);
+        MakeExecutable(scriptPath);
+
+        var callLog = Path.Combine(tempRoot, "calls.log");
+        WriteExecutable(Path.Combine(toolsDir, "dotnet"), """
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'dotnet' >> "$CALL_LOG"
+for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
+printf '\n' >> "$CALL_LOG"
+publish_dir="src/CodeyBox.Agents.Claude.AcpBridge/bin/Release/net10.0/linux-musl-x64/publish"
+mkdir -p "$publish_dir"
+printf '#!/bin/sh\nexit 0\n' > "$publish_dir/CodeyBox.Agents.Claude.AcpBridge"
+chmod 755 "$publish_dir/CodeyBox.Agents.Claude.AcpBridge"
+""");
+        WriteExecutable(Path.Combine(toolsDir, "ldd"), """
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'ldd' >> "$CALL_LOG"
+for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
+printf '\n' >> "$CALL_LOG"
+echo "not a dynamic executable"
+""");
+        WriteExecutable(Path.Combine(toolsDir, "multipass"), """
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'multipass' >> "$CALL_LOG"
+for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
+printf '\n' >> "$CALL_LOG"
+
+if [ "$#" -ge 1 ] && [ "$1" = "start" ]; then
+    exit 0
+fi
+if [ "$#" -ge 1 ] && [ "$1" = "transfer" ]; then
+    exit 0
+fi
+if [ "$#" -ge 4 ] && [ "$1" = "exec" ]; then
+    shift 3
+    case "$1" in
+        mktemp)
+            echo "/tmp/codeybox-acp-bridge-verify.stub"
+            exit 0
+            ;;
+        chmod)
+            exit 0
+            ;;
+        sh)
+            cat >/dev/null
+            exit 0
+            ;;
+        python3)
+            echo "ACP bridge end-to-end verification passed: stub"
+            exit 0
+            ;;
+        rm)
+            exit 0
+            ;;
+    esac
+fi
+
+echo "unexpected multipass argv: $*" >&2
+exit 9
+""");
+
+        return new PublishScriptFixture(
+            tempRoot,
+            scriptPath,
+            toolsDir,
+            callLog,
+            Path.Combine(resourceDir, "acp-bridge"));
+    }
+
+    private static Dictionary<string, string?> PublishScriptEnv(string toolsDir, string callLog)
+    {
+        return new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["PATH"] = toolsDir + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
+            ["CALL_LOG"] = callLog,
+        };
+    }
+
+    private static void WriteExecutable(string path, string contents)
+    {
+        File.WriteAllText(path, contents);
+        MakeExecutable(path);
+    }
+
+    private static void MakeExecutable(string path)
+    {
+        File.SetUnixFileMode(
+            path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessAsync(
+        string fileName,
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?> env)
+    {
+        var psi = new ProcessStartInfo(fileName)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        psi.Environment.Remove("CODEYBOX_ACP_BRIDGE_VERIFY_VM");
+        psi.Environment.Remove("CODEYBOX_ACP_BRIDGE_SKIP_VM_VERIFY");
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+        foreach (var (key, value) in env)
+        {
+            if (value is null)
+                psi.Environment.Remove(key);
+            else
+                psi.Environment[key] = value;
+        }
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start " + fileName);
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        return (process.ExitCode, stdout, stderr);
+    }
+
+    private sealed record PublishScriptFixture(
+        string TempRoot,
+        string ScriptPath,
+        string ToolsDir,
+        string CallLog,
+        string ResourcePath);
+
     // ── NativeAOT static-link contract ─────────────────────────────────────────
 
     /// <summary>
@@ -2876,30 +3083,59 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
-    public void AcpBridge_PublishScript_RemovesStaleResourceAndRunsEndToEndMultipassVerification()
+    public async Task AcpBridge_PublishScript_SkipMultipassVerify_PublishesResourceWithoutMultipass()
     {
-        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
-            ?? throw new InvalidOperationException(
-                "Cannot locate solution root from " + AppContext.BaseDirectory +
-                " — ensure CodeyBox.slnx exists in an ancestor directory.");
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
 
-        var scriptPath = Path.Combine(solutionRoot, "scripts", "publish-acp-bridge.sh");
-        Assert.True(File.Exists(scriptPath), "Publish script missing at " + scriptPath);
-        var script = File.ReadAllText(scriptPath);
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath, "--skip-multipass-verify"], env);
 
-        Assert.Contains("rm -f \"$RESOURCE_PATH\" \"$TMP_RESOURCE\"", script);
-        Assert.Contains("ldd \"$TMP_RESOURCE\"", script);
-        Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_VM must name an already-baked CodeyBox sandbox baseline VM", script);
-        Assert.DoesNotContain("CODEYBOX_ACP_BRIDGE_VERIFY_IMAGE", script);
-        Assert.DoesNotContain("multipass launch", script);
-        Assert.Contains("multipass transfer \"$TMP_RESOURCE\"", script);
-        Assert.Contains("expected bridge to spawn claude with --ide", script);
-        Assert.Contains("x-claude-code-ide-authorization", script);
-        Assert.Contains("wait_for_type(seen, \"peer_connected\"", script);
-        Assert.Contains("\"method\": session_method", script);
-        Assert.Contains("run_turn(bridge_path, \"session/load\")", script);
-        Assert.Contains("wait_for_type(seen, \"turn_complete\"", script);
-        Assert.Contains("ACP bridge end-to-end verification passed", script);
+            Assert.Equal(0, run.ExitCode);
+            Assert.True(File.Exists(fixture.ResourcePath),
+                "The publish script must still refresh the embedded resource when VM verification is explicitly skipped.");
+            Assert.Contains("skipping required Multipass runtime verification", run.Stderr, StringComparison.Ordinal);
+
+            var calls = File.ReadAllText(fixture.CallLog);
+            Assert.Contains("dotnet publish", calls, StringComparison.Ordinal);
+            Assert.Contains("ldd", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_RequiresVerifyVmAndRunsMultipassVerifier()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.Equal(0, run.ExitCode);
+            Assert.True(File.Exists(fixture.ResourcePath),
+                "The publish script should move the verified candidate into the embedded resource path.");
+            Assert.Contains("Multipass ACP verification passed on cb-baseline-test", run.Stdout, StringComparison.Ordinal);
+
+            var calls = File.ReadAllText(fixture.CallLog);
+            Assert.Contains("dotnet publish", calls, StringComparison.Ordinal);
+            Assert.Contains("ldd", calls, StringComparison.Ordinal);
+            Assert.Contains("multipass start cb-baseline-test", calls, StringComparison.Ordinal);
+            Assert.Contains("multipass transfer", calls, StringComparison.Ordinal);
+            Assert.Contains("multipass exec cb-baseline-test -- python3", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass launch", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
     }
 
     [Fact]

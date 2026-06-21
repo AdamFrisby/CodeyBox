@@ -732,6 +732,55 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
     }
 
+    [Theory]
+    [InlineData("fault")]
+    [InlineData("cancel")]
+    public async Task StartupResume_LateProviderTaskCompletionAfterTimeout_IsObservedAndLogged(string completion)
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-late-" + completion,
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var resumeRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = new FakeSuspendingProvider
+        {
+            ResumeReleaseSources = new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal)
+            {
+                ["vm-late-" + completion] = resumeRelease,
+            },
+        };
+        var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            log,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+
+        if (completion == "fault")
+        {
+            resumeRelease.SetException(new InvalidOperationException("late provider fault"));
+            await WaitUntilAsync(() => log.Entries.Any(entry =>
+                entry.Level == LogLevel.Warning
+                && entry.Message.Contains("Provider task faulted after startup resume timeout/cancellation", StringComparison.Ordinal)
+                && entry.Exception is InvalidOperationException ex
+                && ex.Message == "late provider fault"));
+        }
+        else
+        {
+            resumeRelease.SetCanceled();
+            await WaitUntilAsync(() => log.Entries.Any(entry =>
+                entry.Level == LogLevel.Debug
+                && entry.Message.Contains("Provider task observed cancellation after startup resume timeout/cancellation", StringComparison.Ordinal)));
+        }
+    }
+
     [Fact]
     public async Task StartupResume_ProviderCancellation_MarksWorkingItemFailedAndClearsBookkeeping()
     {
