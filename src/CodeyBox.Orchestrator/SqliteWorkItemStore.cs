@@ -531,16 +531,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         try
         {
             using var cmd = _conn.CreateCommand();
-            // prompt / prompt_revision / priority / audit budget / external_id(s) are excluded
+            // prompt / prompt_revision / priority / audit budget / external_id(s) / knobs are excluded
             // from this UPDATE. Callers commonly pass a STALE in-memory WorkItem
             // snapshot taken at pickup time; writing those columns from the
             // snapshot would clobber a concurrent PUT /workitems/{id}/prompt,
             // POST /workitems/{id}/priority, PATCH /workitems/{id} audit budget,
-            // or PATCH /workitems/{id}/external-ids
+            // PATCH /workitems/{id}/external-ids, or queued knob edit
             // that landed mid-pipeline. Use TryReplacePromptAsync /
             // UpdatePriorityAsync / UpdateAuditBudgetAsync /
-            // ReplaceExternalIdsAsync to mutate them safely; routine state
-            // transitions leave them alone.
+            // ReplaceExternalIdsAsync / TryReplaceKnobsIfStateAndUpdatedAtAsync
+            // to mutate them safely; routine state transitions leave them alone.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
@@ -590,8 +590,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at,
-                    knobs_json = $knobs
+                    next_terminal_retry_at = $next_terminal_retry_at
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -613,7 +612,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         try
         {
             using var cmd = _conn.CreateCommand();
-            // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s)
+            // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s) / knobs
             // are excluded from the full-row UPDATE to avoid stale-snapshot clobber.
             cmd.CommandText = """
                 UPDATE work_items SET
@@ -664,8 +663,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at,
-                    knobs_json = $knobs
+                    next_terminal_retry_at = $next_terminal_retry_at
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -743,8 +741,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at,
-                    knobs_json = $knobs
+                    next_terminal_retry_at = $next_terminal_retry_at
                 WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
                 """;
             Bind(cmd, item);
@@ -1030,6 +1027,43 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
             throw HandleDiskFull("UpdateAuditBudgetAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> TryReplaceKnobsIfStateAndUpdatedAtAsync(
+        WorkItemId id,
+        IReadOnlyDictionary<string, string> knobs,
+        DateTimeOffset updatedAt,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    knobs_json = $knobs,
+                    updated_at = $updated_at
+                WHERE id = $id
+                  AND state = $only_if_state
+                  AND updated_at = $only_if_updated_at;
+                """;
+            cmd.Parameters.AddWithValue("$knobs", SerialiseKnobs(knobs));
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+            cmd.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryReplaceKnobsIfStateAndUpdatedAtAsync", sqlex);
         }
         finally
         {

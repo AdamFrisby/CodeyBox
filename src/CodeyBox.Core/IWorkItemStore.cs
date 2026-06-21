@@ -102,19 +102,20 @@ public interface IWorkItemStore
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
     /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
     /// <see cref="WorkItem.AuditMaxIterations"/>, and
-    /// <see cref="WorkItem.AuditComplexity"/>. Use <see cref="UpdatePriorityAsync"/>,
-    /// <see cref="TryReplacePromptAsync"/>, and <see cref="UpdateAuditBudgetAsync"/>
-    /// for those fields so worker writes from stale in-memory snapshots cannot
-    /// revert concurrent PATCH /priority, PUT /workitems/{id}/prompt, or audit-budget
-    /// updates.
+    /// <see cref="WorkItem.AuditComplexity"/>, and <see cref="WorkItem.Knobs"/>.
+    /// Use <see cref="UpdatePriorityAsync"/>, <see cref="TryReplacePromptAsync"/>,
+    /// <see cref="UpdateAuditBudgetAsync"/>, and
+    /// <see cref="TryReplaceKnobsIfStateAndUpdatedAtAsync"/> for those fields so
+    /// worker writes from stale in-memory snapshots cannot revert concurrent
+    /// PATCH /priority, PUT /workitems/{id}/prompt, audit-budget, or knob updates.
     /// </summary>
     Task UpdateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
     /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
     /// <see cref="WorkItem.AuditMaxIterations"/>, and
-    /// <see cref="WorkItem.AuditComplexity"/> only when the persisted state still
-    /// matches <paramref name="onlyIfState"/>.
+    /// <see cref="WorkItem.AuditComplexity"/>, and <see cref="WorkItem.Knobs"/>
+    /// only when the persisted state still matches <paramref name="onlyIfState"/>.
     /// Returns true if the row was updated.
     /// </summary>
     Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default);
@@ -217,6 +218,25 @@ public interface IWorkItemStore
         string? auditComplexity,
         DateTimeOffset updatedAt,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Partial UPDATE that touches only the per-item knob map and
+    /// <c>updated_at</c>, guarded by both persisted state and the exact
+    /// <c>updated_at</c> stamp the caller inspected. This is the only queued
+    /// edit path for <see cref="WorkItem.Knobs"/>; routine worker state writes
+    /// deliberately leave the column untouched so stale in-memory snapshots
+    /// cannot erase operator edits accepted before dispatch.
+    /// </summary>
+    Task<bool> TryReplaceKnobsIfStateAndUpdatedAtAsync(
+        WorkItemId id,
+        IReadOnlyDictionary<string, string> knobs,
+        DateTimeOffset updatedAt,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store must implement guarded knob replacement before it can accept per-item knob edits.");
+
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);
