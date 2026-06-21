@@ -6073,6 +6073,17 @@ while True:
         sb.AppendLine("    fi");
         sb.AppendLine("    if [ \"$codeybox_marker_i\" -ge 50 ]; then");
         sb.AppendLine("        kill -TERM \"-$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        codeybox_term_i=0");
+        sb.AppendLine("        while kill -0 \"$codeybox_detached_pid\" 2>/dev/null && [ \"$codeybox_term_i\" -lt 20 ]; do");
+        sb.AppendLine("            sleep 0.05");
+        sb.AppendLine("            codeybox_term_i=$((codeybox_term_i + 1))");
+        sb.AppendLine("        done");
+        sb.AppendLine("        if kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
+        sb.AppendLine("            kill -KILL \"-$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        fi");
+        sb.AppendLine("        set +e");
+        sb.AppendLine("        wait \"$codeybox_detached_pid\" 2>/dev/null");
+        sb.AppendLine("        set -e");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");

@@ -674,7 +674,7 @@ internal sealed class Bridge : IAsyncDisposable
         {
             if (_claudeProcess is { } p)
             {
-                if (!p.HasExited) TerminateClaudeProcess(p);
+                if (!HasProcessExited(p)) TerminateClaudeProcess(p);
                 // Emit claude_exit BEFORE cancelling _cts. The monitor task
                 // also calls this on its WaitForExitAsync completion, but
                 // emitting it here while we're still on the cleanup path
@@ -695,6 +695,12 @@ internal sealed class Bridge : IAsyncDisposable
         try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
         try { _cts.Cancel(); } catch { }
         try { _stdinStream?.Dispose(); } catch { }
+    }
+
+    private static bool HasProcessExited(Process proc)
+    {
+        try { return proc.HasExited; }
+        catch { return true; }
     }
 
     private static async Task<bool> WaitForProcessExitAfterShutdownAsync(Process proc)
