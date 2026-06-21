@@ -20,6 +20,7 @@
     <ProjectReference Include="..\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.MultipassRemote\CodeyBox.Sandbox.MultipassRemote.csproj" />
     <ProjectReference Include="..\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
     <ProjectReference Include="..\CodeyBox.Notifications\CodeyBox.Notifications.csproj" />
   </ItemGroup>

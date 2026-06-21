@@ -26,7 +26,9 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
+using CodeyBox.Sandbox.MultipassRemote;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.HostProcess;
 using CodeyBox.Webhooks;
 using CodeyBox.Notifications;
 using Serilog;
@@ -414,7 +416,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         {
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: multipass, bubblewrap, process " +
+                "Choose one of: multipass, multipass-remote, bubblewrap, process " +
                 "(see docs/sandbox-providers.md for trade-offs).");
         }
     }
@@ -427,8 +429,9 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
             sp.GetService<ITimingStore>()),
         "multipass" => BuildMultipass(opts, sp, loggerFactory, startupLog, sp.GetService<ITimingStore>()),
+        "multipass-remote" => BuildMultipassRemote(sp, loggerFactory),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, bubblewrap, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, bubblewrap, process"),
     };
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
@@ -532,6 +535,51 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
     }
 
     return provider;
+}
+
+static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory)
+{
+    // All options resolved through IOptionsMonitor so SSH endpoint, key path,
+    // staging dir, and timeouts hot-reload on the next CreateAsync without an
+    // orchestrator restart. The OpenSSH-CLI transport is constructed once and
+    // re-reads options the same way for every call.
+    var transportLogger = loggerFactory.CreateLogger<OpenSshCliTransport>();
+    var runner = sp.GetService<IProcessRunner>() ?? new DefaultProcessRunner();
+    var transport = new OpenSshCliTransport(
+        () => ReadRemoteOpts(sp),
+        runner,
+        transportLogger);
+    return new MultipassRemoteSandboxProvider(
+        () => ReadRemoteOpts(sp),
+        transport,
+        loggerFactory.CreateLogger<MultipassRemoteSandboxProvider>());
+
+    static MultipassRemoteSandboxOptions ReadRemoteOpts(IServiceProvider sp)
+    {
+        var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+        var cfg = live.MultipassRemoteSandbox ?? new MultipassRemoteSandboxConfig();
+        var fromDefaults = new MultipassRemoteSandboxOptions();
+        return new MultipassRemoteSandboxOptions
+        {
+            SshBinary = !string.IsNullOrWhiteSpace(cfg.SshBinary) ? cfg.SshBinary! : fromDefaults.SshBinary,
+            SshTarget = cfg.SshTarget ?? "",
+            SshPort = cfg.SshPort,
+            SshKeyPath = cfg.SshKeyPath,
+            ExtraSshOptions = cfg.ExtraSshOptions?.ToArray() ?? [],
+            AcceptUnknownHostKeys = cfg.AcceptUnknownHostKeys,
+            ServerAliveIntervalSeconds = cfg.ServerAliveIntervalSeconds ?? fromDefaults.ServerAliveIntervalSeconds,
+            ServerAliveCountMax = cfg.ServerAliveCountMax ?? fromDefaults.ServerAliveCountMax,
+            ConnectTimeoutSeconds = cfg.ConnectTimeoutSeconds ?? fromDefaults.ConnectTimeoutSeconds,
+            LocalTarBinary = !string.IsNullOrWhiteSpace(cfg.LocalTarBinary) ? cfg.LocalTarBinary! : fromDefaults.LocalTarBinary,
+            RemoteMultipassPath = !string.IsNullOrWhiteSpace(cfg.RemoteMultipassPath) ? cfg.RemoteMultipassPath! : fromDefaults.RemoteMultipassPath,
+            RemoteStagingRoot = !string.IsNullOrWhiteSpace(cfg.RemoteStagingRoot) ? cfg.RemoteStagingRoot! : fromDefaults.RemoteStagingRoot,
+            DefaultImage = cfg.DefaultImage,
+            VmStartTimeout = cfg.VmStartTimeout ?? fromDefaults.VmStartTimeout,
+            VmStopTimeout = cfg.VmStopTimeout ?? fromDefaults.VmStopTimeout,
+            VmStateCheckInterval = cfg.VmStateCheckInterval ?? fromDefaults.VmStateCheckInterval,
+            VmNamePrefix = !string.IsNullOrWhiteSpace(cfg.VmNamePrefix) ? cfg.VmNamePrefix! : fromDefaults.VmNamePrefix,
+        };
+    }
 }
 
 static void LogDiskGuardBanner(IDiskGuardedSandboxProvider provider, ILogger startupLog)
@@ -3436,6 +3484,72 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
+    /// Configuration for <c>CodeyBox:SandboxProvider=multipass-remote</c>.
+    /// Drives the SSH-backed multipass provider that runs each work-item VM
+    /// on a remote host while the orchestrator brain stays local.
+    /// </summary>
+    public sealed class MultipassRemoteSandboxConfig
+    {
+        /// <summary>SSH destination passed verbatim to <c>ssh &lt;target&gt;</c>. Required.</summary>
+        public string? SshTarget { get; set; }
+
+        /// <summary>OpenSSH binary. Default <c>ssh</c> (resolved via $PATH).</summary>
+        public string? SshBinary { get; set; }
+
+        /// <summary>Optional SSH port override.</summary>
+        public int? SshPort { get; set; }
+
+        /// <summary>Identity file path. Null = use whatever <c>~/.ssh/config</c> / agent resolves.</summary>
+        public string? SshKeyPath { get; set; }
+
+        /// <summary>Extra <c>-o Key=Value</c> options appended verbatim. Validated to look like <c>Key=Value</c> with no whitespace.</summary>
+        public IList<string>? ExtraSshOptions { get; set; }
+
+        /// <summary>
+        /// When true, host key trust-on-first-use (<c>StrictHostKeyChecking=accept-new</c>).
+        /// Leave false in production — let an unknown host key fail loudly.
+        /// </summary>
+        public bool AcceptUnknownHostKeys { get; set; }
+
+        /// <summary>OpenSSH <c>ServerAliveInterval</c> seconds. Null = provider default (30).</summary>
+        public int? ServerAliveIntervalSeconds { get; set; }
+
+        /// <summary>OpenSSH <c>ServerAliveCountMax</c>. Null = provider default (6).</summary>
+        public int? ServerAliveCountMax { get; set; }
+
+        /// <summary>OpenSSH <c>ConnectTimeout</c> seconds. Null = provider default (20).</summary>
+        public int? ConnectTimeoutSeconds { get; set; }
+
+        /// <summary>Local tar binary used by the staging pipeline. Default <c>tar</c>.</summary>
+        public string? LocalTarBinary { get; set; }
+
+        /// <summary>Absolute path to <c>multipass</c> on the remote host.</summary>
+        public string? RemoteMultipassPath { get; set; }
+
+        /// <summary>Absolute path on the remote host where per-sandbox staging dirs live.</summary>
+        public string? RemoteStagingRoot { get; set; }
+
+        /// <summary>Default multipass image alias when SandboxSpec.ImageReference is empty.</summary>
+        public string? DefaultImage { get; set; }
+
+        /// <summary>Deadline for waiting on the VM to reach <c>Running</c>. Null = provider default.</summary>
+        public TimeSpan? VmStartTimeout { get; set; }
+
+        /// <summary>Deadline for waiting on the VM to reach <c>Stopped</c>. Null = provider default.</summary>
+        public TimeSpan? VmStopTimeout { get; set; }
+
+        /// <summary>VM-state polling interval used during waits. Null = provider default.</summary>
+        public TimeSpan? VmStateCheckInterval { get; set; }
+
+        /// <summary>
+        /// Naming prefix the provider applies to every VM it creates on the
+        /// remote host. Used by <c>multipass list</c> filtering and by the
+        /// leak-dispose safety check that refuses to delete arbitrary VMs.
+        /// </summary>
+        public string? VmNamePrefix { get; set; }
+    }
+
+    /// <summary>
     /// Top-level options bag bound from the <c>CodeyBox</c> configuration
     /// section. See <c>docs/configuration.md</c> for the full hot-reload
     /// contract per field. Summary of the rule of thumb consumers should
@@ -3643,6 +3757,12 @@ namespace CodeyBox.Api
 
         /// <summary>Multipass sandbox launch-time readiness tuning.</summary>
         public MultipassSandboxConfig MultipassSandbox { get; set; } = new();
+
+        /// <summary>
+        /// Configuration for <c>SandboxProvider=multipass-remote</c>. Optional;
+        /// only consumed when that provider is selected.
+        /// </summary>
+        public MultipassRemoteSandboxConfig? MultipassRemoteSandbox { get; set; }
 
         /// <summary>
         /// Maps logical network-profile names → host bridge names. Operators
