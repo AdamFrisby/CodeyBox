@@ -107,6 +107,54 @@ public sealed class AcpBridgeUnitTests
         Assert.Equal(new[] { "--ok", "--also-ok" }, cfg.ClaudeArgs);
     }
 
+    [Fact]
+    public void BridgeConfig_FromHello_InvalidScalarTypesFallBackToDefaults()
+    {
+        var hello = JsonDocument.Parse("""
+            {
+              "type": "hello",
+              "claudeBinary": 42,
+              "workingDirectory": false,
+              "lockDir": { "not": "a string" },
+              "turnTimeoutSeconds": "900",
+              "claudeArgs": { "not": "an array" },
+              "claudeEnv": [ "not", "an", "object" ]
+            }
+            """).RootElement;
+
+        var cfg = BridgeConfig.FromHello(hello);
+
+        Assert.Equal(BridgeConfig.Default.ClaudeBinary, cfg.ClaudeBinary);
+        Assert.Equal(BridgeConfig.Default.WorkingDirectory, cfg.WorkingDirectory);
+        Assert.Null(cfg.LockDir);
+        Assert.Equal(BridgeConfig.Default.TurnTimeoutSeconds, cfg.TurnTimeoutSeconds);
+        Assert.Empty(cfg.ClaudeArgs);
+        Assert.Empty(cfg.ClaudeEnv);
+    }
+
+    [Fact]
+    public void BridgeConfig_FromHello_IgnoresNonStringClaudeEnvValues()
+    {
+        var hello = JsonDocument.Parse("""
+            {
+              "type": "hello",
+              "claudeEnv": {
+                "GOOD": "kept",
+                "NUMBER": 42,
+                "NULL": null,
+                "OBJECT": {}
+              }
+            }
+            """).RootElement;
+
+        var cfg = BridgeConfig.FromHello(hello);
+
+        Assert.Equal("kept", cfg.ClaudeEnv["GOOD"]);
+        Assert.False(cfg.ClaudeEnv.ContainsKey("NUMBER"));
+        Assert.False(cfg.ClaudeEnv.ContainsKey("NULL"));
+        Assert.False(cfg.ClaudeEnv.ContainsKey("OBJECT"));
+    }
+
     // ── Emitter envelope shape ─────────────────────────────────────────────────
 
     [Fact]
@@ -360,6 +408,80 @@ public sealed class AcpBridgeUnitTests
         listener.Stop();
     }
 
+    [Fact]
+    public async Task WebSocketConnection_AcceptHandshake_RejectsOversizedMalformedHeadersWith400()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        var accept = Task.Run(async () =>
+        {
+            using var server = await listener.AcceptTcpClientAsync();
+            var ws = new WebSocketConnection(server.GetStream());
+            return await ws.AcceptHandshakeAsync("any", CancellationToken.None);
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        var req = Encoding.ASCII.GetBytes("GET / HTTP/1.1\r\nHost: x\r\n" + new string('x', 17 * 1024));
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        var respBuf = new byte[256];
+        var n = await s.ReadAsync(respBuf.AsMemory()).AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.StartsWith("HTTP/1.1 400 Bad Request",
+            Encoding.ASCII.GetString(respBuf, 0, n));
+        Assert.False(await accept);
+        listener.Stop();
+    }
+
+    [Fact]
+    public async Task WebSocketConnection_ReceiveLoop_PropagatesFrameHandlerFailure()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        var receive = Task.Run(async () =>
+        {
+            using var server = await listener.AcceptTcpClientAsync();
+            var ws = new WebSocketConnection(server.GetStream());
+            var ok = await ws.AcceptHandshakeAsync(authToken: "", CancellationToken.None);
+            Assert.True(ok);
+            await ws.ReceiveLoopAsync(_ => throw new InvalidOperationException("handler boom"),
+                CancellationToken.None);
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: AAAA\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        var respBuf = new byte[1024];
+        var headerSoFar = new List<byte>();
+        while (true)
+        {
+            var n = await s.ReadAsync(respBuf.AsMemory()).AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            if (n <= 0) throw new EndOfStreamException("handshake stream closed");
+            for (int i = 0; i < n; i++) headerSoFar.Add(respBuf[i]);
+            if (HasHeaderTerminator(headerSoFar, out _)) break;
+        }
+
+        await s.WriteAsync(BuildClientMaskedTextFrame(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0"}""")));
+        await s.FlushAsync();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => receive.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal("handler boom", ex.Message);
+        listener.Stop();
+    }
+
     // ── BridgePayloads: lockfile schema ─────────────────────────────────────────
 
     [Fact]
@@ -521,6 +643,18 @@ public sealed class AcpBridgeUnitTests
             """).RootElement);
         var kind = BridgePayloads.ClassifyIncomingFrame(
             """{"jsonrpc":"2.0","id":9,"method":"session/request_permission"}""",
+            cfg, out _, out _, out _, out _);
+        Assert.Equal(BridgePayloads.FrameKind.Plain, kind);
+    }
+
+    [Fact]
+    public void BridgePayloads_ClassifyIncomingFrame_DoesNotAutoAnswerWhenConfigDisabled()
+    {
+        var cfg = BridgeConfig.FromHello(JsonDocument.Parse("""
+            {"type":"hello","autoAnswerQuestions":false}
+            """).RootElement);
+        var kind = BridgePayloads.ClassifyIncomingFrame(
+            """{"jsonrpc":"2.0","id":10,"method":"session/request_input"}""",
             cfg, out _, out _, out _, out _);
         Assert.Equal(BridgePayloads.FrameKind.Plain, kind);
     }
@@ -853,6 +987,8 @@ public sealed class AcpBridgeUnitTests
             var ready = await ctx.WaitForEnvelopeAsync("ready");
             var port = ready.GetProperty("port").GetInt32();
             var lockPath = ready.GetProperty("lockPath").GetString()!;
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                File.GetUnixFileMode(lockPath));
 
             // The auth token is generated inside HandleHello via
             // RandomNumberGenerator and never echoed on stdout; we recover it
@@ -908,14 +1044,68 @@ public sealed class AcpBridgeUnitTests
             // 4. result.stopReason → turn_complete envelope + bridge shuts down.
             const string done =
                 "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"stopReason\":\"end_turn\"}}";
+            var terminalStart = seenSoFar;
             await ctx.SendWebSocketFrameAsync(done);
-            var doneEnv = await ctx.WaitForEnvelopeAsync("turn_complete", startIndex: seenSoFar);
+            var doneRecv = await ctx.WaitForEnvelopeAsync("acp_recv", startIndex: terminalStart);
+            Assert.Equal(99, doneRecv.GetProperty("payload").GetProperty("id").GetInt32());
+            Assert.Equal("end_turn",
+                doneRecv.GetProperty("payload").GetProperty("result").GetProperty("stopReason").GetString());
+            var doneEnv = await ctx.WaitForEnvelopeAsync("turn_complete", startIndex: terminalStart);
             Assert.Equal("end_turn", doneEnv.GetProperty("stopReason").GetString());
 
             var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
             Assert.Equal(0, exitCode);
             Assert.False(File.Exists(lockPath),
                 "Lockfile must be deleted as part of the turn_complete Shutdown.");
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Bridge_OnIncomingFrame_AutoAnswerDisabled_PassesInputRequestThroughWithoutReply()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-noautoanswer-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"autoAnswerQuestions\":false,\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var authToken = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement
+                .GetProperty("authToken").GetString()!;
+
+            await ctx.ConnectWebSocketAsync(port, authToken);
+            await ctx.WaitForEnvelopeAsync("peer_connected");
+            var seenSoFar = ctx.Stdout.SnapshotCount();
+
+            const string inputReq =
+                "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"session/request_input\",\"params\":{}}";
+            await ctx.SendWebSocketFrameAsync(inputReq);
+
+            var recv = await ctx.WaitForEnvelopeAsync("acp_recv", startIndex: seenSoFar);
+            Assert.Equal("session/request_input",
+                recv.GetProperty("payload").GetProperty("method").GetString());
+            Assert.Equal(0, ctx.Stdout.CountByType("question_auto_answered"));
+            await Assert.ThrowsAsync<TimeoutException>(
+                () => ctx.ReadWebSocketFrameAsync(TimeSpan.FromMilliseconds(250)));
+
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
         }
         finally
         {
@@ -958,6 +1148,10 @@ public sealed class AcpBridgeUnitTests
                 "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32603,\"message\":\"boom\"}}";
             await ctx.SendWebSocketFrameAsync(err);
 
+            var recv = await ctx.WaitForEnvelopeAsync("acp_recv", startIndex: seenSoFar);
+            Assert.Equal(7, recv.GetProperty("payload").GetProperty("id").GetInt32());
+            Assert.Equal("boom",
+                recv.GetProperty("payload").GetProperty("error").GetProperty("message").GetString());
             var turnErr = await ctx.WaitForEnvelopeAsync("turn_error", startIndex: seenSoFar);
             var errProp = turnErr.GetProperty("error");
             Assert.Equal(-32603, errProp.GetProperty("code").GetInt32());
@@ -987,7 +1181,7 @@ public sealed class AcpBridgeUnitTests
     // of the pipe open so the stub's read times out instead of EOF'ing.
 
     [Fact]
-    public async Task Bridge_SpawnClaude_RedirectsAndClosesStdin_GivingClaudeAFreshClosedPipe()
+    public async Task Bridge_SpawnClaude_AppliesWorkingDirectoryEnvironmentAndClosedStdin()
     {
         // GNU coreutils' stat / readlink + bash are baseline on every
         // CodeyBox sandbox image, so this fixture is safe in CI.
@@ -1017,6 +1211,8 @@ public sealed class AcpBridgeUnitTests
                 "#!/bin/bash\n" +
                 "set +e\n" +
                 "LOG=\"$2\"\n" +
+                "printf 'pwd=%s\\nenv_marker=%s\\napi_timeout=%s\\n' " +
+                "\"$PWD\" \"${CODEYBOX_TEST_ENV:-}\" \"${API_TIMEOUT_MS:-}\" > \"$LOG\"\n" +
                 "fd0_link=$(readlink /proc/self/fd/0 2>/dev/null || echo unknown)\n" +
                 "fd0_inode=$(stat -L -c %i /proc/self/fd/0 2>/dev/null || echo unknown)\n" +
                 "fd0_type=$(stat -L -c %F /proc/self/fd/0 2>/dev/null || echo unknown)\n" +
@@ -1029,7 +1225,7 @@ public sealed class AcpBridgeUnitTests
                 "else state=timeout\n" +
                 "fi\n" +
                 "printf 'fd0_link=%s\\nfd0_inode=%s\\nfd0_type=%s\\nread_state=%s\\nrc=%s\\nbytes_read=%s\\n' " +
-                "\"$fd0_link\" \"$fd0_inode\" \"$fd0_type\" \"$state\" \"$rc\" \"$byte\" > \"$LOG\"\n" +
+                "\"$fd0_link\" \"$fd0_inode\" \"$fd0_type\" \"$state\" \"$rc\" \"$byte\" >> \"$LOG\"\n" +
                 "exit 0\n");
             File.SetUnixFileMode(stubPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -1044,7 +1240,7 @@ public sealed class AcpBridgeUnitTests
             await using var ctx = new BridgeRunHandle();
             var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
                 + "\",\"claudeArgs\":[\"" + stubLog
-                + "\"],\"workingDirectory\":\"" + workDir
+                + "\"],\"claudeEnv\":{\"CODEYBOX_TEST_ENV\":\"env-from-bridge\",\"API_TIMEOUT_MS\":\"12345\"},\"workingDirectory\":\"" + workDir
                 + "\",\"lockDir\":\"" + lockDir
                 + "\",\"turnTimeoutSeconds\":30}";
             await ctx.WriteStdinLineAsync(hello);
@@ -1055,6 +1251,10 @@ public sealed class AcpBridgeUnitTests
             Assert.True(File.Exists(stubLog),
                 "Stub claude did not write its diagnostic log — Bridge.SpawnClaude probably never invoked it.");
             var kv = ParseKeyValueLog(stubLog);
+
+            Assert.Equal(workDir, kv["pwd"]);
+            Assert.Equal("env-from-bridge", kv["env_marker"]);
+            Assert.Equal("12345", kv["api_timeout"]);
 
             // Regression (b) — bridge created the pipe but forgot to close
             // the write-end. claude's read would BLOCK on an open empty pipe
@@ -1580,6 +1780,28 @@ public sealed class AcpBridgeUnitTests
     // that drops the outer catch entirely; this fixture pins the envelope
     // shape Fatal produces so a regression that changes the envelope message
     // (and silently breaks the host observer's pattern match) is caught.
+
+    [Fact]
+    public async Task Bridge_HandleHello_UnexpectedStartupFailure_EmitsStartupFailedFatal()
+    {
+        using var stdin = new MemoryStream(Encoding.UTF8.GetBytes("{\"type\":\"hello\"}\n"));
+        using var stdoutCapture = new MemoryStream();
+        int exit;
+        using (Emitter.OverrideStreamForTests(stdoutCapture))
+        {
+            await using var bridge = new Bridge(stdin,
+                listenerFactory: () => throw new InvalidOperationException("listener boom"));
+            exit = await bridge.RunAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        }
+
+        Assert.Equal(2, exit);
+        var envelopes = ParseEnvelopes(stdoutCapture.ToArray());
+        var fatalEnv = envelopes.FirstOrDefault(
+            e => e.TryGetProperty("type", out var t) && t.GetString() == "fatal");
+        Assert.NotEqual(default, fatalEnv);
+        Assert.Equal("startup_failed", fatalEnv.GetProperty("message").GetString());
+        Assert.Contains("listener boom", fatalEnv.GetProperty("detail").GetString());
+    }
 
     [Fact]
     public void Bridge_Fatal_StartupFailed_EmitsEnvelopeWithMessageDetailAndShutsDownWithCode2()
@@ -2590,12 +2812,12 @@ public sealed class AcpBridgeUnitTests
     /// immutability 400 cluster the polite signal was specifically added to
     /// prevent.
     ///
-    /// The fix is two MSBuild items in
-    /// <c>CodeyBox.Agents.Claude.AcpBridge.csproj</c>:
-    /// <c>&lt;DirectPInvoke Include="libc" /&gt;</c> (resolve the PInvoke at
-    /// link time, no runtime dlopen) and <c>&lt;NativeLibrary Include="libc" /&gt;</c>
-    /// (statically link libc into the executable so the kill symbol is
-    /// available without a dynamic loader).
+    /// The fix is <c>&lt;DirectPInvoke Include="libc" /&gt;</c> in
+    /// <c>CodeyBox.Agents.Claude.AcpBridge.csproj</c>, which resolves the
+    /// P/Invoke at link time so the static binary does not need runtime
+    /// <c>dlopen</c>. The musl C runtime comes from the linux-musl-x64 toolchain;
+    /// <c>&lt;NativeLibrary Include="libc" /&gt;</c> must NOT be used because
+    /// NativeAOT passes Unix NativeLibrary items as raw file inputs.
     ///
     /// This regression is invisible to the rest of the suite because every
     /// other AcpBridge fixture exercises the IL build (where libc resolves
@@ -2608,7 +2830,7 @@ public sealed class AcpBridgeUnitTests
     /// the DllImport.
     /// </summary>
     [Fact]
-    public void AcpBridge_Csproj_DeclaresDirectPInvokeAndNativeLibraryForLibc()
+    public void AcpBridge_Csproj_DeclaresDirectPInvokeAndDoesNotPassLibcAsNativeLibraryFile()
     {
         var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
             ?? throw new InvalidOperationException(
@@ -2627,15 +2849,54 @@ public sealed class AcpBridgeUnitTests
 
         Assert.Contains("<StaticExecutable>true</StaticExecutable>", csprojText);
         Assert.Contains("<PublishAot>true</PublishAot>", csprojText);
+        Assert.Contains("<LinkerFlavor>lld</LinkerFlavor>", csprojText);
 
-        // The two items together are required: DirectPInvoke alone tells
-        // the AOT compiler to resolve the symbol at link time but doesn't
-        // statically link the library; NativeLibrary alone statically links
-        // libc but doesn't bind the DllImport's "libc" name to it.
-        // Drop either one and the StaticExecutable build regresses to a
-        // runtime DllNotFoundException on the first SIGTERM-grace call.
         Assert.Contains("<DirectPInvoke Include=\"libc\" />", csprojText);
-        Assert.Contains("<NativeLibrary Include=\"libc\" />", csprojText);
+        Assert.DoesNotContain("<NativeLibrary Include=\"libc\" />", csprojText);
+    }
+
+    [Fact]
+    public void AcpBridge_PublishScript_RemovesStaleResourceAndRunsMultipassVerification()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " — ensure CodeyBox.slnx exists in an ancestor directory.");
+
+        var scriptPath = Path.Combine(solutionRoot, "scripts", "publish-acp-bridge.sh");
+        Assert.True(File.Exists(scriptPath), "Publish script missing at " + scriptPath);
+        var script = File.ReadAllText(scriptPath);
+
+        Assert.Contains("rm -f \"$RESOURCE_PATH\" \"$TMP_RESOURCE\"", script);
+        Assert.Contains("ldd \"$TMP_RESOURCE\"", script);
+        Assert.Contains("multipass transfer \"$TMP_RESOURCE\"", script);
+        Assert.Contains("multipass exec \"$VERIFY_VM\" -- sh -c", script);
+        Assert.Contains("\"type\":\"bridge_started\"", script);
+    }
+
+    [Fact]
+    public void AcpBridge_ClaudeProject_ReleaseBuildRequiresNativeResource()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " — ensure CodeyBox.slnx exists in an ancestor directory.");
+
+        var csprojPath = Path.Combine(
+            solutionRoot,
+            "src",
+            "CodeyBox.Agents.Claude",
+            "CodeyBox.Agents.Claude.csproj");
+        Assert.True(File.Exists(csprojPath), "Claude csproj missing at " + csprojPath);
+
+        var csprojText = File.ReadAllText(csprojPath);
+
+        Assert.Contains("PublishAcpBridgeNativeResource", csprojText);
+        Assert.Contains("'$(Configuration)' == 'Release'\">true</PublishAcpBridgeNativeResource>", csprojText);
+        Assert.Contains("scripts/publish-acp-bridge.sh", csprojText);
+        Assert.Contains("RequireAcpBridgeNativeResource", csprojText);
+        Assert.Contains("Release builds of CodeyBox.Agents.Claude require a real ACP bridge resource", csprojText);
+        Assert.Contains("Condition=\"!Exists('$(AcpBridgeResourcePath)') and '$(RequireAcpBridgeNativeResource)' != 'true'\"", csprojText);
     }
 
     private static string? FindAncestorContaining(string start, string fileName)

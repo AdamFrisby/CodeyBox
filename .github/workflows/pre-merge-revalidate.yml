@@ -172,7 +172,10 @@ jobs:
             echo "dotnet not pre-installed on runner; this job assumes the ubuntu-latest image ships it" >&2
             exit 1
           fi
-          dotnet build CodeyBox.slnx --configuration Release
+          sudo apt-get update
+          sudo apt-get install -y musl-tools clang lld
+          scripts/publish-acp-bridge.sh --skip-multipass-verify
+          dotnet build CodeyBox.slnx --configuration Release -p:PublishAcpBridgeNativeResource=false
         continue-on-error: true
 
       - name: test

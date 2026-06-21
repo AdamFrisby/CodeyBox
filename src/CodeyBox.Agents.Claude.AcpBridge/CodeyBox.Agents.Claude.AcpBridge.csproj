@@ -8,14 +8,15 @@
 
     Build prerequisites for `dotnet publish`:
       - musl-tools (for the musl static linker the AOT publish step invokes).
+      - clang (NativeAOT passes the x86_64-linux-musl target flag).
+      - lld (the GNU bfd linker asserts on this static musl link).
       - The linux-musl-x64 ILCompiler runtime nuget package is restored
         on demand.
 
-    The default `dotnet build CodeyBox.slnx` does NOT run the AOT publish;
-    it just builds the IL assembly so the solution stays buildable on hosts
-    without musl-tools installed. Operators run scripts/publish-acp-bridge.sh
-    to produce the static binary and refresh the embedded resource carried
-    by CodeyBox.Agents.Claude.
+    The IL build is used by unit tests. Release/artifact hosts run
+    scripts/publish-acp-bridge.sh to produce the static binary, verify it in a
+    Multipass VM, and refresh the embedded resource carried by
+    CodeyBox.Agents.Claude.
   -->
 
   <PropertyGroup>
@@ -32,6 +33,7 @@
          scripts/publish-acp-bridge.sh. -->
     <PublishAot>true</PublishAot>
     <StaticExecutable>true</StaticExecutable>
+    <LinkerFlavor>lld</LinkerFlavor>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
     <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
@@ -60,15 +62,13 @@
     cluster the polite SIGTERM fix was specifically added to prevent.
 
     DirectPInvoke tells the NativeAOT compiler to resolve the libc PInvoke
-    at link time (no runtime dlopen), and NativeLibrary statically links
-    libc into the executable so the kill symbol is available without a
-    dynamic loader. Together these two items make the libc.kill DllImport
-    work in the StaticExecutable output the same way it works in the IL
-    build that the unit tests exercise via `dotnet exec`.
+    at link time (no runtime dlopen). Do NOT add NativeLibrary Include="libc":
+    on Unix NativeAOT passes NativeLibrary items to the linker as raw file
+    inputs, not as -l flags, so "libc" would be treated as a missing file. The
+    musl C runtime is linked by the linux-musl-x64 toolchain/default startup.
   -->
   <ItemGroup>
     <DirectPInvoke Include="libc" />
-    <NativeLibrary Include="libc" />
   </ItemGroup>
 
 </Project>

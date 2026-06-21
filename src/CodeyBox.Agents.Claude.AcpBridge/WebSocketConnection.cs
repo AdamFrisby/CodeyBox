@@ -113,7 +113,7 @@ internal sealed class WebSocketConnection
                 if (op == 0x1 || op == 0x2)
                 {
                     var text = Encoding.UTF8.GetString(payload);
-                    try { onText(text); } catch { /* swallow downstream errors */ }
+                    onText(text);
                 }
                 // ignore ping/pong/continuation
             }

@@ -43,8 +43,17 @@ jobs:
       - name: multipass version
         run: multipass version
 
+      - name: publish ACP bridge
+        run: |
+          set -euo pipefail
+          if ! command -v musl-gcc >/dev/null || ! command -v clang >/dev/null || ! command -v ld.lld >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools clang lld
+          fi
+          scripts/publish-acp-bridge.sh
+
       - name: build
-        run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release
+        run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release -p:PublishAcpBridgeNativeResource=false
 
       - name: run suspend resilience matrix
         run: |

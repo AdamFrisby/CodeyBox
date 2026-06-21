@@ -19,6 +19,7 @@ namespace CodeyBox.Agents.Claude.AcpBridge;
 internal sealed class Bridge : IAsyncDisposable
 {
     private readonly CancellationTokenSource _cts = new();
+    private readonly Func<TcpListener> _listenerFactory;
     // _pendingLock guards three things together so DrainPending can observe a
     // consistent snapshot: the outbound queue (_pendingPayloads), the current
     // peer reference (_peer), and the peer-ready flag (_peerReady). Holding
@@ -53,7 +54,10 @@ internal sealed class Bridge : IAsyncDisposable
 
     private bool ShutdownStarted => Volatile.Read(ref _shutdownState) != 0;
 
-    public Bridge() { }
+    public Bridge()
+    {
+        _listenerFactory = CreateLoopbackListener;
+    }
 
     /// <summary>
     /// Test-only constructor: pipe a synthetic stdin stream into the bridge
@@ -61,7 +65,11 @@ internal sealed class Bridge : IAsyncDisposable
     /// real sandbox. Production binary path always uses the parameterless
     /// constructor which reads from <see cref="Console.OpenStandardInput"/>.
     /// </summary>
-    internal Bridge(Stream stdinForTests) { _stdinOverride = stdinForTests; }
+    internal Bridge(Stream stdinForTests, Func<TcpListener>? listenerFactory = null)
+    {
+        _stdinOverride = stdinForTests;
+        _listenerFactory = listenerFactory ?? CreateLoopbackListener;
+    }
 
     public async Task<int> RunAsync()
     {
@@ -188,11 +196,13 @@ internal sealed class Bridge : IAsyncDisposable
 
     private void StartServer()
     {
-        _listener = new TcpListener(IPAddress.Loopback, 0);
+        _listener = _listenerFactory();
         _listener.Start();
         _port = ((IPEndPoint)_listener.LocalEndpoint).Port;
         _acceptLoopTask = Task.Run(() => AcceptLoopAsync(_cts.Token));
     }
+
+    private static TcpListener CreateLoopbackListener() => new(IPAddress.Loopback, 0);
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
@@ -246,6 +256,10 @@ internal sealed class Bridge : IAsyncDisposable
         _peerReceiveTask = Task.Run(() => conn.ReceiveLoopAsync(OnIncomingFrame, ct));
         try { await _peerReceiveTask.ConfigureAwait(false); }
         catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Fatal("acp_frame_handler_failed", ex.Message);
+        }
         finally
         {
             lock (_pendingLock)
@@ -385,12 +399,11 @@ internal sealed class Bridge : IAsyncDisposable
         try
         {
             Directory.CreateDirectory(baseDir);
-            try
+            if (!OperatingSystem.IsWindows())
             {
                 File.SetUnixFileMode(baseDir,
                     UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             }
-            catch { /* best-effort — chmod failure is non-fatal */ }
         }
         catch (Exception ex)
         {
@@ -407,13 +420,7 @@ internal sealed class Bridge : IAsyncDisposable
             Environment.ProcessId, _config.WorkingDirectory, _authToken ?? string.Empty, _port);
         try
         {
-            File.WriteAllBytes(_lockPath, bytes);
-            try
-            {
-                File.SetUnixFileMode(_lockPath,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
-            }
-            catch { /* best-effort */ }
+            WriteLockfileBytesAtomically(_lockPath, bytes);
         }
         catch (Exception ex)
         {
@@ -429,6 +436,37 @@ internal sealed class Bridge : IAsyncDisposable
             w.WriteStringValue(_config.WorkingDirectory);
             w.WriteEndArray();
         });
+    }
+
+    private static void WriteLockfileBytesAtomically(string path, byte[] bytes)
+    {
+        var dir = Path.GetDirectoryName(path) ?? ".";
+        var tmp = Path.Combine(dir, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            var options = new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+            };
+            if (!OperatingSystem.IsWindows())
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
+            using (var fs = new FileStream(tmp, options))
+            {
+                fs.Write(bytes, 0, bytes.Length);
+            }
+            File.Move(tmp, path, overwrite: true);
+            tmp = null!;
+        }
+        finally
+        {
+            if (tmp is not null && File.Exists(tmp))
+            {
+                try { File.Delete(tmp); } catch { }
+            }
+        }
     }
 
     private void SpawnClaude()
@@ -728,15 +766,16 @@ internal sealed class Bridge : IAsyncDisposable
         // only ever ships on linux-musl-x64 so the libc resolution is fixed.
         //
         // CRITICAL: the published binary uses StaticExecutable=true, which
-        // strips runtime dlopen support. Without the DirectPInvoke + the
-        // NativeLibrary items in CodeyBox.Agents.Claude.AcpBridge.csproj
+        // strips runtime dlopen support. Without the DirectPInvoke item in
+        // CodeyBox.Agents.Claude.AcpBridge.csproj
         // the NativeAOT PInvoke resolver would fall back to dlopen("libc.so")
         // and throw DllNotFoundException — which TerminateClaudeProcess
         // catches silently and degrades the SIGTERM-grace path to bare
         // SIGKILL, re-introducing the half-written-JSONL → thinking-block
         // immutability 400 cluster the polite signal was added to prevent.
-        // Keep the csproj DirectPInvoke + NativeLibrary entries in sync
-        // with this DllImport.
+        // The musl C runtime is linked by the NativeAOT toolchain; do not add
+        // a NativeLibrary Include="libc" item, because Unix NativeLibrary items
+        // are passed to the linker as file paths rather than -l names.
         [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
         internal static extern int Kill(int pid, int sig);
     }

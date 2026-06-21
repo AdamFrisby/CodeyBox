@@ -54,6 +54,11 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     /// DI-resolved instances can be primed in wiring tests.
     /// </summary>
     internal byte[]? BridgeBinaryOverride { get; set; }
+    /// <summary>
+    /// Test seam for placeholder handling. Production leaves this null so the
+    /// decision comes from the embedded resource bytes in <see cref="AcpBridgeBinary"/>.
+    /// </summary>
+    internal bool? BridgePlaceholderOverride { get; set; }
 
     public string Name => "acp";
     public ClaudeSessionTransport Transport => ClaudeSessionTransport.Acp;
@@ -100,7 +105,8 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         // transport on the very first turn without spending a roundtrip on
         // execing a non-binary. Tests can short-circuit the gate by
         // supplying BridgeBinaryOverride.
-        if (BridgeBinaryOverride is null && AcpBridgeBinary.IsPlaceholderBuild)
+        var isPlaceholderBuild = BridgePlaceholderOverride ?? AcpBridgeBinary.IsPlaceholderBuild;
+        if (BridgeBinaryOverride is null && isPlaceholderBuild)
         {
             throw new AcpTransportUnavailableException(
                 "ACP bridge binary is a placeholder build — run scripts/publish-acp-bridge.sh "
