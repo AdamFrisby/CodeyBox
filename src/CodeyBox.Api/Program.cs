@@ -3869,13 +3869,15 @@ namespace CodeyBox.Api
         public string Mode { get; set; } = "strict";
 
         /// <summary>
-        /// Operator-supplied configuration paths under <c>CodeyBox:*</c>
-        /// whose subtrees are skipped entirely. Use for extension namespaces
-        /// bound outside <c>CodeyBoxOptions</c> / <c>ProjectsOptions</c>.
-        /// The built-in defaults already cover the framework-internal
-        /// separately-bound sections (BuildScriptAudit, Mutation, Plugins, …).
+        /// Operator-supplied full configuration paths under <c>CodeyBox:*</c>
+        /// whose subtrees are skipped entirely (exact, case-insensitive
+        /// match). Use for extension namespaces bound outside
+        /// <c>CodeyBoxOptions</c> / <c>ProjectsOptions</c>. The built-in
+        /// defaults already cover the framework-internal separately-bound
+        /// sections (BuildScriptAudit, Mutation, Plugins, …) by walking them
+        /// with their typed root POCO so typos inside still surface.
         /// </summary>
-        public List<string> AdditionalExemptPathPrefixes { get; set; } = new();
+        public List<string> AdditionalExemptPaths { get; set; } = new();
     }
 
     /// <summary>

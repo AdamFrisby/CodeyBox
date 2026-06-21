@@ -528,7 +528,7 @@ silently misroute and only surface hours later as cascading quota failures.
   "UnboundKeys": {
     "Enabled": true,
     "Mode": "strict",
-    "AdditionalExemptPathPrefixes": []
+    "AdditionalExemptPaths": []
   }
 }
 ```
@@ -538,7 +538,7 @@ silently misroute and only surface hours later as cascading quota failures.
 | `FailOnUnknownModel` | `false` | When `false`, an unknown `ModelId` logs a Warning naming the typoed id and the valid alternatives, but startup succeeds. When `true`, startup fails-fast with a non-zero exit code so the misconfig never reaches production. Operators flip this on in production deployments. |
 | `UnboundKeys.Enabled` | `true` | Master switch for the unbound-key startup check. See below. |
 | `UnboundKeys.Mode` | `"strict"` | `"strict"` throws at startup when any unbound key is found. `"warn"` logs a single Warning naming each unbound key and lets startup proceed. Any other value is treated as `"strict"`. |
-| `UnboundKeys.AdditionalExemptPathPrefixes` | `[]` | Full configuration paths under `CodeyBox:*` whose subtrees the inspector skips entirely. Use for operator extension namespaces bound outside `CodeyBoxOptions` / `ProjectsOptions`. |
+| `UnboundKeys.AdditionalExemptPaths` | `[]` | Full configuration paths under `CodeyBox:*` whose subtrees the inspector skips entirely (exact, case-insensitive match — not a prefix). Use for operator extension namespaces bound outside `CodeyBoxOptions` / `ProjectsOptions`. |
 
 The model validator probes each provider's model-list endpoint
 (`api.anthropic.com/v1/models`, ChatGPT-OAuth `chatgpt.com/backend-api/wham/models`
@@ -585,20 +585,39 @@ Recursion respects the option-graph shape:
 - **Leaf types** (primitives, strings, enums, `TimeSpan`, `DateTimeOffset`,
   `Guid`, `Uri`) — any child of a leaf key is junk.
 
-#### Default exemptions
+#### Default handling for separately-bound sections
 
-A handful of `CodeyBox:*` sections are intentionally bound to typed option
-classes outside `CodeyBoxOptions` / `ProjectsOptions`. They are excluded
-from the walk by default so a vanilla config does not trip the check:
+A handful of `CodeyBox:*` sections bind to typed option classes outside
+`CodeyBoxOptions` / `ProjectsOptions`. The inspector knows about these
+roots and walks each sub-tree against its own typed POCO so typos like
+`CodeyBox:BuildScriptAudit:TimoutSeconds` or
+`CodeyBox:PromptPreprocessing:ProjectRulesPth` still surface — the wholesale
+subtree skip is **not** applied:
 
-- `CodeyBox:BuildScriptAudit`
-- `CodeyBox:PromptPreprocessing`
-- `CodeyBox:Presets`
-- `CodeyBox:Mutation`
-- `CodeyBox:CheckAndActCompletion`
-- `CodeyBox:Plugins`
+| Section | Typed root |
+|---------|------------|
+| `CodeyBox:BuildScriptAudit` | `BuildScriptAuditorOptions` |
+| `CodeyBox:PromptPreprocessing` | `AgentPromptPreprocessingOptions` |
+| `CodeyBox:Presets` | `PresetCatalogOptions` |
+| `CodeyBox:Mutation` | `MutationTestingAuditorOptions` |
+| `CodeyBox:CheckAndActCompletion` | `CheckAndActCompletionOptions` |
+| `CodeyBox:Plugins` | `PluginOptions` (plus operator-defined `<plugin-id>` sub-trees are opaque) |
+
+`CodeyBox:Plugins` is the only section that mixes typed properties
+(`AssemblyPaths`/`PackageDirectories`/`Allowlist`) with operator-defined
+extension keys (per-plugin sub-trees read via `IPluginHost.ScopedConfig`).
+The inspector treats any non-typed key at `CodeyBox:Plugins` level as an
+opaque plugin id, so a typo of a typed property name there cannot be
+distinguished from a plugin id and stays silent. Typos *inside*
+`AssemblyPaths` / `PackageDirectories` / `Allowlist` are still validated.
+
+A small set of leaf-shaped keys is read directly via `IConfiguration` with
+no matching typed property; these are exempted by exact path:
+
 - `CodeyBox:DangerouslyDisableAuth` — read directly via
   `IConfiguration.GetValue<bool>` for the bearer-token middleware.
+- `CodeyBox:CredentialFileWatchers` — read directly to gate the host-side
+  OAuth credential file watchers.
 - Per-agent credential-file leaf keys read directly via
   `builder.Configuration["CodeyBox:…"]` when the matching `CODEYBOX_…_FILE`
   env var is unset: `CodeyBox:ClaudeOAuthFile`, `CodeyBox:CodexOAuthFile`,
@@ -625,13 +644,14 @@ These two exemptions cascade through `Defaults:Audit`, every
 because the binder applies the same custom-map logic at every depth.
 
 To exempt an operator extension namespace, add it to
-`ConfigValidation.UnboundKeys.AdditionalExemptPathPrefixes`. The whole
-subtree under the named path is skipped:
+`ConfigValidation.UnboundKeys.AdditionalExemptPaths`. The whole subtree
+under the exact named path is skipped (case-insensitive equality — not a
+prefix; an entry of `CodeyBox:MyExt` does not also match `CodeyBox:MyExtra`):
 
 ```json
 "ConfigValidation": {
   "UnboundKeys": {
-    "AdditionalExemptPathPrefixes": [
+    "AdditionalExemptPaths": [
       "CodeyBox:MyCustomExtension"
     ]
   }

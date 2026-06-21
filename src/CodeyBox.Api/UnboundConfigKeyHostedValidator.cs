@@ -1,3 +1,6 @@
+using CodeyBox.Audit;
+using CodeyBox.Audit.Presets;
+using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using Microsoft.Extensions.Options;
 
@@ -19,30 +22,36 @@ namespace CodeyBox.Api;
 /// <c>Mode = "strict"</c> (default) throws and <c>"warn"</c> emits one
 /// warning log per unbound key.</para>
 ///
-/// <para>Default exemptions cover framework-internal sections bound outside
-/// the typed root (e.g. <c>BuildScriptAudit</c>, <c>Plugins</c>, <c>Mutation</c>).
-/// Operator extension namespaces add to
-/// <c>CodeyBox:ConfigValidation:UnboundKeys:AdditionalExemptPathPrefixes</c>.</para>
+/// <para>Framework-internal sections bound outside the typed root (e.g.
+/// <c>BuildScriptAudit</c>, <c>Plugins</c>, <c>Mutation</c>) are walked
+/// against their own typed root POCO so typos inside them still surface;
+/// only genuine operator-keyed extension subtrees (e.g. <c>CodeyBox:Plugins:&lt;plugin-id&gt;</c>)
+/// are silenced. Operator extension namespaces add to
+/// <c>CodeyBox:ConfigValidation:UnboundKeys:AdditionalExemptPaths</c>.</para>
 /// </summary>
 internal sealed class UnboundConfigKeyHostedValidator : IHostedService
 {
     /// <summary>
-    /// Sections under <c>CodeyBox:</c> that are deliberately bound to typed
-    /// option classes outside <see cref="CodeyBoxOptions"/> /
-    /// <see cref="ProjectsOptions"/>. Excluded so a vanilla config does not
+    /// Leaf-shaped <c>CodeyBox:*</c> keys read directly via
+    /// <see cref="IConfiguration"/> with no matching property on the typed
+    /// options graph. Excluded by exact path so a vanilla config does not
     /// flag them as unbound.
+    ///
+    /// <para>POCO-shaped sections bound to a typed root outside
+    /// <see cref="CodeyBoxOptions"/> / <see cref="ProjectsOptions"/> are NOT
+    /// listed here — they live in <see cref="DefaultExternalBindings"/> so the
+    /// walker still descends into them with their own property graph and
+    /// surfaces typos like <c>CodeyBox:BuildScriptAudit:TimoutSeconds</c>.</para>
     /// </summary>
     internal static readonly string[] DefaultExemptPaths =
     {
-        "CodeyBox:BuildScriptAudit",
-        "CodeyBox:PromptPreprocessing",
-        "CodeyBox:Presets",
-        "CodeyBox:Mutation",
-        "CodeyBox:CheckAndActCompletion",
-        "CodeyBox:Plugins",
         // Read directly via IConfiguration.GetValue<bool>(ApiKeyAuth.DisableConfigKey)
         // rather than through the typed options graph.
         "CodeyBox:DangerouslyDisableAuth",
+        // Read directly via CredentialFileWatcherSettings.IsEnabled against the
+        // raw configuration value. Documented operator knob with no matching
+        // typed property.
+        "CodeyBox:CredentialFileWatchers",
         // Direct-config leaf keys for per-agent credential file paths and
         // OAuth client secrets. Read via builder.Configuration["CodeyBox:…"]
         // when the matching CODEYBOX_…_FILE env var is unset; no matching
@@ -57,6 +66,36 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
         "CodeyBox:GeminiOauthClientId",
         "CodeyBox:GeminiOauthClientSecret",
     };
+
+    /// <summary>
+    /// Configuration sub-paths whose typed root binds outside the
+    /// <see cref="CodeyBoxOptions"/> / <see cref="ProjectsOptions"/> graph. The
+    /// inspector still walks the sub-tree — using the mapped POCO — so a typo
+    /// like <c>CodeyBox:BuildScriptAudit:TimoutSeconds</c> surfaces instead of
+    /// being lost to a blanket subtree exemption.
+    ///
+    /// <para><c>AllowsExtensionKeys</c> is set on <c>CodeyBox:Plugins</c>
+    /// because its sub-tree mixes typed
+    /// <see cref="PluginOptions.AssemblyPaths"/>/<see cref="PluginOptions.PackageDirectories"/>/
+    /// <see cref="PluginOptions.Allowlist"/> properties with operator-defined
+    /// <c>&lt;plugin-id&gt;</c> sub-trees that plugins read via
+    /// <c>IPluginHost.ScopedConfig</c>. Non-matching keys at that level are
+    /// treated as opaque plugin ids rather than flagged. The trade-off is
+    /// that a typo of a typed property name (e.g. <c>Allwlist</c>) at the
+    /// <c>CodeyBox:Plugins</c> level cannot be distinguished from a plugin
+    /// id and stays silent; typos under the typed properties themselves
+    /// (e.g. inside <c>AssemblyPaths</c>) are still validated.</para>
+    /// </summary>
+    internal static readonly IReadOnlyDictionary<string, ExternalSectionBinding> DefaultExternalBindings =
+        new Dictionary<string, ExternalSectionBinding>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CodeyBox:BuildScriptAudit"] = new(typeof(BuildScriptAuditorOptions), AllowsExtensionKeys: false),
+            ["CodeyBox:PromptPreprocessing"] = new(typeof(AgentPromptPreprocessingOptions), AllowsExtensionKeys: false),
+            ["CodeyBox:Presets"] = new(typeof(PresetCatalogOptions), AllowsExtensionKeys: false),
+            ["CodeyBox:Mutation"] = new(typeof(MutationTestingAuditorOptions), AllowsExtensionKeys: false),
+            ["CodeyBox:CheckAndActCompletion"] = new(typeof(CheckAndActCompletionOptions), AllowsExtensionKeys: false),
+            ["CodeyBox:Plugins"] = new(typeof(PluginOptions), AllowsExtensionKeys: true),
+        };
 
     private readonly IConfiguration _config;
     private readonly IOptions<CodeyBoxOptions> _options;
@@ -78,7 +117,7 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
         if (!knobs.Enabled)
             return Task.CompletedTask;
 
-        var reports = Inspect(_config, knobs.AdditionalExemptPathPrefixes);
+        var reports = Inspect(_config, knobs.AdditionalExemptPaths);
         if (reports.Count == 0)
             return Task.CompletedTask;
 
@@ -115,7 +154,8 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
         return UnboundConfigKeyInspector.Inspect(
             config.GetSection("CodeyBox"),
             new[] { typeof(CodeyBoxOptions), typeof(ProjectsOptions) },
-            exempt);
+            exempt,
+            DefaultExternalBindings);
     }
 
     private static string BuildSummary(IReadOnlyList<UnboundConfigKeyReport> reports)

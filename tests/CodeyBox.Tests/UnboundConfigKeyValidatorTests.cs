@@ -138,16 +138,26 @@ public sealed class UnboundConfigKeyValidatorTests
     }
 
     [Fact]
-    public void Inspect_ExemptsBuiltInExtensionSections()
+    public void Inspect_AcceptsValidKeysInSeparatelyBoundSections()
     {
+        // Separately-bound POCO sections (BuildScriptAudit, PromptPreprocessing,
+        // Presets, Mutation, CheckAndActCompletion) are walked against their
+        // typed root. Real properties bind; this fixture pins the happy path.
         var config = BuildConfig(new()
         {
-            ["CodeyBox:BuildScriptAudit:Enabled"] = "true",
-            ["CodeyBox:Plugins:Foo"] = "bar",
-            ["CodeyBox:Mutation:Threshold"] = "60",
-            ["CodeyBox:CheckAndActCompletion:OnlySomeKey"] = "true",
-            ["CodeyBox:Presets:Languages:0:Id"] = "cs",
-            ["CodeyBox:PromptPreprocessing:Whatever"] = "x",
+            ["CodeyBox:BuildScriptAudit:TimeoutSeconds"] = "1200",
+            ["CodeyBox:PromptPreprocessing:ProjectRulesPath"] = "AGENTS.md",
+            ["CodeyBox:Presets:ProjectRoot"] = "/etc/codeybox/presets",
+            ["CodeyBox:Mutation:Enabled"] = "true",
+            ["CodeyBox:Mutation:ChangedCodeThresholdPercent"] = "80",
+            ["CodeyBox:CheckAndActCompletion:Enabled"] = "true",
+            ["CodeyBox:CheckAndActCompletion:GeminiModel"] = "gemini-2.5-pro",
+            // Plugins: typed properties bind…
+            ["CodeyBox:Plugins:AssemblyPaths:0"] = "/etc/codeybox/plugins/My.dll",
+            ["CodeyBox:Plugins:Allowlist:0"] = "codeybox.statistics",
+            // …and operator-defined plugin-id sub-trees stay opaque.
+            ["CodeyBox:Plugins:codeybox.statistics:SomePluginConfig"] = "value",
+            ["CodeyBox:Plugins:codeybox.statistics:Deep:Nested:Thing"] = "value",
         });
 
         var reports = UnboundConfigKeyHostedValidator.Inspect(config);
@@ -156,7 +166,88 @@ public sealed class UnboundConfigKeyValidatorTests
     }
 
     [Fact]
-    public void Inspect_HonoursAdditionalExemptPathPrefixes()
+    public void Inspect_FlagsTypoInsideSeparatelyBoundSection_BuildScriptAudit()
+    {
+        // The Error-fix case: a typo of TimeoutSeconds inside the
+        // separately-bound BuildScriptAuditorOptions must surface instead of
+        // being lost to a blanket subtree exemption.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:BuildScriptAudit:TimoutSeconds"] = "1200",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal("CodeyBox:BuildScriptAudit:TimoutSeconds", report.Path);
+        Assert.Equal("TimeoutSeconds", report.NearestProperty);
+    }
+
+    [Fact]
+    public void Inspect_FlagsTypoInsideSeparatelyBoundSection_PromptPreprocessing()
+    {
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:PromptPreprocessing:ProjectRulesPth"] = "AGENTS.md",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal("CodeyBox:PromptPreprocessing:ProjectRulesPth", report.Path);
+        Assert.Equal("ProjectRulesPath", report.NearestProperty);
+    }
+
+    [Fact]
+    public void Inspect_FlagsTypoInsideSeparatelyBoundSection_Mutation()
+    {
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Mutation:Enabld"] = "true",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal("CodeyBox:Mutation:Enabld", report.Path);
+        Assert.Equal("Enabled", report.NearestProperty);
+    }
+
+    [Fact]
+    public void Inspect_FlagsTypoDeepInsideSeparatelyBoundSection_Presets()
+    {
+        // Nested typo inside a dictionary value type also surfaces.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Presets:LanguageOverrides:csharp:Replce"] = "true",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal("CodeyBox:Presets:LanguageOverrides:csharp:Replce", report.Path);
+    }
+
+    [Fact]
+    public void Inspect_ExemptsCredentialFileWatchersLeafKey()
+    {
+        // CodeyBox:CredentialFileWatchers is read directly via
+        // CredentialFileWatcherSettings.IsEnabled and has no matching property
+        // on CodeyBoxOptions / ProjectsOptions. It MUST not trip strict-mode
+        // validation — the docs (configuration.md:165) tell operators to set
+        // it.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:CredentialFileWatchers"] = "false",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
+    public void Inspect_HonoursAdditionalExemptPaths()
     {
         var config = BuildConfig(new()
         {

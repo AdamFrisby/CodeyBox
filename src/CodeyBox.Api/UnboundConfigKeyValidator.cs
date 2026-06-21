@@ -30,6 +30,24 @@ public sealed class UnboundConfigKeyReport
 }
 
 /// <summary>
+/// Maps a configuration sub-path to the typed POCO that <c>ConfigurationBinder</c>
+/// uses for that sub-tree when the typed root is bound separately from
+/// <see cref="CodeyBoxOptions"/> / <see cref="ProjectsOptions"/>.
+/// Surfaces typos inside e.g. <c>CodeyBox:Plugins</c> without giving up the
+/// genuinely operator-keyed plugin-id extension namespace.
+/// </summary>
+/// <param name="RootType">The typed POCO bound at the configuration sub-path.</param>
+/// <param name="AllowsExtensionKeys">
+/// When <c>true</c>, child keys at this POCO level that do not match a property
+/// are treated as opaque operator-keyed extensions (the subtree is skipped, no
+/// report). Use for sections that mix typed properties with operator-defined
+/// extension keys at the same level — currently only <c>CodeyBox:Plugins</c>,
+/// which holds <c>AssemblyPaths</c>/<c>PackageDirectories</c>/<c>Allowlist</c>
+/// alongside operator-defined <c>&lt;plugin-id&gt;</c> subtrees.
+/// </param>
+public sealed record ExternalSectionBinding(Type RootType, bool AllowsExtensionKeys);
+
+/// <summary>
 /// Walks an operator-provided <see cref="IConfiguration"/> sub-tree and
 /// reports every leaf/section key that does not bind to a property on the
 /// strongly-typed options graph.
@@ -44,7 +62,8 @@ public sealed class UnboundConfigKeyReport
 /// <item><description>List/array/enumerable — keys are indices and skipped;
 /// values are recursed with the element type.</description></item>
 /// <item><description>Leaf types (primitives, strings, enums, TimeSpan,
-/// DateTimeOffset, Guid, Uri) — any child is an unbound key.</description></item>
+/// DateTime, DateTimeOffset, DateOnly, TimeOnly, decimal, Guid, Uri,
+/// Version, object) — any child is an unbound key.</description></item>
 /// </list>
 ///
 /// <para>The inspector is config-only: it never instantiates the options
@@ -56,14 +75,21 @@ public static class UnboundConfigKeyInspector
     /// <summary>
     /// Inspects <paramref name="section"/> against the union of properties on
     /// <paramref name="rootTypes"/>. <paramref name="exemptPaths"/> is a set
-    /// of full configuration paths (e.g. <c>"CodeyBox:Plugins"</c>) whose
-    /// subtrees are skipped entirely — use for sections bound outside the
-    /// supplied root types.
+    /// of full configuration paths (e.g. <c>"CodeyBox:DangerouslyDisableAuth"</c>)
+    /// whose subtrees are skipped entirely — use for leaf-shaped operator keys
+    /// read directly via <c>IConfiguration</c> with no matching property on the
+    /// typed root graph. <paramref name="externalBindings"/> maps a sub-path to
+    /// a typed POCO bound separately from the root types — the inspector
+    /// recurses into the sub-path with that POCO instead of flagging it
+    /// unbound, so typos like <c>CodeyBox:BuildScriptAudit:TimoutSeconds</c>
+    /// still surface even though <c>BuildScriptAuditorOptions</c> is not part
+    /// of the typed root union.
     /// </summary>
     public static IReadOnlyList<UnboundConfigKeyReport> Inspect(
         IConfiguration section,
         IReadOnlyCollection<Type> rootTypes,
-        IReadOnlyCollection<string>? exemptPaths = null)
+        IReadOnlyCollection<string>? exemptPaths = null,
+        IReadOnlyDictionary<string, ExternalSectionBinding>? externalBindings = null)
     {
         ArgumentNullException.ThrowIfNull(section);
         ArgumentNullException.ThrowIfNull(rootTypes);
@@ -73,8 +99,11 @@ public static class UnboundConfigKeyInspector
         var exempt = new HashSet<string>(
             exemptPaths ?? Array.Empty<string>(),
             StringComparer.OrdinalIgnoreCase);
+        var bindings = externalBindings is null
+            ? new Dictionary<string, ExternalSectionBinding>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, ExternalSectionBinding>(externalBindings, StringComparer.OrdinalIgnoreCase);
         var reports = new List<UnboundConfigKeyReport>();
-        WalkPoco(section, rootTypes, reports, exempt);
+        WalkPoco(section, rootTypes, reports, exempt, bindings, allowsExtensionKeys: false);
         return reports;
     }
 
@@ -82,7 +111,9 @@ public static class UnboundConfigKeyInspector
         IConfiguration node,
         IReadOnlyCollection<Type> types,
         List<UnboundConfigKeyReport> reports,
-        HashSet<string> exempt)
+        HashSet<string> exempt,
+        Dictionary<string, ExternalSectionBinding> externalBindings,
+        bool allowsExtensionKeys)
     {
         // Union the property maps from every supplied type so multiple options
         // classes bound at the same configuration root coexist (e.g.
@@ -107,18 +138,38 @@ public static class UnboundConfigKeyInspector
 
             if (properties.TryGetValue(child.Key, out var prop))
             {
-                if (TryWalkCustomBoundSection(child, prop, reports, exempt))
+                if (TryWalkCustomBoundSection(child, prop, reports, exempt, externalBindings))
                     continue;
-                Walk(child, prop.PropertyType, reports, exempt);
+                Walk(child, prop.PropertyType, reports, exempt, externalBindings);
+                continue;
             }
-            else
+
+            // No typed-property match. Check whether the configuration path is
+            // bound separately to a typed POCO (e.g. CodeyBox:Plugins ->
+            // PluginOptions) — if so, recurse into that POCO's property graph
+            // so typos inside the section still surface.
+            if (externalBindings.TryGetValue(child.Path, out var binding))
             {
-                reports.Add(new UnboundConfigKeyReport
-                {
-                    Path = child.Path,
-                    NearestProperty = NearestPropertyName(child.Key, properties.Keys),
-                });
+                WalkPoco(
+                    child,
+                    new[] { binding.RootType },
+                    reports,
+                    exempt,
+                    externalBindings,
+                    allowsExtensionKeys: binding.AllowsExtensionKeys);
+                continue;
             }
+
+            // Operator-keyed extension namespace (e.g. plugin-id under
+            // CodeyBox:Plugins) — opaque subtree, no report.
+            if (allowsExtensionKeys)
+                continue;
+
+            reports.Add(new UnboundConfigKeyReport
+            {
+                Path = child.Path,
+                NearestProperty = NearestPropertyName(child.Key, properties.Keys),
+            });
         }
     }
 
@@ -134,20 +185,21 @@ public static class UnboundConfigKeyInspector
         IConfigurationSection child,
         PropertyInfo prop,
         List<UnboundConfigKeyReport> reports,
-        HashSet<string> exempt)
+        HashSet<string> exempt,
+        Dictionary<string, ExternalSectionBinding> externalBindings)
     {
         if (prop.DeclaringType != typeof(ProjectAuditConfig))
             return false;
 
         if (string.Equals(prop.Name, nameof(ProjectAuditConfig.Languages), StringComparison.Ordinal))
         {
-            WalkLanguagesSection(child, reports, exempt);
+            WalkLanguagesSection(child, reports, exempt, externalBindings);
             return true;
         }
 
         if (string.Equals(prop.Name, nameof(ProjectAuditConfig.AuditTypes), StringComparison.Ordinal))
         {
-            WalkAuditTypesSection(child, reports, exempt);
+            WalkAuditTypesSection(child, reports, exempt, externalBindings);
             return true;
         }
 
@@ -164,7 +216,8 @@ public static class UnboundConfigKeyInspector
     private static void WalkLanguagesSection(
         IConfigurationSection node,
         List<UnboundConfigKeyReport> reports,
-        HashSet<string> exempt)
+        HashSet<string> exempt,
+        Dictionary<string, ExternalSectionBinding> externalBindings)
     {
         foreach (var child in node.GetChildren())
         {
@@ -174,7 +227,7 @@ public static class UnboundConfigKeyInspector
             if (int.TryParse(child.Key, out _))
             {
                 // List form — element is a string leaf; any sub-key is junk.
-                Walk(child, typeof(string), reports, exempt);
+                Walk(child, typeof(string), reports, exempt, externalBindings);
                 continue;
             }
 
@@ -187,7 +240,7 @@ public static class UnboundConfigKeyInspector
                 {
                     if (exempt.Contains(langChild.Path))
                         continue;
-                    Walk(langChild, typeof(ProjectLanguagePresetOverrideConfig), reports, exempt);
+                    Walk(langChild, typeof(ProjectLanguagePresetOverrideConfig), reports, exempt, externalBindings);
                 }
                 continue;
             }
@@ -207,7 +260,8 @@ public static class UnboundConfigKeyInspector
     private static void WalkAuditTypesSection(
         IConfigurationSection node,
         List<UnboundConfigKeyReport> reports,
-        HashSet<string> exempt)
+        HashSet<string> exempt,
+        Dictionary<string, ExternalSectionBinding> externalBindings)
     {
         var children = node.GetChildren().ToList();
         if (children.Count == 0)
@@ -221,7 +275,7 @@ public static class UnboundConfigKeyInspector
         {
             if (exempt.Contains(child.Path))
                 continue;
-            Walk(child, elementType, reports, exempt);
+            Walk(child, elementType, reports, exempt, externalBindings);
         }
     }
 
@@ -229,7 +283,8 @@ public static class UnboundConfigKeyInspector
         IConfigurationSection node,
         Type type,
         List<UnboundConfigKeyReport> reports,
-        HashSet<string> exempt)
+        HashSet<string> exempt,
+        Dictionary<string, ExternalSectionBinding> externalBindings)
     {
         var effective = Nullable.GetUnderlyingType(type) ?? type;
 
@@ -251,7 +306,7 @@ public static class UnboundConfigKeyInspector
             {
                 if (exempt.Contains(child.Path))
                     continue;
-                Walk(child, valueType, reports, exempt);
+                Walk(child, valueType, reports, exempt, externalBindings);
             }
             return;
         }
@@ -262,13 +317,13 @@ public static class UnboundConfigKeyInspector
             {
                 if (exempt.Contains(child.Path))
                     continue;
-                Walk(child, elementType, reports, exempt);
+                Walk(child, elementType, reports, exempt, externalBindings);
             }
             return;
         }
 
         // POCO — recurse with property map.
-        WalkPoco(node, new[] { effective }, reports, exempt);
+        WalkPoco(node, new[] { effective }, reports, exempt, externalBindings, allowsExtensionKeys: false);
     }
 
     private static IEnumerable<KeyValuePair<string, PropertyInfo>> BuildPropertyMap(Type type)
