@@ -1436,6 +1436,25 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
+    public async Task Bridge_SignalForceExitWatchdog_UsesInjectedExitAction()
+    {
+        var forcedExit = new TaskCompletionSource<int>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var bridge = new Bridge(new MemoryStream(), listenerFactory: null,
+            forceExitForTests: code => forcedExit.TrySetResult(code));
+
+        var exitCodeField = typeof(Bridge).GetField("_exitCode",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        exitCodeField.SetValue(bridge, 17);
+
+        var schedule = typeof(Bridge).GetMethod("ScheduleForceExitAfterSignal",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        schedule.Invoke(bridge, null);
+
+        Assert.Equal(17, await forcedExit.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
     public async Task Bridge_Shutdown_ConcurrentCauses_ClaudeExitEmittedExactlyOnceAndLockfileGone()
     {
         // End-to-end fixture exercising two Shutdown causes back-to-back:

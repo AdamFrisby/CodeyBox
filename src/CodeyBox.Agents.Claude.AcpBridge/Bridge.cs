@@ -20,6 +20,7 @@ internal sealed class Bridge : IAsyncDisposable
 {
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<TcpListener> _listenerFactory;
+    private readonly Action<int> _forceExit;
     // _pendingLock guards three things together so DrainPending can observe a
     // consistent snapshot: the outbound queue (_pendingPayloads), the current
     // peer reference (_peer), and the peer-ready flag (_peerReady). Holding
@@ -57,6 +58,7 @@ internal sealed class Bridge : IAsyncDisposable
     public Bridge()
     {
         _listenerFactory = CreateLoopbackListener;
+        _forceExit = Environment.Exit;
     }
 
     /// <summary>
@@ -66,9 +68,18 @@ internal sealed class Bridge : IAsyncDisposable
     /// constructor which reads from <see cref="Console.OpenStandardInput"/>.
     /// </summary>
     internal Bridge(Stream stdinForTests, Func<TcpListener>? listenerFactory = null)
+        : this(stdinForTests, listenerFactory, _ => { })
+    {
+    }
+
+    internal Bridge(
+        Stream stdinForTests,
+        Func<TcpListener>? listenerFactory,
+        Action<int> forceExitForTests)
     {
         _stdinOverride = stdinForTests;
         _listenerFactory = listenerFactory ?? CreateLoopbackListener;
+        _forceExit = forceExitForTests;
     }
 
     public async Task<int> RunAsync()
@@ -753,7 +764,7 @@ internal sealed class Bridge : IAsyncDisposable
         {
             try { await Task.Delay(1500).ConfigureAwait(false); }
             catch { }
-            try { Environment.Exit(_exitCode); }
+            try { _forceExit(_exitCode); }
             catch { }
         });
     }
