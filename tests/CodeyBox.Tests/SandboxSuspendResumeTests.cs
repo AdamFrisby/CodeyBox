@@ -16,6 +16,7 @@ namespace CodeyBox.Tests;
 /// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/> and clears the
 /// bookkeeping. The leak reaper skips VMs named in the suspended set.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class SandboxSuspendResumeTests : IDisposable
 {
     private readonly string _dbPath =
@@ -66,8 +67,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     {
         // The slack here covers fixed-cost overhead unrelated to the timeout
         // itself: starting the dedicated LongRunning thread for the resume
-        // task, the post-cancellation ObserveProviderTaskAfterCancellationAsync
-        // 250ms grace, and the SQLite UPDATE that records the Failed state.
+        // task, scheduling the post-cancellation observation continuation, and
+        // the SQLite UPDATE that records the Failed state.
         // Under CI load each of these can dilate non-trivially. The bound is
         // generous enough that genuine timeout regressions (resume that never
         // honors the configured cap) still fall well outside it.

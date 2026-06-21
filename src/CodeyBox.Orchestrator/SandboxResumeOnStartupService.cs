@@ -533,7 +533,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             if (resumeTask is not null)
-                await ObserveProviderTaskAfterCancellationAsync(resumeTask);
+                ObserveProviderTaskAfterCancellation(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -543,7 +543,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             if (resumeTask is not null)
-                await ObserveProviderTaskAfterCancellationAsync(resumeTask);
+                ObserveProviderTaskAfterCancellation(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -752,7 +752,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             if (promoteTask is not null)
-                await ObserveProviderTaskAfterCancellationAsync(promoteTask);
+                ObserveProviderTaskAfterCancellation(promoteTask);
 
             _log.LogWarning(
                 "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
@@ -762,7 +762,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             if (promoteTask is not null)
-                await ObserveProviderTaskAfterCancellationAsync(promoteTask);
+                ObserveProviderTaskAfterCancellation(promoteTask);
 
             _log.LogWarning(
                 "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
@@ -794,23 +794,34 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             TaskScheduler.Default);
     }
 
-    private async Task ObserveProviderTaskAfterCancellationAsync(Task task)
+    private void ObserveProviderTaskAfterCancellation(Task task)
     {
-        try
+        if (task.IsCompleted)
         {
-            await task.WaitAsync(TimeSpan.FromMilliseconds(250));
+            LogProviderTaskCompletionAfterCancellation(task);
+            return;
         }
-        catch (TimeoutException)
-        {
-            ObserveProviderTaskException(task);
-        }
-        catch (OperationCanceledException)
+
+        _ = task.ContinueWith(
+            LogProviderTaskCompletionAfterCancellation,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void LogProviderTaskCompletionAfterCancellation(Task task)
+    {
+        if (task.IsCanceled)
         {
             _log.LogDebug("Provider task observed cancellation after startup resume timeout/cancellation");
+            return;
         }
-        catch (Exception ex)
+
+        if (task.IsFaulted)
         {
-            _log.LogWarning(ex, "Provider task faulted after startup resume timeout/cancellation");
+            _log.LogWarning(
+                task.Exception?.GetBaseException(),
+                "Provider task faulted after startup resume timeout/cancellation");
         }
     }
 
