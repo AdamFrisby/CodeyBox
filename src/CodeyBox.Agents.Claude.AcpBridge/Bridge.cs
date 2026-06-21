@@ -38,10 +38,14 @@ internal sealed class Bridge : IAsyncDisposable
     private bool _peerReady;
     private Process? _claudeProcess;
     private int _shutdownState; // 0 = running, 1 = shutting down. Updated via Interlocked.Exchange.
+    private int _claudeExitEmitted; // 0 = not yet emitted, 1 = emitted. Single-fire guard.
     private int _exitCode;
     private Timer? _turnDeadline;
     private Task? _acceptLoopTask;
     private Task? _peerReceiveTask;
+    private Task? _claudeMonitorTask;
+    private Task? _claudeStdoutPumpTask;
+    private Task? _claudeStderrPumpTask;
     private PosixSignalRegistration? _sigterm;
     private PosixSignalRegistration? _sigint;
     private PosixSignalRegistration? _sighup;
@@ -470,59 +474,102 @@ internal sealed class Bridge : IAsyncDisposable
         // RedirectStandardInput = true comment above.
         try { _claudeProcess.StandardInput.Close(); } catch { }
 
-        // Capture the process locally so the Exited handler can't NRE if a
-        // future shutdown path nulls the field. Subscribe BEFORE flipping
-        // EnableRaisingEvents — otherwise a fast-exiting claude can fire its
-        // internal exit notification before the handler is attached, and
-        // MaybeFinish would never run until the turn-deadline timer fires.
+        // Drive claude_exit via an awaitable monitor task instead of the
+        // proc.Exited event. Two reasons:
+        //
+        // 1. proc.Exited is documented to potentially miss the exit if the
+        //    process exits before EnableRaisingEvents = true is set — under
+        //    CPU stress the order Process.Start → close-stdin → subscribe →
+        //    EnableRaisingEvents is non-trivial wall-clock, and a fast stub
+        //    that's already been SIGTERM'd by a racing Shutdown can die in
+        //    that window. The old `if (proc.HasExited) MaybeFinish()` post-
+        //    check called MaybeFinish but did NOT emit claude_exit, so the
+        //    envelope was silently dropped and the host's session-completion
+        //    observer would never see the turn close.
+        // 2. proc.Exited fires on a .NET monitor thread that is NOT awaited
+        //    by Bridge.DisposeAsync, so a late-firing event could call
+        //    Emitter.Emit AFTER the test's OverrideStreamForTests scope has
+        //    been disposed. The emit would then race onto whatever _stdout
+        //    is currently set — either the real process stdout (visible as
+        //    JSON noise in the test runner's output) or, worse, the capture
+        //    stream of a SUBSEQUENT test. The latter caused the audit-iter-10
+        //    flake: a leaked claude_exit / fatal from one test contaminated
+        //    the capture of the next test, breaking envelope-count assertions
+        //    that read `Stdout.Snapshot()`.
+        //
+        // The monitor task is tracked in _claudeMonitorTask and awaited in
+        // WaitForBackgroundTasksAsync — so by the time RunAsync returns and
+        // DisposeAsync completes, the emit has either happened or won't
+        // happen (because the process never exits and we cancelled), but
+        // it is NEVER racing the test's emitter-scope disposal.
         var proc = _claudeProcess;
-        proc.Exited += (_, _) =>
+        _claudeMonitorTask = Task.Run(async () =>
         {
-            int exit;
-            try { exit = proc.ExitCode; } catch { exit = -1; }
-            Emitter.Emit("claude_exit", w =>
+            try
             {
-                w.WriteNumber("code", exit);
-                w.WriteNull("signal");
-            });
+                await proc.WaitForExitAsync(_cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // _cts cancelled by Shutdown — but Shutdown also terminates
+                // claude, so the WaitForExitAsync without the ct should
+                // succeed shortly. Fall through to the exit emit below.
+                try { await proc.WaitForExitAsync().ConfigureAwait(false); }
+                catch { return; }
+            }
+            catch (Exception) { return; }
+            EmitClaudeExitOnce(proc);
             MaybeFinish();
-        };
-        proc.EnableRaisingEvents = true;
-        // If claude already exited between Process.Start and the Exited
-        // subscription, the event will never fire — drive MaybeFinish ourselves.
-        if (proc.HasExited) MaybeFinish();
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var stdout = _claudeProcess.StandardOutput;
-                var buf = new char[4096];
-                while (true)
-                {
-                    var n = await stdout.ReadAsync(buf.AsMemory()).ConfigureAwait(false);
-                    if (n <= 0) return;
-                    var text = new string(buf, 0, n);
-                    Emitter.Emit("claude_stdout", w => w.WriteString("text", text));
-                }
-            }
-            catch (Exception) { /* stream closed */ }
         });
-        _ = Task.Run(async () =>
+
+        // Pass _cts.Token to the reader so Shutdown's _cts.Cancel() unblocks
+        // it cleanly. Without the token, an orphaned grandchild (e.g. a bash
+        // stub backgrounding `sleep 60 & wait $!` and exit-trapping SIGTERM
+        // leaves the sleep process inheriting bash's stdout/stderr and the
+        // pipe stays open even after bash exits) would keep the reader
+        // blocked in ReadAsync forever, and WaitForBackgroundTasksAsync —
+        // which now awaits this task — would never complete.
+        var stdoutStream = _claudeProcess.StandardOutput;
+        var stderrStream = _claudeProcess.StandardError;
+        _claudeStdoutPumpTask = Task.Run(() => PumpReaderAsync(stdoutStream, "claude_stdout", _cts.Token));
+        _claudeStderrPumpTask = Task.Run(() => PumpReaderAsync(stderrStream, "claude_stderr", _cts.Token));
+    }
+
+    private static async Task PumpReaderAsync(StreamReader reader, string envelopeType, CancellationToken ct)
+    {
+        try
         {
-            try
+            var buf = new char[4096];
+            while (true)
             {
-                var stderr = _claudeProcess.StandardError;
-                var buf = new char[4096];
-                while (true)
-                {
-                    var n = await stderr.ReadAsync(buf.AsMemory()).ConfigureAwait(false);
-                    if (n <= 0) return;
-                    var text = new string(buf, 0, n);
-                    Emitter.Emit("claude_stderr", w => w.WriteString("text", text));
-                }
+                var n = await reader.ReadAsync(buf.AsMemory(), ct).ConfigureAwait(false);
+                if (n <= 0) return;
+                var text = new string(buf, 0, n);
+                Emitter.Emit(envelopeType, w => w.WriteString("text", text));
             }
-            catch (Exception) { /* stream closed */ }
+        }
+        catch (OperationCanceledException) { /* shutting down */ }
+        catch (Exception) { /* stream closed */ }
+    }
+
+    /// <summary>
+    /// Single-fire claude_exit emission. The monitor task calls this when the
+    /// claude process exits naturally; Shutdown can also call it directly when
+    /// it terminates the process so the envelope lands before background tasks
+    /// have a chance to be cancelled (and so a fast-exiting stub can never
+    /// drop the envelope because the monitor task hadn't yet started parking
+    /// on WaitForExitAsync). The Interlocked guard makes the second caller a
+    /// no-op so duplicates can't be emitted.
+    /// </summary>
+    private void EmitClaudeExitOnce(Process proc)
+    {
+        if (Interlocked.Exchange(ref _claudeExitEmitted, 1) != 0) return;
+        int exit;
+        try { exit = proc.ExitCode; } catch { exit = -1; }
+        Emitter.Emit("claude_exit", w =>
+        {
+            w.WriteNumber("code", exit);
+            w.WriteNull("signal");
         });
     }
 
@@ -557,9 +604,19 @@ internal sealed class Bridge : IAsyncDisposable
         try { _turnDeadline?.Dispose(); } catch { }
         try
         {
-            if (_claudeProcess is { HasExited: false } p)
+            if (_claudeProcess is { } p)
             {
-                TerminateClaudeProcess(p);
+                if (!p.HasExited) TerminateClaudeProcess(p);
+                // Emit claude_exit BEFORE cancelling _cts. The monitor task
+                // also calls this on its WaitForExitAsync completion, but
+                // emitting it here while we're still on the cleanup path
+                // means a host-side observer sees claude_exit before
+                // peer_closed / process teardown, and it lands deterministic-
+                // ally before the test's emitter scope can be disposed (the
+                // monitor task may not have a chance to wake up before the
+                // CTS cancel propagates). EmitClaudeExitOnce is single-fire,
+                // so the monitor task's later call is a no-op.
+                EmitClaudeExitOnce(p);
             }
         }
         catch { }
@@ -669,6 +726,15 @@ internal sealed class Bridge : IAsyncDisposable
 
     private async Task WaitForBackgroundTasksAsync()
     {
+        // Every background task that calls Emitter.Emit must be drained here
+        // BEFORE DisposeAsync returns. The test harness wraps each Bridge
+        // instance in an Emitter.OverrideStreamForTests scope and disposes
+        // that scope right after _runTask completes — if any of these tasks
+        // call Emitter.Emit after the scope is gone, the envelope either
+        // leaks to the real process stdout or (under cross-test parallelism)
+        // contaminates the next test's capture stream. The latter caused
+        // the audit-iter-10 flake where one test's claude_exit landed in
+        // another test's envelope list and broke its count assertions.
         if (_acceptLoopTask is not null)
         {
             try { await _acceptLoopTask.ConfigureAwait(false); }
@@ -677,6 +743,21 @@ internal sealed class Bridge : IAsyncDisposable
         if (_peerReceiveTask is not null)
         {
             try { await _peerReceiveTask.ConfigureAwait(false); }
+            catch { }
+        }
+        if (_claudeMonitorTask is not null)
+        {
+            try { await _claudeMonitorTask.ConfigureAwait(false); }
+            catch { }
+        }
+        if (_claudeStdoutPumpTask is not null)
+        {
+            try { await _claudeStdoutPumpTask.ConfigureAwait(false); }
+            catch { }
+        }
+        if (_claudeStderrPumpTask is not null)
+        {
+            try { await _claudeStderrPumpTask.ConfigureAwait(false); }
             catch { }
         }
     }
