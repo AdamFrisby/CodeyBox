@@ -21,6 +21,21 @@ internal sealed class WebSocketConnection
     private const string WebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private const string AuthHeaderName = "x-claude-code-ide-authorization";
 
+    // Hard cap on any single inbound WebSocket frame payload. RFC6455 §5.2 lets
+    // the length-127 form carry a 63-bit value (up to ~9.2 EB); without a cap
+    // a peer-supplied length of 0xFFFF_FFFF_FFFF_FFFF wraps to a negative long
+    // and `new byte[len]` throws OverflowException, while a length close to
+    // long.MaxValue overflows the `offset + len` bounds check and triggers an
+    // OutOfMemoryException attempting to allocate ~2 GiB+. Both faults escape
+    // ReceiveLoopAsync (it only catches IOException/ObjectDisposedException on
+    // the read) and bubble out of HandleClientAsync's fire-and-forget Task.Run
+    // as an UnobservedTaskException — the exact crash class that commit 89a9a03
+    // already pinned for WriteRawAsync. Real ACP traffic (session/prompt
+    // responses, session/update notifications) sits well under 1 MiB; capping
+    // here at 8 MiB gives ample headroom while making a hostile/garbled length
+    // a clean connection close instead of a process crash.
+    private const int MaxFramePayloadBytes = 8 * 1024 * 1024;
+
     private readonly NetworkStream _stream;
     private readonly object _writeLock = new();
 
@@ -91,7 +106,8 @@ internal sealed class WebSocketConnection
             if (n <= 0) return;
             for (int i = 0; i < n; i++) acc.Add(buf[i]);
 
-            while (TryParseFrame(acc, out var op, out var payload))
+            bool closeAfterDrain = false;
+            while (TryParseFrame(acc, out var op, out var payload, out closeAfterDrain))
             {
                 if (op == 0x8) return; // close
                 if (op == 0x1 || op == 0x2)
@@ -101,6 +117,12 @@ internal sealed class WebSocketConnection
                 }
                 // ignore ping/pong/continuation
             }
+            // A hostile / broken frame (negative or oversized length-127 value)
+            // can't be unblocked by reading more bytes — the bad length stays
+            // at the head of `acc` and TryParseFrame would loop forever
+            // rejecting the same prefix. Return so HandleClientAsync's
+            // peer-receive task ends and the connection closes cleanly.
+            if (closeAfterDrain) return;
         }
     }
 
@@ -154,10 +176,11 @@ internal sealed class WebSocketConnection
         return frame;
     }
 
-    private static bool TryParseFrame(List<byte> acc, out int opcode, out byte[] payload)
+    private static bool TryParseFrame(List<byte> acc, out int opcode, out byte[] payload, out bool closeConnection)
     {
         opcode = 0;
         payload = Array.Empty<byte>();
+        closeConnection = false;
         if (acc.Count < 2) return false;
         var b1 = acc[0];
         var b2 = acc[1];
@@ -177,6 +200,23 @@ internal sealed class WebSocketConnection
             len = 0;
             for (int i = 0; i < 8; i++) len = (len << 8) | acc[2 + i];
             offset = 10;
+        }
+        // Bound the parsed length BEFORE allocating: an MSB-set 8-byte length
+        // wraps to a negative long and `new byte[len]` would throw
+        // ArgumentOutOfRangeException; a length above MaxFramePayloadBytes is a
+        // hostile-or-broken peer and we'd rather hang up than try to OOM the
+        // sandbox VM with the resulting `new byte[~2 GB]`. Signal the caller
+        // via `closeConnection = true` so ReceiveLoopAsync returns instead of
+        // re-parsing the same bad prefix forever — `acc` keeps the bad bytes
+        // at its head, so a plain return-false would just spin on every
+        // subsequent read. The signed-overflow leg of the bounds check below
+        // also relies on this gate — `offset + len` could otherwise wrap to a
+        // small positive number for a very large len and the check would
+        // spuriously pass.
+        if (len < 0 || len > MaxFramePayloadBytes)
+        {
+            closeConnection = true;
+            return false;
         }
         int maskStart = -1;
         if (masked)

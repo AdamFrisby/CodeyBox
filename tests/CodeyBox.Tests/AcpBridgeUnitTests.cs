@@ -6,6 +6,7 @@ using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
 using System.Text.Json;
@@ -1775,6 +1776,436 @@ public sealed class AcpBridgeUnitTests
         Assert.True(await acceptTask);
         listener.Stop();
     }
+
+    // ── WebSocketConnection.TryParseFrame oversized-length-127 defence ─────────
+    //
+    // RFC6455 §5.2 lets the length-127 form carry an 8-byte length, with the
+    // MSB required to be 0 and a "reasonable" upper bound recommended. The
+    // bridge parser accumulates the 8 bytes into a signed `long`, so a peer
+    // that sets the MSB (0xFF as the high byte) yields a negative `len` —
+    // `new byte[len]` then throws ArgumentOutOfRangeException. A peer that
+    // sets a giant positive value (e.g. 0x00FF_FFFF_FFFF_FFFF) yields a
+    // multi-PB allocation that throws OutOfMemoryException. Neither exception
+    // is caught in ReceiveLoopAsync (only IOException/ObjectDisposedException
+    // on the read are swallowed) and neither is caught in HandleClientAsync's
+    // try/catch(OperationCanceledException) on the peer-receive task — so
+    // either would escape Task.Run as an UnobservedTaskException and crash
+    // the bridge under the default unobserved-exception policy.
+    //
+    // The fix caps `len` and signals the caller (via the new closeConnection
+    // out parameter) to drop the peer cleanly. This fixture pins the contract:
+    // an oversized length-127 frame causes the receive task to complete
+    // gracefully without throwing, even though the bytes never form a valid
+    // frame.
+
+    [Fact]
+    public async Task WebSocketConnection_TryParseFrame_RejectsOversizedLength127Frame_AndClosesReceiveLoopCleanly()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        var receiveDone = new TaskCompletionSource<bool>();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var server = await listener.AcceptTcpClientAsync();
+                var ws = new WebSocketConnection(server.GetStream());
+                var ok = await ws.AcceptHandshakeAsync(authToken: "", CancellationToken.None);
+                if (!ok)
+                {
+                    receiveDone.TrySetException(new Exception("handshake failed"));
+                    return;
+                }
+                // The receive loop MUST return without throwing — even with a
+                // hostile oversized length the closeConnection signal should
+                // drop us out cleanly. A regression that dropped the
+                // out-parameter close signal would either loop forever
+                // re-parsing the same bad prefix or crash the loop.
+                await ws.ReceiveLoopAsync(_ => { }, CancellationToken.None);
+                receiveDone.TrySetResult(true);
+            }
+            catch (Exception ex) { receiveDone.TrySetException(ex); }
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: AAAA\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        // Wait for the 101 upgrade response.
+        var respBuf = new byte[1024];
+        var headerSoFar = new List<byte>();
+        while (true)
+        {
+            var n = await s.ReadAsync(respBuf.AsMemory());
+            if (n <= 0) throw new EndOfStreamException("handshake stream closed");
+            for (int i = 0; i < n; i++) headerSoFar.Add(respBuf[i]);
+            if (HasHeaderTerminator(headerSoFar, out _)) break;
+        }
+
+        // Send a length-127 text frame with the MSB set on the length: the
+        // 8-byte big-endian value 0xFF_00_00_00_00_00_00_00 parses to a
+        // negative long, which a no-bounds parser would feed into
+        // `new byte[len]` and crash. The frame also carries the mask bit so
+        // it looks "valid" up to the length check; the 4 mask bytes are
+        // never reached because the length check fails first.
+        var hostile = new byte[]
+        {
+            0x81,                                   // FIN + text opcode
+            (byte)(0x80 | 127),                     // masked + length-127
+            0xFF, 0xFF, 0xFF, 0xFF,                 // high 4 bytes (MSB set → negative)
+            0xFF, 0xFF, 0xFF, 0xFF,                 // low 4 bytes
+            0x12, 0x34, 0x56, 0x78,                 // mask bytes (irrelevant)
+        };
+        await s.WriteAsync(hostile);
+        await s.FlushAsync();
+
+        // The server's receive task is expected to detect the bad length,
+        // mark closeConnection, and return out of ReceiveLoopAsync. Close the
+        // client side so any post-rejection read returns EOF cleanly.
+        try { client.Close(); } catch { }
+
+        // The Task.Run wrapper must complete with `true` (no exception),
+        // proving both (a) the length-127 path didn't crash with
+        // ArgumentOutOfRangeException/OutOfMemoryException, and (b) the
+        // closeConnection signal actually drove the loop to return.
+        var ok = await receiveDone.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(ok);
+
+        listener.Stop();
+    }
+
+    // ── WebSocketConnection.WriteRawAsync IOException/ODE swallow ──────────────
+    //
+    // Commit 89a9a03 wrapped WriteRawAsync's stream.WriteAsync in
+    // IOException/ObjectDisposedException swallows specifically because the
+    // 400/401 error-branch awaits in AcceptHandshakeAsync have NO outer
+    // try/catch (the only try/catch in HandleClientAsync's fire-and-forget
+    // Task.Run is on OperationCanceledException). Without the catch, a peer
+    // that tore the TCP connection down mid-handshake would propagate
+    // IOException out as an UnobservedTaskException — under the default
+    // unobserved-exception policy, that crashes the bridge.
+    //
+    // The handshake-rejection fixtures (RejectsWrongAuthTokenWith401,
+    // HandshakeRejectsMissingSecWebSocketKey) keep the client connected
+    // throughout the reply, so they never exercise the catch. This fixture
+    // forces the WriteAsync to fail by sending a complete bad-auth request
+    // and immediately RST-closing the TCP connection (LingerOption(true, 0)
+    // → RST instead of FIN), then delaying briefly before the server-side
+    // AcceptHandshakeAsync runs. The server reads the request from the kernel
+    // buffer (already delivered before the RST), checks auth (wrong → 401
+    // branch), then tries to write the 401 response on a dead socket. The
+    // WriteRawAsync catch must absorb the resulting IOException and
+    // AcceptHandshakeAsync must complete with `false` rather than throwing.
+
+    [Fact]
+    public async Task WebSocketConnection_AcceptHandshake_WriteRawAsyncFailureOnPeerDisconnect_IsSwallowed()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        var serverDone = new TaskCompletionSource<bool>();
+        var clientGone = new TaskCompletionSource<bool>();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var server = await listener.AcceptTcpClientAsync();
+                // Wait until the test driver has closed the client side and
+                // the kernel has processed the RST so the server-side write
+                // will hit ECONNRESET — without this delay the WriteAsync may
+                // race ahead of the RST and complete by buffering locally.
+                await clientGone.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await Task.Delay(150);
+                var ws = new WebSocketConnection(server.GetStream());
+                // AcceptHandshakeAsync reads the queued bytes, checks auth
+                // (wrong token → 401 branch), tries to write the 401 reply
+                // on a dead socket. The IOException must be swallowed inside
+                // WriteRawAsync and AcceptHandshakeAsync must return false.
+                var ok = await ws.AcceptHandshakeAsync("the-real-token", CancellationToken.None);
+                serverDone.TrySetResult(ok);
+            }
+            catch (Exception ex) { serverDone.TrySetException(ex); }
+        });
+
+        var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        // LingerState(true, 0) causes Close() to send TCP RST instead of FIN.
+        // A subsequent server-side write hits ECONNRESET which surfaces as
+        // IOException in NetworkStream.WriteAsync — the exact failure mode
+        // commit 89a9a03's catch was added to absorb.
+        client.Client.LingerState = new LingerOption(true, 0);
+        var s = client.GetStream();
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: AAAA\r\nSec-WebSocket-Version: 13\r\n" +
+            "x-claude-code-ide-authorization: wrong-token\r\n\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+        client.Close();
+        clientGone.TrySetResult(true);
+
+        // The server-side AcceptHandshakeAsync MUST complete cleanly with
+        // false. If WriteRawAsync's IOException catch is dropped, this
+        // serverDone task faults with IOException and the assertion fails.
+        var result = await serverDone.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.False(result,
+            "AcceptHandshakeAsync must return false on auth mismatch and absorb the " +
+            "IOException raised by the 401-reply write to a torn-down peer.");
+        listener.Stop();
+    }
+
+    // ── Bridge.TerminateClaudeProcess SIGTERM-first path ───────────────────────
+    //
+    // Commit 89a9a03 added a P/Invoke kill(2) with SIGTERM=15, a 1.5s grace
+    // window, and a Process.Kill(entireProcessTree:true) fallback specifically
+    // to give claude --ide time to flush its session JSONL transcript before
+    // exiting. .NET's Process.Kill(bool) always sends SIGKILL on Linux — no
+    // SIGTERM overload — so reverting to a bare Process.Kill leaves a
+    // half-written transcript that surfaces as a thinking-block immutability
+    // 400 on the next session/load.
+    //
+    // The existing end-to-end fixtures use either /usr/bin/true (already
+    // exited before Shutdown runs; HasExited=true short-circuits
+    // TerminateClaudeProcess) or a short-lived 0.5s sleep stub (also exited
+    // by the time Shutdown fires). Neither verifies that SIGTERM=15 is
+    // actually delivered first. This fixture wires a bash stub that traps
+    // SIGTERM, writes a marker file (proof the polite signal arrived), and
+    // exits 0 — if a regression dropped NativeMethods.Kill and reverted to a
+    // bare Process.Kill, the stub would be SIGKILL'd immediately, the trap
+    // would never run, and the marker file would not exist.
+
+    [Fact]
+    public async Task Bridge_TerminateClaudeProcess_SendsSigtermFirst_GivingClaudeGraceToFlushTranscript()
+    {
+        if (!File.Exists("/bin/bash"))
+            return; // honour Skippable shape without taking the dependency
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-sigterm-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+
+            var markerPath = Path.Combine(tmpDir, "sigterm-trapped.marker");
+            var stubPath = Path.Combine(tmpDir, "claude-sigterm-stub.sh");
+
+            // Bash stub: trap SIGTERM → write marker → exit 0. The `sleep &
+            // wait` pattern is required because bash's `trap` only fires
+            // BETWEEN commands by default; backgrounding the sleep and
+            // wait-ing on it lets the trap deliver mid-sleep. argv[1] ==
+            // "--ide" (the flag Bridge always prepends), argv[2] == the
+            // marker path the trap writes.
+            File.WriteAllText(stubPath,
+                "#!/bin/bash\n" +
+                "MARKER=\"$2\"\n" +
+                "trap 'echo \"got-sigterm\" > \"$MARKER\"; exit 0' SIGTERM\n" +
+                "sleep 60 &\n" +
+                "wait $!\n");
+            File.SetUnixFileMode(stubPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"" + markerPath
+                + "\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":30}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            await ctx.WaitForEnvelopeAsync("ready");
+
+            // Trigger shutdown via the host envelope — drives Bridge.Shutdown,
+            // which sees the stub still running (HasExited=false) and calls
+            // TerminateClaudeProcess. SIGTERM-first means the bash trap runs;
+            // SIGKILL-first means it doesn't.
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+
+            // Give the bash trap a brief moment to flush its marker file —
+            // TerminateClaudeProcess returns as soon as p.HasExited goes true,
+            // which happens just before the file write completes.
+            for (int i = 0; i < 50 && !File.Exists(markerPath); i++)
+                await Task.Delay(50);
+
+            Assert.True(File.Exists(markerPath),
+                "Marker file missing — bash stub did NOT receive SIGTERM, meaning " +
+                "TerminateClaudeProcess sent SIGKILL directly (regression: dropped " +
+                "the NativeMethods.Kill(pid, 15) call). The polite-signal contract " +
+                "is what protects claude's session JSONL flush.");
+            // Marker contents pin SIGTERM specifically — the bash trap only
+            // writes this literal when invoked from the SIGTERM handler.
+            Assert.Equal("got-sigterm", File.ReadAllText(markerPath).Trim());
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Bridge PosixSignalRegistration handlers (SIGTERM / SIGINT / SIGHUP) ────
+    //
+    // Commit 8152b99 added PosixSignalRegistration.Create for SIGTERM, SIGINT
+    // and SIGHUP because the prior Console.CancelKeyPress + ProcessExit pair
+    // never fired on SIGTERM (the sandbox provider's normal stop signal),
+    // silently leaking ~/.claude/ide/<port>.lock files and claude --ide
+    // subprocess trees per the commit message. No test verifies these
+    // registrations actually trigger Shutdown — sending a real signal from
+    // the in-process BridgeRunHandle test seam would kill the test runner.
+    //
+    // Coverage requires spawning the bridge as a subprocess and signalling
+    // it. We invoke the just-built bridge dll via `dotnet exec` (the test
+    // project ProjectReferences the AcpBridge assembly so `typeof(Bridge)
+    // .Assembly.Location` resolves to the IL build alongside its deps.json /
+    // runtimeconfig.json), pipe a hello envelope in, wait for the `ready`
+    // envelope on stdout, then kill(2) the subprocess with the signal under
+    // test. The handler's `ctx.Cancel = true` MUST suppress .NET's default
+    // (terminate) so the bridge exits cleanly with code 0; the handler's
+    // Shutdown(0) MUST clean up the lockfile.
+    //
+    // A regression that drops the three PosixSignalRegistration.Create calls
+    // (or wires them to a noop callback) would either let the process exit
+    // with the signal-default exit code 128+signal (SIGTERM → 143, SIGINT →
+    // 130, SIGHUP → 129) OR leave a leaked lockfile in place — both are
+    // failure modes this fixture catches.
+
+    [Theory]
+    [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
+    [InlineData(2,  "SIGINT")]  // Ctrl+C
+    [InlineData(1,  "SIGHUP")]  // controlling-terminal hangup
+    public async Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName)
+    {
+        if (!File.Exists("/bin/bash"))
+            return; // honour Skippable shape without taking the dependency
+
+        var bridgeDllPath = typeof(Bridge).Assembly.Location;
+        Assert.True(File.Exists(bridgeDllPath),
+            "AcpBridge dll missing at " + bridgeDllPath +
+            " — the test project should ProjectReference the AcpBridge assembly.");
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-posixsig-" + signalName + "-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            // Long-running stub so the bridge stays alive until we signal it.
+            var stubPath = Path.Combine(tmpDir, "claude-longsleep-stub.sh");
+            File.WriteAllText(stubPath,
+                "#!/bin/bash\n" +
+                "exec sleep 60\n");
+            File.SetUnixFileMode(stubPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            var psi = new ProcessStartInfo("dotnet")
+            {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = tmpDir,
+            };
+            psi.ArgumentList.Add("exec");
+            psi.ArgumentList.Add(bridgeDllPath);
+
+            using var proc = Process.Start(psi)
+                ?? throw new InvalidOperationException("Process.Start returned null for dotnet exec.");
+
+            try
+            {
+                var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                    + "\",\"workingDirectory\":\"" + workDir
+                    + "\",\"lockDir\":\"" + lockDir
+                    + "\",\"turnTimeoutSeconds\":60}";
+                await proc.StandardInput.WriteLineAsync(hello);
+                await proc.StandardInput.FlushAsync();
+
+                // Read stdout line-by-line until we see the `ready` envelope —
+                // confirms the bridge is up, the lockfile is written, and the
+                // signal handlers have been registered (HandleHello completes
+                // before `ready` fires, but PosixSignalRegistration.Create
+                // happens at the top of RunAsync which runs first).
+                string? lockPath = null;
+                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+                while (DateTime.UtcNow < deadline)
+                {
+                    var line = await proc.StandardOutput.ReadLineAsync().WaitAsync(
+                        TimeSpan.FromSeconds(5));
+                    if (line is null) break;
+                    if (string.IsNullOrEmpty(line)) continue;
+                    using var doc = JsonDocument.Parse(line);
+                    if (!doc.RootElement.TryGetProperty("type", out var typeEl)) continue;
+                    if (typeEl.GetString() == "ready")
+                    {
+                        lockPath = doc.RootElement.GetProperty("lockPath").GetString();
+                        break;
+                    }
+                }
+                Assert.NotNull(lockPath);
+                Assert.True(File.Exists(lockPath),
+                    "Lockfile must exist after `ready` envelope — pre-signal state.");
+
+                // Drain remaining stdout in the background so the pipe doesn't
+                // fill up and block the bridge while we wait for the signal.
+                var drainTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        while (await proc.StandardOutput.ReadLineAsync() is not null) { }
+                    }
+                    catch { }
+                });
+
+                // Send the signal directly via libc.kill(2). The bridge's
+                // PosixSignalRegistration handler runs, sets ctx.Cancel=true
+                // (suppressing .NET's default-terminate), and calls
+                // Shutdown(0) → lockfile cleanup → bridge exits with code 0.
+                var killResult = LibcKill(proc.Id, signo);
+                Assert.Equal(0, killResult);
+
+                Assert.True(proc.WaitForExit(milliseconds: 15_000),
+                    "Bridge did not exit within 15s of " + signalName +
+                    " — regression: PosixSignalRegistration handler missing or wired to a noop.");
+
+                // Exit code 0 means our handler suppressed the default and
+                // ran Shutdown(0). Exit codes 128+signo (143 / 130 / 129)
+                // indicate the default action ran — the handler is missing
+                // or didn't set ctx.Cancel.
+                Assert.Equal(0, proc.ExitCode);
+
+                // The Shutdown handler also deletes the lockfile. A regression
+                // that calls Shutdown(0) but skips the lockfile delete still
+                // exits cleanly; this assertion catches that drift separately.
+                Assert.False(File.Exists(lockPath),
+                    "Lockfile leaked after " + signalName +
+                    " — Shutdown(0) ran but the per-turn lockfile cleanup was skipped.");
+
+                await drainTask.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            finally
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
+    private static extern int LibcKill(int pid, int sig);
 
     // ── Helpers for the new orchestration / regression fixtures above ───────────
 
