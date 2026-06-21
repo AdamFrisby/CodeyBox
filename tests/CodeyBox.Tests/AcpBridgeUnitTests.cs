@@ -2573,4 +2573,80 @@ public sealed class AcpBridgeUnitTests
             }
         }
     }
+
+    // ── NativeAOT static-link contract ─────────────────────────────────────────
+
+    /// <summary>
+    /// The bridge csproj sets <c>&lt;StaticExecutable&gt;true&lt;/StaticExecutable&gt;</c>
+    /// + <c>&lt;PublishAot&gt;true&lt;/PublishAot&gt;</c>, producing a fully-statically
+    /// linked ELF with NO <c>dlopen</c> support at runtime. The default
+    /// NativeAOT PInvoke resolver falls back to <c>dlopen("libc.so")</c> on
+    /// first call which throws <see cref="DllNotFoundException"/> in a fully-
+    /// static binary. <c>Bridge.NativeMethods.Kill</c> P/Invokes libc's
+    /// <c>kill(2)</c> for the polite SIGTERM-then-grace-then-SIGKILL teardown
+    /// of <c>claude --ide</c> — the exception is caught silently by
+    /// <c>TerminateClaudeProcess</c> and the SIGTERM-grace path regresses to
+    /// bare SIGKILL, re-introducing the half-written-JSONL → thinking-block
+    /// immutability 400 cluster the polite signal was specifically added to
+    /// prevent.
+    ///
+    /// The fix is two MSBuild items in
+    /// <c>CodeyBox.Agents.Claude.AcpBridge.csproj</c>:
+    /// <c>&lt;DirectPInvoke Include="libc" /&gt;</c> (resolve the PInvoke at
+    /// link time, no runtime dlopen) and <c>&lt;NativeLibrary Include="libc" /&gt;</c>
+    /// (statically link libc into the executable so the kill symbol is
+    /// available without a dynamic loader).
+    ///
+    /// This regression is invisible to the rest of the suite because every
+    /// other AcpBridge fixture exercises the IL build (where libc resolves
+    /// via the host's dynamic loader normally); the failure mode only
+    /// manifests in the actually-published binary the sandbox executes.
+    /// We can't easily exec the AOT-published ELF from the test runner
+    /// (musl-tools may not be installed), so pin the csproj contents
+    /// instead — a regression that drops either MSBuild item will fail
+    /// this test loudly and force the operator to keep them in sync with
+    /// the DllImport.
+    /// </summary>
+    [Fact]
+    public void AcpBridge_Csproj_DeclaresDirectPInvokeAndNativeLibraryForLibc()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " — ensure CodeyBox.slnx exists in an ancestor directory.");
+
+        var csprojPath = Path.Combine(
+            solutionRoot,
+            "src",
+            "CodeyBox.Agents.Claude.AcpBridge",
+            "CodeyBox.Agents.Claude.AcpBridge.csproj");
+        Assert.True(File.Exists(csprojPath),
+            "Bridge csproj missing at " + csprojPath);
+
+        var csprojText = File.ReadAllText(csprojPath);
+
+        Assert.Contains("<StaticExecutable>true</StaticExecutable>", csprojText);
+        Assert.Contains("<PublishAot>true</PublishAot>", csprojText);
+
+        // The two items together are required: DirectPInvoke alone tells
+        // the AOT compiler to resolve the symbol at link time but doesn't
+        // statically link the library; NativeLibrary alone statically links
+        // libc but doesn't bind the DllImport's "libc" name to it.
+        // Drop either one and the StaticExecutable build regresses to a
+        // runtime DllNotFoundException on the first SIGTERM-grace call.
+        Assert.Contains("<DirectPInvoke Include=\"libc\" />", csprojText);
+        Assert.Contains("<NativeLibrary Include=\"libc\" />", csprojText);
+    }
+
+    private static string? FindAncestorContaining(string start, string fileName)
+    {
+        var dir = start;
+        while (!string.IsNullOrEmpty(dir))
+        {
+            if (File.Exists(Path.Combine(dir, fileName)))
+                return dir;
+            dir = Path.GetDirectoryName(dir);
+        }
+        return null;
+    }
 }

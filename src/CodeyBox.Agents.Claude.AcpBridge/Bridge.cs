@@ -652,6 +652,17 @@ internal sealed class Bridge : IAsyncDisposable
         // (no codegen required at runtime) and avoids the AllowUnsafeBlocks
         // requirement LibraryImport's source generator imposes. The bridge
         // only ever ships on linux-musl-x64 so the libc resolution is fixed.
+        //
+        // CRITICAL: the published binary uses StaticExecutable=true, which
+        // strips runtime dlopen support. Without the DirectPInvoke + the
+        // NativeLibrary items in CodeyBox.Agents.Claude.AcpBridge.csproj
+        // the NativeAOT PInvoke resolver would fall back to dlopen("libc.so")
+        // and throw DllNotFoundException — which TerminateClaudeProcess
+        // catches silently and degrades the SIGTERM-grace path to bare
+        // SIGKILL, re-introducing the half-written-JSONL → thinking-block
+        // immutability 400 cluster the polite signal was added to prevent.
+        // Keep the csproj DirectPInvoke + NativeLibrary entries in sync
+        // with this DllImport.
         [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
         internal static extern int Kill(int pid, int sig);
     }
