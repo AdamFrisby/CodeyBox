@@ -95,6 +95,11 @@ fragment, and appends the non-empty fragments to the prompt as a single block:
 - **someOtherKnob=…**: …
 ```
 
+Finite knobs may display the canonical value in the bullet label. Free-form
+knobs never display the raw value in that shared label; a descriptor that opts
+in to prompt fragments must delimit, encode, or avoid any raw value it emits in
+its own fragment.
+
 Rework, audit, merge, and check-and-act phases are intentionally left alone —
 knobs only affect the initial work prompt today. Additional seams can be added
 by extending `IKnob` with optional per-phase methods.

@@ -164,6 +164,26 @@ public sealed class KnobRegistryTests
     }
 
     [Fact]
+    public void TryGetTypedValue_ReturnsFalseForUnknownAbsentInvalidOrWrongClrType()
+    {
+        var registry = new KnobRegistry([new TestBooleanKnob("strict", defaultValue: false)]);
+        var effective = registry.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["strict"] = "TRUE" },
+            projectKnobs: null);
+
+        Assert.False(registry.TryGetTypedValue<bool>(effective, "unknown", out _));
+        Assert.False(registry.TryGetTypedValue<bool>(
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+            "strict",
+            out _));
+        Assert.False(registry.TryGetTypedValue<bool>(
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["strict"] = "yes" },
+            "strict",
+            out _));
+        Assert.False(registry.TryGetTypedValue<string>(effective, "strict", out _));
+    }
+
+    [Fact]
     public void BooleanParser_RejectsInvalidValue()
     {
         var registry = new KnobRegistry([new TestBooleanKnob("strict", defaultValue: false)]);
@@ -278,6 +298,16 @@ public sealed class KnobRegistryTests
         var effective = registry.Resolve(
             itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["shape"] = "octagon" },
             projectKnobs: null);
+
+        Assert.Equal("round", effective["shape"]);
+    }
+
+    [Fact]
+    public void Resolve_CanonicalisesDescriptorDefaultValue()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "ROUND", ["round", "square"])]);
+
+        var effective = registry.Resolve(itemKnobs: null, projectKnobs: null);
 
         Assert.Equal("round", effective["shape"]);
     }

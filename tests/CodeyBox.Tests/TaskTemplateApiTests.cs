@@ -269,6 +269,43 @@ public sealed class TaskTemplateApiTests : IDisposable
     }
 
     [Fact]
+    public async Task QueueTemplate_InvalidOnYesKnobs_Returns400WithoutPartialEnqueue()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad-knobs.json"), """
+            {
+              "checks": [
+                {
+                  "question": "This valid entry must not be enqueued before later validation fails.",
+                  "onYes": {
+                    "title": "Fix first issue",
+                    "prompt": "This should not be queued."
+                  }
+                },
+                {
+                  "question": "Is the risky pattern present?",
+                  "onYes": {
+                    "title": "Fix risky pattern",
+                    "prompt": "Remove the risky pattern.",
+                    "knobs": { "changeScope": "yolo" }
+                  }
+                }
+              ]
+            }
+            """);
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "bad-knobs",
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("not allowed", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
     public async Task QueueTemplate_MissingTemplateInRequest_Returns400WithoutPartialEnqueue()
     {
         var response = await _client.PostAsJsonAsync("/templates/queue", new

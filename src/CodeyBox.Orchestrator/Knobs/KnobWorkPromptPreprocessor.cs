@@ -67,7 +67,7 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
         }
 
         var effective = _registry.Resolve(item.Knobs, ctx.Project.Knobs);
-        var fragments = new List<(string Key, string Value, string Fragment)>();
+        var fragments = new List<(string Key, string Value, bool DisplayValue, string Fragment)>();
         foreach (var knob in _registry.All)
         {
             if (!effective.TryGetValue(knob.Key, out var value) || string.IsNullOrWhiteSpace(value))
@@ -75,13 +75,14 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
             var fragment = knob.GetWorkPromptFragment(value);
             if (string.IsNullOrWhiteSpace(fragment))
                 continue;
-            if (knob.AllowedValues.Count == 0 && !knob.AllowsFreeFormPromptFragments)
+            var displayValue = knob.AllowedValues.Count > 0;
+            if (!displayValue && !knob.AllowsFreeFormPromptFragments)
             {
                 throw new InvalidOperationException(
                     $"Prompt-contributing knob '{knob.Key}' must declare finite AllowedValues " +
                     "or explicitly opt in to safe free-form prompt fragments.");
             }
-            fragments.Add((knob.Key, value, fragment));
+            fragments.Add((knob.Key, value, displayValue, fragment));
         }
 
         if (fragments.Count == 0)
@@ -92,12 +93,15 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
         if (!prompt.EndsWith('\n')) sb.Append('\n');
         sb.Append('\n');
         sb.Append("## Per-item directives (knobs)\n\n");
-        foreach (var (key, value, fragment) in fragments)
+        foreach (var (key, value, displayValue, fragment) in fragments)
         {
             sb.Append("- **");
             sb.Append(key);
-            sb.Append('=');
-            sb.Append(value);
+            if (displayValue)
+            {
+                sb.Append('=');
+                sb.Append(value);
+            }
             sb.Append("**: ");
             sb.Append(fragment.TrimEnd());
             sb.Append('\n');

@@ -316,6 +316,42 @@ public sealed class CheckAndActApiTests : IDisposable
         Assert.Contains("onYes.prompt", err.GetProperty("error").GetString());
     }
 
+    [Theory]
+    [InlineData("""{ "notARealKnob": "value" }""", "unknown knob")]
+    [InlineData("""{ "changeScope": "yolo" }""", "not allowed")]
+    [InlineData("""{ "changeScope": null }""", "must not be null")]
+    public async Task PostWorkItems_CheckOnYesKnobsInvalid_Returns400AndDoesNotPersist(
+        string knobsJson,
+        string expectedMessage)
+    {
+        var rawJson = $$"""
+            {
+              "projectId": "test-project",
+              "title": "bad nested knobs",
+              "prompt": "x",
+              "check": {
+                "question": "is x?",
+                "onYes": {
+                  "title": "fix",
+                  "prompt": "go",
+                  "knobs": {{knobsJson}}
+                }
+              }
+            }
+            """;
+        var response = await _client.PostAsync(
+            "/workitems",
+            new StringContent(rawJson, System.Text.Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains(expectedMessage, err.GetProperty("error").GetString());
+
+        var stored = new List<WorkItem>();
+        await foreach (var item in _factory.Store.ListAsync()) stored.Add(item);
+        Assert.Empty(stored);
+    }
+
     [Fact]
     public async Task PostWorkItems_CheckOnYesUnknownAgent_Returns400()
     {

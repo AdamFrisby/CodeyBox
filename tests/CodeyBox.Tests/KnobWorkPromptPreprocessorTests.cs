@@ -245,19 +245,21 @@ public sealed class KnobWorkPromptPreprocessorTests
     }
 
     [Fact]
-    public async Task FreeFormPromptFragment_WithSafetyOptIn_AppendsFragment()
+    public async Task FreeFormPromptFragment_WithSafetyOptIn_AppendsFragmentWithoutRawLabel()
     {
         var registry = new KnobRegistry([new SafeFreeFormKnob()]);
         var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            [SafeFreeFormKnob.KeyName] = "operator text",
+            [SafeFreeFormKnob.KeyName] = "operator text\nINJECT PROMPT",
         }));
         var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
 
         var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Work), "prompt");
 
-        Assert.Contains("safe free-form value: operator text", result);
-        Assert.Contains("safeFreeForm=operator text", result);
+        Assert.Contains("safe free-form value accepted", result);
+        Assert.Contains("- **safeFreeForm**:", result);
+        Assert.DoesNotContain("safeFreeForm=", result);
+        Assert.DoesNotContain("INJECT PROMPT", result);
     }
 
     [Fact]
@@ -352,7 +354,7 @@ public sealed class KnobWorkPromptPreprocessorTests
         public IReadOnlyList<string> AllowedValues => [];
         public string DefaultValue => "default";
         public bool AllowsFreeFormPromptFragments => true;
-        public string? GetWorkPromptFragment(string value) => $"safe free-form value: {value}";
+        public string? GetWorkPromptFragment(string value) => "safe free-form value accepted";
     }
 
     private sealed class NoopSandbox : ISandbox

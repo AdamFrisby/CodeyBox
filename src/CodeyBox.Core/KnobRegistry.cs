@@ -9,6 +9,7 @@ namespace CodeyBox.Core;
 public sealed class KnobRegistry : IKnobRegistry
 {
     private readonly Dictionary<string, IKnob> _byKey;
+    private readonly Dictionary<string, string> _canonicalDefaults;
     private readonly IReadOnlyList<IKnob> _ordered;
 
     public KnobRegistry(IEnumerable<IKnob> knobs)
@@ -16,6 +17,7 @@ public sealed class KnobRegistry : IKnobRegistry
         ArgumentNullException.ThrowIfNull(knobs);
 
         _byKey = new Dictionary<string, IKnob>(StringComparer.OrdinalIgnoreCase);
+        _canonicalDefaults = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var ordered = new List<IKnob>();
         foreach (var knob in knobs)
         {
@@ -35,6 +37,7 @@ public sealed class KnobRegistry : IKnobRegistry
                 throw new InvalidOperationException(
                     $"Knob '{knob.Key}' default '{knob.DefaultValue}' is invalid: {defaultParse.Error}");
 
+            _canonicalDefaults[knob.Key] = defaultParse.CanonicalValue!;
             ordered.Add(knob);
         }
 
@@ -127,7 +130,7 @@ public sealed class KnobRegistry : IKnobRegistry
             else if (projectKnobs is not null && TryGetCanonical(projectKnobs, knob, out var projectValue, out _))
                 effective[knob.Key] = projectValue!;
             else
-                effective[knob.Key] = knob.DefaultValue;
+                effective[knob.Key] = _canonicalDefaults[knob.Key];
         }
         return effective;
     }

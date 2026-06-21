@@ -678,8 +678,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     public async Task TryUpdateIfStateAndUpdatedAtAsync_PersistsKnobsMap()
     {
         // The recovery / retry path uses this UPDATE; a regression that drops
-        // knobs_json from the column list would silently wipe the work item's
-        // knob map on every recovery tick.
+        // knobs_json from the column list would silently ignore knob-map writes.
         var knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["changeScope"] = "refactor",
@@ -692,6 +691,10 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         var updated = persisted! with
         {
             State = WorkItemState.WaitingForTransientRetry,
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["changeScope"] = "surgical",
+            },
             UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
         };
 
@@ -704,7 +707,40 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         var read = await _store.GetAsync(item.Id);
         Assert.NotNull(read);
         Assert.Single(read!.Knobs);
-        Assert.Equal("refactor", read.Knobs["changeScope"]);
+        Assert.Equal("surgical", read.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task TryUpdateIfStateAsync_PersistsKnobsMap()
+    {
+        var item = Sample() with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["changeScope"] = "refactor",
+            },
+        };
+        await _store.CreateAsync(item);
+        var persisted = await _store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+
+        var updated = persisted! with
+        {
+            State = WorkItemState.Working,
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["changeScope"] = "surgical",
+            },
+            UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
+        };
+
+        var wrote = await _store.TryUpdateIfStateAsync(updated, WorkItemState.Queued);
+
+        Assert.True(wrote);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Single(read!.Knobs);
+        Assert.Equal("surgical", read.Knobs["changeScope"]);
     }
 
     [Fact]

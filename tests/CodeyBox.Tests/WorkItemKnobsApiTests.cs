@@ -100,6 +100,25 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
+    public async Task Create_WithTooManyKnobs_Returns400BeforeDescriptorLookup()
+    {
+        var knobs = Enumerable.Range(0, 33)
+            .ToDictionary(i => $"unknownKnob{i}", i => "value");
+
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "too many knobs",
+            prompt = "p",
+            knobs,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("at most 32 entries", body);
+    }
+
+    [Fact]
     public async Task Create_KnobKeyCaseInsensitive_AcceptedAndLookupCaseInsensitive()
     {
         // POST with MIXED-case key. The registry normalises storage to the
@@ -288,24 +307,21 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
-    public void NormaliseKnobs_DelegatesEntryCountAndValueLengthToDescriptors()
+    public void NormaliseKnobs_EnforcesSharedEntryCountBeforeDescriptors()
     {
         var descriptors = Enumerable.Range(0, 40)
             .Select(i => new DescriptorLocalStringKnob($"freeForm{i}"))
             .Cast<IKnob>()
             .ToArray();
         var registry = new KnobRegistry(descriptors);
-        var longValue = new string('v', 4096);
         var knobs = new Dictionary<string, string>();
         for (var i = 0; i < 40; i++)
-            knobs[$"freeForm{i}"] = i == 0 ? longValue : $"value-{i}";
+            knobs[$"freeForm{i}"] = $"value-{i}";
 
         var (normalised, error) = WorkItemCreationService.NormaliseKnobs(knobs, registry);
 
-        Assert.Null(error);
-        Assert.NotNull(normalised);
-        Assert.Equal(40, normalised!.Count);
-        Assert.Equal(longValue, normalised["freeForm0"]);
+        Assert.Null(normalised);
+        Assert.NotNull(error);
     }
 
     [Fact]
@@ -336,7 +352,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("unknown knob", body);
+        Assert.Contains("64 chars", body);
     }
 
     [Fact]
@@ -352,7 +368,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("not allowed", body);
+        Assert.Contains("128 chars", body);
     }
 
     [Fact]
@@ -387,7 +403,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("unknown knob", body);
+        Assert.Contains("control characters", body);
     }
 
     [Fact]
@@ -402,7 +418,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("not allowed", body);
+        Assert.Contains("control characters", body);
     }
 
     [Fact]
