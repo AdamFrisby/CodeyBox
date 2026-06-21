@@ -307,6 +307,14 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptionsValidator>();
 
+// Unbound-key startup check. Walks the CodeyBox:* configuration sub-tree
+// and surfaces any key that does not bind to a property on the typed
+// options graph (the .NET binder silently drops these, which makes a
+// misspelled or renamed key a no-op the operator never notices). Default
+// behaviour is fail-fast at host start; switch to warn-only via
+// CodeyBox:ConfigValidation:UnboundKeys:Mode="warn".
+builder.Services.AddHostedService<UnboundConfigKeyHostedValidator>();
+
 // Rejects ProjectsOptions reloads that remove a project still holding
 // non-terminal work items. Adding new projects passes cleanly.
 builder.Services.AddSingleton<IValidateOptions<ProjectsOptions>, ProjectsOptionsRemovalValidator>();
@@ -3831,6 +3839,45 @@ namespace CodeyBox.Api
         /// dev/UAT hosts still come up.
         /// </summary>
         public bool FailOnUnknownModel { get; set; } = false;
+
+        /// <summary>
+        /// Unbound CodeyBox configuration key detection. Catches typos /
+        /// stale renames under <c>CodeyBox:*</c> that the .NET binder would
+        /// otherwise drop silently.
+        /// </summary>
+        public UnboundKeyValidationOptions UnboundKeys { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Tuning for the startup unbound-key inspector. Bound from
+    /// <c>CodeyBox:ConfigValidation:UnboundKeys</c>.
+    /// </summary>
+    public sealed class UnboundKeyValidationOptions
+    {
+        /// <summary>
+        /// Master switch. Default <c>true</c> — every startup walks the
+        /// operator-provided <c>CodeyBox:*</c> tree against the typed options
+        /// graph.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// <c>"strict"</c> (default) throws at startup; <c>"warn"</c>
+        /// downgrades to a single warning log. Any other value is treated as
+        /// <c>"strict"</c>.
+        /// </summary>
+        public string Mode { get; set; } = "strict";
+
+        /// <summary>
+        /// Operator-supplied full configuration paths under <c>CodeyBox:*</c>
+        /// whose subtrees are skipped entirely (exact, case-insensitive
+        /// match). Use for extension namespaces bound outside
+        /// <c>CodeyBoxOptions</c> / <c>ProjectsOptions</c>. The built-in
+        /// defaults already cover the framework-internal separately-bound
+        /// sections (BuildScriptAudit, Mutation, Plugins, …) by walking them
+        /// with their typed root POCO so typos inside still surface.
+        /// </summary>
+        public List<string> AdditionalExemptPaths { get; set; } = new();
     }
 
     /// <summary>

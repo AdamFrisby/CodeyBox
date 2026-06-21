@@ -524,15 +524,23 @@ silently misroute and only surface hours later as cascading quota failures.
 
 ```json
 "ConfigValidation": {
-  "FailOnUnknownModel": false
+  "FailOnUnknownModel": false,
+  "UnboundKeys": {
+    "Enabled": true,
+    "Mode": "strict",
+    "AdditionalExemptPaths": []
+  }
 }
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `FailOnUnknownModel` | `false` | When `false`, an unknown `ModelId` logs a Warning naming the typoed id and the valid alternatives, but startup succeeds. When `true`, startup fails-fast with a non-zero exit code so the misconfig never reaches production. Operators flip this on in production deployments. |
+| `UnboundKeys.Enabled` | `true` | Master switch for the unbound-key startup check. See below. |
+| `UnboundKeys.Mode` | `"strict"` | `"strict"` throws at startup when any unbound key is found. `"warn"` logs a single Warning naming each unbound key and lets startup proceed. Any other value is treated as `"strict"`. |
+| `UnboundKeys.AdditionalExemptPaths` | `[]` | Full configuration paths under `CodeyBox:*` whose subtrees the inspector skips entirely (exact, case-insensitive match — not a prefix). Use for operator extension namespaces bound outside `CodeyBoxOptions` / `ProjectsOptions`. |
 
-The validator probes each provider's model-list endpoint
+The model validator probes each provider's model-list endpoint
 (`api.anthropic.com/v1/models`, ChatGPT-OAuth `chatgpt.com/backend-api/wham/models`
 or `api.openai.com/v1/models`, and Gemini's quota-bucket / `v1beta/models`
 endpoints) and matches each declared `ModelId` against the response. The
@@ -540,6 +548,120 @@ total validation budget is 10 seconds; an unreachable endpoint or a slow
 network falls through to a Warning that names the agent kind and the
 reason, and the host still comes up. Members without a `ModelId` are not
 validated — they fall through to the agent's own default.
+
+### Unbound CodeyBox configuration keys
+
+`.NET`'s configuration binder silently drops any key that does not match a
+property on the bound options class. A misspelled, renamed, or stale key
+under `CodeyBox:*` is a no-op the operator never notices — the typed
+property keeps its default while the operator believes they reconfigured
+it. The unbound-key inspector walks the operator-provided `CodeyBox:*`
+section at startup and surfaces every key that fails to bind to a property
+on `CodeyBoxOptions` or `ProjectsOptions`.
+
+Canonical case: `CodeyBox:AgentStreams:RootDirectory` looks like a sensible
+configuration knob, but the bound property is `Path`. Before this check,
+the value silently disappeared into the binder; now startup fails with:
+
+```
+Unbound CodeyBox configuration keys detected (no matching CodeyBoxOptions / ProjectsOptions property). …
+  CodeyBox:AgentStreams:RootDirectory — no matching option
+```
+
+Recursion respects the option-graph shape:
+
+- **POCO properties** — each child key must match a public property
+  (case-insensitive). The
+  [`ConfigurationKeyName`](https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.configuration.configurationkeynameattribute)
+  attribute is honoured, so a property whose JSON key is aliased binds
+  under its alias.
+- **`Dictionary<,>` values** — dictionary keys are operator-defined and
+  skipped. The inspector still recurses into the value type, so a typo
+  inside (e.g.) `CodeyBox:AgentNetworkTolerance:codex:NotARealField`
+  is still flagged.
+- **Lists / arrays / enumerables** — the configuration provider keys list
+  elements by numeric index; the index itself is not validated, but the
+  element's property graph is.
+- **Leaf types** (primitives, strings, enums, `TimeSpan`, `DateTimeOffset`,
+  `Guid`, `Uri`) — any child of a leaf key is junk.
+
+#### Default handling for separately-bound sections
+
+A handful of `CodeyBox:*` sections bind to typed option classes outside
+`CodeyBoxOptions` / `ProjectsOptions`. The inspector knows about these
+roots and walks each sub-tree against its own typed POCO so typos like
+`CodeyBox:BuildScriptAudit:TimoutSeconds` or
+`CodeyBox:PromptPreprocessing:ProjectRulesPth` still surface — the wholesale
+subtree skip is **not** applied:
+
+| Section | Typed root |
+|---------|------------|
+| `CodeyBox:BuildScriptAudit` | `BuildScriptAuditorOptions` |
+| `CodeyBox:PromptPreprocessing` | `AgentPromptPreprocessingOptions` |
+| `CodeyBox:Presets` | `PresetCatalogOptions` |
+| `CodeyBox:Mutation` | `MutationTestingAuditorOptions` |
+| `CodeyBox:CheckAndActCompletion` | `CheckAndActCompletionOptions` |
+| `CodeyBox:Plugins` | `PluginOptions` (plus operator-defined `<plugin-id>` sub-trees are opaque) |
+
+`CodeyBox:Plugins` is the only section that mixes typed properties
+(`AssemblyPaths`/`PackageDirectories`/`Allowlist`) with operator-defined
+extension keys (per-plugin sub-trees read via `IPluginHost.ScopedConfig`).
+The inspector treats any non-typed key at `CodeyBox:Plugins` level as an
+opaque plugin id, so a typo of a typed property name there cannot be
+distinguished from a plugin id and stays silent. Typos *inside*
+`AssemblyPaths` / `PackageDirectories` / `Allowlist` are still validated.
+
+A small set of leaf-shaped keys is read directly via `IConfiguration` with
+no matching typed property; these are exempted by exact path:
+
+- `CodeyBox:DangerouslyDisableAuth` — read directly via
+  `IConfiguration.GetValue<bool>` for the bearer-token middleware.
+- `CodeyBox:CredentialFileWatchers` — read directly to gate the host-side
+  OAuth credential file watchers.
+- Per-agent credential-file leaf keys read directly via
+  `builder.Configuration["CodeyBox:…"]` when the matching `CODEYBOX_…_FILE`
+  env var is unset: `CodeyBox:ClaudeOAuthFile`, `CodeyBox:CodexOAuthFile`,
+  `CodeyBox:GeminiOAuthFile`, `CodeyBox:GeminiSettingsFile`,
+  `CodeyBox:CursorAuthFile`, `CodeyBox:OpencodeAuthFile`,
+  `CodeyBox:OpencodeAuthDestPath`, `CodeyBox:GeminiOauthClientId`,
+  `CodeyBox:GeminiOauthClientSecret`.
+
+The inspector also understands the two operator-keyed map shapes that
+`ProjectsOptionsBinder.ApplyCustomMaps` reads:
+
+- `Audit:Languages:Overrides:<lang-id>:…` — the per-language override map
+  documented in [`docs/languages.md`](languages.md). Operator-defined
+  language ids are accepted as dictionary keys; typos *inside* the
+  override value (e.g. `Replce` instead of `Replace`) are still flagged.
+- `Audit:AuditTypes:<id>:…` — the per-audit-type override map documented
+  in [`docs/audit-types.md`](audit-types.md). The inspector detects the
+  shape automatically (all-numeric keys → list form, any non-numeric key
+  → map form) and walks the override POCO under each id so unknown
+  sub-fields still surface.
+
+These two exemptions cascade through `Defaults:Audit`, every
+`Projects:<n>:Audit`, and every `…Audit:Profiles:<profile-id>:…` subtree
+because the binder applies the same custom-map logic at every depth.
+
+To exempt an operator extension namespace, add it to
+`ConfigValidation.UnboundKeys.AdditionalExemptPaths`. The whole subtree
+under the exact named path is skipped (case-insensitive equality — not a
+prefix; an entry of `CodeyBox:MyExt` does not also match `CodeyBox:MyExtra`):
+
+```json
+"ConfigValidation": {
+  "UnboundKeys": {
+    "AdditionalExemptPaths": [
+      "CodeyBox:MyCustomExtension"
+    ]
+  }
+}
+```
+
+The validator runs as a hosted service at host start, so a strict-mode
+failure surfaces before any pipeline component reads its options. Switch
+to `"warn"` mode temporarily if you need to ship a config edit before the
+matching code rename lands; flip back to `"strict"` once both are in.
 
 ---
 
