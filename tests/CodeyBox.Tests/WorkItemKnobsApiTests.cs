@@ -141,7 +141,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
-    public async Task Patch_KnobsReplacesMap_AndIsRejectedAfterDispatch()
+    public async Task Patch_KnobsReplacesMap()
     {
         var create = await _client.PostAsJsonAsync("/workitems", new
         {
@@ -163,6 +163,136 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
         Assert.Equal(ChangeScopeKnob.ValueRefactor, body!.Knobs![ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_KnobsCombinedWithTitle_PersistsBothInOneRequest()
+    {
+        var create = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "combined title",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created!.Id}", new
+        {
+            title = "patched title",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor },
+        });
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal("patched title", stored!.Title);
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, stored.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_KnobsCombinedWithPrompt_PersistsBothAndBumpsRevision()
+    {
+        var create = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "combined prompt",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created!.Id}", new
+        {
+            prompt = "patched prompt",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor },
+        });
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal("patched prompt", stored!.Prompt);
+        Assert.Equal(2, stored.PromptRevision);
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, stored.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_KnobsCombinedWithDependsOn_PersistsBothInOneRequest()
+    {
+        var dep = await CreatePlainQueuedItemAsync("dep");
+        var target = await CreatePlainQueuedItemAsync("target");
+
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{target.Id}", new
+        {
+            dependsOn = new[] { dep.Id },
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+        });
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(target.Id));
+        Assert.NotNull(stored);
+        Assert.Single(stored!.DependsOn);
+        Assert.Equal(WorkItemId.Parse(dep.Id), stored.DependsOn[0]);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, stored.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_KnobsCombinedWithTitleGuardConflict_Returns409WithoutPersistingRequestFields()
+    {
+        using var factory = new WorkItemApiFactory
+        {
+            WorkItemStoreDecorator = inner => new KnobWriteConflictStore(inner),
+        };
+        using var client = factory.CreateClient();
+
+        var create = await client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "mixed race target",
+            prompt = "p",
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var resp = await client.PatchAsJsonAsync($"/workitems/{created!.Id}", new
+        {
+            title = "request title",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor },
+        });
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        var stored = await factory.Store.GetAsync(WorkItemId.Parse(created!.Id));
+        Assert.NotNull(stored);
+        Assert.Equal("concurrent title", stored!.Title);
+        Assert.Empty(stored.Knobs);
+    }
+
+    [Fact]
+    public async Task Patch_KnobsGuardedWriteConflict_Returns409AndDoesNotReplaceKnobs()
+    {
+        using var factory = new WorkItemApiFactory
+        {
+            WorkItemStoreDecorator = inner => new KnobWriteConflictStore(inner),
+        };
+        using var client = factory.CreateClient();
+
+        var create = await client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "race target",
+            prompt = "p",
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var resp = await client.PatchAsJsonAsync($"/workitems/{created!.Id}", new
+        {
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor },
+        });
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        var stored = await factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal("concurrent title", stored!.Title);
+        Assert.Empty(stored.Knobs);
     }
 
     [Fact]
@@ -616,6 +746,118 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         public IReadOnlyList<string> AllowedValues => [];
         public string DefaultValue => "default";
         public string? GetWorkPromptFragment(string value) => null;
+    }
+
+    private sealed class KnobWriteConflictStore(SqliteWorkItemStore inner) : ForwardingWorkItemStore(inner)
+    {
+        public override async Task<bool> TryReplaceKnobsIfStateAndUpdatedAtAsync(
+            WorkItemId id,
+            IReadOnlyDictionary<string, string> knobs,
+            DateTimeOffset updatedAt,
+            WorkItemState onlyIfState,
+            DateTimeOffset onlyIfUpdatedAt,
+            CancellationToken ct = default)
+        {
+            await PersistConcurrentTitleAsync(id, updatedAt, onlyIfState, onlyIfUpdatedAt, ct);
+
+            return false;
+        }
+
+        public override async Task<bool> TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+            WorkItem item,
+            WorkItemState onlyIfState,
+            DateTimeOffset onlyIfUpdatedAt,
+            CancellationToken ct = default)
+        {
+            await PersistConcurrentTitleAsync(item.Id, item.UpdatedAt, onlyIfState, onlyIfUpdatedAt, ct);
+
+            return false;
+        }
+
+        private async Task PersistConcurrentTitleAsync(
+            WorkItemId id,
+            DateTimeOffset updatedAt,
+            WorkItemState onlyIfState,
+            DateTimeOffset onlyIfUpdatedAt,
+            CancellationToken ct)
+        {
+            var current = await Inner.GetAsync(id, ct);
+            if (current is null) return;
+
+            var concurrent = current with
+            {
+                Title = "concurrent title",
+                UpdatedAt = updatedAt.AddTicks(1),
+            };
+            await Inner.TryUpdateIfStateAndUpdatedAtAsync(
+                concurrent,
+                onlyIfState,
+                onlyIfUpdatedAt,
+                ct);
+        }
+    }
+
+    private abstract class ForwardingWorkItemStore(SqliteWorkItemStore inner) : IWorkItemStore
+    {
+        protected SqliteWorkItemStore Inner { get; } = inner;
+
+        public virtual Task CreateAsync(WorkItem item, CancellationToken ct = default) => Inner.CreateAsync(item, ct);
+        public virtual Task UpdateAsync(WorkItem item, CancellationToken ct = default) => Inner.UpdateAsync(item, ct);
+        public virtual Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) =>
+            Inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+        public virtual Task<bool> TryUpdateIfStateAndUpdatedAtAsync(WorkItem item, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
+            Inner.TryUpdateIfStateAndUpdatedAtAsync(item, onlyIfState, onlyIfUpdatedAt, ct);
+        public virtual Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+            Inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
+        public virtual Task<PriorityUpdateResult> UpdatePriorityIfStateAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, WorkItemState onlyIfState, CancellationToken ct = default) =>
+            Inner.UpdatePriorityIfStateAsync(id, priority, updatedAt, onlyIfState, ct);
+        public virtual Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+            Inner.UpdateDependsOnAsync(id, dependsOn, updatedAt, ct);
+        public virtual Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+            Inner.UpdateAuditBudgetAsync(id, auditMaxIterations, auditComplexity, updatedAt, ct);
+        public virtual Task<bool> TryReplaceKnobsIfStateAndUpdatedAtAsync(WorkItemId id, IReadOnlyDictionary<string, string> knobs, DateTimeOffset updatedAt, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
+            Inner.TryReplaceKnobsIfStateAndUpdatedAtAsync(id, knobs, updatedAt, onlyIfState, onlyIfUpdatedAt, ct);
+        public virtual Task<bool> TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(WorkItem item, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
+            Inner.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(item, onlyIfState, onlyIfUpdatedAt, ct);
+        public virtual Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => Inner.GetAsync(id, ct);
+        public virtual IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => Inner.ListAsync(ct);
+        public virtual IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => Inner.ListByStateAsync(state, ct);
+        public virtual Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => Inner.CountByStateAsync(state, ct);
+        public virtual Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => Inner.ReorderAsync(orderedIds, ct);
+        public virtual IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) =>
+            Inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+        public virtual Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) =>
+            Inner.CountStartedInWindowAsync(projectId, since, ct);
+        public virtual Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => Inner.CountInFlightAsync(projectId, ct);
+        public virtual Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(ProjectId projectId, CancellationToken ct = default, WorkItemId? excludeId = null) =>
+            Inner.CountInFlightSplitByRefactorAsync(projectId, ct, excludeId);
+        public virtual Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) =>
+            Inner.GetByExternalIdAsync(projectId, externalId, ct);
+        public virtual Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) =>
+            Inner.GetByNamespacedExternalIdAsync(projectId, @namespace, externalId, ct);
+        public virtual Task<WorkItem?> ReplaceExternalIdsAsync(WorkItemId id, IReadOnlyDictionary<string, string> externalIds, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+            Inner.ReplaceExternalIdsAsync(id, externalIds, updatedAt, ct);
+        public virtual Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default) =>
+            Inner.GetFleetStateCountsAsync(ct);
+        public virtual Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default) =>
+            Inner.GetFleetRecentOutcomesAsync(perProject, ct);
+        public virtual Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) =>
+            Inner.GetFleetPauseStatesAsync(ct);
+        public virtual IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+            Inner.ListByReplaySourceAsync(sourceId, ct);
+        public virtual IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => Inner.ListSuspendedAsync(ct);
+        public virtual Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default) =>
+            Inner.GetActiveBaselineImageRefsAsync(ct);
+        public virtual Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(string baselineImageRef, CancellationToken ct = default) =>
+            Inner.ListWorkItemsForBaselineAsync(baselineImageRef, ct);
+        public virtual Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => Inner.OrphanReplaysAsync(sourceId, ct);
+        public virtual IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => Inner.ListByReleaseAsync(releaseId, ct);
+        public virtual Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+            Inner.TryReplacePromptAsync(id, newPrompt, updatedAt, ct);
+        public virtual Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) =>
+            Inner.RecordIterationDispatchAsync(workItemId, iteration, promptRevisionAtDispatch, dispatchedAt, ct);
+        public virtual Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) =>
+            Inner.GetIterationsAsync(workItemId, ct);
     }
 
     private sealed class NoopSandbox : ISandbox

@@ -237,6 +237,25 @@ public interface IWorkItemStore
         => throw new NotSupportedException(
             "This work item store must implement guarded knob replacement before it can accept per-item knob edits.");
 
+    /// <summary>
+    /// Guarded queued-edit UPDATE used when PATCH /workitems/{id} edits the
+    /// knob map together with other queued-only fields. Unlike
+    /// <see cref="TryUpdateIfStateAndUpdatedAtAsync"/>, this writes
+    /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
+    /// and <see cref="WorkItem.Knobs"/> because the caller is applying a
+    /// freshly validated operator PATCH against the exact snapshot identified
+    /// by <paramref name="onlyIfUpdatedAt"/>. Keeping the row fields and knobs
+    /// in one conditional write prevents a failed mixed PATCH from partially
+    /// persisting only the non-knob fields.
+    /// </summary>
+    Task<bool> TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store must implement guarded queued-field and knob replacement before it can accept mixed per-item knob edits.");
+
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);

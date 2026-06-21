@@ -1140,6 +1140,7 @@ internal static class WorkItemEndpoints
         var updated = item!;
         var now = DateTimeOffset.UtcNow;
         var queuedUpdateExpectedUpdatedAt = item!.UpdatedAt;
+        var deferPromptReplace = body.Prompt is not null && normalisedPatchKnobs is not null;
 
         if (body.Title is not null)
         {
@@ -1152,25 +1153,37 @@ internal static class WorkItemEndpoints
         if (body.Prompt is not null)
         {
             if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
-            // Route through TryReplacePromptAsync — the only write path that
-            // touches prompt + prompt_revision. The full-row UPDATE below
-            // deliberately does NOT carry the prompt columns (they would
-            // clobber a concurrent PUT /workitems/{id}/prompt). The state
-            // guard inside TryReplacePromptAsync mirrors the Queued check
-            // above; success refreshes our in-memory snapshot for the rest
-            // of the PATCH so the response DTO reflects the new revision.
-            var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
-            if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
-                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-            if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
-                return Results.Conflict(new { error = $"cannot edit item in terminal state" });
-            updated = updated with
+            if (deferPromptReplace)
             {
-                Prompt = body.Prompt,
-                PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
-                UpdatedAt = now,
-            };
-            queuedUpdateExpectedUpdatedAt = now;
+                updated = updated with
+                {
+                    Prompt = body.Prompt,
+                    PromptRevision = updated.PromptRevision + 1,
+                    UpdatedAt = now,
+                };
+            }
+            else
+            {
+                // Route through TryReplacePromptAsync — the only write path that
+                // touches prompt + prompt_revision. The full-row UPDATE below
+                // deliberately does NOT carry the prompt columns (they would
+                // clobber a concurrent PUT /workitems/{id}/prompt). The state
+                // guard inside TryReplacePromptAsync mirrors the Queued check
+                // above; success refreshes our in-memory snapshot for the rest
+                // of the PATCH so the response DTO reflects the new revision.
+                var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
+                if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
+                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+                if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
+                    return Results.Conflict(new { error = $"cannot edit item in terminal state" });
+                updated = updated with
+                {
+                    Prompt = body.Prompt,
+                    PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
+                    UpdatedAt = now,
+                };
+                queuedUpdateExpectedUpdatedAt = now;
+            }
         }
 
         if (body.Agent is not null)
@@ -1222,13 +1235,15 @@ internal static class WorkItemEndpoints
             updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Queued-only fields except knobs go through the guarded row UPDATE.
-        // Knobs have their own partial write below so worker state transitions
-        // from stale snapshots cannot erase an accepted queued edit. Audit-budget
-        // fields are restored to their original values for the row write and then
-        // persisted through UpdateAuditBudgetAsync below. That keeps the audit
-        // budget path partial even when an operator sends it alongside a queued
-        // title/timeout/etc edit.
+        // Queued-only fields go through a guarded row UPDATE. Knob-only PATCHes
+        // still use the partial knob write below so worker state transitions from
+        // stale snapshots cannot erase an accepted queued edit. Mixed knob PATCHes
+        // use the combined guarded row+knob write here so a conflict cannot leave
+        // only the non-knob queued fields persisted. Audit-budget fields are
+        // restored to their original values for the row write and then persisted
+        // through UpdateAuditBudgetAsync below. That keeps the audit budget path
+        // partial even when an operator sends it alongside a queued title/timeout
+        // edit.
         var needsQueuedRowUpdate = queuedRowPatch || (depsPatch && queuedOnlyPatch);
         if (needsQueuedRowUpdate)
         {
@@ -1241,16 +1256,22 @@ internal static class WorkItemEndpoints
                 : updated;
             // Guard state and updated_at so queued edits cannot be written over
             // a concurrent pickup or another accepted queued-field patch.
-            var written = await store.TryUpdateIfStateAndUpdatedAtAsync(
-                queuedUpdate,
-                WorkItemState.Queued,
-                queuedUpdateExpectedUpdatedAt,
-                ct);
+            var written = normalisedPatchKnobs is not null
+                ? await store.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+                    queuedUpdate,
+                    WorkItemState.Queued,
+                    queuedUpdateExpectedUpdatedAt,
+                    ct)
+                : await store.TryUpdateIfStateAndUpdatedAtAsync(
+                    queuedUpdate,
+                    WorkItemState.Queued,
+                    queuedUpdateExpectedUpdatedAt,
+                    ct);
             if (!written)
                 return Results.Conflict(new { error = "item changed before the queued-field update could be written" });
             queuedUpdateExpectedUpdatedAt = now;
         }
-        if (normalisedPatchKnobs is not null)
+        if (normalisedPatchKnobs is not null && !needsQueuedRowUpdate)
         {
             var written = await store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
                 updated.Id,
