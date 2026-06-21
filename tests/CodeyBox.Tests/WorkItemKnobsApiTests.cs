@@ -2,7 +2,10 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Orchestrator.Knobs;
+using CodeyBox.Sandbox;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace CodeyBox.Tests;
 
@@ -98,11 +101,8 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     [Fact]
     public async Task Create_KnobKeyCaseInsensitive_AcceptedAndLookupCaseInsensitive()
     {
-        // POST with MIXED-case key. The stored map is OrdinalIgnoreCase, so a
-        // lookup with the canonical lower-case key succeeds even though the
-        // operator's casing is preserved verbatim in storage. Pin both
-        // properties: lookup-by-canonical-key works AND the raw JSON carries
-        // the operator's casing (documented behaviour).
+        // POST with MIXED-case key. The registry normalises storage to the
+        // descriptor's canonical key/value casing.
         var resp = await _client.PostAsJsonAsync("/workitems", new
         {
             projectId = "test-project",
@@ -113,16 +113,11 @@ public sealed class WorkItemKnobsApiTests : IDisposable
 
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         var raw = await resp.Content.ReadAsStringAsync();
-        // Operator's casing is preserved verbatim in storage.
-        Assert.Contains("\"CHANGESCOPE\"", raw, StringComparison.Ordinal);
+        Assert.Contains("\"changeScope\"", raw, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"CHANGESCOPE\"", raw, StringComparison.Ordinal);
         var body = System.Text.Json.JsonSerializer.Deserialize<WorkItemWithKnobsResponse>(raw);
         Assert.NotNull(body!.Knobs);
-        // The deserialised dictionary uses Ordinal comparer, so locate the
-        // entry via a case-insensitive scan rather than assuming OrdinalIgnoreCase.
-        var match = body.Knobs!.FirstOrDefault(kv =>
-            string.Equals(kv.Key, "changeScope", StringComparison.OrdinalIgnoreCase));
-        Assert.False(string.IsNullOrEmpty(match.Key));
-        Assert.Equal("refactor", match.Value);
+        Assert.Equal("refactor", body.Knobs![ChangeScopeKnob.KeyName]);
     }
 
     [Fact]
@@ -223,6 +218,72 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         };
         var resp = await _client.SendAsync(patch);
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_WithInvalidChangeScopeValue_Returns400()
+    {
+        var created = await CreatePlainQueuedItemAsync("patch invalid");
+
+        var patch = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
+        {
+            Content = JsonContent.Create(new
+            {
+                knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = "yolo" },
+            }),
+        };
+        var resp = await _client.SendAsync(patch);
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("not allowed", body);
+    }
+
+    [Fact]
+    public async Task Patch_WithNullKnobValue_Returns400()
+    {
+        var created = await CreatePlainQueuedItemAsync("patch null");
+        var rawJson = """
+            {
+              "knobs": { "changeScope": null }
+            }
+            """;
+        var patch = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
+        {
+            Content = new StringContent(rawJson, System.Text.Encoding.UTF8, "application/json"),
+        };
+
+        var resp = await _client.SendAsync(patch);
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("must not be null", body);
+    }
+
+    [Fact]
+    public async Task Patch_WithLengthAndControlViolations_Returns400()
+    {
+        var created = await CreatePlainQueuedItemAsync("patch caps");
+        var longValue = new string('v', 129);
+        var tooLong = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
+        {
+            Content = JsonContent.Create(new
+            {
+                knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = longValue },
+            }),
+        };
+        var tooLongResp = await _client.SendAsync(tooLong);
+        Assert.Equal(HttpStatusCode.BadRequest, tooLongResp.StatusCode);
+
+        var control = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
+        {
+            Content = JsonContent.Create(new
+            {
+                knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = "ref\u0001actor" },
+            }),
+        };
+        var controlResp = await _client.SendAsync(control);
+        Assert.Equal(HttpStatusCode.BadRequest, controlResp.StatusCode);
     }
 
     [Fact]
@@ -415,28 +476,79 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         var created = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
 
-        // The stored map preserves the operator's casing today (documented
-        // behaviour); the prompt-seam canonicalisation is exercised in
-        // KnobWorkPromptPreprocessorTests. Verify the operator-supplied
-        // value survives lookup case-insensitively, and the raw JSON
-        // contains the operator's casing on the key (this pins the
-        // documented "stored verbatim" behaviour so a future canonicalisation
-        // change updates this test too).
         var get = await _client.GetAsync($"/workitems/{created!.Id}");
         var raw = await get.Content.ReadAsStringAsync();
-        Assert.Contains("\"ChangeScope\"", raw, StringComparison.Ordinal);
+        Assert.Contains("\"changeScope\"", raw, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"ChangeScope\"", raw, StringComparison.Ordinal);
 
         var fetched = System.Text.Json.JsonSerializer.Deserialize<WorkItemWithKnobsResponse>(raw);
         Assert.NotNull(fetched!.Knobs);
-        var match = fetched.Knobs!.FirstOrDefault(kv =>
-            string.Equals(kv.Key, "changeScope", StringComparison.OrdinalIgnoreCase));
-        Assert.False(string.IsNullOrEmpty(match.Key));
-        Assert.Equal("Refactor", match.Value, ignoreCase: true);
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, fetched.Knobs![ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task AppPromptPreprocessorChain_IncludesChangeScopeFragmentFromRegisteredKnob()
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "prompt chain",
+            Prompt = "p",
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            },
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var chain = _factory.Services.GetRequiredService<AgentPromptPreprocessorChain>();
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = "https://github.com/test/repo",
+        };
+        var result = await chain.ProcessAsync(
+            new PromptContext(
+                item.Id,
+                AgentKind.Claude,
+                AgentPromptPhase.Work,
+                Iteration: 1,
+                project,
+                new NoopSandbox(),
+                "/work"),
+            "original prompt");
+
+        Assert.Contains("Per-item directives (knobs)", result);
+        Assert.Contains("changeScope=surgical", result);
+        Assert.Contains("SURGICAL", result);
+    }
+
+    private async Task<WorkItemWithKnobsResponse> CreatePlainQueuedItemAsync(string title)
+    {
+        var create = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title,
+            prompt = "p",
+        });
+        Assert.Equal(HttpStatusCode.Created, create.StatusCode);
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        return created!;
     }
 
     private sealed class WorkItemWithKnobsResponse
     {
         [JsonPropertyName("id")] public string Id { get; init; } = string.Empty;
         [JsonPropertyName("knobs")] public IReadOnlyDictionary<string, string>? Knobs { get; init; }
+    }
+
+    private sealed class NoopSandbox : ISandbox
+    {
+        public string Id => "noop-sandbox";
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(1, "", "not found"));
     }
 }

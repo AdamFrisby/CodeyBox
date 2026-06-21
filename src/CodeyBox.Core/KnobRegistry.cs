@@ -23,17 +23,17 @@ public sealed class KnobRegistry : IKnobRegistry
             if (string.IsNullOrWhiteSpace(knob.Key))
                 throw new InvalidOperationException(
                     $"Knob {knob.GetType().FullName} declared an empty Key.");
+            if (knob.AllowedValues.Any(string.IsNullOrWhiteSpace))
+                throw new InvalidOperationException(
+                    $"Knob '{knob.Key}' declared an empty AllowedValues entry.");
             if (!_byKey.TryAdd(knob.Key, knob))
                 throw new InvalidOperationException(
                     $"Duplicate knob key '{knob.Key}'. Each registered knob must declare a unique Key.");
 
-            if (knob.AllowedValues.Count > 0 &&
-                !knob.AllowedValues.Any(v => string.Equals(v, knob.DefaultValue, StringComparison.OrdinalIgnoreCase)))
-            {
+            var defaultParse = knob.ParseValue(knob.DefaultValue);
+            if (!defaultParse.Ok)
                 throw new InvalidOperationException(
-                    $"Knob '{knob.Key}' default '{knob.DefaultValue}' is not in its AllowedValues " +
-                    $"[{string.Join(", ", knob.AllowedValues)}].");
-            }
+                    $"Knob '{knob.Key}' default '{knob.DefaultValue}' is invalid: {defaultParse.Error}");
 
             ordered.Add(knob);
         }
@@ -56,24 +56,29 @@ public sealed class KnobRegistry : IKnobRegistry
 
     public KnobValidationResult Validate(string key, string value)
     {
-        if (string.IsNullOrWhiteSpace(key))
-            return KnobValidationResult.Fail("knob key must not be empty");
-        if (value is null)
-            return KnobValidationResult.Fail($"knob '{key}' value must not be null");
+        var result = Normalize(key, value);
+        return result.Ok
+            ? KnobValidationResult.Success
+            : KnobValidationResult.Fail(result.Error!);
+    }
 
-        if (!_byKey.TryGetValue(key, out var knob))
-            return KnobValidationResult.Fail(
+    public KnobNormalizationResult Normalize(string key, string value)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            return KnobNormalizationResult.Fail("knob key must not be empty");
+        if (value is null)
+            return KnobNormalizationResult.Fail($"knob '{key}' value must not be null");
+
+        var trimmedKey = key.Trim();
+        if (!_byKey.TryGetValue(trimmedKey, out var knob))
+            return KnobNormalizationResult.Fail(
                 $"unknown knob '{key}'. Known knobs: {KnownKeysDescription()}");
 
-        if (knob.AllowedValues.Count > 0 &&
-            !knob.AllowedValues.Any(v => string.Equals(v, value, StringComparison.OrdinalIgnoreCase)))
-        {
-            return KnobValidationResult.Fail(
-                $"knob '{knob.Key}' value '{value}' is not allowed. Allowed values: " +
-                $"{string.Join(", ", knob.AllowedValues)}");
-        }
+        var parsed = knob.ParseValue(value);
+        if (!parsed.Ok)
+            return KnobNormalizationResult.Fail(parsed.Error!);
 
-        return KnobValidationResult.Success;
+        return KnobNormalizationResult.Success(knob.Key, parsed.CanonicalValue!, parsed.TypedValue!);
     }
 
     public KnobValidationResult ValidateAll(IReadOnlyDictionary<string, string>? proposed)
@@ -89,6 +94,27 @@ public sealed class KnobRegistry : IKnobRegistry
         return KnobValidationResult.Success;
     }
 
+    public bool TryGetTypedValue<T>(
+        IReadOnlyDictionary<string, string> resolved,
+        string key,
+        out T value)
+    {
+        value = default!;
+        if (resolved is null || !_byKey.TryGetValue(key, out var knob))
+            return false;
+
+        if (!TryGetCanonical(resolved, knob, out _, out var typed))
+            return false;
+
+        if (typed is T matched)
+        {
+            value = matched;
+            return true;
+        }
+
+        return false;
+    }
+
     public IReadOnlyDictionary<string, string> Resolve(
         IReadOnlyDictionary<string, string>? itemKnobs,
         IReadOnlyDictionary<string, string>? projectKnobs)
@@ -96,9 +122,9 @@ public sealed class KnobRegistry : IKnobRegistry
         var effective = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var knob in _ordered)
         {
-            if (itemKnobs is not null && TryGetCanonical(itemKnobs, knob, out var itemValue))
+            if (itemKnobs is not null && TryGetCanonical(itemKnobs, knob, out var itemValue, out _))
                 effective[knob.Key] = itemValue!;
-            else if (projectKnobs is not null && TryGetCanonical(projectKnobs, knob, out var projectValue))
+            else if (projectKnobs is not null && TryGetCanonical(projectKnobs, knob, out var projectValue, out _))
                 effective[knob.Key] = projectValue!;
             else
                 effective[knob.Key] = knob.DefaultValue;
@@ -109,46 +135,42 @@ public sealed class KnobRegistry : IKnobRegistry
     private static bool TryGetCanonical(
         IReadOnlyDictionary<string, string> source,
         IKnob knob,
-        out string? canonical)
+        out string? canonical,
+        out object? typed)
     {
         if (source.TryGetValue(knob.Key, out var raw) && !string.IsNullOrWhiteSpace(raw))
-            return TryNormaliseAgainstAllowedValues(knob, raw, out canonical);
+            return TryParse(knob, raw, out canonical, out typed);
 
         foreach (var kv in source)
         {
             if (string.Equals(kv.Key, knob.Key, StringComparison.OrdinalIgnoreCase) &&
                 !string.IsNullOrWhiteSpace(kv.Value))
             {
-                return TryNormaliseAgainstAllowedValues(knob, kv.Value, out canonical);
+                return TryParse(knob, kv.Value, out canonical, out typed);
             }
         }
 
         canonical = null;
+        typed = null;
         return false;
     }
 
-    private static bool TryNormaliseAgainstAllowedValues(IKnob knob, string value, out string? canonical)
+    private static bool TryParse(IKnob knob, string value, out string? canonical, out object? typed)
     {
-        if (knob.AllowedValues.Count == 0)
+        var parsed = knob.ParseValue(value);
+        if (parsed.Ok)
         {
-            canonical = value;
+            canonical = parsed.CanonicalValue!;
+            typed = parsed.TypedValue;
             return true;
         }
 
-        foreach (var allowed in knob.AllowedValues)
-        {
-            if (string.Equals(allowed, value, StringComparison.OrdinalIgnoreCase))
-            {
-                canonical = allowed;
-                return true;
-            }
-        }
-
-        // Persisted value is not in AllowedValues — signal "not set" so Resolve
+        // Persisted value is no longer valid — signal "not set" so Resolve
         // falls through to the next precedence tier (project default → knob
-        // default). The API path validates at set-time so reaching here means
-        // the knob's AllowedValues changed in code since the value was persisted.
+        // default). The API/config paths validate at set-time so reaching here
+        // means the descriptor changed in code since the value was persisted.
         canonical = null;
+        typed = null;
         return false;
     }
 

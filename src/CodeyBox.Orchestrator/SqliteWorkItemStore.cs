@@ -2203,12 +2203,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             }
             return rebuilt;
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            // Corruption-tolerant: unreadable knob map falls back to "no knobs
-            // set" so the work item is still pickable. The pipeline then uses
-            // project defaults / knob defaults, which is the safer fallback.
-            return EmptyKnobs;
+            throw new InvalidDataException("work item knobs_json is invalid JSON", ex);
         }
     }
 

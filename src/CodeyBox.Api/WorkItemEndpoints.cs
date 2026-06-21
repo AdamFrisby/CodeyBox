@@ -2336,8 +2336,8 @@ public sealed record CreateWorkItemRequest(
     // <c>Check</c> and <c>AgentControl</c>.
     bool? IsRefactor = null,
     // Per-item knob overrides. Keys must match a registered IKnob.Key; values
-    // must satisfy the knob's AllowedValues (case-insensitive). Unknown keys
-    // and invalid values are rejected at create time with 400.
+    // must satisfy the knob descriptor parser. Unknown keys and invalid values
+    // are rejected at create time with 400.
     IReadOnlyDictionary<string, string>? Knobs = null);
 
 /// <summary>
@@ -2402,8 +2402,8 @@ public sealed record PatchWorkItemRequest(
     // item. Passing an empty array clears all dependencies.
     string[]? DependsOn = null,
     // Replace-set knob edit (queued-only, like Title/Agent). Sending a non-null
-    // map replaces the entire stored map. Unknown keys and out-of-range values
-    // are rejected with 400. Send an empty map to clear all per-item overrides.
+    // map replaces the entire stored map. Unknown keys and invalid values are
+    // rejected with 400. Send an empty map to clear all per-item overrides.
     IReadOnlyDictionary<string, string>? Knobs = null);
 
 public sealed record PatchPriorityRequest(int Priority);

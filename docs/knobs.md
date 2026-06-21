@@ -63,8 +63,10 @@ Every API set-time path validates against the registered `IKnobRegistry`:
 
 - Unknown keys are rejected with a clear error naming the key and listing the
   known knobs.
-- Values are validated against the knob's declared `AllowedValues` (an empty
-  list means "any non-null string accepted").
+- Values are normalised through the knob descriptor. Finite `AllowedValues`
+  are matched case-insensitively and stored with the registered casing; knobs
+  with no `AllowedValues` use their descriptor parser and still reject empty
+  or whitespace-only values by default.
 - Per-item maps are capped at 32 entries; keys are capped at 64 chars; values
   at 128 chars. Keys and values may not contain control characters.
 
@@ -72,16 +74,15 @@ The PATCH endpoint follows the same Queued-only state machine that other
 queued-only fields use; once an item leaves Queued, knob edits return 409.
 
 Project-default knob maps in `codeybox-extra.json` (both `Defaults.Knobs` and
-`Projects[N].Knobs`) are **not** validated against the registry at config-load
-time. Unknown keys or out-of-range values are dropped silently at
-prompt-assembly time and the effective value falls through to the knob's own
-default. A future hardening pass may add startup validation; today, an
-operator typo in project-default knobs surfaces only as the absence of the
-expected behaviour change.
+`Projects[N].Knobs`) are validated and canonicalised against the same registry
+at config load/reload time. Unknown keys or invalid values reject the
+candidate configuration with a clear error and keep the prior project snapshot
+on hot reload. A project-side empty string is the only non-value sentinel: it
+clears an inherited `Defaults.Knobs` entry for that known key.
 
 ## Resolution and prompt injection
 
-At every work / rework agent invocation, the
+At every work agent invocation, the
 [`KnobWorkPromptPreprocessor`](../src/CodeyBox.Orchestrator/Knobs/KnobWorkPromptPreprocessor.cs)
 loads the work item, resolves each registered knob's effective value
 (item → project default → knob default), asks every knob for its prompt
@@ -94,9 +95,9 @@ fragment, and appends the non-empty fragments to the prompt as a single block:
 - **someOtherKnob=…**: …
 ```
 
-Audit, merge, and check-and-act phases are intentionally left alone — knobs
-only affect work / rework prompts today. Additional seams can be added by
-extending `IKnob` with optional per-phase methods.
+Rework, audit, merge, and check-and-act phases are intentionally left alone —
+knobs only affect the initial work prompt today. Additional seams can be added
+by extending `IKnob` with optional per-phase methods.
 
 A knob whose effective value matches its existing default behaviour should
 return `null` from its prompt-fragment method so the prompt stays
@@ -126,6 +127,13 @@ A new knob is a four-step, localised change. No pipeline edits.
        };
    }
    ```
+
+   For boolean, numeric, range-limited, or structured knobs, keep parsing local
+   to the descriptor by setting `ValueType`/`ClrType` and overriding
+   `ParseValue` when the built-in parser is not enough. Prompt-contributing
+   free-form knobs must either declare finite `AllowedValues` or explicitly
+   opt in via `AllowsFreeFormPromptFragments` after delimiting/encoding any
+   raw user-controlled value as untrusted data.
 
 2. Register the knob as a DI singleton in `Program.cs`:
 

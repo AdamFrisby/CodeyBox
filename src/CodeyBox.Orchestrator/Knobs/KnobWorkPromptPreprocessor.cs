@@ -7,8 +7,8 @@ namespace CodeyBox.Orchestrator.Knobs;
 
 /// <summary>
 /// Built-in preprocessor that gathers fragments from every registered
-/// <see cref="IKnob"/> and appends them to the agent's work / rework prompt
-/// as a single block.
+/// <see cref="IKnob"/> and appends them to the agent's work prompt as a
+/// single block.
 ///
 /// <para>
 /// Runs at <see cref="AgentPromptPreprocessorOrder.BuiltInLast"/> so the
@@ -18,17 +18,16 @@ namespace CodeyBox.Orchestrator.Knobs;
 /// </para>
 ///
 /// <para>
-/// Only fires for <see cref="AgentPromptPhase.Work"/> and
-/// <see cref="AgentPromptPhase.Rework"/> today. Audit / merge / check-and-act
-/// phases are intentionally untouched; knob seams for those phases can be
-/// added by extending <see cref="IKnob"/> with optional methods.
+/// Only fires for <see cref="AgentPromptPhase.Work"/> today. Rework, audit,
+/// merge, and check-and-act phases are intentionally untouched; knob seams for
+/// those phases can be added by extending <see cref="IKnob"/> with optional
+/// methods.
 /// </para>
 /// </summary>
 public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
 {
     private readonly IKnobRegistry _registry;
     private readonly IWorkItemStore _store;
-    private readonly ILogger<KnobWorkPromptPreprocessor> _log;
 
     public KnobWorkPromptPreprocessor(
         IKnobRegistry registry,
@@ -44,32 +43,19 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
     {
         _registry = registry;
         _store = store;
-        _log = log;
     }
 
     public int Order => AgentPromptPreprocessorOrder.BuiltInLast;
 
     public async Task<string> ProcessAsync(PromptContext ctx, string prompt, CancellationToken ct = default)
     {
-        if (ctx.Phase != AgentPromptPhase.Work && ctx.Phase != AgentPromptPhase.Rework)
+        if (ctx.Phase != AgentPromptPhase.Work)
             return prompt;
         if (_registry.All.Count == 0)
             return prompt;
 
-        IReadOnlyDictionary<string, string>? itemKnobs = null;
-        try
-        {
-            var item = await _store.GetAsync(ctx.ItemId, ct).ConfigureAwait(false);
-            itemKnobs = item?.Knobs;
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            // Defensive: a transient store failure must not strand the prompt.
-            // Fall through with no per-item knobs; project defaults still apply.
-            _log.LogWarning(ex,
-                "Knob preprocessor could not load work item {WorkItemId} from store; falling back to project defaults",
-                ctx.ItemId);
-        }
+        var item = await _store.GetAsync(ctx.ItemId, ct).ConfigureAwait(false);
+        var itemKnobs = item?.Knobs;
 
         var effective = _registry.Resolve(itemKnobs, ctx.Project.Knobs);
         var fragments = new List<(string Key, string Value, string Fragment)>();
@@ -80,6 +66,12 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
             var fragment = knob.GetWorkPromptFragment(value);
             if (string.IsNullOrWhiteSpace(fragment))
                 continue;
+            if (knob.AllowedValues.Count == 0 && !knob.AllowsFreeFormPromptFragments)
+            {
+                throw new InvalidOperationException(
+                    $"Prompt-contributing knob '{knob.Key}' must declare finite AllowedValues " +
+                    "or explicitly opt in to safe free-form prompt fragments.");
+            }
             fragments.Add((knob.Key, value, fragment));
         }
 

@@ -1681,7 +1681,8 @@ builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
 builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
     sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>(),
     sp.GetRequiredService<ILogger<ProjectRepository>>(),
-    sp.GetService<PresetCatalogOptions>()));
+    sp.GetService<PresetCatalogOptions>(),
+    sp.GetRequiredService<IKnobRegistry>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(_ =>
 {

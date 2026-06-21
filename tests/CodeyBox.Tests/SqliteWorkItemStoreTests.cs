@@ -83,6 +83,28 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdateAsync_PersistsKnobsMap()
+    {
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        var updated = item with
+        {
+            State = WorkItemState.Working,
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["changeScope"] = "surgical",
+            },
+        };
+        await _store.UpdateAsync(updated);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Single(read!.Knobs);
+        Assert.Equal("surgical", read.Knobs["changeScope"]);
+    }
+
+    [Fact]
     public async Task RecordAuditProgressAsync_ReplacesExistingIterationRow()
     {
         var item = Sample();
@@ -634,6 +656,25 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadRow_CorruptKnobsJson_FailsClosed()
+    {
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE work_items SET knobs_json = $junk WHERE id = $id";
+            cmd.Parameters.AddWithValue("$junk", "not-json");
+            cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => _store.GetAsync(item.Id));
+    }
+
+    [Fact]
     public async Task TryUpdateIfStateAndUpdatedAtAsync_PersistsKnobsMap()
     {
         // The recovery / retry path uses this UPDATE; a regression that drops
@@ -687,10 +728,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
 
         var read = await _store.GetAsync(item.Id);
         Assert.NotNull(read);
-        // Either ordering is acceptable; the contract is "do not throw, do not
-        // strand the row". A non-empty knob map is the proof we survived the
-        // case-insensitive dedup path rather than catching JsonException only.
-        Assert.True(read!.Knobs.ContainsKey("changeScope"));
+        Assert.Equal("refactor", read!.Knobs["changeScope"]);
     }
 
     private static async Task DrainAsync(IAsyncEnumerable<WorkItem> items)

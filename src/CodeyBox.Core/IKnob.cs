@@ -1,11 +1,64 @@
 namespace CodeyBox.Core;
 
 /// <summary>
+/// Built-in value shapes the knob registry knows how to normalise and parse.
+/// Descriptors with specialised semantics can override
+/// <see cref="IKnob.ParseValue"/> while still advertising their high-level
+/// value type here for discovery and validation.
+/// </summary>
+public enum KnobValueType
+{
+    String,
+    Enum,
+    Boolean,
+    Integer,
+    Decimal,
+    Json,
+}
+
+/// <summary>
+/// Result of parsing a knob's string storage value into the descriptor's typed
+/// value. <see cref="CanonicalValue"/> is the string written back to storage;
+/// <see cref="TypedValue"/> is used by typed accessors.
+/// </summary>
+public readonly record struct KnobValueParseResult(
+    bool Ok,
+    string? CanonicalValue,
+    object? TypedValue,
+    string? Error)
+{
+    public static KnobValueParseResult Success(string canonicalValue, object typedValue) =>
+        new(true, canonicalValue, typedValue, null);
+
+    public static KnobValueParseResult Fail(string error) =>
+        new(false, null, null, error);
+}
+
+/// <summary>
+/// Result of normalising a caller-supplied knob assignment against the
+/// registry. Successful results carry the canonical key and value that should
+/// be persisted.
+/// </summary>
+public readonly record struct KnobNormalizationResult(
+    bool Ok,
+    string? Key,
+    string? Value,
+    object? TypedValue,
+    string? Error)
+{
+    public static KnobNormalizationResult Success(string key, string value, object typedValue) =>
+        new(true, key, value, typedValue, null);
+
+    public static KnobNormalizationResult Fail(string error) =>
+        new(false, null, null, null, error);
+}
+
+/// <summary>
 /// A "knob" is a small, registered tuning directive that can be attached
 /// per work item or per project to nudge the agent's behaviour. The framework
 /// is intentionally minimalist: a knob is identified by its <see cref="Key"/>,
-/// constrained by its <see cref="AllowedValues"/> set, and contributes its
-/// behaviour via per-phase hooks (currently just
+/// constrained by its typed value parser, and contributes its behaviour via
+/// per-phase hooks (currently just
 /// <see cref="GetWorkPromptFragment"/>).
 ///
 /// <para>
@@ -33,14 +86,32 @@ public interface IKnob
     string Key { get; }
 
     /// <summary>
-    /// Operator-facing description shown in API discovery responses. Keep this
-    /// short; details belong in <c>docs/knobs.md</c>.
+    /// Operator-facing description. Keep this short; details belong in
+    /// <c>docs/knobs.md</c>.
     /// </summary>
     string Description { get; }
 
     /// <summary>
-    /// The enumeration of values this knob accepts. Comparisons are
-    /// case-insensitive. An empty list means "any non-null string accepted".
+    /// High-level value shape for this knob. When <see cref="AllowedValues"/>
+    /// is non-empty, the default is <see cref="KnobValueType.Enum"/>; otherwise
+    /// the default is <see cref="KnobValueType.String"/>.
+    /// </summary>
+    KnobValueType ValueType => AllowedValues.Count > 0
+        ? KnobValueType.Enum
+        : KnobValueType.String;
+
+    /// <summary>
+    /// CLR type returned by <see cref="ParseValue"/> and
+    /// <see cref="IKnobRegistry.TryGetTypedValue{T}"/>. Built-in enum/string
+    /// descriptors return <see cref="string"/> by default.
+    /// </summary>
+    Type ClrType => typeof(string);
+
+    /// <summary>
+    /// The finite enumeration of values this knob accepts. Comparisons are
+    /// case-insensitive and successful normalisation persists the registered
+    /// casing. An empty list means the descriptor's <see cref="ParseValue"/>
+    /// hook validates the value instead.
     /// </summary>
     IReadOnlyList<string> AllowedValues { get; }
 
@@ -58,6 +129,23 @@ public interface IKnob
     /// existing default behaviour and would just clutter the prompt).
     /// </summary>
     string? GetWorkPromptFragment(string value);
+
+    /// <summary>
+    /// Free-form values can be operator/user controlled. Leave this false
+    /// unless <see cref="GetWorkPromptFragment"/> either never emits the raw
+    /// free-form value or explicitly delimits/encodes it as untrusted data.
+    /// The prompt preprocessor enforces this when a free-form descriptor
+    /// contributes a fragment.
+    /// </summary>
+    bool AllowsFreeFormPromptFragments => false;
+
+    /// <summary>
+    /// Normalises and parses one storage value. Descriptors can override this
+    /// to add ranges, custom numeric parsing, structured values, or a domain
+    /// enum while keeping validation local to the descriptor.
+    /// </summary>
+    KnobValueParseResult ParseValue(string value) =>
+        KnobValueParsers.ParseBuiltIn(this, value);
 }
 
 /// <summary>
@@ -97,11 +185,27 @@ public interface IKnobRegistry
     KnobValidationResult Validate(string key, string value);
 
     /// <summary>
+    /// Validates and normalises one (key, value) pair. Successful results carry
+    /// the canonical key/value that should be persisted.
+    /// </summary>
+    KnobNormalizationResult Normalize(string key, string value);
+
+    /// <summary>
     /// Validates an entire proposed map. Returns the first failure encountered.
     /// Iteration order over the input dictionary is preserved so the error
     /// names the FIRST offending key, which makes operator triage simpler.
     /// </summary>
     KnobValidationResult ValidateAll(IReadOnlyDictionary<string, string>? proposed);
+
+    /// <summary>
+    /// Reads a typed value from an already-resolved knob map. Returns
+    /// <c>false</c> when the key is unknown, absent, invalid for the current
+    /// descriptor, or the parsed value is not assignable to <typeparamref name="T"/>.
+    /// </summary>
+    bool TryGetTypedValue<T>(
+        IReadOnlyDictionary<string, string> resolved,
+        string key,
+        out T value);
 
     /// <summary>
     /// Resolves the effective value of every registered knob using the
@@ -119,4 +223,50 @@ public interface IKnobRegistry
     IReadOnlyDictionary<string, string> Resolve(
         IReadOnlyDictionary<string, string>? itemKnobs,
         IReadOnlyDictionary<string, string>? projectKnobs);
+}
+
+internal static class KnobValueParsers
+{
+    public static KnobValueParseResult ParseBuiltIn(IKnob knob, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return KnobValueParseResult.Fail($"knob '{knob.Key}' value must not be empty");
+
+        if (knob.AllowedValues.Count > 0)
+        {
+            foreach (var allowed in knob.AllowedValues)
+            {
+                if (string.Equals(allowed, value, StringComparison.OrdinalIgnoreCase))
+                    return KnobValueParseResult.Success(allowed, allowed);
+            }
+
+            return KnobValueParseResult.Fail(
+                $"knob '{knob.Key}' value '{value}' is not allowed. Allowed values: " +
+                $"{string.Join(", ", knob.AllowedValues)}");
+        }
+
+        var trimmed = value.Trim();
+        return knob.ValueType switch
+        {
+            KnobValueType.String => KnobValueParseResult.Success(trimmed, trimmed),
+            KnobValueType.Boolean => bool.TryParse(trimmed, out var b)
+                ? KnobValueParseResult.Success(b ? "true" : "false", b)
+                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be true or false"),
+            KnobValueType.Integer => long.TryParse(
+                    trimmed,
+                    System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var i)
+                ? KnobValueParseResult.Success(i.ToString(System.Globalization.CultureInfo.InvariantCulture), i)
+                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be an integer"),
+            KnobValueType.Decimal => decimal.TryParse(
+                    trimmed,
+                    System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var d)
+                ? KnobValueParseResult.Success(d.ToString(System.Globalization.CultureInfo.InvariantCulture), d)
+                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be a decimal number"),
+            _ => KnobValueParseResult.Success(trimmed, trimmed),
+        };
+    }
 }

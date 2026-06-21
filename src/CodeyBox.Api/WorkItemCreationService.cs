@@ -553,10 +553,10 @@ internal sealed class WorkItemCreationService
 
             var key = rawKey.Trim();
             var value = rawValue.Trim();
-            var verdict = registry.Validate(key, value);
+            var verdict = registry.Normalize(key, value);
             if (!verdict.Ok)
                 return (null, Results.BadRequest(new { error = verdict.Error }));
-            normalised[key] = value;
+            normalised[verdict.Key!] = verdict.Value!;
         }
 
         return (normalised, null);

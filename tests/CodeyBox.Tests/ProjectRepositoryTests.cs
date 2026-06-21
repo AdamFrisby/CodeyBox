@@ -2,12 +2,19 @@ using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Configuration;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
 
 public sealed class ProjectRepositoryTests
 {
+    private static readonly IKnobRegistry ProjectKnobRegistry = new KnobRegistry(
+    [
+        new ChangeScopeKnob(),
+        new TestStringKnob("otherKnob", "bar"),
+    ]);
+
     [Fact]
     public async Task LoadsProjectsFromConfig()
     {
@@ -1019,7 +1026,11 @@ public sealed class ProjectRepositoryTests
                 new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
             ],
         };
-        var repo = new ProjectRepository(Options.Create(opts));
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Equal("surgical", p!.Knobs["changeScope"]);
     }
@@ -1039,7 +1050,11 @@ public sealed class ProjectRepositoryTests
                 },
             ],
         };
-        var repo = new ProjectRepository(Options.Create(opts));
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Equal("refactor", p!.Knobs["changeScope"]);
     }
@@ -1063,7 +1078,11 @@ public sealed class ProjectRepositoryTests
                 },
             ],
         };
-        var repo = new ProjectRepository(Options.Create(opts));
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Equal("refactor", p!.Knobs["changeScope"]);
     }
@@ -1087,13 +1106,17 @@ public sealed class ProjectRepositoryTests
                 },
             ],
         };
-        var repo = new ProjectRepository(Options.Create(opts));
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.False(p!.Knobs.ContainsKey("changeScope"));
     }
 
     [Fact]
-    public async Task Knobs_WhitespaceKeyInProject_IsDropped()
+    public void Knobs_WhitespaceKeyInProject_IsRejected()
     {
         var opts = new ProjectsOptions
         {
@@ -1111,18 +1134,17 @@ public sealed class ProjectRepositoryTests
                 },
             ],
         };
-        var repo = new ProjectRepository(Options.Create(opts));
-        var p = await repo.GetAsync(new ProjectId("alpha"));
-        Assert.Single(p!.Knobs);
-        Assert.Equal("refactor", p.Knobs["changeScope"]);
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("knob key must not be empty", ex.Message);
     }
 
     [Fact]
-    public async Task Knobs_WhitespaceValueInDefaults_IsDroppedFromDefaultsMerge()
+    public void Knobs_WhitespaceValueInDefaults_IsRejected()
     {
-        // Defaults with a whitespace value should not propagate into the
-        // resolved project knob map — the documented "clear an inherited
-        // default" semantic only applies to project-side empties.
         var opts = new ProjectsOptions
         {
             Defaults = new ProjectDefaultsConfig
@@ -1134,9 +1156,60 @@ public sealed class ProjectRepositoryTests
                 new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
             ],
         };
-        var repo = new ProjectRepository(Options.Create(opts));
-        var p = await repo.GetAsync(new ProjectId("alpha"));
-        Assert.False(p!.Knobs.ContainsKey("changeScope"));
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("value must not be empty", ex.Message);
+    }
+
+    [Fact]
+    public void Knobs_UnknownDefaultKey_IsRejectedAtConfigLoad()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScpoe"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
+            ],
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("unknown knob 'changeScpoe'", ex.Message);
+    }
+
+    [Fact]
+    public void Knobs_InvalidProjectValue_IsRejectedAtConfigLoad()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "yolo" },
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("not allowed", ex.Message);
+        Assert.Contains("surgical", ex.Message);
     }
 
     [Fact]
@@ -1164,11 +1237,30 @@ public sealed class ProjectRepositoryTests
                 },
             ],
         };
-        var repo = new ProjectRepository(Options.Create(opts));
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Equal("refactor", p!.Knobs["changeScope"]);
         Assert.Equal("foo", p.Knobs["otherKnob"]);
     }
+}
+
+file sealed class TestStringKnob : IKnob
+{
+    public TestStringKnob(string key, string defaultValue)
+    {
+        Key = key;
+        DefaultValue = defaultValue;
+    }
+
+    public string Key { get; }
+    public string Description => $"test string knob '{Key}'";
+    public IReadOnlyList<string> AllowedValues => [];
+    public string DefaultValue { get; }
+    public string? GetWorkPromptFragment(string value) => null;
 }
 
 file sealed class NullAgent : IAgentRunner

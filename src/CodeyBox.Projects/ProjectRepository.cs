@@ -44,6 +44,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
 {
     private readonly ILogger<ProjectRepository> _logger;
     private readonly PresetCatalogOptions? _presetCatalogOptions;
+    private readonly IKnobRegistry _knobRegistry;
     private readonly IDisposable? _changeSubscription;
     private readonly Lock _reloadGate = new();
     private Snapshot _snapshot;
@@ -55,6 +56,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never,
     };
 
+    private static readonly IKnobRegistry EmptyKnobRegistry = new KnobRegistry([]);
+
     public ProjectRepository(IOptions<ProjectsOptions> options)
         : this(options, NullLogger<ProjectRepository>.Instance) { }
 
@@ -64,10 +67,12 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     public ProjectRepository(
         IOptions<ProjectsOptions> options,
         ILogger<ProjectRepository> logger,
-        PresetCatalogOptions? presetCatalogOptions)
+        PresetCatalogOptions? presetCatalogOptions,
+        IKnobRegistry? knobRegistry = null)
     {
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
+        _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
         _snapshot = Build(options.Value, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(options.Value);
     }
@@ -75,11 +80,13 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     public ProjectRepository(
         IOptionsMonitor<ProjectsOptions> monitor,
         ILogger<ProjectRepository> logger,
-        PresetCatalogOptions? presetCatalogOptions = null)
+        PresetCatalogOptions? presetCatalogOptions = null,
+        IKnobRegistry? knobRegistry = null)
     {
         ArgumentNullException.ThrowIfNull(monitor);
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
+        _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
         var initial = monitor.CurrentValue;
         _snapshot = Build(initial, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(initial);
@@ -321,16 +328,17 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             {
                 Enabled = pc.ClaudeSession?.Enabled ?? false,
             },
-            Knobs = ResolveKnobs(pc.Knobs, defaults.Knobs),
+            Knobs = ResolveKnobs(pc.Id, pc.Knobs, defaults.Knobs),
         };
     }
 
     /// <summary>
     /// Per-key merge of project and defaults knob maps; project entries win on
-    /// collision. Empty/whitespace values are dropped from both sides so an
-    /// operator can clear a default for one project with <c>"changeScope": ""</c>.
+    /// collision. Default values must validate normally; an empty/whitespace
+    /// project value clears an inherited default for that known knob key.
     /// </summary>
-    private static IReadOnlyDictionary<string, string> ResolveKnobs(
+    private IReadOnlyDictionary<string, string> ResolveKnobs(
+        string projectId,
         Dictionary<string, string>? project,
         Dictionary<string, string>? defaults)
     {
@@ -341,21 +349,50 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         if (defaults is not null)
         {
             foreach (var (k, v) in defaults)
-                if (!string.IsNullOrWhiteSpace(k) && !string.IsNullOrWhiteSpace(v))
-                    merged[k] = v;
+            {
+                var normalised = NormalizeConfiguredKnob(
+                    $"Defaults.Knobs['{k}']",
+                    k,
+                    v);
+                merged[normalised.Key!] = normalised.Value!;
+            }
         }
         if (project is not null)
         {
             foreach (var (k, v) in project)
             {
-                if (string.IsNullOrWhiteSpace(k)) continue;
                 if (string.IsNullOrWhiteSpace(v))
-                    merged.Remove(k);
-                else
-                    merged[k] = v;
+                {
+                    if (!_knobRegistry.TryGet(k, out var knob))
+                    {
+                        var result = _knobRegistry.Validate(k, "clear");
+                        throw new InvalidOperationException(
+                            $"Project '{projectId}' Knobs['{k}'] is invalid: {result.Error}");
+                    }
+
+                    merged.Remove(knob.Key);
+                    continue;
+                }
+
+                var normalised = NormalizeConfiguredKnob(
+                    $"Project '{projectId}' Knobs['{k}']",
+                    k,
+                    v);
+                merged[normalised.Key!] = normalised.Value!;
             }
         }
         return merged;
+    }
+
+    private KnobNormalizationResult NormalizeConfiguredKnob(
+        string source,
+        string key,
+        string value)
+    {
+        var normalised = _knobRegistry.Normalize(key, value);
+        if (!normalised.Ok)
+            throw new InvalidOperationException($"{source} is invalid: {normalised.Error}");
+        return normalised;
     }
 
     /// <summary>

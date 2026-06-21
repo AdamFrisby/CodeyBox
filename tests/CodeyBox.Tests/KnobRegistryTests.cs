@@ -88,6 +88,60 @@ public sealed class KnobRegistryTests
     }
 
     [Fact]
+    public void Normalize_ReturnsCanonicalKeyAndValue()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("changeScope", "moderate", ["surgical", "moderate"])]);
+
+        var result = registry.Normalize("CHANGESCOPE", "SURGICAL");
+
+        Assert.True(result.Ok);
+        Assert.Equal("changeScope", result.Key);
+        Assert.Equal("surgical", result.Value);
+        Assert.Equal("surgical", result.TypedValue);
+    }
+
+    [Fact]
+    public void ValidateAll_NullOrEmptyMap_Succeeds()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
+
+        Assert.True(registry.ValidateAll(null).Ok);
+        Assert.True(registry.ValidateAll(new Dictionary<string, string>()).Ok);
+    }
+
+    [Fact]
+    public void ValidateAll_ReturnsFirstErrorInInputOrder()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
+        var proposed = new Dictionary<string, string>
+        {
+            ["unknown"] = "value",
+            ["shape"] = "triangle",
+        };
+
+        var result = registry.ValidateAll(proposed);
+
+        Assert.False(result.Ok);
+        Assert.Contains("unknown knob 'unknown'", result.Error);
+        Assert.DoesNotContain("triangle", result.Error);
+    }
+
+    [Fact]
+    public void TryGetTypedValue_ReturnsParsedValueForTypedKnob()
+    {
+        var registry = new KnobRegistry([new TestBooleanKnob("strict", defaultValue: false)]);
+        var effective = registry.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["strict"] = "TRUE" },
+            projectKnobs: null);
+
+        var found = registry.TryGetTypedValue<bool>(effective, "strict", out var strict);
+
+        Assert.True(found);
+        Assert.True(strict);
+        Assert.Equal("true", effective["strict"]);
+    }
+
+    [Fact]
     public void DuplicateKnobKey_ThrowsAtRegistryConstruction()
     {
         Assert.Throws<InvalidOperationException>(() => new KnobRegistry(
@@ -95,6 +149,24 @@ public sealed class KnobRegistryTests
             new TestEnumKnob("dup", "a", ["a", "b"]),
             new TestEnumKnob("dup", "b", ["a", "b"]),
         ]));
+    }
+
+    [Fact]
+    public void NullDescriptor_ThrowsAtRegistryConstruction()
+    {
+        Assert.Throws<ArgumentNullException>(() => new KnobRegistry([null!]));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void EmptyOrWhitespaceKey_ThrowsAtRegistryConstruction(string key)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => new KnobRegistry(
+        [
+            new TestEnumKnob(key, "a", ["a", "b"]),
+        ]));
+        Assert.Contains("empty Key", ex.Message);
     }
 
     [Fact]
@@ -141,14 +213,15 @@ public sealed class KnobRegistryTests
     public void EmptyAllowedValues_AcceptsAnyNonEmptyString_AndResolvesVerbatim()
     {
         // The IKnob contract documents that an empty AllowedValues list means
-        // "any non-null string accepted" — useful for free-form knobs (numeric
-        // budgets, paths, etc.). Validate accepts arbitrary input and Resolve
-        // returns the persisted casing verbatim (no canonicalisation since
-        // there's no allowed-value list to canonicalise against).
+        // the descriptor parser validates the value — useful for free-form
+        // knobs (numeric budgets, paths, etc.). The default string parser
+        // accepts arbitrary non-empty input and Resolve returns it verbatim.
         var registry = new KnobRegistry([new TestEnumKnob("freeForm", "fallback", [])]);
 
         Assert.True(registry.Validate("freeForm", "arbitrary-string").Ok);
         Assert.True(registry.Validate("freeForm", "Another-VALUE").Ok);
+        Assert.False(registry.Validate("freeForm", "").Ok);
+        Assert.False(registry.Validate("freeForm", "   ").Ok);
 
         var effective = registry.Resolve(
             itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["freeForm"] = "Mixed-Case-Verbatim" },
@@ -187,5 +260,22 @@ public sealed class KnobRegistryTests
         public IReadOnlyList<string> AllowedValues { get; }
         public string DefaultValue { get; }
         public string? GetWorkPromptFragment(string value) => $"applied-{value}";
+    }
+
+    private sealed class TestBooleanKnob : IKnob
+    {
+        public TestBooleanKnob(string key, bool defaultValue)
+        {
+            Key = key;
+            DefaultValue = defaultValue ? "true" : "false";
+        }
+
+        public string Key { get; }
+        public string Description => $"test bool knob '{Key}'";
+        public KnobValueType ValueType => KnobValueType.Boolean;
+        public Type ClrType => typeof(bool);
+        public IReadOnlyList<string> AllowedValues => [];
+        public string DefaultValue { get; }
+        public string? GetWorkPromptFragment(string value) => null;
     }
 }
