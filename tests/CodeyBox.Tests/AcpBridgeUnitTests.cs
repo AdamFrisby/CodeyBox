@@ -1,9 +1,16 @@
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.Versioning;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using CodeyBox.Agents.Claude.AcpBridge;
 
 namespace CodeyBox.Tests;
@@ -809,5 +816,850 @@ public sealed class AcpBridgeUnitTests
         Buffer.BlockCopy(header, 0, frame, 0, header.Length);
         Buffer.BlockCopy(masked, 0, frame, header.Length, masked.Length);
         return frame;
+    }
+
+    // ── Bridge.OnIncomingFrame orchestration ────────────────────────────────────
+    //
+    // The fixtures above pin BridgePayloads.ClassifyIncomingFrame's classifier
+    // table cell-by-cell, but the SIDE-EFFECT routing inside
+    // Bridge.OnIncomingFrame (which is what makes a classification actually
+    // change wire state — sending the auto-reply, emitting the per-kind
+    // envelope, calling Shutdown(0)) was previously unexercised. A regression
+    // that dropped the SendPeerText branch from AutoPermission, swapped the
+    // Shutdown(0) ordering, or skipped the acp_recv passthrough for Plain
+    // would pass every classifier-only fixture. The two end-to-end fixtures
+    // below drive each branch through a REAL WebSocket peer and assert both
+    // (a) the peer-side reply bytes and (b) the bridge-side stdout envelopes.
+
+    [Fact]
+    public async Task Bridge_OnIncomingFrame_DrivesPlainPermissionInputAndTurnCompleteOverRealWebSocket()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-onincoming-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+
+            // The auth token is generated inside HandleHello via
+            // RandomNumberGenerator and never echoed on stdout; we recover it
+            // by reading the lockfile claude --ide would read.
+            var lockfile = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement;
+            var authToken = lockfile.GetProperty("authToken").GetString()!;
+
+            await ctx.ConnectWebSocketAsync(port, authToken);
+            await ctx.WaitForEnvelopeAsync("peer_connected");
+            var seenSoFar = ctx.Stdout.SnapshotCount();
+
+            // 1. Plain frame (session/update notification) → acp_recv passthrough.
+            const string plain =
+                "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"agent_message_chunk\"}}}";
+            await ctx.SendWebSocketFrameAsync(plain);
+            var recv = await ctx.WaitForEnvelopeAsync("acp_recv", startIndex: seenSoFar);
+            Assert.Equal("session/update",
+                recv.GetProperty("payload").GetProperty("method").GetString());
+            seenSoFar = ctx.Stdout.SnapshotCount();
+
+            // 2. session/request_permission → auto-grant: WS reply + envelope.
+            const string permReq =
+                "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"session/request_permission\",\"params\":{}}";
+            await ctx.SendWebSocketFrameAsync(permReq);
+            var permReplyJson = await ctx.ReadWebSocketFrameAsync(TimeSpan.FromSeconds(10));
+            using (var pd = JsonDocument.Parse(permReplyJson))
+            {
+                Assert.Equal("2.0", pd.RootElement.GetProperty("jsonrpc").GetString());
+                Assert.Equal(42, pd.RootElement.GetProperty("id").GetInt32());
+                var outer = pd.RootElement.GetProperty("result").GetProperty("outcome");
+                Assert.Equal("selected", outer.GetProperty("outcome").GetString());
+                Assert.Equal("allow_once", outer.GetProperty("optionId").GetString());
+            }
+            var perm = await ctx.WaitForEnvelopeAsync("permission_auto_granted", startIndex: seenSoFar);
+            Assert.Equal("session/request_permission", perm.GetProperty("method").GetString());
+            seenSoFar = ctx.Stdout.SnapshotCount();
+
+            // 3. session/request_input → auto-answer: WS reply + envelope.
+            const string inputReq =
+                "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"session/request_input\",\"params\":{}}";
+            await ctx.SendWebSocketFrameAsync(inputReq);
+            var inputReplyJson = await ctx.ReadWebSocketFrameAsync(TimeSpan.FromSeconds(10));
+            using (var id = JsonDocument.Parse(inputReplyJson))
+            {
+                Assert.Equal(43, id.RootElement.GetProperty("id").GetInt32());
+                Assert.StartsWith("<codeybox-question>",
+                    id.RootElement.GetProperty("result").GetProperty("value").GetString());
+            }
+            var qa = await ctx.WaitForEnvelopeAsync("question_auto_answered", startIndex: seenSoFar);
+            Assert.Equal("session/request_input", qa.GetProperty("method").GetString());
+            seenSoFar = ctx.Stdout.SnapshotCount();
+
+            // 4. result.stopReason → turn_complete envelope + bridge shuts down.
+            const string done =
+                "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"stopReason\":\"end_turn\"}}";
+            await ctx.SendWebSocketFrameAsync(done);
+            var doneEnv = await ctx.WaitForEnvelopeAsync("turn_complete", startIndex: seenSoFar);
+            Assert.Equal("end_turn", doneEnv.GetProperty("stopReason").GetString());
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+            Assert.False(File.Exists(lockPath),
+                "Lockfile must be deleted as part of the turn_complete Shutdown.");
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Bridge_OnIncomingFrame_TurnError_EmitsEnvelopeAndShutsDownCleanly()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-onerror-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var lockfile = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement;
+            var authToken = lockfile.GetProperty("authToken").GetString()!;
+
+            await ctx.ConnectWebSocketAsync(port, authToken);
+            await ctx.WaitForEnvelopeAsync("peer_connected");
+            var seenSoFar = ctx.Stdout.SnapshotCount();
+
+            // error member present → turn_error envelope (with the raw error
+            // subtree echoed) + Shutdown(0). The acp_recv passthrough also
+            // fires from the TurnError branch.
+            const string err =
+                "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32603,\"message\":\"boom\"}}";
+            await ctx.SendWebSocketFrameAsync(err);
+
+            var turnErr = await ctx.WaitForEnvelopeAsync("turn_error", startIndex: seenSoFar);
+            var errProp = turnErr.GetProperty("error");
+            Assert.Equal(-32603, errProp.GetProperty("code").GetInt32());
+            Assert.Equal("boom", errProp.GetProperty("message").GetString());
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+            Assert.False(File.Exists(lockPath));
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Bridge.SpawnClaude stdin redirection (regression for commit 497fdbe) ────
+    //
+    // The bug being pinned: when RedirectStandardInput was false, claude --ide
+    // inherited the bridge's host envelope pipe (fd 0 carrying hello/acp_send
+    // bytes) and raced the bridge's ReadStdinAsync reader for those bytes. The
+    // fix sets RedirectStandardInput = true AND immediately closes
+    // StandardInput so claude sees EOF on a private pipe. This test boots the
+    // bridge with a bash stub that records what its fd 0 actually looks like —
+    // a regression (a) (RedirectStandardInput back to false) makes the stub
+    // inherit the test process's fd 0 (asserted via inode equality), and a
+    // regression (b) (forgetting StandardInput.Close()) leaves the bridge-end
+    // of the pipe open so the stub's read times out instead of EOF'ing.
+
+    [Fact]
+    public async Task Bridge_SpawnClaude_RedirectsAndClosesStdin_GivingClaudeAFreshClosedPipe()
+    {
+        // GNU coreutils' stat / readlink + bash are baseline on every
+        // CodeyBox sandbox image, so this fixture is safe in CI.
+        if (!File.Exists("/bin/bash"))
+            return; // honour Skippable shape without taking the dependency
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-stdineof-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+
+            // Stub claude that records its fd 0 link, fd 0 inode, and the
+            // outcome of an immediate read with a 1-second timeout:
+            //   rc=0  → bytes available (regression: claude inherited the
+            //           bridge's host envelope pipe).
+            //   rc=1  → EOF (the fix: bridge closed the pipe write-end).
+            //   rc>128 → timeout (regression: bridge forgot to close the
+            //           write-end, claude is blocked on an open empty pipe).
+            //
+            // The bridge prepends "--ide" before any configured claudeArgs,
+            // so argv[1]="--ide", argv[2]=stub log path.
+            var stubPath = Path.Combine(tmpDir, "claude-stub.sh");
+            var stubLog = Path.Combine(tmpDir, "stub.log");
+            File.WriteAllText(stubPath,
+                "#!/bin/bash\n" +
+                "set +e\n" +
+                "LOG=\"$2\"\n" +
+                "fd0_link=$(readlink /proc/self/fd/0 2>/dev/null || echo unknown)\n" +
+                "fd0_inode=$(stat -L -c %i /proc/self/fd/0 2>/dev/null || echo unknown)\n" +
+                "fd0_type=$(stat -L -c %F /proc/self/fd/0 2>/dev/null || echo unknown)\n" +
+                "byte=\"\"\n" +
+                "IFS= read -t 1 -r -N 16 byte\n" +
+                "rc=$?\n" +
+                "state=other\n" +
+                "if [ \"$rc\" = \"0\" ]; then state=read\n" +
+                "elif [ \"$rc\" = \"1\" ]; then state=eof\n" +
+                "else state=timeout\n" +
+                "fi\n" +
+                "printf 'fd0_link=%s\\nfd0_inode=%s\\nfd0_type=%s\\nread_state=%s\\nrc=%s\\nbytes_read=%s\\n' " +
+                "\"$fd0_link\" \"$fd0_inode\" \"$fd0_type\" \"$state\" \"$rc\" \"$byte\" > \"$LOG\"\n" +
+                "exit 0\n");
+            File.SetUnixFileMode(stubPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            // Capture THIS test process's fd 0 inode. A non-redirected
+            // subprocess inherits the parent's fd 0, so the inode it reports
+            // is the test's stdin inode. Bridge's claude subprocess MUST get
+            // a fresh pipe with a DIFFERENT inode if RedirectStandardInput
+            // is true.
+            var testFd0Inode = GetCurrentProcessStdinInodeViaSubprocess();
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"" + stubLog
+                + "\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":30}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(20));
+            Assert.Equal(0, exitCode);
+
+            Assert.True(File.Exists(stubLog),
+                "Stub claude did not write its diagnostic log — Bridge.SpawnClaude probably never invoked it.");
+            var kv = ParseKeyValueLog(stubLog);
+
+            // Regression (b) — bridge created the pipe but forgot to close
+            // the write-end. claude's read would BLOCK on an open empty pipe
+            // and the stub's 1-second timeout would fire.
+            Assert.Equal("eof", kv["read_state"]);
+            Assert.Equal("1", kv["rc"]);
+
+            // Regression (a) — bridge didn't redirect at all. claude would
+            // inherit the test process's fd 0; fd0_link could be /dev/null,
+            // a tty, or the test runner's pipe — none of which start with
+            // "pipe:" if the test was launched without an explicit stdin pipe.
+            // This assertion catches some forms of regression (a).
+            Assert.StartsWith("pipe:", kv["fd0_link"]);
+
+            // Deterministic regression (a) catcher: a fresh pipe created by
+            // .NET's Process.Start for the redirected stdin has a NEW inode,
+            // distinct from the test process's fd 0 inode. If the bridge
+            // failed to redirect, claude would inherit the test's fd 0 and
+            // the inodes would be EQUAL.
+            Assert.True(int.TryParse(kv["fd0_inode"], out var stubInode),
+                "Stub did not report a parseable fd 0 inode.");
+            Assert.NotEqual(testFd0Inode, stubInode);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Bridge.DrainPending lock contract (regression for commit 8152b99) ───────
+    //
+    // The bug being pinned: when the lock was narrowed to dequeue-only, two
+    // drainers (the stdin pump after acp_send, and the accept handler after
+    // the peer attaches) could overlap their SendText calls and deliver ACP
+    // frames out of enqueue order — e.g. session/new ahead of initialize.
+    // The fix holds _pendingLock for the ENTIRE dequeue + send loop.
+    //
+    // This fixture pre-queues many ACP frames before the peer connects, then
+    // feeds more from a background task while the peer-connect drain is in
+    // flight. Both drainers contend for the same lock; the test asserts that
+    // every frame arrives at the WebSocket peer in strict enqueue order. A
+    // regression that narrows the lock back to dequeue-only would interleave
+    // the SendText calls under contention — the assertion catches the
+    // resulting out-of-order frames.
+
+    [Fact]
+    public async Task Bridge_DrainPending_PreservesEnqueueOrderUnderConcurrentDrainers()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-drainorder-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            const int PreConnectFrames = 100;
+            const int PostConnectFrames = 100;
+            const int TotalFrames = PreConnectFrames + PostConnectFrames;
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var lockfile = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement;
+            var authToken = lockfile.GetProperty("authToken").GetString()!;
+
+            // Phase A: pre-queue PreConnectFrames acp_send envelopes BEFORE
+            // the peer connects. DrainPending is a no-op while _peerReady is
+            // false, so these accumulate in _pendingPayloads.
+            for (int i = 0; i < PreConnectFrames; i++)
+            {
+                await ctx.WriteStdinLineAsync(BuildSeqAcpSendEnvelope(i));
+            }
+
+            // Phase B: connect the peer. HandleClientAsync flips _peerReady=true
+            // and calls DrainPending, which begins sending the PreConnectFrames
+            // queued frames.
+            await ctx.ConnectWebSocketAsync(port, authToken);
+
+            // Phase C: feed PostConnectFrames MORE envelopes from a background
+            // task that races the peer-connect drain. The stdin pump processes
+            // them one at a time, and each enqueue triggers another DrainPending
+            // call from the stdin pump thread — concurrent with the accept
+            // handler's drain. With a properly-held _pendingLock the two
+            // drainers serialise and frames stay in enqueue order; a narrowed
+            // lock would let SendText calls overlap and reorder under load.
+            var feedTask = Task.Run(async () =>
+            {
+                for (int i = PreConnectFrames; i < TotalFrames; i++)
+                {
+                    await ctx.WriteStdinLineAsync(BuildSeqAcpSendEnvelope(i));
+                }
+            });
+
+            // Read all TotalFrames from the WS peer and verify strict ordering.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            var received = new List<int>(TotalFrames);
+            for (int i = 0; i < TotalFrames; i++)
+            {
+                var frame = await ctx.ReadWebSocketFrameAsync(cts.Token);
+                using var doc = JsonDocument.Parse(frame);
+                var seq = doc.RootElement.GetProperty("params").GetProperty("seq").GetInt32();
+                received.Add(seq);
+            }
+            await feedTask;
+
+            Assert.Equal(TotalFrames, received.Count);
+            for (int i = 0; i < TotalFrames; i++)
+            {
+                Assert.Equal(i, received[i]);
+            }
+
+            // Shut down the bridge cleanly.
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Bridge.Shutdown idempotence (regression for commit 8152b99) ─────────────
+    //
+    // The bug being pinned: a non-atomic shutdown flag could let multiple
+    // Shutdown callers (turn-deadline timer, posix signal, claude exited,
+    // peer closed, OnIncomingFrame stopReason / error) all run the cleanup
+    // body — emitting duplicate claude_exit envelopes, double-deleting the
+    // lockfile, and clobbering the first cause's exit code. The fix uses
+    // Interlocked.Exchange(ref _shutdownState, 1) so the first caller wins
+    // and all others are no-ops.
+    //
+    // The first fixture below is a direct sequential reflection test of the
+    // exit-code-stickiness contract that the Interlocked.Exchange guards.
+    // The second fixture drives two real Shutdown causes (claude exiting +
+    // TurnComplete frame arriving) through a live bridge and asserts the
+    // observable wire contract: claude_exit emitted exactly once, lockfile
+    // deleted, no fatal envelope leak.
+
+    [Fact]
+    public void Bridge_Shutdown_IsIdempotent_FirstExitCodeWinsAcrossRepeatCalls()
+    {
+        // Sequential test that pins the Interlocked.Exchange short-circuit.
+        // A regression that swaps Interlocked.Exchange for a plain
+        // `if (_shutdownState != 0) return; _shutdownState = 1;` would still
+        // pass this sequential fixture (both forms reject the second call),
+        // but a regression that drops the early-return entirely OR moves the
+        // `_exitCode = code` assignment ABOVE the guard would let later calls
+        // overwrite the first cause's exit code — and that IS caught here.
+        var bridge = new Bridge(new MemoryStream());
+        var shutdownMethod = typeof(Bridge).GetMethod("Shutdown",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var exitCodeField = typeof(Bridge).GetField("_exitCode",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var shutdownStateField = typeof(Bridge).GetField("_shutdownState",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        // First call wins, both the exit code and the shutdown-state flag are
+        // observed flipped.
+        shutdownMethod.Invoke(bridge, new object[] { 0 });
+        Assert.Equal(0, (int)exitCodeField.GetValue(bridge)!);
+        Assert.Equal(1, (int)shutdownStateField.GetValue(bridge)!);
+
+        // Subsequent calls must NOT overwrite _exitCode — they're no-ops.
+        shutdownMethod.Invoke(bridge, new object[] { 99 });
+        Assert.Equal(0, (int)exitCodeField.GetValue(bridge)!);
+        Assert.Equal(1, (int)shutdownStateField.GetValue(bridge)!);
+
+        shutdownMethod.Invoke(bridge, new object[] { 42 });
+        Assert.Equal(0, (int)exitCodeField.GetValue(bridge)!);
+    }
+
+    [Fact]
+    public async Task Bridge_Shutdown_ConcurrentCauses_ClaudeExitEmittedExactlyOnceAndLockfileGone()
+    {
+        // End-to-end fixture exercising two Shutdown causes back-to-back:
+        // a short-lived claude (0.5s sleep) AND a TurnComplete frame the test
+        // sends as soon as the peer connects. Whichever cause fires first
+        // wins and runs cleanup; the other observes ShutdownStarted and
+        // becomes a no-op (Interlocked.Exchange returns the prior 1). The
+        // observable wire contract: claude_exit emitted exactly once (the
+        // Process.Exited event runs once per process instance), lockfile
+        // deleted, bridge exits with code 0, no fatal envelope.
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-shutdown-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"0.5\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":30}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var lockfile = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement;
+            var authToken = lockfile.GetProperty("authToken").GetString()!;
+
+            await ctx.ConnectWebSocketAsync(port, authToken);
+            await ctx.WaitForEnvelopeAsync("peer_connected");
+
+            // Fire the TurnComplete frame immediately; the sleep stub will
+            // exit ~500 ms later (Exited handler fires → MaybeFinish →
+            // Shutdown). The two Shutdown triggers race; the idempotence
+            // contract is what keeps cleanup single-shot.
+            const string turnComplete =
+                "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"stopReason\":\"end_turn\"}}";
+            await ctx.SendWebSocketFrameAsync(turnComplete);
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+
+            // claude_exit may be emitted from the Process.Exited handler
+            // AFTER RunAsync returns (the event fires on .NET's monitor
+            // thread and is not awaited by Shutdown). Wait for it before
+            // counting, so we don't race with late delivery.
+            await ctx.WaitForEnvelopeAsync("claude_exit", TimeSpan.FromSeconds(10));
+
+            Assert.Equal(1, ctx.Stdout.CountByType("claude_exit"));
+            Assert.Equal(1, ctx.Stdout.CountByType("turn_complete"));
+            Assert.Equal(0, ctx.Stdout.CountByType("fatal"));
+            Assert.False(File.Exists(lockPath));
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Helpers for the new orchestration / regression fixtures above ───────────
+
+    private static string BuildSeqAcpSendEnvelope(int seq) =>
+        "{\"type\":\"acp_send\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":" + seq
+        + ",\"method\":\"seq/test\",\"params\":{\"seq\":" + seq + "}}}";
+
+    /// <summary>
+    /// Writes a bash stub at <paramref name="stubPath"/> that mirrors the
+    /// invocation contract claude --ide would honour: argv[0] is the literal
+    /// "--ide" flag the bridge always prepends, argv[1] is the desired sleep
+    /// duration in seconds (so the stub stays alive long enough for the test
+    /// to drive the WebSocket peer). Off-the-shelf `sleep` can't be used as a
+    /// long-lived stub because GNU sleep rejects the leading `--ide` arg and
+    /// exits ~immediately, racing the test's WebSocket connect.
+    /// </summary>
+    private static string WriteLongRunningClaudeStub(string tmpDir)
+    {
+        var stubPath = Path.Combine(tmpDir, "claude-sleep-stub.sh");
+        File.WriteAllText(stubPath,
+            "#!/bin/bash\n" +
+            "# argv[1] == \"--ide\" (the flag Bridge always prepends), argv[2] == duration.\n" +
+            "exec sleep \"${2:-30}\"\n");
+        File.SetUnixFileMode(stubPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return stubPath;
+    }
+
+    private static Dictionary<string, string> ParseKeyValueLog(string path)
+    {
+        var d = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var line in File.ReadAllLines(path))
+        {
+            var idx = line.IndexOf('=');
+            if (idx <= 0) continue;
+            d[line.Substring(0, idx)] = line.Substring(idx + 1);
+        }
+        return d;
+    }
+
+    private static int GetCurrentProcessStdinInodeViaSubprocess()
+    {
+        // Spawn `stat` WITHOUT redirecting stdin → subprocess inherits the
+        // test process's fd 0 → reports the test's stdin inode. We compare
+        // this against the bridge-spawned stub's reported fd 0 inode to
+        // determine whether RedirectStandardInput=true did its job.
+        var psi = new ProcessStartInfo("stat", "-L -c %i /proc/self/fd/0")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            // Explicitly NOT redirecting stdin so the child inherits ours.
+            RedirectStandardInput = false,
+            UseShellExecute = false,
+        };
+        using var p = Process.Start(psi)!;
+        var output = p.StandardOutput.ReadToEnd().Trim();
+        if (!p.WaitForExit(5000))
+            throw new TimeoutException("stat subprocess timed out");
+        if (!int.TryParse(output, out var inode))
+            throw new InvalidOperationException(
+                "Could not parse fd 0 inode from `stat` output: " + output);
+        return inode;
+    }
+
+    private static bool TryParseUnmaskedWebSocketFrame(List<byte> acc, out int opcode, out byte[] payload)
+    {
+        opcode = 0;
+        payload = Array.Empty<byte>();
+        if (acc.Count < 2) return false;
+        var b1 = acc[0];
+        var b2 = acc[1];
+        opcode = b1 & 0x0f;
+        bool masked = (b2 & 0x80) != 0;
+        long len = b2 & 0x7f;
+        int offset = 2;
+        if (len == 126)
+        {
+            if (acc.Count < 4) return false;
+            len = (acc[2] << 8) | acc[3];
+            offset = 4;
+        }
+        else if (len == 127)
+        {
+            if (acc.Count < 10) return false;
+            len = 0;
+            for (int i = 0; i < 8; i++) len = (len << 8) | acc[2 + i];
+            offset = 10;
+        }
+        int maskStart = -1;
+        if (masked)
+        {
+            if (acc.Count < offset + 4) return false;
+            maskStart = offset;
+            offset += 4;
+        }
+        if (acc.Count < offset + len) return false;
+        var raw = new byte[len];
+        for (long i = 0; i < len; i++) raw[i] = acc[offset + (int)i];
+        if (masked)
+        {
+            for (long i = 0; i < len; i++) raw[i] ^= acc[maskStart + (int)(i % 4)];
+        }
+        acc.RemoveRange(0, offset + (int)len);
+        payload = raw;
+        return true;
+    }
+
+    /// <summary>
+    /// In-process driver for end-to-end Bridge fixtures. Owns:
+    ///   - A System.IO.Pipelines.Pipe whose reader is wired into the bridge's
+    ///     test-seam stdin (so the test can write hello / acp_send / shutdown
+    ///     envelopes over time, not as one upfront blob).
+    ///   - A <see cref="LineCapturingStream"/> wired into the Emitter so the
+    ///     test can wait for / count envelopes the bridge wrote to stdout.
+    ///   - A TCP/WebSocket client that performs the RFC6455 handshake against
+    ///     the bridge's listener (using the auth token recovered from the
+    ///     lockfile) and lets the test send / receive ACP frames.
+    /// </summary>
+    private sealed class BridgeRunHandle : IAsyncDisposable
+    {
+        private readonly Pipe _stdinPipe = new();
+        private readonly LineCapturingStream _stdout = new();
+        private readonly IDisposable _emitterScope;
+        private readonly Bridge _bridge;
+        private readonly Task<int> _runTask;
+
+        private TcpClient? _wsClient;
+        private NetworkStream? _wsStream;
+        private readonly List<byte> _wsRecvBuffer = new();
+
+        public LineCapturingStream Stdout => _stdout;
+
+        public BridgeRunHandle()
+        {
+            _emitterScope = Emitter.OverrideStreamForTests(_stdout);
+            _bridge = new Bridge(_stdinPipe.Reader.AsStream(leaveOpen: true));
+            _runTask = Task.Run(() => _bridge.RunAsync());
+        }
+
+        public async Task WriteStdinLineAsync(string envelopeJson)
+        {
+            var bytes = Encoding.UTF8.GetBytes(envelopeJson + "\n");
+            await _stdinPipe.Writer.WriteAsync(bytes).ConfigureAwait(false);
+            await _stdinPipe.Writer.FlushAsync().ConfigureAwait(false);
+        }
+
+        public Task<JsonElement> WaitForEnvelopeAsync(string type,
+            TimeSpan? timeout = null, int startIndex = 0) =>
+            _stdout.WaitForEnvelopeAsync(type, timeout ?? TimeSpan.FromSeconds(15), startIndex);
+
+        public Task<int> WaitForExitAsync(TimeSpan timeout) =>
+            _runTask.WaitAsync(timeout);
+
+        public async Task ConnectWebSocketAsync(int port, string authToken,
+            TimeSpan? timeout = null, CancellationToken ct = default)
+        {
+            timeout ??= TimeSpan.FromSeconds(10);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout.Value);
+
+            _wsClient = new TcpClient();
+            await _wsClient.ConnectAsync(IPAddress.Loopback, port, cts.Token).ConfigureAwait(false);
+            _wsStream = _wsClient.GetStream();
+            var req = Encoding.ASCII.GetBytes(
+                "GET / HTTP/1.1\r\n" +
+                "Host: 127.0.0.1\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+                "Sec-WebSocket-Version: 13\r\n" +
+                "x-claude-code-ide-authorization: " + authToken + "\r\n\r\n");
+            await _wsStream.WriteAsync(req, cts.Token).ConfigureAwait(false);
+            await _wsStream.FlushAsync(cts.Token).ConfigureAwait(false);
+
+            // Drain response headers up to \r\n\r\n. Any bytes that follow
+            // (e.g. an immediately-sent text frame from the server) stay in
+            // _wsRecvBuffer for the next ReadWebSocketFrameAsync call.
+            var buf = new byte[4096];
+            while (true)
+            {
+                var n = await _wsStream.ReadAsync(buf.AsMemory(), cts.Token).ConfigureAwait(false);
+                if (n <= 0)
+                    throw new IOException("WS handshake response stream closed before headers ended.");
+                for (int i = 0; i < n; i++) _wsRecvBuffer.Add(buf[i]);
+                if (HasHeaderTerminator(_wsRecvBuffer, out var after))
+                {
+                    var statusLine = Encoding.ASCII.GetString(
+                        _wsRecvBuffer.ToArray(), 0, Math.Min(_wsRecvBuffer.Count, 256));
+                    if (!statusLine.StartsWith("HTTP/1.1 101"))
+                        throw new IOException("WS handshake did not return 101: " + statusLine);
+                    _wsRecvBuffer.RemoveRange(0, after);
+                    return;
+                }
+                if (_wsRecvBuffer.Count > 32 * 1024)
+                    throw new IOException("WS handshake response headers exceeded 32 KiB.");
+            }
+        }
+
+        public async Task SendWebSocketFrameAsync(string text,
+            CancellationToken ct = default)
+        {
+            if (_wsStream is null) throw new InvalidOperationException("WS not connected.");
+            var frame = BuildClientMaskedTextFrame(Encoding.UTF8.GetBytes(text));
+            await _wsStream.WriteAsync(frame, ct).ConfigureAwait(false);
+            await _wsStream.FlushAsync(ct).ConfigureAwait(false);
+        }
+
+        public Task<string> ReadWebSocketFrameAsync(TimeSpan timeout) =>
+            ReadWebSocketFrameAsync(new CancellationTokenSource(timeout).Token);
+
+        public async Task<string> ReadWebSocketFrameAsync(CancellationToken ct)
+        {
+            if (_wsStream is null) throw new InvalidOperationException("WS not connected.");
+            var buf = new byte[8192];
+            while (true)
+            {
+                if (TryParseUnmaskedWebSocketFrame(_wsRecvBuffer, out var op, out var payload))
+                {
+                    if (op == 0x1 || op == 0x2)
+                        return Encoding.UTF8.GetString(payload);
+                    if (op == 0x8)
+                        throw new EndOfStreamException("WS peer sent CLOSE frame.");
+                    // ignore ping / pong / continuation
+                    continue;
+                }
+                int n;
+                try { n = await _wsStream.ReadAsync(buf.AsMemory(), ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { throw new TimeoutException("WS read timed out."); }
+                if (n <= 0) throw new EndOfStreamException("WS stream EOF before a complete frame.");
+                for (int i = 0; i < n; i++) _wsRecvBuffer.Add(buf[i]);
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try { _wsStream?.Close(); } catch { }
+            try { _wsClient?.Dispose(); } catch { }
+            try { await _stdinPipe.Writer.CompleteAsync().ConfigureAwait(false); } catch { }
+            try { await _runTask.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
+            catch { }
+            try { _emitterScope.Dispose(); } catch { }
+            try { await _bridge.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Thread-safe stdout sink for end-to-end bridge fixtures: parses each
+    /// emitted line as a JSON envelope and exposes wait / count helpers.
+    /// </summary>
+    private sealed class LineCapturingStream : Stream
+    {
+        private readonly List<JsonElement> _envelopes = new();
+        private readonly StringBuilder _partial = new();
+        private readonly object _lock = new();
+        private readonly SemaphoreSlim _signal = new(0, int.MaxValue);
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) =>
+            throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            ProcessChunk(Encoding.UTF8.GetString(buffer, offset, count));
+
+        public override void Write(ReadOnlySpan<byte> buffer) =>
+            ProcessChunk(Encoding.UTF8.GetString(buffer));
+
+        public override void WriteByte(byte value) =>
+            ProcessChunk(((char)value).ToString());
+
+        private void ProcessChunk(string chunk)
+        {
+            int released = 0;
+            lock (_lock)
+            {
+                foreach (var c in chunk)
+                {
+                    if (c == '\n')
+                    {
+                        var line = _partial.ToString();
+                        _partial.Clear();
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            _envelopes.Add(doc.RootElement.Clone());
+                            released++;
+                        }
+                        catch (JsonException) { /* non-JSON line — emitter never produces these */ }
+                    }
+                    else _partial.Append(c);
+                }
+            }
+            for (int i = 0; i < released; i++) _signal.Release();
+        }
+
+        public int SnapshotCount()
+        {
+            lock (_lock) return _envelopes.Count;
+        }
+
+        public IReadOnlyList<JsonElement> Snapshot()
+        {
+            lock (_lock) return _envelopes.ToList();
+        }
+
+        public int CountByType(string type)
+        {
+            lock (_lock)
+            {
+                int n = 0;
+                foreach (var e in _envelopes)
+                {
+                    if (e.TryGetProperty("type", out var t)
+                        && t.ValueKind == JsonValueKind.String
+                        && string.Equals(t.GetString(), type, StringComparison.Ordinal))
+                        n++;
+                }
+                return n;
+            }
+        }
+
+        public async Task<JsonElement> WaitForEnvelopeAsync(string type, TimeSpan timeout, int startIndex)
+        {
+            var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+            while (true)
+            {
+                lock (_lock)
+                {
+                    for (int i = startIndex; i < _envelopes.Count; i++)
+                    {
+                        if (_envelopes[i].TryGetProperty("type", out var t)
+                            && t.ValueKind == JsonValueKind.String
+                            && string.Equals(t.GetString(), type, StringComparison.Ordinal))
+                            return _envelopes[i];
+                    }
+                }
+                var remainingMs = deadline - Environment.TickCount64;
+                if (remainingMs <= 0)
+                {
+                    string typesSeen;
+                    lock (_lock)
+                    {
+                        typesSeen = string.Join(",", _envelopes
+                            .Select(e => e.TryGetProperty("type", out var t)
+                                ? t.GetString() ?? "?"
+                                : "?"));
+                    }
+                    throw new TimeoutException(
+                        $"Timed out waiting for envelope type '{type}'. Captured: [{typesSeen}]");
+                }
+                await _signal.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(remainingMs, 250)))
+                    .ConfigureAwait(false);
+            }
+        }
     }
 }
