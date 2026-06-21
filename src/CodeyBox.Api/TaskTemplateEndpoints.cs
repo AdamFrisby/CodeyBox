@@ -146,7 +146,8 @@ internal static class TaskTemplateEndpoints
                     Priority: onYes.Priority,
                     Agent: onYes.Agent,
                     AgentClassId: onYes.AgentClassId,
-                    DependsOn: onYes.DependsOn),
+                    DependsOn: onYes.DependsOn,
+                    Knobs: onYes.Knobs),
                 ActionableAnswer: entry.ActionableAnswer,
                 Mode: entry.Mode));
     }

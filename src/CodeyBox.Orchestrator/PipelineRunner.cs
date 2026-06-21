@@ -4439,6 +4439,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             MinModelScore = minScore,
             OriginCheckWorkItemId = checkItem.Id,
             JobType = JobType.Normal,
+            Knobs = onYes.Knobs,
         };
 
         try

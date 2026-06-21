@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
+using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Orchestrator.Knobs;
@@ -287,21 +288,24 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
-    public async Task Create_KnobsMapExceedsEntryCap_Returns400WithCapMessage()
+    public void NormaliseKnobs_DelegatesEntryCountAndValueLengthToDescriptors()
     {
+        var descriptors = Enumerable.Range(0, 40)
+            .Select(i => new DescriptorLocalStringKnob($"freeForm{i}"))
+            .Cast<IKnob>()
+            .ToArray();
+        var registry = new KnobRegistry(descriptors);
+        var longValue = new string('v', 4096);
         var knobs = new Dictionary<string, string>();
-        for (var i = 0; i < 33; i++)
-            knobs[$"k{i}"] = "v";
-        var resp = await _client.PostAsJsonAsync("/workitems", new
-        {
-            projectId = "test-project",
-            title = "too many",
-            prompt = "p",
-            knobs,
-        });
-        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
-        var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("at most 32 entries", body);
+        for (var i = 0; i < 40; i++)
+            knobs[$"freeForm{i}"] = i == 0 ? longValue : $"value-{i}";
+
+        var (normalised, error) = WorkItemCreationService.NormaliseKnobs(knobs, registry);
+
+        Assert.Null(error);
+        Assert.NotNull(normalised);
+        Assert.Equal(40, normalised!.Count);
+        Assert.Equal(longValue, normalised["freeForm0"]);
     }
 
     [Fact]
@@ -332,7 +336,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("exceeds 64 chars", body);
+        Assert.Contains("unknown knob", body);
     }
 
     [Fact]
@@ -348,7 +352,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("exceeds 128 chars", body);
+        Assert.Contains("not allowed", body);
     }
 
     [Fact]
@@ -383,7 +387,7 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("control characters", body);
+        Assert.Contains("unknown knob", body);
     }
 
     [Fact]
@@ -398,7 +402,29 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         });
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         var body = await resp.Content.ReadAsStringAsync();
-        Assert.Contains("control characters", body);
+        Assert.Contains("not allowed", body);
+    }
+
+    [Fact]
+    public async Task Patch_PromptWithInvalidKnobs_Returns400WithoutPersistingPrompt()
+    {
+        var created = await CreatePlainQueuedItemAsync("atomic patch");
+
+        var patch = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created.Id}")
+        {
+            Content = JsonContent.Create(new
+            {
+                prompt = "mutated prompt",
+                knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = "yolo" },
+            }),
+        };
+        var resp = await _client.SendAsync(patch);
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal("p", stored!.Prompt);
+        Assert.Equal(1, stored.PromptRevision);
     }
 
     [Fact]
@@ -432,9 +458,8 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     [Fact]
     public async Task Patch_KnobsReplacesMap_PersistsToStore()
     {
-        // Confirms the second UPDATE path (TryUpdateIfStateAsync) actually
-        // writes knobs_json — the in-memory response could mask a missing
-        // column in the column list.
+        // Confirms the queued-field UPDATE path actually writes knobs_json —
+        // the in-memory response could mask a missing column in the column list.
         var create = await _client.PostAsJsonAsync("/workitems", new
         {
             projectId = "test-project",
@@ -457,6 +482,30 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
         Assert.NotNull(stored);
         Assert.Equal(ChangeScopeKnob.ValueRefactor, stored!.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_TitleOnly_PreservesExistingKnobs()
+    {
+        var create = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "patch title only",
+            prompt = "p",
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var patch = new HttpRequestMessage(HttpMethod.Patch, $"/workitems/{created!.Id}")
+        {
+            Content = JsonContent.Create(new { title = "patched title" }),
+        };
+        var resp = await _client.SendAsync(patch);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, stored!.Knobs[ChangeScopeKnob.KeyName]);
     }
 
     [Fact]
@@ -542,6 +591,15 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     {
         [JsonPropertyName("id")] public string Id { get; init; } = string.Empty;
         [JsonPropertyName("knobs")] public IReadOnlyDictionary<string, string>? Knobs { get; init; }
+    }
+
+    private sealed class DescriptorLocalStringKnob(string key) : IKnob
+    {
+        public string Key { get; } = key;
+        public string Description => $"descriptor-local string knob {Key}";
+        public IReadOnlyList<string> AllowedValues => [];
+        public string DefaultValue => "default";
+        public string? GetWorkPromptFragment(string value) => null;
     }
 
     private sealed class NoopSandbox : ISandbox

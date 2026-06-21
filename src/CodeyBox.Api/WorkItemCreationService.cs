@@ -334,6 +334,14 @@ internal sealed class WorkItemCreationService
                 return Error("check.onYes.agentClassId must be <= 200 chars");
             if (onYes.DependsOn is { Length: > 100 })
                 return Error("check.onYes.dependsOn must contain at most 100 entries");
+            IReadOnlyDictionary<string, string> onYesKnobs = EmptyKnobs;
+            if (onYes.Knobs is { Count: > 0 })
+            {
+                var (normalisedOnYesKnobs, onYesKnobErr) = NormaliseKnobs(onYes.Knobs, _knobs);
+                if (onYesKnobErr is not null)
+                    return new PreparedWorkItemCreationResult(null, onYesKnobErr);
+                onYesKnobs = normalisedOnYesKnobs!;
+            }
 
             checkSpec = new CheckAndActSpec
             {
@@ -351,6 +359,7 @@ internal sealed class WorkItemCreationService
                     DependsOn = onYes.DependsOn is null
                         ? null
                         : onYes.DependsOn.Where(d => !string.IsNullOrWhiteSpace(d)).Select(d => d.Trim()).ToList(),
+                    Knobs = onYesKnobs,
                 },
             };
             jobType = JobType.CheckAndAct;
@@ -506,10 +515,6 @@ internal sealed class WorkItemCreationService
                 Results.BadRequest(new { error = message }));
     }
 
-    private const int MaxKnobEntries = 32;
-    private const int MaxKnobKeyLength = 64;
-    private const int MaxKnobValueLength = 128;
-
     private static readonly IReadOnlyDictionary<string, string> EmptyKnobs
         = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -517,43 +522,10 @@ internal sealed class WorkItemCreationService
         IReadOnlyDictionary<string, string> raw,
         IKnobRegistry registry)
     {
-        if (raw.Count > MaxKnobEntries)
-            return (null, Results.BadRequest(new
-            {
-                error = $"knobs may contain at most {MaxKnobEntries} entries",
-            }));
-
         var normalised = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (rawKey, rawValue) in raw)
         {
-            if (string.IsNullOrWhiteSpace(rawKey))
-                return (null, Results.BadRequest(new { error = "knob key must not be empty" }));
-            if (rawValue is null)
-                return (null, Results.BadRequest(new { error = $"knob '{rawKey}' value must not be null" }));
-            if (rawKey.Length > MaxKnobKeyLength)
-                return (null, Results.BadRequest(new
-                {
-                    error = $"knob key '{rawKey}' exceeds {MaxKnobKeyLength} chars",
-                }));
-            if (rawValue.Length > MaxKnobValueLength)
-                return (null, Results.BadRequest(new
-                {
-                    error = $"knob '{rawKey}' value exceeds {MaxKnobValueLength} chars",
-                }));
-            if (rawKey.Any(char.IsControl))
-                return (null, Results.BadRequest(new
-                {
-                    error = "knob keys must not contain control characters",
-                }));
-            if (rawValue.Any(char.IsControl))
-                return (null, Results.BadRequest(new
-                {
-                    error = $"knob '{rawKey}' value must not contain control characters",
-                }));
-
-            var key = rawKey.Trim();
-            var value = rawValue.Trim();
-            var verdict = registry.Normalize(key, value);
+            var verdict = registry.Normalize(rawKey, rawValue!);
             if (!verdict.Ok)
                 return (null, Results.BadRequest(new { error = verdict.Error }));
             normalised[verdict.Key!] = verdict.Value!;

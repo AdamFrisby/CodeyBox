@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator.Knobs;
 
 namespace CodeyBox.Tests;
 
@@ -46,6 +47,10 @@ public sealed class CheckAndActApiTests : IDisposable
                     prompt = "Remediate all SQL string interpolation.",
                     minModelScore = 50,
                     priority = 100,
+                    knobs = new Dictionary<string, string>
+                    {
+                        [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+                    },
                 },
                 mode = "completion",
             },
@@ -71,6 +76,7 @@ public sealed class CheckAndActApiTests : IDisposable
         Assert.Equal(CheckAndActModes.Completion, stored.Check.Mode);
         Assert.Equal(100, stored.Check.OnYes.Priority);
         Assert.Equal(50, stored.Check.OnYes.MinModelScore);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, stored.Check.OnYes.Knobs[ChangeScopeKnob.KeyName]);
     }
 
     [Fact]

@@ -1116,6 +1116,34 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public void Knobs_UnknownProjectClear_IsRejectedAtConfigLoad()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScpoe"] = "" },
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("unknown knob 'changeScpoe'", ex.Message);
+    }
+
+    [Fact]
     public void Knobs_WhitespaceKeyInProject_IsRejected()
     {
         var opts = new ProjectsOptions
@@ -1243,6 +1271,33 @@ public sealed class ProjectRepositoryTests
             presetCatalogOptions: null,
             ProjectKnobRegistry);
         var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+        Assert.Equal("foo", p.Knobs["otherKnob"]);
+    }
+
+    [Fact]
+    public async Task Knobs_ConfigBuilderBinding_FlowsThroughDefaultsAndProjectOverrides()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Defaults:Knobs:changeScope"] = "surgical",
+                ["CodeyBox:Defaults:Knobs:otherKnob"] = "foo",
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Knobs:changeScope"] = "refactor",
+            })
+            .Build();
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
+
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.NotNull(p);
         Assert.Equal("refactor", p!.Knobs["changeScope"]);
         Assert.Equal("foo", p.Knobs["otherKnob"]);
     }

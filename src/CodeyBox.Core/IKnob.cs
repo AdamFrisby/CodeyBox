@@ -232,11 +232,12 @@ internal static class KnobValueParsers
         if (string.IsNullOrWhiteSpace(value))
             return KnobValueParseResult.Fail($"knob '{knob.Key}' value must not be empty");
 
+        var trimmed = value.Trim();
         if (knob.AllowedValues.Count > 0)
         {
             foreach (var allowed in knob.AllowedValues)
             {
-                if (string.Equals(allowed, value, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(allowed, trimmed, StringComparison.OrdinalIgnoreCase))
                     return KnobValueParseResult.Success(allowed, allowed);
             }
 
@@ -245,7 +246,6 @@ internal static class KnobValueParsers
                 $"{string.Join(", ", knob.AllowedValues)}");
         }
 
-        var trimmed = value.Trim();
         return knob.ValueType switch
         {
             KnobValueType.String => KnobValueParseResult.Success(trimmed, trimmed),
@@ -261,12 +261,27 @@ internal static class KnobValueParsers
                 : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be an integer"),
             KnobValueType.Decimal => decimal.TryParse(
                     trimmed,
-                    System.Globalization.NumberStyles.Number,
+                    System.Globalization.NumberStyles.AllowLeadingSign |
+                    System.Globalization.NumberStyles.AllowDecimalPoint,
                     System.Globalization.CultureInfo.InvariantCulture,
                     out var d)
                 ? KnobValueParseResult.Success(d.ToString(System.Globalization.CultureInfo.InvariantCulture), d)
                 : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be a decimal number"),
+            KnobValueType.Json => ParseJson(knob, trimmed, value),
             _ => KnobValueParseResult.Success(trimmed, trimmed),
         };
+    }
+
+    private static KnobValueParseResult ParseJson(IKnob knob, string trimmed, string original)
+    {
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(trimmed);
+            return KnobValueParseResult.Success(trimmed, document.RootElement.Clone());
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return KnobValueParseResult.Fail($"knob '{knob.Key}' value '{original}' must be valid JSON");
+        }
     }
 }

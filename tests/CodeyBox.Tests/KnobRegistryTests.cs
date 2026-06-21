@@ -101,6 +101,28 @@ public sealed class KnobRegistryTests
     }
 
     [Fact]
+    public void Normalize_EnumValuesAreTrimmedByRegistryParser()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("changeScope", "moderate", ["surgical", "moderate"])]);
+
+        var result = registry.Normalize("changeScope", " surgical ");
+
+        Assert.True(result.Ok);
+        Assert.Equal("surgical", result.Value);
+    }
+
+    [Fact]
+    public void Normalize_NullValue_IsRejected()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
+
+        var result = registry.Normalize("shape", null!);
+
+        Assert.False(result.Ok);
+        Assert.Contains("must not be null", result.Error);
+    }
+
+    [Fact]
     public void ValidateAll_NullOrEmptyMap_Succeeds()
     {
         var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
@@ -142,6 +164,63 @@ public sealed class KnobRegistryTests
     }
 
     [Fact]
+    public void BooleanParser_RejectsInvalidValue()
+    {
+        var registry = new KnobRegistry([new TestBooleanKnob("strict", defaultValue: false)]);
+
+        var result = registry.Validate("strict", "yes");
+
+        Assert.False(result.Ok);
+        Assert.Contains("true or false", result.Error);
+    }
+
+    [Fact]
+    public void IntegerParser_CanonicalisesInvariantInteger_AndRejectsNonInteger()
+    {
+        var registry = new KnobRegistry([new TestBuiltInKnob("limit", "0", KnobValueType.Integer, typeof(long))]);
+
+        var ok = registry.Normalize("limit", " 42 ");
+        var bad = registry.Validate("limit", "4.2");
+
+        Assert.True(ok.Ok);
+        Assert.Equal("42", ok.Value);
+        Assert.Equal(42L, ok.TypedValue);
+        Assert.False(bad.Ok);
+        Assert.Contains("integer", bad.Error);
+    }
+
+    [Fact]
+    public void DecimalParser_CanonicalisesInvariantDecimal_AndRejectsCommaDecimal()
+    {
+        var registry = new KnobRegistry([new TestBuiltInKnob("ratio", "0", KnobValueType.Decimal, typeof(decimal))]);
+
+        var ok = registry.Normalize("ratio", " 1.25 ");
+        var bad = registry.Validate("ratio", "1,25");
+
+        Assert.True(ok.Ok);
+        Assert.Equal("1.25", ok.Value);
+        Assert.Equal(1.25m, ok.TypedValue);
+        Assert.False(bad.Ok);
+        Assert.Contains("decimal", bad.Error);
+    }
+
+    [Fact]
+    public void JsonParser_ValidatesJson_AndReturnsJsonElement()
+    {
+        var registry = new KnobRegistry([new TestBuiltInKnob("payload", "{}", KnobValueType.Json, typeof(System.Text.Json.JsonElement))]);
+
+        var ok = registry.Normalize("payload", """{ "enabled": true }""");
+        var bad = registry.Validate("payload", "not-json");
+
+        Assert.True(ok.Ok);
+        Assert.Equal("""{ "enabled": true }""", ok.Value);
+        var element = Assert.IsType<System.Text.Json.JsonElement>(ok.TypedValue);
+        Assert.True(element.GetProperty("enabled").GetBoolean());
+        Assert.False(bad.Ok);
+        Assert.Contains("valid JSON", bad.Error);
+    }
+
+    [Fact]
     public void DuplicateKnobKey_ThrowsAtRegistryConstruction()
     {
         Assert.Throws<InvalidOperationException>(() => new KnobRegistry(
@@ -155,6 +234,16 @@ public sealed class KnobRegistryTests
     public void NullDescriptor_ThrowsAtRegistryConstruction()
     {
         Assert.Throws<ArgumentNullException>(() => new KnobRegistry([null!]));
+    }
+
+    [Fact]
+    public void EmptyAllowedValuesEntry_ThrowsAtRegistryConstruction()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => new KnobRegistry(
+        [
+            new TestEnumKnob("shape", "round", ["round", " "]),
+        ]));
+        Assert.Contains("empty AllowedValues entry", ex.Message);
     }
 
     [Theory]
@@ -274,6 +363,25 @@ public sealed class KnobRegistryTests
         public string Description => $"test bool knob '{Key}'";
         public KnobValueType ValueType => KnobValueType.Boolean;
         public Type ClrType => typeof(bool);
+        public IReadOnlyList<string> AllowedValues => [];
+        public string DefaultValue { get; }
+        public string? GetWorkPromptFragment(string value) => null;
+    }
+
+    private sealed class TestBuiltInKnob : IKnob
+    {
+        public TestBuiltInKnob(string key, string defaultValue, KnobValueType valueType, Type clrType)
+        {
+            Key = key;
+            DefaultValue = defaultValue;
+            ValueType = valueType;
+            ClrType = clrType;
+        }
+
+        public string Key { get; }
+        public string Description => $"test {ValueType} knob '{Key}'";
+        public KnobValueType ValueType { get; }
+        public Type ClrType { get; }
         public IReadOnlyList<string> AllowedValues => [];
         public string DefaultValue { get; }
         public string? GetWorkPromptFragment(string value) => null;

@@ -28,6 +28,7 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
 {
     private readonly IKnobRegistry _registry;
     private readonly IWorkItemStore _store;
+    private readonly ILogger<KnobWorkPromptPreprocessor> _log;
 
     public KnobWorkPromptPreprocessor(
         IKnobRegistry registry,
@@ -43,6 +44,7 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
     {
         _registry = registry;
         _store = store;
+        _log = log;
     }
 
     public int Order => AgentPromptPreprocessorOrder.BuiltInLast;
@@ -55,9 +57,16 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
             return prompt;
 
         var item = await _store.GetAsync(ctx.ItemId, ct).ConfigureAwait(false);
-        var itemKnobs = item?.Knobs;
+        if (item is null)
+        {
+            _log.LogError(
+                "Work item {WorkItemId} was not found while applying knob prompt directives",
+                ctx.ItemId);
+            throw new InvalidOperationException(
+                $"Work item '{ctx.ItemId}' was not found while applying knob prompt directives.");
+        }
 
-        var effective = _registry.Resolve(itemKnobs, ctx.Project.Knobs);
+        var effective = _registry.Resolve(item.Knobs, ctx.Project.Knobs);
         var fragments = new List<(string Key, string Value, string Fragment)>();
         foreach (var knob in _registry.All)
         {

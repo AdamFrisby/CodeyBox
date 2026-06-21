@@ -94,6 +94,13 @@ public sealed record OnYesActionSpec
     /// at enqueue time against items in the same project).
     /// </summary>
     public IReadOnlyList<string>? DependsOn { get; init; }
+
+    /// <summary>
+    /// Optional per-item knob overrides for the generated follow-up work item.
+    /// Values are validated when the check item is created.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Knobs { get; init; }
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 }
 
 /// <summary>

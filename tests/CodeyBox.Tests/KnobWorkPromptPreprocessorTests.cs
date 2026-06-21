@@ -216,6 +216,19 @@ public sealed class KnobWorkPromptPreprocessorTests
     }
 
     [Fact]
+    public async Task MissingWorkItem_FailsClosedInsteadOfDroppingItemKnobs()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem());
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => preprocessor.ProcessAsync(NewContext(WorkItemId.New(), AgentPromptPhase.Work), "prompt"));
+
+        Assert.Contains("was not found", ex.Message);
+    }
+
+    [Fact]
     public async Task FreeFormPromptFragment_WithoutSafetyOptIn_Throws()
     {
         var registry = new KnobRegistry([new UnsafeFreeFormKnob()]);
@@ -229,6 +242,22 @@ public sealed class KnobWorkPromptPreprocessorTests
             () => preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Work), "prompt"));
 
         Assert.Contains("must declare finite AllowedValues", ex.Message);
+    }
+
+    [Fact]
+    public async Task FreeFormPromptFragment_WithSafetyOptIn_AppendsFragment()
+    {
+        var registry = new KnobRegistry([new SafeFreeFormKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [SafeFreeFormKnob.KeyName] = "operator text",
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Work), "prompt");
+
+        Assert.Contains("safe free-form value: operator text", result);
+        Assert.Contains("safeFreeForm=operator text", result);
     }
 
     [Fact]
@@ -312,6 +341,18 @@ public sealed class KnobWorkPromptPreprocessorTests
         public IReadOnlyList<string> AllowedValues => [];
         public string DefaultValue => "default";
         public string? GetWorkPromptFragment(string value) => $"raw value: {value}";
+    }
+
+    private sealed class SafeFreeFormKnob : IKnob
+    {
+        public const string KeyName = "safeFreeForm";
+
+        public string Key => KeyName;
+        public string Description => "safe free-form prompt knob";
+        public IReadOnlyList<string> AllowedValues => [];
+        public string DefaultValue => "default";
+        public bool AllowsFreeFormPromptFragments => true;
+        public string? GetWorkPromptFragment(string value) => $"safe free-form value: {value}";
     }
 
     private sealed class NoopSandbox : ISandbox

@@ -1121,8 +1121,17 @@ internal static class WorkItemEndpoints
             newDependsOn = ids;
         }
 
+        IReadOnlyDictionary<string, string>? normalisedPatchKnobs = null;
+        if (body.Knobs is { } patchKnobs)
+        {
+            var (normalisedKnobs, knobErr) = WorkItemCreationService.NormaliseKnobs(patchKnobs, knobs);
+            if (knobErr is not null) return knobErr;
+            normalisedPatchKnobs = normalisedKnobs!;
+        }
+
         var updated = item!;
         var now = DateTimeOffset.UtcNow;
+        var queuedUpdateExpectedUpdatedAt = item!.UpdatedAt;
 
         if (body.Title is not null)
         {
@@ -1153,6 +1162,7 @@ internal static class WorkItemEndpoints
                 PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
                 UpdatedAt = now,
             };
+            queuedUpdateExpectedUpdatedAt = now;
         }
 
         if (body.Agent is not null)
@@ -1179,11 +1189,9 @@ internal static class WorkItemEndpoints
             updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
         }
 
-        if (body.Knobs is { } patchKnobs)
+        if (normalisedPatchKnobs is not null)
         {
-            var (normalisedKnobs, knobErr) = WorkItemCreationService.NormaliseKnobs(patchKnobs, knobs);
-            if (knobErr is not null) return knobErr;
-            updated = updated with { Knobs = normalisedKnobs!, UpdatedAt = now };
+            updated = updated with { Knobs = normalisedPatchKnobs, UpdatedAt = now };
         }
 
         if (body.AuditMaxIterations is { } auditMaxIterations)
@@ -1220,11 +1228,15 @@ internal static class WorkItemEndpoints
                     AuditComplexity = item!.AuditComplexity,
                 }
                 : updated;
-            // TryUpdateIfStateAsync guards against a race where the orchestrator picks
-            // up the item between the GetAsync above and this write.
-            var written = await store.TryUpdateIfStateAsync(queuedUpdate, WorkItemState.Queued, ct);
+            // Guard state and updated_at so queued edits cannot be written over
+            // a concurrent pickup or another accepted queued-field patch.
+            var written = await store.TryUpdateIfStateAndUpdatedAtAsync(
+                queuedUpdate,
+                WorkItemState.Queued,
+                queuedUpdateExpectedUpdatedAt,
+                ct);
             if (!written)
-                return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
+                return Results.Conflict(new { error = "item changed before the queued-field update could be written" });
         }
         if (auditBudgetPatch)
         {
@@ -2365,7 +2377,8 @@ public sealed record OnYesActionRequest(
     int? Priority = null,
     string? Agent = null,
     string? AgentClassId = null,
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 public sealed record AgentControlRequest(
     string Action,

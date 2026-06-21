@@ -36,7 +36,8 @@ internal sealed record TaskTemplateOnYesAction(
     int? Priority = null,
     string? Agent = null,
     string? AgentClassId = null,
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 internal class TaskTemplateLoadException : Exception
 {
