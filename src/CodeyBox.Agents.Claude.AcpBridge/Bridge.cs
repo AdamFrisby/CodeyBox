@@ -420,7 +420,15 @@ internal sealed class Bridge : IAsyncDisposable
         {
             WorkingDirectory = _config.WorkingDirectory,
             UseShellExecute = false,
-            RedirectStandardInput = false,
+            // MUST be true: with RedirectStandardInput = false on Linux, .NET's
+            // Process.Start lets the child inherit the parent's fd 0. The
+            // bridge's own fd 0 is the host envelope pipe (sandbox.ExecAsync's
+            // stdin) — sharing it with claude --ide would race the bridge's
+            // ReadStdinAsync loop for hello/acp_send bytes. The JS bridge
+            // pinned `stdio: ['ignore', 'pipe', 'pipe']` to give claude
+            // /dev/null; we close StandardInput immediately after Start to
+            // give claude EOF on its stdin, which is the equivalent.
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
@@ -443,6 +451,11 @@ internal sealed class Bridge : IAsyncDisposable
             Fatal("claude_spawn_failed", "Process.Start returned null");
             return;
         }
+
+        // Close claude's stdin pipe NOW so it sees EOF and can't race the
+        // bridge's stdin reader for host envelope bytes. See the
+        // RedirectStandardInput = true comment above.
+        try { _claudeProcess.StandardInput.Close(); } catch { }
 
         // Capture the process locally so the Exited handler can't NRE if a
         // future shutdown path nulls the field. Subscribe BEFORE flipping
