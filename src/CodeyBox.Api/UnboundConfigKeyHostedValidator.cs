@@ -2,7 +2,7 @@ using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
-using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Configuration;
 
 namespace CodeyBox.Api;
 
@@ -97,35 +97,63 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
             ["CodeyBox:Plugins"] = new(typeof(PluginOptions), AllowsExtensionKeys: true),
         };
 
+    private const string KnobsSectionPath = "CodeyBox:ConfigValidation:UnboundKeys";
+
     private readonly IConfiguration _config;
-    private readonly IOptions<CodeyBoxOptions> _options;
     private readonly ILogger<UnboundConfigKeyHostedValidator> _log;
 
     public UnboundConfigKeyHostedValidator(
         IConfiguration config,
-        IOptions<CodeyBoxOptions> options,
         ILogger<UnboundConfigKeyHostedValidator> log)
     {
         _config = config;
-        _options = options;
         _log = log;
     }
 
     public Task StartAsync(CancellationToken ct)
     {
-        var knobs = _options.Value.ConfigValidation.UnboundKeys;
-        if (!knobs.Enabled)
+        // Read the knobs directly from IConfiguration rather than via
+        // IOptions&lt;CodeyBoxOptions&gt;.Value: resolving the bound options
+        // would force every registered IValidateOptions&lt;CodeyBoxOptions&gt;
+        // to run first, so an unrelated validator failure (or a typo that
+        // ALSO trips a downstream typed validator — the common shape) would
+        // swallow this report before it could surface. Tying this validator
+        // to live config keeps it independent of the rest of the typed
+        // options graph.
+        var knobs = _config.GetSection(KnobsSectionPath);
+        var enabled = GetBool(knobs, "Enabled", defaultValue: true);
+        if (!enabled)
             return Task.CompletedTask;
 
-        var reports = Inspect(_config, knobs.AdditionalExemptPaths);
+        var mode = knobs["Mode"];
+        var additionalExempt = knobs
+            .GetSection("AdditionalExemptPaths")
+            .GetChildren()
+            .Select(c => c.Value)
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Select(v => v!.Trim())
+            .ToArray();
+
+        var reports = Inspect(_config, additionalExempt);
         if (reports.Count == 0)
             return Task.CompletedTask;
 
-        var summary = BuildSummary(reports);
-        if (string.Equals(knobs.Mode, "warn", StringComparison.OrdinalIgnoreCase))
+        var summary = UnboundConfigKeyInspector.FormatReports(reports);
+        if (IsWarnMode(mode))
         {
             _log.LogWarning("Unbound CodeyBox configuration keys detected: {Reports}", summary);
             return Task.CompletedTask;
+        }
+
+        if (!IsStrictMode(mode))
+        {
+            // Don't silently fall through to strict — operators who typo
+            // "warning"/"loose"/"off" need to see the rejected value, not
+            // discover it via a startup throw they did not expect.
+            _log.LogWarning(
+                "Unknown CodeyBox:ConfigValidation:UnboundKeys:Mode value '{Mode}'. " +
+                "Expected 'strict' or 'warn'; treating as 'strict'.",
+                mode);
         }
 
         throw new InvalidOperationException(
@@ -136,6 +164,21 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
     }
 
     public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+
+    private static bool GetBool(IConfiguration section, string key, bool defaultValue)
+    {
+        var raw = section[key];
+        if (string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+        return bool.TryParse(raw, out var parsed) ? parsed : defaultValue;
+    }
+
+    private static bool IsWarnMode(string? mode) =>
+        string.Equals(mode, "warn", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsStrictMode(string? mode) =>
+        string.IsNullOrWhiteSpace(mode)
+        || string.Equals(mode, "strict", StringComparison.OrdinalIgnoreCase);
 
     internal static IReadOnlyList<UnboundConfigKeyReport> Inspect(
         IConfiguration config,
@@ -157,7 +200,4 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
             exempt,
             DefaultExternalBindings);
     }
-
-    private static string BuildSummary(IReadOnlyList<UnboundConfigKeyReport> reports)
-        => UnboundConfigKeyInspector.FormatReports(reports);
 }

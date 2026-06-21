@@ -328,15 +328,22 @@ public static class UnboundConfigKeyInspector
 
     private static IEnumerable<KeyValuePair<string, PropertyInfo>> BuildPropertyMap(Type type)
     {
-        // BindingFlags mirrors ConfigurationBinder's: only public instance
-        // properties that have a public/internal setter are bound. We don't
-        // need to filter on setter accessibility here because we only consume
-        // the property name — the goal is "does any property accept this key?".
+        // Mirror ConfigurationBinder's bindability rule. The binder writes
+        // scalar/POCO values via a public/internal setter, and mutates the
+        // existing instance in-place for IDictionary&lt;,&gt; / IList&lt;&gt; /
+        // ICollection&lt;&gt; properties — even when those have no setter at
+        // all. A get-only computed property of a non-collection type
+        // (e.g. <c>public TimeSpan Budget => …</c>) is NOT bindable; if
+        // registered here it would mask the very silent-no-op this feature
+        // exists to catch.
         var props = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
         foreach (var prop in props)
         {
             // Indexer properties are not bindable by name.
             if (prop.GetIndexParameters().Length > 0)
+                continue;
+
+            if (!IsBindableProperty(prop))
                 continue;
 
             var keyAlias = prop
@@ -346,6 +353,28 @@ public static class UnboundConfigKeyInspector
                 string.IsNullOrEmpty(keyAlias) ? prop.Name : keyAlias,
                 prop);
         }
+    }
+
+    private static bool IsBindableProperty(PropertyInfo prop)
+    {
+        var setter = prop.SetMethod;
+        if (setter is not null && (setter.IsPublic || setter.IsAssembly))
+            return true;
+
+        // No accessible setter: the binder still binds when the existing
+        // instance is mutable in-place. That covers IDictionary&lt;,&gt; /
+        // IReadOnlyDictionary&lt;,&gt; (the binder calls Add) and
+        // IList&lt;&gt; / ICollection&lt;&gt; / arrays-as-IEnumerable&lt;&gt;
+        // (the binder Adds elements). Scalar/POCO get-only properties fall
+        // through and are dropped.
+        var underlying = Nullable.GetUnderlyingType(prop.PropertyType) ?? prop.PropertyType;
+        if (IsLeaf(underlying))
+            return false;
+        if (TryGetDictionaryValueType(underlying, out _))
+            return true;
+        if (TryGetEnumerableElementType(underlying, out _))
+            return true;
+        return false;
     }
 
     private static bool IsLeaf(Type type)
@@ -433,18 +462,22 @@ public static class UnboundConfigKeyInspector
 
     private static string? NearestPropertyName(string key, IEnumerable<string> candidates)
     {
-        const int maxDistance = 3;
+        // Cap at 64 chars per side to keep the DP table tiny even on bizarre
+        // operator keys.
+        var trimmedKey = key.Length > 64 ? key[..64] : key;
         string? best = null;
         var bestDistance = int.MaxValue;
         foreach (var candidate in candidates)
         {
-            // Strict prefix/contains favourite stays a hint, but distance
-            // wins overall. Cap at 64 chars per side to keep the dynamic
-            // table tiny even on bizarre operator keys.
-            var distance = LevenshteinDistance(
-                key.Length > 64 ? key[..64] : key,
-                candidate.Length > 64 ? candidate[..64] : candidate);
-            if (distance < bestDistance && distance <= maxDistance)
+            var trimmedCandidate = candidate.Length > 64 ? candidate[..64] : candidate;
+            // Scale the cutoff with key length: a 4-char property like Path
+            // would otherwise hint on any unrelated 4–7-char operator key
+            // (distance 3 ≈ one shared char). Min length wins so a short
+            // typo of a long property is still capped tightly.
+            var keyLen = Math.Min(trimmedKey.Length, trimmedCandidate.Length);
+            var cutoff = Math.Min(3, Math.Max(1, keyLen / 2));
+            var distance = LevenshteinDistance(trimmedKey, trimmedCandidate);
+            if (distance < bestDistance && distance <= cutoff)
             {
                 bestDistance = distance;
                 best = candidate;

@@ -1,9 +1,7 @@
 using CodeyBox.Api;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
@@ -481,16 +479,107 @@ public sealed class UnboundConfigKeyValidatorTests
     [Fact]
     public async Task HostedValidator_DisabledFlag_SkipsValidation()
     {
+        var sink = new ListLogger<UnboundConfigKeyHostedValidator>();
         var validator = BuildHostedValidator(
             mode: "strict",
             kvs: new()
             {
                 ["CodeyBox:AgentStreams:RootDirectory"] = "/var/log/codeybox",
             },
-            enabled: false);
+            enabled: false,
+            logger: sink);
 
-        // Must not throw even though strict + unbound key present.
+        // Disabled means the inspector never runs at all: no throw AND no
+        // warning logged. A regression that ran the inspector but swallowed
+        // the throw would still emit the warning and fail this assertion.
         await validator.StartAsync(CancellationToken.None);
+        Assert.Empty(sink.Lines);
+    }
+
+    [Fact]
+    public async Task HostedValidator_UnknownMode_LogsWarningAndStillThrows()
+    {
+        // The Mode parser only special-cases "warn" and "strict". A
+        // typo'd value like "log-only" falls through to strict so the
+        // operator's safest invariant (fail-fast) is preserved, but the
+        // unrecognised value MUST also surface as a warning so the
+        // operator notices the typo instead of inheriting strict by
+        // accident.
+        var sink = new ListLogger<UnboundConfigKeyHostedValidator>();
+        var validator = BuildHostedValidator(
+            mode: "log-only",
+            kvs: new()
+            {
+                ["CodeyBox:AgentStreams:RootDirectory"] = "/var/log/codeybox",
+            },
+            logger: sink);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => validator.StartAsync(CancellationToken.None));
+
+        Assert.Contains(
+            sink.Lines,
+            l => l.Level == LogLevel.Warning && l.Message.Contains("log-only"));
+    }
+
+    [Fact]
+    public void Inspect_FlagsReadOnlyComputedProperty_OnSeparatelyBoundOptions()
+    {
+        // MutationTestingAuditorOptions.Budget is a get-only TimeSpan
+        // computed from BudgetMinutes. ConfigurationBinder cannot write to
+        // it, so an operator who writes CodeyBox:Mutation:Budget alongside
+        // BudgetMinutes has their value silently dropped — exactly the
+        // shape this feature exists to catch. The walker must flag it
+        // instead of treating it as a known bindable property.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Mutation:BudgetMinutes"] = "20",
+            ["CodeyBox:Mutation:Budget"] = "00:20:00",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal("CodeyBox:Mutation:Budget", report.Path);
+    }
+
+    [Fact]
+    public void Inspect_ReportsAllUnboundKeys_NotJustTheFirst()
+    {
+        // Multiple unbound keys at different depths must each surface
+        // independently. A regression that early-returned in WalkPoco
+        // after the first hit would only report one of these.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:AgentStreams:RootDirectory"] = "/var/log/codeybox",
+            ["CodeyBox:Shutdown:Bogus"] = "x",
+            ["CodeyBox:NotARealField"] = "y",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Equal(3, reports.Count);
+        Assert.Contains(reports, r => r.Path == "CodeyBox:AgentStreams:RootDirectory");
+        Assert.Contains(reports, r => r.Path == "CodeyBox:Shutdown:Bogus");
+        Assert.Contains(reports, r => r.Path == "CodeyBox:NotARealField");
+    }
+
+    [Fact]
+    public void Inspect_NearestPropertyHint_DoesNotFireForShortUnrelatedKeys()
+    {
+        // Path is 4 chars; with a fixed cutoff of 3, an unrelated short
+        // key like "Foo" would mis-hint as "Path" (distance 3 ≈ "one
+        // shared char"). The length-scaled cutoff prevents that.
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:AgentStreams:Foo"] = "x",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal("CodeyBox:AgentStreams:Foo", report.Path);
+        Assert.Null(report.NearestProperty);
     }
 
     private static IConfiguration BuildConfig(Dictionary<string, string?> kvs)
@@ -508,13 +597,8 @@ public sealed class UnboundConfigKeyValidatorTests
             ["CodeyBox:ConfigValidation:UnboundKeys:Mode"] = mode,
         };
         var config = BuildConfig(configKvs);
-        var services = new ServiceCollection();
-        services.AddOptions<CodeyBoxOptions>().Bind(config.GetSection("CodeyBox"));
-        var sp = services.BuildServiceProvider();
-        var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>();
         return new UnboundConfigKeyHostedValidator(
             config,
-            opts,
             logger ?? NullLogger<UnboundConfigKeyHostedValidator>.Instance);
     }
 
