@@ -546,7 +546,7 @@ internal sealed class Bridge : IAsyncDisposable
         {
             if (_claudeProcess is { HasExited: false } p)
             {
-                try { p.Kill(entireProcessTree: true); } catch { }
+                TerminateClaudeProcess(p);
             }
         }
         catch { }
@@ -556,6 +556,69 @@ internal sealed class Bridge : IAsyncDisposable
         try { _listener?.Stop(); } catch { }
         try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
         try { _cts.Cancel(); } catch { }
+    }
+
+    /// <summary>
+    /// SIGTERM the claude --ide subprocess with a brief grace window, then
+    /// fall back to SIGKILL (Process.Kill) if it didn't exit. Parity with the
+    /// JS bridge's <c>claudeProc.kill('SIGTERM')</c> — claude needs the polite
+    /// signal so it gets a chance to flush its session JSONL transcript before
+    /// exiting. SIGKILL leaves a half-written transcript that the next
+    /// session/load can read back as a thinking-block immutability 400.
+    /// .NET's <see cref="Process.Kill(bool)"/> always sends SIGKILL on Linux
+    /// with no SIGTERM overload, so we P/Invoke <c>kill(2)</c> for the polite
+    /// signal and use <see cref="Process.Kill(bool)"/> only as the fallback.
+    /// </summary>
+    private static void TerminateClaudeProcess(Process p)
+    {
+        // Snapshot the pid before signalling — once the process exits, .NET
+        // disposes its internal handle and reading <c>p.Id</c> can throw.
+        int pid;
+        try { pid = p.Id; }
+        catch { pid = 0; }
+
+        bool politeSent = false;
+        if (pid > 0)
+        {
+            try
+            {
+                // SIGTERM = 15 on Linux.
+                politeSent = NativeMethods.Kill(pid, 15) == 0;
+            }
+            catch { politeSent = false; }
+        }
+
+        if (politeSent)
+        {
+            // Brief grace window so claude can flush ~/.claude/projects/<slug>/<session>.jsonl
+            // before exiting. 1.5s is well under any operator-visible
+            // teardown latency while comfortably covering the JSONL flush
+            // path; if claude is wedged we still SIGKILL below.
+            try { p.WaitForExit(milliseconds: 1500); }
+            catch { /* WaitForExit can throw if the handle is racing dispose */ }
+        }
+
+        bool exited;
+        try { exited = p.HasExited; }
+        catch { exited = true; }
+
+        if (!exited)
+        {
+            // Either the polite SIGTERM failed to deliver or claude is
+            // wedged. Fall back to the original SIGKILL behaviour so a
+            // hung child can never pin shutdown.
+            try { p.Kill(entireProcessTree: true); } catch { }
+        }
+    }
+
+    private static class NativeMethods
+    {
+        // DllImport with primitive int marshalling is fully NativeAOT-safe
+        // (no codegen required at runtime) and avoids the AllowUnsafeBlocks
+        // requirement LibraryImport's source generator imposes. The bridge
+        // only ever ships on linux-musl-x64 so the libc resolution is fixed.
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
+        internal static extern int Kill(int pid, int sig);
     }
 
     private async Task WaitForBackgroundTasksAsync()

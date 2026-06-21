@@ -1297,6 +1297,485 @@ public sealed class AcpBridgeUnitTests
         }
     }
 
+    // ── Bridge.EmitAcpSentMeta envelope contract ────────────────────────────────
+    //
+    // DrainPending emits a paired acp_sent envelope on stdout immediately after
+    // every SendText so a host-side observer can correlate outbound JSON-RPC
+    // frames by id/method. Plausible regressions the existing drain-order test
+    // does NOT catch: dropping the EmitAcpSentMeta call entirely, swapping
+    // id ↔ method, coercing a numeric id to a string (would happen if a
+    // refactor replaced WriteRawValue(idJson) with WriteString), or emitting
+    // an empty body for envelopes whose payload doesn't carry both fields.
+
+    [Fact]
+    public async Task Bridge_EmitAcpSentMeta_EnvelopePreservesIdTypeAndMethodPerSendText()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-sent-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var authToken = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement
+                .GetProperty("authToken").GetString()!;
+
+            // Enqueue THREE envelopes before the peer connects so DrainPending
+            // runs all three back-to-back on the accept handler's drain pass:
+            //   - numeric id (must remain a JSON number, not a string)
+            //   - string id (must remain a JSON string)
+            //   - method-only (no id field at all — envelope must still emit)
+            await ctx.WriteStdinLineAsync(
+                "{\"type\":\"acp_send\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"initialize\",\"params\":{}}}");
+            await ctx.WriteStdinLineAsync(
+                "{\"type\":\"acp_send\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":\"req-abc\",\"method\":\"session/new\",\"params\":{}}}");
+            await ctx.WriteStdinLineAsync(
+                "{\"type\":\"acp_send\",\"payload\":{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{}}}");
+
+            var beforeConnect = ctx.Stdout.SnapshotCount();
+            await ctx.ConnectWebSocketAsync(port, authToken);
+            await ctx.WaitForEnvelopeAsync("peer_connected");
+
+            // Drain the three WS frames so we know all three SendText calls
+            // ran (and therefore all three EmitAcpSentMeta calls have queued).
+            for (int i = 0; i < 3; i++)
+                _ = await ctx.ReadWebSocketFrameAsync(TimeSpan.FromSeconds(10));
+
+            // Wait for the three acp_sent envelopes to surface on stdout.
+            var sent1 = await ctx.WaitForEnvelopeAsync("acp_sent", startIndex: beforeConnect);
+            var snap = ctx.Stdout.Snapshot();
+            var sentEnvs = snap.Skip(beforeConnect)
+                .Where(e => e.TryGetProperty("type", out var t)
+                    && t.ValueKind == JsonValueKind.String
+                    && t.GetString() == "acp_sent")
+                .ToList();
+            Assert.Equal(3, sentEnvs.Count);
+
+            // Envelope 0: numeric id preserved as Number (not coerced to String).
+            Assert.Equal(JsonValueKind.Number, sentEnvs[0].GetProperty("id").ValueKind);
+            Assert.Equal(42, sentEnvs[0].GetProperty("id").GetInt32());
+            Assert.Equal("initialize", sentEnvs[0].GetProperty("method").GetString());
+
+            // Envelope 1: string id preserved as String.
+            Assert.Equal(JsonValueKind.String, sentEnvs[1].GetProperty("id").ValueKind);
+            Assert.Equal("req-abc", sentEnvs[1].GetProperty("id").GetString());
+            Assert.Equal("session/new", sentEnvs[1].GetProperty("method").GetString());
+
+            // Envelope 2: id absent (notification shape), method present.
+            Assert.False(sentEnvs[2].TryGetProperty("id", out _),
+                "acp_sent envelope must not synthesise an id when the payload has none.");
+            Assert.Equal("session/update", sentEnvs[2].GetProperty("method").GetString());
+
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Bridge.HandleHello turn-deadline timer contract ────────────────────────
+    //
+    // The timer arms with `_config.TurnTimeoutSeconds * 1000` ms; on fire it
+    // emits a {"type":"turn_timeout"} envelope and calls Shutdown(0). Plausible
+    // regressions: dropping the `* 1000` so the seconds value is used as ms
+    // (timer would fire near-instantly), forgetting Shutdown(0) so the bridge
+    // keeps running after the envelope, passing Timeout.Infinite as the due
+    // time (timer never fires), or disposing the timer in HandleHello before
+    // it ever fires. We force the timer to fire immediately via Timer.Change
+    // (testing the callback contract — emit + shutdown) and separately assert
+    // the envelope did NOT fire while the bridge was idle (catches the missing
+    // `* 1000` scaling — a 10s timeout used as 10ms would fire before our
+    // forced trigger).
+
+    [Fact]
+    public async Task Bridge_TurnDeadlineTimer_OnFire_EmitsEnvelopeAndShutsDownWithCodeZero()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-deadline-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                // turnTimeoutSeconds floors to 10 — that's the smallest legal
+                // configuration. The forced-fire below proves the callback
+                // works without waiting for the wall clock; the pre-fire
+                // count assertion proves the timer ISN'T accidentally firing
+                // before that (catches the missing `* 1000` regression).
+                + "\",\"turnTimeoutSeconds\":10}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            await ctx.WaitForEnvelopeAsync("ready");
+            // Give the bridge a moment to settle and ensure the timer hasn't
+            // misfired. If TurnTimeoutSeconds was used as ms instead of
+            // seconds (no `* 1000`), the 10ms timer would have fired by now.
+            await Task.Delay(250);
+            Assert.Equal(0, ctx.Stdout.CountByType("turn_timeout"));
+
+            // Force the timer to fire immediately. The contract under test
+            // is the callback: emit("turn_timeout") + Shutdown(0).
+            var timerField = typeof(Bridge).GetField("_turnDeadline",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var timer = timerField.GetValue(ctx.Bridge) as Timer;
+            Assert.NotNull(timer);
+            timer!.Change(0, Timeout.Infinite);
+
+            var envelope = await ctx.WaitForEnvelopeAsync("turn_timeout",
+                TimeSpan.FromSeconds(10));
+            Assert.Equal("turn_timeout", envelope.GetProperty("type").GetString());
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Bridge.WriteLockfile fatal-envelope contracts ──────────────────────────
+    //
+    // WriteLockfile emits two distinct fatal envelopes the host observer keys
+    // off ("lockdir_create_failed" / "lockfile_write_failed"). The observer's
+    // ObserveBridgeOutput pattern-matches the literal envelope message string
+    // to decide whether to degrade — a rename or shape drift would silently
+    // strand the work item. Plausible regressions covered: dropping the
+    // Fatal call entirely (silent exit instead of envelope), changing the
+    // message string, omitting Shutdown(2) so the bridge keeps running, or
+    // moving the lockfile_write_failed catch outside the WriteAllBytes block
+    // so an EACCES escapes as an unhandled exception.
+
+    [Fact]
+    public async Task Bridge_WriteLockfile_LockdirCreateFailed_EmitsFatalWithMessageAndShutsDown()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-lockdir-").FullName;
+        try
+        {
+            // Point lockDir at an existing REGULAR FILE so
+            // Directory.CreateDirectory throws IOException.
+            var fileAsLockDir = Path.Combine(tmpDir, "this-is-actually-a-file");
+            File.WriteAllText(fileAsLockDir, "not a dir");
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"/usr/bin/true\",\"workingDirectory\":\""
+                + tmpDir + "\",\"lockDir\":\"" + fileAsLockDir
+                + "\",\"turnTimeoutSeconds\":30}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var fatal = await ctx.WaitForEnvelopeAsync("fatal", TimeSpan.FromSeconds(10));
+            Assert.Equal("lockdir_create_failed", fatal.GetProperty("message").GetString());
+            Assert.True(fatal.TryGetProperty("detail", out var detail));
+            Assert.NotEqual(JsonValueKind.Null, detail.ValueKind);
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(2, exitCode);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Bridge_WriteLockfile_LockfileWriteFailed_EmitsFatalWithMessageAndShutsDown()
+    {
+        // Drive WriteLockfile in isolation via reflection. We can't easily
+        // trigger File.WriteAllBytes to fail through the live RunAsync path
+        // because the bridge unconditionally chmod 0700's the lockDir before
+        // writing — so a pre-set 0500 mode is bumped back to writable
+        // (intentionally; the JS parent re-mkdir'd the dir on every turn for
+        // similar reasons). Instead we pre-create the LOCKFILE PATH itself as
+        // a directory, then invoke WriteLockfile with state set so its
+        // `_port + ".lock"` collides with that directory. File.WriteAllBytes
+        // on a path that exists as a directory throws UnauthorizedAccessException
+        // — the WriteLockfile catch routes it to Fatal("lockfile_write_failed").
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-lockwrite-").FullName;
+        try
+        {
+            const int fixedPort = 41999;
+            var lockDir = Path.Combine(tmpDir, "lockdir");
+            Directory.CreateDirectory(lockDir);
+            // Block the lockfile path with a directory entry of the same name.
+            Directory.CreateDirectory(Path.Combine(lockDir, fixedPort + ".lock"));
+
+            using var stdoutCapture = new MemoryStream();
+            var bridge = new Bridge(new MemoryStream());
+            using (Emitter.OverrideStreamForTests(stdoutCapture))
+            {
+                var configField = typeof(Bridge).GetField("_config",
+                    BindingFlags.NonPublic | BindingFlags.Instance)!;
+                var portField = typeof(Bridge).GetField("_port",
+                    BindingFlags.NonPublic | BindingFlags.Instance)!;
+                var tokenField = typeof(Bridge).GetField("_authToken",
+                    BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+                // Build a BridgeConfig directly via the record's init contract
+                // so we can pin LockDir without going through the FromHello
+                // floor / parser.
+                var cfg = BridgeConfig.Default with
+                {
+                    LockDir = lockDir,
+                    WorkingDirectory = tmpDir,
+                };
+                configField.SetValue(bridge, cfg);
+                portField.SetValue(bridge, fixedPort);
+                tokenField.SetValue(bridge, "deadbeefcafe1234");
+
+                var writeLockfile = typeof(Bridge).GetMethod("WriteLockfile",
+                    BindingFlags.NonPublic | BindingFlags.Instance)!;
+                writeLockfile.Invoke(bridge, null);
+            }
+
+            var envelopes = ParseEnvelopes(stdoutCapture.ToArray());
+            var fatal = envelopes.FirstOrDefault(
+                e => e.TryGetProperty("type", out var t) && t.GetString() == "fatal");
+            Assert.NotEqual(default, fatal);
+            Assert.Equal("lockfile_write_failed", fatal.GetProperty("message").GetString());
+            Assert.True(fatal.TryGetProperty("detail", out var detail));
+            Assert.NotEqual(JsonValueKind.Null, detail.ValueKind);
+
+            // Fatal must Shutdown(2): _exitCode = 2 and _shutdownState = 1.
+            var exitCodeField = typeof(Bridge).GetField("_exitCode",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var shutdownStateField = typeof(Bridge).GetField("_shutdownState",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            Assert.Equal(2, (int)exitCodeField.GetValue(bridge)!);
+            Assert.Equal(1, (int)shutdownStateField.GetValue(bridge)!);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── Bridge.Fatal startup_failed envelope contract ──────────────────────────
+    //
+    // HandleHello wraps StartServer/WriteLockfile/SpawnClaude in an outer
+    // catch that calls Fatal("startup_failed", ex.Message). The inner methods
+    // each have their own envelope-specific catches (lockdir_create_failed,
+    // lockfile_write_failed, claude_spawn_failed), so the outer catch is
+    // defense-in-depth — it only fires when something unexpected throws
+    // (e.g. TcpListener.Start raising SocketException for EADDRINUSE on a
+    // sandbox-locked port). The audit's plausible regression is a refactor
+    // that drops the outer catch entirely; this fixture pins the envelope
+    // shape Fatal produces so a regression that changes the envelope message
+    // (and silently breaks the host observer's pattern match) is caught.
+
+    [Fact]
+    public void Bridge_Fatal_StartupFailed_EmitsEnvelopeWithMessageDetailAndShutsDownWithCode2()
+    {
+        using var stdoutCapture = new MemoryStream();
+        var bridge = new Bridge(new MemoryStream());
+        using (Emitter.OverrideStreamForTests(stdoutCapture))
+        {
+            var fatal = typeof(Bridge).GetMethod("Fatal",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            fatal.Invoke(bridge, new object?[]
+            {
+                "startup_failed",
+                "Address already in use on TcpListener.Start",
+            });
+        }
+
+        var envelopes = ParseEnvelopes(stdoutCapture.ToArray());
+        var fatalEnv = envelopes.FirstOrDefault(
+            e => e.TryGetProperty("type", out var t) && t.GetString() == "fatal");
+        Assert.NotEqual(default, fatalEnv);
+        Assert.Equal("startup_failed", fatalEnv.GetProperty("message").GetString());
+        Assert.Equal("Address already in use on TcpListener.Start",
+            fatalEnv.GetProperty("detail").GetString());
+
+        // Fatal must Shutdown(2): _exitCode is 2 and _shutdownState is 1.
+        var exitCodeField = typeof(Bridge).GetField("_exitCode",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var shutdownStateField = typeof(Bridge).GetField("_shutdownState",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        Assert.Equal(2, (int)exitCodeField.GetValue(bridge)!);
+        Assert.Equal(1, (int)shutdownStateField.GetValue(bridge)!);
+    }
+
+    // ── Bridge.SpawnClaude stdout/stderr pump envelopes ────────────────────────
+    //
+    // SpawnClaude pumps claude's StandardOutput/StandardError into
+    // {"type":"claude_stdout","text":...} / {"type":"claude_stderr","text":...}
+    // envelopes. AcpClaudeTransport.ObserveBridgeOutput consumes the
+    // claude_stderr envelope to populate obs.Stderr — a property-name drift
+    // ("text" → "data" / "content") would silently break the host's stderr
+    // surface. None of the existing Bridge fixtures use a claude stub that
+    // actually writes to either stream, so the pump path is entirely
+    // unexercised. This fixture uses a bash stub that writes a marker line
+    // to each stream then exits, and asserts both envelopes carry the
+    // emitted bytes under the documented "text" field name.
+
+    [Fact]
+    public async Task Bridge_SpawnClaude_PumpsClaudeStdoutAndStderrIntoTextEnvelopes()
+    {
+        if (!File.Exists("/bin/bash"))
+            return; // honour Skippable shape without taking the dependency
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-claudeio-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+
+            // Stub writes a distinct marker to each stream then exits 0. Sleep
+            // briefly so the bridge's reader tasks have observed both before
+            // claude exits and the streams close.
+            var stubPath = Path.Combine(tmpDir, "claude-streams-stub.sh");
+            File.WriteAllText(stubPath,
+                "#!/bin/bash\n" +
+                "printf 'STDOUT-MARKER-LINE\\n'\n" +
+                "printf 'STDERR-MARKER-LINE\\n' 1>&2\n" +
+                "sleep 0.25\n" +
+                "exit 0\n");
+            File.SetUnixFileMode(stubPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":30}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+
+            // Concatenate every claude_stdout.text and every claude_stderr.text
+            // emitted by the bridge — the readers chunk reads, so a single
+            // line may arrive across multiple envelopes.
+            var snap = ctx.Stdout.Snapshot();
+            var stdoutText = string.Concat(snap
+                .Where(e => e.TryGetProperty("type", out var t)
+                    && t.ValueKind == JsonValueKind.String
+                    && t.GetString() == "claude_stdout")
+                .Select(e => e.GetProperty("text").GetString() ?? ""));
+            var stderrText = string.Concat(snap
+                .Where(e => e.TryGetProperty("type", out var t)
+                    && t.ValueKind == JsonValueKind.String
+                    && t.GetString() == "claude_stderr")
+                .Select(e => e.GetProperty("text").GetString() ?? ""));
+
+            Assert.Contains("STDOUT-MARKER-LINE", stdoutText);
+            Assert.Contains("STDERR-MARKER-LINE", stderrText);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    // ── WebSocketConnection auth-header fallback shapes ────────────────────────
+    //
+    // AcceptHandshakeAsync admits two auth header shapes the dedicated handshake
+    // fixtures don't cover: (1) the lowercase `authorization` header used as a
+    // fallback when `x-claude-code-ide-authorization` is absent, and (2) the
+    // `Bearer <token>` prefixed form admitted via the EndsWith fallback. Both
+    // are claimed as "drop-in JS parity" but neither was pinned. A regression
+    // that drops either path would silently break claude --ide releases that
+    // pick the other header shape (releases have been observed using both).
+
+    [Fact]
+    public async Task WebSocketConnection_AcceptHandshake_AcceptsLowercaseAuthorizationHeaderFallback()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        const string authToken = "lowercase-auth-fallback-token";
+        var acceptTask = Task.Run(async () =>
+        {
+            using var server = await listener.AcceptTcpClientAsync();
+            var ws = new WebSocketConnection(server.GetStream());
+            return await ws.AcceptHandshakeAsync(authToken, CancellationToken.None);
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        // Only the lowercase `authorization` header — NOT
+        // x-claude-code-ide-authorization. The bridge's fallback branch is
+        // what must admit this.
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\n" +
+            "Host: 127.0.0.1\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "authorization: " + authToken + "\r\n" +
+            "\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        var respBuf = new byte[1024];
+        var n = await s.ReadAsync(respBuf.AsMemory());
+        var resp = Encoding.ASCII.GetString(respBuf, 0, n);
+        Assert.StartsWith("HTTP/1.1 101 Switching Protocols", resp);
+        Assert.True(await acceptTask);
+        listener.Stop();
+    }
+
+    [Fact]
+    public async Task WebSocketConnection_AcceptHandshake_AcceptsBearerPrefixedAuthToken()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        const string authToken = "bearer-prefix-token-deadbeef";
+        var acceptTask = Task.Run(async () =>
+        {
+            using var server = await listener.AcceptTcpClientAsync();
+            var ws = new WebSocketConnection(server.GetStream());
+            return await ws.AcceptHandshakeAsync(authToken, CancellationToken.None);
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        // `Bearer <token>` — admitted by the EndsWith branch.
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\n" +
+            "Host: 127.0.0.1\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "x-claude-code-ide-authorization: Bearer " + authToken + "\r\n" +
+            "\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        var respBuf = new byte[1024];
+        var n = await s.ReadAsync(respBuf.AsMemory());
+        var resp = Encoding.ASCII.GetString(respBuf, 0, n);
+        Assert.StartsWith("HTTP/1.1 101 Switching Protocols", resp);
+        Assert.True(await acceptTask);
+        listener.Stop();
+    }
+
     // ── Helpers for the new orchestration / regression fixtures above ───────────
 
     private static string BuildSeqAcpSendEnvelope(int seq) =>
@@ -1427,6 +1906,7 @@ public sealed class AcpBridgeUnitTests
         private readonly List<byte> _wsRecvBuffer = new();
 
         public LineCapturingStream Stdout => _stdout;
+        public Bridge Bridge => _bridge;
 
         public BridgeRunHandle()
         {

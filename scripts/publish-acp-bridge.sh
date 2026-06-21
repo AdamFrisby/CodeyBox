@@ -51,14 +51,27 @@ file "$RESOURCE_DIR/$RESOURCE_NAME" 2>/dev/null || true
 # "statically linked". Operators verifying against the actual multipass image
 # should additionally copy the resource in and exec `claude-acp-bridge </dev/null`
 # to confirm there are no runtime loader errors (out of scope for this script).
+#
+# A dynamically-linked output is a HARD FAILURE here: the bridge ships into a
+# multipass sandbox whose glibc version is not guaranteed to match the build
+# host, so a non-static binary would die on ld-linux GLIBC_X.Y errors on the
+# first ACP turn. The placeholder gate inside AcpBridgeBinary cannot catch
+# this — it only recognises the literal placeholder sentinel, NOT a real-but-
+# dynamically-linked ELF (whose first byte is still 0x7F). Fail the publish
+# step so the operator gets a loud error instead of a silent embed of a
+# binary that will exit 127-style on every sandbox dispatch.
 if command -v ldd >/dev/null 2>&1; then
     LDD_OUT="$(ldd "$RESOURCE_DIR/$RESOURCE_NAME" 2>&1 || true)"
     echo "ldd: $LDD_OUT"
     case "$LDD_OUT" in
         *"not a dynamic executable"*|*"statically linked"*) ;;
         *)
-            echo "WARNING: published binary appears dynamically linked — check the" >&2
-            echo "         StaticExecutable property and musl-tools installation." >&2
+            echo "ERROR: published binary appears dynamically linked — check the" >&2
+            echo "       StaticExecutable property and musl-tools installation." >&2
+            echo "       Removing $RESOURCE_DIR/$RESOURCE_NAME to avoid embedding" >&2
+            echo "       a binary that would fail to exec in the sandbox." >&2
+            rm -f "$RESOURCE_DIR/$RESOURCE_NAME"
+            exit 1
             ;;
     esac
 fi

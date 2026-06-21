@@ -237,8 +237,22 @@ internal sealed class WebSocketConnection
 
     private async Task WriteRawAsync(string text, CancellationToken ct)
     {
+        // Mirror SendText/ReceiveLoopAsync: swallow IOException /
+        // ObjectDisposedException from a peer that tore the TCP connection
+        // down mid-handshake. The 400/401 error-branch callers in
+        // AcceptHandshakeAsync await us without their own try/catch, so an
+        // unhandled IOException here propagates out of HandleClientAsync's
+        // fire-and-forget Task.Run (whose only catch is for
+        // OperationCanceledException) and surfaces as an
+        // UnobservedTaskException — under the default unobserved-exception
+        // policy that crashes the bridge.
         var bytes = Encoding.ASCII.GetBytes(text);
-        await _stream.WriteAsync(bytes.AsMemory(), ct).ConfigureAwait(false);
+        try
+        {
+            await _stream.WriteAsync(bytes.AsMemory(), ct).ConfigureAwait(false);
+        }
+        catch (IOException) { /* peer torn down mid-handshake */ }
+        catch (ObjectDisposedException) { /* peer closed */ }
     }
 
     private sealed record HttpRequest(IReadOnlyDictionary<string, string> Headers)

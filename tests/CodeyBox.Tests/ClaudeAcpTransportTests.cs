@@ -666,6 +666,58 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_MaterialiseBridgeAsync_SandboxExecThrows_RaisesUnavailable()
+    {
+        // MaterialiseBridgeAsync wraps `sandbox.ExecAsync` in
+        // `catch (Exception ex) when (ex is not OperationCanceledException)
+        //    -> throw new AcpTransportUnavailableException(...)`.
+        // The existing FailMaterialise test exercises the `if (!result.Success)`
+        // branch (result returned with exitCode 1); this pins the OTHER
+        // failure mode — a sandbox provider that THROWS rather than returning
+        // an unsuccessful result. A regression that drops the catch (so the
+        // raw exception escapes to the worker instead of degrading to print)
+        // would silently break the worker's fallback contract.
+        var sandbox = new ThrowingSandbox(new IOException("multipass exec dispatch failed"));
+        var transport = NewAcpTransportWithOverride();
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-throw-materialise");
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => transport.OpenAsync(request, CancellationToken.None));
+        Assert.Contains("failed to write the ACP bridge binary", ex.Message);
+        Assert.IsType<IOException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_SendTurnAsync_BridgeExecThrows_RaisesUnavailable()
+    {
+        // SendTurnAsync wraps the bridge invocation's `_open.Sandbox.ExecAsync`
+        // in a similar catch — when the sandbox throws (vs returning a
+        // non-success result), the worker must observe the failure as
+        // AcpTransportUnavailableException so it can degrade to print for
+        // the remainder of the session. Without this coverage a regression
+        // that drops the catch would leak the underlying provider exception
+        // into the work item and stall the pipeline. The two-stage sandbox
+        // succeeds on the materialise call (so OpenAsync completes), then
+        // throws on the FIRST bridge invocation.
+        var sandbox = new ThrowOnBridgeInvocationSandbox(
+            new InvalidOperationException("sandbox exec channel torn down"));
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-throw-bridge");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("ACP bridge invocation failed", ex.Message);
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+    }
+
+    [Fact]
     public async Task AcpClaudeTransport_SendTurn_ShipsAcpEnvelopesAsStdin_AndCapturesSessionId()
     {
         // First turn: no resume → bridge sees initialize + session/new + session/prompt.
@@ -1241,6 +1293,54 @@ public sealed class ClaudeAcpTransportTests
 
         private static bool IsBash(SandboxExec exec, string flag)
             => exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == flag;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox that throws on EVERY ExecAsync — exercises the exception-
+    /// wrapping catch in <see cref="AcpClaudeTransport.MaterialiseBridgeAsync"/>
+    /// (the existing <c>FailMaterialise</c> path only returns a non-success
+    /// result, never throws).
+    /// </summary>
+    private sealed class ThrowingSandbox : ISandbox
+    {
+        private readonly Exception _toThrow;
+        public string Id { get; } = "vm-throwing-" + Guid.NewGuid().ToString("N")[..8];
+        public ThrowingSandbox(Exception toThrow) => _toThrow = toThrow;
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => throw _toThrow;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox that succeeds on the bridge-materialise call (so OpenAsync
+    /// completes) but throws on the first bridge invocation call — exercises
+    /// the exception-wrapping catch in
+    /// <see cref="AcpClaudeTransport.AcpSession.SendTurnAsync"/>.
+    /// </summary>
+    private sealed class ThrowOnBridgeInvocationSandbox : ISandbox
+    {
+        private readonly Exception _toThrowOnBridge;
+        public string Id { get; } = "vm-throwbridge-" + Guid.NewGuid().ToString("N")[..8];
+        public ThrowOnBridgeInvocationSandbox(Exception toThrowOnBridge) => _toThrowOnBridge = toThrowOnBridge;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            // Materialise script: `bash -c "set -eu\n...base64 -d > ..."`.
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            // Bridge invocation: `bash -lc "exec $HOME/.codeybox/claude-acp-bridge"`.
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == "-lc"
+                && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal))
+            {
+                throw _toThrowOnBridge;
+            }
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
