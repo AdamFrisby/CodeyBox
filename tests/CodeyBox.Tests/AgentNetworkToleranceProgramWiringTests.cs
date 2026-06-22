@@ -160,8 +160,12 @@ public sealed class AgentNetworkToleranceProgramWiringTests
     {
         var stdin = exec.Stdin;
         Assert.NotNull(stdin);
-        var firstLineEnd = stdin!.IndexOf('\n', StringComparison.Ordinal);
-        var firstLine = firstLineEnd < 0 ? stdin : stdin![..firstLineEnd];
+        var marker = AcpClaudeTransport.BridgePayloadEndMarker + "\n";
+        var markerIndex = stdin!.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(markerIndex >= 0, "ACP launcher stdin did not contain the bridge payload terminator.");
+        var bridgeStdin = stdin[(markerIndex + marker.Length)..];
+        var firstLineEnd = bridgeStdin.IndexOf('\n', StringComparison.Ordinal);
+        var firstLine = firstLineEnd < 0 ? bridgeStdin : bridgeStdin[..firstLineEnd];
         return JsonDocument.Parse(firstLine);
     }
 
@@ -256,13 +260,7 @@ public sealed class AgentNetworkToleranceProgramWiringTests
             if (exec.Argv.Count >= 3
                 && (exec.Argv[0] == "bash" || exec.Argv[0] == "sh")
                 && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
-            {
-                return Task.FromResult(new SandboxExecResult(0, "/home/test/.codeybox/claude-acp-bridge\n", ""));
-            }
-
-            if (exec.Argv.Count == 1
-                && exec.Argv[0].Contains("claude-acp-bridge", StringComparison.Ordinal))
+                && exec.Argv[2].Contains(AcpClaudeTransport.BridgePayloadEndMarker, StringComparison.Ordinal))
             {
                 BridgeExecs.Add(exec);
                 var stdout = string.Join('\n', new[]

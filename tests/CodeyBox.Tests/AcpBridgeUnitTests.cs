@@ -3403,6 +3403,10 @@ import sys
 lock_path = None
 session_method = None
 
+first_cache_creation = int(os.environ.get("CODEYBOX_TEST_ACP_FIRST_CACHE_CREATION", "2048"))
+load_cache_read = int(os.environ.get("CODEYBOX_TEST_ACP_LOAD_CACHE_READ", "2048"))
+load_cache_creation = int(os.environ.get("CODEYBOX_TEST_ACP_LOAD_CACHE_CREATION", "0"))
+
 def emit(payload):
     print(json.dumps(payload, separators=(",", ":")), flush=True)
 
@@ -3440,8 +3444,8 @@ for raw in sys.stdin:
             usage = {
                 "input_tokens": 10,
                 "output_tokens": 3,
-                "cache_read_input_tokens": 2048 if session_method == "session/load" else 0,
-                "cache_creation_input_tokens": 0 if session_method == "session/load" else 2048,
+                "cache_read_input_tokens": load_cache_read if session_method == "session/load" else 0,
+                "cache_creation_input_tokens": load_cache_creation if session_method == "session/load" else first_cache_creation,
             }
             emit({"type": "acp_recv", "payload": {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"stopReason": "end_turn", "usage": usage}}})
             emit({"type": "turn_complete", "stopReason": "end_turn"})
@@ -4022,6 +4026,62 @@ exit 9
             Assert.Contains("ACP bridge verifier did not report success", run.Stderr, StringComparison.Ordinal);
             Assert.Contains("verifier finished without marker", run.Stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(fixture.ResourcePath));
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    public static IEnumerable<object[]> AcpCacheVerifierFailureCases()
+    {
+        yield return new object[]
+        {
+            new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["CODEYBOX_TEST_ACP_FIRST_CACHE_CREATION"] = "0",
+            },
+            "cold ACP turn did not report cache_creation_input_tokens > 0",
+        };
+        yield return new object[]
+        {
+            new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["CODEYBOX_TEST_ACP_LOAD_CACHE_READ"] = "0",
+            },
+            "session/load ACP turn did not report cache_read_input_tokens > 0",
+        };
+        yield return new object[]
+        {
+            new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["CODEYBOX_TEST_ACP_LOAD_CACHE_CREATION"] = "2048",
+            },
+            "session/load appears to rebuild the cache instead of reading it",
+        };
+    }
+
+    [Theory]
+    [MemberData(nameof(AcpCacheVerifierFailureCases))]
+    public async Task AcpBridge_PublishScript_CacheWarmVerifierRejectsBadUsageBuckets(
+        IReadOnlyDictionary<string, string?> overrides,
+        string expectedFailure)
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            await File.WriteAllTextAsync(fixture.ResourcePath, "previous verified bridge");
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+            foreach (var (key, value) in overrides)
+                env[key] = value;
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("ACP bridge end-to-end verification failed", run.Stderr, StringComparison.Ordinal);
+            Assert.Contains(expectedFailure, run.Stderr, StringComparison.Ordinal);
+            Assert.Equal("previous verified bridge", await File.ReadAllTextAsync(fixture.ResourcePath));
         }
         finally
         {
