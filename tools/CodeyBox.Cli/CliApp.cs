@@ -1,5 +1,6 @@
 using System.CommandLine;
 using System.CommandLine.Builder;
+using System.CommandLine.Invocation;
 using System.CommandLine.Parsing;
 using CodeyBox.Cli.Commands;
 using CodeyBox.Cli.Services;
@@ -18,6 +19,7 @@ internal static class CliApp
         args = RewriteTemplateShortcut(args);
         var parser = new CommandLineBuilder(BuildRootCommand(clientFactory, cancellationToken))
             .UseDefaults()
+            .UseExceptionHandler(HandleException, errorExitCode: 1)
             .Build();
 
         return parser.InvokeAsync(args);
@@ -64,6 +66,24 @@ internal static class CliApp
         root.AddCommand(VersionCommand.Build());
 
         return root;
+    }
+
+    private static void HandleException(Exception exception, InvocationContext context)
+    {
+        if (exception is CodeyBoxCliException)
+        {
+            Console.Error.WriteLine(exception.Message);
+        }
+        else if (exception is CodeyBoxConnectionException or HttpRequestException)
+        {
+            Console.Error.WriteLine($"Connection error: {exception.Message}");
+        }
+        else
+        {
+            Console.Error.WriteLine($"Unexpected error: {exception.Message}");
+        }
+
+        context.ExitCode = 1;
     }
 
     private static string[] RewriteTemplateShortcut(string[] args)

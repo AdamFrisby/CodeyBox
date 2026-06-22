@@ -15,25 +15,31 @@ internal sealed class CodeyBoxClient
     private readonly HttpClient _http;
     private readonly HttpClient? _sseHttp;
     private readonly ResolvedConfig? _lazySseConfig;
+    private readonly ResolvedConfig? _config;
     private HttpClient? _lazySseHttp;
 
     internal CodeyBoxClient(HttpClient http)
-        : this(http, sseHttp: null, lazySseConfig: null) { }
+        : this(http, sseHttp: null, lazySseConfig: null, config: null) { }
 
     internal CodeyBoxClient(HttpClient http, HttpClient sseHttp)
-        : this(http, sseHttp, lazySseConfig: null) { }
+        : this(http, sseHttp, lazySseConfig: null, config: null) { }
 
-    private CodeyBoxClient(HttpClient http, HttpClient? sseHttp, ResolvedConfig? lazySseConfig)
+    private CodeyBoxClient(
+        HttpClient http,
+        HttpClient? sseHttp,
+        ResolvedConfig? lazySseConfig,
+        ResolvedConfig? config)
     {
         _http = http;
         _sseHttp = sseHttp;
         _lazySseConfig = lazySseConfig;
+        _config = config;
     }
 
     internal static CodeyBoxClient Create(ResolvedConfig config)
     {
         var http = CodeyBoxHttpFactory.CreateClient(config, TimeSpan.FromSeconds(30));
-        return new CodeyBoxClient(http, sseHttp: null, lazySseConfig: config);
+        return new CodeyBoxClient(http, sseHttp: null, lazySseConfig: config, config: config);
     }
 
     internal async Task<List<WorkItemDto>> GetWorkItemsAsync(
@@ -46,14 +52,14 @@ internal sealed class CodeyBoxClient
         if (limit is not null) parts.Add($"limit={limit}");
         var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
 
-        var resp = await _http.GetAsync($"/workitems{qs}", ct);
+        var resp = await SendAsync(token => _http.GetAsync($"/workitems{qs}", token), ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.ListWorkItemDto, ct) ?? [];
     }
 
     internal async Task<WorkItemDto?> GetWorkItemAsync(string id, CancellationToken ct = default)
     {
-        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}", ct);
+        var resp = await SendAsync(token => _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}", token), ct);
         if (resp.StatusCode == HttpStatusCode.NotFound) return null;
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct);
@@ -61,21 +67,25 @@ internal sealed class CodeyBoxClient
 
     internal async Task<WorkItemDto> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsJsonAsync("/workitems", req, CliJsonContext.Default.CreateWorkItemRequest, ct);
+        var resp = await SendAsync(
+            token => _http.PostAsJsonAsync("/workitems", req, CliJsonContext.Default.CreateWorkItemRequest, token),
+            ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
     internal async Task<QueueTemplateResponse> QueueTemplateAsync(QueueTemplateRequest req, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsJsonAsync("/templates/queue", req, CliJsonContext.Default.QueueTemplateRequest, ct);
+        var resp = await SendAsync(
+            token => _http.PostAsJsonAsync("/templates/queue", req, CliJsonContext.Default.QueueTemplateRequest, token),
+            ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.QueueTemplateResponse, ct))!;
     }
 
     internal async Task DeleteWorkItemAsync(string id, CancellationToken ct = default)
     {
-        var resp = await _http.DeleteAsync($"/workitems/{Uri.EscapeDataString(id)}", ct);
+        var resp = await SendAsync(token => _http.DeleteAsync($"/workitems/{Uri.EscapeDataString(id)}", token), ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
@@ -101,11 +111,13 @@ internal sealed class CodeyBoxClient
         var path = $"/workitems/{Uri.EscapeDataString(id)}/retry";
         var requestedFrom = string.IsNullOrWhiteSpace(from) ? null : from;
         var resp = requestedFrom is null
-            ? await _http.PostAsync(path, content: null, ct)
-            : await _http.PostAsJsonAsync(
-                path,
-                new RetryRequest { From = requestedFrom },
-                CliJsonContext.Default.RetryRequest,
+            ? await SendAsync(token => _http.PostAsync(path, null, token), ct)
+            : await SendAsync(
+                token => _http.PostAsJsonAsync(
+                    path,
+                    new RetryRequest { From = requestedFrom },
+                    CliJsonContext.Default.RetryRequest,
+                    token),
                 ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
@@ -113,9 +125,11 @@ internal sealed class CodeyBoxClient
 
     internal async Task<string> PostWorkItemVerbAsync(string id, string verb, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsync(
-            $"/workitems/{Uri.EscapeDataString(id)}/{verb}",
-            content: null,
+        var resp = await SendAsync(
+            token => _http.PostAsync(
+                $"/workitems/{Uri.EscapeDataString(id)}/{verb}",
+                null,
+                token),
             ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return await resp.Content.ReadAsStringAsync(ct);
@@ -123,17 +137,19 @@ internal sealed class CodeyBoxClient
 
     internal async Task PauseQueueAsync(string reason, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsJsonAsync(
-            "/queue/pause",
-            new PauseQueueRequest { Reason = reason },
-            CliJsonContext.Default.PauseQueueRequest,
+        var resp = await SendAsync(
+            token => _http.PostAsJsonAsync(
+                "/queue/pause",
+                new PauseQueueRequest { Reason = reason },
+                CliJsonContext.Default.PauseQueueRequest,
+                token),
             ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
     internal async Task ResumeQueueAsync(CancellationToken ct = default)
     {
-        var resp = await _http.PostAsync("/queue/resume", content: null, ct);
+        var resp = await SendAsync(token => _http.PostAsync("/queue/resume", null, token), ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
@@ -148,17 +164,19 @@ internal sealed class CodeyBoxClient
         double? durationSeconds = null,
         CancellationToken ct = default)
     {
-        var resp = await _http.PostAsJsonAsync(
-            AgentPausePath(kind, "pause"),
-            new PauseAgentRequest { Reason = reason, DurationSeconds = durationSeconds },
-            CliJsonContext.Default.PauseAgentRequest,
+        var resp = await SendAsync(
+            token => _http.PostAsJsonAsync(
+                AgentPausePath(kind, "pause"),
+                new PauseAgentRequest { Reason = reason, DurationSeconds = durationSeconds },
+                CliJsonContext.Default.PauseAgentRequest,
+                token),
             ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
     internal async Task ResumeAgentAsync(string kind, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsync(AgentPausePath(kind, "resume"), content: null, ct);
+        var resp = await SendAsync(token => _http.PostAsync(AgentPausePath(kind, "resume"), null, token), ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
@@ -206,18 +224,42 @@ internal sealed class CodeyBoxClient
 
     internal async Task ReorderQueueAsync(string[] ids, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsJsonAsync(
-            "/workitems/reorder",
-            new ReorderRequest { Ids = ids },
-            CliJsonContext.Default.ReorderRequest,
+        var resp = await SendAsync(
+            token => _http.PostAsJsonAsync(
+                "/workitems/reorder",
+                new ReorderRequest { Ids = ids },
+                CliJsonContext.Default.ReorderRequest,
+                token),
             ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
     private async Task<string> GetRawAsync(string path, CancellationToken ct)
     {
-        var resp = await _http.GetAsync(path, ct);
+        var resp = await SendAsync(token => _http.GetAsync(path, token), ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return await resp.Content.ReadAsStringAsync(ct);
+    }
+
+    private async Task<HttpResponseMessage> SendAsync(
+        Func<CancellationToken, Task<HttpResponseMessage>> send,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await send(ct);
+        }
+        catch (HttpRequestException ex) when (_config is not null)
+        {
+            throw new CodeyBoxConnectionException(
+                CliConnectionDiagnostics.FormatConnectionFailure(_config, ex),
+                ex);
+        }
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested && _config is not null)
+        {
+            throw new CodeyBoxConnectionException(
+                CliConnectionDiagnostics.FormatConnectionFailure(_config, ex),
+                ex);
+        }
     }
 }

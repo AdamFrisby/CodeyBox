@@ -12,22 +12,36 @@ internal static class ConfigResolver
 
     internal static string ConfigFilePath => Path.Combine(ConfigDir, "config.json");
 
+    internal static string ApiBaseUrlPrecedence =>
+        $"--api-url flag > CODEYBOX_CLI_API_URL environment variable > {ConfigFilePath} config file > built-in default http://localhost:5036";
+
     internal static ResolvedConfig Resolve(string? flagUrl, string? flagKey)
     {
         var result = new ResolvedConfig();
 
         var fileConfig = LoadConfigFile();
         if (fileConfig?.ApiBaseUrl is { Length: > 0 } fileUrl)
+        {
             result.ApiBaseUrl = fileUrl;
+            result.ApiBaseUrlSource = $"{ConfigFilePath} config file";
+        }
         if (fileConfig?.ApiKey is { Length: > 0 } fileKey)
             result.ApiKey = fileKey;
 
         var envUrl = Environment.GetEnvironmentVariable("CODEYBOX_CLI_API_URL");
-        if (!string.IsNullOrEmpty(envUrl)) result.ApiBaseUrl = envUrl;
+        if (!string.IsNullOrEmpty(envUrl))
+        {
+            result.ApiBaseUrl = envUrl;
+            result.ApiBaseUrlSource = "CODEYBOX_CLI_API_URL environment variable";
+        }
         var envKey = Environment.GetEnvironmentVariable("CODEYBOX_CLI_API_KEY");
         if (!string.IsNullOrEmpty(envKey)) result.ApiKey = envKey;
 
-        if (!string.IsNullOrEmpty(flagUrl)) result.ApiBaseUrl = flagUrl;
+        if (!string.IsNullOrEmpty(flagUrl))
+        {
+            result.ApiBaseUrl = flagUrl;
+            result.ApiBaseUrlSource = "--api-url flag";
+        }
         if (!string.IsNullOrEmpty(flagKey)) result.ApiKey = flagKey;
 
         // Warn when --api-key flag is used: the value appears in the OS process list.
