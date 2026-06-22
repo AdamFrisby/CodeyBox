@@ -23,32 +23,24 @@
     ships the binary as an embedded resource (LogicalName=acp-bridge); the
     runtime path materialises it inside the sandbox and execs it.
 
-    Debug/test builds can embed the tracked Resources/acp-bridge.placeholder
-    when no native resource has been generated. Release/artifact builds invoke
-    scripts/publish-acp-bridge.sh by default, then must embed Resources/acp-
-    bridge; otherwise the build fails rather than shipping an assembly that
-    always degrades ACP to print.
+    Builds embed Resources/acp-bridge when the artifact pipeline has already
+    produced it; otherwise they embed the tracked Resources/acp-bridge.placeholder.
+    Release/provisioning jobs that must fail without a real bridge can set
+    RequireAcpBridgeNativeResource=true. This project deliberately does not
+    run scripts/publish-acp-bridge.sh from an MSBuild target: publishing and
+    in-VM verification belong to the artifact/provisioning boundary, not the
+    agent library build.
   -->
   <PropertyGroup>
     <AcpBridgeResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge</AcpBridgeResourcePath>
     <AcpBridgePlaceholderResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge.placeholder</AcpBridgePlaceholderResourcePath>
-    <PublishAcpBridgeNativeResource Condition="'$(PublishAcpBridgeNativeResource)' == '' and '$(Configuration)' == 'Release'">true</PublishAcpBridgeNativeResource>
-    <PublishAcpBridgeNativeResource Condition="'$(PublishAcpBridgeNativeResource)' == ''">false</PublishAcpBridgeNativeResource>
-    <RequireAcpBridgeNativeResource Condition="'$(RequireAcpBridgeNativeResource)' == '' and '$(Configuration)' == 'Release'">true</RequireAcpBridgeNativeResource>
     <RequireAcpBridgeNativeResource Condition="'$(RequireAcpBridgeNativeResource)' == ''">false</RequireAcpBridgeNativeResource>
   </PropertyGroup>
-
-  <Target Name="PublishAcpBridgeNativeResource"
-          BeforeTargets="PrepareForBuild"
-          Condition="'$(PublishAcpBridgeNativeResource)' == 'true'">
-    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)../.."
-          Command="scripts/publish-acp-bridge.sh" />
-  </Target>
 
   <Target Name="SelectAcpBridgeEmbeddedResource"
           BeforeTargets="AssignTargetPaths">
     <Error Condition="'$(RequireAcpBridgeNativeResource)' == 'true' and !Exists('$(AcpBridgeResourcePath)')"
-           Text="Release builds of CodeyBox.Agents.Claude require a real ACP bridge resource at $(AcpBridgeResourcePath). Run scripts/publish-acp-bridge.sh on a host with musl-tools and Multipass, or leave PublishAcpBridgeNativeResource enabled for Release builds." />
+           Text="RequireAcpBridgeNativeResource=true but no ACP bridge resource exists at $(AcpBridgeResourcePath). Run scripts/publish-acp-bridge.sh in the artifact/provisioning pipeline before building this project with the requirement enabled." />
 
     <ItemGroup Condition="Exists('$(AcpBridgeResourcePath)')">
       <EmbeddedResource Include="$(AcpBridgeResourcePath)"

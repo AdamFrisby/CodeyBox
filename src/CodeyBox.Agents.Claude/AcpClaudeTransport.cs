@@ -91,12 +91,12 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         // fails for any reason (filesystem read-only, sandbox dead) the open
         // surfaces an AcpTransportUnavailableException so the worker can
         // degrade to the print transport on the very first turn.
-        await MaterialiseBridgeAsync(request.Sandbox, ct).ConfigureAwait(false);
+        var bridgePath = await MaterialiseBridgeAsync(request.Sandbox, ct).ConfigureAwait(false);
 
-        return new AcpSession(this, request);
+        return new AcpSession(this, request, bridgePath);
     }
 
-    internal async Task MaterialiseBridgeAsync(ISandbox sandbox, CancellationToken ct)
+    internal async Task<string> MaterialiseBridgeAsync(ISandbox sandbox, CancellationToken ct)
     {
         // Placeholder-build guard: when the build host has not run
         // scripts/publish-acp-bridge.sh, the embedded resource holds the
@@ -124,16 +124,26 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         var encoded = Convert.ToBase64String(bytes);
         const string script =
             "set -eu\n" +
-            "mkdir -p \"$HOME/.codeybox\"\n" +
-            "chmod 700 \"$HOME/.codeybox\"\n" +
-            "base64 -d > \"$HOME/.codeybox/claude-acp-bridge\"\n" +
-            "chmod 700 \"$HOME/.codeybox/claude-acp-bridge\"\n";
+            "target_dir=\"$HOME/.codeybox\"\n" +
+            "target=\"$target_dir/claude-acp-bridge\"\n" +
+            "if [ -L \"$target_dir\" ]; then echo \"refusing symlinked bridge directory: $target_dir\" >&2; exit 1; fi\n" +
+            "if [ -e \"$target_dir\" ] && [ ! -d \"$target_dir\" ]; then echo \"bridge directory path is not a directory: $target_dir\" >&2; exit 1; fi\n" +
+            "mkdir -p \"$target_dir\"\n" +
+            "if [ -L \"$target_dir\" ] || [ ! -d \"$target_dir\" ]; then echo \"bridge directory path is not a real directory: $target_dir\" >&2; exit 1; fi\n" +
+            "chmod 700 \"$target_dir\"\n" +
+            "tmp=$(mktemp \"$target_dir/.claude-acp-bridge.XXXXXX\")\n" +
+            "trap 'rm -f \"$tmp\"' EXIT INT TERM\n" +
+            "base64 -d > \"$tmp\"\n" +
+            "chmod 700 \"$tmp\"\n" +
+            "mv -f -T \"$tmp\" \"$target\"\n" +
+            "trap - EXIT INT TERM\n" +
+            "printf '%s\\n' \"$target\"\n";
         SandboxExecResult result;
         try
         {
             result = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["bash", "-c", script],
+                Argv = ["sh", "-c", script],
                 Stdin = encoded,
             }, ct).ConfigureAwait(false);
         }
@@ -146,19 +156,32 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             throw new AcpTransportUnavailableException(
                 $"failed to write the ACP bridge binary: exit {result.ExitCode}, stderr={result.Stderr}");
         }
+
+        var path = result.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .LastOrDefault();
+        if (string.IsNullOrWhiteSpace(path) || !path.StartsWith("/", StringComparison.Ordinal))
+        {
+            throw new AcpTransportUnavailableException(
+                "failed to resolve materialised ACP bridge path from sandbox output");
+        }
+
+        return path;
     }
 
     internal sealed class AcpSession : ICredentialRefreshableClaudeTransportSession
     {
         private readonly AcpClaudeTransport _transport;
+        private readonly string _bridgePath;
         private ClaudeTransportOpenRequest _open;
         private int _turnIndex;
         private bool _disposed;
 
-        public AcpSession(AcpClaudeTransport transport, ClaudeTransportOpenRequest open)
+        public AcpSession(AcpClaudeTransport transport, ClaudeTransportOpenRequest open, string bridgePath)
         {
             _transport = transport;
             _open = open;
+            _bridgePath = bridgePath;
         }
 
         public async Task<ClaudeTransportTurnResult> SendTurnAsync(
@@ -200,7 +223,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
             var exec = new SandboxExec
             {
-                Argv = ["bash", "-lc", "exec " + AcpBridgeBinary.BridgeBinaryPath],
+                Argv = [_bridgePath],
                 WorkingDirectory = _open.WorkingDirectory,
                 Stdin = stdin,
                 StdoutChunkCallback = aggregator,

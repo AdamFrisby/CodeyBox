@@ -254,9 +254,15 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         {
             AllExecs.Add(exec);
             if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "bash"
-                && exec.Argv[1] == "-lc"
-                && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal))
+                && (exec.Argv[0] == "bash" || exec.Argv[0] == "sh")
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "/home/test/.codeybox/claude-acp-bridge\n", ""));
+            }
+
+            if (exec.Argv.Count == 1
+                && exec.Argv[0].Contains("claude-acp-bridge", StringComparison.Ordinal))
             {
                 BridgeExecs.Add(exec);
                 var stdout = string.Join('\n', new[]

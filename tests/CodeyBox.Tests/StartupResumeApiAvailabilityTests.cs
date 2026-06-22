@@ -181,6 +181,8 @@ public sealed class StartupResumeApiAvailabilityTests
             sw.Stop();
 
             response.EnsureSuccessStatusCode();
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
+                $"GET /quota was blocked for {sw.Elapsed}; hot-reloaded startup resume timeout {reloadedTimeout} should keep API availability under 5s.");
             Assert.True(sw.Elapsed >= reloadedTimeout,
                 $"hot-reloaded Blocking mode was not observed; GET /quota was served before resume timeout {reloadedTimeout}; elapsed {sw.Elapsed}");
         }

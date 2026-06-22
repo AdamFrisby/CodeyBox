@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipelines;
 using System.Net;
@@ -1113,6 +1114,55 @@ public sealed class AcpBridgeUnitTests
             Assert.Equal(0, exitCode);
             Assert.False(File.Exists(lockPath),
                 "Lockfile must be deleted as part of the turn_complete Shutdown.");
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Bridge_RejectsAuthenticatedWebSocketPeerOutsideClaudeProcessTree()
+    {
+        if (!File.Exists("/bin/bash"))
+            return;
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-peer-auth-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle(useProductionPeerAuthorizer: true);
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var authToken = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement
+                .GetProperty("authToken").GetString()!;
+
+            // This test process knows the lockfile token, but it is not the
+            // spawned claude --ide process or one of its descendants. The
+            // bridge must reject it after the WebSocket auth handshake and
+            // must not let it become the active ACP peer.
+            await ctx.ConnectWebSocketAsync(port, authToken);
+            var rejected = await ctx.WaitForEnvelopeAsync("peer_rejected", TimeSpan.FromSeconds(10));
+            Assert.Equal("untrusted_process", rejected.GetProperty("reason").GetString());
+            Assert.Equal(0, ctx.Stdout.CountByType("peer_connected"));
+
+            await Task.Delay(100);
+            Assert.Equal(0, ctx.Stdout.CountByType("turn_complete"));
+
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
         }
         finally
         {
@@ -2350,6 +2400,64 @@ public sealed class AcpBridgeUnitTests
         }
     }
 
+    [Fact]
+    public async Task Bridge_TerminateClaudeProcess_FallsBackToSigkillWhenChildIgnoresSigterm()
+    {
+        if (!File.Exists("/bin/bash"))
+            return;
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-sigkill-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+
+            var pidPath = Path.Combine(tmpDir, "claude.pid");
+            var markerPath = Path.Combine(tmpDir, "sigterm-observed.marker");
+            var stubPath = Path.Combine(tmpDir, "claude-ignore-sigterm-stub.sh");
+
+            File.WriteAllText(stubPath,
+                "#!/bin/bash\n" +
+                "PIDFILE=\"$2\"\n" +
+                "MARKER=\"$3\"\n" +
+                "echo $$ > \"$PIDFILE\"\n" +
+                "trap 'echo \"got-sigterm-but-staying-alive\" > \"$MARKER\"' SIGTERM\n" +
+                "while true; do sleep 60 & wait $!; done\n");
+            File.SetUnixFileMode(stubPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"" + pidPath + "\",\"" + markerPath
+                + "\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":30}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            await ctx.WaitForEnvelopeAsync("ready");
+            for (int i = 0; i < 50 && !File.Exists(pidPath); i++)
+                await Task.Delay(50);
+            Assert.True(File.Exists(pidPath), "SIGKILL fallback fixture did not record a child pid.");
+            var childPid = int.Parse(File.ReadAllText(pidPath).Trim(), CultureInfo.InvariantCulture);
+
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+
+            Assert.True(File.Exists(markerPath),
+                "Fixture child did not observe the initial SIGTERM; this test must exercise the SIGKILL fallback, not a direct kill.");
+            for (int i = 0; i < 50 && Directory.Exists("/proc/" + childPid); i++)
+                await Task.Delay(50);
+            Assert.False(Directory.Exists("/proc/" + childPid),
+                "Child process remained alive after ignoring SIGTERM; TerminateClaudeProcess must fall back to SIGKILL.");
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
     // ── Bridge PosixSignalRegistration handlers (SIGTERM / SIGINT / SIGHUP) ────
     //
     // Commit 8152b99 added PosixSignalRegistration.Create for SIGTERM, SIGINT
@@ -2636,10 +2744,12 @@ public sealed class AcpBridgeUnitTests
         public LineCapturingStream Stdout => _stdout;
         public Bridge Bridge => _bridge;
 
-        public BridgeRunHandle()
+        public BridgeRunHandle(bool useProductionPeerAuthorizer = false)
         {
             _emitterScope = Emitter.OverrideStreamForTests(_stdout);
-            _bridge = new Bridge(_stdinPipe.Reader.AsStream(leaveOpen: true));
+            _bridge = new Bridge(
+                _stdinPipe.Reader.AsStream(leaveOpen: true),
+                peerAuthorizer: useProductionPeerAuthorizer ? null : (_, _) => true);
             _runTask = Task.Run(() => _bridge.RunAsync());
         }
 
@@ -2902,6 +3012,9 @@ for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
 printf '\n' >> "$CALL_LOG"
 publish_dir="src/CodeyBox.Agents.Claude.AcpBridge/bin/Release/net10.0/linux-musl-x64/publish"
 mkdir -p "$publish_dir"
+if [ "${CODEYBOX_TEST_DOTNET_SKIP_OUTPUT:-0}" = "1" ]; then
+    exit 0
+fi
 cat > "$publish_dir/CodeyBox.Agents.Claude.AcpBridge" <<'PY'
 #!/usr/bin/env python3
 import json
@@ -3011,10 +3124,26 @@ if [ "$#" -ge 4 ] && [ "$1" = "exec" ]; then
             ;;
         sh)
             script="$3"
-            target="${script#*cat > \'}"
-            target="${target%%\'*}"
-            cat > "$target"
-            exit 0
+            if [[ "$script" == *"cat > '"* ]]; then
+                target="${script#*cat > \'}"
+                target="${target%%\'*}"
+                cat > "$target"
+                exit 0
+            fi
+            if [[ "$script" == *"python3 "* ]]; then
+                if [ "${CODEYBOX_TEST_MULTIPASS_PYTHON_EXIT:-0}" != "0" ]; then
+                    echo "simulated verifier failure"
+                    exit "$CODEYBOX_TEST_MULTIPASS_PYTHON_EXIT"
+                fi
+                if [ "${CODEYBOX_TEST_MULTIPASS_PYTHON_NO_SUCCESS:-0}" = "1" ]; then
+                    echo "verifier finished without marker"
+                    exit 0
+                fi
+                eval "$script"
+                exit $?
+            fi
+            echo "unexpected sh script: $script" >&2
+            exit 9
             ;;
         python3)
             if [ "${CODEYBOX_TEST_MULTIPASS_PYTHON_EXIT:-0}" != "0" ]; then
@@ -3054,6 +3183,7 @@ exit 9
             ["PATH"] = toolsDir + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
             ["CALL_LOG"] = callLog,
             ["CODEYBOX_TEST_VM_ROOT"] = Path.Combine(Path.GetDirectoryName(callLog)!, "vm"),
+            ["CODEYBOX_CLAUDE_API_KEY"] = "sk-ant-test-verifier",
         };
     }
 
@@ -3263,7 +3393,8 @@ exit 9
             Assert.Contains("ldd", calls, StringComparison.Ordinal);
             Assert.Contains("multipass start cb-baseline-test", calls, StringComparison.Ordinal);
             Assert.Contains("multipass transfer", calls, StringComparison.Ordinal);
-            Assert.Contains("multipass exec cb-baseline-test -- python3", calls, StringComparison.Ordinal);
+            Assert.Contains("multipass exec cb-baseline-test -- sh -c . '", calls, StringComparison.Ordinal);
+            Assert.Contains("python3 '", calls, StringComparison.Ordinal);
             Assert.Contains("claude --version", calls, StringComparison.Ordinal);
             Assert.DoesNotContain("multipass launch", calls, StringComparison.Ordinal);
         }
@@ -3291,6 +3422,33 @@ exit 9
 
             var calls = File.ReadAllText(fixture.CallLog);
             Assert.Contains("ldd", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_MissingPublishedBinaryDoesNotRefreshResource()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_TEST_DOTNET_SKIP_OUTPUT"] = "1";
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath, "--skip-multipass-verify"], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("published binary not found", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath),
+                "A publish run that does not produce the expected binary must not refresh the embedded bridge resource.");
+
+            var calls = File.ReadAllText(fixture.CallLog);
+            Assert.Contains("dotnet publish", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("ldd", calls, StringComparison.Ordinal);
             Assert.DoesNotContain("multipass", calls, StringComparison.Ordinal);
         }
         finally
@@ -3393,7 +3551,7 @@ exit 9
     }
 
     [Fact]
-    public void AcpBridge_ClaudeProject_ReleaseBuildRequiresNativeResource()
+    public void AcpBridge_ClaudeProject_SelectsPreparedResourceOrPlaceholderWithoutPublishing()
     {
         var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
             ?? throw new InvalidOperationException(
@@ -3411,11 +3569,11 @@ exit 9
         var project = XDocument.Parse(csprojText).Root
             ?? throw new InvalidOperationException("Claude csproj has no root element.");
 
-        Assert.Contains("PublishAcpBridgeNativeResource", csprojText);
-        Assert.Contains("'$(Configuration)' == 'Release'\">true</PublishAcpBridgeNativeResource>", csprojText);
-        Assert.Contains("scripts/publish-acp-bridge.sh", csprojText);
+        Assert.DoesNotContain("PublishAcpBridgeNativeResource", csprojText);
+        Assert.DoesNotContain("<Exec", csprojText);
+        Assert.Contains("scripts/publish-acp-bridge.sh in the artifact/provisioning pipeline", csprojText);
         Assert.Contains("RequireAcpBridgeNativeResource", csprojText);
-        Assert.Contains("Release builds of CodeyBox.Agents.Claude require a real ACP bridge resource", csprojText);
+        Assert.Contains("RequireAcpBridgeNativeResource=true but no ACP bridge resource exists", csprojText);
 
         var topLevelEmbeddedResources = project.Elements("ItemGroup")
             .Elements("EmbeddedResource")

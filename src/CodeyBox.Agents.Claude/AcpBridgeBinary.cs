@@ -27,14 +27,6 @@ namespace CodeyBox.Agents.Claude;
 internal static class AcpBridgeBinary
 {
     /// <summary>
-    /// Path inside the sandbox where the orchestrator materialises the
-    /// bridge binary before invoking it. Lives under <c>~/.codeybox</c>
-    /// rather than the workspace so it survives between turns even when
-    /// the workspace is a fresh checkout.
-    /// </summary>
-    public const string BridgeBinaryPath = "$HOME/.codeybox/claude-acp-bridge";
-
-    /// <summary>
     /// Maximum bridge wall-clock per turn. Hard cap on the bridge subprocess
     /// inside the sandbox so a wedged claude / wedged WebSocket cannot pin
     /// the worker forever — the bridge auto-exits, the worker observes the

@@ -178,12 +178,18 @@ public sealed class AuditorParallelismTests : IDisposable
         var item = AuditorTestHelpers.NewItem();
         await tp.Store.CreateAsync(item);
 
+        var sw = Stopwatch.StartNew();
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        sw.Stop();
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
         Assert.Equal(AuditorCount, Volatile.Read(ref maxRunning));
+        var serialDelay = TimeSpan.FromMilliseconds(DelayMs * AuditorCount);
+        var upperBound = TimeSpan.FromMilliseconds(DelayMs * (AuditorCount - 0.25));
+        Assert.True(sw.Elapsed < upperBound,
+            $"Expected three {DelayMs}ms LLM auditors to complete well under their serial delay {serialDelay}; elapsed {sw.Elapsed}");
     }
 }
 

@@ -612,10 +612,12 @@ public sealed class ClaudeAcpTransportTests
         await using var session = await transport.OpenAsync(request, CancellationToken.None);
 
         var materialise = sandbox.AllExecs.Single();
-        Assert.Equal("bash", materialise.Argv[0]);
+        Assert.Equal("sh", materialise.Argv[0]);
         Assert.Equal("-c", materialise.Argv[1]);
-        Assert.Contains("base64 -d > \"$HOME/.codeybox/claude-acp-bridge\"", materialise.Argv[2]);
-        Assert.Contains("chmod 700 \"$HOME/.codeybox/claude-acp-bridge\"", materialise.Argv[2]);
+        Assert.Contains("if [ -L \"$target_dir\" ]", materialise.Argv[2]);
+        Assert.Contains("tmp=$(mktemp \"$target_dir/.claude-acp-bridge.XXXXXX\")", materialise.Argv[2]);
+        Assert.Contains("base64 -d > \"$tmp\"", materialise.Argv[2]);
+        Assert.Contains("mv -f -T \"$tmp\" \"$target\"", materialise.Argv[2]);
         Assert.DoesNotContain(".cjs", materialise.Argv[2]);
         // The base64 payload must travel via Stdin, NOT argv — Linux
         // MAX_ARG_STRLEN caps every argv element at 128 KiB regardless of
@@ -780,9 +782,9 @@ public sealed class ClaudeAcpTransportTests
 
         var bridgeExec = sandbox.BridgeExecs.Single();
         // Native bridge — no .cjs extension, no node argv element.
-        Assert.Contains("$HOME/.codeybox/claude-acp-bridge", bridgeExec.Argv[2]);
-        Assert.DoesNotContain(".cjs", bridgeExec.Argv[2]);
-        Assert.DoesNotContain("node", bridgeExec.Argv[2]);
+        Assert.Equal("/home/test/.codeybox/claude-acp-bridge", bridgeExec.Argv.Single());
+        Assert.DoesNotContain(".cjs", bridgeExec.Argv.Single());
+        Assert.DoesNotContain("node", bridgeExec.Argv.Single());
         Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, bridgeExec.AgentOutputTransport);
 
         // Stdin frames the full envelope sequence: hello → initialize → session/new → session/prompt.
@@ -1059,6 +1061,31 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_NoTurnOutcome_SurfacesAsTransportUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"claude_exit\",\"code\":0,\"signal\":null}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-no-outcome");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("without reporting a turn outcome", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("timed out", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task AcpClaudeTransport_ThinkingBlock400_ReSanitisesAndRetries_Succeeds()
     {
         // Reactive recovery path (lines 164-206 of AcpClaudeTransport):
@@ -1124,6 +1151,37 @@ public sealed class ClaudeAcpTransportTests
         Assert.False(turn.Result.Success);
         Assert.Contains("sanitiser failed", turn.Result.Summary);
         Assert.Single(sandbox.BridgeExecs); // No retry was attempted.
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_ThinkingBlock400_RetryNoTurnOutcome_SurfacesRetryUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}}",
+            "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
+        });
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"claude_exit\",\"code\":0,\"signal\":null}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-retry-no-outcome");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("without reporting a turn outcome on retry", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, sandbox.BridgeExecs.Count);
     }
 
     [Fact]
@@ -1338,37 +1396,37 @@ public sealed class ClaudeAcpTransportTests
             if (exec.Argv.Count == 0)
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
 
-            // Bridge materialise: `bash -c "set -eu\n...base64 -d > ..."`.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal)
+            // Bridge materialise: `sh -c "set -eu\n...base64 -d > ..."`.
+            if (IsShell(exec, "-c") && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal)
                 && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
             {
                 if (FailMaterialise)
                     return Task.FromResult(new SandboxExecResult(1, "", "permission denied"));
-                return Task.FromResult(new SandboxExecResult(0, "", ""));
+                return Task.FromResult(new SandboxExecResult(0, "/home/test/.codeybox/claude-acp-bridge\n", ""));
             }
 
             // Sanitiser discovery: `bash -c "...session_root..."` with no Stdin.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("session_root", StringComparison.Ordinal))
+            if (IsShell(exec, "-c") && exec.Argv[2].Contains("session_root", StringComparison.Ordinal))
             {
                 return Task.FromResult(new SandboxExecResult(0, SanitiserListsFile ?? "", ""));
             }
 
             // Sanitiser read: `bash -c "cat -- \"$1\" ..." _ <path>`.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("cat -- ", StringComparison.Ordinal) && exec.Stdin is null)
+            if (IsShell(exec, "-c") && exec.Argv[2].Contains("cat -- ", StringComparison.Ordinal) && exec.Stdin is null)
             {
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
             // Sanitiser write: `bash -c "cat > \"$1\"" _ <path>` with Stdin.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("cat > ", StringComparison.Ordinal))
+            if (IsShell(exec, "-c") && exec.Argv[2].Contains("cat > ", StringComparison.Ordinal))
             {
                 if (SanitiserFailWrite)
                     return Task.FromResult(new SandboxExecResult(1, "", "no space left on device"));
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
-            // Bridge invocation: `bash -lc "exec $HOME/.codeybox/claude-acp-bridge"`.
-            if (IsBash(exec, "-lc") && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal))
+            // Bridge invocation: direct exec of the resolved materialised path.
+            if (exec.Argv.Count == 1 && exec.Argv[0].Contains("claude-acp-bridge", StringComparison.Ordinal))
             {
                 BridgeExecs.Add(exec);
                 var envelopes = _bridgeOutputs.Count > 0
@@ -1382,8 +1440,10 @@ public sealed class ClaudeAcpTransportTests
             return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
 
-        private static bool IsBash(SandboxExec exec, string flag)
-            => exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == flag;
+        private static bool IsShell(SandboxExec exec, string flag)
+            => exec.Argv.Count >= 3
+               && (exec.Argv[0] == "bash" || exec.Argv[0] == "sh")
+               && exec.Argv[1] == flag;
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
@@ -1418,15 +1478,16 @@ public sealed class ClaudeAcpTransportTests
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            // Materialise script: `bash -c "set -eu\n...base64 -d > ..."`.
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == "-c"
+            // Materialise script: `sh -c "set -eu\n...base64 -d > ..."`.
+            if (exec.Argv.Count >= 3
+                && (exec.Argv[0] == "bash" || exec.Argv[0] == "sh")
+                && exec.Argv[1] == "-c"
                 && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
             {
-                return Task.FromResult(new SandboxExecResult(0, "", ""));
+                return Task.FromResult(new SandboxExecResult(0, "/home/test/.codeybox/claude-acp-bridge\n", ""));
             }
-            // Bridge invocation: `bash -lc "exec $HOME/.codeybox/claude-acp-bridge"`.
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == "-lc"
-                && exec.Argv[2].Contains("claude-acp-bridge", StringComparison.Ordinal))
+            // Bridge invocation: direct exec of the resolved materialised path.
+            if (exec.Argv.Count == 1 && exec.Argv[0].Contains("claude-acp-bridge", StringComparison.Ordinal))
             {
                 throw _toThrowOnBridge;
             }

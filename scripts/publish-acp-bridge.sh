@@ -53,6 +53,21 @@ cleanup()
 }
 trap cleanup EXIT INT TERM
 
+shell_quote()
+{
+    # POSIX single-quote escaping for values written to the VM-side verifier
+    # env file. The file is sourced by /bin/sh inside the temporary verifier
+    # directory, so credentials never need to ride on the multipass argv.
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+write_env_assignment()
+{
+    printf '%s=' "$1"
+    shell_quote "$2"
+    printf '\n'
+}
+
 mkdir -p "$RESOURCE_DIR"
 
 # Remove the old ignored resource before publishing. If dotnet publish or any
@@ -122,6 +137,7 @@ else
     REMOTE_DIR="$(multipass exec "$VERIFY_VM" -- mktemp -d /tmp/codeybox-acp-bridge-verify.XXXXXX)"
     REMOTE="$REMOTE_DIR/acp-bridge"
     REMOTE_VERIFY="$REMOTE_DIR/verify-acp-bridge.py"
+    REMOTE_ENV="$REMOTE_DIR/claude-env.sh"
     multipass transfer "$TMP_RESOURCE" "$VERIFY_VM:$REMOTE"
     multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE"
     multipass exec "$VERIFY_VM" -- sh -c "cat > '$REMOTE_VERIFY'" <<'PY'
@@ -170,6 +186,27 @@ def require_claude_binary():
         fail("real claude --version exited %d; stdout=%s stderr=%s" %
              (version.returncode, version.stdout.strip(), version.stderr.strip()))
     return claude
+
+
+def prepare_claude_auth_files():
+    oauth_json = os.environ.get("CODEYBOX_CLAUDE_OAUTH_JSON")
+    if not oauth_json:
+        return
+    claude_dir = os.path.expanduser("~/.claude")
+    os.makedirs(claude_dir, mode=0o700, exist_ok=True)
+    credentials_path = os.path.join(claude_dir, ".credentials.json")
+    with open(credentials_path, "w", encoding="utf-8") as handle:
+        handle.write(oauth_json)
+    os.chmod(credentials_path, 0o600)
+
+
+def build_claude_env():
+    env = {}
+    for key in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "API_TIMEOUT_MS"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
 
 
 def reader_thread(pipe, output, seen):
@@ -304,6 +341,7 @@ def run_turn(bridge_path, claude_path, session_method, session_id, prompt):
                 "claudeArgs": claude_args,
                 "workingDirectory": work_dir,
                 "lockDir": lock_dir,
+                "claudeEnv": build_claude_env(),
                 "turnTimeoutSeconds": turn_timeout,
             })
             ready = wait_for_type(seen, "ready", 15, stdout_lines)
@@ -373,6 +411,7 @@ def main():
         fail("usage: verify-acp-bridge.py /path/to/acp-bridge")
     bridge_path = sys.argv[1]
     claude_path = require_claude_binary()
+    prepare_claude_auth_files()
     first = run_turn(
         bridge_path,
         claude_path,
@@ -406,7 +445,29 @@ if __name__ == "__main__":
     main()
 PY
     multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE_VERIFY"
-    VERIFY_OUT="$(multipass exec "$VERIFY_VM" -- python3 "$REMOTE_VERIFY" "$REMOTE" 2>&1)" || {
+    if [ -z "${ANTHROPIC_API_KEY:-}" ] \
+        && [ -z "${CODEYBOX_CLAUDE_API_KEY:-}" ] \
+        && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
+        && [ -z "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
+        echo "ERROR: ACP bridge VM verification requires a Claude credential in host env." >&2
+        echo "       Set CODEYBOX_CLAUDE_API_KEY (mapped to ANTHROPIC_API_KEY in the VM), ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CODEYBOX_CLAUDE_OAUTH_JSON." >&2
+        multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
+        exit 1
+    fi
+    {
+        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            write_env_assignment "ANTHROPIC_API_KEY" "$ANTHROPIC_API_KEY"
+        elif [ -n "${CODEYBOX_CLAUDE_API_KEY:-}" ]; then
+            write_env_assignment "ANTHROPIC_API_KEY" "$CODEYBOX_CLAUDE_API_KEY"
+        fi
+        if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            write_env_assignment "CLAUDE_CODE_OAUTH_TOKEN" "$CLAUDE_CODE_OAUTH_TOKEN"
+        fi
+        if [ -n "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
+            write_env_assignment "CODEYBOX_CLAUDE_OAUTH_JSON" "$CODEYBOX_CLAUDE_OAUTH_JSON"
+        fi
+    } | multipass exec "$VERIFY_VM" -- sh -c "umask 077; cat > '$REMOTE_ENV'"
+    VERIFY_OUT="$(multipass exec "$VERIFY_VM" -- sh -c ". '$REMOTE_ENV'; export ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEYBOX_CLAUDE_OAUTH_JSON; python3 '$REMOTE_VERIFY' '$REMOTE'" 2>&1)" || {
         echo "ERROR: ACP bridge end-to-end verification failed inside Multipass VM $VERIFY_VM:" >&2
         echo "$VERIFY_OUT" >&2
         multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true

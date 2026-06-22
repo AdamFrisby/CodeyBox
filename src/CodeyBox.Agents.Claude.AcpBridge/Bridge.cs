@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -20,6 +21,7 @@ internal sealed class Bridge : IAsyncDisposable
 {
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<TcpListener> _listenerFactory;
+    private readonly Func<TcpClient, Process?, bool> _peerAuthorizer;
     private readonly Action<int> _forceExit;
     // _pendingLock guards three things together so DrainPending can observe a
     // consistent snapshot: the outbound queue (_pendingPayloads), the current
@@ -60,6 +62,7 @@ internal sealed class Bridge : IAsyncDisposable
     public Bridge()
     {
         _listenerFactory = CreateLoopbackListener;
+        _peerAuthorizer = PeerProcessAuthorizer.IsTrustedClaudePeer;
         _forceExit = Environment.Exit;
     }
 
@@ -69,18 +72,23 @@ internal sealed class Bridge : IAsyncDisposable
     /// real sandbox. Production binary path always uses the parameterless
     /// constructor which reads from <see cref="Console.OpenStandardInput"/>.
     /// </summary>
-    internal Bridge(Stream stdinForTests, Func<TcpListener>? listenerFactory = null)
-        : this(stdinForTests, listenerFactory, _ => { })
+    internal Bridge(
+        Stream stdinForTests,
+        Func<TcpListener>? listenerFactory = null,
+        Func<TcpClient, Process?, bool>? peerAuthorizer = null)
+        : this(stdinForTests, listenerFactory, _ => { }, peerAuthorizer)
     {
     }
 
     internal Bridge(
         Stream stdinForTests,
         Func<TcpListener>? listenerFactory,
-        Action<int> forceExitForTests)
+        Action<int> forceExitForTests,
+        Func<TcpClient, Process?, bool>? peerAuthorizer = null)
     {
         _stdinOverride = stdinForTests;
         _listenerFactory = listenerFactory ?? CreateLoopbackListener;
+        _peerAuthorizer = peerAuthorizer ?? PeerProcessAuthorizer.IsTrustedClaudePeer;
         _forceExit = forceExitForTests;
     }
 
@@ -262,10 +270,31 @@ internal sealed class Bridge : IAsyncDisposable
             return;
         }
 
+        if (!_peerAuthorizer(client, _claudeProcess))
+        {
+            Emitter.Emit("peer_rejected", w => w.WriteString("reason", "untrusted_process"));
+            try { conn.Close(); } catch { }
+            try { client.Dispose(); } catch { }
+            return;
+        }
+
+        var becameActivePeer = false;
         lock (_pendingLock)
         {
-            _peer = conn;
-            _peerReady = true;
+            if (!_peerReady && _peer is null)
+            {
+                _peer = conn;
+                _peerReady = true;
+                becameActivePeer = true;
+            }
+        }
+
+        if (!becameActivePeer)
+        {
+            Emitter.Emit("peer_rejected", w => w.WriteString("reason", "active_peer_exists"));
+            try { conn.Close(); } catch { }
+            try { client.Dispose(); } catch { }
+            return;
         }
         Emitter.Emit("peer_connected");
         DrainPending();
@@ -797,6 +826,163 @@ internal sealed class Bridge : IAsyncDisposable
             try { _forceExit(_exitCode); }
             catch { }
         });
+    }
+
+    private static class PeerProcessAuthorizer
+    {
+        public static bool IsTrustedClaudePeer(TcpClient client, Process? claudeProcess)
+        {
+            if (!OperatingSystem.IsLinux())
+                return true;
+            if (claudeProcess is null)
+                return false;
+
+            int claudeRootPid;
+            try
+            {
+                if (claudeProcess.HasExited)
+                    return false;
+                claudeRootPid = claudeProcess.Id;
+            }
+            catch
+            {
+                return false;
+            }
+
+            var peerSocketInode = TryFindPeerSocketInode(client);
+            if (peerSocketInode is null)
+                return false;
+
+            foreach (var pid in FindProcessesOwningSocket(peerSocketInode))
+            {
+                if (IsPidOrDescendantOf(pid, claudeRootPid))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static string? TryFindPeerSocketInode(TcpClient client)
+        {
+            if (client.Client.LocalEndPoint is not IPEndPoint bridgeEndPoint
+                || client.Client.RemoteEndPoint is not IPEndPoint peerEndPoint)
+            {
+                return null;
+            }
+
+            return TryFindPeerSocketInodeIn("/proc/net/tcp", bridgeEndPoint, peerEndPoint)
+                   ?? TryFindPeerSocketInodeIn("/proc/net/tcp6", bridgeEndPoint, peerEndPoint);
+        }
+
+        private static string? TryFindPeerSocketInodeIn(
+            string procNetPath,
+            IPEndPoint bridgeEndPoint,
+            IPEndPoint peerEndPoint)
+        {
+            string[] lines;
+            try { lines = File.ReadAllLines(procNetPath); }
+            catch { return null; }
+
+            foreach (var line in lines.Skip(1))
+            {
+                var fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (fields.Length <= 9)
+                    continue;
+                if (!TryParseProcTcpPort(fields[1], out var localPort)
+                    || !TryParseProcTcpPort(fields[2], out var remotePort))
+                {
+                    continue;
+                }
+
+                // From the peer process' point of view, local == the
+                // ephemeral client port and remote == the bridge listener.
+                if (localPort == peerEndPoint.Port && remotePort == bridgeEndPoint.Port)
+                    return fields[9];
+            }
+
+            return null;
+        }
+
+        private static bool TryParseProcTcpPort(string endpoint, out int port)
+        {
+            port = 0;
+            var colon = endpoint.LastIndexOf(':');
+            if (colon < 0 || colon == endpoint.Length - 1)
+                return false;
+            return int.TryParse(
+                endpoint.AsSpan(colon + 1),
+                NumberStyles.HexNumber,
+                CultureInfo.InvariantCulture,
+                out port);
+        }
+
+        private static IEnumerable<int> FindProcessesOwningSocket(string socketInode)
+        {
+            var expectedTarget = "socket:[" + socketInode + "]";
+            string[] procDirs;
+            try { procDirs = Directory.GetDirectories("/proc"); }
+            catch { yield break; }
+
+            foreach (var procDir in procDirs)
+            {
+                var name = Path.GetFileName(procDir);
+                if (!int.TryParse(name, NumberStyles.None, CultureInfo.InvariantCulture, out var pid))
+                    continue;
+
+                var fdDir = Path.Combine(procDir, "fd");
+                string[] fds;
+                try { fds = Directory.GetFiles(fdDir); }
+                catch { continue; }
+
+                foreach (var fd in fds)
+                {
+                    string? target;
+                    try { target = new FileInfo(fd).LinkTarget; }
+                    catch { continue; }
+                    if (string.Equals(target, expectedTarget, StringComparison.Ordinal))
+                    {
+                        yield return pid;
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static bool IsPidOrDescendantOf(int pid, int ancestorPid)
+        {
+            var seen = new HashSet<int>();
+            var current = pid;
+            while (current > 1 && seen.Add(current))
+            {
+                if (current == ancestorPid)
+                    return true;
+                var parent = TryReadParentPid(current);
+                if (parent is null)
+                    return false;
+                current = parent.Value;
+            }
+
+            return false;
+        }
+
+        private static int? TryReadParentPid(int pid)
+        {
+            string stat;
+            try { stat = File.ReadAllText(Path.Combine("/proc", pid.ToString(CultureInfo.InvariantCulture), "stat")); }
+            catch { return null; }
+
+            var closeParen = stat.LastIndexOf(')');
+            if (closeParen < 0 || closeParen + 2 >= stat.Length)
+                return null;
+
+            var fields = stat[(closeParen + 2)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length < 2)
+                return null;
+
+            return int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var ppid)
+                ? ppid
+                : null;
+        }
     }
 
     private static class NativeMethods
