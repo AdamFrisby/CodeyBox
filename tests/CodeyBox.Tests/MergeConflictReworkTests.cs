@@ -267,8 +267,9 @@ public sealed class MergeConflictReworkTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
-        var sandboxProvider = new ConflictReworkLsFilesMalformedSandboxProvider(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var sandboxProvider = new ConflictReworkLsFilesSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            new SandboxExecResult(0, "not-a-git-record\0", ""));
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
@@ -287,6 +288,36 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Equal(1, final.ConflictReworkAttempts);
         Assert.Contains("could not inspect sandbox conflict files", final.LastError, StringComparison.Ordinal);
         Assert.Contains("malformed git ls-files -u output segment", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(1, sandboxProvider.InterceptedLsFilesCalls);
+        Assert.Empty(tp.Agent.ConflictReworkPrompts);
+    }
+
+    [Fact]
+    public async Task ConflictRework_EmptySandboxLsFilesOutput_FailsBeforePromptWithExactReason()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var sandboxProvider = new ConflictReworkLsFilesSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            new SandboxExecResult(0, "", ""));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            sandboxProvider: sandboxProvider);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        const string failureReason = "rebase failed but git ls-files reported no unmerged paths";
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(1, final.ConflictReworkAttempts);
+        Assert.Equal($"conflict-rework agent did not produce a clean resolution: {failureReason}", final.LastError);
         Assert.Equal(1, sandboxProvider.InterceptedLsFilesCalls);
         Assert.Empty(tp.Agent.ConflictReworkPrompts);
     }
@@ -1225,12 +1256,17 @@ public sealed class MergeConflictReworkTests : IDisposable
                 $"sandbox write failed (exit {r.ExitCode}) for {relPath}: {r.Stderr}");
     }
 
-    private sealed class ConflictReworkLsFilesMalformedSandboxProvider : ISandboxProvider
+    private sealed class ConflictReworkLsFilesSandboxProvider : ISandboxProvider
     {
         private readonly ISandboxProvider _inner;
+        private readonly SandboxExecResult _response;
         public int InterceptedLsFilesCalls { get; private set; }
 
-        public ConflictReworkLsFilesMalformedSandboxProvider(ISandboxProvider inner) => _inner = inner;
+        public ConflictReworkLsFilesSandboxProvider(ISandboxProvider inner, SandboxExecResult response)
+        {
+            _inner = inner;
+            _response = response;
+        }
 
         public string Name => _inner.Name;
         public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
@@ -1240,7 +1276,7 @@ public sealed class MergeConflictReworkTests : IDisposable
         {
             var sandbox = await _inner.CreateAsync(spec, ct);
             return string.Equals(spec.TimingPhase, PipelineRunner.ConflictReworkPhaseKey, StringComparison.Ordinal)
-                ? new ConflictReworkLsFilesMalformedSandbox(sandbox, () => InterceptedLsFilesCalls++)
+                ? new ConflictReworkLsFilesSandbox(sandbox, _response, () => InterceptedLsFilesCalls++)
                 : sandbox;
         }
 
@@ -1251,14 +1287,16 @@ public sealed class MergeConflictReworkTests : IDisposable
             _inner.DisposeLeakedAsync(name, ct);
     }
 
-    private sealed class ConflictReworkLsFilesMalformedSandbox : ISandbox
+    private sealed class ConflictReworkLsFilesSandbox : ISandbox
     {
         private readonly ISandbox _inner;
+        private readonly SandboxExecResult _response;
         private readonly Action _onIntercept;
 
-        public ConflictReworkLsFilesMalformedSandbox(ISandbox inner, Action onIntercept)
+        public ConflictReworkLsFilesSandbox(ISandbox inner, SandboxExecResult response, Action onIntercept)
         {
             _inner = inner;
+            _response = response;
             _onIntercept = onIntercept;
         }
 
@@ -1271,7 +1309,7 @@ public sealed class MergeConflictReworkTests : IDisposable
             if (IsUnmergedLsFilesCommand(exec))
             {
                 _onIntercept();
-                return Task.FromResult(new SandboxExecResult(0, "not-a-git-record\0", ""));
+                return Task.FromResult(_response);
             }
 
             return _inner.ExecAsync(exec, ct);

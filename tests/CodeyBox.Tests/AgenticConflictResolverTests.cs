@@ -913,6 +913,34 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task FinalizeConflictResolutionAsync_WrapsLsFilesInspectorFailure()
+    {
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, "resolved content\n");
+        sandbox.LsFilesResponseQueue.Enqueue(new SandboxExecResult(
+            128,
+            "",
+            "fatal: index corrupted"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            PipelineRunner.FinalizeConflictResolutionAsync(
+                sandbox,
+                [new ConflictHunk(path, StartLine: 1, EndLine: 3)],
+                "codeybox/work",
+                "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+                CancellationToken.None));
+
+        var inspectorFailure = Assert.IsType<MergeConflictResolutionFailedException>(ex.InnerException);
+        Assert.Equal(inspectorFailure.Message, ex.Message);
+        Assert.Contains(
+            "failed to inspect unmerged paths: fatal: index corrupted",
+            ex.Message,
+            StringComparison.Ordinal);
+        Assert.Equal(1, sandbox.LsFilesCallCount);
+    }
+
+    [Fact]
     public void ParseUnmergedPathsFromLsFilesStdout_IgnoresPrefixedMultipassStartupNoise()
     {
         const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
