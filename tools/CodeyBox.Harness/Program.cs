@@ -16,7 +16,9 @@ public static class Program
     public const int ExitUsage = 2;
     public const int ExitLaunchFailed = 1;
 
-    public static async Task<int> Main(string[] args)
+    private static Task<int> Main(string[] args) => RunAsync(args);
+
+    public static async Task<int> RunAsync(string[] args)
     {
         if (args.Length == 0 || args is ["-h"] or ["--help"] or ["help"])
         {

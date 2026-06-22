@@ -37,7 +37,7 @@ public sealed class HarnessProgramTests
         Assert.Equal(1, HarnessProgram.ExitLaunchFailed);
     }
 
-    // ── Main dispatcher ───────────────────────────────────────────────────────
+    // ── Top-level dispatcher ─────────────────────────────────────────────────
 
     public static TheoryData<string[]> HelpOrEmptyMainArgs
     {
@@ -54,16 +54,16 @@ public sealed class HarnessProgramTests
 
     [Theory]
     [MemberData(nameof(HelpOrEmptyMainArgs))]
-    public async Task Main_HelpOrEmptyArgs_ReturnsUsageExit(string[] args)
+    public async Task RunAsync_HelpOrEmptyArgs_ReturnsUsageExit(string[] args)
     {
-        var rc = await HarnessProgram.Main(args);
+        var rc = await HarnessProgram.RunAsync(args);
         Assert.Equal(HarnessProgram.ExitUsage, rc);
     }
 
     [Fact]
-    public async Task Main_UnknownTopLevelCommand_ReturnsUsageExit()
+    public async Task RunAsync_UnknownTopLevelCommand_ReturnsUsageExit()
     {
-        var rc = await HarnessProgram.Main(["bogus-command"]);
+        var rc = await HarnessProgram.RunAsync(["bogus-command"]);
         Assert.Equal(HarnessProgram.ExitUsage, rc);
     }
 
