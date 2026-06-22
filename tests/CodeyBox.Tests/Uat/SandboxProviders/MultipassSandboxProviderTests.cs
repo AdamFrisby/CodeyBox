@@ -1176,6 +1176,19 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void BuildDetachedLaunchScript_RejectsNonPositiveMarkerWaitSeconds()
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => MultipassSandbox.BuildDetachedLaunchScript(
+            "/home/ubuntu/.codeybox-exec-env/env",
+            "/home/ubuntu/.codeybox-exec/detached.pgid",
+            null,
+            ["/bin/sh", "-c", "printf should-not-run"],
+            markerWaitSeconds: 0));
+
+        Assert.Equal("markerWaitSeconds", ex.ParamName);
+    }
+
+    [Fact]
     public async Task BuildDetachedLaunchScript_ScrubsOutputEnvironmentFromDetachedChild()
     {
         if (OperatingSystem.IsWindows())
@@ -1285,7 +1298,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task BuildDetachedLaunchScript_PreflightDoesNotWaitForHttpResponse()
+    public async Task BuildDetachedLaunchScript_PreflightRejectsListenerWithoutReadyProtocol()
     {
         if (OperatingSystem.IsWindows())
             return;
@@ -1338,11 +1351,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 environmentOverrides: FakeSudoPathEnvironment());
             sw.Stop();
 
-            Assert.Equal(0, exit);
-            Assert.Equal("", stderr);
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2.5), $"detached launch waited for HTTP response for {sw.Elapsed}");
-            await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(3));
-            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(3));
+            Assert.Equal(86, exit);
+            Assert.Contains("agent output HTTP ingest unavailable before launch", stderr, StringComparison.Ordinal);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"detached launch waited too long for HTTP readiness for {sw.Elapsed}");
+            Assert.False(File.Exists(doneFile));
+            Assert.False(File.Exists(processGroupMarker));
         }
         finally
         {
@@ -1350,6 +1363,44 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             listener.Stop();
             await acceptTask;
         }
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_PreflightRejectsMalformedHttpIngestUrlBeforeLaunch()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-malformed-ready.env");
+        var commandScript = Path.Combine(_workspace, "detached-malformed-ready-command.sh");
+        var launchScript = Path.Combine(_workspace, "detached-malformed-ready-launch.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-malformed-ready.pgid");
+        var doneFile = Path.Combine(_workspace, "detached-malformed-ready.done");
+        await File.WriteAllTextAsync(
+            envFile,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = "http://",
+                [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "stream-token",
+                [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "malformed-ready",
+            }));
+        await File.WriteAllTextAsync(commandScript, "printf done > \"$1\"\n");
+        File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var (exit, stdout, stderr) = await RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            environmentOverrides: FakeSudoPathEnvironment());
+
+        Assert.Equal(86, exit);
+        Assert.Equal("", stdout);
+        Assert.Contains("agent output HTTP ingest unavailable before launch", stderr, StringComparison.Ordinal);
+        Assert.False(File.Exists(doneFile));
+        Assert.False(File.Exists(processGroupMarker));
     }
 
     [Fact]
