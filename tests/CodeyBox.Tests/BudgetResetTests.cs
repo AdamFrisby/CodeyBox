@@ -9,6 +9,7 @@ namespace CodeyBox.Tests;
 /// rolling window are excluded from the count, making deferred items eligible
 /// once the window advances.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class BudgetResetTests : IDisposable
 {
     private static readonly TimeSpan DispatchObservationTimeout = TimeSpan.FromSeconds(15);

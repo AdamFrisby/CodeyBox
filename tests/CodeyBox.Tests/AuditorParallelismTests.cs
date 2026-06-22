@@ -130,8 +130,8 @@ file sealed class CapturingAuditReportStore : IAuditReportStore
 
 /// <summary>
 /// Three slow fake LLM auditors each delay 1 500 ms.
-/// Running them in parallel the total wall-clock must be well under the 4 500 ms
-/// that sequential execution would require.
+/// Running them in parallel means all three auditor bodies are in flight at
+/// once, regardless of unrelated sandbox/git scheduler noise around the batch.
 /// </summary>
 public sealed class AuditorParallelismTests : IDisposable
 {
@@ -146,12 +146,15 @@ public sealed class AuditorParallelismTests : IDisposable
         const int AuditorCount = 3;
         var running = 0;
         var maxRunning = 0;
+        long firstAuditorStartTimestamp = 0;
+        long lastAuditorFinishTimestamp = 0;
 
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditors = Enumerable.Range(0, AuditorCount)
             .Select(i => new FakeLlmAuditor($"slow-{i}", async (_, _, ct) =>
             {
                 var current = Interlocked.Increment(ref running);
+                Interlocked.CompareExchange(ref firstAuditorStartTimestamp, Stopwatch.GetTimestamp(), 0);
                 int observed;
                 do
                 {
@@ -167,7 +170,8 @@ public sealed class AuditorParallelismTests : IDisposable
                 }
                 finally
                 {
-                    Interlocked.Decrement(ref running);
+                    if (Interlocked.Decrement(ref running) == 0)
+                        Volatile.Write(ref lastAuditorFinishTimestamp, Stopwatch.GetTimestamp());
                 }
             }))
             .ToArray();
@@ -178,24 +182,22 @@ public sealed class AuditorParallelismTests : IDisposable
         var item = AuditorTestHelpers.NewItem();
         await tp.Store.CreateAsync(item);
 
-        var sw = Stopwatch.StartNew();
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
-        sw.Stop();
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
-        // The real proof of parallelism is that all three auditors were in
-        // flight at the same time. The wall-clock check is a coarse guard
-        // against accidentally adding large serial work around the parallel
-        // section; under heavy CI/sandbox load scheduler noise can push the
-        // measured elapsed time well past the nominal DelayMs (observed
-        // ~30s in iteration-10 audit runs on the shared host), so allow
-        // very generous headroom — the maxRunning assertion above is what
-        // actually catches a regression from parallel to serial.
         Assert.Equal(AuditorCount, Volatile.Read(ref maxRunning));
-        Assert.True(sw.ElapsedMilliseconds < AuditorCount * DelayMs * 12,
-            $"Expected wall-clock near parallel execution but got {sw.ElapsedMilliseconds} ms");
+        var firstAuditorStart = Volatile.Read(ref firstAuditorStartTimestamp);
+        var lastAuditorFinish = Volatile.Read(ref lastAuditorFinishTimestamp);
+        Assert.True(firstAuditorStart > 0, "Expected at least one LLM auditor to start.");
+        Assert.True(lastAuditorFinish >= firstAuditorStart, "Expected LLM auditor completion to be observed.");
+
+        var elapsedAuditorWindow = Stopwatch.GetElapsedTime(firstAuditorStart, lastAuditorFinish);
+        var serialDelay = TimeSpan.FromMilliseconds(DelayMs * AuditorCount);
+        var upperBound = TimeSpan.FromMilliseconds(DelayMs * (AuditorCount - 0.25));
+        Assert.True(elapsedAuditorWindow < upperBound,
+            $"Expected three {DelayMs}ms LLM auditors to complete well under their serial delay {serialDelay}; elapsed {elapsedAuditorWindow}");
     }
 }
 

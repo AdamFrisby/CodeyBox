@@ -12,6 +12,7 @@ namespace CodeyBox.Tests;
 /// exhausted (below threshold) and Codex is available. Verifies that the
 /// item is dispatched to Codex, not Claude.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class PipelineRunnerRoutingTests : IDisposable
 {
     private readonly string _dbPath =

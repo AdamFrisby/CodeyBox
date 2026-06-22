@@ -25,3 +25,7 @@ obj/
 # `dotnet test --logger trx` writes per-run result files here; they're
 # time/machine-stamped and not meant to be committed.
 **/TestResults/
+
+# ACP bridge native binary is intentionally tracked. It is produced by
+# scripts/publish-acp-bridge.sh as a static linux-musl-x64 artifact and embedded
+# by CodeyBox.Agents.Claude so ACP is usable without an out-of-band publish job.

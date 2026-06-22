@@ -1,0 +1,73 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ACP bridge native sidecar. Compiles to a self-contained, statically-linked
+    ELF binary that ships into the sandbox VM and replaces the prior Node.js
+    bridge (see AcpBridgeBinary.cs / AcpClaudeTransport.cs in the parent
+    CodeyBox.Agents.Claude project).
+
+    Build prerequisites for `dotnet publish`:
+      - musl-tools (for the musl static linker the AOT publish step invokes).
+      - clang (NativeAOT passes the x86_64-linux-musl target flag).
+      - lld (the GNU bfd linker asserts on this static musl link).
+      - The linux-musl-x64 ILCompiler runtime nuget package is restored
+        on demand.
+
+    The IL build is used by unit tests. Release/artifact hosts run
+    scripts/publish-acp-bridge.sh to produce the static binary, verify it in a
+    Multipass VM, and refresh the embedded resource carried by
+    CodeyBox.Agents.Claude.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>CodeyBox.Agents.Claude.AcpBridge</RootNamespace>
+    <AssemblyName>CodeyBox.Agents.Claude.AcpBridge</AssemblyName>
+
+    <!-- AOT settings honoured by `dotnet publish` only.
+         StaticExecutable is the documented NativeAOT MSBuild property for
+         producing a fully statically-linked binary against musl on the
+         linux-musl-x64 RID. Verify with `file` (advertises "statically linked")
+         and `ldd` ("not a dynamic executable") after running
+         scripts/publish-acp-bridge.sh. -->
+    <PublishAot>true</PublishAot>
+    <StaticExecutable>true</StaticExecutable>
+    <LinkerFlavor>lld</LinkerFlavor>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <StripSymbols>true</StripSymbols>
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+    <IlcOptimizationPreference>Size</IlcOptimizationPreference>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+
+    <!-- Reflection-free JSON: source-generation only. -->
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+
+    <!-- The solution-wide warnings-as-errors settings come from
+         Directory.Build.props. Keep nullable + analysis on so any port bug
+         that survives the JS → C# rewrite gets caught by the analyser. -->
+  </PropertyGroup>
+
+  <!--
+    StaticExecutable=true together with PublishAot=true produces a fully-
+    statically-linked ELF that has NO dlopen / dynamic-loader support at
+    runtime. The default NativeAOT PInvoke resolver path is `dlopen("libc.so")`
+    on first call — which throws DllNotFoundException in a fully-static
+    binary. Bridge.NativeMethods.Kill (the libc kill(2) we P/Invoke for
+    the polite SIGTERM-then-grace-then-SIGKILL teardown of the claude IDE
+    subprocess) would therefore silently regress to bare Process.Kill
+    (SIGKILL only), re-introducing the thinking-block-immutability 400
+    cluster the polite SIGTERM fix was specifically added to prevent.
+
+    DirectPInvoke tells the NativeAOT compiler to resolve the libc PInvoke
+    at link time (no runtime dlopen). Do NOT add NativeLibrary Include="libc":
+    on Unix NativeAOT passes NativeLibrary items to the linker as raw file
+    inputs, not as -l flags, so "libc" would be treated as a missing file. The
+    musl C runtime is linked by the linux-musl-x64 toolchain/default startup.
+  -->
+  <ItemGroup>
+    <DirectPInvoke Include="libc" />
+  </ItemGroup>
+
+</Project>

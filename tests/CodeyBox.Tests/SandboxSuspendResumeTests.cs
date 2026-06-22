@@ -16,6 +16,7 @@ namespace CodeyBox.Tests;
 /// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/> and clears the
 /// bookkeeping. The leak reaper skips VMs named in the suspended set.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class SandboxSuspendResumeTests : IDisposable
 {
     private readonly string _dbPath =
@@ -66,8 +67,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     {
         // The slack here covers fixed-cost overhead unrelated to the timeout
         // itself: starting the dedicated LongRunning thread for the resume
-        // task, the post-cancellation ObserveProviderTaskAfterCancellationAsync
-        // 250ms grace, and the SQLite UPDATE that records the Failed state.
+        // task, scheduling the post-cancellation observation continuation, and
+        // the SQLite UPDATE that records the Failed state.
         // Under CI load each of these can dilate non-trivially. The bound is
         // generous enough that genuine timeout regressions (resume that never
         // honors the configured cap) still fall well outside it.
@@ -729,6 +730,55 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
             && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
         AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
+    }
+
+    [Theory]
+    [InlineData("fault")]
+    [InlineData("cancel")]
+    public async Task StartupResume_LateProviderTaskCompletionAfterTimeout_IsObservedAndLogged(string completion)
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-late-" + completion,
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var resumeRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = new FakeSuspendingProvider
+        {
+            ResumeReleaseSources = new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal)
+            {
+                ["vm-late-" + completion] = resumeRelease,
+            },
+        };
+        var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            log,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+
+        if (completion == "fault")
+        {
+            resumeRelease.SetException(new InvalidOperationException("late provider fault"));
+            await WaitUntilAsync(() => log.Entries.Any(entry =>
+                entry.Level == LogLevel.Warning
+                && entry.Message.Contains("Provider task faulted after startup resume timeout/cancellation", StringComparison.Ordinal)
+                && entry.Exception is InvalidOperationException ex
+                && ex.Message == "late provider fault"));
+        }
+        else
+        {
+            resumeRelease.SetCanceled();
+            await WaitUntilAsync(() => log.Entries.Any(entry =>
+                entry.Level == LogLevel.Debug
+                && entry.Message.Contains("Provider task observed cancellation after startup resume timeout/cancellation", StringComparison.Ordinal)));
+        }
     }
 
     [Fact]

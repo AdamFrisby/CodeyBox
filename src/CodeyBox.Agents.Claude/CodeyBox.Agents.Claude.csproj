@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
@@ -14,6 +14,45 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <!--
+    ACP bridge native binary. The bridge is produced by the sibling
+    CodeyBox.Agents.Claude.AcpBridge project as a self-contained, statically-
+    linked NativeAOT ELF and copied into Resources/acp-bridge by
+    scripts/publish-acp-bridge.sh. The Claude orchestrator-side assembly
+    ships the binary as an embedded resource (LogicalName=acp-bridge); the
+    runtime path materialises it inside the sandbox and execs it.
+
+    Release builds require Resources/acp-bridge by default. Dev/test builds
+    that are intentionally exercising placeholder behavior may opt out by
+    setting RequireAcpBridgeNativeResource=false; deployable builds must not do
+    so. This project deliberately does not run scripts/publish-acp-bridge.sh
+    from an MSBuild target: publishing and in-VM verification belong to the
+    artifact/provisioning boundary, not the agent library build.
+  -->
+  <PropertyGroup>
+    <AcpBridgeResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge</AcpBridgeResourcePath>
+    <AcpBridgePlaceholderResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge.placeholder</AcpBridgePlaceholderResourcePath>
+    <RequireAcpBridgeNativeResource Condition="'$(RequireAcpBridgeNativeResource)' == '' and '$(Configuration)' == 'Release'">true</RequireAcpBridgeNativeResource>
+    <RequireAcpBridgeNativeResource Condition="'$(RequireAcpBridgeNativeResource)' == ''">false</RequireAcpBridgeNativeResource>
+  </PropertyGroup>
+
+  <Target Name="SelectAcpBridgeEmbeddedResource"
+          BeforeTargets="AssignTargetPaths">
+    <Error Condition="'$(RequireAcpBridgeNativeResource)' == 'true' and !Exists('$(AcpBridgeResourcePath)')"
+           Text="RequireAcpBridgeNativeResource=true but no ACP bridge resource exists at $(AcpBridgeResourcePath). Run scripts/publish-acp-bridge.sh in the artifact/provisioning pipeline before building this project with the requirement enabled." />
+
+    <ItemGroup Condition="Exists('$(AcpBridgeResourcePath)')">
+      <EmbeddedResource Include="$(AcpBridgeResourcePath)"
+                        LogicalName="acp-bridge"
+                        Link="Resources/acp-bridge" />
+    </ItemGroup>
+    <ItemGroup Condition="!Exists('$(AcpBridgeResourcePath)') and '$(RequireAcpBridgeNativeResource)' != 'true'">
+      <EmbeddedResource Include="$(AcpBridgePlaceholderResourcePath)"
+                        LogicalName="acp-bridge"
+                        Link="Resources/acp-bridge.placeholder" />
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <InternalsVisibleTo Include="CodeyBox.Tests" />

@@ -27,6 +27,17 @@ public sealed class AgentConfigHotReloadTests
     private static readonly AgentKind Claude = AgentKind.Claude;
     private static readonly AgentKind Codex = AgentKind.Codex;
 
+    // Non-placeholder bridge bytes for tests that drive AcpClaudeTransport.OpenAsync —
+    // the production placeholder gate would otherwise short-circuit before the
+    // assertions get a chance to run.
+    private static readonly byte[] AcpBridgeTestBytes =
+        new byte[] { 0x7f, (byte)'E', (byte)'L', (byte)'F', 0x02, 0x01, 0x01, 0x00, 0xde, 0xad, 0xbe, 0xef };
+
+    private const string AcpBridgeSuccessfulTurnOutput =
+        "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-hot-reload\"}}}\n" +
+        "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}\n" +
+        "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}\n";
+
     [Fact]
     public void Constructor_WithCalculatorButWithoutPricingState_Throws()
     {
@@ -2865,9 +2876,10 @@ public sealed class AgentConfigHotReloadTests
         var transport = new AcpClaudeTransport(snapshot)
         {
             ClaudeBinary = "/opt/claude-test/claude",
+            BridgeBinaryOverride = AcpBridgeTestBytes,
         };
 
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AcpBridgeCapturingSandbox();
         var openRequest = new ClaudeTransportOpenRequest(
             Sandbox: sandbox,
             WorkingDirectory: "/work",
@@ -2896,8 +2908,8 @@ public sealed class AgentConfigHotReloadTests
     {
         var snapshot = new AgentNetworkToleranceSnapshot(
             new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase));
-        var transport = new AcpClaudeTransport(snapshot);
-        var sandbox = new CapturingSandbox();
+        var transport = new AcpClaudeTransport(snapshot) { BridgeBinaryOverride = AcpBridgeTestBytes };
+        var sandbox = new AcpBridgeCapturingSandbox();
         var openRequest = new ClaudeTransportOpenRequest(
             Sandbox: sandbox,
             WorkingDirectory: "/work",
@@ -3007,6 +3019,29 @@ public sealed class AgentConfigHotReloadTests
 
         Assert.True(index > 0, $"argv must contain '{expected}' after a -c flag");
         Assert.Equal("-c", argv[index - 1]);
+    }
+
+    private sealed class AcpBridgeCapturingSandbox : ISandbox
+    {
+        public string Id { get; } = "vm-acp-hot-reload-" + Guid.NewGuid().ToString("N")[..8];
+        public SandboxExec? CapturedExec { get; private set; }
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 3
+                && (exec.Argv[0] == "bash" || exec.Argv[0] == "sh")
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains(AcpClaudeTransport.BridgePayloadEndMarker, StringComparison.Ordinal))
+            {
+                CapturedExec = exec;
+                exec.StdoutChunkCallback?.Invoke(AcpBridgeSuccessfulTurnOutput);
+                return Task.FromResult(new SandboxExecResult(0, AcpBridgeSuccessfulTurnOutput, ""));
+            }
+
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class ManualOptionsMonitor<T> : IOptionsMonitor<T>

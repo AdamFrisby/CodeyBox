@@ -5,6 +5,9 @@
 #   CODEYBOX_CLAUDE_API_KEY, CODEYBOX_CODEX_API_KEY, CODEYBOX_GEMINI_API_KEY
 #   CODEYBOX_CURSOR_AUTH_JSON or CODEYBOX_CURSOR_AUTH_FILE on the runner
 #   CODEYBOX_OPENCODE_AUTH_FILE (or OPENCODE_AUTH_JSON)
+#   CODEYBOX_ACP_BRIDGE_VERIFY_VM repository variable naming an already-baked
+#   CodeyBox baseline VM; the workflow clones it and verifies the ACP bridge on
+#   that disposable clone.
 #
 # The job host must have multipass installed and passwordless access to launch VMs.
 
@@ -37,11 +40,36 @@ jobs:
       CODEYBOX_GEMINI_API_KEY: ${{ secrets.CODEYBOX_GEMINI_API_KEY }}
       CODEYBOX_CURSOR_AUTH_JSON: ${{ secrets.CODEYBOX_CURSOR_AUTH_JSON }}
       CODEYBOX_OPENCODE_AUTH_FILE: ${{ secrets.CODEYBOX_OPENCODE_AUTH_FILE }}
+      CODEYBOX_ACP_BRIDGE_VERIFY_SOURCE_VM: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM }}
     steps:
       - uses: actions/checkout@v4
 
       - name: multipass version
         run: multipass version
+
+      - name: prepare ACP bridge verifier VM
+        run: |
+          set -euo pipefail
+          source_vm="${CODEYBOX_ACP_BRIDGE_VERIFY_SOURCE_VM:-}"
+          if [ -z "$source_vm" ]; then
+            echo "::error::Set the CODEYBOX_ACP_BRIDGE_VERIFY_VM repository variable to an allowlisted baseline VM." >&2
+            exit 1
+          fi
+
+          verify_vm="cb-acp-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "CODEYBOX_ACP_BRIDGE_VERIFY_VM=$verify_vm" >> "$GITHUB_ENV"
+          multipass delete --purge "$verify_vm" >/dev/null 2>&1 || true
+          multipass clone "$source_vm" --name "$verify_vm"
+          multipass start "$verify_vm"
+
+      - name: publish ACP bridge
+        run: |
+          set -euo pipefail
+          if ! command -v musl-gcc >/dev/null || ! command -v clang >/dev/null || ! command -v ld.lld >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools clang lld
+          fi
+          scripts/publish-acp-bridge.sh
 
       - name: build
         run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release
@@ -53,6 +81,14 @@ jobs:
             --no-build \
             --filter "Category=AgentSuspendResilience" \
             --logger "trx;LogFileName=agent-suspend-resilience.trx"
+
+      - name: cleanup ACP bridge verifier VM
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${CODEYBOX_ACP_BRIDGE_VERIFY_VM:-}" ]; then
+            multipass delete --purge "$CODEYBOX_ACP_BRIDGE_VERIFY_VM" >/dev/null 2>&1 || true
+          fi
 
       - name: upload trx
         if: always()

@@ -12,6 +12,7 @@ namespace CodeyBox.Tests;
 /// - A deprecation warning is emitted
 /// - The resulting pool actually enforces the configured concurrency
 /// </summary>
+[Collection("Background service timing")]
 public sealed class WorkerPoolLegacyConcurrencyKeyTests : IDisposable
 {
     private readonly string _dbPath =

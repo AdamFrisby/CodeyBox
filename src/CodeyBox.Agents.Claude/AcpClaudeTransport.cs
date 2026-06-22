@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Core;
@@ -6,7 +7,7 @@ namespace CodeyBox.Agents.Claude;
 
 /// <summary>
 /// Agent Client Protocol transport. Each turn runs the in-sandbox
-/// <see cref="AcpBridgeScript"/> bridge under a single
+/// <see cref="AcpBridgeBinary"/> native bridge under a single
 /// <c>sandbox.ExecAsync</c>: the bridge stands up an IDE-shaped lockfile +
 /// WebSocket, spawns <c>claude --ide</c> (interactive — OFF the
 /// <c>--print</c> metered pool), proxies JSON-RPC 2.0 frames between the
@@ -32,6 +33,8 @@ namespace CodeyBox.Agents.Claude;
 public sealed class AcpClaudeTransport : IClaudeTransport
 {
     internal const int ApiTimeoutBridgeMarginSeconds = 30;
+    internal const string BridgePayloadEndMarker = "__CODEYBOX_ACP_BRIDGE_PAYLOAD_END__";
+    internal const string BridgeFileName = "claude-acp-bridge";
 
     private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
 
@@ -46,10 +49,26 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     public string ClaudeBinary { get; init; } = ClaudeAgentRunner.DefaultBinary;
 
     /// <summary>
-    /// Node binary used to host the bridge. Overrideable for tests / images
-    /// that install Node under a non-default path.
+    /// Test seam — lets tests inject a non-placeholder byte sequence so the
+    /// launcher path can be exercised without running
+    /// <c>scripts/publish-acp-bridge.sh</c>. When non-null the placeholder
+    /// gate is bypassed and these bytes are base64-encoded into the
+    /// per-turn launcher stdin. Settable post-construction so
+    /// DI-resolved instances can be primed in wiring tests.
     /// </summary>
-    public string NodeBinary { get; init; } = "node";
+    internal byte[]? BridgeBinaryOverride { get; set; }
+    /// <summary>
+    /// Test seam for placeholder handling. Production leaves this null so the
+    /// decision comes from the embedded resource bytes in <see cref="AcpBridgeBinary"/>.
+    /// </summary>
+    internal bool? BridgePlaceholderOverride { get; set; }
+    /// <summary>
+    /// Test seam for shell-launcher tests that execute the per-turn bridge
+    /// launcher on the host. Production leaves this null so the launcher
+    /// writes under <c>$HOME/.codeybox/acp-bridge</c>, which is writable across
+    /// Process, Bubblewrap, and Multipass sandboxes.
+    /// </summary>
+    internal string? BridgeInstallDirectoryOverride { get; set; }
 
     public string Name => "acp";
     public ClaudeSessionTransport Transport => ClaudeSessionTransport.Acp;
@@ -63,69 +82,131 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     internal static int ResolveTurnTimeoutSeconds(int? apiTimeoutMs)
     {
         if (!apiTimeoutMs.HasValue)
-            return AcpBridgeScript.TurnTimeoutSeconds;
+            return AcpBridgeBinary.TurnTimeoutSeconds;
 
         var apiTimeoutSeconds = Math.Max(0, (int)Math.Ceiling(apiTimeoutMs.Value / 1000.0));
         return Math.Max(
-            AcpBridgeScript.TurnTimeoutSeconds,
+            AcpBridgeBinary.TurnTimeoutSeconds,
             apiTimeoutSeconds + ApiTimeoutBridgeMarginSeconds);
     }
 
-    public async Task<IClaudeTransportSession> OpenAsync(
+    public Task<IClaudeTransportSession> OpenAsync(
         ClaudeTransportOpenRequest request,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
         ct.ThrowIfCancellationRequested();
 
-        // Materialise the bridge script inside the sandbox up front. If this
-        // fails for any reason (filesystem read-only, sandbox dead) the open
-        // surfaces an AcpTransportUnavailableException so the worker can
-        // degrade to the print transport on the very first turn.
-        await MaterialiseBridgeAsync(request.Sandbox, ct).ConfigureAwait(false);
+        // Validate the embedded bridge before touching the sandbox. The actual
+        // executable is re-materialised from these host-controlled bytes on each
+        // turn, immediately before execution.
+        var bridgeBytes = LoadBridgeBytesOrThrow();
+        var bridgeBase64 = Convert.ToBase64String(bridgeBytes);
+        var bridgeSha256 = ComputeSha256Hex(bridgeBytes);
 
-        return new AcpSession(this, request);
+        return Task.FromResult<IClaudeTransportSession>(
+            new AcpSession(this, request, bridgeBase64, bridgeSha256));
     }
 
-    internal async Task MaterialiseBridgeAsync(ISandbox sandbox, CancellationToken ct)
+    private byte[] LoadBridgeBytesOrThrow()
     {
-        var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(AcpBridgeScript.Source));
-        var script =
-            "set -eu\n" +
-            "mkdir -p \"$HOME/.codeybox\"\n" +
-            "chmod 700 \"$HOME/.codeybox\"\n" +
-            "printf '%s' '" + encoded + "' | base64 -d > \"$HOME/.codeybox/claude-acp-bridge.cjs\"\n" +
-            "chmod 700 \"$HOME/.codeybox/claude-acp-bridge.cjs\"\n";
-        SandboxExecResult result;
-        try
-        {
-            result = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["bash", "-c", script],
-            }, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            throw new AcpTransportUnavailableException("failed to write the ACP bridge script", ex);
-        }
-        if (!result.Success)
+        // Placeholder-build guard: when the build host has not run
+        // scripts/publish-acp-bridge.sh, the embedded resource holds the
+        // tracked placeholder rather than a real ELF. Surface the failure
+        // BEFORE touching the sandbox so the worker degrades to the print
+        // transport on the very first turn without spending a roundtrip on
+        // execing a non-binary. Tests can short-circuit the gate by
+        // supplying BridgeBinaryOverride.
+        var isPlaceholderBuild = BridgePlaceholderOverride ?? AcpBridgeBinary.IsPlaceholderBuild;
+        if (BridgeBinaryOverride is null && isPlaceholderBuild)
         {
             throw new AcpTransportUnavailableException(
-                $"failed to write the ACP bridge script: exit {result.ExitCode}, stderr={result.Stderr}");
+                "ACP bridge binary is a placeholder build — run scripts/publish-acp-bridge.sh "
+                + "on the build host to embed a real NativeAOT binary before enabling the ACP transport");
         }
+
+        return BridgeBinaryOverride ?? AcpBridgeBinary.LoadBinary();
+    }
+
+    private static string ComputeSha256Hex(byte[] bytes)
+        => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+    internal string BuildBridgeLauncherScript(string expectedSha256)
+    {
+        if (string.IsNullOrWhiteSpace(expectedSha256))
+            throw new ArgumentException("Expected bridge SHA-256 is required.", nameof(expectedSha256));
+
+        var baseDirLine = BridgeInstallDirectoryOverride is null
+            ? "base_dir=${HOME:?}/.codeybox/acp-bridge\n"
+            : "base_dir=" + ShellSingleQuote(BridgeInstallDirectoryOverride) + "\n";
+
+        return
+            "set -eu\n" +
+            "fail(){ msg=$1; cat >/dev/null 2>/dev/null || true; echo \"$msg\" >&2; exit 1; }\n" +
+            "expected_sha=" + ShellSingleQuote(expectedSha256) + "\n" +
+            "payload_end=" + ShellSingleQuote(BridgePayloadEndMarker) + "\n" +
+            baseDirLine +
+            "case \"$base_dir\" in /*) ;; *) fail \"ACP bridge install directory must be absolute: $base_dir\";; esac\n" +
+            "[ ! -L \"$base_dir\" ] || fail \"refusing symlinked bridge directory: $base_dir\"\n" +
+            "umask 077\n" +
+            "mkdir -p \"$base_dir\" || fail \"failed to create ACP bridge directory: $base_dir\"\n" +
+            "[ ! -L \"$base_dir\" ] || fail \"refusing symlinked bridge directory: $base_dir\"\n" +
+            "[ -d \"$base_dir\" ] || fail \"ACP bridge path is not a directory: $base_dir\"\n" +
+            "tmpdir=$(mktemp -d \"$base_dir/turn.XXXXXX\") || fail \"failed to create ACP bridge turn directory\"\n" +
+            "bridge=\"$tmpdir/" + BridgeFileName + "\"\n" +
+            "b64=\"$tmpdir/payload.b64\"\n" +
+            "trap 'rc=$?; rm -rf \"$tmpdir\"; exit $rc' EXIT INT TERM\n" +
+            "found=0\n" +
+            "while IFS= read -r line; do\n" +
+            "  if [ \"$line\" = \"$payload_end\" ]; then found=1; break; fi\n" +
+            "  printf '%s\\n' \"$line\" >> \"$b64\"\n" +
+            "done\n" +
+            "[ \"$found\" = 1 ] || fail \"missing ACP bridge payload terminator\"\n" +
+            "[ -s \"$b64\" ] || fail \"missing ACP bridge payload\"\n" +
+            "base64 -d \"$b64\" > \"$bridge\" || fail \"failed to decode ACP bridge payload\"\n" +
+            "chmod 0500 \"$bridge\" || fail \"failed to chmod ACP bridge payload\"\n" +
+            "[ ! -L \"$bridge\" ] || fail \"refusing symlinked ACP bridge payload\"\n" +
+            "[ -f \"$bridge\" ] || fail \"ACP bridge payload is not a regular file\"\n" +
+            "actual_sha=$(sha256sum \"$bridge\" | awk '{print $1}') || fail \"failed to hash ACP bridge payload\"\n" +
+            "[ \"$actual_sha\" = \"$expected_sha\" ] || fail \"ACP bridge payload hash mismatch: expected $expected_sha got $actual_sha\"\n" +
+            "\"$bridge\"\n";
+    }
+
+    private static string ShellSingleQuote(string value)
+        => "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
+
+    internal static string BuildBridgeLauncherStdin(string bridgeBase64, string bridgeStdin)
+    {
+        var sb = new StringBuilder(bridgeBase64.Length + bridgeStdin.Length + 128);
+        for (var i = 0; i < bridgeBase64.Length; i += 76)
+        {
+            var len = Math.Min(76, bridgeBase64.Length - i);
+            sb.Append(bridgeBase64, i, len).Append('\n');
+        }
+        sb.Append(BridgePayloadEndMarker).Append('\n');
+        sb.Append(bridgeStdin);
+        return sb.ToString();
     }
 
     internal sealed class AcpSession : ICredentialRefreshableClaudeTransportSession
     {
         private readonly AcpClaudeTransport _transport;
+        private readonly string _bridgeBase64;
+        private readonly string _bridgeSha256;
         private ClaudeTransportOpenRequest _open;
         private int _turnIndex;
         private bool _disposed;
 
-        public AcpSession(AcpClaudeTransport transport, ClaudeTransportOpenRequest open)
+        public AcpSession(
+            AcpClaudeTransport transport,
+            ClaudeTransportOpenRequest open,
+            string bridgeBase64,
+            string bridgeSha256)
         {
             _transport = transport;
             _open = open;
+            _bridgeBase64 = bridgeBase64;
+            _bridgeSha256 = bridgeSha256;
         }
 
         public async Task<ClaudeTransportTurnResult> SendTurnAsync(
@@ -147,7 +228,8 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             var turnIndex = Interlocked.Increment(ref _turnIndex);
             var apiTimeout = _transport.BindApiTimeout();
             var turnTimeoutSeconds = AcpClaudeTransport.ResolveTurnTimeoutSeconds(apiTimeout);
-            var stdin = BuildStdin(request.Prompt, request.CliResumeSessionId, apiTimeout, turnTimeoutSeconds);
+            var bridgeStdin = BuildStdin(request.Prompt, request.CliResumeSessionId, apiTimeout, turnTimeoutSeconds);
+            var launcherStdin = BuildBridgeLauncherStdin(_bridgeBase64, bridgeStdin);
 
             var stdoutBuf = new StringBuilder(4096);
             Action<string> aggregator = chunk =>
@@ -167,9 +249,9 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
             var exec = new SandboxExec
             {
-                Argv = ["bash", "-lc", "exec " + EscapeForShell(_transport.NodeBinary) + " " + AcpBridgeScript.BridgeScriptPath],
+                Argv = ["sh", "-c", _transport.BuildBridgeLauncherScript(_bridgeSha256)],
                 WorkingDirectory = _open.WorkingDirectory,
-                Stdin = stdin,
+                Stdin = launcherStdin,
                 StdoutChunkCallback = aggregator,
                 ExtraEnvironment = extraEnv.Count > 0 ? extraEnv : null
             };
@@ -183,7 +265,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             catch (Exception ex)
             {
                 throw new AcpTransportUnavailableException(
-                    $"ACP bridge invocation failed on turn {turnIndex}", ex);
+                    $"ACP bridge invocation failed on turn {turnIndex}: {ex.Message}", ex);
             }
 
             var combinedStdout = stdoutBuf.Length > 0
@@ -209,6 +291,14 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                     $"ACP bridge exited {exec_result.ExitCode} without reporting a turn outcome: stderr={exec_result.Stderr}");
             }
 
+            if (observed.TurnError is null && observed.Complete is null)
+            {
+                var reason = observed.TimedOut
+                    ? $"ACP bridge timed out without reporting a turn outcome within {turnTimeoutSeconds}s"
+                    : "ACP bridge exited without reporting a turn outcome";
+                throw new AcpTransportUnavailableException(reason);
+            }
+
             var agentSuccess = observed.TurnError is null && observed.Complete is not null;
             var summary = agentSuccess
                 ? "ok"
@@ -216,7 +306,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                     ? $"acp turn error: {te.Message ?? "unknown"}"
                     : $"acp turn timed out (no stopReason within {turnTimeoutSeconds}s)";
 
-            var stdoutForExtractor = observed.AssistantText.Length > 0
+            var stdoutForExtractor = agentSuccess
                 ? BuildStreamJsonShimForExtractor(observed)
                 : combinedStdout;
 
@@ -253,7 +343,15 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                     var retryStdout = stdoutBuf.Length > 0 ? stdoutBuf.ToString() : retryResult.Stdout ?? string.Empty;
                     var retryObserved = ObserveBridgeOutput(retryStdout);
                     var retrySuccess = retryObserved.TurnError is null && retryObserved.Complete is not null;
-                    var retryShim = retryObserved.AssistantText.Length > 0
+                    if (retryObserved.TurnError is null && retryObserved.Complete is null)
+                    {
+                        var reason = retryObserved.TimedOut
+                            ? $"ACP bridge timed out without reporting a turn outcome within {turnTimeoutSeconds}s on retry"
+                            : "ACP bridge exited without reporting a turn outcome on retry";
+                        throw new AcpTransportUnavailableException(reason);
+                    }
+
+                    var retryShim = retrySuccess
                         ? BuildStreamJsonShimForExtractor(retryObserved)
                         : retryStdout;
                     result = new AgentResult(
@@ -411,11 +509,6 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 env["API_TIMEOUT_MS"] = apiTimeout.Value.ToString();
             }
             return env;
-        }
-
-        private static string EscapeForShell(string value)
-        {
-            return "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
         }
 
         /// <summary>

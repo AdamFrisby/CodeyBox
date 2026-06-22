@@ -7,6 +7,7 @@ using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
+[Collection("Background service timing")]
 public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 {
     private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(10);

@@ -15,6 +15,7 @@ using Xunit;
 
 namespace CodeyBox.Tests;
 
+[Collection("Background service timing")]
 public sealed class QuotaAutoRetryTests : IDisposable
 {
     private static readonly TimeSpan DispatchObservationTimeout = TimeSpan.FromSeconds(30);

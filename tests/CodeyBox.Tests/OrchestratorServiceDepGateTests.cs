@@ -10,6 +10,7 @@ namespace CodeyBox.Tests;
 /// by running a real worker loop with an in-memory store + queue and a
 /// FakePipelineRunner that marks items Done instantly.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class OrchestratorServiceDepGateTests : IDisposable
 {
     private readonly string _dbPath =
