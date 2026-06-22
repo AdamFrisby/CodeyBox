@@ -880,6 +880,37 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsAnsiInsideRecordPath()
+    {
+        var oid = new string('a', 40);
+        var stdout = $"100644 {oid} 2\tsrc/a\u001b[31mb.cs\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains(@"src/a\u001B[31mb.cs", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_AcceptsStageOneStageThreeAndSha256Records()
+    {
+        var sha1Stage1 = new string('a', 40);
+        var sha1Stage3 = new string('b', 40);
+        var sha256Stage2 = new string('c', 64);
+        var stdout =
+            $"100644 {sha1Stage1} 1\tsrc/base-only.txt\0" +
+            $"100644 {sha1Stage3} 3\tsrc/theirs-only.txt\0" +
+            $"100644 {sha256Stage2} 2\tsrc/sha256.txt\0";
+
+        var paths = AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal(["src/base-only.txt", "src/sha256.txt", "src/theirs-only.txt"], paths);
+    }
+
+    [Fact]
     public void PromptShape_MergeOperationUsesMergeTokens()
     {
         var prompt = AgenticConflictResolver.BuildAgenticConflictResolverPrompt(
@@ -922,6 +953,17 @@ public sealed class AgenticConflictResolverTests
     {
         Assert.Throws<MergeConflictResolutionFailedException>(() =>
             AgenticConflictResolver.ValidateRelativeWorkPath(path));
+    }
+
+    [Fact]
+    public void ValidateRelativeWorkPath_EncodesControlCharactersInErrorMessage()
+    {
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            AgenticConflictResolver.ValidateRelativeWorkPath("src/a\nb.cs"));
+
+        Assert.Contains(@"src/a\u000Ab.cs", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", ex.Message, StringComparison.Ordinal);
     }
 
     private static string BuildSimpleConflict(string baseLine, string mainLine, string workLine)

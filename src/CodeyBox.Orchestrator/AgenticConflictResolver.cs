@@ -163,12 +163,8 @@ public sealed record AgenticConflictCandidatesResult(
 /// </summary>
 public sealed class AgenticConflictResolver
 {
-    private static readonly Regex AnsiEscape = new(
-        @"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
     private static readonly Regex LsFilesUnmergedRecord = new(
-        @"[0-7]{6} [0-9a-fA-F]{40,64} [1-3]\t(?<path>[^\0]+)",
+        @"[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t(?<path>[^\0]+)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly AgenticConflictResolverOptionsSnapshot _options;
@@ -583,10 +579,15 @@ public sealed class AgenticConflictResolver
         if (string.IsNullOrEmpty(stdout))
             return [];
 
-        var sanitized = AnsiEscape.Replace(stdout, string.Empty);
-        return LsFilesUnmergedRecord.Matches(sanitized)
-            .Select(static match => match.Groups["path"].Value)
-            .Where(static path => !string.IsNullOrEmpty(path))
+        return stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            .Select(static segment => LsFilesUnmergedRecord.Match(segment))
+            .Where(static match => match.Success)
+            .Select(static match =>
+            {
+                var path = match.Groups["path"].Value;
+                ValidateRelativeWorkPath(path);
+                return path;
+            })
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToList();
@@ -607,8 +608,34 @@ public sealed class AgenticConflictResolver
             || path.Any(static ch => char.IsControl(ch))
             || path.Split('/', StringSplitOptions.None).Any(static part => part is "" or "." or ".."))
         {
-            throw new MergeConflictResolutionFailedException($"unsafe conflict file path '{path}'");
+            throw new MergeConflictResolutionFailedException(
+                $"unsafe conflict file path '{EscapeForSingleLine(path)}'");
         }
+    }
+
+    private static string EscapeForSingleLine(string value)
+    {
+        var sb = new StringBuilder(value.Length);
+        foreach (var ch in value)
+        {
+            switch (ch)
+            {
+                case '\\':
+                    sb.Append(@"\\");
+                    break;
+                case '\'':
+                    sb.Append(@"\'");
+                    break;
+                default:
+                    if (char.IsControl(ch))
+                        sb.Append(@"\u").Append(((int)ch).ToString("X4"));
+                    else
+                        sb.Append(ch);
+                    break;
+            }
+        }
+
+        return sb.ToString();
     }
 
     internal sealed record VerificationOutcome(bool Success, string Reason);
