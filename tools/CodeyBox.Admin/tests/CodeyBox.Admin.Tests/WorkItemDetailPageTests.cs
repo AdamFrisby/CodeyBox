@@ -53,6 +53,29 @@ public sealed class WorkItemDetailPageTests : TestContext
     }
 
     [Fact]
+    public void WorkItemDetail_WithPlanArtifact_ShowsPlanPanelAndMetadata()
+    {
+        var generatedAt = new DateTimeOffset(2026, 6, 1, 2, 3, 4, TimeSpan.Zero);
+        var reviewedAt = generatedAt.AddMinutes(5);
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task");
+        item.PlanArtifact = "PLAN:\nApproach: render this plan.";
+        item.PlanGeneratedAt = generatedAt;
+        item.PlanReviewedAt = reviewedAt;
+        item.PlanReviewSummary = "Placeholder plan review approved.";
+        var fake = new FakeApiClient([item]);
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+
+        Assert.Contains("Plan", cut.Markup);
+        Assert.Contains("PLAN:", cut.Markup);
+        Assert.Contains("render this plan", cut.Markup);
+        Assert.Contains($"Generated {generatedAt:O}", cut.Markup);
+        Assert.Contains($"Reviewed {reviewedAt:O}", cut.Markup);
+        Assert.Contains("Placeholder plan review approved.", cut.Markup);
+    }
+
+    [Fact]
     public void WorkItemDetail_QueuedItem_ShowsEditLink()
     {
         var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Queued Task", "Queued");

@@ -224,6 +224,9 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     [Theory]
     [InlineData(WorkItemState.Working, "work")]
     [InlineData(WorkItemState.Queued, "work")]
+    [InlineData(WorkItemState.Planning, "planning")]
+    [InlineData(WorkItemState.PlanReview, "planning")]
+    [InlineData(WorkItemState.PlanApproved, "work")]
     [InlineData(WorkItemState.Auditing, "audit")]
     [InlineData(WorkItemState.Reworking, "rework")]
     [InlineData(WorkItemState.ReworkingForConflict, "rework")]
@@ -245,6 +248,7 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     /// five-hour incident — fails here.
     /// </summary>
     [Theory]
+    [InlineData("planning", "planning")]
     [InlineData("work", "work")]
     [InlineData("audit", "audit")]
     [InlineData("rework", "audit")]
@@ -269,6 +273,9 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     [Theory]
     [InlineData(WorkItemState.Reworking, "audit")]
     [InlineData(WorkItemState.ReworkingForConflict, "audit")]
+    [InlineData(WorkItemState.Planning, "planning")]
+    [InlineData(WorkItemState.PlanReview, "planning")]
+    [InlineData(WorkItemState.PlanApproved, "work")]
     [InlineData(WorkItemState.Auditing, "audit")]
     [InlineData(WorkItemState.Merging, "merge")]
     [InlineData(WorkItemState.UpstreamPushing, "upstream")]

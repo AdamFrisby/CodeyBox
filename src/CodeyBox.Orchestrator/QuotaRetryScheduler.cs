@@ -797,6 +797,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
     private static string NormalizeRetryFrom(string? retryFrom) => retryFrom?.Trim().ToLowerInvariant() switch
     {
+        "planning" => "planning",
         "audit" => "audit",
         "conflict_rework" => "conflict_rework",
         "merge" => "merge",

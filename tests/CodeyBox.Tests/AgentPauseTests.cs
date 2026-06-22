@@ -1131,6 +1131,7 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Theory]
+    [InlineData(WorkItemState.Planning, "planning", WorkItemState.Queued)]
     [InlineData(WorkItemState.WorkComplete, "audit", WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.ReworkingForConflict, "conflict_rework", WorkItemState.ReworkingForConflict)]
     [InlineData(WorkItemState.AuditPassed, "merge", WorkItemState.AuditPassed)]

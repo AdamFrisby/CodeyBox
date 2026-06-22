@@ -818,7 +818,10 @@ internal static class WorkItemEndpoints
         if (item.State == WorkItemState.AbandonedAfterRecoveryAttempts)
             return Results.Ok(new { id = item.Id.ToString(), state = item.State.ToString() });
 
-        if (item.State is WorkItemState.Working
+        if (item.State is WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.Working
             or WorkItemState.WorkComplete
             or WorkItemState.Auditing
             or WorkItemState.Reworking
@@ -1215,6 +1218,9 @@ internal static class WorkItemEndpoints
             updated = updated with { Knobs = normalisedPatchKnobs, UpdatedAt = now };
         }
 
+        if (queuedOnlyPatch)
+            updated = ClearPlanReview(updated) with { UpdatedAt = now };
+
         if (body.AuditMaxIterations is { } auditMaxIterations)
         {
             var auditMaxIterationsError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditMaxIterations);
@@ -1246,6 +1252,7 @@ internal static class WorkItemEndpoints
         var auditBudgetWrittenWithQueuedUpdate = normalisedPatchKnobs is not null && auditBudgetPatch;
         var needsQueuedRowUpdate =
             queuedRowPatch
+            || normalisedPatchKnobs is not null
             || (depsPatch && queuedOnlyPatch)
             || auditBudgetWrittenWithQueuedUpdate;
         if (needsQueuedRowUpdate)
@@ -1367,6 +1374,14 @@ internal static class WorkItemEndpoints
         var project = await projects.GetAsync(updated.ProjectId, ct);
         return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
     }
+
+    private static WorkItem ClearPlanReview(WorkItem item) => item with
+    {
+        PlanArtifact = null,
+        PlanGeneratedAt = null,
+        PlanReviewedAt = null,
+        PlanReviewSummary = null,
+    };
 
     /// <summary>
     /// Resolves and validates a <c>dependsOn</c> string array for a PATCH-time

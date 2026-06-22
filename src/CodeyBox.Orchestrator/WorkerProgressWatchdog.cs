@@ -558,6 +558,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     /// </summary>
     internal static bool IsWatchedState(WorkItemState state) => state switch
     {
+        WorkItemState.Planning => true,
+        WorkItemState.PlanReview => true,
         WorkItemState.Working => true,
         WorkItemState.Reworking => true,
         WorkItemState.Auditing => true,

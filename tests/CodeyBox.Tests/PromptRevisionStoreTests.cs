@@ -58,6 +58,62 @@ public sealed class PromptRevisionStoreTests : IDisposable
         Assert.Equal(3, read.PromptRevision);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning)]
+    [InlineData(WorkItemState.PlanReview)]
+    [InlineData(WorkItemState.PlanApproved)]
+    public async Task TryReplacePromptAsync_ClearsPlanAndRequeuesPlanningState(WorkItemState state)
+    {
+        var item = Sample(state) with
+        {
+            PlanArtifact = "PLAN:\nApproach: old prompt",
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-3),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewSummary = "old review",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+        };
+        await _store.CreateAsync(item);
+
+        var result = await _store.TryReplacePromptAsync(item.Id, "new prompt", DateTimeOffset.UtcNow);
+
+        Assert.Equal(PromptReplaceOutcome.Updated, result.Outcome);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Queued, read!.State);
+        Assert.Null(read.StartedAt);
+        Assert.Null(read.PlanArtifact);
+        Assert.Null(read.PlanGeneratedAt);
+        Assert.Null(read.PlanReviewedAt);
+        Assert.Null(read.PlanReviewSummary);
+        Assert.Equal("new prompt", read.Prompt);
+        Assert.Equal(2, read.PromptRevision);
+    }
+
+    [Fact]
+    public async Task TryReplacePromptAsync_ClearsPlanWithoutChangingNonPlanningState()
+    {
+        var item = Sample(WorkItemState.Working) with
+        {
+            PlanArtifact = "PLAN:\nApproach: old prompt",
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-3),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewSummary = "old review",
+        };
+        await _store.CreateAsync(item);
+
+        var result = await _store.TryReplacePromptAsync(item.Id, "new prompt", DateTimeOffset.UtcNow);
+
+        Assert.Equal(PromptReplaceOutcome.Updated, result.Outcome);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Working, read!.State);
+        Assert.Null(read.PlanArtifact);
+        Assert.Null(read.PlanGeneratedAt);
+        Assert.Null(read.PlanReviewedAt);
+        Assert.Null(read.PlanReviewSummary);
+        Assert.Equal(2, read.PromptRevision);
+    }
+
     [Fact]
     public async Task TryReplacePromptAsync_RejectsTerminalState()
     {

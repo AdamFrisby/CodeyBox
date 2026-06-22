@@ -54,6 +54,17 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         try { File.Delete(_dbPath); } catch { }
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning, true)]
+    [InlineData(WorkItemState.PlanReview, true)]
+    [InlineData(WorkItemState.PlanApproved, false)]
+    [InlineData(WorkItemState.Working, true)]
+    [InlineData(WorkItemState.WorkComplete, false)]
+    public void IsWatchedState_IncludesActivePlanningStates(WorkItemState state, bool expected)
+    {
+        Assert.Equal(expected, WorkerProgressWatchdog.IsWatchedState(state));
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static WorkItem MakeItem(

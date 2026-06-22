@@ -64,7 +64,10 @@ internal static class WorkItemRecoveryPolicy
             : toState switch
             {
                 WorkItemState.PlanApproved => recoverySourceState is WorkItemState.Planning or WorkItemState.PlanReview,
-                WorkItemState.WorkComplete => recoverySourceState is WorkItemState.Working or WorkItemState.Reworking,
+                WorkItemState.WorkComplete => recoverySourceState is
+                    WorkItemState.PlanApproved
+                    or WorkItemState.Working
+                    or WorkItemState.Reworking,
                 WorkItemState.AuditPassed => recoverySourceState is
                     WorkItemState.WorkComplete
                     or WorkItemState.Auditing

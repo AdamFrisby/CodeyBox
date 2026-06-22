@@ -45,6 +45,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private const int CompletionReviewFileMaxChars = 8 * 1024;
     private const int CompletionReviewMaxFiles = 80;
     private const int PlanArtifactMaxChars = 64 * 1024;
+    private const int PlanOutputAccumulatorMaxChars = PlanArtifactMaxChars + 4096;
     private const string PlanReviewPlaceholderSummary = "Placeholder plan review approved.";
 
     private readonly ISandboxProvider _sandboxes;
@@ -821,10 +822,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
             && string.Equals(value, PlanKnob.ValueOn, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsPlanningLifecycleState(WorkItemState state) =>
+        state is WorkItemState.Planning or WorkItemState.PlanReview or WorkItemState.PlanApproved;
+
+    private static bool HasApprovedCurrentPlan(WorkItem item) =>
+        item.State == WorkItemState.PlanApproved
+        && item.PlanReviewedAt is not null
+        && !string.IsNullOrWhiteSpace(item.PlanArtifact);
+
+    private static string? ApprovedPlanForImplementation(WorkItem item, bool planningWasRequired)
+        => planningWasRequired && HasApprovedCurrentPlan(item) ? item.PlanArtifact : null;
+
     private async Task<WorkItem> RunPlanningLifecycleIfNeededAsync(
         WorkItem item,
         Project project,
-        IAgentRunner agentRunner,
         string repoId,
         string baseBranch,
         CancellationToken ct,
@@ -835,11 +846,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return current;
 
         if (current.State == WorkItemState.PlanApproved)
+        {
+            if (!HasApprovedCurrentPlan(current))
+                throw new InvalidOperationException("PlanApproved item is missing an approved planning artifact.");
             return current;
+        }
 
         if (!string.IsNullOrWhiteSpace(current.PlanArtifact))
         {
-            if (current.PlanReviewedAt is null || current.State == WorkItemState.PlanReview)
+            if (current.PlanReviewedAt is null || current.State != WorkItemState.PlanApproved)
                 return await RunPlanReviewPlaceholderAsync(current, project, ct);
 
             return current;
@@ -891,7 +906,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
         }
 
-        var planned = await PersistPlanArtifactAsync(current.Id, planArtifact, ct);
+        var planned = await PersistPlanArtifactAsync(current.Id, current.PromptRevision, planArtifact, ct);
         await Transition(planned, WorkItemState.PlanReview, ct, project);
         var reviewing = await _store.GetAsync(current.Id, ct) ?? planned with { State = WorkItemState.PlanReview };
         return await RunPlanReviewPlaceholderAsync(reviewing, project, ct);
@@ -899,11 +914,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private async Task<WorkItem> PersistPlanArtifactAsync(
         WorkItemId itemId,
+        int promptRevisionAtPlanningDispatch,
         string artifact,
         CancellationToken ct)
     {
         var current = await _store.GetAsync(itemId, ct)
             ?? throw new InvalidOperationException($"Work item '{itemId}' disappeared while persisting planning artifact.");
+        if (current.PromptRevision != promptRevisionAtPlanningDispatch)
+        {
+            throw new InvalidOperationException(
+                $"Planning phase completed against prompt revision {promptRevisionAtPlanningDispatch}, but the work item is now at prompt revision {current.PromptRevision}; refusing to persist a stale plan.");
+        }
+
         var normalized = NormalizePlanArtifact(artifact);
         if (string.IsNullOrWhiteSpace(normalized))
             throw new InvalidOperationException("Planning phase completed without producing a PLAN artifact.");
@@ -960,7 +982,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken hostShutdownToken)
     {
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
-        var access = _gitHost.GetSandboxAccess(repoId);
+        var access = _gitHost.GetReadOnlySandboxAccess(repoId);
         var spec = BuildSandboxSpec(
             access,
             includeAgentCredential: credential,
@@ -1006,7 +1028,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             BuildPlanningPrompt(item),
             ct);
 
-        var aggregator = new StringBuilder();
+        var aggregator = new BoundedStringAccumulator(PlanOutputAccumulatorMaxChars);
         AgentStreamCapture? streamCapture = null;
         try
         {
@@ -1049,15 +1071,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 activitySource: CodeyBoxActivities.Pipeline))
             {
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                var runTask = runner.RunAsync(
+                var runTask = RunPlanningSessionTurnAsync(
+                    runner,
                     sandbox,
-                    SandboxConventions.WorkDir,
                     prompt,
                     credential,
-                    item.ModelId,
-                    item.ReasoningMode,
+                    item,
+                    project,
+                    stdoutCallback,
                     runnerCts.Token,
-                    stdoutChunkCallback: stdoutCallback,
                     captureStructuredStream: false);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completed != runTask)
@@ -1137,19 +1159,69 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throw new InvalidOperationException(detail);
             }
 
-            var aggregated = aggregator.ToString();
             if (!string.IsNullOrEmpty(result.Stdout)
-                && !aggregated.EndsWith(result.Stdout, StringComparison.Ordinal))
+                && !aggregator.HasContent)
             {
-                aggregated += result.Stdout;
+                aggregator.Append(result.Stdout);
             }
 
-            return string.IsNullOrWhiteSpace(aggregated) ? result.Summary : aggregated;
+            var aggregated = aggregator.ToString();
+            return aggregated;
         }
         finally
         {
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
+        }
+    }
+
+    private async Task<AgentResult> RunPlanningSessionTurnAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string prompt,
+        AgentCredential? credential,
+        WorkItem item,
+        Project project,
+        Action<string>? stdoutCallback,
+        CancellationToken ct,
+        bool captureStructuredStream)
+    {
+        var sessionRunner = runner as ISessionAgentRunner
+            ?? new StatelessSessionAgentRunner(runner);
+        var selectedMember = TryResolveSelectedMember(runner.Kind, project, item);
+        AgentSessionHandle? handle = null;
+        try
+        {
+            handle = sessionRunner is IScopedSessionAgentRunner scoped
+                ? await scoped.OpenSessionAsync(
+                    new AgentSessionOpenRequest(
+                        sandbox,
+                        SandboxConventions.WorkDir,
+                        credential,
+                        selectedMember?.ModelId ?? item.ModelId,
+                        selectedMember?.ReasoningMode ?? item.ReasoningMode,
+                        project.Id.Value,
+                        selectedMember?.RouteKey),
+                    ct).ConfigureAwait(false)
+                : await sessionRunner.OpenSessionAsync(
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    credential,
+                    selectedMember?.ModelId ?? item.ModelId,
+                    selectedMember?.ReasoningMode ?? item.ReasoningMode,
+                    ct).ConfigureAwait(false);
+
+            return await sessionRunner.SendTurnAsync(
+                handle,
+                prompt,
+                ct,
+                stdoutCallback,
+                captureStructuredStream).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (handle is not null)
+                await sessionRunner.CloseSessionAsync(handle, CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -1178,12 +1250,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private static string NormalizePlanArtifact(string artifact)
     {
-        var trimmed = artifact.Trim();
+        var trimmed = RawOutputRedactor.Redact(artifact).Trim();
         if (trimmed.Length <= PlanArtifactMaxChars)
             return trimmed;
 
         return trimmed[..PlanArtifactMaxChars]
-            + "\n\n[CodeyBox: planning artifact truncated to 65536 characters.]";
+            + $"\n\n[CodeyBox: planning artifact truncated to {PlanArtifactMaxChars} characters.]";
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
@@ -1258,9 +1330,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             || resumingConflictRework;
         var skipMerge = entry is WorkItemState.Merged;
         var planningEnabledAtEntry = ShouldUsePlanningPhase(item, project);
-        var planningPendingAtEntry = planningEnabledAtEntry
-            && !skipWork
-            && entry is WorkItemState.Queued or WorkItemState.Planning
+        var planningLifecycleRequiredAtEntry = !skipWork
+            && (planningEnabledAtEntry || IsPlanningLifecycleState(entry));
+        var planningPendingAtEntry = planningLifecycleRequiredAtEntry
+            && entry is (WorkItemState.Queued or WorkItemState.Planning)
             && string.IsNullOrWhiteSpace(item.PlanArtifact);
 
         // ── Credential smoke gate ────────────────────────────────────────────────
@@ -1399,12 +1472,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throw new InvalidOperationException(
                     $"workBranch must differ from baseBranch (both '{baseBranch}'); refusing to bypass merge-phase containment");
 
-            if (planningEnabledAtEntry && !skipWork)
+            if (planningLifecycleRequiredAtEntry)
             {
                 item = await RunPlanningLifecycleIfNeededAsync(
                     item,
                     project,
-                    agentRunner,
                     repoId,
                     baseBranch,
                     ct,
@@ -1529,7 +1601,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             async (runner, trialItem, attemptCt) =>
                                 await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workPhase, ct, phaseCt =>
                                     RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                        BuildInitialWorkPrompt(trialItem.Prompt, project.AllowAgentQuestions, auditors, trialItem.PlanArtifact), isInitial: true,
+                                        BuildInitialWorkPrompt(
+                                            trialItem.Prompt,
+                                            project.AllowAgentQuestions,
+                                            auditors,
+                                            ApprovedPlanForImplementation(trialItem, planningLifecycleRequiredAtEntry)),
+                                        isInitial: true,
                                         networkProfile: sandboxTarget.NetworkProfile,
                                         sandboxFlavor: sandboxTarget.Flavor,
                                         project: project,
@@ -5658,6 +5735,50 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         const int MaxOutputBytes = 4096;
         return RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(s), MaxOutputBytes);
+    }
+
+    private sealed class BoundedStringAccumulator
+    {
+        private readonly StringBuilder _buffer;
+        private readonly int _maxChars;
+        private bool _truncated;
+
+        public bool HasContent => _buffer.Length > 0;
+
+        public BoundedStringAccumulator(int maxChars)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxChars);
+            _maxChars = maxChars;
+            _buffer = new StringBuilder(Math.Min(maxChars, 4096));
+        }
+
+        public void Append(string? chunk)
+        {
+            if (string.IsNullOrEmpty(chunk))
+                return;
+            if (_buffer.Length >= _maxChars)
+            {
+                _truncated = true;
+                return;
+            }
+
+            var remaining = _maxChars - _buffer.Length;
+            if (chunk.Length <= remaining)
+            {
+                _buffer.Append(chunk);
+                return;
+            }
+
+            _buffer.Append(chunk, 0, remaining);
+            _truncated = true;
+        }
+
+        public override string ToString()
+        {
+            if (!_truncated)
+                return _buffer.ToString();
+            return _buffer.ToString() + "\n\n[CodeyBox: planning output capture truncated before artifact normalization.]";
+        }
     }
 
     private async Task RecordAvailabilityOutcomeAsync(
@@ -14905,6 +15026,7 @@ Original merge-phase failure (JSON string, for context only):
     /// </summary>
     internal static string RetryFromForQuotaPhase(string phase) => NormalizeQuotaRetryPhase(phase) switch
     {
+        "planning" => "planning",
         "audit" => "audit",
         "rework" => "audit",
         "merge" => "merge",
@@ -14929,7 +15051,7 @@ Original merge-phase failure (JSON string, for context only):
 
     internal static string? RetryFromForTransientPhase(string? phase, WorkItemState currentState) => phase switch
     {
-        "planning" => "work",
+        "planning" => "planning",
         "audit" => "audit",
         "rework" => "audit",
         ConflictReworkPhaseKey => "conflict_rework",

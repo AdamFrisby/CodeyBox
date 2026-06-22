@@ -151,6 +151,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Theory]
+    [InlineData("planning", WorkItemState.Planning, "planning")]
     [InlineData("work", WorkItemState.Queued, null)]
     [InlineData("audit", WorkItemState.WorkComplete, "audit")]
     [InlineData("rework", WorkItemState.WorkComplete, "audit")]

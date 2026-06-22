@@ -1949,7 +1949,21 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 UPDATE work_items
-                SET prompt = $prompt, prompt_revision = $rev, updated_at = $ua
+                SET prompt = $prompt,
+                    prompt_revision = $rev,
+                    updated_at = $ua,
+                    state = CASE
+                        WHEN state IN (15, 16, 17) THEN 0
+                        ELSE state
+                    END,
+                    started_at = CASE
+                        WHEN state IN (15, 16, 17) THEN NULL
+                        ELSE started_at
+                    END,
+                    plan_artifact = NULL,
+                    plan_generated_at = NULL,
+                    plan_reviewed_at = NULL,
+                    plan_review_summary = NULL
                 WHERE id = $id;
                 """;
             cmd.Parameters.AddWithValue("$prompt", newPrompt);

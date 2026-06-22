@@ -6049,9 +6049,16 @@ while True:
         sb.AppendLine($"codeybox_stderr_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stderr.XXXXXX\") || {{ rm -f \"$codeybox_stdout_file\"; exit {DetachedSupervisorSetupFailedExitCode}; }}");
         sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
         sb.AppendLine("    set -o pipefail");
-        sb.AppendLine("    codeybox_root_sh 'cat -- \"$1\" 2>/dev/null' \"$codeybox_stdin_file\" | \"$@\" >\"$codeybox_stdout_file\" 2>>\"$codeybox_stderr_file\"");
+        sb.AppendLine("    set +e");
+        sb.AppendLine("    codeybox_root_sh 'cat -- \"$1\"' \"$codeybox_stdin_file\" 2>>\"$codeybox_stderr_file\" | \"$@\" >\"$codeybox_stdout_file\" 2>>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_status=(\"${PIPESTATUS[@]}\")");
+        sb.AppendLine("    set -e");
+        sb.AppendLine("    codeybox_stdin_rc=${codeybox_status[0]}");
         sb.AppendLine("    codeybox_wrapper_rc=${codeybox_status[1]}");
+        sb.AppendLine("    if [ \"$codeybox_stdin_rc\" -ne 0 ] && [ \"$codeybox_stdin_rc\" -ne 141 ] && ! grep -qi 'broken pipe' \"$codeybox_stderr_file\"; then");
+        sb.AppendLine("        printf 'codeybox-detached: failed to read stdin sidecar (exit %s)\\n' \"$codeybox_stdin_rc\" >>\"$codeybox_stderr_file\"");
+        sb.AppendLine($"        codeybox_wrapper_rc={DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    fi");
         sb.AppendLine("else");
         sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_wrapper_rc=$?");

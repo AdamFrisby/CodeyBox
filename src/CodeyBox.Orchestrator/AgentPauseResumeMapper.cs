@@ -7,6 +7,7 @@ internal static class AgentPauseResumeMapper
     public static string NormalizeRetryFrom(string? retryFrom) =>
         retryFrom?.Trim().ToLowerInvariant() switch
         {
+            "planning" => "planning",
             "audit" => "audit",
             "conflict_rework" => "conflict_rework",
             "merge" => "merge",
@@ -16,6 +17,8 @@ internal static class AgentPauseResumeMapper
 
     public static string RetryFromForState(WorkItemState state) => state switch
     {
+        WorkItemState.Planning => "planning",
+        WorkItemState.PlanReview => "planning",
         WorkItemState.WorkComplete => "audit",
         WorkItemState.Auditing => "audit",
         WorkItemState.Reworking => "audit",
@@ -31,6 +34,7 @@ internal static class AgentPauseResumeMapper
     public static WorkItemState ResumeStateForRetryFrom(string? retryFrom) =>
         NormalizeRetryFrom(retryFrom) switch
         {
+            "planning" => WorkItemState.Queued,
             "audit" => WorkItemState.WorkComplete,
             "conflict_rework" => WorkItemState.ReworkingForConflict,
             "merge" => WorkItemState.AuditPassed,

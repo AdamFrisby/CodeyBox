@@ -95,6 +95,9 @@ public sealed class WorkItemVerbEndpointTests : IDisposable
 
     [Theory]
     [InlineData(WorkItemState.Done)]
+    [InlineData(WorkItemState.Planning)]
+    [InlineData(WorkItemState.PlanReview)]
+    [InlineData(WorkItemState.PlanApproved)]
     [InlineData(WorkItemState.Working)]
     [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Auditing)]

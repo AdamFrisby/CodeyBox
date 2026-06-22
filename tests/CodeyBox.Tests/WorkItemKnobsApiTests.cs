@@ -52,6 +52,23 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
+    public async Task Create_WithPlanOn_RoundTripsProductionPlanKnob()
+    {
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "planned task",
+            prompt = "plan before work",
+            knobs = new Dictionary<string, string> { [PlanKnob.KeyName] = PlanKnob.ValueOn },
+        });
+
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        Assert.NotNull(body!.Knobs);
+        Assert.Equal(PlanKnob.ValueOn, body.Knobs![PlanKnob.KeyName]);
+    }
+
+    [Fact]
     public async Task Create_WithoutKnobs_KnobsFieldIsAbsentFromResponse()
     {
         // The DTO serialises Knobs with WhenWritingNull, and an empty
@@ -202,6 +219,48 @@ public sealed class WorkItemKnobsApiTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
         Assert.Equal(ChangeScopeKnob.ValueRefactor, body!.Knobs![ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
+    public async Task Patch_QueuedKnobEdit_ClearsStoredPlanReview()
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "queued planned item",
+            Prompt = "old task",
+            State = WorkItemState.Queued,
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+            PlanArtifact = "PLAN:\nApproach: old task",
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-4),
+            PlanReviewSummary = "old approval",
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{item.Id}", new
+        {
+            knobs = new Dictionary<string, string> { [PlanKnob.KeyName] = PlanKnob.ValueOff },
+        });
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        Assert.Null(body!.PlanArtifact);
+        Assert.Null(body.PlanGeneratedAt);
+        Assert.Null(body.PlanReviewedAt);
+        Assert.Null(body.PlanReviewSummary);
+
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Null(stored!.PlanArtifact);
+        Assert.Null(stored.PlanGeneratedAt);
+        Assert.Null(stored.PlanReviewedAt);
+        Assert.Null(stored.PlanReviewSummary);
+        Assert.Equal(PlanKnob.ValueOff, stored.Knobs[PlanKnob.KeyName]);
     }
 
     [Fact]

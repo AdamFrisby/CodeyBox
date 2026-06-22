@@ -181,6 +181,24 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgress_ClearsPlanApprovedRecoveryOnWorkCompletion()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = WorkItemState.PlanApproved,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            item.With(WorkItemState.WorkComplete),
+            fromState: WorkItemState.PlanApproved,
+            toState: WorkItemState.WorkComplete);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+        Assert.Null(reset.RecoveryAttemptSourceState);
+    }
+
+    [Fact]
     public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_Requeues()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-recovery-{Guid.NewGuid():N}.db");
