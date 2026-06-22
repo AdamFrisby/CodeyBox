@@ -694,6 +694,39 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_ListUnmergedPathsIgnoresPrefixedMultipassStartupNoise()
+    {
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, BuildSimpleConflict("b", "m", "w"));
+        sandbox.LsFilesResponseQueue.Enqueue(
+            new SandboxExecResult(0, BuildContaminatedLsFilesStdout(path), ""));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile(path, "m + w\n");
+            sb.GitAdd(path);
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Equal([path], result.ConflictFiles.ToArray());
+        Assert.Equal(1, runner.InvocationCount);
+        Assert.DoesNotContain("unsafe conflict file path", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ResolveAsync_AgentThrows_AdvancesToNextCandidate()
     {
         var sandbox = new ConflictSandbox();
@@ -800,15 +833,44 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_VerifyRemainingUnmergedPathsReportsCleanPath()
+    {
+        const string path = "src/a.txt";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, BuildSimpleConflict("b", "m", "w"));
+        sandbox.LsFilesResponseQueue.Enqueue(null);
+        sandbox.LsFilesResponseQueue.Enqueue(
+            new SandboxExecResult(0, BuildContaminatedLsFilesStdout(path), ""));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile(path, "m + w\n");
+            return new AgentResult(true, "forgot to stage", null, null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("unmerged paths remain after agent: src/a.txt", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("\x1b", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("Starting codeybox", result.Summary, StringComparison.Ordinal);
+        Assert.Equal(1, runner.InvocationCount);
+    }
+
+    [Fact]
     public void ParseUnmergedPathsFromLsFilesStdout_IgnoresPrefixedMultipassStartupNoise()
     {
-        var oid2 = new string('a', 40);
-        var oid3 = new string('b', 40);
         const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
-        var stdout =
-            "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner>  " +
-            $"100644 {oid2} 2\t{path}\0" +
-            $"100644 {oid3} 3\t{path}\0";
+        var stdout = BuildContaminatedLsFilesStdout(path);
 
         var paths = AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout);
 
@@ -896,6 +958,16 @@ public sealed class AgenticConflictResolverTests
         return sb.ToString();
     }
 
+    private static string BuildContaminatedLsFilesStdout(string path)
+    {
+        var oid2 = new string('a', 40);
+        var oid3 = new string('b', 40);
+        return
+            "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner>  " +
+            $"100644 {oid2} 2\t{path}\0" +
+            $"100644 {oid3} 3\t{path}\0";
+    }
+
     private static string BuildLargeResolved(string conflictedContent)
     {
         // Replace just the conflict block with a merged line. Everything else
@@ -980,6 +1052,12 @@ public sealed class AgenticConflictResolverTests
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "ls-files"
                 && argv.Contains("-u"))
             {
+                if (!argv.Contains("-z"))
+                    return Task.FromResult(new SandboxExecResult(
+                        129,
+                        "",
+                        "test fake requires git ls-files -u -z so unmerged paths are NUL-delimited"));
+
                 if (LsFilesResponseQueue.TryDequeue(out var queued) && queued is not null)
                     return Task.FromResult(queued);
 
