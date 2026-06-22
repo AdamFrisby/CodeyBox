@@ -35,6 +35,7 @@ namespace CodeyBox.Tests;
 /// surfaces here rather than via mysterious turn failures in production.
 /// </summary>
 [SupportedOSPlatform("linux")]
+[Collection("Process environment")]
 public sealed class AcpBridgeUnitTests
 {
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
