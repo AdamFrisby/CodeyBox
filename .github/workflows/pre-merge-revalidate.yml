@@ -100,10 +100,10 @@ jobs:
     name: rebase + build + test (untrusted)
     needs: enumerate
     if: ${{ needs.enumerate.outputs.prs != '[]' && needs.enumerate.outputs.prs != '' }}
-    # The ACP bridge must be proven inside the real Multipass sandbox image
-    # before this gate can call the rebased tree green, so this job needs the
-    # same self-hosted runner shape as the suspend-resilience verifier.
-    runs-on: [self-hosted, multipass]
+    # This job executes attacker-controlled PR code after checkout/rebase, so it
+    # must stay on an ephemeral GitHub-hosted runner with no Multipass host
+    # privileges and no out-of-band verifier credentials.
+    runs-on: ubuntu-latest
     # SECURITY: this job intentionally runs attacker-controllable code
     # (PR-side MSBuild targets, NuGet pre/post-build hooks, .gitattributes
     # filter drivers can all execute during rebase/build/test). It MUST
@@ -129,6 +129,11 @@ jobs:
           persist-credentials: false
           # Need full history so the rebase has the merge-base available.
           fetch-depth: 0
+
+      - name: set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
 
       - name: fetch PR head
         id: fetch
@@ -171,27 +176,9 @@ jobs:
           GH_TOKEN: ''
           ACTIONS_RUNTIME_TOKEN: ''
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
-          CODEYBOX_ACP_BRIDGE_VERIFY_VM: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM }}
-          CODEYBOX_ACP_BRIDGE_VERIFY_MODEL: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_MODEL }}
-          CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS }}
-          API_TIMEOUT_MS: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_API_TIMEOUT_MS }}
         run: |
-          # setup-dotnet is invoked in this same step (not as a separate
-          # action) so all of dotnet's lifecycle runs under the scrubbed
-          # env block above — the action's own env injection cannot bring
-          # GH_TOKEN back into scope after this point.
           set -euo pipefail
-          if ! command -v dotnet >/dev/null; then
-            echo "dotnet not pre-installed on runner; this job assumes the ubuntu-latest image ships it" >&2
-            exit 1
-          fi
-          sudo apt-get update
-          sudo apt-get install -y musl-tools clang lld
-          # The self-hosted runner supplies the verifier Claude credential out
-          # of band. Do not inject repository secrets into this PR-controlled
-          # build job.
-          scripts/publish-acp-bridge.sh
-          dotnet build CodeyBox.slnx --configuration Release
+          dotnet build CodeyBox.slnx --configuration Release -p:RequireAcpBridgeNativeResource=false
         continue-on-error: true
 
       - name: test
@@ -206,7 +193,7 @@ jobs:
           GH_TOKEN: ''
           ACTIONS_RUNTIME_TOKEN: ''
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
-        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build
+        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build -p:RequireAcpBridgeNativeResource=false
         continue-on-error: true
 
       - name: classify outcome

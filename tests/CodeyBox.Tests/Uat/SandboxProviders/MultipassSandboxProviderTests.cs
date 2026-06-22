@@ -1152,6 +1152,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("mv -f \"$stdout_tmp\" \"${marker}.stdout\"", script);
         Assert.Contains("mv -f \"$stderr_tmp\" \"${marker}.stderr\"", script);
         Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
+        Assert.Contains("while kill -0 \"-$codeybox_detached_pid\"", script);
+        Assert.Contains("kill -KILL \"-$codeybox_detached_pid\"", script);
         Assert.DoesNotContain("codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"", script);
         Assert.DoesNotContain("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN=\"$codeybox_output_exit_token\"", script);
         Assert.DoesNotContain("codeybox_exit_marker", script);
@@ -1632,6 +1634,82 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stdout);
         Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
         Assert.False(File.Exists(processGroupMarker));
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_MarkerTimeoutSigkillsChildThatIgnoresSigterm()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "marker-timeout-sigkill",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-marker-timeout-sigkill.env");
+        var launchScript = Path.Combine(_workspace, "detached-marker-timeout-sigkill.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-marker-timeout-sigkill.pgid");
+        var sudoProcessGroupFile = Path.Combine(_workspace, "detached-marker-timeout-sigkill.sudo-pgid");
+        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", "-c", "printf should-not-run"]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var fakeSudo = CreateFakeSudoBin($$"""
+            #!/bin/sh
+            if [ "$1" = "-n" ]; then shift; fi
+            if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
+                case "$3" in *'pgid=$2'*)
+                    pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
+                    printf '%s\n' "$pgid" > {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
+                    trap '' TERM
+                    while :; do sleep 1; done
+                    ;;
+                esac
+            fi
+            exec "$@"
+            """);
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var (exit, stdout, stderr) = await RunLocalProcessAsync(
+                "/bin/bash",
+                [launchScript],
+                timeout.Token,
+                environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+                });
+
+            Assert.Equal(88, exit);
+            Assert.Equal("", stdout);
+            Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(processGroupMarker));
+
+            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(1));
+            var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
+            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(3));
+        }
+        finally
+        {
+            if (File.Exists(sudoProcessGroupFile))
+            {
+                var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
+                await KillProcessGroupAsync(pgid);
+            }
+        }
     }
 
     [Fact]
@@ -5163,6 +5241,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         await WaitForFileAsync(markerPath, timeout);
         var pgid = (await File.ReadAllTextAsync(markerPath)).Trim();
+        await WaitForProcessGroupIdGoneAsync(pgid, timeout);
+    }
+
+    private static async Task WaitForProcessGroupIdGoneAsync(string pgid, TimeSpan timeout)
+    {
         var deadline = DateTimeOffset.UtcNow + timeout;
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -5174,7 +5257,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             await Task.Delay(50);
         }
 
-        Assert.Fail($"Expected process group {pgid} from {markerPath} to exit.");
+        Assert.Fail($"Expected process group {pgid} to exit.");
+    }
+
+    private static async Task KillProcessGroupAsync(string pgid)
+    {
+        if (string.IsNullOrWhiteSpace(pgid))
+            return;
+
+        await RunLocalProcessAsync(
+            "/bin/sh",
+            ["-c", "kill -KILL \"-$1\" 2>/dev/null || true", "codeybox-pgid-cleanup", pgid]);
     }
 
     private string CreateFakeSudoBin()

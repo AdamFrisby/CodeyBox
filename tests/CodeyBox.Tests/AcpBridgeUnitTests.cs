@@ -2291,7 +2291,37 @@ public sealed class AcpBridgeUnitTests
     // frame.
 
     [Fact]
-    public async Task WebSocketConnection_TryParseFrame_RejectsOversizedLength127Frame_AndClosesReceiveLoopCleanly()
+    public async Task WebSocketConnection_TryParseFrame_RejectsNegativeLength127Frame_AndClosesReceiveLoopCleanly()
+    {
+        // 0xFF_FF_FF_FF_FF_FF_FF_FF parses as a negative signed long. A
+        // no-bounds parser would feed that value into `new byte[len]`.
+        await AssertOversizedLength127FrameClosesReceiveLoopCleanlyAsync(
+        [
+            0x81,                                   // FIN + text opcode
+            (byte)(0x80 | 127),                     // masked + length-127
+            0xFF, 0xFF, 0xFF, 0xFF,                 // high 4 bytes (MSB set -> negative)
+            0xFF, 0xFF, 0xFF, 0xFF,                 // low 4 bytes
+            0x12, 0x34, 0x56, 0x78,                 // mask bytes (irrelevant)
+        ]);
+    }
+
+    [Fact]
+    public async Task WebSocketConnection_TryParseFrame_RejectsPositiveOverCapLength127Frame_AndClosesReceiveLoopCleanly()
+    {
+        // 0x00_00_00_00_00_80_00_01 is MaxFramePayloadBytes + 1. It is a
+        // positive signed long, so this case specifically pins the upper-bound
+        // cap rather than the signed-overflow guard.
+        await AssertOversizedLength127FrameClosesReceiveLoopCleanlyAsync(
+        [
+            0x81,                                   // FIN + text opcode
+            (byte)(0x80 | 127),                     // masked + length-127
+            0x00, 0x00, 0x00, 0x00,                 // high 4 bytes
+            0x00, 0x80, 0x00, 0x01,                 // low 4 bytes: 8 MiB + 1
+            0x12, 0x34, 0x56, 0x78,                 // mask bytes (irrelevant)
+        ]);
+    }
+
+    private static async Task AssertOversizedLength127FrameClosesReceiveLoopCleanlyAsync(byte[] hostile)
     {
         var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -2341,20 +2371,9 @@ public sealed class AcpBridgeUnitTests
             if (HasHeaderTerminator(headerSoFar, out _)) break;
         }
 
-        // Send a length-127 text frame with the MSB set on the length: the
-        // 8-byte big-endian value 0xFF_00_00_00_00_00_00_00 parses to a
-        // negative long, which a no-bounds parser would feed into
-        // `new byte[len]` and crash. The frame also carries the mask bit so
-        // it looks "valid" up to the length check; the 4 mask bytes are
-        // never reached because the length check fails first.
-        var hostile = new byte[]
-        {
-            0x81,                                   // FIN + text opcode
-            (byte)(0x80 | 127),                     // masked + length-127
-            0xFF, 0xFF, 0xFF, 0xFF,                 // high 4 bytes (MSB set → negative)
-            0xFF, 0xFF, 0xFF, 0xFF,                 // low 4 bytes
-            0x12, 0x34, 0x56, 0x78,                 // mask bytes (irrelevant)
-        };
+        // The frame carries the mask bit so it looks valid up to the length
+        // check; the 4 mask bytes are never reached because the length check
+        // fails first.
         await s.WriteAsync(hostile);
         await s.FlushAsync();
 
@@ -3686,7 +3705,7 @@ exit 9
     }
 
     [Fact]
-    public async Task AcpBridge_PublishScript_SkipMultipassVerify_PublishesResourceWithoutMultipass()
+    public async Task AcpBridge_PublishScript_SkipMultipassVerifyArgumentIsRejectedBeforePublish()
     {
         var fixture = CreatePublishScriptFixture();
         try
@@ -3695,15 +3714,13 @@ exit 9
 
             var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath, "--skip-multipass-verify"], env);
 
-            Assert.Equal(0, run.ExitCode);
-            Assert.True(File.Exists(fixture.ResourcePath),
-                "The publish script must still refresh the embedded resource when VM verification is explicitly skipped.");
-            Assert.Contains("skipping required Multipass runtime verification", run.Stderr, StringComparison.Ordinal);
+            Assert.Equal(64, run.ExitCode);
+            Assert.Contains("Usage: scripts/publish-acp-bridge.sh", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath),
+                "Rejected skip arguments must not refresh the embedded bridge resource.");
 
-            var calls = File.ReadAllText(fixture.CallLog);
-            Assert.Contains("dotnet publish", calls, StringComparison.Ordinal);
-            Assert.Contains("ldd", calls, StringComparison.Ordinal);
-            Assert.DoesNotContain("multipass", calls, StringComparison.Ordinal);
+            if (File.Exists(fixture.CallLog))
+                Assert.Equal("", File.ReadAllText(fixture.CallLog));
         }
         finally
         {
@@ -3712,7 +3729,7 @@ exit 9
     }
 
     [Fact]
-    public async Task AcpBridge_PublishScript_EnvironmentSkipMultipassVerify_PublishesResourceWithoutMultipass()
+    public async Task AcpBridge_PublishScript_EnvironmentSkipMultipassVerifyDoesNotBypassVmRequirement()
     {
         var fixture = CreatePublishScriptFixture();
         try
@@ -3722,15 +3739,15 @@ exit 9
 
             var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
 
-            Assert.Equal(0, run.ExitCode);
-            Assert.True(File.Exists(fixture.ResourcePath),
-                "The environment skip flag must behave like --skip-multipass-verify and still publish the resource.");
-            Assert.Contains("skipping required Multipass runtime verification", run.Stderr, StringComparison.Ordinal);
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_VM must name", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath),
+                "Environment skip flags must not refresh the embedded bridge resource.");
 
             var calls = File.ReadAllText(fixture.CallLog);
             Assert.Contains("dotnet publish", calls, StringComparison.Ordinal);
             Assert.Contains("ldd", calls, StringComparison.Ordinal);
-            Assert.DoesNotContain("multipass", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass start", calls, StringComparison.Ordinal);
         }
         finally
         {
@@ -3815,7 +3832,7 @@ exit 9
             var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
             env["CODEYBOX_TEST_LDD_OUT"] = "\tlinux-vdso.so.1 (0x00007ffc00000000)\n\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6";
 
-            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath, "--skip-multipass-verify"], env);
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
 
             Assert.NotEqual(0, run.ExitCode);
             Assert.Contains("published binary appears dynamically linked", run.Stderr, StringComparison.Ordinal);
@@ -3841,7 +3858,7 @@ exit 9
             var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
             env["CODEYBOX_TEST_DOTNET_SKIP_OUTPUT"] = "1";
 
-            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath, "--skip-multipass-verify"], env);
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
 
             Assert.NotEqual(0, run.ExitCode);
             Assert.Contains("published binary not found", run.Stderr, StringComparison.Ordinal);
@@ -4078,7 +4095,7 @@ exit 9
     }
 
     [Fact]
-    public void AcpBridge_PreMergeRevalidateWorkflow_RunsSandboxVerifierAndStrictResourceBuild()
+    public void AcpBridge_PreMergeRevalidateWorkflow_DoesNotRunCredentialedVerifierOnUntrustedPrCode()
     {
         var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
             ?? throw new InvalidOperationException(
@@ -4087,11 +4104,11 @@ exit 9
         var workflowPath = Path.Combine(solutionRoot, ".github", "workflows", "pre-merge-revalidate.yml");
         var text = File.ReadAllText(workflowPath);
 
-        Assert.Contains("runs-on: [self-hosted, multipass]", text, StringComparison.Ordinal);
-        Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_VM", text, StringComparison.Ordinal);
-        Assert.Contains("scripts/publish-acp-bridge.sh", text, StringComparison.Ordinal);
-        Assert.DoesNotContain("scripts/publish-acp-bridge.sh --skip-multipass-verify", text, StringComparison.Ordinal);
-        Assert.DoesNotContain("RequireAcpBridgeNativeResource=false", text, StringComparison.Ordinal);
+        Assert.Contains("runs-on: ubuntu-latest", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("runs-on: [self-hosted, multipass]", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("CODEYBOX_ACP_BRIDGE_VERIFY_VM", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("scripts/publish-acp-bridge.sh", text, StringComparison.Ordinal);
+        Assert.Contains("-p:RequireAcpBridgeNativeResource=false", text, StringComparison.Ordinal);
     }
 
     private static string ClaudeProjectPath()

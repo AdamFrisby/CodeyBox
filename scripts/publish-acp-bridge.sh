@@ -15,25 +15,13 @@
 #   CODEYBOX_ACP_BRIDGE_VERIFY_VM=cb-baseline-abc123 scripts/publish-acp-bridge.sh
 #
 # The verification VM MUST be an already-baked CodeyBox baseline supplied in
-# CODEYBOX_ACP_BRIDGE_VERIFY_VM. Compile-only CI may pass
-# --skip-multipass-verify, but release artifacts must not use that escape hatch.
+# CODEYBOX_ACP_BRIDGE_VERIFY_VM. The embedded resource is refreshed only after
+# the candidate has passed the required in-VM verification.
 set -eu
 
-SKIP_VM_VERIFY=0
-for arg in "$@"; do
-    case "$arg" in
-        --skip-multipass-verify)
-            SKIP_VM_VERIFY=1
-            ;;
-        *)
-            echo "Usage: scripts/publish-acp-bridge.sh [--skip-multipass-verify]" >&2
-            exit 64
-            ;;
-    esac
-done
-
-if [ "${CODEYBOX_ACP_BRIDGE_SKIP_VM_VERIFY:-0}" = "1" ]; then
-    SKIP_VM_VERIFY=1
+if [ "$#" -ne 0 ]; then
+    echo "Usage: scripts/publish-acp-bridge.sh" >&2
+    exit 64
 fi
 
 cd "$(dirname "$0")/.."
@@ -120,40 +108,37 @@ if command -v ldd >/dev/null 2>&1; then
     esac
 fi
 
-if [ "$SKIP_VM_VERIFY" = "1" ]; then
-    echo "WARNING: skipping required Multipass runtime verification by explicit request." >&2
-else
-    if ! command -v multipass >/dev/null 2>&1; then
-        echo "ERROR: multipass is required to verify the ACP bridge inside the sandbox image." >&2
-        echo "       Set CODEYBOX_ACP_BRIDGE_VERIFY_VM to a baked CodeyBox baseline VM, or install Multipass." >&2
-        exit 1
-    fi
+if ! command -v multipass >/dev/null 2>&1; then
+    echo "ERROR: multipass is required to verify the ACP bridge inside the sandbox image." >&2
+    echo "       Set CODEYBOX_ACP_BRIDGE_VERIFY_VM to a baked CodeyBox baseline VM, or install Multipass." >&2
+    exit 1
+fi
 
-    VERIFY_VM="${CODEYBOX_ACP_BRIDGE_VERIFY_VM:-}"
-    if [ -z "$VERIFY_VM" ]; then
-        echo "ERROR: CODEYBOX_ACP_BRIDGE_VERIFY_VM must name an already-baked CodeyBox sandbox baseline VM." >&2
-        echo "       The bridge verifier must run on the same image operators will clone; it no longer falls back to vanilla Ubuntu." >&2
-        exit 1
-    fi
-    if [ -z "${ANTHROPIC_API_KEY:-}" ] \
-        && [ -z "${CODEYBOX_CLAUDE_API_KEY:-}" ] \
-        && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
-        && [ -z "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
-        echo "ERROR: ACP bridge VM verification requires a Claude credential in host env." >&2
-        echo "       Set CODEYBOX_CLAUDE_API_KEY (mapped to ANTHROPIC_API_KEY in the VM), ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CODEYBOX_CLAUDE_OAUTH_JSON." >&2
-        exit 1
-    fi
+VERIFY_VM="${CODEYBOX_ACP_BRIDGE_VERIFY_VM:-}"
+if [ -z "$VERIFY_VM" ]; then
+    echo "ERROR: CODEYBOX_ACP_BRIDGE_VERIFY_VM must name an already-baked CodeyBox sandbox baseline VM." >&2
+    echo "       The bridge verifier must run on the same image operators will clone; it no longer falls back to vanilla Ubuntu." >&2
+    exit 1
+fi
+if [ -z "${ANTHROPIC_API_KEY:-}" ] \
+    && [ -z "${CODEYBOX_CLAUDE_API_KEY:-}" ] \
+    && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
+    && [ -z "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
+    echo "ERROR: ACP bridge VM verification requires a Claude credential in host env." >&2
+    echo "       Set CODEYBOX_CLAUDE_API_KEY (mapped to ANTHROPIC_API_KEY in the VM), ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CODEYBOX_CLAUDE_OAUTH_JSON." >&2
+    exit 1
+fi
 
-    echo "Using CodeyBox Multipass verification VM $VERIFY_VM..."
-    multipass start "$VERIFY_VM" >/dev/null 2>&1 || true
+echo "Using CodeyBox Multipass verification VM $VERIFY_VM..."
+multipass start "$VERIFY_VM" >/dev/null 2>&1 || true
 
-    REMOTE_DIR="$(multipass exec "$VERIFY_VM" -- mktemp -d /tmp/codeybox-acp-bridge-verify.XXXXXX)"
-    REMOTE="$REMOTE_DIR/acp-bridge"
-    REMOTE_VERIFY="$REMOTE_DIR/verify-acp-bridge.py"
-    REMOTE_ENV="$REMOTE_DIR/claude-env.sh"
-    multipass transfer "$TMP_RESOURCE" "$VERIFY_VM:$REMOTE"
-    multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE"
-    multipass exec "$VERIFY_VM" -- sh -c "cat > '$REMOTE_VERIFY'" <<'PY'
+REMOTE_DIR="$(multipass exec "$VERIFY_VM" -- mktemp -d /tmp/codeybox-acp-bridge-verify.XXXXXX)"
+REMOTE="$REMOTE_DIR/acp-bridge"
+REMOTE_VERIFY="$REMOTE_DIR/verify-acp-bridge.py"
+REMOTE_ENV="$REMOTE_DIR/claude-env.sh"
+multipass transfer "$TMP_RESOURCE" "$VERIFY_VM:$REMOTE"
+multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE"
+multipass exec "$VERIFY_VM" -- sh -c "cat > '$REMOTE_VERIFY'" <<'PY'
 #!/usr/bin/env python3
 import json
 import os
@@ -471,49 +456,48 @@ def main():
 if __name__ == "__main__":
     main()
 PY
-    multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE_VERIFY"
-    {
-        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-            write_env_assignment "ANTHROPIC_API_KEY" "$ANTHROPIC_API_KEY"
-        elif [ -n "${CODEYBOX_CLAUDE_API_KEY:-}" ]; then
-            write_env_assignment "ANTHROPIC_API_KEY" "$CODEYBOX_CLAUDE_API_KEY"
-        fi
-        if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-            write_env_assignment "CLAUDE_CODE_OAUTH_TOKEN" "$CLAUDE_CODE_OAUTH_TOKEN"
-        fi
-        if [ -n "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
-            write_env_assignment "CODEYBOX_CLAUDE_OAUTH_JSON" "$CODEYBOX_CLAUDE_OAUTH_JSON"
-        fi
-        if [ -n "${CODEYBOX_ACP_BRIDGE_VERIFY_MODEL:-}" ]; then
-            write_env_assignment "CODEYBOX_ACP_BRIDGE_VERIFY_MODEL" "$CODEYBOX_ACP_BRIDGE_VERIFY_MODEL"
-        fi
-        if [ -n "${CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS:-}" ]; then
-            write_env_assignment "CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS" "$CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS"
-        fi
-        if [ -n "${API_TIMEOUT_MS:-}" ]; then
-            write_env_assignment "API_TIMEOUT_MS" "$API_TIMEOUT_MS"
-        fi
-    } | multipass exec "$VERIFY_VM" -- sh -c "umask 077; cat > '$REMOTE_ENV'"
-    VERIFY_OUT="$(multipass exec "$VERIFY_VM" -- sh -c ". '$REMOTE_ENV'; export ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEYBOX_CLAUDE_OAUTH_JSON CODEYBOX_ACP_BRIDGE_VERIFY_MODEL CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS API_TIMEOUT_MS; python3 '$REMOTE_VERIFY' '$REMOTE'" 2>&1)" || {
-        echo "ERROR: ACP bridge end-to-end verification failed inside Multipass VM $VERIFY_VM:" >&2
-        echo "$VERIFY_OUT" >&2
-        multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
-        REMOTE_DIR=""
-        exit 1
-    }
+multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE_VERIFY"
+{
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        write_env_assignment "ANTHROPIC_API_KEY" "$ANTHROPIC_API_KEY"
+    elif [ -n "${CODEYBOX_CLAUDE_API_KEY:-}" ]; then
+        write_env_assignment "ANTHROPIC_API_KEY" "$CODEYBOX_CLAUDE_API_KEY"
+    fi
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        write_env_assignment "CLAUDE_CODE_OAUTH_TOKEN" "$CLAUDE_CODE_OAUTH_TOKEN"
+    fi
+    if [ -n "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
+        write_env_assignment "CODEYBOX_CLAUDE_OAUTH_JSON" "$CODEYBOX_CLAUDE_OAUTH_JSON"
+    fi
+    if [ -n "${CODEYBOX_ACP_BRIDGE_VERIFY_MODEL:-}" ]; then
+        write_env_assignment "CODEYBOX_ACP_BRIDGE_VERIFY_MODEL" "$CODEYBOX_ACP_BRIDGE_VERIFY_MODEL"
+    fi
+    if [ -n "${CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS:-}" ]; then
+        write_env_assignment "CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS" "$CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS"
+    fi
+    if [ -n "${API_TIMEOUT_MS:-}" ]; then
+        write_env_assignment "API_TIMEOUT_MS" "$API_TIMEOUT_MS"
+    fi
+} | multipass exec "$VERIFY_VM" -- sh -c "umask 077; cat > '$REMOTE_ENV'"
+VERIFY_OUT="$(multipass exec "$VERIFY_VM" -- sh -c ". '$REMOTE_ENV'; export ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEYBOX_CLAUDE_OAUTH_JSON CODEYBOX_ACP_BRIDGE_VERIFY_MODEL CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS API_TIMEOUT_MS; python3 '$REMOTE_VERIFY' '$REMOTE'" 2>&1)" || {
+    echo "ERROR: ACP bridge end-to-end verification failed inside Multipass VM $VERIFY_VM:" >&2
+    echo "$VERIFY_OUT" >&2
     multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
     REMOTE_DIR=""
-    case "$VERIFY_OUT" in
-        *"ACP bridge end-to-end verification passed"*) ;;
-        *)
-            echo "ERROR: ACP bridge verifier did not report success:" >&2
-            echo "$VERIFY_OUT" >&2
-            exit 1
-            ;;
-    esac
-    echo "$VERIFY_OUT"
-    echo "Multipass ACP verification passed on $VERIFY_VM."
-fi
+    exit 1
+}
+multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
+REMOTE_DIR=""
+case "$VERIFY_OUT" in
+    *"ACP bridge end-to-end verification passed"*) ;;
+    *)
+        echo "ERROR: ACP bridge verifier did not report success:" >&2
+        echo "$VERIFY_OUT" >&2
+        exit 1
+        ;;
+esac
+echo "$VERIFY_OUT"
+echo "Multipass ACP verification passed on $VERIFY_VM."
 
 mv "$TMP_RESOURCE" "$RESOURCE_PATH"
 chmod 644 "$RESOURCE_PATH"
