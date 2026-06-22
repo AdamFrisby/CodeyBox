@@ -850,6 +850,18 @@ public sealed class AgenticConflictResolverTests
         AgenticConflictResolver.ValidateRelativeWorkPath("src/a.cs");
     }
 
+    [Theory]
+    [InlineData("src/a\nb.cs")]
+    [InlineData("src/a\rb.cs")]
+    [InlineData("src/a\tb.cs")]
+    [InlineData("src/a\u001bb.cs")]
+    [InlineData("src/a\u007fb.cs")]
+    public void ValidateRelativeWorkPath_RejectsControlCharacters(string path)
+    {
+        Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            AgenticConflictResolver.ValidateRelativeWorkPath(path));
+    }
+
     private static string BuildSimpleConflict(string baseLine, string mainLine, string workLine)
     {
         var sb = new StringBuilder();
