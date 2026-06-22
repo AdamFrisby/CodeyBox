@@ -124,14 +124,15 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         var encoded = Convert.ToBase64String(bytes);
         const string script =
             "set -eu\n" +
+            "fail(){ cat >/dev/null || true; echo \"$1\" >&2; exit 1; }\n" +
             "target_dir=\"$HOME/.codeybox\"\n" +
             "target=\"$target_dir/claude-acp-bridge\"\n" +
-            "if [ -L \"$target_dir\" ]; then echo \"refusing symlinked bridge directory: $target_dir\" >&2; exit 1; fi\n" +
-            "if [ -e \"$target_dir\" ] && [ ! -d \"$target_dir\" ]; then echo \"bridge directory path is not a directory: $target_dir\" >&2; exit 1; fi\n" +
-            "mkdir -p \"$target_dir\"\n" +
-            "if [ -L \"$target_dir\" ] || [ ! -d \"$target_dir\" ]; then echo \"bridge directory path is not a real directory: $target_dir\" >&2; exit 1; fi\n" +
-            "chmod 700 \"$target_dir\"\n" +
-            "tmp=$(mktemp \"$target_dir/.claude-acp-bridge.XXXXXX\")\n" +
+            "if [ -L \"$target_dir\" ]; then fail \"refusing symlinked bridge directory: $target_dir\"; fi\n" +
+            "if [ -e \"$target_dir\" ] && [ ! -d \"$target_dir\" ]; then fail \"bridge directory path is not a directory: $target_dir\"; fi\n" +
+            "mkdir -p \"$target_dir\" || fail \"failed to create bridge directory: $target_dir\"\n" +
+            "if [ -L \"$target_dir\" ] || [ ! -d \"$target_dir\" ]; then fail \"bridge directory path is not a real directory: $target_dir\"; fi\n" +
+            "chmod 700 \"$target_dir\" || fail \"failed to chmod bridge directory: $target_dir\"\n" +
+            "tmp=$(mktemp \"$target_dir/.claude-acp-bridge.XXXXXX\") || fail \"failed to create temporary ACP bridge file: $target_dir\"\n" +
             "trap 'rm -f \"$tmp\"' EXIT INT TERM\n" +
             "base64 -d > \"$tmp\"\n" +
             "chmod 700 \"$tmp\"\n" +
