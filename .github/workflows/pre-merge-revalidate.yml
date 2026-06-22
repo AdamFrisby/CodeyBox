@@ -181,7 +181,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools clang lld
           scripts/publish-acp-bridge.sh --skip-multipass-verify
-          dotnet build CodeyBox.slnx --configuration Release -p:PublishAcpBridgeNativeResource=false
+          dotnet build CodeyBox.slnx --configuration Release -p:RequireAcpBridgeNativeResource=false
         continue-on-error: true
 
       - name: test

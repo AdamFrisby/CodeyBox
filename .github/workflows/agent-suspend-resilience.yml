@@ -77,7 +77,7 @@ jobs:
           scripts/publish-acp-bridge.sh
 
       - name: build
-        run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release -p:PublishAcpBridgeNativeResource=false
+        run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release -p:RequireAcpBridgeNativeResource=false
 
       - name: run suspend resilience matrix
         run: |

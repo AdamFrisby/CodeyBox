@@ -700,6 +700,24 @@ public sealed class ClaudeAcpTransportTests
             () => transport.OpenAsync(request, CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("relative/claude-acp-bridge\n")]
+    public async Task AcpClaudeTransport_OpenAsync_InvalidMaterialisedBridgePath_RaisesUnavailable(string materialiseStdout)
+    {
+        var sandbox = new BridgeSandbox { MaterialiseStdout = materialiseStdout };
+        var transport = NewAcpTransportWithOverride();
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-bad-materialised-path");
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => transport.OpenAsync(request, CancellationToken.None));
+
+        Assert.Contains("materialised ACP bridge path", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(sandbox.BridgeExecs);
+    }
+
     [Fact]
     public async Task AcpClaudeTransport_MaterialiseBridgeAsync_SandboxExecThrows_RaisesUnavailable()
     {
@@ -1384,6 +1402,7 @@ public sealed class ClaudeAcpTransportTests
         public string Id { get; } = "vm-" + Guid.NewGuid().ToString("N")[..8];
 
         public bool FailMaterialise { get; set; }
+        public string MaterialiseStdout { get; set; } = "/home/test/.codeybox/claude-acp-bridge\n";
         public int BridgeExitCode { get; set; }
         public string? SanitiserListsFile { get; set; }
         public bool SanitiserFailWrite { get; set; }
@@ -1402,7 +1421,7 @@ public sealed class ClaudeAcpTransportTests
             {
                 if (FailMaterialise)
                     return Task.FromResult(new SandboxExecResult(1, "", "permission denied"));
-                return Task.FromResult(new SandboxExecResult(0, "/home/test/.codeybox/claude-acp-bridge\n", ""));
+                return Task.FromResult(new SandboxExecResult(0, MaterialiseStdout, ""));
             }
 
             // Sanitiser discovery: `bash -c "...session_root..."` with no Stdin.

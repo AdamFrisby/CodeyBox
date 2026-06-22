@@ -130,6 +130,14 @@ else
         echo "       The bridge verifier must run on the same image operators will clone; it no longer falls back to vanilla Ubuntu." >&2
         exit 1
     fi
+    if [ -z "${ANTHROPIC_API_KEY:-}" ] \
+        && [ -z "${CODEYBOX_CLAUDE_API_KEY:-}" ] \
+        && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
+        && [ -z "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
+        echo "ERROR: ACP bridge VM verification requires a Claude credential in host env." >&2
+        echo "       Set CODEYBOX_CLAUDE_API_KEY (mapped to ANTHROPIC_API_KEY in the VM), ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CODEYBOX_CLAUDE_OAUTH_JSON." >&2
+        exit 1
+    fi
 
     echo "Using CodeyBox Multipass verification VM $VERIFY_VM..."
     multipass start "$VERIFY_VM" >/dev/null 2>&1 || true
@@ -151,6 +159,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 SUCCESS_MARKER = "ACP bridge end-to-end verification passed"
 
@@ -198,6 +207,14 @@ def prepare_claude_auth_files():
     with open(credentials_path, "w", encoding="utf-8") as handle:
         handle.write(oauth_json)
     os.chmod(credentials_path, 0o600)
+
+
+def prepare_isolated_home(bridge_path):
+    verifier_root = os.path.dirname(os.path.abspath(bridge_path))
+    home = os.path.join(verifier_root, "home")
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    os.environ["HOME"] = home
+    return home
 
 
 def build_claude_env():
@@ -410,21 +427,26 @@ def main():
     if len(sys.argv) != 2:
         fail("usage: verify-acp-bridge.py /path/to/acp-bridge")
     bridge_path = sys.argv[1]
-    claude_path = require_claude_binary()
+    prepare_isolated_home(bridge_path)
     prepare_claude_auth_files()
+    claude_path = require_claude_binary()
+    cache_prompt_prefix = (
+        CACHE_PROMPT_PREFIX
+        + "\nVerifier run nonce: %s\n" % uuid.uuid4().hex
+    )
     first = run_turn(
         bridge_path,
         claude_path,
         "session/new",
         None,
-        CACHE_PROMPT_PREFIX + "\nTurn 1: reply briefly with codeybox-acp-verify.",
+        cache_prompt_prefix + "\nTurn 1: reply briefly with codeybox-acp-verify.",
     )
     second = run_turn(
         bridge_path,
         claude_path,
         "session/load",
         first["session_id"],
-        CACHE_PROMPT_PREFIX + "\nTurn 2: reply briefly with codeybox-acp-verify.",
+        cache_prompt_prefix + "\nTurn 2: reply briefly with codeybox-acp-verify.",
     )
 
     first_usage = first["usage"]
@@ -445,15 +467,6 @@ if __name__ == "__main__":
     main()
 PY
     multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE_VERIFY"
-    if [ -z "${ANTHROPIC_API_KEY:-}" ] \
-        && [ -z "${CODEYBOX_CLAUDE_API_KEY:-}" ] \
-        && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
-        && [ -z "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
-        echo "ERROR: ACP bridge VM verification requires a Claude credential in host env." >&2
-        echo "       Set CODEYBOX_CLAUDE_API_KEY (mapped to ANTHROPIC_API_KEY in the VM), ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CODEYBOX_CLAUDE_OAUTH_JSON." >&2
-        multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
-        exit 1
-    fi
     {
         if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
             write_env_assignment "ANTHROPIC_API_KEY" "$ANTHROPIC_API_KEY"

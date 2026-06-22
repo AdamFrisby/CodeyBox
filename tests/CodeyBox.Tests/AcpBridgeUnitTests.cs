@@ -1010,6 +1010,12 @@ public sealed class AcpBridgeUnitTests
         return frame;
     }
 
+    private static byte[] BuildClientMaskedCloseFrame()
+    {
+        var mask = new byte[] { 0x12, 0x34, 0x56, 0x78 };
+        return new byte[] { 0x88, 0x80, mask[0], mask[1], mask[2], mask[3] };
+    }
+
     // ── Bridge.OnIncomingFrame orchestration ────────────────────────────────────
     //
     // The fixtures above pin BridgePayloads.ClassifyIncomingFrame's classifier
@@ -1159,6 +1165,92 @@ public sealed class AcpBridgeUnitTests
 
             await Task.Delay(100);
             Assert.Equal(0, ctx.Stdout.CountByType("turn_complete"));
+
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Bridge_AcceptsAuthenticatedWebSocketPeerFromClaudeDescendantProcess()
+    {
+        if (!File.Exists("/bin/bash") || !CommandExists("python3"))
+            return;
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-peer-auth-positive-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            Directory.CreateDirectory(lockDir);
+            var markerPath = Path.Combine(tmpDir, "descendant-connected.marker");
+            var stubPath = WriteClaudeStubThatConnectsFromDescendant(tmpDir);
+
+            await using var ctx = new BridgeRunHandle(useProductionPeerAuthorizer: true);
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"" + lockDir + "\",\"" + markerPath
+                + "\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            await ctx.WaitForEnvelopeAsync("ready");
+            await ctx.WaitForEnvelopeAsync("peer_connected", TimeSpan.FromSeconds(15));
+
+            for (int i = 0; i < 50 && !File.Exists(markerPath); i++)
+                await Task.Delay(50);
+            Assert.True(File.Exists(markerPath),
+                "The descendant claude stub did not complete the authenticated WebSocket handshake.");
+            Assert.Equal(0, ctx.Stdout.CountByType("peer_rejected"));
+
+            await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
+            var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, exitCode);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Bridge_RejectsSecondAuthenticatedWebSocketPeerWhileOnePeerIsActive()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-active-peer-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteLongRunningClaudeStub(tmpDir);
+
+            await using var ctx = new BridgeRunHandle();
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"claudeArgs\":[\"30\"],\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+            await ctx.WriteStdinLineAsync(hello);
+
+            var ready = await ctx.WaitForEnvelopeAsync("ready");
+            var port = ready.GetProperty("port").GetInt32();
+            var lockPath = ready.GetProperty("lockPath").GetString()!;
+            var authToken = JsonDocument.Parse(File.ReadAllBytes(lockPath)).RootElement
+                .GetProperty("authToken").GetString()!;
+
+            await ctx.ConnectWebSocketAsync(port, authToken);
+            await ctx.WaitForEnvelopeAsync("peer_connected");
+            var startIndex = ctx.Stdout.SnapshotCount();
+
+            using var secondPeer = await ConnectAuthenticatedWebSocketClientAsync(port, authToken);
+            var rejected = await ctx.WaitForEnvelopeAsync("peer_rejected", startIndex: startIndex);
+            Assert.Equal("active_peer_exists", rejected.GetProperty("reason").GetString());
+            Assert.Equal(1, ctx.Stdout.CountByType("peer_connected"));
 
             await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");
             var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
@@ -1390,13 +1482,15 @@ public sealed class AcpBridgeUnitTests
         }
     }
 
-    // ── Bridge.DrainPending lock contract (regression for commit 8152b99) ───────
+    // ── Bridge.DrainPending order contract (regression for commit 8152b99) ──────
     //
     // The bug being pinned: when the lock was narrowed to dequeue-only, two
     // drainers (the stdin pump after acp_send, and the accept handler after
     // the peer attaches) could overlap their SendText calls and deliver ACP
     // frames out of enqueue order — e.g. session/new ahead of initialize.
-    // The fix holds _pendingLock for the ENTIRE dequeue + send loop.
+    // The fix permits only one active drainer at a time while doing the actual
+    // NetworkStream.Write outside _pendingLock so shutdown can still close a
+    // stalled peer.
     //
     // This fixture pre-queues many ACP frames before the peer connects, then
     // feeds more from a background task while the peer-connect drain is in
@@ -1451,9 +1545,9 @@ public sealed class AcpBridgeUnitTests
             // task that races the peer-connect drain. The stdin pump processes
             // them one at a time, and each enqueue triggers another DrainPending
             // call from the stdin pump thread — concurrent with the accept
-            // handler's drain. With a properly-held _pendingLock the two
-            // drainers serialise and frames stay in enqueue order; a narrowed
-            // lock would let SendText calls overlap and reorder under load.
+            // handler's drain. With a single-drainer guard the drainers serialise
+            // and frames stay in enqueue order; a narrowed lock without that guard
+            // would let SendText calls overlap and reorder under load.
             var feedTask = Task.Run(async () =>
             {
                 for (int i = PreConnectFrames; i < TotalFrames; i++)
@@ -1678,14 +1772,25 @@ public sealed class AcpBridgeUnitTests
             for (int i = 0; i < 3; i++)
                 _ = await ctx.ReadWebSocketFrameAsync(TimeSpan.FromSeconds(10));
 
-            // Wait for the three acp_sent envelopes to surface on stdout.
-            var sent1 = await ctx.WaitForEnvelopeAsync("acp_sent", startIndex: beforeConnect);
-            var snap = ctx.Stdout.Snapshot();
-            var sentEnvs = snap.Skip(beforeConnect)
-                .Where(e => e.TryGetProperty("type", out var t)
-                    && t.ValueKind == JsonValueKind.String
-                    && t.GetString() == "acp_sent")
-                .ToList();
+            // Wait for the three acp_sent envelopes to surface on stdout. The
+            // peer can read a frame before the paired stdout envelope has been
+            // flushed, so don't snapshot immediately after the first envelope.
+            List<JsonElement> sentEnvs;
+            var deadline = Environment.TickCount64 + (long)TimeSpan.FromSeconds(10).TotalMilliseconds;
+            while (true)
+            {
+                var snap = ctx.Stdout.Snapshot();
+                sentEnvs = snap.Skip(beforeConnect)
+                    .Where(e => e.TryGetProperty("type", out var t)
+                        && t.ValueKind == JsonValueKind.String
+                        && t.GetString() == "acp_sent")
+                    .ToList();
+                if (sentEnvs.Count >= 3)
+                    break;
+                if (Environment.TickCount64 >= deadline)
+                    break;
+                await Task.Delay(50);
+            }
             Assert.Equal(3, sentEnvs.Count);
 
             // Envelope 0: numeric id preserved as Number (not coerced to String).
@@ -2228,6 +2333,62 @@ public sealed class AcpBridgeUnitTests
         listener.Stop();
     }
 
+    [Fact]
+    public async Task WebSocketConnection_ReceiveLoop_CloseFrameEndsStreamWithoutDeliveringText()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        var receiveDone = new TaskCompletionSource<int>();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var server = await listener.AcceptTcpClientAsync();
+                var ws = new WebSocketConnection(server.GetStream());
+                var ok = await ws.AcceptHandshakeAsync(authToken: "", CancellationToken.None);
+                if (!ok)
+                {
+                    receiveDone.TrySetException(new Exception("handshake failed"));
+                    return;
+                }
+
+                var delivered = 0;
+                await ws.ReceiveLoopAsync(_ => delivered++, CancellationToken.None);
+                receiveDone.TrySetResult(delivered);
+            }
+            catch (Exception ex) { receiveDone.TrySetException(ex); }
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: AAAA\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        var respBuf = new byte[1024];
+        var headerSoFar = new List<byte>();
+        while (true)
+        {
+            var n = await s.ReadAsync(respBuf.AsMemory()).AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            if (n <= 0) throw new EndOfStreamException("handshake stream closed");
+            for (int i = 0; i < n; i++) headerSoFar.Add(respBuf[i]);
+            if (HasHeaderTerminator(headerSoFar, out _)) break;
+        }
+
+        await s.WriteAsync(BuildClientMaskedCloseFrame());
+        await s.FlushAsync();
+
+        var deliveredFrames = await receiveDone.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, deliveredFrames);
+
+        listener.Stop();
+    }
+
     // ── WebSocketConnection.WriteRawAsync IOException/ODE swallow ──────────────
     //
     // Commit 89a9a03 wrapped WriteRawAsync's stream.WriteAsync in
@@ -2637,6 +2798,138 @@ public sealed class AcpBridgeUnitTests
         File.SetUnixFileMode(stubPath,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         return stubPath;
+    }
+
+    private static string WriteClaudeStubThatConnectsFromDescendant(string tmpDir)
+    {
+        var stubPath = Path.Combine(tmpDir, "claude-descendant-ws-stub.sh");
+        File.WriteAllText(stubPath, """
+#!/bin/bash
+set -euo pipefail
+LOCK_DIR="$2"
+MARKER="$3"
+python3 - "$LOCK_DIR" "$MARKER" <<'PY' &
+import glob
+import json
+import os
+import socket
+import sys
+import time
+
+lock_dir = sys.argv[1]
+marker = sys.argv[2]
+deadline = time.time() + 10
+lock_path = None
+while time.time() < deadline:
+    matches = glob.glob(os.path.join(lock_dir, "*.lock"))
+    if matches:
+        lock_path = matches[0]
+        break
+    time.sleep(0.05)
+if lock_path is None:
+    sys.exit(3)
+
+with open(lock_path, encoding="utf-8") as handle:
+    lockfile = json.load(handle)
+port = int(lockfile["url"].rsplit(":", 1)[1].split("/", 1)[0])
+auth = lockfile["authToken"]
+
+sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+request = (
+    "GET / HTTP/1.1\r\n"
+    "Host: 127.0.0.1\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "x-claude-code-ide-authorization: " + auth + "\r\n\r\n"
+)
+sock.sendall(request.encode("ascii"))
+response = b""
+while b"\r\n\r\n" not in response:
+    chunk = sock.recv(4096)
+    if not chunk:
+        break
+    response += chunk
+if not response.startswith(b"HTTP/1.1 101"):
+    sys.stderr.write("unexpected websocket handshake response: %r\n" % response[:200])
+    sys.exit(4)
+
+with open(marker, "w", encoding="utf-8") as handle:
+    handle.write("connected\n")
+
+try:
+    time.sleep(30)
+finally:
+    sock.close()
+PY
+child=$!
+trap 'kill "$child" 2>/dev/null || true; exit 0' TERM INT HUP
+wait "$child"
+""");
+        File.SetUnixFileMode(stubPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return stubPath;
+    }
+
+    private static bool CommandExists(string name)
+    {
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (File.Exists(Path.Combine(dir, name)))
+                return true;
+        }
+        return false;
+    }
+
+    private static async Task<TcpClient> ConnectAuthenticatedWebSocketClientAsync(
+        int port,
+        string authToken,
+        TimeSpan? timeout = null)
+    {
+        timeout ??= TimeSpan.FromSeconds(10);
+        using var cts = new CancellationTokenSource(timeout.Value);
+        var client = new TcpClient();
+        try
+        {
+            await client.ConnectAsync(IPAddress.Loopback, port, cts.Token).ConfigureAwait(false);
+            var stream = client.GetStream();
+            var req = Encoding.ASCII.GetBytes(
+                "GET / HTTP/1.1\r\n" +
+                "Host: 127.0.0.1\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+                "Sec-WebSocket-Version: 13\r\n" +
+                "x-claude-code-ide-authorization: " + authToken + "\r\n\r\n");
+            await stream.WriteAsync(req, cts.Token).ConfigureAwait(false);
+            await stream.FlushAsync(cts.Token).ConfigureAwait(false);
+
+            var buf = new byte[4096];
+            var header = new List<byte>();
+            while (true)
+            {
+                var n = await stream.ReadAsync(buf.AsMemory(), cts.Token).ConfigureAwait(false);
+                if (n <= 0)
+                    throw new IOException("WS handshake response stream closed before headers ended.");
+                for (int i = 0; i < n; i++) header.Add(buf[i]);
+                if (HasHeaderTerminator(header, out _))
+                {
+                    var statusLine = Encoding.ASCII.GetString(header.ToArray(), 0, Math.Min(header.Count, 256));
+                    if (!statusLine.StartsWith("HTTP/1.1 101", StringComparison.Ordinal))
+                        throw new IOException("WS handshake did not return 101: " + statusLine);
+                    return client;
+                }
+                if (header.Count > 32 * 1024)
+                    throw new IOException("WS handshake response headers exceeded 32 KiB.");
+            }
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
     }
 
     private static Dictionary<string, string> ParseKeyValueLog(string path)
@@ -3086,6 +3379,12 @@ set -euo pipefail
 printf 'claude' >> "$CALL_LOG"
 for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
 printf '\n' >> "$CALL_LOG"
+if [ -z "${ANTHROPIC_API_KEY:-}" ] \
+    && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
+    && [ -z "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
+    echo "missing verifier auth env" >&2
+    exit 42
+fi
 if [ "${1:-}" = "--version" ]; then
     echo "claude test-double version"
     exit 0
@@ -3373,6 +3672,33 @@ exit 9
     }
 
     [Fact]
+    public async Task AcpBridge_PublishScript_EnvironmentSkipMultipassVerify_PublishesResourceWithoutMultipass()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_ACP_BRIDGE_SKIP_VM_VERIFY"] = "1";
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.Equal(0, run.ExitCode);
+            Assert.True(File.Exists(fixture.ResourcePath),
+                "The environment skip flag must behave like --skip-multipass-verify and still publish the resource.");
+            Assert.Contains("skipping required Multipass runtime verification", run.Stderr, StringComparison.Ordinal);
+
+            var calls = File.ReadAllText(fixture.CallLog);
+            Assert.Contains("dotnet publish", calls, StringComparison.Ordinal);
+            Assert.Contains("ldd", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task AcpBridge_PublishScript_RequiresVerifyVmAndRunsMultipassVerifier()
     {
         var fixture = CreatePublishScriptFixture();
@@ -3397,6 +3723,36 @@ exit 9
             Assert.Contains("python3 '", calls, StringComparison.Ordinal);
             Assert.Contains("claude --version", calls, StringComparison.Ordinal);
             Assert.DoesNotContain("multipass launch", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_OAuthVerifierUsesTemporaryHomeAndCleansCredentials()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+            env["CODEYBOX_CLAUDE_API_KEY"] = null;
+            env["ANTHROPIC_API_KEY"] = null;
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = null;
+            env["CODEYBOX_CLAUDE_OAUTH_JSON"] = "{\"accessToken\":\"oauth-test\"}";
+            var hostHome = Path.Combine(fixture.TempRoot, "host-home");
+            Directory.CreateDirectory(hostHome);
+            env["HOME"] = hostHome;
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.Equal(0, run.ExitCode);
+            Assert.True(File.Exists(fixture.ResourcePath));
+            Assert.False(File.Exists(Path.Combine(hostHome, ".claude", ".credentials.json")),
+                "The verifier must not write OAuth credentials to the reusable VM user's HOME.");
+            Assert.Empty(Directory.GetFileSystemEntries(Path.Combine(fixture.TempRoot, "vm")));
         }
         finally
         {
@@ -3497,6 +3853,38 @@ exit 9
             var calls = File.ReadAllText(fixture.CallLog);
             Assert.Contains("ldd", calls, StringComparison.Ordinal);
             Assert.DoesNotContain("multipass start", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_RejectsMissingVerifierCredentialsBeforeMutatingVm()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+            env["CODEYBOX_CLAUDE_API_KEY"] = null;
+            env["ANTHROPIC_API_KEY"] = null;
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = null;
+            env["CODEYBOX_CLAUDE_OAUTH_JSON"] = null;
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("VM verification requires a Claude credential", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath));
+
+            var calls = File.ReadAllText(fixture.CallLog);
+            Assert.Contains("dotnet publish", calls, StringComparison.Ordinal);
+            Assert.Contains("ldd", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass start", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass exec", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass transfer", calls, StringComparison.Ordinal);
         }
         finally
         {

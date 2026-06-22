@@ -23,12 +23,9 @@ internal sealed class Bridge : IAsyncDisposable
     private readonly Func<TcpListener> _listenerFactory;
     private readonly Func<TcpClient, Process?, bool> _peerAuthorizer;
     private readonly Action<int> _forceExit;
-    // _pendingLock guards three things together so DrainPending can observe a
-    // consistent snapshot: the outbound queue (_pendingPayloads), the current
-    // peer reference (_peer), and the peer-ready flag (_peerReady). Holding
-    // the lock for the entire dequeue + send keeps frame order deterministic
-    // when both the stdin pump and the accept handler call DrainPending
-    // concurrently.
+    // _pendingLock guards the outbound queue, active peer snapshot, peer-ready
+    // flag, and single-drainer flag. Sends happen outside this lock so shutdown
+    // can close a stalled peer even if NetworkStream.Write is blocked.
     private readonly object _pendingLock = new();
     private readonly object _clientTaskLock = new();
     private readonly Queue<string> _pendingPayloads = new();
@@ -43,6 +40,7 @@ internal sealed class Bridge : IAsyncDisposable
     private string? _lockPath;
     private string? _authToken;
     private bool _peerReady;
+    private bool _drainInProgress;
     private Process? _claudeProcess;
     private int _shutdownState; // 0 = running, 1 = shutting down. Updated via Interlocked.Exchange.
     private int _claudeExitEmitted; // 0 = not yet emitted, 1 = emitted. Single-fire guard.
@@ -385,28 +383,49 @@ internal sealed class Bridge : IAsyncDisposable
         lock (_pendingLock) _pendingPayloads.Enqueue(payloadJson);
     }
 
-    /// <summary>
-    /// Hold <see cref="_pendingLock"/> for the ENTIRE dequeue + send loop. If
-    /// two drainers raced (stdin pump after acp_send vs. accept handler after
-    /// the peer attaches) and only the dequeue was synchronised, the actual
-    /// SendText calls could overtake each other and deliver ACP frames out
-    /// of order (e.g. session/new ahead of initialize). The lock also gives
-    /// us a single consistent read of <see cref="_peer"/>/<see cref="_peerReady"/>
-    /// so a peer-disconnect can't NRE the send. WebSocketConnection.SendText
-    /// is non-blocking (writes to a NetworkStream) so holding the lock is
-    /// cheap.
-    /// </summary>
     private void DrainPending()
     {
         lock (_pendingLock)
         {
-            while (_peerReady && _peer is not null && _pendingPayloads.Count > 0)
+            if (_drainInProgress)
+                return;
+            _drainInProgress = true;
+        }
+
+        var releasedDrain = false;
+        try
+        {
+            while (true)
             {
-                var next = _pendingPayloads.Dequeue();
-                _peer.SendText(next);
+                WebSocketConnection peer;
+                string next;
+                lock (_pendingLock)
+                {
+                    if (!_peerReady || _peer is null || _pendingPayloads.Count == 0)
+                    {
+                        _drainInProgress = false;
+                        releasedDrain = true;
+                        return;
+                    }
+
+                    peer = _peer;
+                    next = _pendingPayloads.Dequeue();
+                }
+
+                peer.SendText(next);
 
                 // Mirror the JS bridge's acp_sent envelope (id + method may be absent).
                 EmitAcpSentMeta(next);
+            }
+        }
+        finally
+        {
+            if (!releasedDrain)
+            {
+                lock (_pendingLock)
+                {
+                    _drainInProgress = false;
+                }
             }
         }
     }
