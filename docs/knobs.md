@@ -67,8 +67,10 @@ Every API set-time path validates against the registered `IKnobRegistry`:
   are matched case-insensitively and stored with the registered casing; knobs
   with no `AllowedValues` use their descriptor parser and still reject empty
   or whitespace-only values by default.
-- Per-item maps are capped at 32 entries; keys are capped at 64 chars; values
-  at 128 chars. Keys and values may not contain control characters.
+- There is no generic framework-level cap for map size, key length, value
+  length, or control characters beyond the registry lookup and descriptor
+  parser. Add those limits inside a descriptor when a specific knob needs
+  them.
 
 The PATCH endpoint follows the same Queued-only state machine that other
 queued-only fields use; once an item leaves Queued, knob edits return 409.

@@ -1239,15 +1239,18 @@ internal static class WorkItemEndpoints
         // still use the partial knob write below so worker state transitions from
         // stale snapshots cannot erase an accepted queued edit. Mixed knob PATCHes
         // use the combined guarded row+knob write here so a conflict cannot leave
-        // only the non-knob queued fields persisted. Audit-budget fields are
-        // restored to their original values for the row write and then persisted
-        // through UpdateAuditBudgetAsync below. That keeps the audit budget path
-        // partial even when an operator sends it alongside a queued title/timeout
-        // edit.
-        var needsQueuedRowUpdate = queuedRowPatch || (depsPatch && queuedOnlyPatch);
+        // only part of the request persisted. When knobs and audit budget fields
+        // are sent together, include the audit budget in that same guarded write;
+        // otherwise the later audit-budget write could conflict after the knob
+        // map had already been replaced.
+        var auditBudgetWrittenWithQueuedUpdate = normalisedPatchKnobs is not null && auditBudgetPatch;
+        var needsQueuedRowUpdate =
+            queuedRowPatch
+            || (depsPatch && queuedOnlyPatch)
+            || auditBudgetWrittenWithQueuedUpdate;
         if (needsQueuedRowUpdate)
         {
-            var queuedUpdate = auditBudgetPatch
+            var queuedUpdate = auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate
                 ? updated with
                 {
                     AuditMaxIterations = item!.AuditMaxIterations,
@@ -1283,7 +1286,7 @@ internal static class WorkItemEndpoints
             if (!written)
                 return Results.Conflict(new { error = "item changed before the queued knob update could be written" });
         }
-        if (auditBudgetPatch)
+        if (auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate)
         {
             var budgetResult = await store.UpdateAuditBudgetAsync(
                 updated.Id,

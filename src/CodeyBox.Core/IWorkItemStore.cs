@@ -242,11 +242,12 @@ public interface IWorkItemStore
     /// knob map together with other queued-only fields. Unlike
     /// <see cref="TryUpdateIfStateAndUpdatedAtAsync"/>, this writes
     /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
-    /// and <see cref="WorkItem.Knobs"/> because the caller is applying a
-    /// freshly validated operator PATCH against the exact snapshot identified
-    /// by <paramref name="onlyIfUpdatedAt"/>. Keeping the row fields and knobs
-    /// in one conditional write prevents a failed mixed PATCH from partially
-    /// persisting only the non-knob fields.
+    /// <see cref="WorkItem.AuditMaxIterations"/>,
+    /// <see cref="WorkItem.AuditComplexity"/>, and <see cref="WorkItem.Knobs"/>
+    /// because the caller is applying a freshly validated operator PATCH
+    /// against the exact snapshot identified by <paramref name="onlyIfUpdatedAt"/>.
+    /// Keeping the requested row fields, audit-budget fields, and knobs in one
+    /// conditional write prevents a failed mixed PATCH from partially persisting.
     /// </summary>
     Task<bool> TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
         WorkItem item,

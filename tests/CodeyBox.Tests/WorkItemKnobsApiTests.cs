@@ -228,6 +228,32 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
+    public async Task Patch_KnobsCombinedWithOtherQueuedFields_PersistsAllInOneRequest()
+    {
+        var created = await CreatePlainQueuedItemAsync("combined queued fields");
+
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created.Id}", new
+        {
+            agent = "codex",
+            workTimeoutMinutes = 123,
+            mergeTimeoutMinutes = 45,
+            minModelScore = 88,
+            requiredCapabilities = new[] { " sensitive ", "architecture" },
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor },
+        });
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var stored = await _factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal(AgentKind.Codex, stored!.Agent);
+        Assert.Equal(TimeSpan.FromMinutes(123), stored.WorkTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(45), stored.MergeTimeout);
+        Assert.Equal(88, stored.MinModelScore);
+        Assert.Equal(new[] { "sensitive", "architecture" }, stored.RequiredCapabilities);
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, stored.Knobs[ChangeScopeKnob.KeyName]);
+    }
+
+    [Fact]
     public async Task Patch_KnobsCombinedWithDependsOn_PersistsBothInOneRequest()
     {
         var dep = await CreatePlainQueuedItemAsync("dep");
@@ -276,6 +302,38 @@ public sealed class WorkItemKnobsApiTests : IDisposable
             && GetScalar<string>(e, "WorkItemId") == created.Id);
         Assert.True(GetScalar<bool>(auditEvent, "KnobsChanged"));
         Assert.True(GetScalar<bool>(auditEvent, "AuditBudgetChanged"));
+    }
+
+    [Fact]
+    public async Task Patch_KnobsCombinedWithAuditBudget_UsesSingleGuardedWrite()
+    {
+        using var factory = new WorkItemApiFactory
+        {
+            WorkItemStoreDecorator = inner => new RejectSeparateAuditBudgetStore(inner),
+        };
+        using var client = factory.CreateClient();
+
+        var create = await client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "single guarded audit budget",
+            prompt = "p",
+        });
+        var created = await create.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+
+        var resp = await client.PatchAsJsonAsync($"/workitems/{created!.Id}", new
+        {
+            knobs = new Dictionary<string, string> { [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical },
+            auditMaxIterations = 7,
+            auditComplexity = "hard",
+        });
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var stored = await factory.Store.GetAsync(WorkItemId.Parse(created.Id));
+        Assert.NotNull(stored);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, stored!.Knobs[ChangeScopeKnob.KeyName]);
+        Assert.Equal(7, stored.AuditMaxIterations);
+        Assert.Equal("hard", stored.AuditComplexity);
     }
 
     [Fact]
@@ -851,6 +909,17 @@ public sealed class WorkItemKnobsApiTests : IDisposable
                 onlyIfUpdatedAt,
                 ct);
         }
+    }
+
+    private sealed class RejectSeparateAuditBudgetStore(SqliteWorkItemStore inner) : ForwardingWorkItemStore(inner)
+    {
+        public override Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(
+            WorkItemId id,
+            int? auditMaxIterations,
+            string? auditComplexity,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            throw new InvalidOperationException("knob+audit PATCH must use the combined guarded write");
     }
 
     private abstract class ForwardingWorkItemStore(SqliteWorkItemStore inner) : IWorkItemStore

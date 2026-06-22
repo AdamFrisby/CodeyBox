@@ -1081,14 +1081,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         try
         {
             using var cmd = _conn.CreateCommand();
-            // Endpoint-only mixed PATCH path: include prompt / revision and
-            // knobs because the exact updated_at guard proves this is still
-            // the queued row the operator validated before writing.
+            // Endpoint-only mixed PATCH path: include prompt / revision, audit
+            // budget, and knobs because the exact updated_at guard proves this
+            // is still the queued row the operator validated before writing.
             cmd.CommandText = """
                 UPDATE work_items SET
                     prompt = $prompt,
                     prompt_revision = $prompt_revision,
                     knobs_json = $knobs,
+                    audit_max_iterations = $audit_max_iterations,
+                    audit_complexity = $audit_complexity,
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     agent_instance_id = $agent_instance_id,
