@@ -17,10 +17,10 @@ internal static class CliConnectionDiagnostics
     internal static string FormatMalformedApiBaseUrl(ResolvedConfig config, string cause) =>
         string.Join(Environment.NewLine, new[]
         {
-            $"Error: malformed API base URL '{config.ApiBaseUrl}'.",
-            $"Source: {config.ApiBaseUrlSource}.",
-            $"Cause: {cause}",
-            $"Precedence: {ConfigResolver.ApiBaseUrlPrecedence}.",
+            $"Error: malformed API base URL '{FormatApiBaseUrlForDiagnostics(config.ApiBaseUrl)}'.",
+            $"Source: {SanitizeDiagnosticText(config.ApiBaseUrlSource)}.",
+            $"Cause: {SanitizeDiagnosticText(cause)}",
+            $"Precedence: {SanitizeDiagnosticText(ConfigResolver.ApiBaseUrlPrecedence)}.",
             $"Remedy: {Remedy}",
         });
 
@@ -28,13 +28,69 @@ internal static class CliConnectionDiagnostics
         string.Join(Environment.NewLine, new[]
         {
             "Could not connect to the CodeyBox API.",
-            $"Resolved API base URL: {config.ApiBaseUrl}",
-            $"Source: {config.ApiBaseUrlSource}.",
+            $"Resolved API base URL: {FormatApiBaseUrlForDiagnostics(config.ApiBaseUrl)}",
+            $"Source: {SanitizeDiagnosticText(config.ApiBaseUrlSource)}.",
             $"Cause: {ClassifyCause(exception)}",
-            $"Underlying error: {exception.GetBaseException().Message}",
-            $"Precedence: {ConfigResolver.ApiBaseUrlPrecedence}.",
+            $"Underlying error: {SanitizeDiagnosticText(exception.GetBaseException().Message)}",
+            $"Precedence: {SanitizeDiagnosticText(ConfigResolver.ApiBaseUrlPrecedence)}.",
             $"Remedy: {Remedy}",
         });
+
+    internal static string FormatApiBaseUrlForDiagnostics(string value)
+    {
+        var sanitized = SanitizeDiagnosticText(value);
+        if (Uri.TryCreate(sanitized, UriKind.Absolute, out var uri))
+            return FormatParsedUriForDiagnostics(uri);
+
+        return RedactUrlLikeText(sanitized);
+    }
+
+    private static string FormatParsedUriForDiagnostics(Uri uri)
+    {
+        var host = uri.HostNameType == UriHostNameType.IPv6
+            ? $"[{uri.Host}]"
+            : uri.IdnHost;
+        var authority = $"{host}:{uri.Port}";
+        var path = uri.GetComponents(UriComponents.Path, UriFormat.UriEscaped);
+        var query = string.IsNullOrEmpty(uri.Query) ? "" : "?redacted";
+
+        var userInfo = string.IsNullOrEmpty(uri.UserInfo) ? "" : "redacted@";
+        return string.IsNullOrEmpty(path)
+            ? $"{uri.Scheme}://{userInfo}{authority}{query}"
+            : $"{uri.Scheme}://{userInfo}{authority}/{path}{query}";
+    }
+
+    private static string RedactUrlLikeText(string value)
+    {
+        var fragmentStart = value.IndexOf('#');
+        if (fragmentStart >= 0)
+            value = value[..fragmentStart];
+
+        var queryStart = value.IndexOf('?');
+        if (queryStart >= 0)
+            value = value[..queryStart] + "?redacted";
+
+        var schemeEnd = value.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd >= 0)
+        {
+            var authorityStart = schemeEnd + 3;
+            var authorityEnd = value.IndexOfAny(['/', '?', '#'], authorityStart);
+            if (authorityEnd < 0)
+                authorityEnd = value.Length;
+
+            if (authorityEnd > authorityStart)
+            {
+                var userInfoEnd = value.LastIndexOf('@', authorityEnd - 1, authorityEnd - authorityStart);
+                if (userInfoEnd >= authorityStart)
+                    value = value[..authorityStart] + "redacted@" + value[(userInfoEnd + 1)..];
+            }
+        }
+
+        return string.IsNullOrWhiteSpace(value) ? "<empty>" : value;
+    }
+
+    private static string SanitizeDiagnosticText(string value) =>
+        new(value.Where(c => !char.IsControl(c)).ToArray());
 
     private static string ClassifyCause(Exception exception)
     {

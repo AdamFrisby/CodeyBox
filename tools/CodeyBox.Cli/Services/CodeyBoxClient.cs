@@ -24,6 +24,9 @@ internal sealed class CodeyBoxClient
     internal CodeyBoxClient(HttpClient http, HttpClient sseHttp)
         : this(http, sseHttp, lazySseConfig: null, config: null) { }
 
+    internal CodeyBoxClient(HttpClient http, ResolvedConfig config)
+        : this(http, sseHttp: null, lazySseConfig: null, config: config) { }
+
     private CodeyBoxClient(
         HttpClient http,
         HttpClient? sseHttp,
@@ -255,7 +258,7 @@ internal sealed class CodeyBoxClient
                 CliConnectionDiagnostics.FormatConnectionFailure(_config, ex),
                 ex);
         }
-        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested && _config is not null)
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && _config is not null)
         {
             throw new CodeyBoxConnectionException(
                 CliConnectionDiagnostics.FormatConnectionFailure(_config, ex),

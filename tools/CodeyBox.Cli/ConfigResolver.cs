@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeyBox.Cli.Services;
 
 namespace CodeyBox.Cli;
 
@@ -53,7 +54,7 @@ internal static class ConfigResolver
             && apiUri.Scheme == "http"
             && !IsLoopbackHost(apiUri.Host))
             Console.Error.WriteLine(
-                $"Warning: API base URL '{result.ApiBaseUrl}' uses plaintext HTTP on a non-loopback address; the bearer token will be sent unencrypted.");
+                $"Warning: API base URL '{CliConnectionDiagnostics.FormatApiBaseUrlForDiagnostics(result.ApiBaseUrl)}' uses plaintext HTTP on a non-loopback address; the bearer token will be sent unencrypted.");
 
         return result;
     }
