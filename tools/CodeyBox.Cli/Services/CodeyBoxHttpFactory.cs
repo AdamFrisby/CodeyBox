@@ -40,11 +40,6 @@ internal static class CodeyBoxHttpFactory
                 config,
                 "scheme must be http or https"));
 
-        if (string.IsNullOrWhiteSpace(uri.Host))
-            throw new CodeyBoxCliException(CliConnectionDiagnostics.FormatMalformedApiBaseUrl(
-                config,
-                "host is empty"));
-
         return uri;
     }
 }

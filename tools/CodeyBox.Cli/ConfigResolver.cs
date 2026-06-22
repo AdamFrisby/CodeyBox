@@ -1,5 +1,4 @@
 using System.Text.Json;
-using CodeyBox.Cli.Services;
 
 namespace CodeyBox.Cli;
 
@@ -13,24 +12,24 @@ internal static class ConfigResolver
 
     internal static string ConfigFilePath => Path.Combine(ConfigDir, "config.json");
 
-    internal static string ApiBaseUrlPrecedence =>
-        $"--api-url flag > CODEYBOX_CLI_API_URL environment variable > {ConfigFilePath} config file > built-in default http://localhost:5036";
-
     internal static ResolvedConfig Resolve(string? flagUrl, string? flagKey)
     {
-        var result = new ResolvedConfig();
+        var result = new ResolvedConfig
+        {
+            ApiBaseUrlPrecedence = ResolvedConfig.BuildApiBaseUrlPrecedence($"{ConfigFilePath} config file"),
+        };
 
         var fileConfig = LoadConfigFile();
-        if (fileConfig?.ApiBaseUrl is { Length: > 0 } fileUrl)
+        if (fileConfig?.ApiBaseUrl is not null)
         {
-            result.ApiBaseUrl = fileUrl;
+            result.ApiBaseUrl = fileConfig.ApiBaseUrl;
             result.ApiBaseUrlSource = $"{ConfigFilePath} config file";
         }
         if (fileConfig?.ApiKey is { Length: > 0 } fileKey)
             result.ApiKey = fileKey;
 
         var envUrl = Environment.GetEnvironmentVariable("CODEYBOX_CLI_API_URL");
-        if (!string.IsNullOrEmpty(envUrl))
+        if (envUrl is not null)
         {
             result.ApiBaseUrl = envUrl;
             result.ApiBaseUrlSource = "CODEYBOX_CLI_API_URL environment variable";
@@ -38,7 +37,7 @@ internal static class ConfigResolver
         var envKey = Environment.GetEnvironmentVariable("CODEYBOX_CLI_API_KEY");
         if (!string.IsNullOrEmpty(envKey)) result.ApiKey = envKey;
 
-        if (!string.IsNullOrEmpty(flagUrl))
+        if (flagUrl is not null)
         {
             result.ApiBaseUrl = flagUrl;
             result.ApiBaseUrlSource = "--api-url flag";
@@ -54,7 +53,7 @@ internal static class ConfigResolver
             && apiUri.Scheme == "http"
             && !IsLoopbackHost(apiUri.Host))
             Console.Error.WriteLine(
-                $"Warning: API base URL '{CliConnectionDiagnostics.FormatApiBaseUrlForDiagnostics(result.ApiBaseUrl)}' uses plaintext HTTP on a non-loopback address; the bearer token will be sent unencrypted.");
+                $"Warning: API base URL '{CliDiagnosticFormatting.FormatApiBaseUrlForDiagnostics(result.ApiBaseUrl)}' uses plaintext HTTP on a non-loopback address; the bearer token will be sent unencrypted.");
 
         return result;
     }
