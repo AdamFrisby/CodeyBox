@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -1280,6 +1282,74 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.True(File.Exists(processGroupMarker));
         await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
         await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_PreflightDoesNotWaitForHttpResponse()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var acceptCts = new CancellationTokenSource();
+        var acceptTask = Task.Run(async () =>
+        {
+            try
+            {
+                using var client = await listener.AcceptTcpClientAsync(acceptCts.Token);
+                await Task.Delay(TimeSpan.FromSeconds(10), acceptCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var envFile = Path.Combine(_workspace, "detached-slow-ready.env");
+        var commandScript = Path.Combine(_workspace, "detached-slow-ready-command.sh");
+        var launchScript = Path.Combine(_workspace, "detached-slow-ready-launch.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-slow-ready.pgid");
+        var doneFile = Path.Combine(_workspace, "detached-slow-ready.done");
+        await File.WriteAllTextAsync(
+            envFile,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] =
+                    $"http://127.0.0.1:{port}/codeybox-agent-output",
+                [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "stream-token",
+                [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "slow-ready",
+            }));
+        await File.WriteAllTextAsync(commandScript, "printf done > \"$1\"\n");
+        File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var sw = Stopwatch.StartNew();
+            var (exit, _, stderr) = await RunLocalProcessAsync(
+                "/bin/bash",
+                [launchScript],
+                timeout.Token,
+                environmentOverrides: FakeSudoPathEnvironment());
+            sw.Stop();
+
+            Assert.Equal(0, exit);
+            Assert.Equal("", stderr);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2.5), $"detached launch waited for HTTP response for {sw.Elapsed}");
+            await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(3));
+            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(3));
+        }
+        finally
+        {
+            acceptCts.Cancel();
+            listener.Stop();
+            await acceptTask;
+        }
     }
 
     [Fact]
