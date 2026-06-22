@@ -613,7 +613,7 @@ public sealed class ErrorOutputTests
     }
 
     [Fact]
-    public async Task Error_WatchSseResponseHeaderTimeout_PrintsDiagnosticsWithoutPollingFallback()
+    public async Task Error_WatchSseResponseHeaderTimeout_FallsBackToPolling()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
         var url = "http://127.0.0.1:5036";
@@ -631,7 +631,8 @@ public sealed class ErrorOutputTests
                 config =>
                 {
                     var baseUri = new Uri(config.ApiBaseUrl);
-                    var http = new HttpClient(new FakeHttpMessageHandler(_ => SampleData.WorkItemResponse()))
+                    var http = new HttpClient(new FakeHttpMessageHandler(
+                        _ => SampleData.WorkItemResponse(SampleData.WorkItem("Done"))))
                     {
                         BaseAddress = baseUri,
                         Timeout = TimeSpan.FromSeconds(30),
@@ -645,14 +646,11 @@ public sealed class ErrorOutputTests
                 });
 
             var error = output.Error.ToString();
-            Assert.NotEqual(0, code);
-            Assert.Empty(output.Out.ToString());
-            Assert.Contains("Connection error: Could not connect to the CodeyBox API.", error);
-            Assert.Contains($"Resolved API base URL: {url}", error);
-            Assert.Contains("Source: --api-url flag.", error);
-            Assert.Contains("Cause: timeout", error);
-            Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
-            Assert.DoesNotContain("SSE unavailable", error);
+            Assert.Equal(0, code);
+            Assert.Contains("SSE unavailable", error);
+            Assert.Contains("Done", output.Out.ToString());
+            Assert.DoesNotContain("Connection error: Could not connect to the CodeyBox API.", error);
+            Assert.DoesNotContain("Resolved API base URL", error);
         }
         finally
         {
@@ -685,6 +683,67 @@ public sealed class ErrorOutputTests
             () => codeyBoxClient.GetWorkItemsAsync(ct: cts.Token));
 
         Assert.IsNotType<CodeyBoxConnectionException>(ex);
+    }
+
+    [Theory]
+    [InlineData(SocketError.NetworkUnreachable, "connection failed (NetworkUnreachable)")]
+    [InlineData(SocketError.AddressNotAvailable, "connection failed (AddressNotAvailable)")]
+    public async Task Error_ConnectionFailure_PrintsGenericSocketCause(SocketError socketError, string expectedCause)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["queue", "ls"],
+                MakeThrowingDiagnosticFactory(SocketFailure(socketError)));
+
+            var error = output.Error.ToString();
+            Assert.NotEqual(0, code);
+            Assert.Contains($"Cause: {expectedCause}", error);
+            Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Error_ConnectionFailure_PrintsGenericNonSocketCause()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["queue", "ls"],
+                MakeThrowingDiagnosticFactory(new HttpRequestException("unexpected transport failure")));
+
+            var error = output.Error.ToString();
+            Assert.NotEqual(0, code);
+            Assert.Contains("Cause: connection failed", error);
+            Assert.Contains("Underlying error: unexpected transport failure", error);
+            Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
     }
 
     [Fact]

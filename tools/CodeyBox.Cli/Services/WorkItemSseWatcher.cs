@@ -44,7 +44,7 @@ internal sealed class WorkItemSseWatcher
         }
         catch (CodeyBoxConnectionException)
         {
-            throw;
+            return SseWatchResult.ShouldFallback;
         }
         catch (HttpRequestException)
         {
