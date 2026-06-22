@@ -146,12 +146,15 @@ public sealed class AuditorParallelismTests : IDisposable
         const int AuditorCount = 3;
         var running = 0;
         var maxRunning = 0;
+        long firstAuditorStartTimestamp = 0;
+        long lastAuditorFinishTimestamp = 0;
 
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditors = Enumerable.Range(0, AuditorCount)
             .Select(i => new FakeLlmAuditor($"slow-{i}", async (_, _, ct) =>
             {
                 var current = Interlocked.Increment(ref running);
+                Interlocked.CompareExchange(ref firstAuditorStartTimestamp, Stopwatch.GetTimestamp(), 0);
                 int observed;
                 do
                 {
@@ -167,7 +170,8 @@ public sealed class AuditorParallelismTests : IDisposable
                 }
                 finally
                 {
-                    Interlocked.Decrement(ref running);
+                    if (Interlocked.Decrement(ref running) == 0)
+                        Volatile.Write(ref lastAuditorFinishTimestamp, Stopwatch.GetTimestamp());
                 }
             }))
             .ToArray();
@@ -178,18 +182,22 @@ public sealed class AuditorParallelismTests : IDisposable
         var item = AuditorTestHelpers.NewItem();
         await tp.Store.CreateAsync(item);
 
-        var sw = Stopwatch.StartNew();
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
-        sw.Stop();
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
         Assert.Equal(AuditorCount, Volatile.Read(ref maxRunning));
+        var firstAuditorStart = Volatile.Read(ref firstAuditorStartTimestamp);
+        var lastAuditorFinish = Volatile.Read(ref lastAuditorFinishTimestamp);
+        Assert.True(firstAuditorStart > 0, "Expected at least one LLM auditor to start.");
+        Assert.True(lastAuditorFinish >= firstAuditorStart, "Expected LLM auditor completion to be observed.");
+
+        var elapsedAuditorWindow = Stopwatch.GetElapsedTime(firstAuditorStart, lastAuditorFinish);
         var serialDelay = TimeSpan.FromMilliseconds(DelayMs * AuditorCount);
         var upperBound = TimeSpan.FromMilliseconds(DelayMs * (AuditorCount - 0.25));
-        Assert.True(sw.Elapsed < upperBound,
-            $"Expected three {DelayMs}ms LLM auditors to complete well under their serial delay {serialDelay}; elapsed {sw.Elapsed}");
+        Assert.True(elapsedAuditorWindow < upperBound,
+            $"Expected three {DelayMs}ms LLM auditors to complete well under their serial delay {serialDelay}; elapsed {elapsedAuditorWindow}");
     }
 }
 
