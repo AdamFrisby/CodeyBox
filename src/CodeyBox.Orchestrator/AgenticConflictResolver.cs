@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -162,6 +163,14 @@ public sealed record AgenticConflictCandidatesResult(
 /// </summary>
 public sealed class AgenticConflictResolver
 {
+    private static readonly Regex AnsiEscape = new(
+        @"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex LsFilesUnmergedRecord = new(
+        @"[0-7]{6} [0-9a-fA-F]{40,64} [1-3]\t(?<path>[^\0]+)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private readonly AgenticConflictResolverOptionsSnapshot _options;
     private readonly ILogger _log;
     private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
@@ -560,14 +569,24 @@ public sealed class AgenticConflictResolver
     {
         var result = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["git", "-C", workingDirectory, "diff", "--name-only", "--diff-filter=U"],
+            Argv = ["git", "-C", workingDirectory, "ls-files", "-u", "-z"],
         }, ct);
         if (!result.Success)
             throw new MergeConflictResolutionFailedException(
                 $"failed to inspect unmerged paths: {result.Stderr.Trim()}");
 
-        return result.Stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        return ParseUnmergedPathsFromLsFilesStdout(result.Stdout);
+    }
+
+    internal static IReadOnlyList<string> ParseUnmergedPathsFromLsFilesStdout(string stdout)
+    {
+        if (string.IsNullOrEmpty(stdout))
+            return [];
+
+        var sanitized = AnsiEscape.Replace(stdout, string.Empty);
+        return LsFilesUnmergedRecord.Matches(sanitized)
+            .Select(static match => match.Groups["path"].Value)
+            .Where(static path => !string.IsNullOrEmpty(path))
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToList();
@@ -585,6 +604,7 @@ public sealed class AgenticConflictResolver
         if (string.IsNullOrWhiteSpace(path)
             || Path.IsPathRooted(path)
             || path.Contains('\\', StringComparison.Ordinal)
+            || path.Any(static ch => char.IsControl(ch))
             || path.Split('/', StringSplitOptions.None).Any(static part => part is "" or "." or ".."))
         {
             throw new MergeConflictResolutionFailedException($"unsafe conflict file path '{path}'");
@@ -602,14 +622,16 @@ public sealed class AgenticConflictResolver
     {
         var unmerged = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["git", "-C", workingDirectory, "diff", "--name-only", "--diff-filter=U"],
+            Argv = ["git", "-C", workingDirectory, "ls-files", "-u", "-z"],
         }, ct);
         if (!unmerged.Success)
-            return new VerificationOutcome(false, $"git diff failed: {unmerged.Stderr.Trim()}");
-        if (!string.IsNullOrWhiteSpace(unmerged.Stdout))
+            return new VerificationOutcome(false, $"git ls-files failed: {unmerged.Stderr.Trim()}");
+
+        var remainingUnmergedPaths = ParseUnmergedPathsFromLsFilesStdout(unmerged.Stdout);
+        if (remainingUnmergedPaths.Count > 0)
             return new VerificationOutcome(
                 false,
-                "unmerged paths remain after agent: " + unmerged.Stdout.Trim().Replace('\n', ' '));
+                "unmerged paths remain after agent: " + string.Join(' ', remainingUnmergedPaths));
 
         if (originalConflictFiles.Count > 0)
         {

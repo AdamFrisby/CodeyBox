@@ -673,9 +673,9 @@ public sealed class AgenticConflictResolverTests
     {
         var sandbox = new ConflictSandbox();
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
-        // First (and only) diff call must fail so ListUnmergedPathsAsync throws
+        // First (and only) unmerged-index call must fail so ListUnmergedPathsAsync throws
         // before any agent invocation happens.
-        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: not a git repository"));
+        sandbox.LsFilesResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: not a git repository"));
 
         var resolver = new AgenticConflictResolver();
         var runner = new FakeAgentResolverRunner(_ => throw new InvalidOperationException("agent should never run"));
@@ -767,14 +767,14 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
-    public async Task ResolveAsync_VerifyDiffFails_ReportsDiffFailure()
+    public async Task ResolveAsync_VerifyUnmergedPathInspectionFails_ReportsInspectionFailure()
     {
         var sandbox = new ConflictSandbox();
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
-        // First diff call (in ListUnmergedPathsAsync) returns default success +
-        // the conflict file; second diff call (in VerifyResolutionAsync) fails.
-        sandbox.DiffResponseQueue.Enqueue(null);
-        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: index corrupted"));
+        // First ls-files call (in ListUnmergedPathsAsync) returns default success
+        // plus the conflict file; second call (in VerifyResolutionAsync) fails.
+        sandbox.LsFilesResponseQueue.Enqueue(null);
+        sandbox.LsFilesResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: index corrupted"));
 
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
@@ -795,8 +795,26 @@ public sealed class AgenticConflictResolverTests
             CancellationToken.None);
 
         Assert.False(result.Success);
-        Assert.Contains("git diff failed", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("git ls-files failed", result.Summary, StringComparison.Ordinal);
         Assert.Contains("fatal: index corrupted", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_IgnoresPrefixedMultipassStartupNoise()
+    {
+        var oid2 = new string('a', 40);
+        var oid3 = new string('b', 40);
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var stdout =
+            "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner>  " +
+            $"100644 {oid2} 2\t{path}\0" +
+            $"100644 {oid3} 3\t{path}\0";
+
+        var paths = AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal([path], paths);
+        Assert.DoesNotContain(paths, p => p.Contains('\x1b'));
+        Assert.DoesNotContain(paths, p => p.Contains("Starting codeybox", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -895,9 +913,9 @@ public sealed class AgenticConflictResolverTests
     /// <summary>
     /// In-memory sandbox that mocks just enough of git to drive the agentic
     /// resolver. Tracks per-path file contents and "unmerged" state; intercepts
-    /// the git invocations the resolver issues (<c>diff --diff-filter=U</c>,
-    /// <c>grep</c>, <c>add</c>) and forwards everything else to a registered
-    /// command map or a permissive default.
+    /// the git invocations the resolver issues (<c>ls-files -u</c>,
+    /// <c>diff --diff-filter=U</c>, <c>grep</c>, <c>add</c>) and forwards
+    /// everything else to a registered command map or a permissive default.
     /// </summary>
     internal sealed class ConflictSandbox : ISandbox
     {
@@ -911,6 +929,7 @@ public sealed class AgenticConflictResolverTests
         // Per-call response overrides. Null entry = use default behaviour for
         // that call; concrete entry overrides it. Empty queue = always default.
         public Queue<SandboxExecResult?> DiffResponseQueue { get; } = new();
+        public Queue<SandboxExecResult?> LsFilesResponseQueue { get; } = new();
         public Queue<SandboxExecResult?> GrepResponseQueue { get; } = new();
 
         public void AddConflictedFile(string relativePath, string content)
@@ -945,6 +964,17 @@ public sealed class AgenticConflictResolverTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             var argv = exec.Argv;
+            if (argv.Count >= 5
+                && argv[0] == "git" && argv[1] == "-C" && argv[3] == "ls-files"
+                && argv.Contains("-u"))
+            {
+                if (LsFilesResponseQueue.TryDequeue(out var queued) && queued is not null)
+                    return Task.FromResult(queued);
+
+                var listed = BuildLsFilesUnmergedOutput(_unmerged.Order(StringComparer.Ordinal));
+                return Task.FromResult(new SandboxExecResult(0, listed, ""));
+            }
+
             if (argv.Count >= 5
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "diff"
                 && argv.Contains("--diff-filter=U"))
@@ -996,6 +1026,15 @@ public sealed class AgenticConflictResolverTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private static string BuildLsFilesUnmergedOutput(IEnumerable<string> paths)
+        {
+            var sb = new StringBuilder();
+            var oid = new string('a', 40);
+            foreach (var path in paths)
+                sb.Append("100644 ").Append(oid).Append(" 2\t").Append(path).Append('\0');
+            return sb.ToString();
+        }
 
         private static bool ContainsMarkers(string content)
         {
