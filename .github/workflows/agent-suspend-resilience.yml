@@ -62,10 +62,10 @@ jobs:
           fi
 
           verify_vm="cb-acp-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "CODEYBOX_ACP_BRIDGE_VERIFY_VM=$verify_vm" >> "$GITHUB_ENV"
           multipass delete --purge "$verify_vm" >/dev/null 2>&1 || true
           multipass clone "$source_vm" --name "$verify_vm"
           multipass start "$verify_vm"
-          echo "CODEYBOX_ACP_BRIDGE_VERIFY_VM=$verify_vm" >> "$GITHUB_ENV"
 
       - name: publish ACP bridge
         run: |
@@ -77,7 +77,7 @@ jobs:
           scripts/publish-acp-bridge.sh
 
       - name: build
-        run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release -p:RequireAcpBridgeNativeResource=false
+        run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release
 
       - name: run suspend resilience matrix
         run: |

@@ -44,11 +44,16 @@ RESOURCE_NAME="acp-bridge"
 RESOURCE_PATH="$RESOURCE_DIR/$RESOURCE_NAME"
 TMP_RESOURCE="$RESOURCE_DIR/.$RESOURCE_NAME.$$.new"
 RID="linux-musl-x64"
+VERIFY_VM=""
+REMOTE_DIR=""
 
 cleanup()
 {
     if [ -n "$TMP_RESOURCE" ]; then
         rm -f "$TMP_RESOURCE"
+    fi
+    if [ -n "$VERIFY_VM" ] && [ -n "$REMOTE_DIR" ] && command -v multipass >/dev/null 2>&1; then
+        multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT INT TERM
@@ -479,14 +484,25 @@ PY
         if [ -n "${CODEYBOX_CLAUDE_OAUTH_JSON:-}" ]; then
             write_env_assignment "CODEYBOX_CLAUDE_OAUTH_JSON" "$CODEYBOX_CLAUDE_OAUTH_JSON"
         fi
+        if [ -n "${CODEYBOX_ACP_BRIDGE_VERIFY_MODEL:-}" ]; then
+            write_env_assignment "CODEYBOX_ACP_BRIDGE_VERIFY_MODEL" "$CODEYBOX_ACP_BRIDGE_VERIFY_MODEL"
+        fi
+        if [ -n "${CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS:-}" ]; then
+            write_env_assignment "CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS" "$CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS"
+        fi
+        if [ -n "${API_TIMEOUT_MS:-}" ]; then
+            write_env_assignment "API_TIMEOUT_MS" "$API_TIMEOUT_MS"
+        fi
     } | multipass exec "$VERIFY_VM" -- sh -c "umask 077; cat > '$REMOTE_ENV'"
-    VERIFY_OUT="$(multipass exec "$VERIFY_VM" -- sh -c ". '$REMOTE_ENV'; export ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEYBOX_CLAUDE_OAUTH_JSON; python3 '$REMOTE_VERIFY' '$REMOTE'" 2>&1)" || {
+    VERIFY_OUT="$(multipass exec "$VERIFY_VM" -- sh -c ". '$REMOTE_ENV'; export ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEYBOX_CLAUDE_OAUTH_JSON CODEYBOX_ACP_BRIDGE_VERIFY_MODEL CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS API_TIMEOUT_MS; python3 '$REMOTE_VERIFY' '$REMOTE'" 2>&1)" || {
         echo "ERROR: ACP bridge end-to-end verification failed inside Multipass VM $VERIFY_VM:" >&2
         echo "$VERIFY_OUT" >&2
         multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
+        REMOTE_DIR=""
         exit 1
     }
     multipass exec "$VERIFY_VM" -- rm -rf "$REMOTE_DIR" >/dev/null 2>&1 || true
+    REMOTE_DIR=""
     case "$VERIFY_OUT" in
         *"ACP bridge end-to-end verification passed"*) ;;
         *)

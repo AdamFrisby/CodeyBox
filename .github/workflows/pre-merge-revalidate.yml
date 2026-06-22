@@ -100,7 +100,10 @@ jobs:
     name: rebase + build + test (untrusted)
     needs: enumerate
     if: ${{ needs.enumerate.outputs.prs != '[]' && needs.enumerate.outputs.prs != '' }}
-    runs-on: ubuntu-latest
+    # The ACP bridge must be proven inside the real Multipass sandbox image
+    # before this gate can call the rebased tree green, so this job needs the
+    # same self-hosted runner shape as the suspend-resilience verifier.
+    runs-on: [self-hosted, multipass]
     # SECURITY: this job intentionally runs attacker-controllable code
     # (PR-side MSBuild targets, NuGet pre/post-build hooks, .gitattributes
     # filter drivers can all execute during rebase/build/test). It MUST
@@ -168,6 +171,10 @@ jobs:
           GH_TOKEN: ''
           ACTIONS_RUNTIME_TOKEN: ''
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+          CODEYBOX_ACP_BRIDGE_VERIFY_VM: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM }}
+          CODEYBOX_ACP_BRIDGE_VERIFY_MODEL: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_MODEL }}
+          CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS }}
+          API_TIMEOUT_MS: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_API_TIMEOUT_MS }}
         run: |
           # setup-dotnet is invoked in this same step (not as a separate
           # action) so all of dotnet's lifecycle runs under the scrubbed
@@ -180,8 +187,11 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install -y musl-tools clang lld
-          scripts/publish-acp-bridge.sh --skip-multipass-verify
-          dotnet build CodeyBox.slnx --configuration Release -p:RequireAcpBridgeNativeResource=false
+          # The self-hosted runner supplies the verifier Claude credential out
+          # of band. Do not inject repository secrets into this PR-controlled
+          # build job.
+          scripts/publish-acp-bridge.sh
+          dotnet build CodeyBox.slnx --configuration Release
         continue-on-error: true
 
       - name: test

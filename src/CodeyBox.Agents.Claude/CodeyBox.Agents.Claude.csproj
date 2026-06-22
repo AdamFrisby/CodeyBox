@@ -23,17 +23,17 @@
     ships the binary as an embedded resource (LogicalName=acp-bridge); the
     runtime path materialises it inside the sandbox and execs it.
 
-    Builds embed Resources/acp-bridge when the artifact pipeline has already
-    produced it; otherwise they embed the tracked Resources/acp-bridge.placeholder.
-    Release/provisioning jobs that must fail without a real bridge can set
-    RequireAcpBridgeNativeResource=true. This project deliberately does not
-    run scripts/publish-acp-bridge.sh from an MSBuild target: publishing and
-    in-VM verification belong to the artifact/provisioning boundary, not the
-    agent library build.
+    Release builds require Resources/acp-bridge by default. Dev/test builds
+    that are intentionally exercising placeholder behavior may opt out by
+    setting RequireAcpBridgeNativeResource=false; deployable builds must not do
+    so. This project deliberately does not run scripts/publish-acp-bridge.sh
+    from an MSBuild target: publishing and in-VM verification belong to the
+    artifact/provisioning boundary, not the agent library build.
   -->
   <PropertyGroup>
     <AcpBridgeResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge</AcpBridgeResourcePath>
     <AcpBridgePlaceholderResourcePath>$(MSBuildThisFileDirectory)Resources/acp-bridge.placeholder</AcpBridgePlaceholderResourcePath>
+    <RequireAcpBridgeNativeResource Condition="'$(RequireAcpBridgeNativeResource)' == '' and '$(Configuration)' == 'Release'">true</RequireAcpBridgeNativeResource>
     <RequireAcpBridgeNativeResource Condition="'$(RequireAcpBridgeNativeResource)' == ''">false</RequireAcpBridgeNativeResource>
   </PropertyGroup>
 

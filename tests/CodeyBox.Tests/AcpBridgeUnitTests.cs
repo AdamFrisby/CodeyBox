@@ -13,7 +13,6 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Xml.Linq;
 using CodeyBox.Agents.Claude.AcpBridge;
 
 namespace CodeyBox.Tests;
@@ -218,6 +217,47 @@ public sealed class AcpBridgeUnitTests
         var line = captured.TrimEnd('\n');
         using var doc = JsonDocument.Parse(line);
         Assert.Equal("a\"b\\c", doc.RootElement.GetProperty("type").GetString());
+    }
+
+    [Fact]
+    public async Task ProgramMain_EmptyStdin_ExecutesBridgeEntryPointAndEmitsStartedEnvelope()
+    {
+        var bridgeDllPath = typeof(Bridge).Assembly.Location;
+        Assert.True(File.Exists(bridgeDllPath),
+            "AcpBridge dll missing at " + bridgeDllPath +
+            " — the test project should ProjectReference the AcpBridge assembly.");
+
+        var psi = new ProcessStartInfo("dotnet")
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.ArgumentList.Add("exec");
+        psi.ArgumentList.Add(bridgeDllPath);
+        psi.Environment["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1";
+        psi.Environment["DOTNET_NOLOGO"] = "1";
+
+        using var proc = Process.Start(psi)
+            ?? throw new InvalidOperationException("Process.Start returned null for dotnet exec.");
+        await proc.StandardInput.DisposeAsync();
+
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15));
+
+        var stdout = await stdoutTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var stderr = await stderrTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, proc.ExitCode);
+        Assert.True(string.IsNullOrWhiteSpace(stderr), "bridge entry point wrote stderr: " + stderr);
+
+        var lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var line = Assert.Single(lines);
+        using var doc = JsonDocument.Parse(line);
+        Assert.Equal("bridge_started", doc.RootElement.GetProperty("type").GetString());
+        Assert.True(doc.RootElement.GetProperty("pid").GetInt32() > 0);
     }
 
     // ── WebSocketConnection: RFC6455 handshake + frame round-trip ──────────────
@@ -3706,6 +3746,9 @@ exit 9
         {
             var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
             env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_MODEL"] = "claude-opus-test";
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS"] = "321";
+            env["API_TIMEOUT_MS"] = "456000";
 
             var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
 
@@ -3722,6 +3765,9 @@ exit 9
             Assert.Contains("multipass exec cb-baseline-test -- sh -c . '", calls, StringComparison.Ordinal);
             Assert.Contains("python3 '", calls, StringComparison.Ordinal);
             Assert.Contains("claude --version", calls, StringComparison.Ordinal);
+            Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_MODEL", calls, StringComparison.Ordinal);
+            Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS", calls, StringComparison.Ordinal);
+            Assert.Contains("API_TIMEOUT_MS", calls, StringComparison.Ordinal);
             Assert.DoesNotContain("multipass launch", calls, StringComparison.Ordinal);
         }
         finally
@@ -3939,7 +3985,116 @@ exit 9
     }
 
     [Fact]
-    public void AcpBridge_ClaudeProject_SelectsPreparedResourceOrPlaceholderWithoutPublishing()
+    public async Task AcpBridge_ClaudeProject_ReleaseBuildRequiresPreparedNativeResourceByDefault()
+    {
+        var csprojPath = ClaudeProjectPath();
+        var missingResource = Path.Combine(Path.GetTempPath(), "missing-acp-bridge-" + Guid.NewGuid().ToString("N"));
+        var placeholderPath = Path.Combine(Path.GetDirectoryName(csprojPath)!, "Resources", "acp-bridge.placeholder");
+
+        var run = await RunProcessAsync("dotnet",
+            [
+                "msbuild",
+                csprojPath,
+                "-nologo",
+                "-t:SelectAcpBridgeEmbeddedResource",
+                "-p:Configuration=Release",
+                "-p:AcpBridgeResourcePath=" + missingResource,
+                "-p:AcpBridgePlaceholderResourcePath=" + placeholderPath,
+            ],
+            DotnetTestEnv());
+
+        Assert.NotEqual(0, run.ExitCode);
+        Assert.Contains("RequireAcpBridgeNativeResource=true but no ACP bridge resource exists",
+            run.Stdout + run.Stderr, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AcpBridge_ClaudeProject_ExplicitPlaceholderOptOutSelectsPlaceholderResource()
+    {
+        var csprojPath = ClaudeProjectPath();
+        var missingResource = Path.Combine(Path.GetTempPath(), "missing-acp-bridge-" + Guid.NewGuid().ToString("N"));
+        var placeholderPath = Path.Combine(Path.GetDirectoryName(csprojPath)!, "Resources", "acp-bridge.placeholder");
+
+        var run = await RunProcessAsync("dotnet",
+            [
+                "msbuild",
+                csprojPath,
+                "-nologo",
+                "-t:SelectAcpBridgeEmbeddedResource",
+                "-getItem:EmbeddedResource",
+                "-p:Configuration=Release",
+                "-p:RequireAcpBridgeNativeResource=false",
+                "-p:AcpBridgeResourcePath=" + missingResource,
+                "-p:AcpBridgePlaceholderResourcePath=" + placeholderPath,
+            ],
+            DotnetTestEnv());
+
+        Assert.Equal(0, run.ExitCode);
+        using var doc = JsonDocument.Parse(run.Stdout);
+        var resources = doc.RootElement.GetProperty("Items").GetProperty("EmbeddedResource").EnumerateArray().ToList();
+        var resource = Assert.Single(resources);
+        Assert.Equal(Path.GetFullPath(placeholderPath), resource.GetProperty("Identity").GetString());
+        Assert.Equal("acp-bridge", resource.GetProperty("LogicalName").GetString());
+        Assert.Equal("Resources/acp-bridge.placeholder", resource.GetProperty("Link").GetString());
+    }
+
+    [Fact]
+    public async Task AcpBridge_ClaudeProject_RequiredBuildSelectsPreparedNativeResource()
+    {
+        var csprojPath = ClaudeProjectPath();
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-resource-msbuild-").FullName;
+        try
+        {
+            var resourcePath = Path.Combine(tmpDir, "acp-bridge");
+            await File.WriteAllBytesAsync(resourcePath, [0x7f, (byte)'E', (byte)'L', (byte)'F', 2]);
+            var placeholderPath = Path.Combine(Path.GetDirectoryName(csprojPath)!, "Resources", "acp-bridge.placeholder");
+
+            var run = await RunProcessAsync("dotnet",
+                [
+                    "msbuild",
+                    csprojPath,
+                    "-nologo",
+                    "-t:SelectAcpBridgeEmbeddedResource",
+                    "-getItem:EmbeddedResource",
+                    "-p:Configuration=Release",
+                    "-p:RequireAcpBridgeNativeResource=true",
+                    "-p:AcpBridgeResourcePath=" + resourcePath,
+                    "-p:AcpBridgePlaceholderResourcePath=" + placeholderPath,
+                ],
+                DotnetTestEnv());
+
+            Assert.Equal(0, run.ExitCode);
+            using var doc = JsonDocument.Parse(run.Stdout);
+            var resources = doc.RootElement.GetProperty("Items").GetProperty("EmbeddedResource").EnumerateArray().ToList();
+            var resource = Assert.Single(resources);
+            Assert.Equal(Path.GetFullPath(resourcePath), resource.GetProperty("Identity").GetString());
+            Assert.Equal("acp-bridge", resource.GetProperty("LogicalName").GetString());
+            Assert.Equal("Resources/acp-bridge", resource.GetProperty("Link").GetString());
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void AcpBridge_PreMergeRevalidateWorkflow_RunsSandboxVerifierAndStrictResourceBuild()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " — ensure CodeyBox.slnx exists in an ancestor directory.");
+        var workflowPath = Path.Combine(solutionRoot, ".github", "workflows", "pre-merge-revalidate.yml");
+        var text = File.ReadAllText(workflowPath);
+
+        Assert.Contains("runs-on: [self-hosted, multipass]", text, StringComparison.Ordinal);
+        Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_VM", text, StringComparison.Ordinal);
+        Assert.Contains("scripts/publish-acp-bridge.sh", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("scripts/publish-acp-bridge.sh --skip-multipass-verify", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("RequireAcpBridgeNativeResource=false", text, StringComparison.Ordinal);
+    }
+
+    private static string ClaudeProjectPath()
     {
         var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
             ?? throw new InvalidOperationException(
@@ -3952,37 +4107,15 @@ exit 9
             "CodeyBox.Agents.Claude",
             "CodeyBox.Agents.Claude.csproj");
         Assert.True(File.Exists(csprojPath), "Claude csproj missing at " + csprojPath);
-
-        var csprojText = File.ReadAllText(csprojPath);
-        var project = XDocument.Parse(csprojText).Root
-            ?? throw new InvalidOperationException("Claude csproj has no root element.");
-
-        Assert.DoesNotContain("PublishAcpBridgeNativeResource", csprojText);
-        Assert.DoesNotContain("<Exec", csprojText);
-        Assert.Contains("scripts/publish-acp-bridge.sh in the artifact/provisioning pipeline", csprojText);
-        Assert.Contains("RequireAcpBridgeNativeResource", csprojText);
-        Assert.Contains("RequireAcpBridgeNativeResource=true but no ACP bridge resource exists", csprojText);
-
-        var topLevelEmbeddedResources = project.Elements("ItemGroup")
-            .Elements("EmbeddedResource")
-            .Where(e => (string?)e.Attribute("LogicalName") == "acp-bridge")
-            .ToList();
-        Assert.Empty(topLevelEmbeddedResources);
-
-        var selectTarget = Assert.Single(project.Elements("Target"),
-            e => (string?)e.Attribute("Name") == "SelectAcpBridgeEmbeddedResource");
-        Assert.Equal("AssignTargetPaths", (string?)selectTarget.Attribute("BeforeTargets"));
-
-        var targetResources = selectTarget.Elements("ItemGroup")
-            .Elements("EmbeddedResource")
-            .ToList();
-        Assert.Contains(targetResources, e =>
-            (string?)e.Attribute("Include") == "$(AcpBridgeResourcePath)"
-            && (string?)e.Attribute("LogicalName") == "acp-bridge");
-        Assert.Contains(targetResources, e =>
-            (string?)e.Attribute("Include") == "$(AcpBridgePlaceholderResourcePath)"
-            && (string?)e.Attribute("LogicalName") == "acp-bridge");
+        return csprojPath;
     }
+
+    private static Dictionary<string, string?> DotnetTestEnv() =>
+        new(StringComparer.Ordinal)
+        {
+            ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
+            ["DOTNET_NOLOGO"] = "1",
+        };
 
     private static string? FindAncestorContaining(string start, string fileName)
     {
