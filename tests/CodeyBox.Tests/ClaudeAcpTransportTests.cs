@@ -705,6 +705,11 @@ public sealed class ClaudeAcpTransportTests
     [Fact]
     public async Task AcpClaudeTransport_OpenAsync_PlaceholderBuild_RaisesUnavailable_BeforeTouchingSandbox()
     {
+        var placeholderBytes = File.ReadAllBytes(PlaceholderResourcePath());
+        Assert.True(
+            AcpBridgeBinary.IsPlaceholderPayload(placeholderBytes),
+            "The checked-in placeholder resource must start with the sentinel consumed by AcpBridgeBinary.");
+
         var sandbox = new BridgeSandbox();
         var placeholderTransport = new AcpClaudeTransport
         {
@@ -722,6 +727,15 @@ public sealed class ClaudeAcpTransportTests
         Assert.Contains("placeholder", ex.Message, StringComparison.OrdinalIgnoreCase);
         // No sandbox call should have been made.
         Assert.Empty(sandbox.AllExecs);
+    }
+
+    [Fact]
+    public void AcpBridgePlaceholderResource_StartsWithRuntimePlaceholderSentinel()
+    {
+        var bytes = File.ReadAllBytes(PlaceholderResourcePath());
+        Assert.True(
+            AcpBridgeBinary.IsPlaceholderPayload(bytes),
+            "Resources/acp-bridge.placeholder drifted from the runtime placeholder detector.");
     }
 
     [Fact]
@@ -1354,6 +1368,35 @@ public sealed class ClaudeAcpTransportTests
     private static AcpClaudeTransport NewAcpTransportWithOverride(
         AgentNetworkToleranceSnapshot? networkTolerance = null)
         => new(networkTolerance) { BridgeBinaryOverride = TestBridgeBytes };
+
+    private static string PlaceholderResourcePath()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " - ensure CodeyBox.slnx exists in an ancestor directory.");
+
+        var path = Path.Combine(
+            solutionRoot,
+            "src",
+            "CodeyBox.Agents.Claude",
+            "Resources",
+            "acp-bridge.placeholder");
+        Assert.True(File.Exists(path), "ACP bridge placeholder resource missing at " + path);
+        return path;
+    }
+
+    private static string? FindAncestorContaining(string start, string fileName)
+    {
+        var dir = start;
+        while (!string.IsNullOrEmpty(dir))
+        {
+            if (File.Exists(Path.Combine(dir, fileName)))
+                return dir;
+            dir = Path.GetDirectoryName(dir);
+        }
+        return null;
+    }
 
     private static ClaudeAgentRunner BuildRunner() =>
         new(new AgentDefaultsSnapshot(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)

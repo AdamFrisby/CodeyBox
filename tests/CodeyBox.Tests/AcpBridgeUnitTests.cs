@@ -3412,7 +3412,7 @@ for raw in sys.stdin:
     envelope = json.loads(raw)
     kind = envelope.get("type")
     if kind == "hello":
-        lock_dir = envelope["lockDir"]
+        lock_dir = os.path.join(os.path.expanduser("~"), ".claude", "ide")
         os.makedirs(lock_dir, exist_ok=True)
         lock_path = os.path.join(lock_dir, "40123.lock")
         with open(lock_path, "w", encoding="utf-8") as handle:

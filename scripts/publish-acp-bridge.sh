@@ -312,9 +312,8 @@ def sent_methods(lines):
 def run_turn(bridge_path, claude_path, session_method, session_id, prompt):
     with tempfile.TemporaryDirectory(prefix="cb-acp-verify-") as tmp:
         work_dir = os.path.join(tmp, "work")
-        lock_dir = os.path.join(tmp, "locks")
         os.mkdir(work_dir)
-        os.mkdir(lock_dir)
+        expected_lock_dir = os.path.join(os.path.expanduser("~"), ".claude", "ide")
 
         proc = subprocess.Popen(
             [bridge_path],
@@ -346,11 +345,15 @@ def run_turn(bridge_path, claude_path, session_method, session_id, prompt):
                 "claudeBinary": claude_path,
                 "claudeArgs": claude_args,
                 "workingDirectory": work_dir,
-                "lockDir": lock_dir,
                 "claudeEnv": build_claude_env(),
                 "turnTimeoutSeconds": turn_timeout,
             })
             ready = wait_for_type(seen, "ready", 15, stdout_lines)
+            lock_path = ready["lockPath"]
+            expected_prefix = expected_lock_dir + os.sep
+            if not lock_path.startswith(expected_prefix):
+                fail("bridge wrote IDE lockfile outside Claude discovery path; expected prefix %s, got %s" %
+                     (expected_prefix, lock_path))
             wait_for_type(seen, "peer_connected", 15, stdout_lines)
 
             session_params = {"cwd": work_dir}
@@ -388,7 +391,6 @@ def run_turn(bridge_path, claude_path, session_method, session_id, prompt):
                 fail("bridge exited %d; stdout:\n%s\nstderr:\n%s" %
                      (code, "\n".join(stdout_lines), "\n".join(stderr_lines)))
 
-            lock_path = ready["lockPath"]
             if os.path.exists(lock_path):
                 fail("bridge left IDE lockfile behind: " + lock_path)
 

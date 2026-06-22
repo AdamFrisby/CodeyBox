@@ -90,12 +90,15 @@ internal static class AcpBridgeBinary
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         var bytes = ms.ToArray();
-        _isPlaceholderCached = StartsWith(bytes, PlaceholderSentinel);
+        _isPlaceholderCached = IsPlaceholderPayload(bytes);
         _cached = bytes;
         return bytes;
     }
 
-    private static bool StartsWith(byte[] data, byte[] prefix)
+    internal static bool IsPlaceholderPayload(ReadOnlySpan<byte> bytes)
+        => StartsWith(bytes, PlaceholderSentinel);
+
+    private static bool StartsWith(ReadOnlySpan<byte> data, ReadOnlySpan<byte> prefix)
     {
         if (data.Length < prefix.Length) return false;
         for (int i = 0; i < prefix.Length; i++)
