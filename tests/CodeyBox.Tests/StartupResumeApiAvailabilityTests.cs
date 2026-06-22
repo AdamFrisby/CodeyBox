@@ -168,6 +168,12 @@ public sealed class StartupResumeApiAvailabilityTests
         HttpResponseMessage? response = null;
         try
         {
+            // This is a full-host test: the startup resume sweep is the
+            // behavior under test, but unrelated hosted services still start
+            // before Kestrel serves the request. Keep the HTTP availability
+            // guard broad enough for parallel audit-suite load; the persisted
+            // work item assertion below proves the hot-reloaded 250 ms timeout
+            // was the value used by the resume handler.
             response = await Task.Run(async () =>
             {
                 bootstrapClient = factory.CreateClient();
@@ -175,14 +181,14 @@ public sealed class StartupResumeApiAvailabilityTests
                     ?? throw new InvalidOperationException("Kestrel-backed client did not expose a base address");
                 networkClient = new HttpClient { BaseAddress = baseAddress };
                 return await networkClient.GetAsync("/quota");
-            }).WaitAsync(TimeSpan.FromSeconds(5));
+            }).WaitAsync(initialTimeout + TimeSpan.FromSeconds(10));
             sw.Stop();
 
             response.EnsureSuccessStatusCode();
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
+                $"GET /quota was blocked for {sw.Elapsed}; hot-reloaded startup resume timeout {reloadedTimeout} should keep API availability under 5s.");
             Assert.True(sw.Elapsed >= reloadedTimeout,
                 $"hot-reloaded Blocking mode was not observed; GET /quota was served before resume timeout {reloadedTimeout}; elapsed {sw.Elapsed}");
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
-                $"hot-reloaded resume timeout {reloadedTimeout} was not observed; elapsed {sw.Elapsed}");
         }
         finally
         {

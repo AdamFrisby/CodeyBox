@@ -1479,7 +1479,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             CreateNoWindow = true,
         };
         psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add("while :; do :; done");
+        psi.ArgumentList.Add("exec yes >/dev/null");
         psi.Environment[SandboxConventions.WorkItemIdEnvironmentVariable] = itemId.ToString();
         var process = DiagProcess.Start(psi)
             ?? throw new InvalidOperationException("failed to start busy test process");

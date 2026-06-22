@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Agents.Claude;
@@ -211,21 +212,6 @@ public sealed class ClaudeAcpTransportTests
     }
 
     // ── Permission / question auto-handling ───────────────────────────────────
-
-    [Fact]
-    public void AcpBridge_ConfigurationDefaults_AutoApproveAndAutoAnswer()
-    {
-        // The bridge script defaults to auto-approve permissions and
-        // auto-answer questions so a headless ACP session never waits on a
-        // human. The script is large; verify the explicit defaults are wired
-        // (the operator could only opt out by writing the hello envelope with
-        // those flags set to false, which CodeyBox never does).
-        Assert.Contains("autoApprovePermissions: true", AcpBridgeScript.Source);
-        Assert.Contains("autoAnswerQuestions: true", AcpBridgeScript.Source);
-        Assert.Contains("<codeybox-question>", AcpBridgeScript.Source);
-        Assert.Contains("session/request_permission", AcpBridgeScript.Source);
-        Assert.Contains("session/request_input", AcpBridgeScript.Source);
-    }
 
     [Fact]
     public void AcpBridge_ObservesPermissionGrantsAndQuestions()
@@ -613,39 +599,287 @@ public sealed class ClaudeAcpTransportTests
             worker.SnapshotPersistedHandle(persisted).Metadata![ClaudeSessionWorker.TransportMetadataKey]);
     }
 
-    // ── Real AcpClaudeTransport — bridge materialisation + turn round-trip ───
+    // ── Real AcpClaudeTransport — bridge launcher + turn round-trip ──────────
 
     [Fact]
-    public async Task AcpClaudeTransport_OpenAsync_WritesBridgeScript_ViaBase64Pipe()
+    public async Task AcpClaudeTransport_SendTurn_WritesFreshBridgeBinary_ViaLauncherStdin()
     {
         var sandbox = new BridgeSandbox();
-        var transport = new AcpClaudeTransport { NodeBinary = "node" };
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-launcher-1\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+        var transport = NewAcpTransportWithOverride();
         var request = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-1");
 
         await using var session = await transport.OpenAsync(request, CancellationToken.None);
+        Assert.Empty(sandbox.AllExecs);
 
-        var materialise = sandbox.AllExecs.Single();
-        Assert.Equal("bash", materialise.Argv[0]);
-        Assert.Equal("-c", materialise.Argv[1]);
-        Assert.Contains("base64 -d > \"$HOME/.codeybox/claude-acp-bridge.cjs\"", materialise.Argv[2]);
-        // The encoded payload is the bridge script verbatim.
-        var encoded = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(AcpBridgeScript.Source));
-        Assert.Contains(encoded, materialise.Argv[2]);
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.True(turn.Result.Success);
+        var launcher = sandbox.BridgeExecs.Single();
+        Assert.Equal("sh", launcher.Argv[0]);
+        Assert.Equal("-c", launcher.Argv[1]);
+        var script = launcher.Argv[2];
+        Assert.Contains("base_dir=${HOME:?}/.codeybox/acp-bridge", script);
+        Assert.Contains("mktemp -d \"$base_dir/turn.XXXXXX\"", script);
+        Assert.Contains("base64 -d \"$b64\" > \"$bridge\"", script);
+        Assert.Contains("sha256sum \"$bridge\"", script);
+        Assert.Contains("\"$bridge\"", script);
+        Assert.DoesNotContain("/usr/local/lib/codeybox", script);
+        Assert.DoesNotContain("sudo", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".cjs", script);
+        Assert.DoesNotContain("node", script, StringComparison.OrdinalIgnoreCase);
+
+        // The base64 payload must travel via stdin, not argv. Linux MAX_ARG_STRLEN
+        // caps every argv element at 128 KiB, which a NativeAOT bridge would trip
+        // if embedded in the shell script.
+        var encoded = Convert.ToBase64String(TestBridgeBytes);
+        Assert.Equal(encoded, ExtractBridgePayloadFromLauncherStdin(launcher.Stdin!));
+        Assert.DoesNotContain(encoded, script);
+        Assert.True(script.Length < 4096,
+            $"launcher script grew to {script.Length} bytes; keep argv tiny");
+
+        var bridgeStdin = ExtractBridgeInputFromLauncherStdin(launcher.Stdin!);
+        Assert.Contains("\"type\":\"hello\"", bridgeStdin);
+        Assert.Contains("\"method\":\"session/new\"", bridgeStdin);
+        Assert.Contains("\"method\":\"session/prompt\"", bridgeStdin);
     }
 
     [Fact]
-    public async Task AcpClaudeTransport_OpenAsync_SandboxFailure_RaisesUnavailable()
+    public async Task AcpClaudeTransport_BridgeLauncherScript_ExecutesPayloadAndRejectsHashMismatch()
     {
-        var sandbox = new BridgeSandbox { FailMaterialise = true };
+        var successRoot = Directory.CreateTempSubdirectory("cb-acp-launcher-success-").FullName;
+        try
+        {
+            var home = Path.Combine(successRoot, "home");
+            Directory.CreateDirectory(home);
+            var installDir = Path.Combine(home, "acp-bridge");
+            var sandbox = new ExecutingLauncherSandbox(home);
+            var transport = NewAcpTransportWithOverride(
+                bridgeInstallDirectory: installDir,
+                bridgeBytes: TestExecutableBridgeBytes);
+            var open = new ClaudeTransportOpenRequest(
+                sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+                LocalSessionId: "local-launcher-exec");
+            await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+            var turn = await session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None);
+
+            Assert.True(turn.Result.Success);
+            Assert.Equal("acp-executable-1", turn.CapturedCliSessionId);
+            Assert.Empty(Directory.GetDirectories(installDir));
+        }
+        finally
+        {
+            try { Directory.Delete(successRoot, recursive: true); } catch { }
+        }
+
+        var mismatchRoot = Directory.CreateTempSubdirectory("cb-acp-launcher-mismatch-").FullName;
+        try
+        {
+            var home = Path.Combine(mismatchRoot, "home");
+            Directory.CreateDirectory(home);
+            var transport = NewAcpTransportWithOverride(
+                bridgeInstallDirectory: Path.Combine(home, "acp-bridge"),
+                bridgeBytes: TestExecutableBridgeBytes);
+            var script = transport.BuildBridgeLauncherScript(new string('0', 64));
+            var stdin = AcpClaudeTransport.BuildBridgeLauncherStdin(
+                Convert.ToBase64String(TestExecutableBridgeBytes),
+                "{\"type\":\"hello\"}\n");
+            var sandbox = new ExecutingLauncherSandbox(home);
+
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", script],
+                Stdin = stdin,
+                WorkingDirectory = "/work",
+            }, CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Contains("hash mismatch", result.Stderr, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("turn_complete", result.Stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(mismatchRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_OpenAsync_PlaceholderBuild_RaisesUnavailable_BeforeTouchingSandbox()
+    {
+        var placeholderBytes = File.ReadAllBytes(PlaceholderResourcePath());
+        Assert.True(
+            AcpBridgeBinary.IsPlaceholderPayload(placeholderBytes),
+            "The checked-in placeholder resource must start with the sentinel consumed by AcpBridgeBinary.");
+
+        var sandbox = new BridgeSandbox();
+        var placeholderTransport = new AcpClaudeTransport
+        {
+            // Explicit fixture seam: this test pins placeholder behavior
+            // without depending on whether the current checkout has already
+            // run scripts/publish-acp-bridge.sh.
+            BridgePlaceholderOverride = true,
+        };
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-placeholder");
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => placeholderTransport.OpenAsync(request, CancellationToken.None));
+        Assert.Contains("placeholder", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // No sandbox call should have been made.
+        Assert.Empty(sandbox.AllExecs);
+    }
+
+    [Fact]
+    public void AcpBridgePlaceholderResource_StartsWithRuntimePlaceholderSentinel()
+    {
+        var bytes = File.ReadAllBytes(PlaceholderResourcePath());
+        Assert.True(
+            AcpBridgeBinary.IsPlaceholderPayload(bytes),
+            "Resources/acp-bridge.placeholder drifted from the runtime placeholder detector.");
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_OpenAsync_ProductionResourcePath_UsesActualEmbeddedResourceSentinel()
+    {
+        var sandbox = new BridgeSandbox();
         var transport = new AcpClaudeTransport();
         var request = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
-            LocalSessionId: "local-x");
+            LocalSessionId: "local-embedded");
 
-        await Assert.ThrowsAsync<AcpTransportUnavailableException>(
-            () => transport.OpenAsync(request, CancellationToken.None));
+        var resourceNames = typeof(AcpBridgeBinary).Assembly.GetManifestResourceNames();
+        Assert.Contains(AcpBridgeBinary.EmbeddedResourceName, resourceNames);
+
+        if (AcpBridgeBinary.IsPlaceholderBuild)
+        {
+            var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+                () => transport.OpenAsync(request, CancellationToken.None));
+            Assert.Contains("placeholder", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Empty(sandbox.AllExecs);
+            return;
+        }
+
+        await using var session = await transport.OpenAsync(request, CancellationToken.None);
+
+        Assert.Empty(sandbox.AllExecs);
+        var embeddedBytes = AcpBridgeBinary.LoadBinary();
+        Assert.True(embeddedBytes.Length > 4);
+        Assert.Equal(0x7f, embeddedBytes[0]);
+        Assert.Equal((byte)'E', embeddedBytes[1]);
+        Assert.Equal((byte)'L', embeddedBytes[2]);
+        Assert.Equal((byte)'F', embeddedBytes[3]);
+        Assert.Equal(2, embeddedBytes[4]); // 64-bit ELF class.
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_SendTurnAsync_LauncherFailure_RaisesUnavailable()
+    {
+        var sandbox = new BridgeSandbox { FailBridgeLaunch = true };
+        var transport = NewAcpTransportWithOverride();
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-x");
+        await using var session = await transport.OpenAsync(request, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+
+        Assert.Contains("ACP bridge exited", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("permission denied", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("relative/acp-bridge")]
+    public async Task AcpClaudeTransport_SendTurnAsync_InvalidLauncherDirectory_RaisesUnavailable(string installDir)
+    {
+        var root = Directory.CreateTempSubdirectory("cb-acp-invalid-launcher-dir-").FullName;
+        try
+        {
+            var home = Path.Combine(root, "home");
+            Directory.CreateDirectory(home);
+            var sandbox = new ExecutingLauncherSandbox(home);
+            var transport = NewAcpTransportWithOverride(
+                bridgeInstallDirectory: installDir,
+                bridgeBytes: TestExecutableBridgeBytes);
+            var request = new ClaudeTransportOpenRequest(
+                sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+                LocalSessionId: "local-bad-launcher-dir");
+            await using var session = await transport.OpenAsync(request, CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+                session.SendTurnAsync(
+                    new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+                    CancellationToken.None));
+
+            Assert.Contains("install directory must be absolute", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_SendTurnAsync_SandboxExecThrows_RaisesUnavailable()
+    {
+        var sandbox = new ThrowingSandbox(new IOException("multipass exec dispatch failed"));
+        var transport = NewAcpTransportWithOverride();
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-throw-launcher");
+        await using var session = await transport.OpenAsync(request, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+
+        Assert.Contains("ACP bridge invocation failed", ex.Message);
+        Assert.IsType<IOException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_SendTurnAsync_BridgeExecThrows_RaisesUnavailable()
+    {
+        // SendTurnAsync wraps the bridge invocation's `_open.Sandbox.ExecAsync`
+        // in a similar catch — when the sandbox throws (vs returning a
+        // non-success result), the worker must observe the failure as
+        // AcpTransportUnavailableException so it can degrade to print for
+        // the remainder of the session. Without this coverage a regression
+        // that drops the catch would leak the underlying provider exception
+        // into the work item and stall the pipeline.
+        var sandbox = new ThrowOnBridgeInvocationSandbox(
+            new InvalidOperationException("sandbox exec channel torn down"));
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-throw-bridge");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("ACP bridge invocation failed", ex.Message);
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
     }
 
     [Fact]
@@ -663,7 +897,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
 
-        var transport = new AcpClaudeTransport { NodeBinary = "node" };
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-real");
@@ -677,11 +911,14 @@ public sealed class ClaudeAcpTransportTests
         Assert.Equal("acp-real-1", turn.CapturedCliSessionId);
 
         var bridgeExec = sandbox.BridgeExecs.Single();
-        Assert.Contains("$HOME/.codeybox/claude-acp-bridge.cjs", bridgeExec.Argv[2]);
+        Assert.Equal("sh", bridgeExec.Argv[0]);
+        Assert.Equal("-c", bridgeExec.Argv[1]);
+        Assert.DoesNotContain(".cjs", bridgeExec.Argv[2]);
+        Assert.DoesNotContain("node", bridgeExec.Argv[2], StringComparison.OrdinalIgnoreCase);
         Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, bridgeExec.AgentOutputTransport);
 
         // Stdin frames the full envelope sequence: hello → initialize → session/new → session/prompt.
-        var stdin = bridgeExec.Stdin!;
+        var stdin = ExtractBridgeInputFromLauncherStdin(bridgeExec.Stdin!);
         Assert.Contains("\"type\":\"hello\"", stdin);
         Assert.Contains("\"autoApprovePermissions\":true", stdin);
         Assert.Contains("\"autoAnswerQuestions\":true", stdin);
@@ -709,7 +946,7 @@ public sealed class ClaudeAcpTransportTests
             {
                 ["claude"] = new AgentNetworkToleranceOptions { ApiTimeoutMs = 1_200_000 },
             });
-        var transport = new AcpClaudeTransport(snapshot);
+        var transport = NewAcpTransportWithOverride(snapshot);
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-timeout");
@@ -723,11 +960,12 @@ public sealed class ClaudeAcpTransportTests
         var bridgeExec = sandbox.BridgeExecs.Single();
         Assert.Equal("1200000", bridgeExec.ExtraEnvironment!["API_TIMEOUT_MS"]);
 
-        using var hello = JsonDocument.Parse(bridgeExec.Stdin!.Split('\n')[0]);
+        var bridgeStdin = ExtractBridgeInputFromLauncherStdin(bridgeExec.Stdin!);
+        using var hello = JsonDocument.Parse(bridgeStdin.Split('\n')[0]);
         var root = hello.RootElement;
         Assert.Equal("1200000", root.GetProperty("claudeEnv").GetProperty("API_TIMEOUT_MS").GetString());
         Assert.Equal(expectedTurnTimeoutSeconds, root.GetProperty("turnTimeoutSeconds").GetInt32());
-        Assert.True(root.GetProperty("turnTimeoutSeconds").GetInt32() > AcpBridgeScript.TurnTimeoutSeconds);
+        Assert.True(root.GetProperty("turnTimeoutSeconds").GetInt32() > AcpBridgeBinary.TurnTimeoutSeconds);
     }
 
     [Fact]
@@ -743,7 +981,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}",
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-timeout-default");
@@ -757,7 +995,8 @@ public sealed class ClaudeAcpTransportTests
         var bridgeExec = sandbox.BridgeExecs.Single();
         Assert.True(bridgeExec.ExtraEnvironment is null || !bridgeExec.ExtraEnvironment.ContainsKey("API_TIMEOUT_MS"));
 
-        using var hello = JsonDocument.Parse(bridgeExec.Stdin!.Split('\n')[0]);
+        var bridgeStdin = ExtractBridgeInputFromLauncherStdin(bridgeExec.Stdin!);
+        using var hello = JsonDocument.Parse(bridgeStdin.Split('\n')[0]);
         var root = hello.RootElement;
         Assert.False(root.GetProperty("claudeEnv").TryGetProperty("API_TIMEOUT_MS", out _));
         Assert.Equal(expectedTurnTimeoutSeconds, root.GetProperty("turnTimeoutSeconds").GetInt32());
@@ -774,7 +1013,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-resume");
@@ -792,7 +1031,7 @@ public sealed class ClaudeAcpTransportTests
             e.Argv.Count >= 3 && e.Argv[2].Contains("session_root", StringComparison.Ordinal));
 
         var bridgeExec = sandbox.BridgeExecs.Single();
-        var stdin = bridgeExec.Stdin!;
+        var stdin = ExtractBridgeInputFromLauncherStdin(bridgeExec.Stdin!);
         Assert.Contains("\"method\":\"session/load\"", stdin);
         Assert.Contains("\"sessionId\":\"acp-prior\"", stdin);
         Assert.DoesNotContain("\"method\":\"session/new\"", stdin);
@@ -815,7 +1054,7 @@ public sealed class ClaudeAcpTransportTests
         });
 
         var sink = new RecordingMetricsSink();
-        var realAcp = new AcpClaudeTransport();
+        var realAcp = NewAcpTransportWithOverride();
         var worker = new ClaudeSessionWorker(
             BuildRunner(),
             metricsSink: sink,
@@ -858,7 +1097,7 @@ public sealed class ClaudeAcpTransportTests
             BuildRunner(),
             metricsSink: sink,
             options: new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp },
-            acpTransport: new AcpClaudeTransport());
+            acpTransport: NewAcpTransportWithOverride());
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
         var result = await worker.SendTurnAsync(handle, "first");
@@ -872,6 +1111,42 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_UsageOnlySuccessfulTurn_StillBuildsShimAndEmitsMetrics()
+    {
+        // A real ACP turn can finish with stopReason + usage but no
+        // session/update text chunk. Metrics still need the stream-json shim;
+        // returning the raw bridge envelopes would make ClaudeCostExtractor
+        // miss cache_read/cache_creation entirely.
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-usage-only\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":77,\"output_tokens\":9,\"cache_read_input_tokens\":1234,\"cache_creation_input_tokens\":456}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+
+        var sink = new RecordingMetricsSink();
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            metricsSink: sink,
+            options: new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp },
+            acpTransport: NewAcpTransportWithOverride());
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        var result = await worker.SendTurnAsync(handle, "first");
+
+        Assert.True(result.Success);
+        var rec = sink.Records.Single();
+        Assert.Equal("acp", rec.Transport);
+        Assert.Equal(77 + 456 + 1234, rec.InputTokens);
+        Assert.Equal(1234, rec.CachedInputTokens);
+        Assert.Equal(77 + 456, rec.FreshInputTokens);
+        Assert.Equal(456, rec.CacheCreationInputTokens);
+        Assert.Equal(9, rec.OutputTokens);
+    }
+
+    [Fact]
     public async Task AcpClaudeTransport_FatalEnvelope_SurfacesAsTransportUnavailable()
     {
         var sandbox = new BridgeSandbox();
@@ -881,7 +1156,7 @@ public sealed class ClaudeAcpTransportTests
         });
         sandbox.BridgeExitCode = 2;
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-fatal");
@@ -891,6 +1166,55 @@ public sealed class ClaudeAcpTransportTests
             session.SendTurnAsync(
                 new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
                 CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_TurnTimeout_SurfacesAsTransportUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"turn_timeout\"}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-timeout-unavailable");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("timed out", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_NoTurnOutcome_SurfacesAsTransportUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"claude_exit\",\"code\":0,\"signal\":null}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-no-outcome");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("without reporting a turn outcome", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("timed out", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -916,7 +1240,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
         });
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-retry");
@@ -946,7 +1270,7 @@ public sealed class ClaudeAcpTransportTests
             "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
         });
 
-        var transport = new AcpClaudeTransport();
+        var transport = NewAcpTransportWithOverride();
         var open = new ClaudeTransportOpenRequest(
             sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
             LocalSessionId: "local-saniterr");
@@ -959,6 +1283,69 @@ public sealed class ClaudeAcpTransportTests
         Assert.False(turn.Result.Success);
         Assert.Contains("sanitiser failed", turn.Result.Summary);
         Assert.Single(sandbox.BridgeExecs); // No retry was attempted.
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_ThinkingBlock400_RetryNoTurnOutcome_SurfacesRetryUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}}",
+            "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
+        });
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"claude_exit\",\"code\":0,\"signal\":null}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-retry-no-outcome");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("without reporting a turn outcome on retry", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, sandbox.BridgeExecs.Count);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_ThinkingBlock400_RetryTurnTimeout_SurfacesRetryTimeoutUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}}",
+            "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
+        });
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"turn_timeout\"}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-retry-timeout");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("timed out", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("on retry", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, sandbox.BridgeExecs.Count);
     }
 
     [Fact]
@@ -996,7 +1383,87 @@ public sealed class ClaudeAcpTransportTests
         return (string)mi.Invoke(null, new object[] { obs })!;
     }
 
+    private static string ExtractBridgePayloadFromLauncherStdin(string launcherStdin)
+    {
+        var marker = AcpClaudeTransport.BridgePayloadEndMarker + "\n";
+        var index = launcherStdin.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(index >= 0, "launcher stdin did not contain bridge payload marker");
+        var payload = launcherStdin[..index];
+        return payload.Replace("\n", "", StringComparison.Ordinal);
+    }
+
+    private static string ExtractBridgeInputFromLauncherStdin(string launcherStdin)
+    {
+        var marker = AcpClaudeTransport.BridgePayloadEndMarker + "\n";
+        var index = launcherStdin.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(index >= 0, "launcher stdin did not contain bridge payload marker");
+        return launcherStdin[(index + marker.Length)..];
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Fake bridge bytes for tests that drive <see cref="AcpClaudeTransport"/>
+    /// directly. Production reads from <see cref="AcpBridgeBinary.LoadBinary"/>;
+    /// supplying this override gives focused tests a tiny non-placeholder byte
+    /// sequence without depending on the native artifact generated by Release
+    /// workflows.
+    /// </summary>
+    private static readonly byte[] TestBridgeBytes =
+        new byte[] { 0x7f, (byte)'E', (byte)'L', (byte)'F', 0x02, 0x01, 0x01, 0x00, 0xde, 0xad, 0xbe, 0xef };
+
+    private static readonly byte[] TestExecutableBridgeBytes = Encoding.UTF8.GetBytes("""
+#!/bin/sh
+input=$(cat)
+case "$input" in
+  *'"method":"session/prompt"'*) ;;
+  *) echo "bridge stdin was not delivered" >&2; exit 17 ;;
+esac
+printf '%s\n' '{"type":"ready","port":40123}'
+printf '%s\n' '{"type":"peer_connected"}'
+printf '%s\n' '{"type":"acp_recv","payload":{"jsonrpc":"2.0","id":2,"result":{"sessionId":"acp-executable-1"}}}'
+printf '%s\n' '{"type":"acp_recv","payload":{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'
+printf '%s\n' '{"type":"turn_complete","stopReason":"end_turn"}'
+""".Replace("\r\n", "\n", StringComparison.Ordinal));
+
+    private static AcpClaudeTransport NewAcpTransportWithOverride(
+        AgentNetworkToleranceSnapshot? networkTolerance = null,
+        string? bridgeInstallDirectory = null,
+        byte[]? bridgeBytes = null)
+        => new(networkTolerance)
+        {
+            BridgeBinaryOverride = bridgeBytes ?? TestBridgeBytes,
+            BridgeInstallDirectoryOverride = bridgeInstallDirectory,
+        };
+
+    private static string PlaceholderResourcePath()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " - ensure CodeyBox.slnx exists in an ancestor directory.");
+
+        var path = Path.Combine(
+            solutionRoot,
+            "src",
+            "CodeyBox.Agents.Claude",
+            "Resources",
+            "acp-bridge.placeholder");
+        Assert.True(File.Exists(path), "ACP bridge placeholder resource missing at " + path);
+        return path;
+    }
+
+    private static string? FindAncestorContaining(string start, string fileName)
+    {
+        var dir = start;
+        while (!string.IsNullOrEmpty(dir))
+        {
+            if (File.Exists(Path.Combine(dir, fileName)))
+                return dir;
+            dir = Path.GetDirectoryName(dir);
+        }
+        return null;
+    }
 
     private static ClaudeAgentRunner BuildRunner() =>
         new(new AgentDefaultsSnapshot(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
@@ -1035,6 +1502,55 @@ public sealed class ClaudeAcpTransportTests
                 return Task.FromResult(new SandboxExecResult(0, stdout, ""));
             }
             return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ExecutingLauncherSandbox : ISandbox
+    {
+        private readonly string _home;
+
+        public ExecutingLauncherSandbox(string home)
+        {
+            _home = home;
+            Directory.CreateDirectory(_home);
+        }
+
+        public string Id { get; } = "vm-launcher-" + Guid.NewGuid().ToString("N")[..8];
+        public List<SandboxExec> AllExecs { get; } = new();
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            if (exec.Argv.Count == 0)
+                return new SandboxExecResult(0, "", "");
+
+            var psi = new ProcessStartInfo(exec.Argv[0])
+            {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                WorkingDirectory = _home,
+            };
+            for (var i = 1; i < exec.Argv.Count; i++)
+                psi.ArgumentList.Add(exec.Argv[i]);
+            psi.Environment["HOME"] = _home;
+            psi.Environment["PATH"] = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin";
+
+            using var process = Process.Start(psi)
+                ?? throw new InvalidOperationException("Failed to start " + exec.Argv[0]);
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = process.StandardError.ReadToEndAsync(ct);
+            if (exec.Stdin is not null)
+                await process.StandardInput.WriteAsync(exec.Stdin.AsMemory(), ct);
+            process.StandardInput.Close();
+
+            await process.WaitForExitAsync(ct);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+            return new SandboxExecResult(process.ExitCode, stdout, stderr);
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
@@ -1134,7 +1650,6 @@ public sealed class ClaudeAcpTransportTests
     /// Sandbox stub that classifies each ExecAsync by argv shape so the real
     /// <see cref="AcpClaudeTransport"/> can drive a full SendTurn round-trip:
     /// the bridge invocation receives queued envelopes via StdoutChunkCallback,
-    /// the bridge-script materialise call succeeds, and the
     /// <see cref="ClaudeSessionSanitizer"/> discovery script returns either an
     /// empty file list (default) or a single file path (for the sanitiser
     /// failure test).
@@ -1146,7 +1661,7 @@ public sealed class ClaudeAcpTransportTests
         public List<SandboxExec> BridgeExecs { get; } = new();
         public string Id { get; } = "vm-" + Guid.NewGuid().ToString("N")[..8];
 
-        public bool FailMaterialise { get; set; }
+        public bool FailBridgeLaunch { get; set; }
         public int BridgeExitCode { get; set; }
         public string? SanitiserListsFile { get; set; }
         public bool SanitiserFailWrite { get; set; }
@@ -1159,39 +1674,36 @@ public sealed class ClaudeAcpTransportTests
             if (exec.Argv.Count == 0)
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
 
-            // Bridge materialise: `bash -c "set -eu\n...base64 -d > ..."`.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("claude-acp-bridge.cjs", StringComparison.Ordinal)
-                && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
-            {
-                if (FailMaterialise)
-                    return Task.FromResult(new SandboxExecResult(1, "", "permission denied"));
-                return Task.FromResult(new SandboxExecResult(0, "", ""));
-            }
-
             // Sanitiser discovery: `bash -c "...session_root..."` with no Stdin.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("session_root", StringComparison.Ordinal))
+            if (IsShell(exec, "-c") && exec.Argv[2].Contains("session_root", StringComparison.Ordinal))
             {
                 return Task.FromResult(new SandboxExecResult(0, SanitiserListsFile ?? "", ""));
             }
 
             // Sanitiser read: `bash -c "cat -- \"$1\" ..." _ <path>`.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("cat -- ", StringComparison.Ordinal) && exec.Stdin is null)
+            if (IsShell(exec, "-c") && exec.Argv[2].Contains("cat -- ", StringComparison.Ordinal) && exec.Stdin is null)
             {
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
             // Sanitiser write: `bash -c "cat > \"$1\"" _ <path>` with Stdin.
-            if (IsBash(exec, "-c") && exec.Argv[2].Contains("cat > ", StringComparison.Ordinal))
+            if (IsShell(exec, "-c") && exec.Argv[2].Contains("cat > ", StringComparison.Ordinal))
             {
                 if (SanitiserFailWrite)
                     return Task.FromResult(new SandboxExecResult(1, "", "no space left on device"));
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
-            // Bridge invocation: `bash -lc "exec '<node>' $HOME/.codeybox/...cjs"`.
-            if (IsBash(exec, "-lc") && exec.Argv[2].Contains("claude-acp-bridge.cjs", StringComparison.Ordinal))
+            // Bridge invocation: the per-turn shell launcher decodes the native
+            // bridge payload from stdin, verifies its SHA-256, then runs it with
+            // the remaining ACP stdin.
+            if (IsShell(exec, "-c")
+                && exec.Argv[2].Contains(AcpClaudeTransport.BridgePayloadEndMarker, StringComparison.Ordinal)
+                && exec.Argv[2].Contains("sha256sum", StringComparison.Ordinal))
             {
                 BridgeExecs.Add(exec);
+                if (FailBridgeLaunch)
+                    return Task.FromResult(new SandboxExecResult(1, "", "permission denied"));
                 var envelopes = _bridgeOutputs.Count > 0
                     ? _bridgeOutputs.Dequeue()
                     : Array.Empty<string>();
@@ -1203,8 +1715,51 @@ public sealed class ClaudeAcpTransportTests
             return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
 
-        private static bool IsBash(SandboxExec exec, string flag)
-            => exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == flag;
+        private static bool IsShell(SandboxExec exec, string flag)
+            => exec.Argv.Count >= 3
+               && (exec.Argv[0] == "bash" || exec.Argv[0] == "sh")
+               && exec.Argv[1] == flag;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox that throws on EVERY ExecAsync — exercises the exception-
+    /// wrapping catch around the per-turn bridge launcher invocation.
+    /// </summary>
+    private sealed class ThrowingSandbox : ISandbox
+    {
+        private readonly Exception _toThrow;
+        public string Id { get; } = "vm-throwing-" + Guid.NewGuid().ToString("N")[..8];
+        public ThrowingSandbox(Exception toThrow) => _toThrow = toThrow;
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => throw _toThrow;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox that lets OpenAsync complete (it does not touch the sandbox) but
+    /// throws on the first bridge launcher invocation — exercises
+    /// the exception-wrapping catch in
+    /// <see cref="AcpClaudeTransport.AcpSession.SendTurnAsync"/>.
+    /// </summary>
+    private sealed class ThrowOnBridgeInvocationSandbox : ISandbox
+    {
+        private readonly Exception _toThrowOnBridge;
+        public string Id { get; } = "vm-throwbridge-" + Guid.NewGuid().ToString("N")[..8];
+        public ThrowOnBridgeInvocationSandbox(Exception toThrowOnBridge) => _toThrowOnBridge = toThrowOnBridge;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 3
+                && (exec.Argv[0] == "bash" || exec.Argv[0] == "sh")
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains(AcpClaudeTransport.BridgePayloadEndMarker, StringComparison.Ordinal))
+            {
+                throw _toThrowOnBridge;
+            }
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }

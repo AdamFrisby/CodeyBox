@@ -95,6 +95,14 @@ workflow runs the same filter on a **self-hosted runner labeled `multipass`**
 (with KVM and agent credentials). It does **not** run on every push to `main`
 (cost and duration). Register such a runner before enabling the schedule.
 
+Set the `CODEYBOX_ACP_BRIDGE_VERIFY_VM` repository variable to an already-baked
+CodeyBox baseline VM. The workflow clones that baseline into a disposable
+verifier VM before running `scripts/publish-acp-bridge.sh`, so ACP bridge
+runtime verification does not depend on hidden runner-local VM state or mutate
+the stopped baseline directly. Manual dispatch intentionally uses the same
+repository variable rather than accepting a VM-name override, because the job
+runs with provider credentials on a self-hosted Multipass runner.
+
 ## When to add a stronger wrapper
 
 If an agent shows **Failed** at **N ≤ 60 s** even after durable recovery:

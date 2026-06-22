@@ -200,17 +200,44 @@ session id (passed back via `--resume`); cache warmth follows the server-side
 prompt cache TTL.
 
 `acp` runs the in-sandbox `ClaudeSessionWorker.AcpClaudeTransport` bridge:
-CodeyBox materialises a tiny Node.js bridge inside the sandbox, the bridge
-hosts a WebSocket on a random local port, writes an IDE lockfile at
-`~/.claude/ide/<port>.lock` carrying `{transport:"ws", url, authToken,
-workspaceFolders, ...}`, and spawns `claude --ide` so the agent connects to
-the bridge. ACP JSON-RPC traffic (`initialize`, `session/new` or
-`session/load`, `session/prompt`, streamed `session/update`s, `stopReason`)
-flows host ↔ bridge stdio ↔ in-VM WebSocket ↔ claude. Permission requests
-(`session/request_permission`) and input requests (`session/request_input`)
-auto-grant / answer with a `<codeybox-question>` default so a headless ACP
-turn never waits on a human. Session continuity uses the assigned ACP
-session id, passed back via `session/load` on the next turn.
+CodeyBox materialises a tiny **C# native bridge binary** inside the sandbox
+(self-contained, statically-linked NativeAOT ELF — no Node.js dependency on
+the sandbox image), the bridge hosts a WebSocket on a random local port,
+writes an IDE lockfile at `~/.claude/ide/<port>.lock` carrying
+`{transport:"ws", url, authToken, workspaceFolders, ...}`, and spawns
+`claude --ide` so the agent connects to the bridge. ACP JSON-RPC traffic
+(`initialize`, `session/new` or `session/load`, `session/prompt`, streamed
+`session/update`s, `stopReason`) flows host ↔ bridge stdio ↔ in-VM
+WebSocket ↔ claude. Permission requests (`session/request_permission`) and
+input requests (`session/request_input`) auto-grant / answer with a
+`<codeybox-question>` default so a headless ACP turn never waits on a
+human. Session continuity uses the assigned ACP session id, passed back via
+`session/load` on the next turn.
+
+The bridge ships as a `.csproj` in the master solution
+(`src/CodeyBox.Agents.Claude.AcpBridge`); operators produce the native
+binary by running `scripts/publish-acp-bridge.sh` on the build host (which
+needs `musl-tools` installed — the static linker the AOT publish step
+invokes). The publish settings use the documented NativeAOT `StaticExecutable`
+MSBuild property for fully-static linking against musl on `linux-musl-x64`;
+the script also runs `ldd` after publish and warns if the produced binary
+isn't statically linked. The script writes the published ELF to
+`src/CodeyBox.Agents.Claude/Resources/acp-bridge`, where it is picked up
+as an embedded resource of the orchestrator-side Claude assembly. On hosts
+that have not run the publish script, a tracked placeholder resource is
+embedded instead — `AcpClaudeTransport.MaterialiseBridgeAsync` consults
+`AcpBridgeBinary.IsPlaceholderBuild` and raises
+`AcpTransportUnavailableException` **before touching the sandbox**, so the
+worker degrades to the `print` transport on the first ACP turn rather than
+spending a sandbox roundtrip to exec a non-binary.
+
+The materialised payload travels via `SandboxExec.Stdin` (the bridge ELF
+is base64-encoded on the host and decoded inside the sandbox by `base64 -d`
+reading from stdin). It does NOT travel through argv — Linux
+`MAX_ARG_STRLEN` caps every argv element at 128 KiB regardless of in-shell
+heredoc syntax, which a multi-MB NativeAOT bridge would trip. Keeping the
+script tiny (~200 bytes) means the same materialise step works identically
+across Process / Bubblewrap / Multipass sandbox providers.
 
 If the ACP transport fails to open or any turn raises
 `AcpTransportUnavailableException`, the worker logs

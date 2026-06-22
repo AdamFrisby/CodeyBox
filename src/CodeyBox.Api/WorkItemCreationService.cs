@@ -15,7 +15,7 @@ internal sealed class WorkItemCreationService
     private readonly IProjectRepository _projects;
     private readonly IAgentRegistry _agents;
     private readonly IKnobRegistry _knobs;
-    private readonly IReleaseStore? _releaseStore;
+    private readonly Func<IReleaseStore?> _releaseStoreFactory;
     private readonly IWebhookDispatcher _webhooks;
 
     public WorkItemCreationService(
@@ -25,7 +25,7 @@ internal sealed class WorkItemCreationService
         IAgentRegistry agents,
         IKnobRegistry knobs,
         IWebhookDispatcher webhooks,
-        IReleaseStore? releaseStore = null)
+        Func<IReleaseStore?>? releaseStoreFactory = null)
     {
         _store = store;
         _queue = queue;
@@ -33,7 +33,7 @@ internal sealed class WorkItemCreationService
         _agents = agents;
         _knobs = knobs;
         _webhooks = webhooks;
-        _releaseStore = releaseStore;
+        _releaseStoreFactory = releaseStoreFactory ?? (() => null);
     }
 
     public Task<PreparedWorkItemCreationResult> PrepareAsync(
@@ -206,13 +206,14 @@ internal sealed class WorkItemCreationService
         ReleaseId? releaseId = null;
         if (!string.IsNullOrWhiteSpace(req.ReleaseId))
         {
-            if (_releaseStore is null)
+            var releaseStore = _releaseStoreFactory();
+            if (releaseStore is null)
                 return Error("release management is not available");
 
             if (!ReleaseId.TryParse(req.ReleaseId, out var rid))
                 return Error("invalid releaseId");
 
-            var rel = await _releaseStore.GetAsync(rid, ct);
+            var rel = await releaseStore.GetAsync(rid, ct);
             if (rel is null)
                 return new PreparedWorkItemCreationResult(
                     null,

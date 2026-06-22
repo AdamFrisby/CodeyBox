@@ -1,0 +1,5 @@
+CODEYBOX_ACP_BRIDGE_PLACEHOLDER_v1
+This file ships into builds where scripts/publish-acp-bridge.sh has not been
+run on the build host. It is NOT a runnable bridge — the runtime path detects
+the placeholder magic on the first byte sequence and short-circuits to the
+print transport instead of trying to exec a non-binary in the sandbox.

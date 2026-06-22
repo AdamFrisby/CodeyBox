@@ -1947,6 +1947,7 @@ builder.Services.AddSingleton<IReleaseStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteReleaseStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<Func<IReleaseStore?>>(sp => () => sp.GetService<IReleaseStore>());
 builder.Services.AddSingleton<SqliteWorkItemStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;

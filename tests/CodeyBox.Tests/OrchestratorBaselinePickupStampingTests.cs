@@ -13,6 +13,7 @@ namespace CodeyBox.Tests;
 /// <see cref="WorkItem.BaselineImageRef"/>. The in-memory item passed into
 /// <see cref="IPipelineRunner"/> must carry that same persisted ref.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
 {
     private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-bsl-pickup-{Guid.NewGuid():N}.db");

@@ -19,6 +19,7 @@ namespace CodeyBox.Tests;
 /// Store-level tests pin the in-flight split query the orchestrator gate reads;
 /// the orchestrator-level integration tests pin the dispatch-time behaviour.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class RefactorJobTypeTests : IDisposable
 {
     private readonly string _dbPath =

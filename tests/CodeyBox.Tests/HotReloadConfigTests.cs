@@ -156,7 +156,7 @@ public sealed class HotReloadConfigTests
             // Generous timeout: this is a behaviour test, not a performance
             // test, and under heavy CI/sandbox load the work+audit phases can
             // take well over the nominal time.
-            await runTask.WaitAsync(TimeSpan.FromSeconds(60));
+            await runTask.WaitAsync(TimeSpan.FromMinutes(3));
 
             Assert.True(auditor.Completed);
             var finished = await fixture.Store.GetAsync(item.Id);
