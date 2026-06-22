@@ -32,6 +32,8 @@ namespace CodeyBox.Agents.Claude;
 public sealed class AcpClaudeTransport : IClaudeTransport
 {
     internal const int ApiTimeoutBridgeMarginSeconds = 30;
+    internal const string BridgeInstallDirectory = "/usr/local/lib/codeybox";
+    internal const string BridgeInstallPath = BridgeInstallDirectory + "/claude-acp-bridge";
 
     private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
 
@@ -59,6 +61,12 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     /// decision comes from the embedded resource bytes in <see cref="AcpBridgeBinary"/>.
     /// </summary>
     internal bool? BridgePlaceholderOverride { get; set; }
+    /// <summary>
+    /// Test seam for shell-payload tests that execute the materialiser on the
+    /// host without root privileges. Production leaves this null so the bridge
+    /// lands under <see cref="BridgeInstallDirectory"/>.
+    /// </summary>
+    internal string? BridgeInstallDirectoryOverride { get; set; }
 
     public string Name => "acp";
     public ClaudeSessionTransport Transport => ClaudeSessionTransport.Acp;
@@ -118,26 +126,48 @@ public sealed class AcpClaudeTransport : IClaudeTransport
         // than argv. Linux MAX_ARG_STRLEN caps every argv element at 128 KiB
         // (PAGE_SIZE * 32) at execve() time, regardless of in-shell heredoc
         // syntax — a multi-MB NativeAOT bridge would trip that limit if it
-        // were wedged into argv[2]. Keeping the script tiny means the same
-        // path works under Process / Bubblewrap / Multipass sandboxes
-        // identically.
+        // were wedged into argv[2]. Keeping the script tiny avoids that
+        // execve() ceiling while the privileged installer puts the executable
+        // outside the agent-writable home directory.
+        var targetDir = BridgeInstallDirectoryOverride ?? BridgeInstallDirectory;
+        if (string.IsNullOrWhiteSpace(targetDir) || !targetDir.StartsWith("/", StringComparison.Ordinal))
+        {
+            throw new AcpTransportUnavailableException(
+                $"ACP bridge install directory must be absolute: {targetDir}");
+        }
+
+        var target = targetDir.TrimEnd('/') + "/claude-acp-bridge";
         var encoded = Convert.ToBase64String(bytes);
-        const string script =
+        var script =
             "set -eu\n" +
             "fail(){ cat >/dev/null || true; echo \"$1\" >&2; exit 1; }\n" +
-            "target_dir=\"$HOME/.codeybox\"\n" +
-            "target=\"$target_dir/claude-acp-bridge\"\n" +
-            "if [ -L \"$target_dir\" ]; then fail \"refusing symlinked bridge directory: $target_dir\"; fi\n" +
-            "if [ -e \"$target_dir\" ] && [ ! -d \"$target_dir\" ]; then fail \"bridge directory path is not a directory: $target_dir\"; fi\n" +
-            "mkdir -p \"$target_dir\" || fail \"failed to create bridge directory: $target_dir\"\n" +
-            "if [ -L \"$target_dir\" ] || [ ! -d \"$target_dir\" ]; then fail \"bridge directory path is not a real directory: $target_dir\"; fi\n" +
-            "chmod 700 \"$target_dir\" || fail \"failed to chmod bridge directory: $target_dir\"\n" +
-            "tmp=$(mktemp \"$target_dir/.claude-acp-bridge.XXXXXX\") || fail \"failed to create temporary ACP bridge file: $target_dir\"\n" +
+            "target_dir=" + ShellSingleQuote(targetDir) + "\n" +
+            "target=" + ShellSingleQuote(target) + "\n" +
+            "tmp=$(mktemp \"${TMPDIR:-/tmp}/claude-acp-bridge.XXXXXX\") || fail \"failed to create temporary ACP bridge file\"\n" +
             "trap 'rm -f \"$tmp\"' EXIT INT TERM\n" +
             "base64 -d > \"$tmp\"\n" +
             "chmod 700 \"$tmp\"\n" +
-            "mv -f -T \"$tmp\" \"$target\"\n" +
+            "installer='set -eu\n" +
+            "tmp=$1\n" +
+            "target_dir=$2\n" +
+            "target=$3\n" +
+            "[ ! -L \"$target_dir\" ] || { echo \"refusing symlinked bridge directory: $target_dir\" >&2; exit 1; }\n" +
+            "install -d -m 0755 -o root -g root \"$target_dir\"\n" +
+            "[ ! -L \"$target_dir\" ] || { echo \"refusing symlinked bridge directory: $target_dir\" >&2; exit 1; }\n" +
+            "[ -d \"$target_dir\" ] || { echo \"bridge directory path is not a directory: $target_dir\" >&2; exit 1; }\n" +
+            "install -m 0555 -o root -g root \"$tmp\" \"$target\"\n" +
+            "[ ! -L \"$target\" ] || { echo \"refusing symlinked bridge path: $target\" >&2; exit 1; }\n" +
+            "set -- $(stat -c \"%u %g %a %F\" \"$target\")\n" +
+            "[ \"$1\" = 0 ] && [ \"$2\" = 0 ] && [ \"$3\" = 555 ] && [ \"$4 $5\" = \"regular file\" ]'\n" +
+            "if command -v sudo >/dev/null 2>&1; then\n" +
+            "  sudo -n sh -c \"$installer\" codeybox-acp-install \"$tmp\" \"$target_dir\" \"$target\" || fail \"failed to install root-owned ACP bridge binary: $target\"\n" +
+            "elif [ \"$(id -u)\" = 0 ]; then\n" +
+            "  sh -c \"$installer\" codeybox-acp-install \"$tmp\" \"$target_dir\" \"$target\" || fail \"failed to install root-owned ACP bridge binary: $target\"\n" +
+            "else\n" +
+            "  fail \"sudo is required to install ACP bridge binary outside the agent-writable home\"\n" +
+            "fi\n" +
             "trap - EXIT INT TERM\n" +
+            "rm -f \"$tmp\"\n" +
             "printf '%s\\n' \"$target\"\n";
         SandboxExecResult result;
         try
@@ -169,6 +199,19 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
         return path;
     }
+
+    private static string ShellSingleQuote(string value)
+        => "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
+
+    internal static string BuildBridgeVerificationScript()
+        => "set -eu\n" +
+           "target=$1\n" +
+           "if [ -L \"$target\" ]; then echo \"ACP bridge path is a symlink: $target\" >&2; exit 1; fi\n" +
+           "set -- $(stat -c \"%u %g %a %F\" \"$target\")\n" +
+           "if [ \"$1\" != 0 ] || [ \"$2\" != 0 ] || [ \"$3\" != 555 ] || [ \"$4 $5\" != \"regular file\" ]; then\n" +
+           "  echo \"ACP bridge ownership/mode check failed for $target: uid=$1 gid=$2 mode=$3 type=$4 $5\" >&2\n" +
+           "  exit 1\n" +
+           "fi\n";
 
     internal sealed class AcpSession : ICredentialRefreshableClaudeTransportSession
     {
@@ -221,6 +264,8 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             {
                 extraEnv["API_TIMEOUT_MS"] = apiTimeout.Value.ToString();
             }
+
+            await VerifyBridgeBeforeExecAsync(turnIndex, ct).ConfigureAwait(false);
 
             var exec = new SandboxExec
             {
@@ -347,6 +392,30 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             }
 
             return new ClaudeTransportTurnResult(result, stdoutForExtractor, observed.SessionId);
+        }
+
+        private async Task VerifyBridgeBeforeExecAsync(int turnIndex, CancellationToken ct)
+        {
+            SandboxExecResult verify;
+            try
+            {
+                verify = await _open.Sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", BuildBridgeVerificationScript(), "codeybox-acp-verify", _bridgePath],
+                }, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                throw new AcpTransportUnavailableException(
+                    $"ACP bridge verification failed before turn {turnIndex}", ex);
+            }
+
+            if (!verify.Success)
+            {
+                throw new AcpTransportUnavailableException(
+                    $"ACP bridge verification failed before turn {turnIndex}: exit {verify.ExitCode}, stderr={verify.Stderr}");
+            }
         }
 
         public ValueTask DisposeAsync()

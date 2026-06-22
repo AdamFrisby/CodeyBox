@@ -615,10 +615,14 @@ public sealed class ClaudeAcpTransportTests
         var materialise = sandbox.AllExecs.Single();
         Assert.Equal("sh", materialise.Argv[0]);
         Assert.Equal("-c", materialise.Argv[1]);
-        Assert.Contains("if [ -L \"$target_dir\" ]", materialise.Argv[2]);
-        Assert.Contains("tmp=$(mktemp \"$target_dir/.claude-acp-bridge.XXXXXX\")", materialise.Argv[2]);
+        Assert.Contains("target_dir='/usr/local/lib/codeybox'", materialise.Argv[2]);
+        Assert.Contains("target='/usr/local/lib/codeybox/claude-acp-bridge'", materialise.Argv[2]);
+        Assert.Contains("tmp=$(mktemp \"${TMPDIR:-/tmp}/claude-acp-bridge.XXXXXX\")", materialise.Argv[2]);
         Assert.Contains("base64 -d > \"$tmp\"", materialise.Argv[2]);
-        Assert.Contains("mv -f -T \"$tmp\" \"$target\"", materialise.Argv[2]);
+        Assert.Contains("sudo -n sh -c \"$installer\"", materialise.Argv[2]);
+        Assert.Contains("install -m 0555 -o root -g root \"$tmp\" \"$target\"", materialise.Argv[2]);
+        Assert.Contains("stat -c \"%u %g %a %F\" \"$target\"", materialise.Argv[2]);
+        Assert.DoesNotContain("$HOME/.codeybox", materialise.Argv[2]);
         Assert.DoesNotContain(".cjs", materialise.Argv[2]);
         // The base64 payload must travel via Stdin, NOT argv — Linux
         // MAX_ARG_STRLEN caps every argv element at 128 KiB regardless of
@@ -627,14 +631,14 @@ public sealed class ClaudeAcpTransportTests
         var encoded = Convert.ToBase64String(TestBridgeBytes);
         Assert.Equal(encoded, materialise.Stdin);
         Assert.DoesNotContain(encoded, materialise.Argv[2]);
-        // And the script itself stays well under 1 KiB so MAX_ARG_STRLEN
-        // can never be a concern for the materialise step.
-        Assert.True(materialise.Argv[2].Length < 1024,
+        // And the script itself stays well under Linux's 128 KiB argv element
+        // ceiling so MAX_ARGSTRLEN can never be a concern for the materialise step.
+        Assert.True(materialise.Argv[2].Length < 4096,
             $"materialise script grew to {materialise.Argv[2].Length} bytes; keep argv tiny");
     }
 
     [Fact]
-    public async Task AcpClaudeTransport_MaterialiseBridgeAsync_ExecutesShellPayloadAndRejectsUnsafeCodeyboxDir()
+    public async Task AcpClaudeTransport_MaterialiseBridgeAsync_ExecutesShellPayloadAndRejectsUnsafeInstallDir()
     {
         var successRoot = Directory.CreateTempSubdirectory("cb-acp-materialise-success-").FullName;
         try
@@ -642,21 +646,26 @@ public sealed class ClaudeAcpTransportTests
             var home = Path.Combine(successRoot, "home");
             Directory.CreateDirectory(home);
             var sandbox = new ExecutingMaterialiseSandbox(home);
-            var transport = NewAcpTransportWithOverride();
+            var installDir = Path.Combine(successRoot, "usr-local-lib-codeybox");
+            var transport = NewAcpTransportWithOverride(bridgeInstallDirectory: installDir);
 
             var path = await transport.MaterialiseBridgeAsync(sandbox, CancellationToken.None);
 
-            var expected = Path.Combine(home, ".codeybox", "claude-acp-bridge");
+            var expected = Path.Combine(installDir, "claude-acp-bridge");
             Assert.Equal(expected, path);
             Assert.Equal(TestBridgeBytes, await File.ReadAllBytesAsync(path));
             if (OperatingSystem.IsLinux())
             {
                 Assert.Equal(
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                    UnixFileMode.UserRead | UnixFileMode.UserExecute |
+                    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                    UnixFileMode.OtherRead | UnixFileMode.OtherExecute,
                     File.GetUnixFileMode(path));
                 Assert.Equal(
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
-                    File.GetUnixFileMode(Path.Combine(home, ".codeybox")));
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                    UnixFileMode.OtherRead | UnixFileMode.OtherExecute,
+                    File.GetUnixFileMode(installDir));
             }
         }
         finally
@@ -669,12 +678,13 @@ public sealed class ClaudeAcpTransportTests
         {
             var home = Path.Combine(fileRoot, "home");
             Directory.CreateDirectory(home);
-            await File.WriteAllTextAsync(Path.Combine(home, ".codeybox"), "not a directory");
+            var installDir = Path.Combine(fileRoot, "usr-local-lib-codeybox");
+            await File.WriteAllTextAsync(installDir, "not a directory");
             var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
-                NewAcpTransportWithOverride().MaterialiseBridgeAsync(
+                NewAcpTransportWithOverride(bridgeInstallDirectory: installDir).MaterialiseBridgeAsync(
                     new ExecutingMaterialiseSandbox(home),
                     CancellationToken.None));
-            Assert.Contains("not a directory", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("failed to install root-owned ACP bridge binary", ex.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -686,12 +696,13 @@ public sealed class ClaudeAcpTransportTests
         {
             var home = Path.Combine(symlinkRoot, "home");
             var target = Path.Combine(symlinkRoot, "target");
+            var installDir = Path.Combine(symlinkRoot, "usr-local-lib-codeybox");
             Directory.CreateDirectory(home);
             Directory.CreateDirectory(target);
-            Directory.CreateSymbolicLink(Path.Combine(home, ".codeybox"), target);
+            Directory.CreateSymbolicLink(installDir, target);
 
             var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
-                NewAcpTransportWithOverride().MaterialiseBridgeAsync(
+                NewAcpTransportWithOverride(bridgeInstallDirectory: installDir).MaterialiseBridgeAsync(
                     new ExecutingMaterialiseSandbox(home),
                     CancellationToken.None));
             Assert.Contains("symlinked bridge directory", ex.Message, StringComparison.OrdinalIgnoreCase);
@@ -882,9 +893,13 @@ public sealed class ClaudeAcpTransportTests
         Assert.True(turn.Result.Success);
         Assert.Equal("acp-real-1", turn.CapturedCliSessionId);
 
+        var verification = sandbox.BridgeVerificationExecs.Single();
+        Assert.Equal(AcpClaudeTransport.BridgeInstallPath, verification.Argv.Last());
+        Assert.Contains("stat -c \"%u %g %a %F\" \"$target\"", verification.Argv[2]);
+
         var bridgeExec = sandbox.BridgeExecs.Single();
         // Native bridge — no .cjs extension, no node argv element.
-        Assert.Equal("/home/test/.codeybox/claude-acp-bridge", bridgeExec.Argv.Single());
+        Assert.Equal(AcpClaudeTransport.BridgeInstallPath, bridgeExec.Argv.Single());
         Assert.DoesNotContain(".cjs", bridgeExec.Argv.Single());
         Assert.DoesNotContain("node", bridgeExec.Argv.Single());
         Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, bridgeExec.AgentOutputTransport);
@@ -898,6 +913,26 @@ public sealed class ClaudeAcpTransportTests
         Assert.Contains("\"method\":\"session/new\"", stdin);
         Assert.Contains("\"method\":\"session/prompt\"", stdin);
         Assert.DoesNotContain("\"method\":\"session/load\"", stdin);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_SendTurn_VerificationFailureDoesNotExecuteBridge()
+    {
+        var sandbox = new BridgeSandbox { FailBridgeVerification = true };
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-verify-failure");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+
+        Assert.Contains("verification failed", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(sandbox.BridgeVerificationExecs);
+        Assert.Empty(sandbox.BridgeExecs);
     }
 
     [Fact]
@@ -1366,8 +1401,13 @@ public sealed class ClaudeAcpTransportTests
         new byte[] { 0x7f, (byte)'E', (byte)'L', (byte)'F', 0x02, 0x01, 0x01, 0x00, 0xde, 0xad, 0xbe, 0xef };
 
     private static AcpClaudeTransport NewAcpTransportWithOverride(
-        AgentNetworkToleranceSnapshot? networkTolerance = null)
-        => new(networkTolerance) { BridgeBinaryOverride = TestBridgeBytes };
+        AgentNetworkToleranceSnapshot? networkTolerance = null,
+        string? bridgeInstallDirectory = null)
+        => new(networkTolerance)
+        {
+            BridgeBinaryOverride = TestBridgeBytes,
+            BridgeInstallDirectoryOverride = bridgeInstallDirectory,
+        };
 
     private static string PlaceholderResourcePath()
     {
@@ -1443,8 +1483,38 @@ public sealed class ClaudeAcpTransportTests
     private sealed class ExecutingMaterialiseSandbox : ISandbox
     {
         private readonly string _home;
+        private readonly string _binDir;
 
-        public ExecutingMaterialiseSandbox(string home) => _home = home;
+        public ExecutingMaterialiseSandbox(string home)
+        {
+            _home = home;
+            _binDir = Path.Combine(home, "fake-bin");
+            Directory.CreateDirectory(_binDir);
+            WriteExecutable("sudo", """
+#!/bin/sh
+if [ "$1" = "-n" ]; then shift; fi
+exec "$@"
+""");
+            WriteExecutable("install", """
+#!/bin/bash
+set -e
+args=()
+while (($#)); do
+  case "$1" in
+    -o|-g) shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+exec /usr/bin/install "${args[@]}"
+""");
+            WriteExecutable("stat", """
+#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u %g %a %F" ]; then
+  exec /usr/bin/stat -c "0 0 %a %F" "$3"
+fi
+exec /usr/bin/stat "$@"
+""");
+        }
 
         public string Id { get; } = "vm-materialise-" + Guid.NewGuid().ToString("N")[..8];
         public List<SandboxExec> AllExecs { get; } = new();
@@ -1466,6 +1536,7 @@ public sealed class ClaudeAcpTransportTests
             for (var i = 1; i < exec.Argv.Count; i++)
                 psi.ArgumentList.Add(exec.Argv[i]);
             psi.Environment["HOME"] = _home;
+            psi.Environment["PATH"] = _binDir + Path.PathSeparator + (psi.Environment["PATH"] ?? "/usr/bin:/bin");
 
             using var process = Process.Start(psi)
                 ?? throw new InvalidOperationException("Failed to start " + exec.Argv[0]);
@@ -1479,6 +1550,18 @@ public sealed class ClaudeAcpTransportTests
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
             return new SandboxExecResult(process.ExitCode, stdout, stderr);
+        }
+
+        private void WriteExecutable(string name, string contents)
+        {
+            var path = Path.Combine(_binDir, name);
+            File.WriteAllText(path, contents.Replace("\r\n", "\n", StringComparison.Ordinal));
+            if (OperatingSystem.IsLinux())
+            {
+                File.SetUnixFileMode(
+                    path,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
@@ -1588,10 +1671,12 @@ public sealed class ClaudeAcpTransportTests
         private readonly Queue<string[]> _bridgeOutputs = new();
         public List<SandboxExec> AllExecs { get; } = new();
         public List<SandboxExec> BridgeExecs { get; } = new();
+        public List<SandboxExec> BridgeVerificationExecs { get; } = new();
         public string Id { get; } = "vm-" + Guid.NewGuid().ToString("N")[..8];
 
         public bool FailMaterialise { get; set; }
-        public string MaterialiseStdout { get; set; } = "/home/test/.codeybox/claude-acp-bridge\n";
+        public bool FailBridgeVerification { get; set; }
+        public string MaterialiseStdout { get; set; } = AcpClaudeTransport.BridgeInstallPath + "\n";
         public int BridgeExitCode { get; set; }
         public string? SanitiserListsFile { get; set; }
         public bool SanitiserFailWrite { get; set; }
@@ -1611,6 +1696,14 @@ public sealed class ClaudeAcpTransportTests
                 if (FailMaterialise)
                     return Task.FromResult(new SandboxExecResult(1, "", "permission denied"));
                 return Task.FromResult(new SandboxExecResult(0, MaterialiseStdout, ""));
+            }
+
+            if (exec.Argv.Count >= 4 && exec.Argv[3] == "codeybox-acp-verify")
+            {
+                BridgeVerificationExecs.Add(exec);
+                return FailBridgeVerification
+                    ? Task.FromResult(new SandboxExecResult(1, "", "ACP bridge ownership/mode check failed"))
+                    : Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
             // Sanitiser discovery: `bash -c "...session_root..."` with no Stdin.
@@ -1692,7 +1785,7 @@ public sealed class ClaudeAcpTransportTests
                 && exec.Argv[1] == "-c"
                 && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
             {
-                return Task.FromResult(new SandboxExecResult(0, "/home/test/.codeybox/claude-acp-bridge\n", ""));
+                return Task.FromResult(new SandboxExecResult(0, AcpClaudeTransport.BridgeInstallPath + "\n", ""));
             }
             // Bridge invocation: direct exec of the resolved materialised path.
             if (exec.Argv.Count == 1 && exec.Argv[0].Contains("claude-acp-bridge", StringComparison.Ordinal))
