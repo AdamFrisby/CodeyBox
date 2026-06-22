@@ -977,6 +977,42 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_UsageOnlySuccessfulTurn_StillBuildsShimAndEmitsMetrics()
+    {
+        // A real ACP turn can finish with stopReason + usage but no
+        // session/update text chunk. Metrics still need the stream-json shim;
+        // returning the raw bridge envelopes would make ClaudeCostExtractor
+        // miss cache_read/cache_creation entirely.
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-usage-only\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":77,\"output_tokens\":9,\"cache_read_input_tokens\":1234,\"cache_creation_input_tokens\":456}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+
+        var sink = new RecordingMetricsSink();
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            metricsSink: sink,
+            options: new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp },
+            acpTransport: NewAcpTransportWithOverride());
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        var result = await worker.SendTurnAsync(handle, "first");
+
+        Assert.True(result.Success);
+        var rec = sink.Records.Single();
+        Assert.Equal("acp", rec.Transport);
+        Assert.Equal(77 + 456 + 1234, rec.InputTokens);
+        Assert.Equal(1234, rec.CachedInputTokens);
+        Assert.Equal(77 + 456, rec.FreshInputTokens);
+        Assert.Equal(456, rec.CacheCreationInputTokens);
+        Assert.Equal(9, rec.OutputTokens);
+    }
+
+    [Fact]
     public async Task AcpClaudeTransport_FatalEnvelope_SurfacesAsTransportUnavailable()
     {
         var sandbox = new BridgeSandbox();
@@ -996,6 +1032,30 @@ public sealed class ClaudeAcpTransportTests
             session.SendTurnAsync(
                 new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
                 CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_TurnTimeout_SurfacesAsTransportUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"turn_timeout\"}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-timeout-unavailable");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("timed out", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

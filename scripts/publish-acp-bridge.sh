@@ -126,161 +126,50 @@ else
     multipass exec "$VERIFY_VM" -- chmod 700 "$REMOTE"
     multipass exec "$VERIFY_VM" -- sh -c "cat > '$REMOTE_VERIFY'" <<'PY'
 #!/usr/bin/env python3
-import base64
-import hashlib
 import json
 import os
 import queue
-import socket
-import struct
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 
+SUCCESS_MARKER = "ACP bridge end-to-end verification passed"
+
+# Keep the shared prefix large and stable across the two turns so the provider
+# has something meaningful to write on turn 1 and read via session/load on turn
+# 2. The exact reply text is irrelevant; the verifier reads the usage buckets.
+CACHE_PROMPT_PREFIX = (
+    "CodeyBox ACP bridge cache verification context. "
+    "This paragraph is intentionally repetitive and stable across turns. "
+) * 1200
+
 
 def fail(message):
     raise AssertionError(message)
 
 
-def read_exact(sock, count):
-    chunks = []
-    remaining = count
-    while remaining:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise RuntimeError("socket closed while reading WebSocket frame")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+def require_claude_binary():
+    claude = shutil.which("claude")
+    if not claude:
+        fail("real claude binary not found on verification VM PATH")
 
-
-FAKE_CLAUDE = r'''#!/usr/bin/env python3
-import base64
-import hashlib
-import json
-import os
-import socket
-import struct
-import sys
-import time
-
-
-def read_exact(sock, count):
-    chunks = []
-    remaining = count
-    while remaining:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise RuntimeError("socket closed while reading WebSocket frame")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def recv_ws(sock):
-    first = read_exact(sock, 2)
-    length = first[1] & 0x7f
-    masked = (first[1] & 0x80) != 0
-    if length == 126:
-        length = struct.unpack("!H", read_exact(sock, 2))[0]
-    elif length == 127:
-        length = struct.unpack("!Q", read_exact(sock, 8))[0]
-    mask = read_exact(sock, 4) if masked else b""
-    payload = bytearray(read_exact(sock, length))
-    if masked:
-        for i in range(length):
-            payload[i] ^= mask[i % 4]
-    return payload.decode("utf-8")
-
-
-def send_ws(sock, payload):
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    mask = os.urandom(4)
-    if len(raw) < 126:
-        header = bytes([0x81, 0x80 | len(raw)])
-    elif len(raw) < 65536:
-        header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(raw))
-    else:
-        header = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", len(raw))
-    masked = bytes(raw[i] ^ mask[i % 4] for i in range(len(raw)))
-    sock.sendall(header + mask + masked)
-
-
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] != "--ide":
-        raise SystemExit("expected bridge to spawn claude with --ide")
-
-    lock_dir = os.environ["CODEYBOX_ACP_VERIFY_LOCK_DIR"]
-    marker_path = os.environ["CODEYBOX_ACP_VERIFY_MARKER"]
-    lock_path = None
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        candidates = [os.path.join(lock_dir, name) for name in os.listdir(lock_dir)] if os.path.isdir(lock_dir) else []
-        candidates = [path for path in candidates if path.endswith(".lock")]
-        if candidates:
-            lock_path = candidates[0]
-            break
-        time.sleep(0.05)
-    if lock_path is None:
-        raise SystemExit("bridge did not write an IDE lockfile")
-
-    with open(lock_path, "r", encoding="utf-8") as handle:
-        lockfile = json.load(handle)
-    url = lockfile["url"]
-    if not url.startswith("ws://127.0.0.1:"):
-        raise SystemExit("unexpected lockfile URL: " + url)
-    port = int(url.rsplit(":", 1)[1])
-    token = lockfile["authToken"]
-
-    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
-    sock.settimeout(10)
-    key = base64.b64encode(os.urandom(16)).decode("ascii")
-    request = (
-        "GET / HTTP/1.1\r\n"
-        "Host: 127.0.0.1:%d\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: %s\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "x-claude-code-ide-authorization: %s\r\n\r\n"
-    ) % (port, key, token)
-    sock.sendall(request.encode("ascii"))
-    response = b""
-    while b"\r\n\r\n" not in response:
-        response += sock.recv(4096)
-    if b"101 Switching Protocols" not in response:
-        raise SystemExit("WebSocket upgrade failed: " + response.decode("ascii", "replace"))
-
-    methods = []
-    while True:
-        incoming = json.loads(recv_ws(sock))
-        method = incoming.get("method")
-        methods.append(method)
-        request_id = incoming.get("id")
-        if request_id is None:
-            continue
-
-        if method == "initialize":
-            send_ws(sock, {"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": 1, "capabilities": {}}})
-        elif method == "session/new":
-            send_ws(sock, {"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "verify-session"}})
-        elif method == "session/load":
-            send_ws(sock, {"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "verify-session"}})
-        elif method == "session/prompt":
-            with open(marker_path, "w", encoding="utf-8") as handle:
-                json.dump({"argv": sys.argv[1:], "methods": methods, "lockPath": lock_path}, handle)
-            send_ws(sock, {"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
-            time.sleep(0.1)
-            return
-        else:
-            raise SystemExit("unexpected ACP method from bridge: " + str(method))
-
-
-if __name__ == "__main__":
-    main()
-'''
+    try:
+        version = subprocess.run(
+            [claude, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+    except Exception as ex:
+        fail("failed to execute real claude --version: %s" % ex)
+    if version.returncode != 0:
+        fail("real claude --version exited %d; stdout=%s stderr=%s" %
+             (version.returncode, version.stdout.strip(), version.stderr.strip()))
+    return claude
 
 
 def reader_thread(pipe, output, seen):
@@ -317,17 +206,72 @@ def write_envelope(proc, envelope):
     proc.stdin.flush()
 
 
-def run_turn(bridge_path, session_method):
+def iter_json_envelopes(lines):
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
+def extract_session_id(lines):
+    for env in iter_json_envelopes(lines):
+        if env.get("type") != "acp_recv":
+            continue
+        payload = env.get("payload") or {}
+        result = payload.get("result") or {}
+        session_id = result.get("sessionId") or result.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            return session_id
+    return None
+
+
+def extract_usage(lines):
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    for env in iter_json_envelopes(lines):
+        if env.get("type") != "acp_recv":
+            continue
+        payload = env.get("payload") or {}
+        candidates = []
+        result = payload.get("result")
+        if isinstance(result, dict):
+            candidates.append(result.get("usage"))
+        params = payload.get("params")
+        if isinstance(params, dict):
+            update = params.get("update")
+            if isinstance(update, dict):
+                candidates.append(update.get("usage"))
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for key in usage:
+                value = candidate.get(key)
+                if isinstance(value, int):
+                    usage[key] += value
+    return usage
+
+
+def sent_methods(lines):
+    methods = []
+    for env in iter_json_envelopes(lines):
+        if env.get("type") == "acp_sent":
+            methods.append(env.get("method"))
+    return methods
+
+
+def run_turn(bridge_path, claude_path, session_method, session_id, prompt):
     with tempfile.TemporaryDirectory(prefix="cb-acp-verify-") as tmp:
         work_dir = os.path.join(tmp, "work")
         lock_dir = os.path.join(tmp, "locks")
         os.mkdir(work_dir)
         os.mkdir(lock_dir)
-        marker = os.path.join(tmp, "fake-claude-marker.json")
-        fake_claude = os.path.join(tmp, "claude")
-        with open(fake_claude, "w", encoding="utf-8") as handle:
-            handle.write(FAKE_CLAUDE)
-        os.chmod(fake_claude, 0o700)
 
         proc = subprocess.Popen(
             [bridge_path],
@@ -349,29 +293,41 @@ def run_turn(bridge_path, session_method):
         stderr_reader.start()
 
         try:
+            turn_timeout = int(os.environ.get("CODEYBOX_ACP_BRIDGE_VERIFY_TURN_TIMEOUT_SECONDS", "240"))
+            claude_args = ["--dangerously-skip-permissions"]
+            model = os.environ.get("CODEYBOX_ACP_BRIDGE_VERIFY_MODEL")
+            if model:
+                claude_args.extend(["--model", model])
             write_envelope(proc, {
                 "type": "hello",
-                "claudeBinary": fake_claude,
+                "claudeBinary": claude_path,
+                "claudeArgs": claude_args,
                 "workingDirectory": work_dir,
                 "lockDir": lock_dir,
-                "turnTimeoutSeconds": 30,
-                "claudeEnv": {
-                    "CODEYBOX_ACP_VERIFY_LOCK_DIR": lock_dir,
-                    "CODEYBOX_ACP_VERIFY_MARKER": marker,
-                },
+                "turnTimeoutSeconds": turn_timeout,
             })
             ready = wait_for_type(seen, "ready", 15, stdout_lines)
             wait_for_type(seen, "peer_connected", 15, stdout_lines)
 
+            session_params = {"cwd": work_dir}
+            if session_method == "session/new":
+                session_params["mcpServers"] = []
+            elif session_method == "session/load":
+                if not session_id:
+                    fail("session/load verifier turn requires a session id")
+                session_params["sessionId"] = session_id
+            else:
+                fail("unexpected session method: " + session_method)
+
             frames = [
                 {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-                {"jsonrpc": "2.0", "id": 2, "method": session_method, "params": {"sessionId": "verify-session"}},
-                {"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"prompt": [{"type": "text", "text": "verify"}]}},
+                {"jsonrpc": "2.0", "id": 2, "method": session_method, "params": session_params},
+                {"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"prompt": [{"type": "text", "text": prompt}]}},
             ]
             for payload in frames:
                 write_envelope(proc, {"type": "acp_send", "payload": payload})
 
-            complete = wait_for_type(seen, "turn_complete", 20, stdout_lines)
+            complete = wait_for_type(seen, "turn_complete", turn_timeout + 30, stdout_lines)
             if complete.get("stopReason") != "end_turn":
                 fail("turn_complete stopReason drifted: " + json.dumps(complete))
 
@@ -388,28 +344,25 @@ def run_turn(bridge_path, session_method):
                 fail("bridge exited %d; stdout:\n%s\nstderr:\n%s" %
                      (code, "\n".join(stdout_lines), "\n".join(stderr_lines)))
 
-            if not os.path.exists(marker):
-                fail("fake claude did not record a completed ACP exchange; stdout:\n%s" % "\n".join(stdout_lines))
-            with open(marker, "r", encoding="utf-8") as handle:
-                marker_doc = json.load(handle)
-            if marker_doc["argv"][0] != "--ide":
-                fail("bridge did not spawn claude with --ide: " + json.dumps(marker_doc["argv"]))
-            for expected in ("initialize", session_method, "session/prompt"):
-                if expected not in marker_doc["methods"]:
-                    fail("fake claude did not receive %s; saw %s" % (expected, marker_doc["methods"]))
-
             lock_path = ready["lockPath"]
             if os.path.exists(lock_path):
                 fail("bridge left IDE lockfile behind: " + lock_path)
 
-            sent_methods = [
-                env.get("method") for env in
-                (json.loads(line) for line in stdout_lines if line.startswith("{"))
-                if env.get("type") == "acp_sent"
-            ]
+            observed_sent_methods = sent_methods(stdout_lines)
             for expected in ("initialize", session_method, "session/prompt"):
-                if expected not in sent_methods:
-                    fail("bridge did not emit acp_sent for %s; saw %s" % (expected, sent_methods))
+                if expected not in observed_sent_methods:
+                    fail("bridge did not emit acp_sent for %s; saw %s" % (expected, observed_sent_methods))
+
+            observed_session_id = extract_session_id(stdout_lines)
+            if not observed_session_id:
+                fail("bridge did not surface an ACP session id during %s; stdout:\n%s" %
+                     (session_method, "\n".join(stdout_lines)))
+            return {
+                "session_id": observed_session_id,
+                "usage": extract_usage(stdout_lines),
+                "stdout": stdout_lines,
+                "stderr": stderr_lines,
+            }
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -419,14 +372,34 @@ def main():
     if len(sys.argv) != 2:
         fail("usage: verify-acp-bridge.py /path/to/acp-bridge")
     bridge_path = sys.argv[1]
-    with open(bridge_path, "rb") as handle:
-        magic = handle.read(4)
-    if magic != b"\x7fELF":
-        fail("published bridge is not an ELF binary")
+    claude_path = require_claude_binary()
+    first = run_turn(
+        bridge_path,
+        claude_path,
+        "session/new",
+        None,
+        CACHE_PROMPT_PREFIX + "\nTurn 1: reply briefly with codeybox-acp-verify.",
+    )
+    second = run_turn(
+        bridge_path,
+        claude_path,
+        "session/load",
+        first["session_id"],
+        CACHE_PROMPT_PREFIX + "\nTurn 2: reply briefly with codeybox-acp-verify.",
+    )
 
-    run_turn(bridge_path, "session/new")
-    run_turn(bridge_path, "session/load")
-    print("ACP bridge end-to-end verification passed: lockfile, WebSocket, claude --ide spawn, session/new, and session/load.")
+    first_usage = first["usage"]
+    second_usage = second["usage"]
+    if first_usage["cache_creation_input_tokens"] <= 0:
+        fail("cold ACP turn did not report cache_creation_input_tokens > 0; usage=%s" % first_usage)
+    if second_usage["cache_read_input_tokens"] <= 0:
+        fail("session/load ACP turn did not report cache_read_input_tokens > 0; usage=%s" % second_usage)
+    if (second_usage["cache_creation_input_tokens"] > 0
+            and second_usage["cache_creation_input_tokens"] >= first_usage["cache_creation_input_tokens"]):
+        fail("session/load appears to rebuild the cache instead of reading it; first=%s second=%s" %
+             (first_usage, second_usage))
+
+    print(SUCCESS_MARKER + ": real claude --ide lockfile discovery, session/new, session/load, and cache_read continuity.")
 
 
 if __name__ == "__main__":

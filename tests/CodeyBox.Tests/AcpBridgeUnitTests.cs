@@ -2902,7 +2902,61 @@ for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
 printf '\n' >> "$CALL_LOG"
 publish_dir="src/CodeyBox.Agents.Claude.AcpBridge/bin/Release/net10.0/linux-musl-x64/publish"
 mkdir -p "$publish_dir"
-printf '#!/bin/sh\nexit 0\n' > "$publish_dir/CodeyBox.Agents.Claude.AcpBridge"
+cat > "$publish_dir/CodeyBox.Agents.Claude.AcpBridge" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import sys
+
+lock_path = None
+session_method = None
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":")), flush=True)
+
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    envelope = json.loads(raw)
+    kind = envelope.get("type")
+    if kind == "hello":
+        lock_dir = envelope["lockDir"]
+        os.makedirs(lock_dir, exist_ok=True)
+        lock_path = os.path.join(lock_dir, "40123.lock")
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "pid": os.getpid(),
+                "workspaceFolders": [envelope["workingDirectory"]],
+                "ideName": "CodeyBox",
+                "transport": "ws",
+                "runningInWindows": False,
+                "authToken": "test-token",
+                "url": "ws://127.0.0.1:40123",
+            }, handle)
+        emit({"type": "bridge_started", "pid": os.getpid()})
+        emit({"type": "ready", "port": 40123, "lockPath": lock_path})
+        emit({"type": "peer_connected"})
+    elif kind == "acp_send":
+        payload = envelope["payload"]
+        method = payload.get("method")
+        emit({"type": "acp_sent", "id": payload.get("id"), "method": method})
+        if method in ("session/new", "session/load"):
+            session_method = method
+            session_id = payload.get("params", {}).get("sessionId") or "verify-session"
+            emit({"type": "acp_recv", "payload": {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"sessionId": session_id}}})
+        elif method == "session/prompt":
+            usage = {
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "cache_read_input_tokens": 2048 if session_method == "session/load" else 0,
+                "cache_creation_input_tokens": 0 if session_method == "session/load" else 2048,
+            }
+            emit({"type": "acp_recv", "payload": {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"stopReason": "end_turn", "usage": usage}}})
+            emit({"type": "turn_complete", "stopReason": "end_turn"})
+            if lock_path and os.path.exists(lock_path):
+                os.remove(lock_path)
+            sys.exit(0)
+PY
 chmod 755 "$publish_dir/CodeyBox.Agents.Claude.AcpBridge"
 """);
         WriteExecutable(Path.Combine(toolsDir, "ldd"), """
@@ -2911,7 +2965,20 @@ set -euo pipefail
 printf 'ldd' >> "$CALL_LOG"
 for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
 printf '\n' >> "$CALL_LOG"
-echo "not a dynamic executable"
+echo "${CODEYBOX_TEST_LDD_OUT:-not a dynamic executable}"
+""");
+        WriteExecutable(Path.Combine(toolsDir, "claude"), """
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'claude' >> "$CALL_LOG"
+for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
+printf '\n' >> "$CALL_LOG"
+if [ "${1:-}" = "--version" ]; then
+    echo "claude test-double version"
+    exit 0
+fi
+echo "unit-test claude stub should only be used for --version" >&2
+exit 2
 """);
         WriteExecutable(Path.Combine(toolsDir, "multipass"), """
 #!/usr/bin/env bash
@@ -2924,27 +2991,45 @@ if [ "$#" -ge 1 ] && [ "$1" = "start" ]; then
     exit 0
 fi
 if [ "$#" -ge 1 ] && [ "$1" = "transfer" ]; then
+    src="$2"
+    remote="${3#*:}"
+    mkdir -p "$(dirname "$remote")"
+    cp "$src" "$remote"
     exit 0
 fi
 if [ "$#" -ge 4 ] && [ "$1" = "exec" ]; then
     shift 3
     case "$1" in
         mktemp)
-            echo "/tmp/codeybox-acp-bridge-verify.stub"
+            mkdir -p "$CODEYBOX_TEST_VM_ROOT"
+            mktemp -d "$CODEYBOX_TEST_VM_ROOT/codeybox-acp-bridge-verify.XXXXXX"
             exit 0
             ;;
         chmod)
+            "$@"
             exit 0
             ;;
         sh)
-            cat >/dev/null
+            script="$3"
+            target="${script#*cat > \'}"
+            target="${target%%\'*}"
+            cat > "$target"
             exit 0
             ;;
         python3)
-            echo "ACP bridge end-to-end verification passed: stub"
-            exit 0
+            if [ "${CODEYBOX_TEST_MULTIPASS_PYTHON_EXIT:-0}" != "0" ]; then
+                echo "simulated verifier failure"
+                exit "$CODEYBOX_TEST_MULTIPASS_PYTHON_EXIT"
+            fi
+            if [ "${CODEYBOX_TEST_MULTIPASS_PYTHON_NO_SUCCESS:-0}" = "1" ]; then
+                echo "verifier finished without marker"
+                exit 0
+            fi
+            "$@"
+            exit $?
             ;;
         rm)
+            "$@"
             exit 0
             ;;
     esac
@@ -2968,7 +3053,56 @@ exit 9
         {
             ["PATH"] = toolsDir + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
             ["CALL_LOG"] = callLog,
+            ["CODEYBOX_TEST_VM_ROOT"] = Path.Combine(Path.GetDirectoryName(callLog)!, "vm"),
         };
+    }
+
+    private static string CreateToolPathWithoutMultipass(PublishScriptFixture fixture)
+    {
+        var tools = Path.Combine(fixture.TempRoot, "tools-no-multipass");
+        Directory.CreateDirectory(tools);
+
+        foreach (var name in new[] { "dotnet", "ldd", "claude" })
+        {
+            var source = Path.Combine(fixture.ToolsDir, name);
+            var dest = Path.Combine(tools, name);
+            File.Copy(source, dest, overwrite: true);
+            MakeExecutable(dest);
+        }
+
+        foreach (var name in new[] { "bash", "dirname", "mkdir", "rm", "cp", "chmod", "ls", "file", "mktemp", "cat" })
+        {
+            var source = RequireExecutableOnPath(name);
+            var dest = Path.Combine(tools, name);
+            TryLinkOrCopyExecutable(source, dest);
+        }
+
+        return tools;
+    }
+
+    private static string RequireExecutableOnPath(string name)
+    {
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(dir, name);
+            if (File.Exists(candidate))
+                return candidate;
+        }
+        throw new InvalidOperationException("Required test tool not found on PATH: " + name);
+    }
+
+    private static void TryLinkOrCopyExecutable(string source, string dest)
+    {
+        try
+        {
+            File.CreateSymbolicLink(dest, source);
+        }
+        catch
+        {
+            File.Copy(source, dest, overwrite: true);
+            MakeExecutable(dest);
+        }
     }
 
     private static void WriteExecutable(string path, string contents)
@@ -3130,7 +3264,127 @@ exit 9
             Assert.Contains("multipass start cb-baseline-test", calls, StringComparison.Ordinal);
             Assert.Contains("multipass transfer", calls, StringComparison.Ordinal);
             Assert.Contains("multipass exec cb-baseline-test -- python3", calls, StringComparison.Ordinal);
+            Assert.Contains("claude --version", calls, StringComparison.Ordinal);
             Assert.DoesNotContain("multipass launch", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_RejectsDynamicallyLinkedCandidateBeforeRefreshingResource()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_TEST_LDD_OUT"] = "\tlinux-vdso.so.1 (0x00007ffc00000000)\n\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6";
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath, "--skip-multipass-verify"], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("published binary appears dynamically linked", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath),
+                "A dynamically linked candidate must not replace the embedded bridge resource.");
+
+            var calls = File.ReadAllText(fixture.CallLog);
+            Assert.Contains("ldd", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_RequiresMultipassWhenVmVerificationIsNotSkipped()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var toolsWithoutMultipass = CreateToolPathWithoutMultipass(fixture);
+            var env = PublishScriptEnv(toolsWithoutMultipass, fixture.CallLog);
+            env["PATH"] = toolsWithoutMultipass;
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("multipass is required", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath));
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_RequiresVerifyVmWhenVmVerificationIsNotSkipped()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("CODEYBOX_ACP_BRIDGE_VERIFY_VM must name", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath));
+
+            var calls = File.ReadAllText(fixture.CallLog);
+            Assert.Contains("ldd", calls, StringComparison.Ordinal);
+            Assert.DoesNotContain("multipass start", calls, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_VerifierNonZeroExitDoesNotRefreshResource()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+            env["CODEYBOX_TEST_MULTIPASS_PYTHON_EXIT"] = "7";
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("ACP bridge end-to-end verification failed", run.Stderr, StringComparison.Ordinal);
+            Assert.Contains("simulated verifier failure", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath));
+        }
+        finally
+        {
+            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AcpBridge_PublishScript_VerifierMissingSuccessMarkerDoesNotRefreshResource()
+    {
+        var fixture = CreatePublishScriptFixture();
+        try
+        {
+            var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
+            env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
+            env["CODEYBOX_TEST_MULTIPASS_PYTHON_NO_SUCCESS"] = "1";
+
+            var run = await RunProcessAsync("/bin/sh", [fixture.ScriptPath], env);
+
+            Assert.NotEqual(0, run.ExitCode);
+            Assert.Contains("ACP bridge verifier did not report success", run.Stderr, StringComparison.Ordinal);
+            Assert.Contains("verifier finished without marker", run.Stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(fixture.ResourcePath));
         }
         finally
         {

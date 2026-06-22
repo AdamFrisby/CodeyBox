@@ -28,7 +28,9 @@ internal sealed class Bridge : IAsyncDisposable
     // when both the stdin pump and the accept handler call DrainPending
     // concurrently.
     private readonly object _pendingLock = new();
+    private readonly object _clientTaskLock = new();
     private readonly Queue<string> _pendingPayloads = new();
+    private readonly List<Task> _clientHandlerTasks = new();
     private readonly Stream? _stdinOverride;
 
     private BridgeConfig _config = BridgeConfig.Default;
@@ -228,7 +230,11 @@ internal sealed class Bridge : IAsyncDisposable
             catch (ObjectDisposedException) { return; }
             catch (SocketException) { return; }
 
-            _ = Task.Run(() => HandleClientAsync(client, ct));
+            var handlerTask = Task.Run(() => HandleClientAsync(client, ct));
+            lock (_clientTaskLock)
+            {
+                _clientHandlerTasks.Add(handlerTask);
+            }
         }
     }
 
@@ -829,6 +835,16 @@ internal sealed class Bridge : IAsyncDisposable
         if (_acceptLoopTask is not null)
         {
             try { await _acceptLoopTask.ConfigureAwait(false); }
+            catch { }
+        }
+        Task[] clientHandlers;
+        lock (_clientTaskLock)
+        {
+            clientHandlers = _clientHandlerTasks.ToArray();
+        }
+        foreach (var handler in clientHandlers)
+        {
+            try { await handler.ConfigureAwait(false); }
             catch { }
         }
         if (_peerReceiveTask is not null)

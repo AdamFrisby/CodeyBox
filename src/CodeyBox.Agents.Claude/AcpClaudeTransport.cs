@@ -242,6 +242,14 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                     $"ACP bridge exited {exec_result.ExitCode} without reporting a turn outcome: stderr={exec_result.Stderr}");
             }
 
+            if (observed.TurnError is null && observed.Complete is null)
+            {
+                var reason = observed.TimedOut
+                    ? $"ACP bridge timed out without reporting a turn outcome within {turnTimeoutSeconds}s"
+                    : "ACP bridge exited without reporting a turn outcome";
+                throw new AcpTransportUnavailableException(reason);
+            }
+
             var agentSuccess = observed.TurnError is null && observed.Complete is not null;
             var summary = agentSuccess
                 ? "ok"
@@ -249,7 +257,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                     ? $"acp turn error: {te.Message ?? "unknown"}"
                     : $"acp turn timed out (no stopReason within {turnTimeoutSeconds}s)";
 
-            var stdoutForExtractor = observed.AssistantText.Length > 0
+            var stdoutForExtractor = agentSuccess
                 ? BuildStreamJsonShimForExtractor(observed)
                 : combinedStdout;
 
@@ -286,7 +294,15 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                     var retryStdout = stdoutBuf.Length > 0 ? stdoutBuf.ToString() : retryResult.Stdout ?? string.Empty;
                     var retryObserved = ObserveBridgeOutput(retryStdout);
                     var retrySuccess = retryObserved.TurnError is null && retryObserved.Complete is not null;
-                    var retryShim = retryObserved.AssistantText.Length > 0
+                    if (retryObserved.TurnError is null && retryObserved.Complete is null)
+                    {
+                        var reason = retryObserved.TimedOut
+                            ? $"ACP bridge timed out without reporting a turn outcome within {turnTimeoutSeconds}s on retry"
+                            : "ACP bridge exited without reporting a turn outcome on retry";
+                        throw new AcpTransportUnavailableException(reason);
+                    }
+
+                    var retryShim = retrySuccess
                         ? BuildStreamJsonShimForExtractor(retryObserved)
                         : retryStdout;
                     result = new AgentResult(
