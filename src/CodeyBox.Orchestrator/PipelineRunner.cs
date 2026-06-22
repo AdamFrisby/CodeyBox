@@ -10923,7 +10923,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private static async Task FinalizeConflictResolutionAsync(
+    internal static async Task FinalizeConflictResolutionAsync(
         ISandbox sandbox,
         IReadOnlyList<ConflictHunk> conflictHunks,
         string workBranch,
@@ -10938,14 +10938,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
             await RunWithCancellation(sandbox, ct, addArgv.ToArray());
         }
 
-        var unmerged = await sandbox.ExecAsync(new SandboxExec
+        IReadOnlyList<string> remainingUnmergedPaths;
+        try
         {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--name-only", "--diff-filter=U"],
-        }, ct);
-        if (!unmerged.Success)
-            throw new InvalidOperationException($"failed to inspect unmerged paths: {unmerged.Stderr}");
-        if (!string.IsNullOrWhiteSpace(unmerged.Stdout))
-            throw new InvalidOperationException($"merge resolver left unmerged paths:\n{unmerged.Stdout}");
+            remainingUnmergedPaths = await MergeConflictPathInspector.ListUnmergedPathsAsync(
+                sandbox,
+                SandboxConventions.WorkDir,
+                ct);
+        }
+        catch (MergeConflictResolutionFailedException ex)
+        {
+            throw new InvalidOperationException(ex.Message, ex);
+        }
+
+        if (remainingUnmergedPaths.Count > 0)
+            throw new InvalidOperationException(
+                "merge resolver left unmerged paths:\n" + string.Join('\n', remainingUnmergedPaths));
 
         if (files.Length > 0)
         {
@@ -12026,8 +12034,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             outcome = await RunConflictReworkAgentAsync(
                 item, project, runner, repoId, baseBranch, workBranch,
-                priorWorkTip, baseTip, conflictFiles, originalFailure,
-                ct, hostShutdownToken);
+                priorWorkTip, originalFailure, ct, hostShutdownToken);
         }
         catch (TerminalTransientNetworkError ex)
         {
@@ -12185,8 +12192,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string baseBranch,
         string workBranch,
         string priorWorkTip,
-        string baseTip,
-        IReadOnlyList<string> conflictFiles,
         MergeConflictResolutionFailedException originalFailure,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
@@ -12257,11 +12262,33 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     FilesChanged: null, Insertions: null, Deletions: null);
             }
 
-            // Collect the actual sandbox-side conflict file list (more reliable
-            // than the host's pre-merge probe). Fall back to the caller's list
-            // when git ls-files is empty or unreadable.
-            var sandboxConflictFiles = await ListSandboxConflictFilesAsync(sandbox, conflictFiles, ct);
-            if (sandboxConflictFiles.Count == 0) sandboxConflictFiles = conflictFiles;
+            // Collect the actual sandbox-side conflict file list from git's
+            // unmerged index entries. Do not fall back to the merge-phase error
+            // string: that text is telemetry, not a safe path source.
+            IReadOnlyList<string> sandboxConflictFiles;
+            try
+            {
+                sandboxConflictFiles = await ListSandboxConflictFilesAsync(sandbox, ct);
+            }
+            catch (MergeConflictResolutionFailedException ex)
+            {
+                return new ConflictReworkAgentOutcome(
+                    AgentSucceeded: false,
+                    NewTip: null,
+                    FailureReason: $"could not inspect sandbox conflict files: {ex.Message}",
+                    SemanticIncompatibleReason: null,
+                    FilesChanged: null, Insertions: null, Deletions: null);
+            }
+
+            if (sandboxConflictFiles.Count == 0)
+            {
+                return new ConflictReworkAgentOutcome(
+                    AgentSucceeded: false,
+                    NewTip: null,
+                    FailureReason: "rebase failed but git ls-files reported no unmerged paths",
+                    SemanticIncompatibleReason: null,
+                    FilesChanged: null, Insertions: null, Deletions: null);
+            }
 
             var prompt = BuildConflictReworkPrompt(
                 item.Prompt, baseBranch, workBranch, sandboxConflictFiles, originalFailure.Message);
@@ -12600,12 +12627,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Best-effort parse of the conflict-file list from
-    /// <see cref="MergeConflictResolutionFailedException.Message"/>. The
-    /// merge-phase failure message contains
-    /// <c>"... conflicts in &lt;file&gt;, &lt;file&gt;"</c>; we split on commas
-    /// and clean trailing punctuation. The agent gets a sandbox-side
-    /// re-derivation anyway, so this is only used for the started-event
-    /// payload and for telemetry.
+    /// <see cref="MergeConflictResolutionFailedException.Message"/> for the
+    /// operator-facing started-event payload. Rework prompts must use the
+    /// sandbox-side git index enumeration instead.
     /// </summary>
     private static IReadOnlyList<string> ExtractConflictFilesFromMessage(string message)
     {
@@ -12624,17 +12648,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private static async Task<IReadOnlyList<string>> ListSandboxConflictFilesAsync(
         ISandbox sandbox,
-        IReadOnlyList<string> fallbackConflictFiles,
         CancellationToken ct)
     {
-        try
-        {
-            return await MergeConflictPathInspector.ListUnmergedPathsAsync(sandbox, SandboxConventions.WorkDir, ct);
-        }
-        catch (MergeConflictResolutionFailedException) when (fallbackConflictFiles.Count > 0)
-        {
-            return fallbackConflictFiles;
-        }
+        return await MergeConflictPathInspector.ListUnmergedPathsAsync(sandbox, SandboxConventions.WorkDir, ct);
     }
 
     /// <summary>

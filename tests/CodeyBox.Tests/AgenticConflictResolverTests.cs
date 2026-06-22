@@ -891,6 +891,28 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task FinalizeConflictResolutionAsync_UsesLsFilesInspectorInsteadOfRawDiffStdout()
+    {
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, "resolved content\n");
+        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(
+            0,
+            "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner>  " + path + "\n",
+            ""));
+
+        await PipelineRunner.FinalizeConflictResolutionAsync(
+            sandbox,
+            [new ConflictHunk(path, StartLine: 1, EndLine: 3)],
+            "codeybox/work",
+            "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            CancellationToken.None);
+
+        Assert.Equal(0, sandbox.DiffCallCount);
+        Assert.Equal(1, sandbox.LsFilesCallCount);
+    }
+
+    [Fact]
     public void ParseUnmergedPathsFromLsFilesStdout_IgnoresPrefixedMultipassStartupNoise()
     {
         const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
@@ -1143,6 +1165,8 @@ public sealed class AgenticConflictResolverTests
         public Queue<SandboxExecResult?> DiffResponseQueue { get; } = new();
         public Queue<SandboxExecResult?> LsFilesResponseQueue { get; } = new();
         public Queue<SandboxExecResult?> GrepResponseQueue { get; } = new();
+        public int DiffCallCount { get; private set; }
+        public int LsFilesCallCount { get; private set; }
 
         public void AddConflictedFile(string relativePath, string content)
         {
@@ -1180,6 +1204,7 @@ public sealed class AgenticConflictResolverTests
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "ls-files"
                 && argv.Contains("-u"))
             {
+                LsFilesCallCount++;
                 if (!argv.Contains("-z"))
                     return Task.FromResult(new SandboxExecResult(
                         129,
@@ -1197,6 +1222,7 @@ public sealed class AgenticConflictResolverTests
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "diff"
                 && argv.Contains("--diff-filter=U"))
             {
+                DiffCallCount++;
                 if (DiffResponseQueue.TryDequeue(out var queued) && queued is not null)
                     return Task.FromResult(queued);
                 var listed = string.Join('\n', _unmerged.Order(StringComparer.Ordinal));
