@@ -164,7 +164,11 @@ public sealed record AgenticConflictCandidatesResult(
 public sealed class AgenticConflictResolver
 {
     private static readonly Regex LsFilesUnmergedRecord = new(
-        @"[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t(?<path>[^\0]+)",
+        @"\A[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t(?<path>[^\0]+)\z",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex LsFilesUnmergedRecordStart = new(
+        @"[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly AgenticConflictResolverOptionsSnapshot _options;
@@ -580,17 +584,28 @@ public sealed class AgenticConflictResolver
             return [];
 
         return stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries)
-            .Select(static segment => LsFilesUnmergedRecord.Match(segment))
-            .Where(static match => match.Success)
+            .Select(static segment => MatchLsFilesUnmergedRecord(segment))
+            .Where(static match => match is not null)
             .Select(static match =>
             {
-                var path = match.Groups["path"].Value;
+                var path = match!.Groups["path"].Value;
                 ValidateRelativeWorkPath(path);
                 return path;
             })
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToList();
+    }
+
+    private static Match? MatchLsFilesUnmergedRecord(string segment)
+    {
+        var start = LsFilesUnmergedRecordStart.Match(segment);
+        if (!start.Success)
+            return null;
+
+        var record = start.Index == 0 ? segment : segment[start.Index..];
+        var match = LsFilesUnmergedRecord.Match(record);
+        return match.Success ? match : null;
     }
 
     /// <summary>

@@ -1264,7 +1264,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // Prune completed tasks on every iteration to prevent unbounded growth.
                 inFlight.RemoveAll(t => t.IsCompleted);
 
-                break;
+                // One dispatch signal means "the durable queue may have work",
+                // not "spawn exactly one worker". Keep filling any immediately
+                // free slots from the store-backed pickup query so a lost or
+                // consumed wake cannot leave ready backlog idle behind an open
+                // worker slot.
+                blockForFirstSlot = false;
             }
         }
 
