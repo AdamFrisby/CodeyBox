@@ -6079,7 +6079,13 @@ while True:
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");
+        sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
+        sb.AppendLine("        break");
+        sb.AppendLine("    fi");
         sb.AppendLine("    if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
+        sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
+        sb.AppendLine("            break");
+        sb.AppendLine("        fi");
         sb.AppendLine("        set +e");
         sb.AppendLine("        wait \"$codeybox_detached_pid\"");
         sb.AppendLine("        codeybox_child_rc=$?");
