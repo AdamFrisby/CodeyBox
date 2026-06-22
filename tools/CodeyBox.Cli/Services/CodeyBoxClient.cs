@@ -12,6 +12,8 @@ internal sealed class CodeyBoxApiException(int statusCode, string body)
 
 internal sealed class CodeyBoxClient
 {
+    internal static TimeSpan SseResponseHeaderTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
     private readonly HttpClient _http;
     private readonly HttpClient? _sseHttp;
     private readonly ResolvedConfig? _lazySseConfig;
@@ -23,6 +25,9 @@ internal sealed class CodeyBoxClient
 
     internal CodeyBoxClient(HttpClient http, HttpClient sseHttp)
         : this(http, sseHttp, lazySseConfig: null, config: null) { }
+
+    internal CodeyBoxClient(HttpClient http, HttpClient sseHttp, ResolvedConfig config)
+        : this(http, sseHttp, lazySseConfig: null, config: config) { }
 
     internal CodeyBoxClient(HttpClient http, ResolvedConfig config)
         : this(http, sseHttp: null, lazySseConfig: null, config: config) { }
@@ -97,8 +102,23 @@ internal sealed class CodeyBoxClient
         Action<string> onStateTransition,
         CancellationToken ct = default)
     {
-        var watcher = new WorkItemSseWatcher(GetSseHttp());
+        var watcher = _config is null
+            ? new WorkItemSseWatcher(GetSseHttp())
+            : new WorkItemSseWatcher(SendSseRequestAsync);
         return await watcher.WatchAsync(id, onStateTransition, ct);
+    }
+
+    private async Task<HttpResponseMessage> SendSseRequestAsync(
+        HttpRequestMessage request,
+        CancellationToken ct)
+    {
+        using var headerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        headerCts.CancelAfter(SseResponseHeaderTimeout);
+
+        return await SendAsync(
+            token => GetSseHttp().SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token),
+            headerCts.Token,
+            ct);
     }
 
     private HttpClient GetSseHttp()
@@ -246,11 +266,17 @@ internal sealed class CodeyBoxClient
 
     private async Task<HttpResponseMessage> SendAsync(
         Func<CancellationToken, Task<HttpResponseMessage>> send,
-        CancellationToken ct)
+        CancellationToken ct) =>
+        await SendAsync(send, ct, ct);
+
+    private async Task<HttpResponseMessage> SendAsync(
+        Func<CancellationToken, Task<HttpResponseMessage>> send,
+        CancellationToken sendCt,
+        CancellationToken callerCt)
     {
         try
         {
-            return await send(ct);
+            return await send(sendCt);
         }
         catch (HttpRequestException ex) when (_config is not null)
         {
@@ -258,7 +284,7 @@ internal sealed class CodeyBoxClient
                 CliConnectionDiagnostics.FormatConnectionFailure(_config, ex),
                 ex);
         }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && _config is not null)
+        catch (OperationCanceledException ex) when (!callerCt.IsCancellationRequested && _config is not null)
         {
             throw new CodeyBoxConnectionException(
                 CliConnectionDiagnostics.FormatConnectionFailure(_config, ex),

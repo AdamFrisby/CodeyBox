@@ -189,6 +189,40 @@ public sealed class ErrorOutputTests
     }
 
     [Fact]
+    public async Task Error_TaskCanceledTimeout_PrintsTimeoutDiagnostics()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        var url = "http://127.0.0.1:5036";
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["--api-url", url, "queue", "ls"],
+                MakeThrowingDiagnosticFactory(new TaskCanceledException("request timed out")));
+
+            var error = output.Error.ToString();
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains($"Resolved API base URL: {url}", error);
+            Assert.Contains("Source: --api-url flag.", error);
+            Assert.Contains("Cause: timeout", error);
+            Assert.Contains("Underlying error: request timed out", error);
+            Assert.DoesNotContain("Unexpected error", error);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void CodeyBoxHttpFactory_UsesShortConnectTimeout()
     {
         var config = new ResolvedConfig
@@ -240,6 +274,7 @@ public sealed class ErrorOutputTests
     [Theory]
     [InlineData("   ", "value is empty")]
     [InlineData("http://:5036", "value is not an absolute URI")]
+    [InlineData("localhost:5036", "scheme must be http or https")]
     [InlineData("ftp://127.0.0.1:5036", "scheme must be http or https")]
     public async Task Error_MalformedApiBaseUrl_PrintsActionableMessageForValidationBranches(
         string apiBaseUrl,
@@ -263,6 +298,7 @@ public sealed class ErrorOutputTests
             Assert.Contains($"Cause: {expectedCause}", error);
             AssertFullApiBaseUrlPrecedence(error, tempDir);
             Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
+            Assert.DoesNotContain("localhost://", error);
         }
         finally
         {
@@ -504,6 +540,7 @@ public sealed class ErrorOutputTests
         yield return new object[] { new[] { "queue", "add", "--project", "proj", "--title", "Title", "--prompt", "Prompt" } };
         yield return new object[] { new[] { "queue", "template", "checks", "--project", "proj" } };
         yield return new object[] { new[] { "queue", "retry", "some-id" } };
+        yield return new object[] { new[] { "queue", "retry", "some-id", "--from", "audit" } };
         yield return new object[] { new[] { "queue", "abandon", "some-id" } };
         yield return new object[] { new[] { "queue", "pause", "--reason", "maintenance" } };
         yield return new object[] { new[] { "queue", "resume" } };
@@ -568,6 +605,58 @@ public sealed class ErrorOutputTests
         }
         finally
         {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Error_WatchSseResponseHeaderTimeout_PrintsDiagnosticsWithoutPollingFallback()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        var url = "http://127.0.0.1:5036";
+        var originalTimeout = CodeyBoxClient.SseResponseHeaderTimeout;
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+
+        using var output = new TestOutput();
+        try
+        {
+            CodeyBoxClient.SseResponseHeaderTimeout = TimeSpan.FromMilliseconds(50);
+            var code = await CliApp.InvokeAsync(
+                ["--api-url", url, "queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                config =>
+                {
+                    var baseUri = new Uri(config.ApiBaseUrl);
+                    var http = new HttpClient(new FakeHttpMessageHandler(_ => SampleData.WorkItemResponse()))
+                    {
+                        BaseAddress = baseUri,
+                        Timeout = TimeSpan.FromSeconds(30),
+                    };
+                    var sse = new HttpClient(new SseTestHttp.NeverCompletesHandler())
+                    {
+                        BaseAddress = baseUri,
+                        Timeout = Timeout.InfiniteTimeSpan,
+                    };
+                    return new CodeyBoxClient(http, sse, config);
+                });
+
+            var error = output.Error.ToString();
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Connection error: Could not connect to the CodeyBox API.", error);
+            Assert.Contains($"Resolved API base URL: {url}", error);
+            Assert.Contains("Source: --api-url flag.", error);
+            Assert.Contains("Cause: timeout", error);
+            Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
+            Assert.DoesNotContain("SSE unavailable", error);
+        }
+        finally
+        {
+            CodeyBoxClient.SseResponseHeaderTimeout = originalTimeout;
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);

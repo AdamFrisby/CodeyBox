@@ -13,9 +13,20 @@ internal sealed class WorkItemSseWatcher
     internal const int MaxDataPayloadBytes = 64 * 1024;
     internal const int MaxSseLineChars = 256 * 1024;
 
-    private readonly HttpClient _sseHttp;
+    private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _sendAsync;
 
-    internal WorkItemSseWatcher(HttpClient sseHttp) => _sseHttp = sseHttp;
+    internal WorkItemSseWatcher(HttpClient sseHttp)
+        : this(
+            (request, ct) => sseHttp.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                ct)) { }
+
+    internal WorkItemSseWatcher(
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> sendAsync)
+    {
+        _sendAsync = sendAsync;
+    }
 
     internal async Task<SseWatchResult> WatchAsync(
         string id,
@@ -29,7 +40,11 @@ internal sealed class WorkItemSseWatcher
         HttpResponseMessage resp;
         try
         {
-            resp = await _sseHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            resp = await _sendAsync(req, ct);
+        }
+        catch (CodeyBoxConnectionException)
+        {
+            throw;
         }
         catch (HttpRequestException)
         {

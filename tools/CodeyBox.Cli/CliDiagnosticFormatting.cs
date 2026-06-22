@@ -5,8 +5,12 @@ internal static class CliDiagnosticFormatting
     internal static string FormatApiBaseUrlForDiagnostics(string value)
     {
         var sanitized = SanitizeDiagnosticText(value);
-        if (Uri.TryCreate(sanitized, UriKind.Absolute, out var uri))
+        if (Uri.TryCreate(sanitized, UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            && !string.IsNullOrEmpty(uri.Host))
+        {
             return FormatParsedUriForDiagnostics(uri);
+        }
 
         return RedactUrlLikeText(sanitized);
     }
