@@ -23,7 +23,7 @@ internal static class SseTestHttp
                 BaseAddress = baseUri,
                 Timeout = sseTimeout ?? Timeout.InfiniteTimeSpan,
             };
-            return new CodeyBoxClient(http, sse);
+            return new CodeyBoxClient(http, sse, config);
         };
     }
 

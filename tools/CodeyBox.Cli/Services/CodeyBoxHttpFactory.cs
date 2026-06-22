@@ -6,9 +6,15 @@ internal static class CodeyBoxHttpFactory
 {
     internal static HttpClient CreateClient(ResolvedConfig config, TimeSpan timeout)
     {
-        var http = new HttpClient
+        var baseUri = ApiBaseUrlValidator.Parse(config);
+        var handler = new SocketsHttpHandler
         {
-            BaseAddress = new Uri(config.ApiBaseUrl),
+            ConnectTimeout = CliConnectionDiagnostics.ConnectTimeout,
+        };
+
+        var http = new HttpClient(handler)
+        {
+            BaseAddress = baseUri,
             Timeout = timeout,
         };
         if (!string.IsNullOrEmpty(config.ApiKey))

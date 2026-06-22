@@ -18,10 +18,10 @@ internal static class ConfigureCommand
 
         var existing = ConfigResolver.LoadConfigFile();
 
-        Console.Write($"API base URL [{existing?.ApiBaseUrl ?? "http://localhost:5036"}]: ");
+        Console.Write($"API base URL [{existing?.ApiBaseUrl ?? ResolvedConfig.DefaultApiBaseUrl}]: ");
         var urlInput = await ReadLineAsync();
         var url = string.IsNullOrWhiteSpace(urlInput)
-            ? (existing?.ApiBaseUrl ?? "http://localhost:5036")
+            ? (existing?.ApiBaseUrl ?? ResolvedConfig.DefaultApiBaseUrl)
             : urlInput.Trim();
 
         Console.Write("API key (input hidden): ");
