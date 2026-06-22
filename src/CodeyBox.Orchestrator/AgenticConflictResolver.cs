@@ -1,6 +1,5 @@
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -164,18 +163,6 @@ public sealed record AgenticConflictCandidatesResult(
 /// </summary>
 public sealed class AgenticConflictResolver
 {
-    private static readonly Regex LsFilesUnmergedRecord = new(
-        @"\A[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t(?<path>[^\0\p{Cc}]+)\z",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-    private static readonly Regex LsFilesUnmergedRecordStart = new(
-        @"[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-    private static readonly Regex AnsiEscapeSequence = new(
-        @"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[@-Z\\-_])",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
     private readonly AgenticConflictResolverOptionsSnapshot _options;
     private readonly ILogger _log;
     private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
@@ -221,7 +208,7 @@ public sealed class AgenticConflictResolver
         if (candidates is null || candidates.Count == 0)
             throw new ArgumentException("at least one agent candidate is required", nameof(candidates));
 
-        var conflictFiles = await ListUnmergedPathsAsync(sandbox, workingDirectory, ct);
+        var conflictFiles = await MergeConflictPathInspector.ListUnmergedPathsAsync(sandbox, workingDirectory, ct);
         if (conflictFiles.Count == 0)
         {
             return new AgenticConflictResolverResult(
@@ -236,7 +223,7 @@ public sealed class AgenticConflictResolver
         }
 
         foreach (var file in conflictFiles)
-            ValidateRelativeWorkPath(file);
+            MergeConflictPathInspector.ValidateRelativeWorkPath(file);
 
         var options = _options.Current;
         var maxIterations = Math.Max(1, options.MaxIterations);
@@ -569,150 +556,6 @@ public sealed class AgenticConflictResolver
             ct);
     }
 
-    internal static async Task<IReadOnlyList<string>> ListUnmergedPathsAsync(
-        ISandbox sandbox, string workingDirectory, CancellationToken ct)
-    {
-        var result = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", workingDirectory, "ls-files", "-u", "-z"],
-        }, ct);
-        if (!result.Success)
-            throw new MergeConflictResolutionFailedException(
-                $"failed to inspect unmerged paths: {result.Stderr.Trim()}");
-
-        return ParseUnmergedPathsFromLsFilesStdout(result.Stdout);
-    }
-
-    internal static IReadOnlyList<string> ParseUnmergedPathsFromLsFilesStdout(string stdout)
-    {
-        if (string.IsNullOrEmpty(stdout))
-            return [];
-
-        var paths = new List<string>();
-        foreach (var rawSegment in stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries))
-        {
-            if (IsBenignLsFilesFramingSegment(rawSegment))
-                continue;
-
-            if (IsRecognizedTerminalStartupNoise(rawSegment))
-                continue;
-
-            var segment = StripRecognizedTerminalStartupNoisePrefix(rawSegment);
-            var match = LsFilesUnmergedRecord.Match(segment);
-            if (!match.Success)
-            {
-                throw new MergeConflictResolutionFailedException(
-                    "malformed git ls-files -u output segment '" +
-                    Truncate(EscapeForSingleLine(rawSegment), 200) +
-                    "'");
-            }
-
-            var path = match.Groups["path"].Value;
-            ValidateRelativeWorkPath(path);
-            paths.Add(path);
-        }
-
-        return paths
-            .Distinct(StringComparer.Ordinal)
-            .Order(StringComparer.Ordinal)
-            .ToList();
-    }
-
-    private static bool IsBenignLsFilesFramingSegment(string segment) =>
-        segment.All(static ch => ch is '\r' or '\n');
-
-    private static string StripRecognizedTerminalStartupNoisePrefix(string segment)
-    {
-        var start = LsFilesUnmergedRecordStart.Match(segment);
-        if (!start.Success || start.Index == 0)
-            return segment;
-
-        return IsRecognizedTerminalStartupNoise(segment[..start.Index])
-            ? segment[start.Index..]
-            : segment;
-    }
-
-    private static bool IsRecognizedTerminalStartupNoise(string value)
-    {
-        if (!ContainsTerminalControl(value))
-            return false;
-
-        var cleaned = AnsiEscapeSequence.Replace(value, "");
-        var sb = new StringBuilder(cleaned.Length);
-        foreach (var ch in cleaned)
-        {
-            if (!char.IsControl(ch))
-                sb.Append(ch);
-        }
-
-        var text = sb.ToString().Trim();
-        if (!text.StartsWith("Starting ", StringComparison.Ordinal))
-            return false;
-
-        var rest = text["Starting ".Length..].TrimStart();
-        return rest.Length > 0;
-    }
-
-    private static bool ContainsTerminalControl(string value)
-    {
-        if (AnsiEscapeSequence.IsMatch(value))
-            return true;
-
-        foreach (var ch in value)
-        {
-            if (char.IsControl(ch))
-                return true;
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Reject path patterns that escape the working directory (absolute paths,
-    /// backslashes, traversal segments). The agent runs inside the sandbox so
-    /// the VM boundary is the real defence; this is belt-and-braces against a
-    /// malformed git output line that, if interpolated into a downstream argv,
-    /// could reach outside <paramref name="workingDirectory"/>.
-    /// </summary>
-    internal static void ValidateRelativeWorkPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path)
-            || Path.IsPathRooted(path)
-            || path.Contains('\\', StringComparison.Ordinal)
-            || path.Contains('`', StringComparison.Ordinal)
-            || path.Any(static ch => char.IsControl(ch))
-            || path.Split('/', StringSplitOptions.None).Any(static part => part is "" or "." or ".."))
-        {
-            throw new MergeConflictResolutionFailedException(
-                $"unsafe conflict file path '{EscapeForSingleLine(path)}'");
-        }
-    }
-
-    private static string EscapeForSingleLine(string value)
-    {
-        var sb = new StringBuilder(value.Length);
-        foreach (var ch in value)
-        {
-            switch (ch)
-            {
-                case '\\':
-                    sb.Append(@"\\");
-                    break;
-                case '\'':
-                    sb.Append(@"\'");
-                    break;
-                default:
-                    if (char.IsControl(ch))
-                        sb.Append(@"\u").Append(((int)ch).ToString("X4"));
-                    else
-                        sb.Append(ch);
-                    break;
-            }
-        }
-
-        return sb.ToString();
-    }
-
     internal sealed record VerificationOutcome(bool Success, string Reason);
 
     internal async Task<VerificationOutcome> VerifyResolutionAsync(
@@ -729,7 +572,7 @@ public sealed class AgenticConflictResolver
         if (!unmerged.Success)
             return new VerificationOutcome(false, $"git ls-files failed: {unmerged.Stderr.Trim()}");
 
-        var remainingUnmergedPaths = ParseUnmergedPathsFromLsFilesStdout(unmerged.Stdout);
+        var remainingUnmergedPaths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(unmerged.Stdout);
         if (remainingUnmergedPaths.Count > 0)
             return new VerificationOutcome(
                 false,
@@ -782,7 +625,7 @@ public sealed class AgenticConflictResolver
         string? priorVerificationError)
     {
         foreach (var file in conflictFiles)
-            ValidateRelativeWorkPath(file);
+            MergeConflictPathInspector.ValidateRelativeWorkPath(file);
 
         var op = context.Operation == AgenticConflictResolverOperation.Rebase ? "rebase" : "merge";
         var sb = new StringBuilder();

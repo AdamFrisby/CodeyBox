@@ -12259,8 +12259,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             // Collect the actual sandbox-side conflict file list (more reliable
             // than the host's pre-merge probe). Fall back to the caller's list
-            // when git ls-files is empty for any reason.
-            var sandboxConflictFiles = await ListSandboxConflictFilesAsync(sandbox, ct);
+            // when git ls-files is empty or unreadable.
+            var sandboxConflictFiles = await ListSandboxConflictFilesAsync(sandbox, conflictFiles, ct);
             if (sandboxConflictFiles.Count == 0) sandboxConflictFiles = conflictFiles;
 
             var prompt = BuildConflictReworkPrompt(
@@ -12622,9 +12622,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
             .ToArray();
     }
 
-    private static async Task<IReadOnlyList<string>> ListSandboxConflictFilesAsync(ISandbox sandbox, CancellationToken ct)
+    private static async Task<IReadOnlyList<string>> ListSandboxConflictFilesAsync(
+        ISandbox sandbox,
+        IReadOnlyList<string> fallbackConflictFiles,
+        CancellationToken ct)
     {
-        return await AgenticConflictResolver.ListUnmergedPathsAsync(sandbox, SandboxConventions.WorkDir, ct);
+        try
+        {
+            return await MergeConflictPathInspector.ListUnmergedPathsAsync(sandbox, SandboxConventions.WorkDir, ct);
+        }
+        catch (MergeConflictResolutionFailedException) when (fallbackConflictFiles.Count > 0)
+        {
+            return fallbackConflictFiles;
+        }
     }
 
     /// <summary>
@@ -12633,7 +12643,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// in-progress rebase state, prohibits destructive actions, and documents
     /// the <c>SEMANTIC_INCOMPATIBLE:</c> escape hatch.
     /// </summary>
-    private static string BuildConflictReworkPrompt(
+    internal static string BuildConflictReworkPrompt(
         string originalPrompt,
         string baseBranch,
         string workBranch,
@@ -12641,7 +12651,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string mergePhaseFailureMessage)
     {
         foreach (var file in conflictFiles)
-            AgenticConflictResolver.ValidateRelativeWorkPath(file);
+            MergeConflictPathInspector.ValidateRelativeWorkPath(file);
 
         var conflictList = JsonSerializer.Serialize(conflictFiles, new JsonSerializerOptions { WriteIndented = true });
         var mergePhaseFailureContext = JsonSerializer.Serialize(mergePhaseFailureMessage);
