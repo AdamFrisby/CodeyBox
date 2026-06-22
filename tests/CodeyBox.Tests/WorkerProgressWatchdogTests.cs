@@ -1483,12 +1483,10 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         psi.Environment[SandboxConventions.WorkItemIdEnvironmentVariable] = itemId.ToString();
         var process = DiagProcess.Start(psi)
             ?? throw new InvalidOperationException("failed to start busy test process");
-        // Keep this below normal so it does not dominate parallel xUnit work,
-        // but avoid idle priority: on a saturated host idle-priority loops can
-        // accumulate no ticks within the probe window and make activity tests
-        // falsely observe no CPU progress.
-        try { process.PriorityClass = System.Diagnostics.ProcessPriorityClass.BelowNormal; }
-        catch { /* best-effort: priority adjustments require capabilities on some Linux configs */ }
+        // Leave the CPU burner at the platform default priority. These tests
+        // intentionally assert that an active tagged process remains observable
+        // even when the rest of the suite is busy; lowering its priority makes
+        // the assertion depend on scheduler luck rather than watchdog logic.
         return process;
     }
 

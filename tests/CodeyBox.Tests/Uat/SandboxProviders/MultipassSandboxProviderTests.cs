@@ -1678,7 +1678,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", "-c", "printf should-not-run"]));
+                ["/bin/sh", "-c", "printf should-not-run"],
+                markerWaitSeconds: 5));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin(
@@ -1733,7 +1734,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", "-c", "printf should-not-run"]));
+                ["/bin/sh", "-c", "printf should-not-run"],
+                markerWaitSeconds: 5));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin($$"""

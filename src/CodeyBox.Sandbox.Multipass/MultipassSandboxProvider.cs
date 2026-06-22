@@ -5816,10 +5816,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         string? stdinFile,
         IReadOnlyList<string> command,
         int launchLockAttempts = 300,
-        string? exitTokenFile = null)
+        string? exitTokenFile = null,
+        int markerWaitSeconds = 30)
     {
         if (launchLockAttempts < 0)
             throw new ArgumentOutOfRangeException(nameof(launchLockAttempts), "Launch lock attempts must be non-negative.");
+        if (markerWaitSeconds <= 0)
+            throw new ArgumentOutOfRangeException(nameof(markerWaitSeconds), "Marker wait seconds must be positive.");
 
         const string detachedHttpExitPosterScript = """
 import os, sys, time, urllib.error, urllib.parse, urllib.request
@@ -5864,6 +5867,7 @@ while True:
         sb.Append("codeybox_stdin_file=").Append(MultipassSandboxProvider.ShellSingleQuote(stdinFile ?? "")).Append('\n');
         sb.Append("codeybox_exit_token_file=").Append(MultipassSandboxProvider.ShellSingleQuote(exitTokenFile ?? "")).Append('\n');
         sb.Append("codeybox_lock_max=").Append(launchLockAttempts.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append("codeybox_marker_wait_seconds=").Append(markerWaitSeconds.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.AppendLine("codeybox_supervisor_dir=$(dirname \"$codeybox_pgid_marker\")");
         sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
         sb.AppendLine("codeybox_root_sh() {");
@@ -6063,9 +6067,15 @@ while True:
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
         sb.AppendLine(" </dev/null >/dev/null 2>/dev/null &");
         sb.AppendLine("codeybox_detached_pid=$!");
-        sb.AppendLine("codeybox_marker_deadline=$((SECONDS + 5))");
+        sb.AppendLine("codeybox_marker_deadline=$((SECONDS + codeybox_marker_wait_seconds))");
         sb.AppendLine("while ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; do");
+        sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
+        sb.AppendLine("        break");
+        sb.AppendLine("    fi");
         sb.AppendLine("    if [ \"$SECONDS\" -ge \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
+        sb.AppendLine("            break");
+        sb.AppendLine("        fi");
         sb.AppendLine("        kill -TERM \"-$codeybox_detached_pid\" 2>/dev/null || true");
         sb.AppendLine("        codeybox_term_i=0");
         sb.AppendLine("        while kill -0 \"-$codeybox_detached_pid\" 2>/dev/null && [ \"$codeybox_term_i\" -lt 20 ]; do");
