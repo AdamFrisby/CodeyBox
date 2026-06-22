@@ -142,7 +142,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
         return
             "set -eu\n" +
-            "fail(){ echo \"$1\" >&2; exit 1; }\n" +
+            "fail(){ msg=$1; cat >/dev/null 2>/dev/null || true; echo \"$msg\" >&2; exit 1; }\n" +
             "expected_sha=" + ShellSingleQuote(expectedSha256) + "\n" +
             "payload_end=" + ShellSingleQuote(BridgePayloadEndMarker) + "\n" +
             baseDirLine +
@@ -265,7 +265,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             catch (Exception ex)
             {
                 throw new AcpTransportUnavailableException(
-                    $"ACP bridge invocation failed on turn {turnIndex}", ex);
+                    $"ACP bridge invocation failed on turn {turnIndex}: {ex.Message}", ex);
             }
 
             var combinedStdout = stdoutBuf.Length > 0
