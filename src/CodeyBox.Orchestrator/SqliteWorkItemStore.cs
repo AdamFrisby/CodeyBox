@@ -313,6 +313,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // JSON object; default '{}' so legacy rows behave as "no knobs set"
             // and fall through to per-project / knob defaults at prompt time.
             RunMigration("ALTER TABLE work_items ADD COLUMN knobs_json TEXT NOT NULL DEFAULT '{}';");
+            RunMigration("ALTER TABLE work_items ADD COLUMN plan_artifact TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN plan_generated_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN plan_reviewed_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN plan_review_summary TEXT;");
 
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
@@ -454,7 +458,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup,
                         terminal_retry_attempts, next_terminal_retry_at,
-                        knobs_json)
+                        knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
@@ -471,7 +475,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup,
                         $terminal_retry_attempts, $next_terminal_retry_at,
-                        $knobs);
+                        $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -607,7 +611,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at
+                    next_terminal_retry_at = $next_terminal_retry_at,
+                    plan_artifact = $plan_artifact,
+                    plan_generated_at = $plan_generated_at,
+                    plan_reviewed_at = $plan_reviewed_at,
+                    plan_review_summary = $plan_review_summary
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -683,7 +691,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at
+                    next_terminal_retry_at = $next_terminal_retry_at,
+                    plan_artifact = $plan_artifact,
+                    plan_generated_at = $plan_generated_at,
+                    plan_reviewed_at = $plan_reviewed_at,
+                    plan_review_summary = $plan_review_summary
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -764,7 +776,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at
+                    next_terminal_retry_at = $next_terminal_retry_at,
+                    plan_artifact = $plan_artifact,
+                    plan_generated_at = $plan_generated_at,
+                    plan_reviewed_at = $plan_reviewed_at,
+                    plan_review_summary = $plan_review_summary
                 WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
                 """;
             Bind(cmd, item);
@@ -1164,7 +1180,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at
+                    next_terminal_retry_at = $next_terminal_retry_at,
+                    plan_artifact = $plan_artifact,
+                    plan_generated_at = $plan_generated_at,
+                    plan_reviewed_at = $plan_reviewed_at,
+                    plan_review_summary = $plan_review_summary
                 WHERE id = $id
                   AND state = $only_if_state
                   AND updated_at = $only_if_updated_at;
@@ -2325,6 +2345,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$terminal_retry_attempts", item.TerminalRetryAttempts);
         cmd.Parameters.AddWithValue("$next_terminal_retry_at", (object?)item.NextTerminalRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$knobs", SerialiseKnobs(item.Knobs));
+        cmd.Parameters.AddWithValue("$plan_artifact", (object?)item.PlanArtifact ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$plan_generated_at", (object?)item.PlanGeneratedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$plan_reviewed_at", (object?)item.PlanReviewedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$plan_review_summary", (object?)item.PlanReviewSummary ?? DBNull.Value);
     }
 
     private static string SerialiseKnobs(IReadOnlyDictionary<string, string>? knobs)
@@ -2440,6 +2464,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         TerminalRetryAttempts = ReadInt32OrDefault(r, "terminal_retry_attempts", defaultValue: 0),
         NextTerminalRetryAt = ReadNullableDateTimeOffset(r, "next_terminal_retry_at"),
         Knobs = ReadKnobs(r),
+        PlanArtifact = ReadNullableString(r, "plan_artifact"),
+        PlanGeneratedAt = ReadNullableDateTimeOffset(r, "plan_generated_at"),
+        PlanReviewedAt = ReadNullableDateTimeOffset(r, "plan_reviewed_at"),
+        PlanReviewSummary = ReadNullableString(r, "plan_review_summary"),
     };
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)

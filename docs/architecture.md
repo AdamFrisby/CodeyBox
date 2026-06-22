@@ -128,15 +128,19 @@ host git verification and the scope fence gate the push.
 ## State machine
 
 ```
-Queued → Working → WorkComplete ─┬─→ Auditing* ─pass─→ AuditPassed ─→ Merging ─→ Merged ─→ UpstreamPushing ─→ Done
-                                 │      │
-                                 │      └─fail─→ Reworking ─→ Auditing* (loop)
-                                 │                  │
-                                 │                  └─no-changes─→ Failed
-                                 │      │
-                                 │      └─maxIters─→ AuditFailed (terminal)
-                                 │
-                                 └─(no auditors registered)─→ Merging ─→ ...
+Queued ── plan=on ─→ Planning → PlanReview → PlanApproved ┐
+   │                                                      │
+   └──────────────── plan=off ────────────────────────────┘
+                                                          ↓
+Working → WorkComplete ─┬─→ Auditing* ─pass─→ AuditPassed ─→ Merging ─→ Merged ─→ UpstreamPushing ─→ Done
+                        │      │
+                        │      └─fail─→ Reworking ─→ Auditing* (loop)
+                        │                  │
+                        │                  └─no-changes─→ Failed
+                        │      │
+                        │      └─maxIters─→ AuditFailed (terminal)
+                        │
+                        └─(no auditors registered)─→ Merging ─→ ...
 
 Merging can also terminate as `MergeConflictResolutionFailed` when host-side
 merge verification or the scope fence rejects a conflict resolution.
@@ -154,6 +158,11 @@ third-line fallback is burning.
 
 Cancelled (via DELETE /workitems/{id}) is reachable from any non-terminal state.
 ```
+
+`Planning` is optional and gated by the `plan` knob, which defaults to `off`.
+The planning turn runs in a discardable sandbox and persists only the PLAN
+artifact on the work item; the placeholder `PlanReview` approves it and
+`PlanApproved` flows into normal implementation.
 
 `*` Before each `Auditing` run, configured mechanical fixers may run in a
 credential-free sandbox and commit deterministic normalizations. This is a

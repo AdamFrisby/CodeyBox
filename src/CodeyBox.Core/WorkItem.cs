@@ -619,6 +619,26 @@ public sealed record WorkItem
         = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Structured planning artifact produced by the optional <c>plan</c> knob
+    /// before implementation starts. Null when the planning knob is off or the
+    /// planning turn has not completed.
+    /// </summary>
+    public string? PlanArtifact { get; init; }
+
+    /// <summary>UTC timestamp when <see cref="PlanArtifact"/> was persisted.</summary>
+    public DateTimeOffset? PlanGeneratedAt { get; init; }
+
+    /// <summary>
+    /// UTC timestamp when the plan-review gate approved the current
+    /// <see cref="PlanArtifact"/>. The initial scaffold uses an always-pass
+    /// placeholder reviewer.
+    /// </summary>
+    public DateTimeOffset? PlanReviewedAt { get; init; }
+
+    /// <summary>Short operator-facing summary of the plan-review decision.</summary>
+    public string? PlanReviewSummary { get; init; }
+
+    /// <summary>
     /// Content-hashed identifier of the sandbox baseline image this work item is
     /// pinned to. Stamped at pickup time from the sandbox provider's live config
     /// (profile, flavor, cloud-init, extra runcmd, extra cloud-init) and preserved
@@ -714,6 +734,9 @@ public sealed record WorkItem
     private static bool ShouldPreserveTransientRetryHistory(WorkItemState state) =>
         state is WorkItemState.Queued
             or WorkItemState.Working
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
             or WorkItemState.Auditing
             or WorkItemState.Reworking
             or WorkItemState.Merging

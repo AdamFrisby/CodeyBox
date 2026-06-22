@@ -70,6 +70,34 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     }
 
     [Fact]
+    public async Task Get_WithPlanArtifact_SurfacesPlanningFields()
+    {
+        var generatedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var reviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "planned",
+            Prompt = "p",
+            PlanArtifact = "PLAN:\nApproach: test",
+            PlanGeneratedAt = generatedAt,
+            PlanReviewedAt = reviewedAt,
+            PlanReviewSummary = "Placeholder plan review approved.",
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var resp = await _client.GetAsync($"/workitems/{item.Id}");
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<WorkItemWithKnobsResponse>();
+        Assert.Equal(item.PlanArtifact, body!.PlanArtifact);
+        Assert.Equal(generatedAt, body.PlanGeneratedAt);
+        Assert.Equal(reviewedAt, body.PlanReviewedAt);
+        Assert.Equal(item.PlanReviewSummary, body.PlanReviewSummary);
+    }
+
+    [Fact]
     public async Task Create_WithUnknownKnobKey_Returns400AndRejectsKey()
     {
         var resp = await _client.PostAsJsonAsync("/workitems", new
@@ -851,6 +879,10 @@ public sealed class WorkItemKnobsApiTests : IDisposable
     {
         [JsonPropertyName("id")] public string Id { get; init; } = string.Empty;
         [JsonPropertyName("knobs")] public IReadOnlyDictionary<string, string>? Knobs { get; init; }
+        [JsonPropertyName("planArtifact")] public string? PlanArtifact { get; init; }
+        [JsonPropertyName("planGeneratedAt")] public DateTimeOffset? PlanGeneratedAt { get; init; }
+        [JsonPropertyName("planReviewedAt")] public DateTimeOffset? PlanReviewedAt { get; init; }
+        [JsonPropertyName("planReviewSummary")] public string? PlanReviewSummary { get; init; }
     }
 
     private sealed class DescriptorLocalStringKnob(string key) : IKnob

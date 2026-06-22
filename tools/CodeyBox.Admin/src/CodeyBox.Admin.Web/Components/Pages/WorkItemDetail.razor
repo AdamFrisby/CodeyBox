@@ -103,6 +103,28 @@ else
         <pre class="prompt-text">@_item.Prompt</pre>
     </details>
 
+    @if (!string.IsNullOrWhiteSpace(_item.PlanArtifact))
+    {
+        <details class="prompt-collapsible" open>
+            <summary>Plan</summary>
+            <div class="plan-meta">
+                @if (_item.PlanGeneratedAt is not null)
+                {
+                    <span>Generated @_item.PlanGeneratedAt.Value.ToString("O")</span>
+                }
+                @if (_item.PlanReviewedAt is not null)
+                {
+                    <span>Reviewed @_item.PlanReviewedAt.Value.ToString("O")</span>
+                }
+                @if (!string.IsNullOrWhiteSpace(_item.PlanReviewSummary))
+                {
+                    <span>@_item.PlanReviewSummary</span>
+                }
+            </div>
+            <pre class="prompt-text">@_item.PlanArtifact</pre>
+        </details>
+    }
+
     @if (_questions.Count > 0)
     {
         <details class="prompt-collapsible" open>

@@ -63,6 +63,7 @@ internal static class WorkItemRecoveryPolicy
             ? IsRealProgressCompletionState(toState)
             : toState switch
             {
+                WorkItemState.PlanApproved => recoverySourceState is WorkItemState.Planning or WorkItemState.PlanReview,
                 WorkItemState.WorkComplete => recoverySourceState is WorkItemState.Working or WorkItemState.Reworking,
                 WorkItemState.AuditPassed => recoverySourceState is
                     WorkItemState.WorkComplete
@@ -100,6 +101,7 @@ internal static class WorkItemRecoveryPolicy
     private static bool IsRealProgressCompletionState(WorkItemState state) => state switch
     {
         WorkItemState.WorkComplete => true,
+        WorkItemState.PlanApproved => true,
         WorkItemState.AuditPassed => true,
         WorkItemState.Merged => true,
         WorkItemState.Done => true,
@@ -289,6 +291,8 @@ internal static class WorkItemRecoveryPolicy
     public static bool IsItemStaleWatchedState(WorkItemState state) => state switch
     {
         WorkItemState.Working => true,
+        WorkItemState.Planning => true,
+        WorkItemState.PlanReview => true,
         WorkItemState.Reworking => true,
         WorkItemState.Auditing => true,
         WorkItemState.Merging => true,
@@ -423,6 +427,9 @@ internal static class WorkItemRecoveryPolicy
     /// </summary>
     public static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
     {
+        WorkItemState.Planning => WorkItemState.Queued,
+        WorkItemState.PlanReview => WorkItemState.PlanReview,
+        WorkItemState.PlanApproved => WorkItemState.PlanApproved,
         WorkItemState.Reworking => WorkItemState.WorkComplete,
         WorkItemState.WorkComplete => WorkItemState.WorkComplete,
         WorkItemState.Auditing => WorkItemState.WorkComplete,

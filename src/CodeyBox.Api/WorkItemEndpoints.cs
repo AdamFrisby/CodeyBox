@@ -2155,6 +2155,10 @@ internal static class WorkItemEndpoints
             AgentInstanceId: item.AgentInstanceId,
             TemplateName: item.TemplateName,
             TemplateEntryIndex: item.TemplateEntryIndex,
+            PlanArtifact: item.PlanArtifact,
+            PlanGeneratedAt: item.PlanGeneratedAt,
+            PlanReviewedAt: item.PlanReviewedAt,
+            PlanReviewSummary: item.PlanReviewSummary,
             Knobs: item.Knobs.Count == 0
                 ? null
                 : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
@@ -2580,6 +2584,14 @@ public sealed record WorkItemDto(
     string? TemplateName = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     int? TemplateEntryIndex = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? PlanArtifact = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    DateTimeOffset? PlanGeneratedAt = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    DateTimeOffset? PlanReviewedAt = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? PlanReviewSummary = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyDictionary<string, string>? Knobs = null);
 

@@ -291,6 +291,18 @@ public sealed class KnobWorkPromptPreprocessorTests
         Assert.Contains("REFACTOR", refactor);
     }
 
+    [Fact]
+    public void PlanKnob_DefaultsOff_AndContributesNoWorkPromptFragment()
+    {
+        var knob = new PlanKnob();
+
+        Assert.Equal(PlanKnob.KeyName, knob.Key);
+        Assert.Equal(PlanKnob.ValueOff, knob.DefaultValue);
+        Assert.Equal([PlanKnob.ValueOff, PlanKnob.ValueOn], knob.AllowedValues);
+        Assert.Null(knob.GetWorkPromptFragment(PlanKnob.ValueOff));
+        Assert.Null(knob.GetWorkPromptFragment(PlanKnob.ValueOn));
+    }
+
     private static WorkItem NewItem(IReadOnlyDictionary<string, string>? knobs = null) => new()
     {
         Id = WorkItemId.New(),

@@ -69,6 +69,7 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Theory]
+    [InlineData(WorkItemState.PlanApproved)]
     [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.Merged)]
@@ -84,6 +85,8 @@ public sealed class WorkItemRecoveryPolicyTests
 
     [Theory]
     [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Planning)]
+    [InlineData(WorkItemState.PlanReview)]
     [InlineData(WorkItemState.Auditing)]
     [InlineData(WorkItemState.Reworking)]
     [InlineData(WorkItemState.Merging)]
@@ -252,6 +255,9 @@ public sealed class WorkItemRecoveryPolicyTests
 
     [Theory]
     [InlineData(WorkItemState.Working, WorkItemState.Queued, true)]
+    [InlineData(WorkItemState.Planning, WorkItemState.Queued, true)]
+    [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview, false)]
+    [InlineData(WorkItemState.PlanApproved, WorkItemState.PlanApproved, false)]
     [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete, false)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete, false)]
     [InlineData(WorkItemState.ReworkingForConflict, WorkItemState.AuditPassed, false)]

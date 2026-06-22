@@ -685,6 +685,7 @@ builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptP
 // registry exposes it to the API for set/validate and the work-prompt
 // preprocessor picks up its fragment without further edits.
 builder.Services.AddSingleton<IKnob, CodeyBox.Orchestrator.Knobs.ChangeScopeKnob>();
+builder.Services.AddSingleton<IKnob, CodeyBox.Orchestrator.Knobs.PlanKnob>();
 builder.Services.AddSingleton<IKnobRegistry, KnobRegistry>();
 builder.Services.AddSingleton<IAgentPromptPreprocessor, CodeyBox.Orchestrator.Knobs.KnobWorkPromptPreprocessor>();
 
@@ -2460,6 +2461,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
+    knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
     checkCompletionRunner: sp.GetService<ICheckAndActCompletionRunner>(),
     agentSupervision: sp.GetService<IAgentSupervisionService>(),
     // Resumable session worker (item 3 of the rollout). PipelineRunner
