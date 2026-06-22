@@ -6,7 +6,7 @@ internal static class CodeyBoxHttpFactory
 {
     internal static HttpClient CreateClient(ResolvedConfig config, TimeSpan timeout)
     {
-        var baseUri = ParseApiBaseUrl(config);
+        var baseUri = ApiBaseUrlValidator.Parse(config);
         var handler = new SocketsHttpHandler
         {
             ConnectTimeout = CliConnectionDiagnostics.ConnectTimeout,
@@ -21,25 +21,5 @@ internal static class CodeyBoxHttpFactory
             http.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", config.ApiKey);
         return http;
-    }
-
-    private static Uri ParseApiBaseUrl(ResolvedConfig config)
-    {
-        if (string.IsNullOrWhiteSpace(config.ApiBaseUrl))
-            throw new CodeyBoxCliException(CliConnectionDiagnostics.FormatMalformedApiBaseUrl(
-                config,
-                "value is empty"));
-
-        if (!Uri.TryCreate(config.ApiBaseUrl, UriKind.Absolute, out var uri))
-            throw new CodeyBoxCliException(CliConnectionDiagnostics.FormatMalformedApiBaseUrl(
-                config,
-                "value is not an absolute URI"));
-
-        if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
-            throw new CodeyBoxCliException(CliConnectionDiagnostics.FormatMalformedApiBaseUrl(
-                config,
-                "scheme must be http or https"));
-
-        return uri;
     }
 }

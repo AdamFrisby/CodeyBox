@@ -48,9 +48,10 @@ internal static class ConfigResolver
         if (!string.IsNullOrEmpty(flagKey) && (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()))
             Console.Error.WriteLine("Warning: --api-key is visible in the OS process list. Prefer CODEYBOX_CLI_API_KEY env var in scripts.");
 
+        var apiUri = ApiBaseUrlValidator.Parse(result);
+
         // Warn when a non-loopback HTTP URL is configured: bearer token would be transmitted in cleartext.
-        if (Uri.TryCreate(result.ApiBaseUrl, UriKind.Absolute, out var apiUri)
-            && apiUri.Scheme == "http"
+        if (apiUri.Scheme == "http"
             && !IsLoopbackHost(apiUri.Host))
             Console.Error.WriteLine(
                 $"Warning: API base URL '{CliDiagnosticFormatting.FormatApiBaseUrlForDiagnostics(result.ApiBaseUrl)}' uses plaintext HTTP on a non-loopback address; the bearer token will be sent unencrypted.");
