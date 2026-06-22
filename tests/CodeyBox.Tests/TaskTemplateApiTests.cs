@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Orchestrator.Knobs;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace CodeyBox.Tests;
@@ -43,7 +44,8 @@ public sealed class TaskTemplateApiTests : IDisposable
                     "priority": 100,
                     "agent": "codex",
                     "agentClassId": "secure-class",
-                    "dependsOn": [ "ticket:SEC-1", "550e8400-e29b-41d4-a716-446655440000" ]
+                    "dependsOn": [ "ticket:SEC-1", "550e8400-e29b-41d4-a716-446655440000" ],
+                    "knobs": { "changeScope": "refactor" }
                   }
                 },
                 {
@@ -117,6 +119,7 @@ public sealed class TaskTemplateApiTests : IDisposable
         Assert.Equal(
             ["ticket:SEC-1", "550e8400-e29b-41d4-a716-446655440000"],
             byIndex[0].Check!.OnYes.DependsOn);
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, byIndex[0].Check!.OnYes.Knobs[ChangeScopeKnob.KeyName]);
         Assert.Equal("Check cookie attributes", byIndex[1].Title);
         Assert.Equal("agentic", byIndex[1].Check!.Mode);
         Assert.False(byIndex[1].Check!.ActionableAnswer);
@@ -263,6 +266,43 @@ public sealed class TaskTemplateApiTests : IDisposable
 
         var queue = _factory.Services.GetRequiredService<InMemoryTaskQueue>();
         Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task QueueTemplate_InvalidOnYesKnobs_Returns400WithoutPartialEnqueue()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad-knobs.json"), """
+            {
+              "checks": [
+                {
+                  "question": "This valid entry must not be enqueued before later validation fails.",
+                  "onYes": {
+                    "title": "Fix first issue",
+                    "prompt": "This should not be queued."
+                  }
+                },
+                {
+                  "question": "Is the risky pattern present?",
+                  "onYes": {
+                    "title": "Fix risky pattern",
+                    "prompt": "Remove the risky pattern.",
+                    "knobs": { "changeScope": "yolo" }
+                  }
+                }
+              ]
+            }
+            """);
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "bad-knobs",
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("not allowed", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
     }
 
     [Fact]

@@ -511,6 +511,7 @@ internal static class WorkItemEndpoints
             ReplayOfWorkItemId = source.Id,
             MinModelScore = source.MinModelScore,
             RequiredCapabilities = source.RequiredCapabilities,
+            Knobs = source.Knobs,
         };
 
         await store.CreateAsync(replay, ct);
@@ -1071,6 +1072,7 @@ internal static class WorkItemEndpoints
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
+        IKnobRegistry knobs,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -1078,6 +1080,15 @@ internal static class WorkItemEndpoints
 
         var depsPatch = body.DependsOn is not null;
         var queuedOnlyPatch =
+            body.Title is not null
+            || body.Prompt is not null
+            || body.Agent is not null
+            || body.WorkTimeoutMinutes is not null
+            || body.MergeTimeoutMinutes is not null
+            || body.MinModelScore is not null
+            || body.RequiredCapabilities is not null
+            || body.Knobs is not null;
+        var queuedRowPatch =
             body.Title is not null
             || body.Prompt is not null
             || body.Agent is not null
@@ -1118,8 +1129,18 @@ internal static class WorkItemEndpoints
             newDependsOn = ids;
         }
 
+        IReadOnlyDictionary<string, string>? normalisedPatchKnobs = null;
+        if (body.Knobs is { } patchKnobs)
+        {
+            var (normalisedKnobs, knobErr) = WorkItemCreationService.NormaliseKnobs(patchKnobs, knobs);
+            if (knobErr is not null) return knobErr;
+            normalisedPatchKnobs = normalisedKnobs!;
+        }
+
         var updated = item!;
         var now = DateTimeOffset.UtcNow;
+        var queuedUpdateExpectedUpdatedAt = item!.UpdatedAt;
+        var deferPromptReplace = body.Prompt is not null && normalisedPatchKnobs is not null;
 
         if (body.Title is not null)
         {
@@ -1132,24 +1153,37 @@ internal static class WorkItemEndpoints
         if (body.Prompt is not null)
         {
             if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
-            // Route through TryReplacePromptAsync — the only write path that
-            // touches prompt + prompt_revision. The full-row UPDATE below
-            // deliberately does NOT carry the prompt columns (they would
-            // clobber a concurrent PUT /workitems/{id}/prompt). The state
-            // guard inside TryReplacePromptAsync mirrors the Queued check
-            // above; success refreshes our in-memory snapshot for the rest
-            // of the PATCH so the response DTO reflects the new revision.
-            var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
-            if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
-                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-            if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
-                return Results.Conflict(new { error = $"cannot edit item in terminal state" });
-            updated = updated with
+            if (deferPromptReplace)
             {
-                Prompt = body.Prompt,
-                PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
-                UpdatedAt = now,
-            };
+                updated = updated with
+                {
+                    Prompt = body.Prompt,
+                    PromptRevision = updated.PromptRevision + 1,
+                    UpdatedAt = now,
+                };
+            }
+            else
+            {
+                // Route through TryReplacePromptAsync — the only write path that
+                // touches prompt + prompt_revision. The full-row UPDATE below
+                // deliberately does NOT carry the prompt columns (they would
+                // clobber a concurrent PUT /workitems/{id}/prompt). The state
+                // guard inside TryReplacePromptAsync mirrors the Queued check
+                // above; success refreshes our in-memory snapshot for the rest
+                // of the PATCH so the response DTO reflects the new revision.
+                var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
+                if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
+                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+                if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
+                    return Results.Conflict(new { error = $"cannot edit item in terminal state" });
+                updated = updated with
+                {
+                    Prompt = body.Prompt,
+                    PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
+                    UpdatedAt = now,
+                };
+                queuedUpdateExpectedUpdatedAt = now;
+            }
         }
 
         if (body.Agent is not null)
@@ -1176,6 +1210,11 @@ internal static class WorkItemEndpoints
             updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
         }
 
+        if (normalisedPatchKnobs is not null)
+        {
+            updated = updated with { Knobs = normalisedPatchKnobs, UpdatedAt = now };
+        }
+
         if (body.AuditMaxIterations is { } auditMaxIterations)
         {
             var auditMaxIterationsError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditMaxIterations);
@@ -1196,27 +1235,58 @@ internal static class WorkItemEndpoints
             updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Queued-only fields go through the full-row UPDATE, but audit-budget
-        // fields are restored to their original values for that write and then
-        // persisted through UpdateAuditBudgetAsync below. That keeps the audit
-        // budget path partial even when an operator sends it alongside a queued
-        // title/timeout/etc edit.
-        if (queuedOnlyPatch)
+        // Queued-only fields go through a guarded row UPDATE. Knob-only PATCHes
+        // still use the partial knob write below so worker state transitions from
+        // stale snapshots cannot erase an accepted queued edit. Mixed knob PATCHes
+        // use the combined guarded row+knob write here so a conflict cannot leave
+        // only part of the request persisted. When knobs and audit budget fields
+        // are sent together, include the audit budget in that same guarded write;
+        // otherwise the later audit-budget write could conflict after the knob
+        // map had already been replaced.
+        var auditBudgetWrittenWithQueuedUpdate = normalisedPatchKnobs is not null && auditBudgetPatch;
+        var needsQueuedRowUpdate =
+            queuedRowPatch
+            || (depsPatch && queuedOnlyPatch)
+            || auditBudgetWrittenWithQueuedUpdate;
+        if (needsQueuedRowUpdate)
         {
-            var queuedUpdate = auditBudgetPatch
+            var queuedUpdate = auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate
                 ? updated with
                 {
                     AuditMaxIterations = item!.AuditMaxIterations,
                     AuditComplexity = item!.AuditComplexity,
                 }
                 : updated;
-            // TryUpdateIfStateAsync guards against a race where the orchestrator picks
-            // up the item between the GetAsync above and this write.
-            var written = await store.TryUpdateIfStateAsync(queuedUpdate, WorkItemState.Queued, ct);
+            // Guard state and updated_at so queued edits cannot be written over
+            // a concurrent pickup or another accepted queued-field patch.
+            var written = normalisedPatchKnobs is not null
+                ? await store.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+                    queuedUpdate,
+                    WorkItemState.Queued,
+                    queuedUpdateExpectedUpdatedAt,
+                    ct)
+                : await store.TryUpdateIfStateAndUpdatedAtAsync(
+                    queuedUpdate,
+                    WorkItemState.Queued,
+                    queuedUpdateExpectedUpdatedAt,
+                    ct);
             if (!written)
-                return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
+                return Results.Conflict(new { error = "item changed before the queued-field update could be written" });
+            queuedUpdateExpectedUpdatedAt = now;
         }
-        if (auditBudgetPatch)
+        if (normalisedPatchKnobs is not null && !needsQueuedRowUpdate)
+        {
+            var written = await store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
+                updated.Id,
+                normalisedPatchKnobs,
+                now,
+                WorkItemState.Queued,
+                queuedUpdateExpectedUpdatedAt,
+                ct);
+            if (!written)
+                return Results.Conflict(new { error = "item changed before the queued knob update could be written" });
+        }
+        if (auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate)
         {
             var budgetResult = await store.UpdateAuditBudgetAsync(
                 updated.Id,
@@ -1266,7 +1336,8 @@ internal static class WorkItemEndpoints
                 mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
                 minModelScoreChanged: body.MinModelScore is not null,
                 requiredCapabilitiesChanged: body.RequiredCapabilities is not null,
-                auditBudgetChanged: auditBudgetPatch);
+                auditBudgetChanged: auditBudgetPatch,
+                knobsChanged: body.Knobs is not null);
         }
         if (depsPatch)
             AuditLog.WorkItemDependenciesChanged(updated.Id, oldDependsOn, newDependsOn!);
@@ -2080,7 +2151,10 @@ internal static class WorkItemEndpoints
             ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts,
             AgentInstanceId: item.AgentInstanceId,
             TemplateName: item.TemplateName,
-            TemplateEntryIndex: item.TemplateEntryIndex);
+            TemplateEntryIndex: item.TemplateEntryIndex,
+            Knobs: item.Knobs.Count == 0
+                ? null
+                : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -2320,7 +2394,11 @@ public sealed record CreateWorkItemRequest(
     // once the project has zero other in-flight items, and while it runs no
     // other item for the same project may start. Mutually exclusive with
     // <c>Check</c> and <c>AgentControl</c>.
-    bool? IsRefactor = null);
+    bool? IsRefactor = null,
+    // Per-item knob overrides. Keys must match a registered IKnob.Key; values
+    // must satisfy the knob descriptor parser. Unknown keys and invalid values
+    // are rejected at create time with 400.
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 /// <summary>
 /// Request payload for the optional <c>check</c> block on
@@ -2347,7 +2425,8 @@ public sealed record OnYesActionRequest(
     int? Priority = null,
     string? Agent = null,
     string? AgentClassId = null,
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 public sealed record AgentControlRequest(
     string Action,
@@ -2382,7 +2461,11 @@ public sealed record PatchWorkItemRequest(
     // 'ns:value' externalId, or a bare externalId (unambiguous within the
     // project). Cap at 100 entries; cycle-checked; allowed on any non-terminal
     // item. Passing an empty array clears all dependencies.
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    // Replace-set knob edit (queued-only, like Title/Agent). Sending a non-null
+    // map replaces the entire stored map. Unknown keys and invalid values are
+    // rejected with 400. Send an empty map to clear all per-item overrides.
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 public sealed record PatchPriorityRequest(int Priority);
 
@@ -2490,7 +2573,9 @@ public sealed record WorkItemDto(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     string? TemplateName = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    int? TemplateEntryIndex = null);
+    int? TemplateEntryIndex = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 /// <summary>
 /// One entry in a work item's per-phase agent involvement trail. Mirrors

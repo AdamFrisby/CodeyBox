@@ -297,6 +297,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN terminal_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN next_terminal_retry_at TEXT;");
 
+            // Per-item knob map (registered IKnob → string value). Stored as a
+            // JSON object; default '{}' so legacy rows behave as "no knobs set"
+            // and fall through to per-project / knob defaults at prompt time.
+            RunMigration("ALTER TABLE work_items ADD COLUMN knobs_json TEXT NOT NULL DEFAULT '{}';");
+
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
             // restart-recovery for the same iteration) overwrites the row via
@@ -435,7 +440,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup,
-                        terminal_retry_attempts, next_terminal_retry_at)
+                        terminal_retry_attempts, next_terminal_retry_at,
+                        knobs_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
@@ -450,7 +456,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup,
-                        $terminal_retry_attempts, $next_terminal_retry_at);
+                        $terminal_retry_attempts, $next_terminal_retry_at,
+                        $knobs);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -524,16 +531,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         try
         {
             using var cmd = _conn.CreateCommand();
-            // prompt / prompt_revision / priority / audit budget / external_id(s) are excluded
+            // prompt / prompt_revision / priority / audit budget / external_id(s) / knobs are excluded
             // from this UPDATE. Callers commonly pass a STALE in-memory WorkItem
             // snapshot taken at pickup time; writing those columns from the
             // snapshot would clobber a concurrent PUT /workitems/{id}/prompt,
             // POST /workitems/{id}/priority, PATCH /workitems/{id} audit budget,
-            // or PATCH /workitems/{id}/external-ids
+            // PATCH /workitems/{id}/external-ids, or queued knob edit
             // that landed mid-pipeline. Use TryReplacePromptAsync /
             // UpdatePriorityAsync / UpdateAuditBudgetAsync /
-            // ReplaceExternalIdsAsync to mutate them safely; routine state
-            // transitions leave them alone.
+            // ReplaceExternalIdsAsync / TryReplaceKnobsIfStateAndUpdatedAtAsync
+            // to mutate them safely; routine state transitions leave them alone.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
@@ -605,7 +612,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         try
         {
             using var cmd = _conn.CreateCommand();
-            // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s)
+            // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s) / knobs
             // are excluded from the full-row UPDATE to avoid stale-snapshot clobber.
             cmd.CommandText = """
                 UPDATE work_items SET
@@ -1020,6 +1027,130 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
             throw HandleDiskFull("UpdateAuditBudgetAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> TryReplaceKnobsIfStateAndUpdatedAtAsync(
+        WorkItemId id,
+        IReadOnlyDictionary<string, string> knobs,
+        DateTimeOffset updatedAt,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    knobs_json = $knobs,
+                    updated_at = $updated_at
+                WHERE id = $id
+                  AND state = $only_if_state
+                  AND updated_at = $only_if_updated_at;
+                """;
+            cmd.Parameters.AddWithValue("$knobs", SerialiseKnobs(knobs));
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+            cmd.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryReplaceKnobsIfStateAndUpdatedAtAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            // Endpoint-only mixed PATCH path: include prompt / revision, audit
+            // budget, and knobs because the exact updated_at guard proves this
+            // is still the queued row the operator validated before writing.
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    prompt = $prompt,
+                    prompt_revision = $prompt_revision,
+                    knobs_json = $knobs,
+                    audit_max_iterations = $audit_max_iterations,
+                    audit_complexity = $audit_complexity,
+                    project_id = $project_id, title = $title,
+                    base_branch = $base, work_branch = $work, agent = $agent,
+                    agent_instance_id = $agent_instance_id,
+                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    state = $state, updated_at = $ua, last_error = $err,
+                    upstream_push_attempts = $att, depends_on_json = $deps,
+                    agent_class_id = $class_id, queue_position = $qpos,
+                    stuck_retries = $sretries, started_at = $started_at,
+                    replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                    min_model_score = $min_model_score,
+                    cancellation_reason = $cancellation_reason,
+                    recovery_attempts = $recovery_attempts,
+                    recovery_attempt_source_state = $recovery_attempt_source_state,
+                    release_id = $release_id,
+                    preempted_at = $preempted_at,
+                    preempt_checkpoint = $preempt_checkpoint,
+                    suspended_vm_name = $suspended_vm_name,
+                    suspended_at = $suspended_at,
+                    agent_log_path = $agent_log_path,
+                    failure_kind = $failure_kind,
+                    quota_reset_at = $quota_reset_at,
+                    next_quota_retry_at = $next_quota_retry_at,
+                    quota_retry_attempts = $quota_retry_attempts,
+                    quota_retry_from = $quota_retry_from,
+                    quota_retry_phase = $quota_retry_phase,
+                    next_transient_retry_at = $next_transient_retry_at,
+                    transient_retry_attempts = $transient_retry_attempts,
+                    transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                    transient_retry_from = $transient_retry_from,
+                    agent_pause_target = $agent_pause_target,
+                    agent_pause_retry_from = $agent_pause_retry_from,
+                    auditor_profile = $auditor_profile,
+                    cancellation_source = $cancellation_source,
+                    transient_cancel_retries = $transient_cancel_retries,
+                    conflict_rework_attempts = $conflict_rework_attempts,
+                    baseline_image_ref = $baseline_image_ref,
+                    required_capabilities_json = $required_capabilities,
+                    job_type = $job_type,
+                    check_spec_json = $check_spec,
+                    agent_control_json = $agent_control,
+                    check_verdict_json = $check_verdict,
+                    origin_check_work_item_id = $origin_check,
+                    re_check_verdicts_json = $re_check_verdicts,
+                    template_name = $template_name,
+                    template_entry_index = $template_entry_index,
+                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
+                    terminal_retry_attempts = $terminal_retry_attempts,
+                    next_terminal_retry_at = $next_terminal_retry_at
+                WHERE id = $id
+                  AND state = $only_if_state
+                  AND updated_at = $only_if_updated_at;
+                """;
+            Bind(cmd, item);
+            cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+            cmd.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync", sqlex);
         }
         finally
         {
@@ -2163,7 +2294,44 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$preserve_work_branch_on_queued_pickup", item.PreserveWorkBranchOnQueuedPickup ? 1 : 0);
         cmd.Parameters.AddWithValue("$terminal_retry_attempts", item.TerminalRetryAttempts);
         cmd.Parameters.AddWithValue("$next_terminal_retry_at", (object?)item.NextTerminalRetryAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$knobs", SerialiseKnobs(item.Knobs));
     }
+
+    private static string SerialiseKnobs(IReadOnlyDictionary<string, string>? knobs)
+    {
+        if (knobs is null || knobs.Count == 0) return "{}";
+        return JsonSerializer.Serialize(knobs);
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadKnobs(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("knobs_json");
+        if (r.IsDBNull(ord)) return EmptyKnobs;
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json) || json == "{}") return EmptyKnobs;
+        try
+        {
+            var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+            if (dict is null || dict.Count == 0) return EmptyKnobs;
+            var rebuilt = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in dict)
+            {
+                // Case-insensitive duplicates can only appear on hand-edited or
+                // pre-migration rows (the API path always normalises through an
+                // OrdinalIgnoreCase dictionary). Last-write-wins matches the
+                // dictionary indexer semantics callers expect.
+                rebuilt[k] = v;
+            }
+            return rebuilt;
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("work item knobs_json is invalid JSON", ex);
+        }
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyKnobs
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     private static WorkItem Read(SqliteDataReader r) => new()
     {
@@ -2238,6 +2406,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         PreserveWorkBranchOnQueuedPickup = ReadInt32OrDefault(r, "preserve_work_branch_on_queued_pickup", defaultValue: 0) != 0,
         TerminalRetryAttempts = ReadInt32OrDefault(r, "terminal_retry_attempts", defaultValue: 0),
         NextTerminalRetryAt = ReadNullableDateTimeOffset(r, "next_terminal_retry_at"),
+        Knobs = ReadKnobs(r),
     };
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)

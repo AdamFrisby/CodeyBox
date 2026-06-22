@@ -179,6 +179,71 @@ public sealed class SqliteWorkItemStoreMigrationTests : IDisposable
     }
 
     [Fact]
+    public async Task KnobsJsonMigration_DefaultsLegacyRowsToEmptyKnobMap()
+    {
+        var id = WorkItemId.New();
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        using (var raw = new SqliteConnection($"Data Source={_dbPath}"))
+        {
+            raw.Open();
+            using var create = raw.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE work_items (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    base_branch TEXT,
+                    work_branch TEXT,
+                    agent TEXT,
+                    agent_instance_id TEXT,
+                    work_timeout_ticks INTEGER NOT NULL,
+                    merge_timeout_ticks INTEGER NOT NULL,
+                    push_upstream INTEGER NOT NULL,
+                    state INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    upstream_push_attempts INTEGER NOT NULL DEFAULT 0
+                );
+                """;
+            create.ExecuteNonQuery();
+
+            using var insert = raw.CreateCommand();
+            insert.CommandText = """
+                INSERT INTO work_items (
+                    id, project_id, title, prompt, agent,
+                    work_timeout_ticks, merge_timeout_ticks, push_upstream,
+                    state, created_at, updated_at, upstream_push_attempts)
+                VALUES (
+                    $id, 'proj', 'legacy row', 'p', 'claude',
+                    $work_timeout, $merge_timeout, 1,
+                    $state, $created_at, $updated_at, 0);
+                """;
+            insert.Parameters.AddWithValue("$id", id.ToString());
+            insert.Parameters.AddWithValue("$work_timeout", TimeSpan.FromMinutes(240).Ticks);
+            insert.Parameters.AddWithValue("$merge_timeout", TimeSpan.FromMinutes(60).Ticks);
+            insert.Parameters.AddWithValue("$state", (int)WorkItemState.Queued);
+            insert.Parameters.AddWithValue("$created_at", now);
+            insert.Parameters.AddWithValue("$updated_at", now);
+            insert.ExecuteNonQuery();
+        }
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+
+        var read = await store.GetAsync(id);
+        Assert.NotNull(read);
+        Assert.Empty(read!.Knobs);
+
+        using var verify = new SqliteConnection($"Data Source={_dbPath}");
+        verify.Open();
+        using var cmd = verify.CreateCommand();
+        cmd.CommandText = "SELECT knobs_json FROM work_items WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", id.ToString());
+        Assert.Equal("{}", cmd.ExecuteScalar());
+    }
+
+    [Fact]
     public async Task OriginCheckUniqueIndexMigration_ClearsDuplicateBacklinksBeforeCreatingIndex()
     {
         var originCheckId = WorkItemId.New();

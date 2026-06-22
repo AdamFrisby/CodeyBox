@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
@@ -717,6 +718,10 @@ public sealed class CheckAndActPipelineTests : IDisposable
                     Prompt = "remediate",
                     Priority = 1000,
                     MinModelScore = 200,
+                    Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+                    },
                 },
             },
         };
@@ -728,6 +733,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
         var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
         Assert.Equal(1000, followup.Priority);
         Assert.Equal(200, followup.MinModelScore);
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, followup.Knobs[ChangeScopeKnob.KeyName]);
     }
 
     [Fact]

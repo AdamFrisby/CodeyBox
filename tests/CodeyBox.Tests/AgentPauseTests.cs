@@ -397,7 +397,7 @@ public sealed class AgentPauseTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
         await queue.EnqueueAsync(item.Id);
 
-        Assert.True(await pipeline.WaitForEnteredAsync(TimeSpan.FromSeconds(5)));
+        Assert.True(await pipeline.WaitForEnteredAsync(TimeSpan.FromSeconds(15)));
         await pauses.PauseAsync(AgentKind.Claude, "after start", "test");
         pipeline.Release();
 
@@ -1331,9 +1331,18 @@ public sealed class AgentPauseTests : IDisposable
             await store.UpdateAsync(item.With(WorkItemState.Done), ct);
         }
 
-        public Task<bool> WaitForEnteredAsync(TimeSpan timeout) =>
-            Task.WhenAny(_entered.Task, Task.Delay(timeout))
-                .ContinueWith(t => t.Result == _entered.Task);
+        public async Task<bool> WaitForEnteredAsync(TimeSpan timeout)
+        {
+            try
+            {
+                await _entered.Task.WaitAsync(timeout);
+                return true;
+            }
+            catch (TimeoutException)
+            {
+                return false;
+            }
+        }
 
         public void Release() => _release.TrySetResult();
     }

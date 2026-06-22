@@ -261,6 +261,7 @@ internal sealed class AgentSupervisionApiFactory : WebApplicationFactory<Program
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
+            cfg.Sources.Clear();
             var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {

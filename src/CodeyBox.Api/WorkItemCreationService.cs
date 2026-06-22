@@ -14,6 +14,7 @@ internal sealed class WorkItemCreationService
     private readonly ITaskQueue _queue;
     private readonly IProjectRepository _projects;
     private readonly IAgentRegistry _agents;
+    private readonly IKnobRegistry _knobs;
     private readonly IReleaseStore? _releaseStore;
     private readonly IWebhookDispatcher _webhooks;
 
@@ -22,6 +23,7 @@ internal sealed class WorkItemCreationService
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
+        IKnobRegistry knobs,
         IWebhookDispatcher webhooks,
         IReleaseStore? releaseStore = null)
     {
@@ -29,6 +31,7 @@ internal sealed class WorkItemCreationService
         _queue = queue;
         _projects = projects;
         _agents = agents;
+        _knobs = knobs;
         _webhooks = webhooks;
         _releaseStore = releaseStore;
     }
@@ -270,6 +273,15 @@ internal sealed class WorkItemCreationService
             requiredCapabilities = normalised!;
         }
 
+        IReadOnlyDictionary<string, string> knobs = EmptyKnobs;
+        if (req.Knobs is { Count: > 0 })
+        {
+            var (normalisedKnobs, knobErr) = NormaliseKnobs(req.Knobs, _knobs);
+            if (knobErr is not null)
+                return new PreparedWorkItemCreationResult(null, knobErr);
+            knobs = normalisedKnobs!;
+        }
+
         var jobType = JobType.Normal;
         CheckAndActSpec? checkSpec = null;
         AgentControlSpec? agentControlSpec = null;
@@ -322,6 +334,14 @@ internal sealed class WorkItemCreationService
                 return Error("check.onYes.agentClassId must be <= 200 chars");
             if (onYes.DependsOn is { Length: > 100 })
                 return Error("check.onYes.dependsOn must contain at most 100 entries");
+            IReadOnlyDictionary<string, string> onYesKnobs = EmptyKnobs;
+            if (onYes.Knobs is { Count: > 0 })
+            {
+                var (normalisedOnYesKnobs, onYesKnobErr) = NormaliseKnobs(onYes.Knobs, _knobs);
+                if (onYesKnobErr is not null)
+                    return new PreparedWorkItemCreationResult(null, onYesKnobErr);
+                onYesKnobs = normalisedOnYesKnobs!;
+            }
 
             checkSpec = new CheckAndActSpec
             {
@@ -339,6 +359,7 @@ internal sealed class WorkItemCreationService
                     DependsOn = onYes.DependsOn is null
                         ? null
                         : onYes.DependsOn.Where(d => !string.IsNullOrWhiteSpace(d)).Select(d => d.Trim()).ToList(),
+                    Knobs = onYesKnobs,
                 },
             };
             jobType = JobType.CheckAndAct;
@@ -415,6 +436,7 @@ internal sealed class WorkItemCreationService
             ExternalIds = canonicalExternalIds,
             ReleaseId = releaseId,
             RequiredCapabilities = requiredCapabilities,
+            Knobs = knobs,
             JobType = jobType,
             Check = checkSpec,
             AgentControl = agentControlSpec,
@@ -491,6 +513,25 @@ internal sealed class WorkItemCreationService
                 new Dictionary<WorkItemId, WorkItemState>(),
                 new Dictionary<WorkItemId, string?>(),
                 Results.BadRequest(new { error = message }));
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyKnobs
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    internal static (IReadOnlyDictionary<string, string>? Knobs, IResult? Error) NormaliseKnobs(
+        IReadOnlyDictionary<string, string> raw,
+        IKnobRegistry registry)
+    {
+        var normalised = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (rawKey, rawValue) in raw)
+        {
+            var verdict = registry.Normalize(rawKey, rawValue);
+            if (!verdict.Ok)
+                return (null, Results.BadRequest(new { error = verdict.Error }));
+            normalised[verdict.Key!] = verdict.Value!;
+        }
+
+        return (normalised, null);
     }
 
     private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(

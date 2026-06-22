@@ -144,6 +144,78 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
         AssertAuditEmitted("TryUpdateIfStateAsync");
     }
 
+    [Fact]
+    public async Task TryReplaceKnobsIfStateAndUpdatedAtAsync_TranslatesSqliteFull_ToTypedException()
+    {
+        ConfigureLogger();
+        _sink.Clear();
+        using var store = new SqliteWorkItemStore(_dbPath);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+        };
+        await store.CreateAsync(item);
+
+        store.ForceMaxPageCountForTesting(1);
+
+        var knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["largeKnob"] = new string('k', 256 * 1024),
+        };
+        var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(
+            () => store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
+                item.Id,
+                knobs,
+                item.UpdatedAt.AddSeconds(1),
+                item.State,
+                item.UpdatedAt));
+        Assert.Equal("TryReplaceKnobsIfStateAndUpdatedAtAsync", ex.Operation);
+        Assert.IsType<SqliteException>(ex.InnerException);
+        AssertAuditEmitted("TryReplaceKnobsIfStateAndUpdatedAtAsync");
+    }
+
+    [Fact]
+    public async Task TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync_TranslatesSqliteFull_ToTypedException()
+    {
+        ConfigureLogger();
+        _sink.Clear();
+        using var store = new SqliteWorkItemStore(_dbPath);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+        };
+        await store.CreateAsync(item);
+
+        store.ForceMaxPageCountForTesting(1);
+
+        var updated = item with
+        {
+            UpdatedAt = item.UpdatedAt.AddSeconds(1),
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["largeKnob"] = new string('k', 256 * 1024),
+            },
+        };
+        var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(
+            () => store.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
+                updated,
+                item.State,
+                item.UpdatedAt));
+        Assert.Equal("TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync", ex.Operation);
+        Assert.IsType<SqliteException>(ex.InnerException);
+        AssertAuditEmitted("TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync");
+    }
+
     private void AssertAuditEmitted(string expectedOperation)
     {
         var evt = _sink.Events.FirstOrDefault(e =>

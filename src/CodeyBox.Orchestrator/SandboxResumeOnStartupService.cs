@@ -275,7 +275,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             {
                 var backgroundCts = new CancellationTokenSource();
                 _backgroundCts = backgroundCts;
-                _resumeTask = RunLongRunningAsync(() => ResumeAllAndSignalAsync(backgroundCts.Token));
+                _resumeTask = RunBackgroundAsync(() => ResumeAllAndSignalAsync(backgroundCts.Token));
                 return Task.CompletedTask;
             }
 
@@ -845,6 +845,15 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             work,
             CancellationToken.None,
             TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
+            TaskScheduler.Default).Unwrap();
+
+    // The sweep coordinator is async; only provider calls that may block before
+    // returning their Task need the dedicated-thread LongRunning path.
+    private static Task RunBackgroundAsync(Func<Task> work) =>
+        Task.Factory.StartNew(
+            work,
+            CancellationToken.None,
+            TaskCreationOptions.DenyChildAttach,
             TaskScheduler.Default).Unwrap();
 
     private static Task<T> RunLongRunningAsync<T>(Func<Task<T>> work) =>

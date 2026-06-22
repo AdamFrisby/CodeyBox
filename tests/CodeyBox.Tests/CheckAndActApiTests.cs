@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator.Knobs;
 
 namespace CodeyBox.Tests;
 
@@ -46,6 +47,10 @@ public sealed class CheckAndActApiTests : IDisposable
                     prompt = "Remediate all SQL string interpolation.",
                     minModelScore = 50,
                     priority = 100,
+                    knobs = new Dictionary<string, string>
+                    {
+                        [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+                    },
                 },
                 mode = "completion",
             },
@@ -71,6 +76,7 @@ public sealed class CheckAndActApiTests : IDisposable
         Assert.Equal(CheckAndActModes.Completion, stored.Check.Mode);
         Assert.Equal(100, stored.Check.OnYes.Priority);
         Assert.Equal(50, stored.Check.OnYes.MinModelScore);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, stored.Check.OnYes.Knobs[ChangeScopeKnob.KeyName]);
     }
 
     [Fact]
@@ -308,6 +314,42 @@ public sealed class CheckAndActApiTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         var err = await response.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Contains("onYes.prompt", err.GetProperty("error").GetString());
+    }
+
+    [Theory]
+    [InlineData("""{ "notARealKnob": "value" }""", "unknown knob")]
+    [InlineData("""{ "changeScope": "yolo" }""", "not allowed")]
+    [InlineData("""{ "changeScope": null }""", "must not be null")]
+    public async Task PostWorkItems_CheckOnYesKnobsInvalid_Returns400AndDoesNotPersist(
+        string knobsJson,
+        string expectedMessage)
+    {
+        var rawJson = $$"""
+            {
+              "projectId": "test-project",
+              "title": "bad nested knobs",
+              "prompt": "x",
+              "check": {
+                "question": "is x?",
+                "onYes": {
+                  "title": "fix",
+                  "prompt": "go",
+                  "knobs": {{knobsJson}}
+                }
+              }
+            }
+            """;
+        var response = await _client.PostAsync(
+            "/workitems",
+            new StringContent(rawJson, System.Text.Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains(expectedMessage, err.GetProperty("error").GetString());
+
+        var stored = new List<WorkItem>();
+        await foreach (var item in _factory.Store.ListAsync()) stored.Add(item);
+        Assert.Empty(stored);
     }
 
     [Fact]

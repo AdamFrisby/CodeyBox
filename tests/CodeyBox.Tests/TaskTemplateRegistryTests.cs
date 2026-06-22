@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using CodeyBox.Api;
+using CodeyBox.Orchestrator.Knobs;
 
 namespace CodeyBox.Tests;
 
@@ -25,7 +26,8 @@ public sealed class TaskTemplateRegistryTests : IDisposable
                   "mode": "completion",
                   "onYes": {
                     "title": "Fix SQL injection",
-                    "prompt": "Replace unsafe SQL construction with parameters."
+                    "prompt": "Replace unsafe SQL construction with parameters.",
+                    "knobs": { "changeScope": "surgical" }
                   }
                 },
                 {
@@ -47,6 +49,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         Assert.Equal(2, loaded.Checks.Count);
         Assert.Equal("Is user input interpolated into SQL?", loaded.Checks[0].Question);
         Assert.Equal("completion", loaded.Checks[0].Mode);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, loaded.Checks[0].OnYes.Knobs![ChangeScopeKnob.KeyName]);
         Assert.Equal("agentic", loaded.Checks[1].Mode);
         Assert.False(loaded.Checks[1].ActionableAnswer);
 

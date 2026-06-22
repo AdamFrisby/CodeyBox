@@ -259,7 +259,11 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
 
         var now = DateTimeOffset.UtcNow;
-        var running = MakeItem(createdAt: now);
+        // The scenario under test is the pause of a second, already-consumed
+        // wake while it waits for the first worker slot. Make the first item
+        // unambiguously first in the store-backed dispatcher ordering so the
+        // assertion does not depend on timestamp precision under load.
+        var running = MakeItem(createdAt: now) with { Priority = 1 };
         var readyBacklog = MakeItem(createdAt: now.AddMilliseconds(1));
         await _store.CreateAsync(running);
         await _store.CreateAsync(readyBacklog);

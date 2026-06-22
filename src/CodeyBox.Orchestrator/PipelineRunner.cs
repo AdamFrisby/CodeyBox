@@ -4397,8 +4397,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// <see cref="WorkItem.ProjectId"/> and base branch, uses the spec's
     /// title / prompt verbatim, and back-links to the check via
     /// <see cref="WorkItem.OriginCheckWorkItemId"/>. Optional spec fields
-    /// (agent kind, agent class, dependsOn, priority, min-model-score) flow
-    /// through verbatim — no defaulting here so the operator's intent is
+    /// (agent kind, agent class, dependsOn, priority, min-model-score, knobs)
+    /// flow through verbatim — no defaulting here so the operator's intent is
     /// preserved end-to-end. Dependency resolution mirrors
     /// <c>POST /workitems</c>: UUIDs and bare/namespaced externalIds within
     /// the same project.
@@ -4439,6 +4439,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             MinModelScore = minScore,
             OriginCheckWorkItemId = checkItem.Id,
             JobType = JobType.Normal,
+            Knobs = onYes.Knobs,
         };
 
         try

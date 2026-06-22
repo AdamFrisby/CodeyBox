@@ -2,12 +2,19 @@ using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Configuration;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
 
 public sealed class ProjectRepositoryTests
 {
+    private static readonly IKnobRegistry ProjectKnobRegistry = new KnobRegistry(
+    [
+        new ChangeScopeKnob(),
+        new TestStringKnob("otherKnob", "bar"),
+    ]);
+
     [Fact]
     public async Task LoadsProjectsFromConfig()
     {
@@ -1004,6 +1011,311 @@ public sealed class ProjectRepositoryTests
         Assert.NotNull(p);
         Assert.Equal("noop", p!.Upstream.Kind);
     }
+
+    [Fact]
+    public async Task Knobs_DefaultsOnly_FlowToProject()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
+            ],
+        };
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("surgical", p!.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task Knobs_ProjectOnly_FlowsThroughWithoutDefaults()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "refactor" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task Knobs_ProjectOverridesDefaultOnKeyCollision()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "refactor" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+    }
+
+    [Fact]
+    public async Task Knobs_EmptyStringInProject_ClearsInheritedDefault()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.False(p!.Knobs.ContainsKey("changeScope"));
+    }
+
+    [Fact]
+    public void Knobs_UnknownProjectClear_IsRejectedAtConfigLoad()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScpoe"] = "" },
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("unknown knob 'changeScpoe'", ex.Message);
+    }
+
+    [Fact]
+    public void Knobs_WhitespaceKeyInProject_IsRejected()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string>
+                    {
+                        ["   "] = "surgical",
+                        ["changeScope"] = "refactor",
+                    },
+                },
+            ],
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("knob key must not be empty", ex.Message);
+    }
+
+    [Fact]
+    public void Knobs_WhitespaceValueInDefaults_IsRejected()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScope"] = "  " },
+            },
+            Projects =
+            [
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
+            ],
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("value must not be empty", ex.Message);
+    }
+
+    [Fact]
+    public void Knobs_UnknownDefaultKey_IsRejectedAtConfigLoad()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string> { ["changeScpoe"] = "surgical" },
+            },
+            Projects =
+            [
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://example.com/x.git" },
+            ],
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("unknown knob 'changeScpoe'", ex.Message);
+    }
+
+    [Fact]
+    public void Knobs_InvalidProjectValue_IsRejectedAtConfigLoad()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "yolo" },
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry));
+        Assert.Contains("not allowed", ex.Message);
+        Assert.Contains("surgical", ex.Message);
+    }
+
+    [Fact]
+    public async Task Knobs_KeyOnlyInDefaults_NotShadowedByProjectKnobsForOtherKey()
+    {
+        // A project that overrides one knob must NOT wipe other inherited
+        // defaults — the merge is per-key, not whole-map replace.
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Knobs = new Dictionary<string, string>
+                {
+                    ["changeScope"] = "surgical",
+                    ["otherKnob"] = "foo",
+                },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Knobs = new Dictionary<string, string> { ["changeScope"] = "refactor" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+        Assert.Equal("foo", p.Knobs["otherKnob"]);
+    }
+
+    [Fact]
+    public async Task Knobs_ConfigBuilderBinding_FlowsThroughDefaultsAndProjectOverrides()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Defaults:Knobs:changeScope"] = "surgical",
+                ["CodeyBox:Defaults:Knobs:otherKnob"] = "foo",
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Knobs:changeScope"] = "refactor",
+            })
+            .Build();
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(
+            Options.Create(opts),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            ProjectKnobRegistry);
+
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.NotNull(p);
+        Assert.Equal("refactor", p!.Knobs["changeScope"]);
+        Assert.Equal("foo", p.Knobs["otherKnob"]);
+    }
+}
+
+file sealed class TestStringKnob : IKnob
+{
+    public TestStringKnob(string key, string defaultValue)
+    {
+        Key = key;
+        DefaultValue = defaultValue;
+    }
+
+    public string Key { get; }
+    public string Description => $"test string knob '{Key}'";
+    public IReadOnlyList<string> AllowedValues => [];
+    public string DefaultValue { get; }
+    public string? GetWorkPromptFragment(string value) => null;
 }
 
 file sealed class NullAgent : IAgentRunner

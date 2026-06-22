@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Orchestrator.Knobs;
 
 namespace CodeyBox.Tests;
 
@@ -163,6 +164,27 @@ public sealed class ReplayCreationTests : IDisposable
         var dto = await resp.Content.ReadFromJsonAsync<EligibilityResponse>();
         Assert.Equal(95, dto!.MinModelScore);
         Assert.Equal(new[] { "sensitive", "architectural" }, dto.RequiredCapabilities);
+    }
+
+    [Fact]
+    public async Task Replay_CopiesKnobsFromSource()
+    {
+        var source = DoneItem() with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            },
+        };
+        await _factory.Store.CreateAsync(source);
+
+        var resp = await _client.PostAsJsonAsync($"/workitems/{source.Id}/replay", new { });
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        var dto = await resp.Content.ReadFromJsonAsync<WorkItemResponse>();
+
+        var replay = await _factory.Store.GetAsync(WorkItemId.Parse(dto!.Id));
+        Assert.NotNull(replay);
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, replay!.Knobs[ChangeScopeKnob.KeyName]);
     }
 
     // ── Local response shape ─────────────────────────────────────────────────

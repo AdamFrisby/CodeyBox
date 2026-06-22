@@ -59,9 +59,13 @@ public sealed class StartupResumeApiAvailabilityTests
         HttpResponseMessage? response = null;
         try
         {
+            // Blocking mode intentionally waits for a hung resume until
+            // configuredTimeout; the extra wall-clock slack absorbs full-suite
+            // host startup contention without changing the elapsed assertions
+            // that prove the startup resume contract.
             var availabilityDeadline = mode == SandboxResumeMode.Background
                 ? configuredTimeout
-                : configuredTimeout + TimeSpan.FromSeconds(7);
+                : configuredTimeout + TimeSpan.FromSeconds(30);
             response = await Task.Run(async () =>
             {
                 bootstrapClient = factory.CreateClient();

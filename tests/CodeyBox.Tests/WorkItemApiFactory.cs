@@ -22,6 +22,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
     private readonly Project[] _projects;
 
     public SqliteWorkItemStore Store { get; }
+    public List<IKnob> AdditionalKnobs { get; } = new();
     public string? TemplateDirectory { get; set; }
     public int? MaxTemplateChecks { get; set; }
     public Func<SqliteWorkItemStore, IWorkItemStore>? WorkItemStoreDecorator { get; set; }
@@ -88,6 +89,9 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
             // the same externalId is allowed in two different projects.
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(_projects));
+
+            foreach (var knob in AdditionalKnobs)
+                services.AddSingleton(knob);
         });
     }
 
