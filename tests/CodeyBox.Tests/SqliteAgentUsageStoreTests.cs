@@ -22,7 +22,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     }
 
     private static AgentUsageEvent Event(
-        DateTimeOffset time, string agent = "opencode", string? model = "m1", long microCents = 10_000) => new()
+        DateTimeOffset time, string agent = "opencode", string? model = "m1", long costMicroCents = 10_000) => new()
         {
             Id = Guid.NewGuid().ToString("N"),
             TimeUtc = time,
@@ -31,7 +31,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
             InputTokens = 100,
             CachedInputTokens = 10,
             OutputTokens = 20,
-            CostMicroCents = microCents,
+            CostMicroCents = costMicroCents,
             WorkItemId = "wi-1",
         };
 
@@ -39,9 +39,9 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     public async Task SumWindow_SumsOnlyEventsInRange()
     {
         var now = DateTimeOffset.UtcNow;
-        await _store.RecordAsync(Event(now.AddHours(-1), microCents: 100));
-        await _store.RecordAsync(Event(now.AddHours(-2), microCents: 200));
-        await _store.RecordAsync(Event(now.AddHours(-10), microCents: 999)); // outside 5h window
+        await _store.RecordAsync(Event(now.AddHours(-1), costMicroCents: 100));
+        await _store.RecordAsync(Event(now.AddHours(-2), costMicroCents: 200));
+        await _store.RecordAsync(Event(now.AddHours(-10), costMicroCents: 999)); // outside 5h window
 
         var agg = await _store.SumWindowAsync("opencode", "m1", now.AddHours(-5), now.AddHours(1));
 
@@ -54,9 +54,9 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     public async Task SumWindow_FiltersByAgentAndModel()
     {
         var now = DateTimeOffset.UtcNow;
-        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", microCents: 100));
-        await _store.RecordAsync(Event(now, agent: "opencode", model: "m2", microCents: 500));
-        await _store.RecordAsync(Event(now, agent: "claude", model: "m1", microCents: 700));
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", costMicroCents: 100));
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m2", costMicroCents: 500));
+        await _store.RecordAsync(Event(now, agent: "claude", model: "m1", costMicroCents: 700));
 
         var agg = await _store.SumWindowAsync("opencode", "m1", now.AddHours(-1), now.AddHours(1));
 
@@ -68,8 +68,8 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     public async Task SumWindow_NullModel_MatchesOnlyNullModelRows()
     {
         var now = DateTimeOffset.UtcNow;
-        await _store.RecordAsync(Event(now, model: null, microCents: 42));
-        await _store.RecordAsync(Event(now, model: "m1", microCents: 999));
+        await _store.RecordAsync(Event(now, model: null, costMicroCents: 42));
+        await _store.RecordAsync(Event(now, model: "m1", costMicroCents: 999));
 
         var agg = await _store.SumWindowAsync("opencode", null, now.AddHours(-1), now.AddHours(1));
 
@@ -86,8 +86,8 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
         // paths sum the same rows; without them a casing mismatch would sum to
         // zero and overstate remaining budget.
         var now = DateTimeOffset.UtcNow;
-        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", microCents: 100));
-        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", microCents: 200));
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", costMicroCents: 100));
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", costMicroCents: 200));
 
         var agg = await _store.SumWindowAsync("OpenCode", "M1", now.AddHours(-1), now.AddHours(1));
 
@@ -224,11 +224,11 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
         // by AgentBudgetCalculator under real config into the right AvailablePct.
         // The split fake-based suites (FakeUsageStore + direct store calls) cannot
         // catch wiring mistakes here: time_utc bounds, the model-key bucket match
-        // between RecordAsync and SumWindowAsync, and the microcents→percent math.
+        // between RecordAsync and SumWindowAsync, and the legacy cost-unit-to-percent math.
         var now = DateTimeOffset.UtcNow;
-        await _store.RecordAsync(Event(now.AddHours(-1), microCents: 1_000_000)); // 100c, in window
-        await _store.RecordAsync(Event(now.AddHours(-2), microCents: 800_000));   // 80c, in window
-        await _store.RecordAsync(Event(now.AddHours(-10), microCents: 5_000_000)); // 500c, outside 5h window
+        await _store.RecordAsync(Event(now.AddHours(-1), costMicroCents: AgentUsageEvent.UsdToMicroCents(1.00m))); // 100c, in window
+        await _store.RecordAsync(Event(now.AddHours(-2), costMicroCents: AgentUsageEvent.UsdToMicroCents(0.80m))); // 80c, in window
+        await _store.RecordAsync(Event(now.AddHours(-10), costMicroCents: AgentUsageEvent.UsdToMicroCents(5.00m))); // 500c, outside 5h window
 
         var opts = new AgentBudgetOptions();
         opts.Members["opencode"] = new AgentBudgetMemberOptions
@@ -251,7 +251,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
 
         var snapshot = await calc.GetBudgetSnapshotAsync(AgentKind.Opencode, "m1");
 
-        // 180c spent of 200c limit → 10% remaining; the out-of-window 500c row is
+        // 180c spent of 200c limit -> 10% remaining; the out-of-window 500c row is
         // excluded by the time bound, not double-counted.
         Assert.NotNull(snapshot);
         Assert.Equal(10.0, snapshot!.AvailablePct, precision: 6);
@@ -370,7 +370,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
         int input = 0,
         int cached = 0,
         int output = 0,
-        long microCents = 0) => new()
+        long costMicroCents = 0) => new()
         {
             Id = Guid.NewGuid().ToString("N"),
             TimeUtc = time,
@@ -379,7 +379,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
             InputTokens = input,
             CachedInputTokens = cached,
             OutputTokens = output,
-            CostMicroCents = microCents,
+            CostMicroCents = costMicroCents,
             WorkItemId = "wi-tokens",
         };
 

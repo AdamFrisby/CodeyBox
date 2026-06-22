@@ -35,6 +35,7 @@ namespace CodeyBox.Tests;
 /// surfaces here rather than via mysterious turn failures in production.
 /// </summary>
 [SupportedOSPlatform("linux")]
+[Collection("Process environment")]
 public sealed class AcpBridgeUnitTests
 {
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
@@ -2710,8 +2711,8 @@ public sealed class AcpBridgeUnitTests
 
     [Theory]
     [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
-    [InlineData(2,  "SIGINT")]  // Ctrl+C
-    [InlineData(1,  "SIGHUP")]  // controlling-terminal hangup
+    [InlineData(2, "SIGINT")]  // Ctrl+C
+    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
     public async Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName)
     {
         if (!File.Exists("/bin/bash"))

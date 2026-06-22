@@ -14470,10 +14470,10 @@ Original merge-phase failure (for context):
     /// <para>
     /// Token counts and cost come from parsing untrusted agent stdout/stderr. A
     /// hostile or malformed CLI emission (e.g. <c>completion_tokens:-999999999</c>)
-    /// would otherwise persist negative microcents, deflate the budget window SUM,
-    /// and keep AvailablePct artificially high — fail-open on the spend cap. Every
-    /// persisted component is clamped non-negative so a bad emission can only ever
-    /// over-report spend, never deflate it.
+    /// would otherwise persist a negative legacy cost unit, deflate the budget
+    /// window SUM, and keep AvailablePct artificially high — fail-open on the
+    /// spend cap. Every persisted component is clamped non-negative so a bad
+    /// emission can only ever over-report spend, never deflate it.
     /// </para>
     /// </summary>
     internal static AgentUsageEvent BuildUsageEvent(

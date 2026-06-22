@@ -6,8 +6,9 @@ namespace CodeyBox.Core;
 /// <see cref="IWorkItemCostStore"/> (whose rows cascade-delete with the work
 /// item), usage events live in an independent table so multi-window budget
 /// accounting is not corrupted when a work item is deleted. Cost is stored in
-/// <b>microcents</b> (1 cent = 10000 microcents, 1 USD = 1_000_000 microcents)
-/// to keep an integer column without losing per-call precision.
+/// the historical <c>CostMicroCents</c> / <c>cost_microcents</c> unit:
+/// <b>USD x 1_000_000</b> (micro-dollars). The name is legacy; these values
+/// are not true microcents.
 /// </summary>
 public sealed record AgentUsageEvent
 {
@@ -25,20 +26,38 @@ public sealed record AgentUsageEvent
     public int CachedInputTokens { get; init; }
     public required int OutputTokens { get; init; }
 
-    /// <summary>Equivalent pay-per-API cost of this invocation in microcents (USD × 1_000_000).</summary>
+    /// <summary>
+    /// Equivalent pay-per-API cost of this invocation in the legacy
+    /// <c>CostMicroCents</c> unit: USD x 1_000_000 (micro-dollars, not true
+    /// microcents).
+    /// </summary>
     public required long CostMicroCents { get; init; }
 
     /// <summary>The work item this invocation belonged to. Kept for traceability; not a FK.</summary>
     public string? WorkItemId { get; init; }
 
-    /// <summary>Converts an equivalent-USD figure to the microcents unit used by this table.</summary>
+    /// <summary>
+    /// Number of legacy <c>CostMicroCents</c> storage units per USD. Despite the
+    /// historical name, one unit is one micro-dollar, not one true microcent.
+    /// </summary>
+    public const long CostMicroCentsPerUsd = 1_000_000L;
+
+    /// <summary>Number of legacy <c>CostMicroCents</c> storage units per cent.</summary>
+    public const long CostMicroCentsPerCent = CostMicroCentsPerUsd / 100L;
+
+    /// <summary>Converts an equivalent-USD figure to the legacy storage unit.</summary>
     public static long UsdToMicroCents(decimal usd) =>
-        (long)decimal.Round(usd * 1_000_000m, 0, MidpointRounding.AwayFromZero);
+        (long)decimal.Round(usd * CostMicroCentsPerUsd, 0, MidpointRounding.AwayFromZero);
+
+    /// <summary>Converts the legacy storage unit back to equivalent USD.</summary>
+    public static decimal MicroCentsToUsd(long costMicroCents) =>
+        costMicroCents / (decimal)CostMicroCentsPerUsd;
 }
 
 /// <summary>
 /// Aggregate of usage events over a time window for one (agent, model) pair.
 /// </summary>
+/// <param name="SumMicroCents">Sum in the legacy <c>CostMicroCents</c> unit: USD x 1_000_000.</param>
 public readonly record struct AgentUsageWindowAggregate(
     long SumMicroCents,
     DateTimeOffset? EarliestUtc,
@@ -52,6 +71,7 @@ public readonly record struct AgentUsageWindowAggregate(
 /// same interval. <see cref="AgentUsageWindowAggregate"/> stays the
 /// budget-side cost-only shape.
 /// </summary>
+/// <param name="SumMicroCents">Sum in the legacy <c>CostMicroCents</c> unit: USD x 1_000_000.</param>
 public readonly record struct AgentUsageWindowTokens(
     long InputTokens,
     long CachedInputTokens,
@@ -85,7 +105,8 @@ public interface IAgentUsageStore
 
     /// <summary>
     /// Token-aware window aggregate. Returns input / cached input / output token
-    /// totals, cost (microcents), event count, and earliest event time for events
+    /// totals, cost in the legacy <c>CostMicroCents</c> unit (USD x 1_000_000),
+    /// event count, and earliest event time for events
     /// matching <paramref name="agentKind"/> + <paramref name="modelId"/> with
     /// <see cref="AgentUsageEvent.TimeUtc"/> in <c>[fromUtc, toUtc)</c>.
     /// <para>When <paramref name="modelId"/> is null the implementation MUST sum

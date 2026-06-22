@@ -48,8 +48,8 @@ public sealed class AgentBudgetCalculatorTests
     [Fact]
     public async Task SingleWindow_HalfSpent_ReturnsFiftyPercentRemaining()
     {
-        // LimitCents 200 → 2_000_000 microcents; 1_000_000 spent = 50% used.
-        var store = new FakeUsageStore { DefaultSum = 1_000_000 };
+        // LimitCents 200 ($2.00); $1.00 spent = 50% used.
+        var store = new FakeUsageStore { DefaultSum = AgentUsageEvent.UsdToMicroCents(1.00m) };
         var calc = Build(store, Opts(Rolling(5, 200)));
 
         var snapshot = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
@@ -65,8 +65,8 @@ public sealed class AgentBudgetCalculatorTests
         // 90% used must yield 10% remaining. The 50% boundary test cannot catch a
         // percentUsed/percentRemaining inversion (both formulas give 50 there);
         // this asymmetric point only passes when AvailablePct == 100 - percentUsed.
-        // LimitCents 200 → 2_000_000 microcents; 1_800_000 spent = 90% used.
-        var store = new FakeUsageStore { DefaultSum = 1_800_000 };
+        // LimitCents 200 ($2.00); $1.80 spent = 90% used.
+        var store = new FakeUsageStore { DefaultSum = AgentUsageEvent.UsdToMicroCents(1.80m) };
         var calc = Build(store, Opts(Rolling(5, 200)));
 
         var snapshot = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
@@ -112,8 +112,8 @@ public sealed class AgentBudgetCalculatorTests
         {
             Responder = (_, _, from, to) =>
                 (to - from) < TimeSpan.FromDays(1)
-                    ? new AgentUsageWindowAggregate(1_000_000, null, 1) // 50% of 200c
-                    : new AgentUsageWindowAggregate(200_000, null, 1),  // 10% of 200c → 90% remaining
+                    ? new AgentUsageWindowAggregate(AgentUsageEvent.UsdToMicroCents(1.00m), null, 1) // 50% of 200c
+                    : new AgentUsageWindowAggregate(AgentUsageEvent.UsdToMicroCents(0.20m), null, 1), // 10% of 200c -> 90% remaining
         };
         var opts = Opts(Rolling(5, 200), new AgentBudgetWindowOptions { Kind = BudgetWindowKind.Monthly, LimitCents = 200 });
         var calc = Build(store, opts);
@@ -135,9 +135,9 @@ public sealed class AgentBudgetCalculatorTests
             Responder = (_, _, from, to) =>
             {
                 var span = to - from;
-                if (span < TimeSpan.FromDays(1)) return new AgentUsageWindowAggregate(1_000_000, null, 1); // 50% rem
-                if (span < TimeSpan.FromDays(10)) return new AgentUsageWindowAggregate(1_600_000, null, 1); // 20% rem
-                return new AgentUsageWindowAggregate(200_000, null, 1); // 90% rem
+                if (span < TimeSpan.FromDays(1)) return new AgentUsageWindowAggregate(AgentUsageEvent.UsdToMicroCents(1.00m), null, 1); // 50% rem
+                if (span < TimeSpan.FromDays(10)) return new AgentUsageWindowAggregate(AgentUsageEvent.UsdToMicroCents(1.60m), null, 1); // 20% rem
+                return new AgentUsageWindowAggregate(AgentUsageEvent.UsdToMicroCents(0.20m), null, 1); // 90% rem
             },
         };
         var opts = Opts(
@@ -203,7 +203,7 @@ public sealed class AgentBudgetCalculatorTests
     [Fact]
     public async Task SummariseAll_ReturnsPerWindowUsageView()
     {
-        var store = new FakeUsageStore { DefaultSum = 1_000_000 };
+        var store = new FakeUsageStore { DefaultSum = AgentUsageEvent.UsdToMicroCents(1.00m) };
         var calc = Build(store, Opts(Rolling(5, 200)));
 
         var views = await calc.SummariseAllAsync();
@@ -214,7 +214,7 @@ public sealed class AgentBudgetCalculatorTests
         var w = Assert.Single(view.Windows);
         Assert.Equal("Rolling", w.Kind);
         Assert.Equal(5, w.Hours);
-        Assert.Equal(100, w.UsedCents);   // 1_000_000 microcents = 100 cents
+        Assert.Equal(100, w.UsedCents);   // $1.00 = 100 cents
         Assert.Equal(200, w.LimitCents);
         Assert.Equal(50.0, w.PercentRemaining, precision: 6);
     }
@@ -222,7 +222,7 @@ public sealed class AgentBudgetCalculatorTests
     [Fact]
     public async Task ConfigReload_AppliesNewLimits()
     {
-        var store = new FakeUsageStore { DefaultSum = 1_000_000 };
+        var store = new FakeUsageStore { DefaultSum = AgentUsageEvent.UsdToMicroCents(1.00m) };
         var calc = Build(store, Opts(Rolling(5, 200)));
 
         var first = await calc.SummariseAllAsync();
@@ -370,7 +370,7 @@ public sealed class AgentBudgetCalculatorTests
         // keep /quota reporting pre-outage percentRemaining after an accounting
         // outage begins, contradicting the fail-closed contract. Every call
         // recomputes against the live store.
-        var store = new FakeUsageStore { DefaultSum = 1_000_000 };
+        var store = new FakeUsageStore { DefaultSum = AgentUsageEvent.UsdToMicroCents(1.00m) };
         var calc = Build(store, Opts(Rolling(5, 200)));
 
         await calc.SummariseAllAsync();
@@ -408,7 +408,7 @@ public sealed class AgentBudgetCalculatorTests
         // The dispatch gate must recompute every call: a cached "healthy" value
         // would mask an accounting outage, bypassing the documented fail-closed
         // behaviour.
-        var store = new FakeUsageStore { DefaultSum = 1_000_000 };
+        var store = new FakeUsageStore { DefaultSum = AgentUsageEvent.UsdToMicroCents(1.00m) };
         var calc = Build(store, Opts(Rolling(5, 200)));
 
         await calc.GetBudgetSnapshotAsync(Opencode, "m1");

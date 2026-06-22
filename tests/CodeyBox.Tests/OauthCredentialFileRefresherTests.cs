@@ -15,6 +15,7 @@ namespace CodeyBox.Tests;
 /// posts to the OAuth refresh endpoint, persists the new token to disk, and
 /// dedupes concurrent refresh attempts.
 /// </summary>
+[Collection("Process environment")]
 public sealed class OauthCredentialFileRefresherTests : IDisposable
 {
     private readonly string _dir;
