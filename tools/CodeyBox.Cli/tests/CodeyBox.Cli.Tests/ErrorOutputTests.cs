@@ -105,7 +105,7 @@ public sealed class ErrorOutputTests
             Assert.Contains("Source: --api-url flag.", error);
             Assert.Contains("Cause: connection refused", error);
             Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
-            Assert.Contains("--api-url flag > CODEYBOX_CLI_API_URL environment variable", error);
+            AssertFullApiBaseUrlPrecedence(error, tempDir);
             Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"CLI took {sw.Elapsed} to report connection refused.");
         }
         finally
@@ -225,7 +225,7 @@ public sealed class ErrorOutputTests
             Assert.Contains("malformed API base URL 'not a url'", error);
             Assert.Contains("Source: --api-url flag.", error);
             Assert.Contains("Cause: value is not an absolute URI", error);
-            Assert.Contains("--api-url flag > CODEYBOX_CLI_API_URL environment variable", error);
+            AssertFullApiBaseUrlPrecedence(error, tempDir);
             Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
         }
         finally
@@ -261,7 +261,7 @@ public sealed class ErrorOutputTests
             Assert.Contains("malformed API base URL", error);
             Assert.Contains("Source: --api-url flag.", error);
             Assert.Contains($"Cause: {expectedCause}", error);
-            Assert.Contains("--api-url flag > CODEYBOX_CLI_API_URL environment variable", error);
+            AssertFullApiBaseUrlPrecedence(error, tempDir);
             Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
         }
         finally
@@ -521,6 +521,7 @@ public sealed class ErrorOutputTests
             var args = (string[])row[0];
             yield return new object[] { args, SocketFailure(SocketError.ConnectionRefused), "connection refused" };
             yield return new object[] { args, SocketFailure(SocketError.HostNotFound), "invalid host or DNS lookup failed" };
+            yield return new object[] { args, SocketFailure(SocketError.TimedOut), "timeout" };
             yield return new object[]
             {
                 args,
@@ -529,6 +530,104 @@ public sealed class ErrorOutputTests
                     new TimeoutException("connect timed out")),
                 "timeout",
             };
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Error_WatchConnectionFailure_PrintsResolvedUrlCauseRemedyAndSource(bool forcePoll)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        var url = $"http://127.0.0.1:{GetUnusedTcpPort()}";
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+
+        var args = forcePoll
+            ? new[] { "--api-url", url, "queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll" }
+            : new[] { "--api-url", url, "queue", "watch", "aabbccdd-0000-0000-0000-000000000000" };
+
+        using var output = new TestOutput();
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var code = await CliApp.InvokeAsync(args);
+            sw.Stop();
+
+            var error = output.Error.ToString();
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Connection error: Could not connect to the CodeyBox API.", error);
+            Assert.Contains($"Resolved API base URL: {url}", error);
+            Assert.Contains("Source: --api-url flag.", error);
+            Assert.Contains("Cause: connection refused", error);
+            AssertFullApiBaseUrlPrecedence(error, tempDir);
+            Assert.Contains("Run codeybox configure to set the API base URL and key, or pass --api-url.", error);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"CLI took {sw.Elapsed} to report watch connection failure.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Error_CallerCancelledRequest_IsNotReportedAsConnectionFailure()
+    {
+        var config = new ResolvedConfig
+        {
+            ApiBaseUrl = "http://127.0.0.1:5036",
+            ApiKey = "test-key",
+        };
+        using var client = new HttpClient(new CancelledHttpMessageHandler())
+        {
+            BaseAddress = new Uri(config.ApiBaseUrl),
+        };
+        var codeyBoxClient = new CodeyBoxClient(client, config);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => codeyBoxClient.GetWorkItemsAsync(ct: cts.Token));
+
+        Assert.IsNotType<CodeyBoxConnectionException>(ex);
+    }
+
+    [Fact]
+    public async Task Error_MalformedApiBaseUrl_RedactsUrlLikeSecretsWhenUriCannotBeParsed()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        const string url = "http://user:secret@example.com:notaport/api?token=secret#fragment";
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["--api-url", url, "queue", "ls"], MakeNetworkForbiddenFactory());
+
+            var error = output.Error.ToString();
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("malformed API base URL 'http://redacted@example.com:notaport/api?redacted'.", error);
+            Assert.Contains("Cause: value is not an absolute URI", error);
+            Assert.DoesNotContain("secret", error);
+            Assert.DoesNotContain("token=", error);
+            Assert.DoesNotContain("fragment", error);
+            Assert.DoesNotContain("network should not be attempted", error);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
         }
     }
 
@@ -672,11 +771,27 @@ public sealed class ErrorOutputTests
     private static HttpRequestException SocketFailure(SocketError socketError) =>
         new("socket failure", new SocketException((int)socketError));
 
+    private static void AssertFullApiBaseUrlPrecedence(string error, string tempDir)
+    {
+        var configPath = Path.Combine(tempDir, "config.json");
+        Assert.Contains(
+            $"Precedence: --api-url flag > CODEYBOX_CLI_API_URL environment variable > {configPath} config file > built-in default http://localhost:5036.",
+            error);
+    }
+
     private static void WriteConfigFile(string tempDir, string url, string key)
     {
         Directory.CreateDirectory(tempDir);
         var config = new CliConfig { ApiBaseUrl = url, ApiKey = key };
         var json = JsonSerializer.Serialize(config, CliJsonContext.Default.CliConfig);
         File.WriteAllText(Path.Combine(tempDir, "config.json"), json);
+    }
+
+    private sealed class CancelledHttpMessageHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) =>
+            Task.FromCanceled<HttpResponseMessage>(cancellationToken);
     }
 }
