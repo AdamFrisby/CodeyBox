@@ -1430,7 +1430,7 @@ public sealed class AgentConfigHotReloadTests
         // AgentBudgetCalculator (new limit applied, snapshot cache dropped)
         // without a restart. Spend is fixed at 100 cents; halving the limit from
         // 200c to 100c turns a 50%-remaining budget into a 0%-remaining one.
-        var store = new FixedSumUsageStore(1_000_000); // 100 cents spent
+        var store = new FixedSumUsageStore(AgentUsageEvent.UsdToMicroCents(1.00m)); // 100 cents spent
         var initialBudgets = MakeBudgets(limitCents: 200);
         var calculator = new AgentBudgetCalculator(
             store, initialBudgets, NullLogger<AgentBudgetCalculator>.Instance);
@@ -1483,7 +1483,7 @@ public sealed class AgentConfigHotReloadTests
     private sealed class FixedSumUsageStore : IAgentUsageStore
     {
         private readonly long _sum;
-        public FixedSumUsageStore(long sumMicroCents) { _sum = sumMicroCents; }
+        public FixedSumUsageStore(long sumCostMicroCents) { _sum = sumCostMicroCents; }
 
         public Task RecordAsync(AgentUsageEvent usage, CancellationToken ct = default) => Task.CompletedTask;
 

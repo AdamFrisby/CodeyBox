@@ -20,7 +20,8 @@ internal sealed class WorkItemSseWatcher
             (request, ct) => sseHttp.SendAsync(
                 request,
                 HttpCompletionOption.ResponseHeadersRead,
-                ct)) { }
+                ct))
+    { }
 
     internal WorkItemSseWatcher(
         Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> sendAsync)

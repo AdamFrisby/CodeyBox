@@ -192,7 +192,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(costStore.Recorded[0].EndedAt, ev.EndedUtc);
         Assert.True(ev.ElapsedMs > 0);
 
-        // The microcent cost and timestamp must be derived from the same recorded
+        // The legacy cost unit and timestamp must be derived from the same recorded
         // cost row (not a different field or scale): CostMicroCents is the cost
         // row's USD run through UsdToMicroCents, and TimeUtc is its EndedAt.
         var costRow = costStore.Recorded[0];

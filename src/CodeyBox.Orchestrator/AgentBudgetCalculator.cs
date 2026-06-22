@@ -21,8 +21,6 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class AgentBudgetCalculator : IAgentBudgetProvider, IAgentBudgetConfigReloadable
 {
-    private const long MicroCentsPerCent = 10_000L;
-
     private readonly Func<IAgentUsageStore> _resolveStore;
     private AgentBudgetOptions _opts;
     private readonly TimeProvider _time;
@@ -126,7 +124,7 @@ public sealed class AgentBudgetCalculator : IAgentBudgetProvider, IAgentBudgetCo
 
         foreach (var w in model.Windows)
         {
-            var limitMicro = (long)decimal.Round((decimal)w.LimitCents * MicroCentsPerCent, 0, MidpointRounding.AwayFromZero);
+            var limitCostMicroCents = CentsToCostMicroCents(w.LimitCents);
             var limitCents = (long)decimal.Round((decimal)w.LimitCents, 0, MidpointRounding.AwayFromZero);
 
             // An unrecognised window kind (e.g. a new enum value left unhandled or
@@ -199,21 +197,21 @@ public sealed class AgentBudgetCalculator : IAgentBudgetProvider, IAgentBudgetCo
                 usedCents = 0;
                 resetAt = w.Kind == BudgetWindowKind.Rolling ? null : resetAtCalendar;
             }
-            else if (limitMicro <= 0)
+            else if (limitCostMicroCents <= 0)
             {
                 // Misconfigured (zero/negative cap). A zero budget means nothing is
                 // available, so fail closed rather than disable the gate on a typo.
                 percentRemaining = 0.0;
-                usedCents = (long)decimal.Round((decimal)a.SumMicroCents / MicroCentsPerCent, 0, MidpointRounding.AwayFromZero);
+                usedCents = CostMicroCentsToRoundedCents(a.SumMicroCents);
                 resetAt = w.Kind == BudgetWindowKind.Rolling
                     ? (a.EarliestUtc is { } e0 && w.Hours is { } h0 ? e0.AddHours(h0) : null)
                     : resetAtCalendar;
             }
             else
             {
-                var percentUsed = a.SumMicroCents / (double)limitMicro * 100.0;
+                var percentUsed = a.SumMicroCents / (double)limitCostMicroCents * 100.0;
                 percentRemaining = Math.Clamp(100.0 - percentUsed, 0.0, 100.0);
-                usedCents = (long)decimal.Round((decimal)a.SumMicroCents / MicroCentsPerCent, 0, MidpointRounding.AwayFromZero);
+                usedCents = CostMicroCentsToRoundedCents(a.SumMicroCents);
                 // Rolling reset = when the oldest contributing event ages out of
                 // the window (soonest the window's usage drops); null when the
                 // window is empty. Calendar reset = the next window boundary.
@@ -295,6 +293,12 @@ public sealed class AgentBudgetCalculator : IAgentBudgetProvider, IAgentBudgetCo
                 throw new ArgumentOutOfRangeException(nameof(w), w.Kind, "Unrecognised budget window kind.");
         }
     }
+
+    private static long CentsToCostMicroCents(double cents) =>
+        (long)decimal.Round((decimal)cents * AgentUsageEvent.CostMicroCentsPerCent, 0, MidpointRounding.AwayFromZero);
+
+    private static long CostMicroCentsToRoundedCents(long costMicroCents) =>
+        (long)decimal.Round((decimal)costMicroCents / AgentUsageEvent.CostMicroCentsPerCent, 0, MidpointRounding.AwayFromZero);
 
     private sealed record BudgetComputation(AgentQuotaSnapshot Snapshot, IReadOnlyList<BudgetWindowUsage> Windows);
 }

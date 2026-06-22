@@ -2710,8 +2710,8 @@ public sealed class AcpBridgeUnitTests
 
     [Theory]
     [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
-    [InlineData(2,  "SIGINT")]  // Ctrl+C
-    [InlineData(1,  "SIGHUP")]  // controlling-terminal hangup
+    [InlineData(2, "SIGINT")]  // Ctrl+C
+    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
     public async Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName)
     {
         if (!File.Exists("/bin/bash"))

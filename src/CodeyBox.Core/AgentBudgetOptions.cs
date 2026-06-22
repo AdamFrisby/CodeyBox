@@ -53,6 +53,6 @@ public sealed class AgentBudgetWindowOptions
     /// <summary>Window length in hours; required for <see cref="BudgetWindowKind.Rolling"/>, ignored otherwise.</summary>
     public int? Hours { get; set; }
 
-    /// <summary>Spend cap for this window, in cents (1 cent = 10000 microcents).</summary>
+    /// <summary>Spend cap for this window, in cents.</summary>
     public double LimitCents { get; set; }
 }

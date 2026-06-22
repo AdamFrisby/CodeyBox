@@ -114,7 +114,10 @@ public sealed record CapacityEntry
     /// <summary>Sum of recorded event count across the same intervals.</summary>
     public required long TotalRequests { get; init; }
 
-    /// <summary>Sum of recorded cost in microcents across the same intervals (mostly informational for subscription members).</summary>
+    /// <summary>
+    /// Sum of recorded cost in the legacy <c>CostMicroCents</c> unit (USD x
+    /// 1_000_000; mostly informational for subscription members).
+    /// </summary>
     public required long TotalCostMicroCents { get; init; }
 
     /// <summary>Weighted average input tokens (billable) per 1% of window drained. Null when no intervals survived filtering.</summary>
@@ -170,6 +173,7 @@ public sealed record CapacityEntry
 }
 
 /// <summary>One differencing interval between consecutive quota samples.</summary>
+/// <param name="CostMicroCents">Cost in the legacy <c>CostMicroCents</c> unit: USD x 1_000_000.</param>
 public sealed record CapacityInterval(
     DateTimeOffset FromUtc,
     DateTimeOffset ToUtc,
