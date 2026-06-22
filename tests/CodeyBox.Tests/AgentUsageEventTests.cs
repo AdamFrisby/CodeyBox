@@ -9,7 +9,7 @@ public sealed class AgentUsageEventTests
     {
         var stored = AgentUsageEvent.UsdToMicroCents(1.00m);
 
-        Assert.Equal(AgentUsageEvent.CostMicroCentsPerUsd, stored);
-        Assert.Equal(1.00m, AgentUsageEvent.MicroCentsToUsd(stored));
+        Assert.Equal(1_000_000L, stored);
+        Assert.Equal(1.00m, AgentUsageEvent.MicroCentsToUsd(1_000_000L));
     }
 }
