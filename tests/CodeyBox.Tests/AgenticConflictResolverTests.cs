@@ -895,6 +895,58 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsNonRecordOutput()
+    {
+        var stdout = "\x1b[2K\x1b[0Eworking...\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("malformed git ls-files -u output segment", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(@"\u001B[2K\u001B[0Eworking...", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_IgnoresCrLfOnlyFramingSegments()
+    {
+        var oid = new string('a', 40);
+        var stdout = "\n\0" +
+                     $"100644 {oid} 2\tsrc/a.cs\0" +
+                     "\r\n\0";
+
+        var paths = AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal(["src/a.cs"], paths);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsStandaloneMultipassStartupNoise()
+    {
+        var stdout = "\x1b[2K\x1b[0EStarting codeybox-xxxx  <spinner>\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("malformed git ls-files -u output segment", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Starting codeybox-xxxx", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsMalformedSegmentAfterValidRecord()
+    {
+        var oid = new string('a', 40);
+        var stdout = $"100644 {oid} 2\tsrc/a.cs\0truncated-stage-record\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            AgenticConflictResolver.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("malformed git ls-files -u output segment 'truncated-stage-record'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ParseUnmergedPathsFromLsFilesStdout_AcceptsStageOneStageThreeAndSha256Records()
     {
         var sha1Stage1 = new string('a', 40);

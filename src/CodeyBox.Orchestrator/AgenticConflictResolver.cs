@@ -164,11 +164,19 @@ public sealed record AgenticConflictCandidatesResult(
 public sealed class AgenticConflictResolver
 {
     private static readonly Regex LsFilesUnmergedRecord = new(
-        @"\A[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t(?<path>[^\0]+)\z",
+        @"\A[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t(?<path>[^\0\p{Cc}]+)\z",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex LsFilesUnmergedRecordStart = new(
         @"[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex AnsiEscapeSequence = new(
+        @"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[@-Z\\-_])",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex MultipassVmName = new(
+        @"\A[A-Za-z0-9][A-Za-z0-9._-]*\z",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly AgenticConflictResolverOptionsSnapshot _options;
@@ -583,29 +591,68 @@ public sealed class AgenticConflictResolver
         if (string.IsNullOrEmpty(stdout))
             return [];
 
-        return stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries)
-            .Select(static segment => MatchLsFilesUnmergedRecord(segment))
-            .Where(static match => match is not null)
-            .Select(static match =>
+        var paths = new List<string>();
+        foreach (var rawSegment in stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (IsBenignLsFilesFramingSegment(rawSegment))
+                continue;
+
+            var segment = StripRecognizedLsFilesNoisePrefix(rawSegment);
+            var match = LsFilesUnmergedRecord.Match(segment);
+            if (!match.Success)
             {
-                var path = match!.Groups["path"].Value;
-                ValidateRelativeWorkPath(path);
-                return path;
-            })
+                throw new MergeConflictResolutionFailedException(
+                    "malformed git ls-files -u output segment '" +
+                    Truncate(EscapeForSingleLine(rawSegment), 200) +
+                    "'");
+            }
+
+            var path = match.Groups["path"].Value;
+            ValidateRelativeWorkPath(path);
+            paths.Add(path);
+        }
+
+        return paths
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToList();
     }
 
-    private static Match? MatchLsFilesUnmergedRecord(string segment)
+    private static bool IsBenignLsFilesFramingSegment(string segment) =>
+        segment.All(static ch => ch is '\r' or '\n');
+
+    private static string StripRecognizedLsFilesNoisePrefix(string segment)
     {
         var start = LsFilesUnmergedRecordStart.Match(segment);
-        if (!start.Success)
-            return null;
+        if (!start.Success || start.Index == 0)
+            return segment;
 
-        var record = start.Index == 0 ? segment : segment[start.Index..];
-        var match = LsFilesUnmergedRecord.Match(record);
-        return match.Success ? match : null;
+        return IsRecognizedMultipassStartupNoisePrefix(segment[..start.Index])
+            ? segment[start.Index..]
+            : segment;
+    }
+
+    private static bool IsRecognizedMultipassStartupNoisePrefix(string prefix)
+    {
+        var cleaned = AnsiEscapeSequence.Replace(prefix, "");
+        var sb = new StringBuilder(cleaned.Length);
+        foreach (var ch in cleaned)
+        {
+            if (!char.IsControl(ch))
+                sb.Append(ch);
+        }
+
+        var text = sb.ToString().Trim();
+        if (!text.StartsWith("Starting ", StringComparison.Ordinal))
+            return false;
+
+        var rest = text["Starting ".Length..].TrimStart();
+        if (rest.Length == 0)
+            return false;
+
+        var vmNameEnd = rest.IndexOfAny([' ', '\t']);
+        var vmName = vmNameEnd < 0 ? rest : rest[..vmNameEnd];
+        return MultipassVmName.IsMatch(vmName);
     }
 
     /// <summary>
