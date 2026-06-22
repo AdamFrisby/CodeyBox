@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Agents.Claude;
@@ -633,6 +634,75 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_MaterialiseBridgeAsync_ExecutesShellPayloadAndRejectsUnsafeCodeyboxDir()
+    {
+        var successRoot = Directory.CreateTempSubdirectory("cb-acp-materialise-success-").FullName;
+        try
+        {
+            var home = Path.Combine(successRoot, "home");
+            Directory.CreateDirectory(home);
+            var sandbox = new ExecutingMaterialiseSandbox(home);
+            var transport = NewAcpTransportWithOverride();
+
+            var path = await transport.MaterialiseBridgeAsync(sandbox, CancellationToken.None);
+
+            var expected = Path.Combine(home, ".codeybox", "claude-acp-bridge");
+            Assert.Equal(expected, path);
+            Assert.Equal(TestBridgeBytes, await File.ReadAllBytesAsync(path));
+            if (OperatingSystem.IsLinux())
+            {
+                Assert.Equal(
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                    File.GetUnixFileMode(path));
+                Assert.Equal(
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                    File.GetUnixFileMode(Path.Combine(home, ".codeybox")));
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(successRoot, recursive: true); } catch { }
+        }
+
+        var fileRoot = Directory.CreateTempSubdirectory("cb-acp-materialise-file-").FullName;
+        try
+        {
+            var home = Path.Combine(fileRoot, "home");
+            Directory.CreateDirectory(home);
+            await File.WriteAllTextAsync(Path.Combine(home, ".codeybox"), "not a directory");
+            var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+                NewAcpTransportWithOverride().MaterialiseBridgeAsync(
+                    new ExecutingMaterialiseSandbox(home),
+                    CancellationToken.None));
+            Assert.Contains("not a directory", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            try { Directory.Delete(fileRoot, recursive: true); } catch { }
+        }
+
+        var symlinkRoot = Directory.CreateTempSubdirectory("cb-acp-materialise-symlink-").FullName;
+        try
+        {
+            var home = Path.Combine(symlinkRoot, "home");
+            var target = Path.Combine(symlinkRoot, "target");
+            Directory.CreateDirectory(home);
+            Directory.CreateDirectory(target);
+            Directory.CreateSymbolicLink(Path.Combine(home, ".codeybox"), target);
+
+            var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+                NewAcpTransportWithOverride().MaterialiseBridgeAsync(
+                    new ExecutingMaterialiseSandbox(home),
+                    CancellationToken.None));
+            Assert.Contains("symlinked bridge directory", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            try { Directory.Delete(symlinkRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task AcpClaudeTransport_OpenAsync_PlaceholderBuild_RaisesUnavailable_BeforeTouchingSandbox()
     {
         var sandbox = new BridgeSandbox();
@@ -1203,6 +1273,38 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_ThinkingBlock400_RetryTurnTimeout_SurfacesRetryTimeoutUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}}",
+            "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
+        });
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"turn_timeout\"}",
+        });
+
+        var transport = NewAcpTransportWithOverride();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-retry-timeout");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+        Assert.Contains("timed out", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("on retry", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, sandbox.BridgeExecs.Count);
+    }
+
+    [Fact]
     public void AcpClaudeTransport_BuildStreamJsonShimForExtractor_RoundTripsThroughCostExtractor()
     {
         // Direct check of the production shim shape so a property-name drift
@@ -1290,6 +1392,50 @@ public sealed class ClaudeAcpTransportTests
                 return Task.FromResult(new SandboxExecResult(0, stdout, ""));
             }
             return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ExecutingMaterialiseSandbox : ISandbox
+    {
+        private readonly string _home;
+
+        public ExecutingMaterialiseSandbox(string home) => _home = home;
+
+        public string Id { get; } = "vm-materialise-" + Guid.NewGuid().ToString("N")[..8];
+        public List<SandboxExec> AllExecs { get; } = new();
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            if (exec.Argv.Count == 0)
+                return new SandboxExecResult(0, "", "");
+
+            var psi = new ProcessStartInfo(exec.Argv[0])
+            {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                WorkingDirectory = _home,
+            };
+            for (var i = 1; i < exec.Argv.Count; i++)
+                psi.ArgumentList.Add(exec.Argv[i]);
+            psi.Environment["HOME"] = _home;
+
+            using var process = Process.Start(psi)
+                ?? throw new InvalidOperationException("Failed to start " + exec.Argv[0]);
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = process.StandardError.ReadToEndAsync(ct);
+            if (exec.Stdin is not null)
+                await process.StandardInput.WriteAsync(exec.Stdin.AsMemory(), ct);
+            process.StandardInput.Close();
+
+            await process.WaitForExitAsync(ct);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+            return new SandboxExecResult(process.ExitCode, stdout, stderr);
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

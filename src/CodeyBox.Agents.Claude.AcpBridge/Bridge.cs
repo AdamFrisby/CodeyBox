@@ -206,6 +206,8 @@ internal sealed class Bridge : IAsyncDisposable
             WriteLockfile();
             if (ShutdownStarted) return; // lockfile failure already raised fatal
             SpawnClaude();
+            if (ShutdownStarted) return; // spawn failure already raised fatal
+            StartAcceptLoop();
         }
         catch (Exception ex)
         {
@@ -218,6 +220,10 @@ internal sealed class Bridge : IAsyncDisposable
         _listener = _listenerFactory();
         _listener.Start();
         _port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+    }
+
+    private void StartAcceptLoop()
+    {
         _acceptLoopTask = Task.Run(() => AcceptLoopAsync(_cts.Token));
     }
 

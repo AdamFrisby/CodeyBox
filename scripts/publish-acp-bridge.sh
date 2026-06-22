@@ -63,11 +63,10 @@ write_env_assignment()
 
 mkdir -p "$RESOURCE_DIR"
 
-# Remove the old ignored resource before publishing. If dotnet publish or any
-# verification step fails, the parent project can only fall back to the tracked
-# placeholder; it cannot silently embed stale bytes from an earlier successful
-# run.
-rm -f "$RESOURCE_PATH" "$TMP_RESOURCE"
+# Keep the last verified resource intact until the replacement has passed every
+# build/link/runtime check. A failed publish must not leave Release builds
+# without the previously-good embedded bridge.
+rm -f "$TMP_RESOURCE"
 
 dotnet publish "$BRIDGE_PROJECT" \
     -c Release \
@@ -499,8 +498,8 @@ esac
 echo "$VERIFY_OUT"
 echo "Multipass ACP verification passed on $VERIFY_VM."
 
+chmod 644 "$TMP_RESOURCE"
 mv "$TMP_RESOURCE" "$RESOURCE_PATH"
-chmod 644 "$RESOURCE_PATH"
 TMP_RESOURCE=""
 
 echo "Embedded resource refreshed:"

@@ -15,11 +15,6 @@ name: agent suspend resilience
 
 on:
   workflow_dispatch:
-    inputs:
-      acp_bridge_verify_vm:
-        description: "Already-baked CodeyBox baseline VM to clone for ACP bridge verification"
-        required: false
-        type: string
   schedule:
     # Weekly Sunday 03:00 UTC — adjust if your fleet uses a different maintenance window.
     - cron: "0 3 * * 0"
@@ -45,7 +40,7 @@ jobs:
       CODEYBOX_GEMINI_API_KEY: ${{ secrets.CODEYBOX_GEMINI_API_KEY }}
       CODEYBOX_CURSOR_AUTH_JSON: ${{ secrets.CODEYBOX_CURSOR_AUTH_JSON }}
       CODEYBOX_OPENCODE_AUTH_FILE: ${{ secrets.CODEYBOX_OPENCODE_AUTH_FILE }}
-      CODEYBOX_ACP_BRIDGE_VERIFY_SOURCE_VM: ${{ inputs.acp_bridge_verify_vm || vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM }}
+      CODEYBOX_ACP_BRIDGE_VERIFY_SOURCE_VM: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,7 +52,7 @@ jobs:
           set -euo pipefail
           source_vm="${CODEYBOX_ACP_BRIDGE_VERIFY_SOURCE_VM:-}"
           if [ -z "$source_vm" ]; then
-            echo "::error::Set the CODEYBOX_ACP_BRIDGE_VERIFY_VM repository variable, or pass acp_bridge_verify_vm when manually dispatching this workflow." >&2
+            echo "::error::Set the CODEYBOX_ACP_BRIDGE_VERIFY_VM repository variable to an allowlisted baseline VM." >&2
             exit 1
           fi
 

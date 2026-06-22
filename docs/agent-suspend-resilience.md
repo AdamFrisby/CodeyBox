@@ -99,8 +99,9 @@ Set the `CODEYBOX_ACP_BRIDGE_VERIFY_VM` repository variable to an already-baked
 CodeyBox baseline VM. The workflow clones that baseline into a disposable
 verifier VM before running `scripts/publish-acp-bridge.sh`, so ACP bridge
 runtime verification does not depend on hidden runner-local VM state or mutate
-the stopped baseline directly. Manual dispatch can override the same source VM
-with the `acp_bridge_verify_vm` input.
+the stopped baseline directly. Manual dispatch intentionally uses the same
+repository variable rather than accepting a VM-name override, because the job
+runs with provider credentials on a self-hosted Multipass runner.
 
 ## When to add a stronger wrapper
 

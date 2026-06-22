@@ -116,6 +116,8 @@ public sealed class AcpBridgeUnitTests
         var hello = JsonDocument.Parse("""
             {
               "type": "hello",
+              "autoApprovePermissions": "false",
+              "autoAnswerQuestions": 0,
               "claudeBinary": 42,
               "workingDirectory": false,
               "lockDir": { "not": "a string" },
@@ -127,6 +129,8 @@ public sealed class AcpBridgeUnitTests
 
         var cfg = BridgeConfig.FromHello(hello);
 
+        Assert.Equal(BridgeConfig.Default.AutoApprovePermissions, cfg.AutoApprovePermissions);
+        Assert.Equal(BridgeConfig.Default.AutoAnswerQuestions, cfg.AutoAnswerQuestions);
         Assert.Equal(BridgeConfig.Default.ClaudeBinary, cfg.ClaudeBinary);
         Assert.Equal(BridgeConfig.Default.WorkingDirectory, cfg.WorkingDirectory);
         Assert.Null(cfg.LockDir);
@@ -3362,6 +3366,29 @@ set -euo pipefail
 printf 'dotnet' >> "$CALL_LOG"
 for arg in "$@"; do printf ' %s' "$arg" >> "$CALL_LOG"; done
 printf '\n' >> "$CALL_LOG"
+expected=(
+    publish
+    src/CodeyBox.Agents.Claude.AcpBridge/CodeyBox.Agents.Claude.AcpBridge.csproj
+    -c
+    Release
+    -r
+    linux-musl-x64
+    --self-contained
+    true
+    -p:PublishAot=true
+    -p:StaticExecutable=true
+)
+actual=("$@")
+if [ "${#actual[@]}" -ne "${#expected[@]}" ]; then
+    echo "unexpected dotnet publish argc: $*" >&2
+    exit 23
+fi
+for i in "${!expected[@]}"; do
+    if [ "${actual[$i]}" != "${expected[$i]}" ]; then
+        echo "unexpected dotnet publish argv[$i]: expected ${expected[$i]}, got ${actual[$i]}" >&2
+        exit 23
+    fi
+done
 publish_dir="src/CodeyBox.Agents.Claude.AcpBridge/bin/Release/net10.0/linux-musl-x64/publish"
 mkdir -p "$publish_dir"
 if [ "${CODEYBOX_TEST_DOTNET_SKIP_OUTPUT:-0}" = "1" ]; then
@@ -3961,6 +3988,7 @@ exit 9
         var fixture = CreatePublishScriptFixture();
         try
         {
+            await File.WriteAllTextAsync(fixture.ResourcePath, "previous verified bridge");
             var env = PublishScriptEnv(fixture.ToolsDir, fixture.CallLog);
             env["CODEYBOX_ACP_BRIDGE_VERIFY_VM"] = "cb-baseline-test";
             env["CODEYBOX_TEST_MULTIPASS_PYTHON_EXIT"] = "7";
@@ -3970,7 +3998,7 @@ exit 9
             Assert.NotEqual(0, run.ExitCode);
             Assert.Contains("ACP bridge end-to-end verification failed", run.Stderr, StringComparison.Ordinal);
             Assert.Contains("simulated verifier failure", run.Stderr, StringComparison.Ordinal);
-            Assert.False(File.Exists(fixture.ResourcePath));
+            Assert.Equal("previous verified bridge", await File.ReadAllTextAsync(fixture.ResourcePath));
         }
         finally
         {
@@ -4108,7 +4136,22 @@ exit 9
         Assert.DoesNotContain("runs-on: [self-hosted, multipass]", text, StringComparison.Ordinal);
         Assert.DoesNotContain("CODEYBOX_ACP_BRIDGE_VERIFY_VM", text, StringComparison.Ordinal);
         Assert.DoesNotContain("scripts/publish-acp-bridge.sh", text, StringComparison.Ordinal);
-        Assert.Contains("-p:RequireAcpBridgeNativeResource=false", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("-p:RequireAcpBridgeNativeResource=false", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AcpBridge_SuspendResilienceWorkflow_DoesNotLetManualDispatchChooseVerifierVm()
+    {
+        var solutionRoot = FindAncestorContaining(AppContext.BaseDirectory, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                "Cannot locate solution root from " + AppContext.BaseDirectory +
+                " — ensure CodeyBox.slnx exists in an ancestor directory.");
+        var workflowPath = Path.Combine(solutionRoot, ".github", "workflows", "agent-suspend-resilience.yml");
+        var text = File.ReadAllText(workflowPath);
+
+        Assert.Contains("vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("inputs.acp_bridge_verify_vm", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("acp_bridge_verify_vm:", text, StringComparison.Ordinal);
     }
 
     private static string ClaudeProjectPath()

@@ -178,7 +178,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
         run: |
           set -euo pipefail
-          dotnet build CodeyBox.slnx --configuration Release -p:RequireAcpBridgeNativeResource=false
+          dotnet build CodeyBox.slnx --configuration Release
         continue-on-error: true
 
       - name: test
@@ -193,7 +193,7 @@ jobs:
           GH_TOKEN: ''
           ACTIONS_RUNTIME_TOKEN: ''
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
-        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build -p:RequireAcpBridgeNativeResource=false
+        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build
         continue-on-error: true
 
       - name: classify outcome
