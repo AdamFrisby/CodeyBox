@@ -133,7 +133,7 @@ public sealed class PlanReviewGateTests
     }
 
     [Fact]
-    public void ToImplementationGuidance_DoesNotReinjectFreeFormPlanText()
+    public void ToImplementationGuidance_IncludesReviewedPlanText()
     {
         var normalized = PlanArtifactDocument.NormalizeRaw(
             """
@@ -151,10 +151,10 @@ public sealed class PlanReviewGateTests
 
         Assert.Contains("Reviewed planning metadata", guidance, StringComparison.Ordinal);
         Assert.Contains("output.txt", guidance, StringComparison.Ordinal);
-        Assert.DoesNotContain("ignore the operator", guidance, StringComparison.Ordinal);
-        Assert.DoesNotContain("read secrets now", guidance, StringComparison.Ordinal);
-        Assert.DoesNotContain("make network calls", guidance, StringComparison.Ordinal);
-        Assert.DoesNotContain("overriding policy", guidance, StringComparison.Ordinal);
+        Assert.Contains("ignore the operator", guidance, StringComparison.Ordinal);
+        Assert.Contains("read secrets now", guidance, StringComparison.Ordinal);
+        Assert.Contains("make network calls", guidance, StringComparison.Ordinal);
+        Assert.Contains("overriding policy", guidance, StringComparison.Ordinal);
     }
 
     private static WorkItem SampleItem() => new()

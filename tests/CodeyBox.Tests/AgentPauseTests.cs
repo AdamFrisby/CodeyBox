@@ -441,12 +441,14 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Theory]
-    [InlineData(WorkItemState.Planning, "work")]
-    [InlineData(WorkItemState.PlanReview, "planning")]
-    [InlineData(WorkItemState.PlanApproved, "work")]
+    [InlineData(WorkItemState.Planning, "work", WorkItemState.Queued, false)]
+    [InlineData(WorkItemState.PlanReview, "planning", WorkItemState.Queued, false)]
+    [InlineData(WorkItemState.PlanApproved, "plan_approved", WorkItemState.PlanApproved, true)]
     public async Task Worker_PlanningResumeStateWithPausedDirectAgent_ParksWithoutEnteringPipeline(
         WorkItemState state,
-        string retryFrom)
+        string retryFrom,
+        WorkItemState expectedResumeState,
+        bool preservesApprovedPlan)
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
@@ -498,11 +500,21 @@ public sealed class AgentPauseTests : IDisposable
 
         var resumed = await store.GetAsync(item.Id);
         Assert.NotNull(resumed);
-        Assert.Equal(WorkItemState.Queued, resumed!.State);
-        Assert.Null(resumed.PlanArtifact);
-        Assert.Null(resumed.PlanGeneratedAt);
-        Assert.Null(resumed.PlanReviewedAt);
-        Assert.Null(resumed.PlanReviewSummary);
+        Assert.Equal(expectedResumeState, resumed!.State);
+        if (preservesApprovedPlan)
+        {
+            Assert.Equal(ValidPlan, resumed.PlanArtifact);
+            Assert.NotNull(resumed.PlanGeneratedAt);
+            Assert.NotNull(resumed.PlanReviewedAt);
+            Assert.Equal("approved", resumed.PlanReviewSummary);
+        }
+        else
+        {
+            Assert.Null(resumed.PlanArtifact);
+            Assert.Null(resumed.PlanGeneratedAt);
+            Assert.Null(resumed.PlanReviewedAt);
+            Assert.Null(resumed.PlanReviewSummary);
+        }
 
         using var resumedRegistry = new CancellationRegistry(CancellationToken.None);
         using var resumedSvc = new OrchestratorService(
@@ -1213,6 +1225,7 @@ public sealed class AgentPauseTests : IDisposable
 
     [Theory]
     [InlineData(WorkItemState.Planning, "planning", WorkItemState.Queued)]
+    [InlineData(WorkItemState.PlanApproved, "plan_approved", WorkItemState.PlanApproved)]
     [InlineData(WorkItemState.WorkComplete, "audit", WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.ReworkingForConflict, "conflict_rework", WorkItemState.ReworkingForConflict)]
     [InlineData(WorkItemState.AuditPassed, "merge", WorkItemState.AuditPassed)]

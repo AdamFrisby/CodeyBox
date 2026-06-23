@@ -633,6 +633,7 @@ public sealed class DeadWorkerReaper : BackgroundService
                 // Re-queued items must not appear in-flight to CountInFlightAsync.
                 StartedAt = recoveryTarget == WorkItemState.Queued ? null : item.StartedAt,
             }, attempt, item.State);
+            updated = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(updated);
             _log.LogInformation(
                 "Recovery ({WorkerId}): recovering work item {ItemId} from {From} → {To} (attempt {Attempt}/{Max})",
                 workerIdContext, itemId, fromState, recoveryTarget, attempt, _opts.MaxRecoveryAttempts);

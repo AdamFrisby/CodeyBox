@@ -23,4 +23,9 @@ public sealed class PlanKnob : IKnob
     public string DefaultValue => ValueOff;
 
     public string? GetWorkPromptFragment(string value) => null;
+
+    public KnobPipelineLifecycle GetPipelineLifecycle(string value) =>
+        string.Equals(value, ValueOn, StringComparison.OrdinalIgnoreCase)
+            ? KnobPipelineLifecycle.Planning
+            : KnobPipelineLifecycle.None;
 }

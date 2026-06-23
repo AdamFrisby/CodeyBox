@@ -184,8 +184,8 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
             frozenState,
             updatedAt: _time.GetUtcNow().AddMinutes(-95)) with
         {
-            PlanArtifact = frozenState == WorkItemState.PlanReview ? ValidPlan : null,
-            PlanGeneratedAt = frozenState == WorkItemState.PlanReview
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = frozenState is WorkItemState.Planning or WorkItemState.PlanReview
                 ? _time.GetUtcNow().AddMinutes(-100)
                 : null,
         };
@@ -196,6 +196,17 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.NotNull(after);
         Assert.Equal(expectedState, after!.State);
+        if (expectedState == WorkItemState.Queued)
+        {
+            Assert.Null(after.PlanArtifact);
+            Assert.Null(after.PlanGeneratedAt);
+            Assert.Null(after.PlanReviewedAt);
+            Assert.Null(after.PlanReviewSummary);
+        }
+        else
+        {
+            Assert.Equal(ValidPlan, after.PlanArtifact);
+        }
         Assert.Equal(1, after.RecoveryAttempts);
         Assert.Contains("item-stale", after.LastError);
         Assert.Equal(1, _queue.Count);

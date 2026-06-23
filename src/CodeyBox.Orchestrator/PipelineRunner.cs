@@ -7,7 +7,6 @@ using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Git;
-using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 
@@ -522,7 +521,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         IAgentRunner runner,
         string repoId,
-        bool useReadOnlyRepositoryAccess,
         CancellationToken ct)
     {
         if (!ShouldEnterClaudeSessionMode(item, project, runner))
@@ -534,9 +532,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // rework turns reuse the same VM via session resume, so the network
         // profile / flavor / baseline pin established here applies to every
         // worker turn for this item.
-        var access = useReadOnlyRepositoryAccess
-            ? _gitHost.GetReadOnlySandboxAccess(repoId)
-            : _gitHost.GetSandboxAccess(repoId);
+        var access = _gitHost.GetSandboxAccess(repoId);
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
         var selectedMember = TryResolveSelectedMember(runner.Kind, project, item);
         var openedRouteKey = selectedMember?.RouteKey ?? CanonicalAgentRouteKey(runner.Kind, item.AgentInstanceId);
@@ -551,7 +547,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             allowAgentNetwork: true,
             hostNetworkProfile: sandboxTarget.NetworkProfile,
             timingWorkItemId: item.Id,
-            timingPhase: useReadOnlyRepositoryAccess ? "planning" : "work",
+            timingPhase: "work",
             flavor: sandboxTarget.Flavor,
             extraEnvironment: null,
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
@@ -823,8 +819,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return false;
 
         var effective = _knobRegistry.Resolve(item.Knobs, project.Knobs);
-        return effective.TryGetValue(PlanKnob.KeyName, out var value)
-            && string.Equals(value, PlanKnob.ValueOn, StringComparison.OrdinalIgnoreCase);
+        return _knobRegistry.All.Any(knob =>
+            effective.TryGetValue(knob.Key, out var value)
+            && knob.GetPipelineLifecycle(value).HasFlag(KnobPipelineLifecycle.Planning));
     }
 
     private static bool IsPlanningLifecycleState(WorkItemState state) =>
@@ -835,17 +832,79 @@ public sealed partial class PipelineRunner : IPipelineRunner
         && item.PlanReviewedAt is not null
         && !string.IsNullOrWhiteSpace(item.PlanArtifact);
 
+    private static bool HasReviewedPlanArtifact(WorkItem item) =>
+        item.PlanReviewedAt is not null
+        && !string.IsNullOrWhiteSpace(item.PlanArtifact);
+
     private static string? ApprovedPlanForImplementation(WorkItem item, bool planningWasRequired)
-        => planningWasRequired && HasApprovedCurrentPlan(item)
+        => planningWasRequired && HasReviewedPlanArtifact(item)
             ? PlanArtifactDocument.ToImplementationGuidance(item.PlanArtifact!)
             : null;
+
+    private static bool ApprovedPlanSnapshotMatches(WorkItem current, WorkItem approved)
+    {
+        return current.State == WorkItemState.PlanApproved
+            && current.PromptRevision == approved.PromptRevision
+            && current.PlanReviewedAt == approved.PlanReviewedAt
+            && current.PlanGeneratedAt == approved.PlanGeneratedAt
+            && string.Equals(current.PlanArtifact, approved.PlanArtifact, StringComparison.Ordinal)
+            && string.Equals(current.PlanReviewSummary, approved.PlanReviewSummary, StringComparison.Ordinal);
+    }
+
+    private async Task<WorkItem?> TryEnterWorkFromApprovedPlanAsync(
+        WorkItem approvedPlanSnapshot,
+        Project project,
+        CancellationToken ct)
+    {
+        var current = await _store.GetAsync(approvedPlanSnapshot.Id, ct) ?? approvedPlanSnapshot;
+        if (!ApprovedPlanSnapshotMatches(current, approvedPlanSnapshot))
+        {
+            _log.LogInformation(
+                "Approved plan for work item {WorkItemId} changed or was invalidated before implementation; current state {State}, revision {PromptRevision}.",
+                approvedPlanSnapshot.Id,
+                current.State,
+                current.PromptRevision);
+            return null;
+        }
+
+        var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            current.With(WorkItemState.Working),
+            current.State,
+            WorkItemState.Working);
+        var transitioned = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            next,
+            WorkItemState.PlanApproved,
+            current.UpdatedAt,
+            ct);
+        if (!transitioned)
+        {
+            current = await _store.GetAsync(approvedPlanSnapshot.Id, ct) ?? current;
+            if (!ApprovedPlanSnapshotMatches(current, approvedPlanSnapshot))
+            {
+                _log.LogInformation(
+                    "Approved plan for work item {WorkItemId} lost a race before implementation; current state {State}, revision {PromptRevision}.",
+                    approvedPlanSnapshot.Id,
+                    current.State,
+                    current.PromptRevision);
+                return null;
+            }
+
+            throw new InvalidOperationException(
+                $"Plan-approved work item {approvedPlanSnapshot.Id} raced while entering implementation.");
+        }
+
+        await EmitTransitionSideEffectsAsync(next, WorkItemState.Working, project, ct);
+        return next with
+        {
+            AgentInstanceId = approvedPlanSnapshot.AgentInstanceId,
+            ModelId = approvedPlanSnapshot.ModelId,
+            ReasoningMode = approvedPlanSnapshot.ReasoningMode,
+        };
+    }
 
     private async Task<WorkItem> RunPlanningLifecycleIfNeededAsync(
         WorkItem item,
         Project project,
-        string repoId,
-        string baseBranch,
-        ClaudeSessionLifecycle? sessionLifecycle,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -900,7 +959,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             planningPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(current.WorkTimeout));
             planningPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
-            var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
             try
             {
                 planArtifact = await InvokeAgentWithQuotaFallbackAsync(
@@ -916,21 +974,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             "planning",
                             planningPhase,
                             ct,
-                            phaseCt => RunPlanningAgentTurnAsync(
+                            phaseCt => RunPlanningTextOnlyTurnAsync(
                                 trialItem,
                                 runner,
-                                repoId,
-                                baseBranch,
                                 project,
-                                sandboxTarget.NetworkProfile,
-                                sandboxTarget.Flavor,
-                                sessionLifecycle,
                                 phaseCt,
                                 hostShutdownToken),
                             workToken: attemptCt),
                     ct,
                     phaseCancellation: planningPhase,
-                    attemptTimeout: current.WorkTimeout);
+                    attemptTimeout: current.WorkTimeout,
+                    skipInVmSmoke: true);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
@@ -1122,151 +1176,43 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return next;
     }
 
-    private async Task<string> RunPlanningAgentTurnAsync(
+    private async Task<string> RunPlanningTextOnlyTurnAsync(
         WorkItem item,
         IAgentRunner runner,
-        string repoId,
-        string baseBranch,
         Project project,
-        string? networkProfile,
-        SandboxProfileFlavor sandboxFlavor,
-        ClaudeSessionLifecycle? sessionLifecycle,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
+        if (runner is not ITextOnlyAgentRunner textOnlyRunner)
+        {
+            throw new InvalidOperationException(
+                $"Planning phase requires agent '{runner.Kind.Value}' to support text-only execution.");
+        }
+
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
-        var selectedMemberForSession = TryResolveSelectedMember(runner.Kind, project, item);
-        var sessionTurnItem = selectedMemberForSession is null
-            ? item
-            : item with
-            {
-                AgentInstanceId = selectedMemberForSession.RouteKey,
-                ModelId = selectedMemberForSession.ModelId,
-                ReasoningMode = selectedMemberForSession.ReasoningMode,
-            };
-        var useClaudeSession = sessionLifecycle is not null
-            && !sessionLifecycle.IsClosed
-            && runner.Kind == AgentKind.Claude
-            && sessionLifecycle.CanRunTurn(runner, sessionTurnItem)
-            && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
-        var access = _gitHost.GetReadOnlySandboxAccess(repoId);
-
-        ISandbox? sandboxToDispose = null;
-        ISandbox sandbox;
-        if (useClaudeSession)
+        if (textOnlyRunner.GetTextOnlyUnavailabilityReason(credential) is { } unavailable)
         {
-            sandbox = await sessionLifecycle!.GetSandboxAsync(ct);
-            if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
-            await sessionLifecycle.RefreshCredentialAsync(credential, ct);
-        }
-        else
-        {
-            if (sessionLifecycle is not null
-                && !sessionLifecycle.IsClosed
-                && runner.Kind == AgentKind.Claude
-                && string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
-                && !sessionLifecycle.CanRunTurn(runner, sessionTurnItem))
-            {
-                await CloseAmbientClaudeSessionAsync(
-                    sessionLifecycle,
-                    item,
-                    project,
-                    "selected Claude planning fallback member does not match the opened session");
-                _ambientSessionLifecycle.Value = null;
-                sessionLifecycle = null;
-            }
-
-            var spec = BuildSandboxSpec(
-                access,
-                includeAgentCredential: credential,
-                allowAgentNetwork: true,
-                hostNetworkProfile: networkProfile,
-                timingWorkItemId: item.Id,
-                timingPhase: "planning",
-                flavor: sandboxFlavor,
-                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
-                    project,
-                    new SandboxTarget(networkProfile, sandboxFlavor),
-                    item.BaselineImageRef));
-
-            var sandboxStartSw = Stopwatch.StartNew();
-            sandbox = await _sandboxes.CreateAsync(spec, ct);
-            sandboxToDispose = sandbox;
-            sandboxStartSw.Stop();
-            CodeyBoxMeters.SandboxLifecycle.Record(
-                sandboxStartSw.ElapsedMilliseconds,
-                new KeyValuePair<string, object?>("step", "start"));
-
-            if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            throw new InvalidOperationException(
+                $"Planning phase cannot use agent '{runner.Kind.Value}' for text-only execution: {unavailable}");
         }
 
-        await using (var cloneScope = await TimingScope.BeginAsync(
-            _timings,
-            item.Id,
-            "planning",
-            "git.clone_into_sandbox",
-            activitySource: CodeyBoxActivities.Sandbox,
-            log: _log))
-        {
-            var alreadyCloned = useClaudeSession && await IsSandboxWorkTreePresentAsync(sandbox, ct);
-            if (alreadyCloned)
-            {
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
-            }
-            else
-            {
-                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            }
-        }
-        if (useClaudeSession)
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", "DISABLED_BY_CODEYBOX_PLANNING");
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", baseBranch, $"origin/{baseBranch}");
-
+        var promptSandbox = new EmptyPlanningPromptSandbox(item.Id);
         var prompt = await ProcessAgentPromptAsync(
             item.Id,
             runner.Kind,
             AgentPromptPhase.Planning,
             1,
             project,
-            sandbox,
+            promptSandbox,
             BuildPlanningPrompt(item),
             ct);
 
         var aggregator = new BoundedStringAccumulator(PlanOutputAccumulatorMaxChars);
-        AgentStreamCapture? streamCapture = null;
         try
         {
-            streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
-                ? await BeginAgentStreamCaptureAsync(item.Id, "planning", 1, ct)
-                : null;
-            var stdoutCallback = BuildStdoutCallback(item.Id, "planning", streamCapture);
-            if (stdoutCallback is not null)
-            {
-                var inner = stdoutCallback;
-                stdoutCallback = chunk =>
-                {
-                    aggregator.Append(chunk);
-                    inner(chunk);
-                };
-            }
-            else if (_stdoutBroadcaster is not null)
-            {
-                stdoutCallback = chunk =>
-                {
-                    aggregator.Append(chunk);
-                    _stdoutBroadcaster.BroadcastChunk(item.Id, "planning", chunk);
-                };
-            }
-            else
-            {
-                stdoutCallback = chunk => aggregator.Append(chunk);
-            }
-
-            AuditLog.AgentStarted(runner.Kind, sandbox.Id, "planning");
+            AuditLog.AgentStarted(runner.Kind, promptSandbox.Id, "planning");
             var agentSw = Stopwatch.StartNew();
-            AgentResult result;
+            TextOnlyAgentResult result;
             await using (var agentScope = await TimingScope.BeginAsync(
                 _timings,
                 item.Id,
@@ -1277,25 +1223,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 activitySource: CodeyBoxActivities.Pipeline))
             {
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                var runTask = useClaudeSession
-                    ? sessionLifecycle!.SendTurnAsync(prompt, runnerCts.Token, stdoutCallback)
-                    : RunPlanningSessionTurnAsync(
-                        runner,
-                        sandbox,
-                        prompt,
-                        credential,
-                        item,
-                        project,
-                        stdoutCallback,
-                        runnerCts.Token,
-                        captureStructuredStream: false);
+                var runTask = textOnlyRunner.RunTextOnlyAsync(
+                    prompt,
+                    credential,
+                    item.ModelId,
+                    item.ReasoningMode,
+                    runnerCts.Token);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completed != runTask)
                 {
-                    await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
-                    completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
-                    if (completed != runTask)
-                        await runnerCts.CancelAsync();
+                    await runnerCts.CancelAsync();
                     throw new OperationCanceledException(hostShutdownToken);
                 }
 
@@ -1307,8 +1244,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var observedModelId = ResolveObservedModelId(runner, item.ModelId);
             var startedAt = endedAt - agentSw.Elapsed;
             await TryRecordCostAsync(
-                result.Stdout,
-                result.Stderr,
+                result.Output,
+                result.Error,
                 runner.Kind,
                 item.AgentInstanceId,
                 item.Id,
@@ -1320,23 +1257,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             AuditLog.AgentFinished(
                 runner.Kind,
-                sandbox.Id,
+                promptSandbox.Id,
                 result.Success,
                 null,
                 agentSw.Elapsed,
-                stdoutTail: Tail(result.Stdout),
-                stderrTail: Tail(result.Stderr));
-            LogAgentOutput(_log, runner.Kind, result);
+                stdoutTail: Tail(result.Output),
+                stderrTail: Tail(result.Error));
+            LogAgentOutput(_log, runner.Kind, ToPlanningAgentResult(result));
 
             if (!result.Success)
             {
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     runner.Kind,
-                    result.Stderr,
-                    result.Stdout,
+                    result.Error,
+                    result.Output,
                     "planning",
-                    sandbox.Id);
-                var detection = _quotaClassifier.Detect(runner.Kind, result.Stderr, result.Stdout);
+                    promptSandbox.Id);
+                var detection = _quotaClassifier.Detect(runner.Kind, result.Error, result.Output);
                 if (detection is not null)
                 {
                     await _quotaClassifier.RecordIfQuotaFailureAsync(
@@ -1344,68 +1281,61 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         runner.Kind,
                         observedModelId,
                         result.Summary,
-                        result.Stderr,
+                        result.Error,
                         endedAt,
                         _auditQuotaOptions.ObservedFailureRetention,
                         ct,
                         projectId: item.ProjectId,
-                        stdout: result.Stdout);
+                        stdout: result.Output);
                     throw new TerminalQuotaError(
                         detection.Kind,
                         $"Agent {runner.Kind} reported quota failure during planning: {result.Summary}",
                         detection.ResetAt);
                 }
 
-                ThrowIfTransientAgentFailure(runner, result, "planning");
+                ThrowIfTransientAgentFailure(runner, ToPlanningAgentResult(result), "planning");
                 var detail = string.Join("\n",
                     new[]
                     {
                         $"Planning agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(result.Summary)}",
-                        !string.IsNullOrEmpty(result.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(result.Stderr)}" : null,
-                        !string.IsNullOrEmpty(result.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(result.Stdout)}" : null,
+                        !string.IsNullOrEmpty(result.Error) ? $"stderr:\n{RedactAndTruncateAgentDetail(result.Error)}" : null,
+                        !string.IsNullOrEmpty(result.Output) ? $"stdout:\n{RedactAndTruncateAgentDetail(result.Output)}" : null,
                     }.Where(s => s is not null));
                 throw new InvalidOperationException(detail);
             }
 
-            if (!string.IsNullOrEmpty(result.Stdout)
+            if (!string.IsNullOrEmpty(result.Output)
                 && !aggregator.HasContent)
             {
-                aggregator.Append(result.Stdout);
+                aggregator.Append(result.Output);
             }
 
-            var aggregated = aggregator.ToString();
-            if (useClaudeSession && !string.IsNullOrWhiteSpace(result.Stdout))
-                return result.Stdout;
-            return aggregated;
+            return aggregator.ToString();
         }
         finally
         {
-            if (useClaudeSession)
-            {
-                try
-                {
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", access.CloneUrlInsideSandbox);
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "reset", "--hard");
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "clean", "-fdx");
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex,
-                        "Failed to clean warm planning sandbox for work item {WorkItemId}; closing Claude session before implementation",
-                        item.Id);
-                    await CloseAmbientClaudeSessionAsync(
-                        sessionLifecycle!,
-                        item,
-                        project,
-                        "planning sandbox cleanup failed");
-                    _ambientSessionLifecycle.Value = null;
-                }
-            }
-            if (streamCapture is not null)
-                await streamCapture.DisposeAsync();
-            if (sandboxToDispose is not null)
-                await sandboxToDispose.DisposeAsync();
+            await promptSandbox.DisposeAsync();
         }
+    }
+
+    private static AgentResult ToPlanningAgentResult(TextOnlyAgentResult result) =>
+        new(result.Success, result.Summary, result.Output, result.Error);
+
+    private sealed class EmptyPlanningPromptSandbox(WorkItemId itemId) : ISandbox
+    {
+        public string Id { get; } = $"planning-text-only:{itemId}";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _ = exec;
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult(new SandboxExecResult(
+                127,
+                string.Empty,
+                "planning text-only prompt sandbox does not expose a repository or shell"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static async Task<bool> IsSandboxWorkTreePresentAsync(ISandbox sandbox, CancellationToken ct)
@@ -1483,10 +1413,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
           "satisfiesTask": "how this plan satisfies the task"
         }
 
-        You may inspect the repository
-        and run read-only commands as needed, but do not write implementation
-        code, edit files, create commits, or push branches. The implementation
-        phase will run later after this artifact is reviewed.
+        This is a text-only planning call. You do not have repository tools,
+        shell access, network tools, or a checkout. Use only the work item
+        title and task text below. Do not write implementation code. The
+        implementation phase will run later after this artifact is reviewed.
 
         Return JSON only. Do not wrap it in Markdown.
 
@@ -1663,8 +1593,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var planningEnabledAtEntry = ShouldUsePlanningPhase(item, project);
         var planningLifecycleRequiredAtEntry = !skipWork
             && (planningEnabledAtEntry || IsPlanningLifecycleState(entry));
-        var planningPendingAtEntry = planningLifecycleRequiredAtEntry
-            && entry is (WorkItemState.Queued or WorkItemState.Planning);
 
         // ── Credential smoke gate ────────────────────────────────────────────────
         // Run before ANY sandbox is allocated. Skipped when the project opts out
@@ -1736,7 +1664,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ? completionModeCheck ? null : "check"
             : skipWork
                 ? null
-                : planningPendingAtEntry ? "planning" : "work";
+                : "work";
         if (initialSmokePhase is not null)
         {
             var initialSmokeTarget = ResolvePhaseSmokeTarget(project, initialSmokePhase, item.BaselineImageRef);
@@ -1790,7 +1718,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         ClaudeSessionLifecycle? claudeSessionLifecycle = null;
-        var claudeSessionOpenedReadOnlyForPlanning = false;
         try
         {
             await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
@@ -1813,25 +1740,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // RunAgentPhaseAsync takes the legacy independent-phase branch.
             if (!skipWork && !skipAudit)
             {
-                if (planningPendingAtEntry)
+                if (!planningLifecycleRequiredAtEntry)
                 {
                     claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
                         item,
                         project,
                         agentRunner,
                         repoId,
-                        useReadOnlyRepositoryAccess: true,
-                        ct);
-                    claudeSessionOpenedReadOnlyForPlanning = claudeSessionLifecycle is not null;
-                }
-                else if (!planningLifecycleRequiredAtEntry)
-                {
-                    claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
-                        item,
-                        project,
-                        agentRunner,
-                        repoId,
-                        useReadOnlyRepositoryAccess: false,
                         ct);
                 }
                 // Publish the lifecycle on the AsyncLocal in RunAsync's own
@@ -1851,9 +1766,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item = await RunPlanningLifecycleIfNeededAsync(
                     item,
                     project,
-                    repoId,
-                    baseBranch,
-                    claudeSessionLifecycle,
                     ct,
                     hostShutdownToken);
 
@@ -1881,18 +1793,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     AgentInstanceId = planningEntryAgentInstanceId,
                 };
 
-                if (claudeSessionOpenedReadOnlyForPlanning && claudeSessionLifecycle is not null)
-                {
-                    await CloseAmbientClaudeSessionAsync(
-                        claudeSessionLifecycle,
-                        item,
-                        project,
-                        "read-only planning session completed before writable implementation");
-                    claudeSessionLifecycle = null;
-                    claudeSessionOpenedReadOnlyForPlanning = false;
-                    _ambientSessionLifecycle.Value = null;
-                }
-
                 if (!skipWork && !skipAudit && claudeSessionLifecycle is null)
                 {
                     claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
@@ -1900,7 +1800,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         project,
                         agentRunner,
                         repoId,
-                        useReadOnlyRepositoryAccess: false,
                         ct);
                     _ambientSessionLifecycle.Value = claudeSessionLifecycle;
                 }
@@ -1984,11 +1883,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (!skipWork)
             {
                 using var workPhaseScope = BeginPhaseScope(item, "work");
-                await PublishIterationStartedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase, ct);
                 var workIterationStart = DateTimeOffset.UtcNow;
+                if (planningLifecycleRequiredAtEntry)
+                {
+                    var enteredWork = await TryEnterWorkFromApprovedPlanAsync(item, project, ct);
+                    if (enteredWork is null)
+                        return;
+                    item = enteredWork;
+                }
+                else
+                {
+                    await Transition(item, WorkItemState.Working, ct, project);
+                    item = item with { State = WorkItemState.Working };
+                }
+
+                await PublishIterationStartedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase, ct);
                 await _store.RecordIterationDispatchAsync(
                     item.Id, AuditProgressIterationNumbers.WorkPhase, item.PromptRevision, workIterationStart, ct);
-                await Transition(item, WorkItemState.Working, ct, project);
                 string? workAgentStdout = null;
                 using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
                 {
@@ -10658,6 +10569,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
             : new AgentAvailability(true, null, null);
     }
 
+    private async Task<AgentAvailability> EnsureAgentPauseAllowsTextOnlyAsync(
+        AgentKind kind,
+        string? agentInstanceId,
+        CancellationToken ct)
+    {
+        if (_agentPauses is null)
+            return new AgentAvailability(true, null, null);
+
+        var pause = await _agentPauses.GetAgentStateAsync(kind, ct, agentInstanceId);
+        if (pause is null)
+            return new AgentAvailability(true, null, null);
+
+        var reason = string.IsNullOrWhiteSpace(pause.PausedReason)
+            ? AgentDispatchAvailability.PausedReasonPrefix
+            : $"{AgentDispatchAvailability.PausedReasonPrefix}: {pause.PausedReason}";
+        if (pause.ExpiresAt is { } expiresAt)
+            reason = $"{reason} until {expiresAt:O}";
+
+        return new AgentAvailability(false, reason, null, AgentAvailabilityCause.OperatorPaused);
+    }
+
     private static bool IsOperatorPaused(AgentAvailability? availability) =>
         availability is { Available: false, Cause: AgentAvailabilityCause.OperatorPaused };
 
@@ -10790,7 +10722,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentMembership? initialMemberOverride = null,
         bool recordInvolvement = true,
         InVmSmokeSandboxTarget? smokeTarget = null,
-        string? requireCapability = null)
+        string? requireCapability = null,
+        bool skipInVmSmoke = false)
     {
         // R8-core: every agent invocation gets a deterministic in-VM log path,
         // persisted on the work item BEFORE the runner starts. If SIGTERM fires
@@ -11030,7 +10963,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (_classRouter is null
             || (item.AgentClassId is null && project.DefaultAgentClass is null))
         {
-            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(initialRunner.Kind, fallbackSmokeTarget, ct);
+            var smokeAvailability = skipInVmSmoke
+                ? await EnsureAgentPauseAllowsTextOnlyAsync(initialRunner.Kind, initialItem.AgentInstanceId, ct)
+                : await EnsureAgentSmokeAvailableAsync(initialRunner.Kind, fallbackSmokeTarget, ct);
             if (!smokeAvailability.Available)
             {
                 if (IsOperatorPaused(smokeAvailability))
@@ -11409,7 +11344,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             triedKeys.Add(TriedMemberKey(currentMember));
             triedCount++;
 
-            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(currentRunner.Kind, fallbackSmokeTarget, ct);
+            var smokeAvailability = skipInVmSmoke
+                ? await EnsureAgentPauseAllowsTextOnlyAsync(currentRunner.Kind, currentItem.AgentInstanceId, ct)
+                : await EnsureAgentSmokeAvailableAsync(currentRunner.Kind, fallbackSmokeTarget, ct);
             if (!smokeAvailability.Available)
             {
                 if (IsOperatorPaused(smokeAvailability))

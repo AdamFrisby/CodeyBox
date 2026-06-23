@@ -418,6 +418,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 PreemptCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptCheckpoint : null,
                 UpdatedAt = DateTimeOffset.UtcNow,
             }, attempts, item.State);
+            updated = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(updated);
         }
 
         await _store.UpdateAsync(updated, ct);

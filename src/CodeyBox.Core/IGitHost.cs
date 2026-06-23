@@ -33,18 +33,6 @@ public interface IGitHost
     /// </summary>
     SandboxRepositoryAccess GetSandboxAccess(string repositoryId);
 
-    /// <summary>
-    /// Describes read-only sandbox access to a managed repository. Planning and
-    /// other analysis-only phases use this when sandbox-side pushes or direct
-    /// bare-repo writes must not be able to mutate the durable host repository.
-    ///
-    /// <para>Default throws because returning <see cref="GetSandboxAccess"/>
-    /// would silently downgrade a security boundary to a convention.</para>
-    /// </summary>
-    SandboxRepositoryAccess GetReadOnlySandboxAccess(string repositoryId)
-        => throw new NotSupportedException(
-            "This git host does not support read-only sandbox repository access.");
-
     /// <summary>Returns the host filesystem path for a managed bare repository.</summary>
     string GetRepoPath(string repositoryId)
         => throw new NotSupportedException("This git host does not expose a host repository path.");

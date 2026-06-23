@@ -55,10 +55,10 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("## Reviewed planning metadata", agent.LastWorkPrompt, StringComparison.Ordinal);
-        Assert.Contains("Plan-declared path-like files/areas", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("Plan-declared files/areas", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.Contains("output.txt", agent.LastWorkPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("make the smallest output file change", agent.LastWorkPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("\"approach\"", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("make the smallest output file change", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("pipeline integration verifies final branch", agent.LastWorkPrompt, StringComparison.Ordinal);
 
         var events = setup.Webhooks.Events.Select(e => e.Event).ToArray();
         Assert.Contains("work_item.planning", events);
@@ -181,9 +181,9 @@ public sealed class PlanningPipelineTests : IDisposable
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Equal(2, sessionRunner.OpenCalls);
+        Assert.Equal(1, sessionRunner.OpenCalls);
         Assert.Equal(1, sessionRunner.SendTurns);
-        Assert.Equal(2, sessionRunner.CloseCalls);
+        Assert.Equal(1, sessionRunner.CloseCalls);
         Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
         Assert.Equal("max", sessionRunner.OpenedReasoningMode);
         var sessionPrompt = Assert.Single(sessionRunner.PromptsSent);
@@ -193,6 +193,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
         Assert.Contains("planning-only phase", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.False(agent.PlanningReceivedSandbox);
 
         var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
         var (_, treeOutput, _) = await TestSupport.RunGit(
@@ -315,7 +316,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal("Placeholder plan review approved.", final.PlanReviewSummary);
         Assert.Contains("## Reviewed planning metadata", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.Contains("output.txt", agent.LastWorkPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("resume from review", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("resume from review", agent.LastWorkPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -351,7 +352,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.WorkCalls);
         Assert.Equal("approved earlier", final.PlanReviewSummary);
         Assert.Contains("## Reviewed planning metadata", agent.LastWorkPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("already approved", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("already approved", agent.LastWorkPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -914,7 +915,7 @@ internal sealed class PlanningPipelineSetup(
     public void Dispose() => Store.Dispose();
 }
 
-internal sealed partial class PlanningAwareAgent : IAgentRunner
+internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentRunner
 {
     private const string DefaultPlan = """
         {
@@ -938,6 +939,7 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
     public Func<CancellationToken, Task>? OnPlanningBeforeReturnAsync { get; set; }
     public string LastPlanningPrompt { get; private set; } = string.Empty;
     public string LastWorkPrompt { get; private set; } = string.Empty;
+    public bool PlanningReceivedSandbox { get; private set; }
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -1034,6 +1036,48 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
         return result.Success
             ? new AgentFailureClassification(AgentFailureKind.Normal)
             : AgentFailureClassifier.Classify(result.Stderr, result.Stdout, result.Summary);
+    }
+
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+    {
+        _ = credential;
+        return null;
+    }
+
+    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = workingDirectory;
+        PlanningReceivedSandbox = sandbox is not null;
+
+        if (!prompt.Contains("planning-only phase", StringComparison.Ordinal))
+            return new TextOnlyAgentResult(false, "unexpected text-only prompt", null, prompt);
+
+        PlanningCalls++;
+        LastPlanningPrompt = prompt;
+
+        if (OnPlanningBeforeReturnAsync is not null)
+            await OnPlanningBeforeReturnAsync(ct);
+
+        if (PlanningResult is not null)
+        {
+            return new TextOnlyAgentResult(
+                PlanningResult.Success,
+                PlanningResult.Summary,
+                PlanningResult.Stdout,
+                PlanningResult.Stderr);
+        }
+
+        return new TextOnlyAgentResult(true, "planned", PlanOutput, null);
     }
 
     private static async Task<AgentResult> HandleMergeAsync(

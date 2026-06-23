@@ -1,7 +1,6 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Text.RegularExpressions;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -43,10 +42,6 @@ internal sealed record PlanArtifactDocument(
     private const int MaxFieldChars = 4000;
     private const int MaxListItems = 25;
     private const int MaxListItemChars = 600;
-
-    private static readonly Regex SafePathLikeToken = new(
-        @"\A[A-Za-z0-9._/@:+-]{1,240}\z",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -91,9 +86,7 @@ internal sealed record PlanArtifactDocument(
     public static string ToImplementationGuidance(string artifact)
     {
         var plan = ParseCanonical(artifact);
-        var safeFiles = plan.Files
-            .Select(NormalizePathLikeToken)
-            .OfType<string>()
+        var files = plan.Files
             .Distinct(StringComparer.Ordinal)
             .Take(MaxListItems)
             .ToArray();
@@ -102,10 +95,14 @@ internal sealed record PlanArtifactDocument(
         sb.Append("""
             ## Reviewed planning metadata
 
-            A schema-valid PLAN artifact was approved before implementation. The placeholder reviewer used by this scaffold does not establish trust in free-form plan text, so approach, test, risk, and satisfaction prose are intentionally not repeated here.
+            A schema-valid PLAN artifact was approved before implementation. Use this reviewed plan as guidance; adapt only when repository facts require a narrower correction.
 
             """);
-        AppendList(sb, "Plan-declared path-like files/areas", safeFiles);
+        AppendField(sb, "Approach", plan.Approach);
+        AppendList(sb, "Plan-declared files/areas", files);
+        AppendList(sb, "Test strategy", plan.TestStrategy);
+        AppendList(sb, "Risks and mitigations", plan.Risks);
+        AppendField(sb, "How this satisfies the task", plan.SatisfiesTask);
         return sb.ToString().TrimEnd();
     }
 
@@ -231,21 +228,6 @@ internal sealed record PlanArtifactDocument(
 
     private static string Truncate(string value, int maxChars)
         => value.Length <= maxChars ? value : value[..maxChars] + "...";
-
-    private static string? NormalizePathLikeToken(string value)
-    {
-        value = value.Trim();
-        if (value.Length == 0
-            || value.Contains("..", StringComparison.Ordinal)
-            || value.StartsWith("-", StringComparison.Ordinal)
-            || value.StartsWith("/", StringComparison.Ordinal)
-            || !SafePathLikeToken.IsMatch(value))
-        {
-            return null;
-        }
-
-        return value;
-    }
 
     private static void AppendField(StringBuilder sb, string label, string value)
     {

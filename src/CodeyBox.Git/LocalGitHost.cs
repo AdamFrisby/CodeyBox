@@ -211,13 +211,6 @@ public sealed class LocalGitHost : IGitHost
         return new SandboxRepositoryAccess(SandboxRepoMountPath, mounts, SandboxNetworkPolicy.Denied);
     }
 
-    public SandboxRepositoryAccess GetReadOnlySandboxAccess(string repositoryId)
-    {
-        var repoPath = GetRepoPath(repositoryId);
-        var mounts = GetRepositoryMounts(repoPath, readOnly: true);
-        return new SandboxRepositoryAccess(SandboxRepoMountPath, mounts, SandboxNetworkPolicy.Denied);
-    }
-
     /// <summary>Sandbox-side path the bare repo is mounted at. Per-item scoped.</summary>
     public const string SandboxRepoMountPath = "/repo";
 

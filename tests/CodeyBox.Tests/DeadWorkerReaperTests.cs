@@ -123,6 +123,38 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_PlanningToQueued_ClearsStalePlanFields()
+    {
+        var item = MakeItem(WorkItemState.Planning) with
+        {
+            PlanArtifact = """
+                {
+                  "approach": "stale",
+                  "files": ["stale.txt"],
+                  "testStrategy": ["stale"],
+                  "risks": ["stale"],
+                  "satisfiesTask": "stale"
+                }
+                """,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewSummary = "unreviewed stale approval",
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Null(after.PlanArtifact);
+        Assert.Null(after.PlanGeneratedAt);
+        Assert.Null(after.PlanReviewedAt);
+        Assert.Null(after.PlanReviewSummary);
+    }
+
+    [Fact]
     public async Task Reaper_WorkingWithoutPreempt_MarksFailed()
     {
         var item = MakeItem(WorkItemState.Working);
