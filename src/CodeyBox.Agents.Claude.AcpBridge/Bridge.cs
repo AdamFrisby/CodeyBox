@@ -208,6 +208,11 @@ internal sealed class Bridge : IAsyncDisposable
             SpawnClaude();
             if (ShutdownStarted) return; // spawn failure already raised fatal
             StartAcceptLoop();
+            if (ShutdownStarted) return;
+            // `ready` is the host/client signal that a WebSocket handshake can
+            // complete, so emit it only after the accept loop is live.
+            EmitReady();
+            StartClaudeBackgroundTasks();
         }
         catch (Exception ex)
         {
@@ -498,7 +503,10 @@ internal sealed class Bridge : IAsyncDisposable
             Fatal("lockfile_write_failed", ex.Message);
             return;
         }
+    }
 
+    private void EmitReady()
+    {
         Emitter.Emit("ready", w =>
         {
             w.WriteNumber("port", _port);
@@ -582,16 +590,22 @@ internal sealed class Bridge : IAsyncDisposable
         // bridge's stdin reader for host envelope bytes. See the
         // RedirectStandardInput = true comment above.
         try { _claudeProcess.StandardInput.Close(); } catch { }
+    }
+
+    private void StartClaudeBackgroundTasks()
+    {
+        if (_claudeProcess is null)
+            return;
 
         // Drive claude_exit via an awaitable monitor task instead of the
         // proc.Exited event. Two reasons:
         //
         // 1. proc.Exited is documented to potentially miss the exit if the
         //    process exits before EnableRaisingEvents = true is set — under
-        //    CPU stress the order Process.Start → close-stdin → subscribe →
-        //    EnableRaisingEvents is non-trivial wall-clock, and a fast stub
-        //    that's already been SIGTERM'd by a racing Shutdown can die in
-        //    that window. The old `if (proc.HasExited) MaybeFinish()` post-
+        //    CPU stress the order Process.Start → close-stdin → ready →
+        //    subscribe is non-trivial wall-clock, and a fast stub that's
+        //    already been SIGTERM'd by a racing Shutdown can die in that
+        //    window. The old `if (proc.HasExited) MaybeFinish()` post-
         //    check called MaybeFinish but did NOT emit claude_exit, so the
         //    envelope was silently dropped and the host's session-completion
         //    observer would never see the turn close.
