@@ -1970,6 +1970,11 @@ builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemQuestionStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<ITestCaseStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteTestCaseStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2893,6 +2898,7 @@ app.UseApiKeyAuth(
 IdempotencyMiddleware.Use(app);
 
 WorkItemEndpoints.Map(app);
+TestCaseEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
@@ -3532,6 +3538,9 @@ namespace CodeyBox.Api
         /// </summary>
         public WorkerPoolHealthWatchdogOptions WorkerPoolHealthWatchdog { get; set; } = new();
 
+        public const int DefaultMaxBulkItems = 1000;
+        public const int MaximumMaxBulkItems = 10_000;
+        public int MaxBulkItems { get; set; } = DefaultMaxBulkItems;
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;

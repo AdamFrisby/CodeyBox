@@ -27,6 +27,9 @@ Start here if you're new:
     properties. Start here when writing SIEM rules or log-query dashboards.
 14. [`agent-supervision.md`](agent-supervision.md) — config-gated human live
     supervision, streaming, and injection across concurrent agent sessions.
+15. [`test-cases.md`](test-cases.md) — first-class TestCase artifact attached
+    to work items: lean schema, SQLite persistence, REST surface, and the
+    JobTrack mapping (`SourceWorkItemId` ↔ `SourceTaskId`).
 
 ## Plugin SDK
 

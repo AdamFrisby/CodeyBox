@@ -184,6 +184,35 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:MaxTemplateChecks", result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(CodeyBoxOptions.MaximumMaxBulkItems + 1)]
+    public void Validate_RejectsOutOfRangeMaxBulkItems(int maxBulk)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MaxBulkItems = maxBulk;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:MaxBulkItems", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(CodeyBoxOptions.DefaultMaxBulkItems)]
+    [InlineData(CodeyBoxOptions.MaximumMaxBulkItems)]
+    public void Validate_AcceptsMaxBulkItemsBoundaries(int maxBulk)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MaxBulkItems = maxBulk;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_RejectsInvalidSandboxResumeMode()
     {
