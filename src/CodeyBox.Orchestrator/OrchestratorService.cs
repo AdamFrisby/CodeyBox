@@ -2148,13 +2148,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // agent and deferring. When ResolveAsync returns Chosen != null
             // it has already test-and-reserved the chosen member's slot via
             // the gate; the outer finally releases on every exit path.
-            var shouldRouteWorkAgentAtPickup = ShouldRouteWorkAgentAtPickup(item);
-            if (_router is not null && !isAgentControlItem && shouldRouteWorkAgentAtPickup)
+            var shouldResolveAgentClassAtPickup = ShouldResolveAgentClassAtPickup(item);
+            var shouldGateDirectWorkAgentAtPickup = ShouldGateDirectWorkAgentAtPickup(item);
+            if (_router is not null && !isAgentControlItem && shouldResolveAgentClassAtPickup)
             {
                 var decision = await _router.ResolveAsync(item, project, ct, slotGate: this);
                 if (decision.ShouldWait)
                 {
-                    if (decision.WaitingForPausedAgent && !shouldRouteWorkAgentAtPickup)
+                    if (decision.WaitingForPausedAgent && !shouldGateDirectWorkAgentAtPickup)
                     {
                         _log.LogInformation(
                             "Work item {Id}: paused class-routing verdict deferred to pipeline phase handling for state {State}",
@@ -2244,7 +2245,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (!agentSlotReserved && !isAgentControlItem)
             {
                 var effectiveDirectAgent = item.Agent ?? project?.DefaultAgent;
-                var directAvailability = shouldRouteWorkAgentAtPickup && effectiveDirectAgent is { } directAgent
+                var directAvailability = shouldGateDirectWorkAgentAtPickup && effectiveDirectAgent is { } directAgent
                     ? _dispatchAvailability?.GetAvailability(new AgentMembership
                     {
                         Agent = directAgent,
@@ -2267,7 +2268,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     return;
                 }
 
-                if (shouldRouteWorkAgentAtPickup && item.Agent is { } routedAgent)
+                if (shouldGateDirectWorkAgentAtPickup && item.Agent is { } routedAgent)
                 {
                     var routeKey = ResolveDirectRouteKey(routedAgent, item.AgentInstanceId);
                     var cap = GetAgentCapForRoute(routedAgent, routeKey);
@@ -2564,7 +2565,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
-    private static bool ShouldRouteWorkAgentAtPickup(WorkItem item) =>
+    private static bool ShouldResolveAgentClassAtPickup(WorkItem item) =>
+        item.State is not WorkItemState.PlanReview;
+
+    private static bool ShouldGateDirectWorkAgentAtPickup(WorkItem item) =>
         item.State is WorkItemState.Queued
             or WorkItemState.Planning
             or WorkItemState.PlanApproved
