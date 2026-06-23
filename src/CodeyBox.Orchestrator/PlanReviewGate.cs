@@ -32,7 +32,7 @@ public sealed class AlwaysPassPlanReviewGate : IPlanReviewGate
     }
 }
 
-internal sealed record PlanArtifactDocument(
+public sealed record PlanArtifactDocument(
     string Approach,
     IReadOnlyList<string> Files,
     IReadOnlyList<string> TestStrategy,

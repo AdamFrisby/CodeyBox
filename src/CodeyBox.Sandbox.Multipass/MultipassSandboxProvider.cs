@@ -298,7 +298,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             }
             else if (m.HostPath is not null)
             {
-                var hostPath = m.ReadOnly
+                var hostPath = m.SnapshotForIsolation
                     ? StageReadOnlyBindSnapshot(sandboxRoot, m.HostPath, m.SandboxPath)
                     : m.HostPath;
                 bindMounts.Add(new BindMount(hostPath, m.SandboxPath, m.ReadOnly));
