@@ -277,11 +277,13 @@ public sealed class MergeConflictReworkTests : IDisposable
         var sandboxProvider = new ConflictReworkLsFilesSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             new SandboxExecResult(0, "not-a-git-record\0", ""));
+        var webhooks = new CapturingWebhookDispatcher();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [auditor],
-            sandboxProvider: sandboxProvider);
+            sandboxProvider: sandboxProvider,
+            webhookDispatcher: webhooks);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
@@ -297,6 +299,11 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Contains("malformed git ls-files -u output segment", final.LastError, StringComparison.Ordinal);
         Assert.Equal(1, sandboxProvider.InterceptedLsFilesCalls);
         Assert.Empty(tp.Agent.ConflictReworkPrompts);
+        var startedDetails = Assert.Single(
+            webhooks.Events,
+            e => e.Event == "work_item.conflict_rework_started").Details;
+        Assert.Empty(Assert.IsType<ConflictReworkStartedDetails>(startedDetails).ConflictFiles);
+        AssertConflictReworkStartedBeforeFinished(webhooks);
     }
 
     [Fact]
@@ -307,11 +314,13 @@ public sealed class MergeConflictReworkTests : IDisposable
         var sandboxProvider = new ConflictReworkLsFilesSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             new SandboxExecResult(0, "", ""));
+        var webhooks = new CapturingWebhookDispatcher();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [auditor],
-            sandboxProvider: sandboxProvider);
+            sandboxProvider: sandboxProvider,
+            webhookDispatcher: webhooks);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
@@ -327,6 +336,11 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Equal($"conflict-rework agent did not produce a clean resolution: {failureReason}", final.LastError);
         Assert.Equal(1, sandboxProvider.InterceptedLsFilesCalls);
         Assert.Empty(tp.Agent.ConflictReworkPrompts);
+        var startedDetails = Assert.Single(
+            webhooks.Events,
+            e => e.Event == "work_item.conflict_rework_started").Details;
+        Assert.Empty(Assert.IsType<ConflictReworkStartedDetails>(startedDetails).ConflictFiles);
+        AssertConflictReworkStartedBeforeFinished(webhooks);
     }
 
     [Fact]
@@ -1070,10 +1084,22 @@ public sealed class MergeConflictReworkTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
         var webhooks = new CapturingWebhookDispatcher();
+        var sandboxProvider = new PollutedSecondMergeGrepSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         using var tp = TestSupport.BuildPipeline(_workspace, seed,
-            auditors: [auditor], webhookDispatcher: webhooks);
+            auditors: [auditor],
+            sandboxProvider: sandboxProvider,
+            webhookDispatcher: webhooks);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            Assert.Equal(["README.md"], files.Select(f => f.Path).ToArray());
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main side\nwork side\n",
+            };
+        });
 
         tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
         {
@@ -1091,6 +1117,10 @@ public sealed class MergeConflictReworkTests : IDisposable
         await tp.Store.CreateAsync(item);
 
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.Equal(1, sandboxProvider.InjectedGrepFailures);
+        Assert.Single(tp.Agent.ConflictReworkPrompts);
+        Assert.Contains("Starting codeybox-xxxx", tp.Agent.ConflictReworkPrompts[0], StringComparison.Ordinal);
 
         var startedEvt = Assert.Single(webhooks.Events, e => e.Event == "work_item.conflict_rework_started");
         var startedDetails = Assert.IsType<ConflictReworkStartedDetails>(startedEvt.Details);
@@ -1254,6 +1284,15 @@ public sealed class MergeConflictReworkTests : IDisposable
         await (Task)method.Invoke(scheduler, [CancellationToken.None])!;
     }
 
+    private static void AssertConflictReworkStartedBeforeFinished(CapturingWebhookDispatcher webhooks)
+    {
+        var events = webhooks.Events.ToList();
+        var startedIdx = events.FindIndex(e => e.Event == "work_item.conflict_rework_started");
+        var finishedIdx = events.FindIndex(e => e.Event == "work_item.conflict_rework_finished");
+        Assert.True(startedIdx >= 0 && finishedIdx > startedIdx,
+            $"finished must follow started (started={startedIdx}, finished={finishedIdx})");
+    }
+
     private static async Task WriteFileAsync(ISandbox sandbox, string workDir, string relPath, string content, CancellationToken ct)
     {
         var r = await sandbox.ExecAsync(new SandboxExec
@@ -1264,6 +1303,93 @@ public sealed class MergeConflictReworkTests : IDisposable
         if (!r.Success)
             throw new InvalidOperationException(
                 $"sandbox write failed (exit {r.ExitCode}) for {relPath}: {r.Stderr}");
+    }
+
+    private sealed class PollutedSecondMergeGrepSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        private int _mergeGrepCalls;
+        private bool _injected;
+        public int InjectedGrepFailures { get; private set; }
+
+        public PollutedSecondMergeGrepSandboxProvider(ISandboxProvider inner)
+        {
+            _inner = inner;
+        }
+
+        public string Name => _inner.Name;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var sandbox = await _inner.CreateAsync(spec, ct);
+            return string.Equals(spec.TimingPhase, "merge", StringComparison.Ordinal)
+                ? new PollutedSecondMergeGrepSandbox(sandbox, this)
+                : sandbox;
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            _inner.DisposeLeakedAsync(name, ct);
+
+        public bool ShouldInject(SandboxExec exec)
+        {
+            if (_injected || !IsGitGrepCommand(exec))
+                return false;
+
+            _mergeGrepCalls++;
+            if (_mergeGrepCalls < 2)
+                return false;
+
+            _injected = true;
+            InjectedGrepFailures++;
+            return true;
+        }
+
+        private static bool IsGitGrepCommand(SandboxExec exec) =>
+            exec.Argv.Count >= 4
+            && exec.Argv[0] == "git"
+            && exec.Argv[1] == "-C"
+            && exec.Argv[3] == "grep";
+    }
+
+    private sealed class PollutedSecondMergeGrepSandbox : ISandbox
+    {
+        private readonly ISandbox _inner;
+        private readonly PollutedSecondMergeGrepSandboxProvider _owner;
+
+        public PollutedSecondMergeGrepSandbox(
+            ISandbox inner,
+            PollutedSecondMergeGrepSandboxProvider owner)
+        {
+            _inner = inner;
+            _owner = owner;
+        }
+
+        public string Id => _inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (_owner.ShouldInject(exec))
+            {
+                return Task.FromResult(new SandboxExecResult(
+                    2,
+                    "",
+                    "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner> grep failed"));
+            }
+
+            return _inner.ExecAsync(exec, ct);
+        }
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default) =>
+            _inner.KillActiveExecsAsync(ct);
+
+        public ValueTask DisposeAsync() => _inner.DisposeAsync();
     }
 
     private sealed class ConflictReworkLsFilesSandboxProvider : ISandboxProvider

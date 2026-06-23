@@ -12029,8 +12029,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             priorChangedFiles = [];
         }
 
+        var conflictReworkStartedPublished = false;
+
         async Task PublishStartedAsync(IReadOnlyList<string> conflictFiles)
         {
+            if (conflictReworkStartedPublished)
+                return;
+
+            conflictReworkStartedPublished = true;
             await TryPublishEventAsync(item, project, "work_item.conflict_rework_started",
                 new ConflictReworkStartedDetails
                 {
@@ -12041,6 +12047,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     BaseTip = baseTip,
                     ConflictFiles = conflictFiles,
                 }, ct);
+        }
+
+        async Task PublishFinishedAfterStartedAsync(
+            bool success,
+            string? newTip,
+            IReadOnlyList<string>? filesChanged,
+            int? insertions,
+            int? deletions,
+            string? semanticIncompatible,
+            string? parkReason)
+        {
+            if (!conflictReworkStartedPublished)
+                await PublishStartedAsync(Array.Empty<string>());
+
+            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                success, newTip, filesChanged, insertions, deletions, semanticIncompatible, parkReason, ct);
         }
 
         ConflictReworkAgentOutcome outcome;
@@ -12055,10 +12077,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex,
                 "Conflict rework agent invocation hit transient transport failure for work item {Id}: {Message}",
                 item.Id, ex.Message);
-            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+            await PublishFinishedAfterStartedAsync(
                 success: false, newTip: null, filesChanged: null,
                 insertions: null, deletions: null, semanticIncompatible: null,
-                parkReason: ex.Message, ct);
+                parkReason: ex.Message);
             throw;
         }
         catch (Exception ex) when (ex is not OperationCanceledException
@@ -12068,10 +12090,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex,
                 "Conflict rework agent invocation failed for work item {Id}: {Message}",
                 item.Id, ex.Message);
-            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+            await PublishFinishedAfterStartedAsync(
                 success: false, newTip: null, filesChanged: null,
                 insertions: null, deletions: null, semanticIncompatible: null,
-                parkReason: ex.Message, ct);
+                parkReason: ex.Message);
             return new ConflictReworkResult(false,
                 $"conflict-rework agent failed: {ex.Message}");
         }
@@ -12082,21 +12104,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} conflict-rework declared semantic-incompatible: {Reason}",
                 item.Id, outcome.SemanticIncompatibleReason);
-            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+            await PublishFinishedAfterStartedAsync(
                 success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
                 insertions: outcome.Insertions, deletions: outcome.Deletions,
                 semanticIncompatible: outcome.SemanticIncompatibleReason,
-                parkReason: parkMsg, ct);
+                parkReason: parkMsg);
             return new ConflictReworkResult(false, parkMsg);
         }
 
         if (!outcome.AgentSucceeded || outcome.NewTip is null)
         {
             var parkMsg = $"conflict-rework agent did not produce a clean resolution: {outcome.FailureReason ?? "agent reported failure"}";
-            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+            await PublishFinishedAfterStartedAsync(
                 success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
                 insertions: outcome.Insertions, deletions: outcome.Deletions,
-                semanticIncompatible: null, parkReason: parkMsg, ct);
+                semanticIncompatible: null, parkReason: parkMsg);
             return new ConflictReworkResult(false, parkMsg);
         }
 
@@ -12118,10 +12140,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     "Conflict rework: could not enumerate rework changed files for work item {Id}; refusing to advance",
                     item.Id);
                 var listFailMsg = $"could not verify rework diff for anti-abandonment guard: {ex.Message}";
-                await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                await PublishFinishedAfterStartedAsync(
                     success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
                     insertions: outcome.Insertions, deletions: outcome.Deletions,
-                    semanticIncompatible: null, parkReason: listFailMsg, ct);
+                    semanticIncompatible: null, parkReason: listFailMsg);
                 return new ConflictReworkResult(false, listFailMsg);
             }
 
@@ -12136,10 +12158,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 _log.LogWarning(
                     "Work item {Id} conflict-rework dropped work-agent changes; missing={Missing}, priorTouched={Prior}, newTouched={New}",
                     item.Id, string.Join(',', missing), priorChangedFiles.Count, newChangedFiles.Count);
-                await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                await PublishFinishedAfterStartedAsync(
                     success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
                     insertions: outcome.Insertions, deletions: outcome.Deletions,
-                    semanticIncompatible: null, parkReason: parkMsg, ct);
+                    semanticIncompatible: null, parkReason: parkMsg);
                 return new ConflictReworkResult(false, parkMsg);
             }
         }
@@ -12156,10 +12178,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex,
                 "Conflict rework: failed to set work branch to rework tip for work item {Id}",
                 item.Id);
-            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+            await PublishFinishedAfterStartedAsync(
                 success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
                 insertions: outcome.Insertions, deletions: outcome.Deletions,
-                semanticIncompatible: null, parkReason: parkMsg, ct);
+                semanticIncompatible: null, parkReason: parkMsg);
             return new ConflictReworkResult(false, parkMsg);
         }
 
@@ -12171,10 +12193,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         _ = startedAt; // currently unused; future: emit conflict_rework duration metric.
 
-        await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+        await PublishFinishedAfterStartedAsync(
             success: true, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
             insertions: outcome.Insertions, deletions: outcome.Deletions,
-            semanticIncompatible: null, parkReason: null, ct);
+            semanticIncompatible: null, parkReason: null);
 
         return new ConflictReworkResult(true, null);
     }

@@ -1,7 +1,9 @@
 using System.Text;
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests;
 
@@ -852,7 +854,7 @@ public sealed class AgenticConflictResolverTests
             CancellationToken.None);
 
         Assert.False(result.Success);
-        Assert.Contains("git ls-files failed", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("failed to inspect unmerged paths", result.Summary, StringComparison.Ordinal);
         Assert.Contains("fatal: index corrupted", result.Summary, StringComparison.Ordinal);
     }
 
@@ -938,6 +940,41 @@ public sealed class AgenticConflictResolverTests
             ex.Message,
             StringComparison.Ordinal);
         Assert.Equal(1, sandbox.LsFilesCallCount);
+    }
+
+    [Fact]
+    public async Task FinalizeConflictResolutionAsync_UsesLiteralPathspecs_ForGitAddAndMarkerScan()
+    {
+        const string literalPath = "src/conflict*[ab].txt";
+        const string wildcardNeighbor = "src/conflictZZa.txt";
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "init");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "tests@codeybox.invalid");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "CodeyBox Tests");
+        await Run(sandbox, "mkdir", "-p", $"{SandboxConventions.WorkDir}/src");
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{literalPath}", "resolved\n");
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{wildcardNeighbor}", "clean\n");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", ".");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", "seed");
+
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{literalPath}", "resolved differently\n");
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{wildcardNeighbor}", "<<<<<<< marker\n");
+
+        await PipelineRunner.FinalizeConflictResolutionAsync(
+            sandbox,
+            [new ConflictHunk(literalPath, StartLine: 1, EndLine: 3)],
+            "codeybox/work",
+            "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            CancellationToken.None);
+
+        var staged = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--name-only"],
+        });
+        Assert.True(staged.Success, staged.Stderr);
+        Assert.Equal(literalPath + "\n", staged.Stdout);
     }
 
     [Fact]
@@ -1175,6 +1212,22 @@ public sealed class AgenticConflictResolverTests
         return
             "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner>  " +
             $"100644 {oid2} 2\t{path}\0";
+    }
+
+    private static async Task Run(ISandbox sandbox, params string[] argv)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = argv });
+        Assert.True(result.Success, $"command failed ({string.Join(' ', argv)}): {result.Stderr}\n{result.Stdout}");
+    }
+
+    private static async Task WriteFileAsync(ISandbox sandbox, string path, string content)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$0\"", path],
+            Stdin = content,
+        });
+        Assert.True(result.Success, $"write failed for {path}: {result.Stderr}");
     }
 
     private static string BuildLargeResolved(string conflictedContent)

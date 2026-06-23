@@ -565,14 +565,19 @@ public sealed class AgenticConflictResolver
         AgenticConflictResolverOptions options,
         CancellationToken ct)
     {
-        var unmerged = await sandbox.ExecAsync(new SandboxExec
+        IReadOnlyList<string> remainingUnmergedPaths;
+        try
         {
-            Argv = ["git", "-C", workingDirectory, "ls-files", "-u", "-z"],
-        }, ct);
-        if (!unmerged.Success)
-            return new VerificationOutcome(false, $"git ls-files failed: {unmerged.Stderr.Trim()}");
+            remainingUnmergedPaths = await MergeConflictPathInspector.ListUnmergedPathsAsync(
+                sandbox,
+                workingDirectory,
+                ct);
+        }
+        catch (MergeConflictResolutionFailedException ex)
+        {
+            return new VerificationOutcome(false, ex.Message);
+        }
 
-        var remainingUnmergedPaths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(unmerged.Stdout);
         if (remainingUnmergedPaths.Count > 0)
             return new VerificationOutcome(
                 false,
