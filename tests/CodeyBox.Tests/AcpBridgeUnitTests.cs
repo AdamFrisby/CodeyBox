@@ -46,7 +46,6 @@ public sealed class AcpBridgeCollection
 /// </summary>
 [Collection("ACP bridge")]
 [SupportedOSPlatform("linux")]
-[Collection("Process environment")]
 public sealed class AcpBridgeUnitTests
 {
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
