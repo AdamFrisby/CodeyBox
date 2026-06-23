@@ -20,9 +20,10 @@ public interface ITestCaseStore
     Task BulkCreateAsync(IReadOnlyList<TestCase> testCases, CancellationToken ct = default);
 
     /// <summary>
-    /// Updates an existing test case.
+    /// Updates an existing test case. Returns true if a row was affected, false if no row with
+    /// the given id existed (the typical signal for an HTTP 404).
     /// </summary>
-    Task UpdateAsync(TestCase testCase, CancellationToken ct = default);
+    Task<bool> UpdateAsync(TestCase testCase, CancellationToken ct = default);
 
     /// <summary>
     /// Retrieves a test case by its unique ID.
@@ -40,7 +41,8 @@ public interface ITestCaseStore
     IAsyncEnumerable<TestCase> ListByWorkItemAsync(string workItemId, CancellationToken ct = default);
 
     /// <summary>
-    /// Physically deletes a test case from the store.
+    /// Physically deletes a test case from the store. Returns true if a row was affected, false
+    /// if no row with the given id existed.
     /// </summary>
-    Task DeleteAsync(string id, CancellationToken ct = default);
+    Task<bool> DeleteAsync(string id, CancellationToken ct = default);
 }

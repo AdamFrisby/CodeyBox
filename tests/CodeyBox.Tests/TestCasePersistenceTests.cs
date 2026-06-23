@@ -82,9 +82,11 @@ public sealed class TestCasePersistenceTests : IDisposable
         Assert.Equal(tc.Label, loaded.Label);
         Assert.Equal(tc.LastRunPassed, loaded.LastRunPassed);
         Assert.Equal(tc.LastRunResult, loaded.LastRunResult);
-        Assert.True(Math.Abs((tc.CreatedAt - loaded.CreatedAt).TotalSeconds) < 1);
-        Assert.True(Math.Abs((tc.UpdatedAt - loaded.UpdatedAt).TotalSeconds) < 1);
-        Assert.True(tc.LastRunAt.HasValue && loaded.LastRunAt.HasValue && Math.Abs((tc.LastRunAt.Value - loaded.LastRunAt.Value).TotalSeconds) < 1);
+        // Round-trip via ISO 8601 ("O") is lossless; assert exact equality so a future format
+        // change that drops precision regresses noisily.
+        Assert.Equal(tc.CreatedAt, loaded.CreatedAt);
+        Assert.Equal(tc.UpdatedAt, loaded.UpdatedAt);
+        Assert.Equal(tc.LastRunAt, loaded.LastRunAt);
     }
 
     [Fact]
@@ -121,6 +123,134 @@ public sealed class TestCasePersistenceTests : IDisposable
         Assert.Null(loaded.LastRunPassed);
         Assert.Null(loaded.LastRunAt);
         Assert.Null(loaded.LastRunResult);
+    }
+
+    [Fact]
+    public async Task Update_MissingRow_ReturnsFalse()
+    {
+        var wid = await SeedWorkItemAsync();
+        var ghost = new TestCase
+        {
+            Id = "never-existed",
+            Name = "Ghost",
+            Description = "",
+            SourceWorkItemId = wid,
+        };
+        var ok = await _store.UpdateAsync(ghost);
+        Assert.False(ok);
+    }
+
+    [Fact]
+    public async Task Update_ExistingRow_ReturnsTrue()
+    {
+        var wid = await SeedWorkItemAsync();
+        var tc = new TestCase
+        {
+            Id = "tc-up-rc-1",
+            Name = "n",
+            Description = "",
+            SourceWorkItemId = wid,
+        };
+        await _store.CreateAsync(tc);
+        var ok = await _store.UpdateAsync(tc with { Name = "n2" });
+        Assert.True(ok);
+    }
+
+    [Fact]
+    public async Task Delete_MissingRow_ReturnsFalse()
+    {
+        var ok = await _store.DeleteAsync("never-existed");
+        Assert.False(ok);
+    }
+
+    [Fact]
+    public async Task Delete_ExistingRow_ReturnsTrue()
+    {
+        var wid = await SeedWorkItemAsync();
+        var tc = new TestCase
+        {
+            Id = "tc-del-rc-1",
+            Name = "n",
+            Description = "",
+            SourceWorkItemId = wid,
+        };
+        await _store.CreateAsync(tc);
+        var ok = await _store.DeleteAsync("tc-del-rc-1");
+        Assert.True(ok);
+    }
+
+    [Fact]
+    public async Task RoundTrip_AutomationKind_Integration()
+    {
+        var wid = await SeedWorkItemAsync();
+        var tc = new TestCase
+        {
+            Id = "tc-int-1",
+            Name = "Integration Case",
+            Description = "",
+            SourceWorkItemId = wid,
+            AutomationKind = AutomationKind.Integration,
+        };
+        await _store.CreateAsync(tc);
+        var loaded = await _store.GetAsync("tc-int-1");
+        Assert.NotNull(loaded);
+        Assert.Equal(AutomationKind.Integration, loaded.AutomationKind);
+    }
+
+    [Fact]
+    public async Task Read_UnknownAutomationKind_FallsBackToNullInsteadOfThrowing()
+    {
+        var wid = await SeedWorkItemAsync();
+        var tc = new TestCase
+        {
+            Id = "tc-unknown-kind",
+            Name = "n",
+            Description = "",
+            SourceWorkItemId = wid,
+        };
+        await _store.CreateAsync(tc);
+
+        // Forge a value the running enum doesn't know about — simulating either a forward-compat
+        // row written by a newer version or a corrupted row. Read must not throw.
+        using (var conn = new SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE test_cases SET automation_kind='SomeFutureKind' WHERE id=$id;";
+            cmd.Parameters.AddWithValue("$id", "tc-unknown-kind");
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var loaded = await _store.GetAsync("tc-unknown-kind");
+        Assert.NotNull(loaded);
+        Assert.Null(loaded.AutomationKind);
+    }
+
+    [Fact]
+    public async Task BulkCreate_DuplicateIdMidBatch_RollsBackEntireBatch()
+    {
+        var wid = await SeedWorkItemAsync();
+        // Seed an existing row whose Id one of the bulk items will collide with.
+        await _store.CreateAsync(new TestCase
+        {
+            Id = "tc-collide",
+            Name = "Pre-existing",
+            Description = "",
+            SourceWorkItemId = wid,
+        });
+
+        var batch = new List<TestCase>
+        {
+            new() { Id = "tc-bulk-rollback-1", Name = "A", Description = "", SourceWorkItemId = wid },
+            new() { Id = "tc-bulk-rollback-2", Name = "B", Description = "", SourceWorkItemId = wid },
+            new() { Id = "tc-collide", Name = "Conflict", Description = "", SourceWorkItemId = wid },
+        };
+
+        await Assert.ThrowsAsync<SqliteException>(() => _store.BulkCreateAsync(batch));
+
+        // Items 1 and 2 must NOT have landed — the whole batch is rolled back.
+        Assert.Null(await _store.GetAsync("tc-bulk-rollback-1"));
+        Assert.Null(await _store.GetAsync("tc-bulk-rollback-2"));
     }
 
     [Fact]
@@ -300,37 +430,47 @@ public sealed class TestCasePersistenceTests : IDisposable
                 cmd.ExecuteNonQuery();
             }
 
-            // 2. Instantiate SqliteTestCaseStore on the existing DB file.
-            // This should run the Migration logic (CREATE TABLE IF NOT EXISTS test_cases, indexes, etc.).
+            // 2. Seed a work item row so the FK on test_cases.source_work_item_id is satisfied.
+            using (var conn = new SqliteConnection($"Data Source={migrationDbPath}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO work_items (id, project_id, title, prompt, work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at)
+                    VALUES ('some-wid', 'test-proj', 'Mig Item', 'test', 0, 0, 0, 0, '2026-06-10T12:00:00Z', '2026-06-10T12:00:00Z');
+                    """;
+                cmd.ExecuteNonQuery();
+            }
+
+            // 3. Instantiating SqliteTestCaseStore on the pre-existing DB must run the additive
+            // migration (CREATE TABLE IF NOT EXISTS test_cases + indexes) without error, and the
+            // table must be writable + readable immediately afterwards.
             using (var store = new SqliteTestCaseStore(migrationDbPath))
             {
-                // 3. Verify that we can write to and read from the test_cases table without error.
                 var tc = new TestCase
                 {
                     Id = "tc-mig-1",
                     Name = "Migration Case",
                     Description = "Verify migration works",
-                    SourceWorkItemId = "some-wid", // FK check is ON but since it's not referenced by work_items in this isolated test, wait:
-                    // Wait, we turned foreign keys ON, so referencing a non-existent work item might fail?
-                    // Let's seed a work item in this database to be safe.
+                    SourceWorkItemId = "some-wid",
                 };
-
-                // Let's seed a work item in the migration DB first.
-                using (var conn = new SqliteConnection($"Data Source={migrationDbPath}"))
-                {
-                    conn.Open();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = """
-                        INSERT INTO work_items (id, project_id, title, prompt, work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at)
-                        VALUES ('some-wid', 'test-proj', 'Mig Item', 'test', 0, 0, 0, 0, '2026-06-10T12:00:00Z', '2026-06-10T12:00:00Z');
-                        """;
-                    cmd.ExecuteNonQuery();
-                }
 
                 await store.CreateAsync(tc);
                 var loaded = await store.GetAsync("tc-mig-1");
                 Assert.NotNull(loaded);
                 Assert.Equal("Migration Case", loaded.Name);
+
+                // The three documented indexes must have been created by the migration.
+                using var conn = new SqliteConnection($"Data Source={migrationDbPath}");
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='test_cases';";
+                using var reader = cmd.ExecuteReader();
+                var indexes = new List<string>();
+                while (reader.Read()) indexes.Add(reader.GetString(0));
+                Assert.Contains("idx_test_cases_work_item", indexes);
+                Assert.Contains("idx_test_cases_label", indexes);
+                Assert.Contains("idx_test_cases_archived", indexes);
             }
         }
         finally

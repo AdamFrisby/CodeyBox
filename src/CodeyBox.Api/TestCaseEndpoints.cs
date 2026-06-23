@@ -8,7 +8,6 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using CodeyBox.Core;
-using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
@@ -197,11 +196,16 @@ internal static class TestCaseEndpoints
         var existing = await store.GetAsync(id, ct);
         if (existing is null) return Results.NotFound();
 
+        // SourceWorkItemId is the stable cross-system provenance link a later JobTrack
+        // propagation item relies on; reject mutation that would silently break that mapping
+        // rather than rewriting the link.
+        if (!string.Equals(existing.SourceWorkItemId, normalisedSourceWorkItemId, StringComparison.Ordinal))
+            return Results.BadRequest(new { error = "SourceWorkItemId cannot be changed after creation" });
+
         var updated = existing with
         {
             Name = req.Name,
             Description = req.Description ?? string.Empty,
-            SourceWorkItemId = normalisedSourceWorkItemId,
             UpdatedAt = DateTimeOffset.UtcNow,
             IsArchived = req.IsArchived,
             AutomationKind = req.AutomationKind,
@@ -213,8 +217,11 @@ internal static class TestCaseEndpoints
             LastRunResult = req.LastRunResult
         };
 
-        await store.UpdateAsync(updated, ct);
-        return Results.Ok(ToDto(updated));
+        // Single atomic UPDATE; if the row vanished after the existence check (concurrent
+        // delete), the affected-row count is zero and we surface that as 404 rather than
+        // returning OK with stale state.
+        var ok = await store.UpdateAsync(updated, ct);
+        return ok ? Results.Ok(ToDto(updated)) : Results.NotFound();
     }
 
     private static async Task<IResult> DeleteAsync(
@@ -222,11 +229,8 @@ internal static class TestCaseEndpoints
         ITestCaseStore store,
         CancellationToken ct)
     {
-        var existing = await store.GetAsync(id, ct);
-        if (existing is null) return Results.NotFound();
-
-        await store.DeleteAsync(id, ct);
-        return Results.NoContent();
+        var ok = await store.DeleteAsync(id, ct);
+        return ok ? Results.NoContent() : Results.NotFound();
     }
 
     private static TestCaseDto ToDto(TestCase tc) => new(

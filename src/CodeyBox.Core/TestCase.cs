@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 
 namespace CodeyBox.Core;
 
@@ -15,45 +14,13 @@ public enum AutomationKind
 }
 
 /// <summary>
-/// A step inside an e2e-replay executable artifact.
-/// </summary>
-public sealed record E2eReplayStep
-{
-    public required string Action { get; init; }
-    public required string Selector { get; init; }
-    public string? Value { get; init; }
-}
-
-/// <summary>
-/// An assertion inside an e2e-replay executable artifact.
-/// </summary>
-public sealed record E2eReplayAssertion
-{
-    public required string Type { get; init; }
-    public required string Selector { get; init; }
-    public string? ExpectedValue { get; init; }
-}
-
-/// <summary>
-/// The structured executable artifact payload for E2E replays.
-/// </summary>
-public sealed record E2eReplayArtifact
-{
-    public required IReadOnlyList<E2eReplayStep> Steps { get; init; }
-    public required IReadOnlyList<E2eReplayAssertion> Assertions { get; init; }
-}
-
-/// <summary>
-/// The conformance conditions determining whether a test case meets coverage expectations.
-/// </summary>
-public sealed record ConformanceCondition
-{
-    public string? BrokenBranch { get; init; }
-    public string? ExpectedOutcome { get; init; }
-}
-
-/// <summary>
 /// A lean, execution-focused test case artifact linked to a work item.
+///
+/// CodeyBox intentionally does NOT model the management taxonomy JobTrack uses
+/// (no SurfaceArea, no parent/path/level hierarchy). <see cref="ExecutableArtifactJson"/>
+/// and <see cref="ConformanceJson"/> are persisted as opaque JSON strings; the schema for
+/// those payloads is owned by their consumers (the E2E executor, the mutation gate), which
+/// land as separate items. See <c>docs/test-cases.md</c> for the schema and the JobTrack mapping.
 /// </summary>
 public sealed record TestCase
 {
