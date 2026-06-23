@@ -405,7 +405,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             {
                 State = target,
                 LastError = $"watchdog: worker made no progress for {sinceProgressSeconds}s in state {fromState}",
-                StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+                StartedAt = WorkItemRecoveryPolicy.ShouldClearStartedAtForRecoveryTarget(target) ? null : item.StartedAt,
                 WorkBranch = target == WorkItemState.Queued ? null : item.WorkBranch,
                 // Clearing WorkBranch on Queued recovery regenerates the default
                 // rebase-owned branch name on re-dispatch; the operator-resume

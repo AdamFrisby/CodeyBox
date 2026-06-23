@@ -60,6 +60,11 @@ internal static class WorkItemRecoveryPolicy
         };
     }
 
+    public static bool ShouldClearStartedAtForRecoveryTarget(WorkItemState target)
+        => target is WorkItemState.Queued
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved;
+
     private static WorkItem ClearRecoveryAttempts(WorkItem item) => item with
     {
         RecoveryAttempts = 0,
@@ -262,7 +267,7 @@ internal static class WorkItemRecoveryPolicy
 
         var recovered = ClearPlanFieldsIfQueued(item.With(target.Value, error) with
         {
-            StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+            StartedAt = ShouldClearStartedAtForRecoveryTarget(target.Value) ? null : item.StartedAt,
             UpdatedAt = now,
         });
         return WithRecoveryAttempt(recovered, attempts, item.State);
@@ -431,7 +436,7 @@ internal static class WorkItemRecoveryPolicy
         {
             State = target,
             LastError = reason,
-            StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+            StartedAt = ShouldClearStartedAtForRecoveryTarget(target) ? null : item.StartedAt,
             PreemptedAt = null,
             PreemptCheckpoint = null,
             UpdatedAt = now,

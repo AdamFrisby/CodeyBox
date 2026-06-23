@@ -533,7 +533,7 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task Worker_PlanReviewWithPausedDirectAgent_DoesNotParkBeforePipeline()
+    public async Task Worker_PlanReviewWithPausedDirectAgent_ParksBeforePipeline()
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
@@ -564,10 +564,10 @@ public sealed class AgentPauseTests : IDisposable
         await store.CreateAsync(item);
         await queue.EnqueueAsync(item.Id);
 
-        var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
-        Assert.NotNull(done);
-        Assert.True(pipeline.Entered);
-        Assert.Null(done!.AgentPauseRetryFrom);
+        var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
+        Assert.NotNull(parked);
+        Assert.False(pipeline.Entered);
+        Assert.Equal("plan_review", parked!.AgentPauseRetryFrom);
         await svc.StopAsync(CancellationToken.None);
     }
 

@@ -1924,8 +1924,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }, newAttempts, item.State);
         }
 
+        var recovered = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(item.With(targetState.Value) with
+        {
+            StartedAt = WorkItemRecoveryPolicy.ShouldClearStartedAtForRecoveryTarget(targetState.Value)
+                ? null
+                : item.StartedAt,
+        });
         return WorkItemRecoveryPolicy.WithRecoveryAttempt(
-            item.With(targetState.Value),
+            recovered,
             newAttempts,
             item.State);
     }
@@ -2568,6 +2574,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item) =>
         item.State is WorkItemState.Queued
             or WorkItemState.Planning
+            or WorkItemState.PlanReview
             or WorkItemState.PlanApproved
             or WorkItemState.Reworking
             or WorkItemState.ReworkingForConflict;
@@ -2575,6 +2582,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static bool ShouldGateDirectWorkAgentAtPickup(WorkItem item) =>
         item.State is WorkItemState.Queued
             or WorkItemState.Planning
+            or WorkItemState.PlanReview
             or WorkItemState.PlanApproved
             or WorkItemState.Reworking
             or WorkItemState.ReworkingForConflict;

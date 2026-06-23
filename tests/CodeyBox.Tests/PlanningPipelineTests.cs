@@ -149,7 +149,7 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_ClaudeSessionMode_RunsPlanningOutsideWarmSessionThenImplementation()
+    public async Task PlanOn_ClaudeSessionMode_RunsPlanningAsFirstWarmSessionTurnThenImplementation()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
@@ -182,14 +182,19 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(1, sessionRunner.OpenCalls);
-        Assert.Equal(1, sessionRunner.SendTurns);
+        Assert.True(
+            sessionRunner.SendTurns == 2,
+            "Expected planning and work to both use the warm session. Prompts: "
+            + string.Join("\n---\n", sessionRunner.PromptsSent));
         Assert.Equal(1, sessionRunner.CloseCalls);
         Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
         Assert.Equal("max", sessionRunner.OpenedReasoningMode);
-        Assert.DoesNotContain("planning-only phase", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
-        Assert.Contains("Reviewed planning metadata", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
-        Assert.Contains("output.txt", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
-        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Contains("planning-only phase", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("Reviewed planning metadata", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("planning-only phase", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
+        Assert.Contains("Reviewed planning metadata", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
+        Assert.Contains("output.txt", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
+        Assert.Equal(0, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
 
         var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
@@ -348,6 +353,47 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.WorkCalls);
         Assert.True(agent.PlanningReceivedSandbox);
         Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_RunnerWithoutTextOnlyCapability_PlanningSandboxGetsCredentialAndAgentNetwork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new SandboxOnlyPlanningAgent();
+        var recorder = new PlanningRecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            credentials: new PlanningMarkerCredentialProvider(),
+            sandboxProvider: recorder,
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [PlanningMarkerCredentialProvider.MarkerHost],
+            });
+        var item = NewItem("feature/no-text-only-plan-credential") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(agent.PlanningReceivedCredential);
+
+        var planningSpec = Assert.Single(recorder.SpecsForPhase("planning"));
+        Assert.Equal(
+            PlanningMarkerCredentialProvider.MarkerValue,
+            planningSpec.Environment[PlanningMarkerCredentialProvider.MarkerKey]);
+        Assert.Contains(PlanningMarkerCredentialProvider.MarkerHost, planningSpec.Network.AllowedHosts);
     }
 
     [Fact]
@@ -936,7 +982,10 @@ public sealed class PlanningPipelineTests : IDisposable
         IQuotaFailureClassifier? quotaClassifier = null,
         IWorkItemAutoRetryScheduler? retryScheduler = null,
         IAgentPauseController? agentPauseController = null,
-        AgentPromptPreprocessorChain? promptPreprocessors = null)
+        AgentPromptPreprocessorChain? promptPreprocessors = null,
+        ICredentialProvider? credentials = null,
+        ISandboxProvider? sandboxProvider = null,
+        PipelineOptions? pipelineOptions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -945,7 +994,8 @@ public sealed class PlanningPipelineTests : IDisposable
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
-        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var sandboxes = sandboxProvider
+            ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var registry = new AgentRegistry([agent]);
         var webhooks = new CapturingWebhookDispatcher();
@@ -963,10 +1013,10 @@ public sealed class PlanningPipelineTests : IDisposable
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
-            sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
+            sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            pipelineOptions ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
@@ -1208,6 +1258,7 @@ internal sealed partial class SandboxOnlyPlanningAgent : IAgentRunner
     public int PlanningCalls { get; private set; }
     public int WorkCalls { get; private set; }
     public bool PlanningReceivedSandbox { get; private set; }
+    public bool PlanningReceivedCredential { get; private set; }
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -1229,6 +1280,7 @@ internal sealed partial class SandboxOnlyPlanningAgent : IAgentRunner
         {
             PlanningCalls++;
             PlanningReceivedSandbox = true;
+            PlanningReceivedCredential = credential?.EnvironmentVariables.ContainsKey(PlanningMarkerCredentialProvider.MarkerKey) == true;
             stdoutChunkCallback?.Invoke(PlanningAwareAgentJson.DefaultPlan);
             return new AgentResult(true, "planned", PlanningAwareAgentJson.DefaultPlan, null);
         }
@@ -1419,6 +1471,45 @@ internal static class PlanningAwareAgentJson
           "satisfiesTask": "creates output.txt."
         }
         """;
+}
+
+internal sealed class PlanningMarkerCredentialProvider : ICredentialProvider
+{
+    public const string MarkerKey = "CODEYBOX_PLANNING_CREDENTIAL_MARKER";
+    public const string MarkerValue = "planning-credential-present";
+    public const string MarkerHost = "planning-agent.example.invalid";
+
+    public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        => Task.FromResult<AgentCredential?>(new AgentCredential(
+            agent,
+            EnvironmentVariables: new Dictionary<string, string> { [MarkerKey] = MarkerValue },
+            Files: new Dictionary<string, string>()));
+}
+
+internal sealed class PlanningRecordingSandboxProvider(ISandboxProvider inner) : ISandboxProvider
+{
+    private readonly List<SandboxSpec> _specs = [];
+
+    public string Name => inner.Name;
+
+    public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+    {
+        lock (_specs)
+            _specs.Add(spec);
+        return inner.CreateAsync(spec, ct);
+    }
+
+    public IReadOnlyList<SandboxSpec> SpecsForPhase(string phase)
+    {
+        lock (_specs)
+            return _specs.Where(s => s.TimingPhase == phase).ToList();
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => inner.DisposeLeakedAsync(name, ct);
 }
 
 internal sealed class RejectingPlanReviewGate : IPlanReviewGate
