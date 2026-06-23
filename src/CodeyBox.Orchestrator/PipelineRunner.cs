@@ -45,8 +45,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private const int CompletionReviewFileMaxChars = 8 * 1024;
     private const int CompletionReviewMaxFiles = 80;
     private const int PlanArtifactMaxChars = 64 * 1024;
-    private const int PlanOutputAccumulatorMaxChars = PlanArtifactMaxChars + 4096;
-    private const string PlanReviewPlaceholderSummary = "Placeholder plan review approved.";
+    private const int PlanOutputAccumulatorMaxChars = 256 * 1024;
 
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
@@ -169,6 +168,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly CancellationRegistry? _cancellations;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly IKnobRegistry? _knobRegistry;
+    private readonly IPlanReviewGate _planReviewGate;
     private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the
     // default for tests / minimal compositions). Composed with the global
@@ -302,7 +302,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // duplication. Legacy embedders / tests that don't wire this still get
         // the registry-built path below.
         IAgentAuthRequiredHandler? authRequiredHandler = null,
-        IAgentAuthRequiredAvailabilityReader? authRequiredReader = null)
+        IAgentAuthRequiredAvailabilityReader? authRequiredReader = null,
+        IPlanReviewGate? planReviewGate = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -377,6 +378,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _cancellations = cancellationRegistry;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _knobRegistry = knobRegistry;
+        _planReviewGate = planReviewGate ?? new AlwaysPassPlanReviewGate();
         _availability = availability;
         // Prefer the DI-injected handler when supplied: keeps the registry
         // plumbing in one place (the composition root) rather than duplicated
@@ -831,13 +833,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
         && !string.IsNullOrWhiteSpace(item.PlanArtifact);
 
     private static string? ApprovedPlanForImplementation(WorkItem item, bool planningWasRequired)
-        => planningWasRequired && HasApprovedCurrentPlan(item) ? item.PlanArtifact : null;
+        => planningWasRequired && HasApprovedCurrentPlan(item)
+            ? PlanArtifactDocument.ToImplementationGuidance(item.PlanArtifact!)
+            : null;
 
     private async Task<WorkItem> RunPlanningLifecycleIfNeededAsync(
         WorkItem item,
         Project project,
         string repoId,
         string baseBranch,
+        ClaudeSessionLifecycle? sessionLifecycle,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -850,6 +855,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (!HasApprovedCurrentPlan(current))
                 throw new InvalidOperationException("PlanApproved item is missing an approved planning artifact.");
             return current;
+        }
+
+        if (current.State == WorkItemState.PlanReview
+            && string.IsNullOrWhiteSpace(current.PlanArtifact))
+        {
+            throw new InvalidOperationException("Plan review cannot run before the planning artifact exists.");
         }
 
         if (!string.IsNullOrWhiteSpace(current.PlanArtifact))
@@ -893,6 +904,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                 project,
                                 sandboxTarget.NetworkProfile,
                                 sandboxTarget.Flavor,
+                                sessionLifecycle,
                                 phaseCt,
                                 hostShutdownToken),
                             workToken: attemptCt),
@@ -907,12 +919,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         var planned = await PersistPlanArtifactAsync(current.Id, current.PromptRevision, planArtifact, ct);
-        await Transition(planned, WorkItemState.PlanReview, ct, project);
-        var reviewing = await _store.GetAsync(current.Id, ct) ?? planned with { State = WorkItemState.PlanReview };
+        if (planned is null)
+            return await _store.GetAsync(current.Id, ct) ?? current;
+
+        var reviewing = await TryTransitionPlanningStateAsync(
+            planned,
+            WorkItemState.PlanReview,
+            project,
+            ct);
+        if (reviewing.State != WorkItemState.PlanReview)
+            return reviewing;
+
         return await RunPlanReviewPlaceholderAsync(reviewing, project, ct);
     }
 
-    private async Task<WorkItem> PersistPlanArtifactAsync(
+    private async Task<WorkItem?> PersistPlanArtifactAsync(
         WorkItemId itemId,
         int promptRevisionAtPlanningDispatch,
         string artifact,
@@ -922,8 +943,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ?? throw new InvalidOperationException($"Work item '{itemId}' disappeared while persisting planning artifact.");
         if (current.PromptRevision != promptRevisionAtPlanningDispatch)
         {
-            throw new InvalidOperationException(
-                $"Planning phase completed against prompt revision {promptRevisionAtPlanningDispatch}, but the work item is now at prompt revision {current.PromptRevision}; refusing to persist a stale plan.");
+            _log.LogInformation(
+                "Planning phase completed against stale prompt revision {PlanningRevision} for work item {WorkItemId}; current revision is {CurrentRevision}. Leaving the item queued for replanning.",
+                promptRevisionAtPlanningDispatch,
+                itemId,
+                current.PromptRevision);
+            return null;
         }
 
         var normalized = NormalizePlanArtifact(artifact);
@@ -939,8 +964,29 @@ public sealed partial class PipelineRunner : IPipelineRunner
             PlanReviewSummary = null,
             UpdatedAt = updatedAt,
         };
-        await _store.UpdateAsync(updated, ct);
-        return updated;
+        var persisted = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            updated,
+            WorkItemState.Planning,
+            current.UpdatedAt,
+            ct);
+        if (persisted)
+            return updated;
+
+        current = await _store.GetAsync(itemId, ct)
+            ?? throw new InvalidOperationException($"Work item '{itemId}' disappeared while persisting planning artifact.");
+        if (current.PromptRevision != promptRevisionAtPlanningDispatch
+            || current.State == WorkItemState.Queued)
+        {
+            _log.LogInformation(
+                "Planning artifact for work item {WorkItemId} lost a race with a prompt edit or lifecycle rewind; leaving current state {State} at revision {PromptRevision}.",
+                itemId,
+                current.State,
+                current.PromptRevision);
+            return null;
+        }
+
+        throw new InvalidOperationException(
+            $"Planning artifact persistence raced with state {current.State}; refusing to approve an ambiguous plan.");
     }
 
     private async Task<WorkItem> RunPlanReviewPlaceholderAsync(
@@ -955,19 +1001,105 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException("Plan review cannot run before the planning artifact exists.");
 
         if (current.State != WorkItemState.PlanReview)
-            await Transition(current, WorkItemState.PlanReview, ct, project);
+        {
+            current = await TryTransitionPlanningStateAsync(current, WorkItemState.PlanReview, project, ct);
+            if (current.State != WorkItemState.PlanReview)
+                return current;
+        }
 
         current = await _store.GetAsync(item.Id, ct) ?? current with { State = WorkItemState.PlanReview };
+        var decision = await _planReviewGate.ReviewAsync(current, current.PlanArtifact!, ct);
+        if (!decision.Approved)
+        {
+            throw new InvalidOperationException(
+                $"Plan review rejected the planning artifact: {decision.RejectionReason ?? decision.Summary}");
+        }
+
         var updatedAt = DateTimeOffset.UtcNow;
         var reviewed = current with
         {
+            State = WorkItemState.PlanApproved,
             PlanReviewedAt = updatedAt,
-            PlanReviewSummary = PlanReviewPlaceholderSummary,
+            PlanReviewSummary = decision.Summary,
             UpdatedAt = updatedAt,
         };
-        await _store.UpdateAsync(reviewed, ct);
-        await Transition(reviewed, WorkItemState.PlanApproved, ct, project);
-        return await _store.GetAsync(item.Id, ct) ?? reviewed with { State = WorkItemState.PlanApproved };
+        var approved = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            reviewed,
+            WorkItemState.PlanReview,
+            current.UpdatedAt,
+            ct);
+        if (!approved)
+        {
+            var latest = await _store.GetAsync(item.Id, ct) ?? current;
+            if (latest.PromptRevision != current.PromptRevision
+                || latest.State == WorkItemState.Queued)
+            {
+                _log.LogInformation(
+                    "Plan review for work item {WorkItemId} lost a race with a prompt edit or lifecycle rewind; leaving current state {State} at revision {PromptRevision}.",
+                    item.Id,
+                    latest.State,
+                    latest.PromptRevision);
+                return latest;
+            }
+
+            throw new InvalidOperationException(
+                $"Plan review approval raced with state {latest.State}; refusing to approve an ambiguous plan.");
+        }
+
+        await EmitTransitionSideEffectsAsync(reviewed, WorkItemState.PlanApproved, project, ct);
+        return await _store.GetAsync(item.Id, ct) ?? reviewed;
+    }
+
+    private async Task<WorkItem> TryTransitionPlanningStateAsync(
+        WorkItem item,
+        WorkItemState state,
+        Project project,
+        CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        if (current.PromptRevision != item.PromptRevision
+            || string.IsNullOrWhiteSpace(current.PlanArtifact)
+            || current.State == WorkItemState.Queued)
+        {
+            _log.LogInformation(
+                "Skipping planning transition for work item {WorkItemId} to {State}; current state {CurrentState}, revision {CurrentRevision}, expected revision {ExpectedRevision}.",
+                item.Id,
+                state,
+                current.State,
+                current.PromptRevision,
+                item.PromptRevision);
+            return current;
+        }
+
+        if (current.State == state)
+            return current;
+
+        if (current.State is not (WorkItemState.Planning or WorkItemState.PlanReview))
+            throw new InvalidOperationException(
+                $"Cannot transition planning artifact for work item {item.Id} from {current.State} to {state}.");
+
+        var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            current.With(state),
+            current.State,
+            state);
+        var transitioned = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            next,
+            current.State,
+            current.UpdatedAt,
+            ct);
+        if (!transitioned)
+        {
+            var latest = await _store.GetAsync(item.Id, ct) ?? current;
+            if (latest.PromptRevision != item.PromptRevision
+                || latest.State == WorkItemState.Queued)
+                return latest;
+
+            throw new InvalidOperationException(
+                $"Planning transition for work item {item.Id} raced with state {latest.State}; refusing stale continuation.");
+        }
+
+        await EmitTransitionSideEffectsAsync(next, state, project, ct);
+        return next;
     }
 
     private async Task<string> RunPlanningAgentTurnAsync(
@@ -978,33 +1110,54 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         string? networkProfile,
         SandboxProfileFlavor sandboxFlavor,
+        ClaudeSessionLifecycle? sessionLifecycle,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
-        var access = _gitHost.GetReadOnlySandboxAccess(repoId);
-        var spec = BuildSandboxSpec(
-            access,
-            includeAgentCredential: credential,
-            allowAgentNetwork: true,
-            hostNetworkProfile: networkProfile,
-            timingWorkItemId: item.Id,
-            timingPhase: "planning",
-            flavor: sandboxFlavor,
-            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
-                project,
-                new SandboxTarget(networkProfile, sandboxFlavor),
-                item.BaselineImageRef));
+        var useClaudeSession = sessionLifecycle is not null
+            && !sessionLifecycle.IsClosed
+            && runner.Kind == AgentKind.Claude
+            && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        var access = useClaudeSession
+            ? _gitHost.GetSandboxAccess(repoId)
+            : _gitHost.GetReadOnlySandboxAccess(repoId);
 
-        var sandboxStartSw = Stopwatch.StartNew();
-        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-        sandboxStartSw.Stop();
-        CodeyBoxMeters.SandboxLifecycle.Record(
-            sandboxStartSw.ElapsedMilliseconds,
-            new KeyValuePair<string, object?>("step", "start"));
+        ISandbox? sandboxToDispose = null;
+        ISandbox sandbox;
+        if (useClaudeSession)
+        {
+            sandbox = await sessionLifecycle!.GetSandboxAsync(ct);
+            if (credential is not null && credential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            await sessionLifecycle.RefreshCredentialAsync(credential, ct);
+        }
+        else
+        {
+            var spec = BuildSandboxSpec(
+                access,
+                includeAgentCredential: credential,
+                allowAgentNetwork: true,
+                hostNetworkProfile: networkProfile,
+                timingWorkItemId: item.Id,
+                timingPhase: "planning",
+                flavor: sandboxFlavor,
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                    project,
+                    new SandboxTarget(networkProfile, sandboxFlavor),
+                    item.BaselineImageRef));
 
-        if (credential is not null && credential.Files.Count > 0)
-            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            var sandboxStartSw = Stopwatch.StartNew();
+            sandbox = await _sandboxes.CreateAsync(spec, ct);
+            sandboxToDispose = sandbox;
+            sandboxStartSw.Stop();
+            CodeyBoxMeters.SandboxLifecycle.Record(
+                sandboxStartSw.ElapsedMilliseconds,
+                new KeyValuePair<string, object?>("step", "start"));
+
+            if (credential is not null && credential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+        }
 
         await using (var cloneScope = await TimingScope.BeginAsync(
             _timings,
@@ -1014,8 +1167,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
             activitySource: CodeyBoxActivities.Sandbox,
             log: _log))
         {
-            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            var alreadyCloned = useClaudeSession && await IsSandboxWorkTreePresentAsync(sandbox, ct);
+            if (alreadyCloned)
+            {
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
+            }
+            else
+            {
+                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            }
         }
+        if (useClaudeSession)
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", "DISABLED_BY_CODEYBOX_PLANNING");
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", baseBranch, $"origin/{baseBranch}");
 
         var prompt = await ProcessAgentPromptAsync(
@@ -1071,16 +1234,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 activitySource: CodeyBoxActivities.Pipeline))
             {
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                var runTask = RunPlanningSessionTurnAsync(
-                    runner,
-                    sandbox,
-                    prompt,
-                    credential,
-                    item,
-                    project,
-                    stdoutCallback,
-                    runnerCts.Token,
-                    captureStructuredStream: false);
+                var runTask = useClaudeSession
+                    ? sessionLifecycle!.SendTurnAsync(prompt, runnerCts.Token, stdoutCallback)
+                    : RunPlanningSessionTurnAsync(
+                        runner,
+                        sandbox,
+                        prompt,
+                        credential,
+                        item,
+                        project,
+                        stdoutCallback,
+                        runnerCts.Token,
+                        captureStructuredStream: false);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completed != runTask)
                 {
@@ -1170,9 +1335,42 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         finally
         {
+            if (useClaudeSession)
+            {
+                try
+                {
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", access.CloneUrlInsideSandbox);
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "reset", "--hard");
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "clean", "-fdx");
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "Failed to clean warm planning sandbox for work item {WorkItemId}; closing Claude session before implementation",
+                        item.Id);
+                    await CloseAmbientClaudeSessionAsync(
+                        sessionLifecycle!,
+                        item,
+                        project,
+                        "planning sandbox cleanup failed");
+                    _ambientSessionLifecycle.Value = null;
+                }
+            }
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
+            if (sandboxToDispose is not null)
+                await sandboxToDispose.DisposeAsync();
         }
+    }
+
+    private static async Task<bool> IsSandboxWorkTreePresentAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "--is-inside-work-tree"],
+        }, ct);
+        return result.Success
+            && result.Stdout.Trim().Equals("true", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<AgentResult> RunPlanningSessionTurnAsync(
@@ -1229,17 +1427,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
         $$"""
         You are in CodeyBox's planning-only phase for this work item.
 
-        Produce a structured PLAN artifact only. You may inspect the repository
+        Produce a structured PLAN artifact only, as a single JSON object with
+        this exact shape:
+
+        {
+          "approach": "short implementation approach",
+          "files": ["files or areas likely to change"],
+          "testStrategy": ["tests, build checks, and E2E strategy"],
+          "risks": ["risks and mitigations"],
+          "satisfiesTask": "how this plan satisfies the task"
+        }
+
+        You may inspect the repository
         and run read-only commands as needed, but do not write implementation
         code, edit files, create commits, or push branches. The implementation
         phase will run later after this artifact is reviewed.
 
-        The PLAN must cover:
-        - Approach
-        - Files/areas to change
-        - Test/E2E strategy
-        - Risks and mitigations
-        - How the plan satisfies the task
+        Return JSON only. Do not wrap it in Markdown.
 
         Work item title:
         {{item.Title}}
@@ -1249,14 +1453,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         """;
 
     private static string NormalizePlanArtifact(string artifact)
-    {
-        var trimmed = RawOutputRedactor.Redact(artifact).Trim();
-        if (trimmed.Length <= PlanArtifactMaxChars)
-            return trimmed;
-
-        return trimmed[..PlanArtifactMaxChars]
-            + $"\n\n[CodeyBox: planning artifact truncated to {PlanArtifactMaxChars} characters.]";
-    }
+        => PlanArtifactDocument.NormalizeRaw(artifact, PlanArtifactMaxChars);
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
@@ -1472,17 +1669,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throw new InvalidOperationException(
                     $"workBranch must differ from baseBranch (both '{baseBranch}'); refusing to bypass merge-phase containment");
 
-            if (planningLifecycleRequiredAtEntry)
-            {
-                item = await RunPlanningLifecycleIfNeededAsync(
-                    item,
-                    project,
-                    repoId,
-                    baseBranch,
-                    ct,
-                    hostShutdownToken);
-            }
-
             // Session-mode dispatch: when the work item, its project, and the
             // global flag all opt in for the Claude resumable worker, open one
             // worker session+VM up-front. The lifecycle is published via the
@@ -1501,6 +1687,45 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // RunAgentPhaseAsync read below — assign here in the parent
                 // frame so the value flows down to the work / rework calls.
                 _ambientSessionLifecycle.Value = claudeSessionLifecycle;
+            }
+
+            if (planningLifecycleRequiredAtEntry)
+            {
+                var planningEntryModelId = item.ModelId;
+                var planningEntryReasoningMode = item.ReasoningMode;
+                var planningEntryAgentInstanceId = item.AgentInstanceId;
+                item = await RunPlanningLifecycleIfNeededAsync(
+                    item,
+                    project,
+                    repoId,
+                    baseBranch,
+                    claudeSessionLifecycle,
+                    ct,
+                    hostShutdownToken);
+
+                var postPlanning = await _store.GetAsync(item.Id, ct) ?? item;
+                if (!HasApprovedCurrentPlan(postPlanning))
+                {
+                    if (postPlanning.State == WorkItemState.Queued
+                        && string.IsNullOrWhiteSpace(postPlanning.PlanArtifact))
+                    {
+                        _log.LogInformation(
+                            "Planning lifecycle for work item {WorkItemId} exited before approval because the item was rewound to Queued at prompt revision {PromptRevision}.",
+                            postPlanning.Id,
+                            postPlanning.PromptRevision);
+                        return;
+                    }
+
+                    throw new InvalidOperationException(
+                        $"Planning lifecycle for work item {postPlanning.Id} did not produce an approved plan before implementation.");
+                }
+
+                item = postPlanning with
+                {
+                    ModelId = planningEntryModelId,
+                    ReasoningMode = planningEntryReasoningMode,
+                    AgentInstanceId = planningEntryAgentInstanceId,
+                };
             }
             if (!string.Equals(item.WorkBranch, workBranch, StringComparison.Ordinal))
             {
@@ -3534,7 +3759,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         if (!string.IsNullOrWhiteSpace(approvedPlan))
         {
-            sb.Append("\n\n## Approved plan\n\nFollow this approved planning artifact while implementing. If the plan is stale or unsafe, make the smallest necessary deviation and explain it in your final response.\n\n");
+            sb.Append("\n\nFollow this reviewed planning summary while implementing. If the plan is stale or unsafe, make the smallest necessary deviation and explain it in your final response.\n\n");
             sb.Append(approvedPlan.Trim());
         }
 
@@ -3717,6 +3942,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // rebase that ran between iterations lands in the work tree
                 // before the agent looks at it.
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
+                if (useClaudeSession && !resumingPreempt)
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", access.CloneUrlInsideSandbox);
             }
             var checkedOutExistingBranch = false;
             if (resumingPreempt)
@@ -14496,26 +14723,35 @@ Original merge-phase failure (JSON string, for context only):
                 current.State,
                 state);
             await _store.UpdateAsync(next, transitionCt);
-            _log.LogInformation("Work item {Id} → {State}", item.Id, state);
-            AuditLog.WorkItemTransitioned(item.Id, state.ToString());
-            CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
-            if (project is not null)
-            {
-                var usage = await TryGetUsageSummaryAsync(item.Id);
-                var revision = await BuildTerminalRevisionAsync(next, transitionCt);
-                await _webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = StateToEventName(state),
-                    WorkItem = next,
-                    Project = project,
-                    Usage = usage?.Iteration,
-                    UsageTotal = usage?.Total,
-                    PromptRevision = revision?.PromptRevision,
-                    RevisionAtCompletion = revision?.RevisionAtCompletion,
-                    RevisionMatches = revision?.RevisionMatches,
-                }, CancellationToken.None);
-            }
+            await EmitTransitionSideEffectsAsync(next, state, project, transitionCt);
         });
+    }
+
+    private async Task EmitTransitionSideEffectsAsync(
+        WorkItem item,
+        WorkItemState state,
+        Project? project,
+        CancellationToken ct)
+    {
+        _log.LogInformation("Work item {Id} → {State}", item.Id, state);
+        AuditLog.WorkItemTransitioned(item.Id, state.ToString());
+        CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
+        if (project is null)
+            return;
+
+        var usage = await TryGetUsageSummaryAsync(item.Id);
+        var revision = await BuildTerminalRevisionAsync(item, ct);
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = StateToEventName(state),
+            WorkItem = item,
+            Project = project,
+            Usage = usage?.Iteration,
+            UsageTotal = usage?.Total,
+            PromptRevision = revision?.PromptRevision,
+            RevisionAtCompletion = revision?.RevisionAtCompletion,
+            RevisionMatches = revision?.RevisionMatches,
+        }, CancellationToken.None);
     }
 
     private async Task ResetRecoveryAttemptsAfterRealProgressEventAsync(

@@ -118,6 +118,7 @@ public sealed class WorkItemRetrier
         var requestedFrom = from!.Trim().ToLowerInvariant();
         var resumeState = requestedFrom switch
         {
+            "planning" => WorkItemState.Queued,
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
@@ -131,6 +132,7 @@ public sealed class WorkItemRetrier
             return (false, $"invalid 'from' value '{from}'", null, null, null);
 
         var actualFrom = requestedFrom;
+        var retryingFromPlanning = requestedFrom == "planning";
 
         // For from != "work", the pipeline expects the bare repo to still be present.
         if (resumeState != WorkItemState.Queued)
@@ -187,6 +189,17 @@ public sealed class WorkItemRetrier
             NextTerminalRetryAt = null,
             StartedAt = null
         };
+        if (retryingFromPlanning)
+        {
+            resumed = resumed with
+            {
+                PlanArtifact = null,
+                PlanGeneratedAt = null,
+                PlanReviewedAt = null,
+                PlanReviewSummary = null,
+                PreserveWorkBranchOnQueuedPickup = false,
+            };
+        }
 
         // Atomic conditional update to prevent race conditions.
         // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
@@ -493,6 +506,7 @@ public sealed class WorkItemRetrier
         var requestedFrom = (from ?? "work").Trim().ToLowerInvariant();
         var resumeState = requestedFrom switch
         {
+            "planning" => WorkItemState.Queued,
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
@@ -502,9 +516,10 @@ public sealed class WorkItemRetrier
         if (resumeState is null)
             return new ResumeOutcome(
                 ResumeStatus.BadRequest,
-                $"invalid 'from' value '{from}'; expected one of: work, rework, audit, merge",
+                $"invalid 'from' value '{from}'; expected one of: planning, work, rework, audit, merge",
                 null,
                 null);
+        var resumingFromPlanning = requestedFrom == "planning";
 
         // Resume preserves the prior bare repo + work-branch (that is the
         // entire point — recovering the agent commits the operator's cancel
@@ -512,26 +527,29 @@ public sealed class WorkItemRetrier
         // /replay for a fresh start.
         const string preconditionMessage =
             "bare repo or work-branch no longer present; cannot resume — use POST /workitems/{id}/replay for a fresh start";
-        var repoPresent = await _gitHost.RepositoryExistsAsync(item.Id, ct);
-        if (!repoPresent)
-            return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
+        if (!resumingFromPlanning)
+        {
+            var repoPresent = await _gitHost.RepositoryExistsAsync(item.Id, ct);
+            if (!repoPresent)
+                return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
 
-        var workBranch = item.WorkBranch;
-        bool branchPresent;
-        try
-        {
-            branchPresent = !string.IsNullOrEmpty(workBranch)
-                && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+            var workBranch = item.WorkBranch;
+            bool branchPresent;
+            try
+            {
+                branchPresent = !string.IsNullOrEmpty(workBranch)
+                    && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+            }
+            catch (ArgumentException)
+            {
+                // A legacy/corrupt WorkBranch value can fail name validation in the
+                // git host. Treat that the same as "branch not present" — the
+                // operator's recovery path is the same (412 → /replay).
+                branchPresent = false;
+            }
+            if (!branchPresent)
+                return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
         }
-        catch (ArgumentException)
-        {
-            // A legacy/corrupt WorkBranch value can fail name validation in the
-            // git host. Treat that the same as "branch not present" — the
-            // operator's recovery path is the same (412 → /replay).
-            branchPresent = false;
-        }
-        if (!branchPresent)
-            return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
 
         // from=rework / from=audit / from=merge bypass the work phase, so the existing
         // commits on the work branch must already have durable workflow-owned
@@ -573,7 +591,11 @@ public sealed class WorkItemRetrier
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             StartedAt = null,
-            PreserveWorkBranchOnQueuedPickup = resumeState.Value == WorkItemState.Queued,
+            PlanArtifact = resumingFromPlanning ? null : item.PlanArtifact,
+            PlanGeneratedAt = resumingFromPlanning ? null : item.PlanGeneratedAt,
+            PlanReviewedAt = resumingFromPlanning ? null : item.PlanReviewedAt,
+            PlanReviewSummary = resumingFromPlanning ? null : item.PlanReviewSummary,
+            PreserveWorkBranchOnQueuedPickup = resumeState.Value == WorkItemState.Queued && !resumingFromPlanning,
         };
 
         // Conditional update guards against a racing cascade-cancel or

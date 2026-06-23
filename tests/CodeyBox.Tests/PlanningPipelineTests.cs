@@ -47,14 +47,15 @@ public sealed class PlanningPipelineTests : IDisposable
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Contains("PLAN:", final.PlanArtifact, StringComparison.Ordinal);
+        Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
         Assert.NotNull(final.PlanGeneratedAt);
         Assert.NotNull(final.PlanReviewedAt);
         Assert.Equal("Placeholder plan review approved.", final.PlanReviewSummary);
         Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
-        Assert.Contains("## Approved plan", agent.LastWorkPrompt, StringComparison.Ordinal);
-        Assert.Contains("PLAN:", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("## Reviewed planning summary", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("Approach: make the smallest output file change", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"approach\"", agent.LastWorkPrompt, StringComparison.Ordinal);
 
         var events = setup.Webhooks.Events.Select(e => e.Event).ToArray();
         Assert.Contains("work_item.planning", events);
@@ -90,7 +91,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Null(final.PlanArtifact);
         Assert.Equal(0, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
-        Assert.DoesNotContain("## Approved plan", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("## Reviewed planning summary", agent.LastWorkPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -115,7 +116,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(0, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
-        Assert.DoesNotContain("## Approved plan", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("## Reviewed planning summary", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.DoesNotContain("STALE PLAN", agent.LastWorkPrompt, StringComparison.Ordinal);
     }
 
@@ -139,9 +140,53 @@ public sealed class PlanningPipelineTests : IDisposable
 
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
         Assert.Equal(1, agent.PlanningCalls);
-        Assert.Contains("PLAN:", final.PlanArtifact, StringComparison.Ordinal);
+        Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_ClaudeSessionMode_RunsPlanningAsFirstWarmSessionTurn()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var sessionRunner = new PlanningSessionRunner();
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            projectKnobs: null,
+            sessionRunner,
+            enableClaudeSession: true);
+        var item = NewItem("feature/session-planning") with
+        {
+            ModelId = "claude-opus-4-7",
+            ReasoningMode = "max",
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, sessionRunner.OpenCalls);
+        Assert.Equal(2, sessionRunner.SendTurns);
+        Assert.Equal(1, sessionRunner.CloseCalls);
+        Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
+        Assert.Equal("max", sessionRunner.OpenedReasoningMode);
+        Assert.Contains(sessionRunner.PromptsSent, p => p.Contains("planning-only phase", StringComparison.Ordinal));
+        Assert.Contains(sessionRunner.PromptsSent, p => p.Contains("Reviewed planning summary", StringComparison.Ordinal));
+        Assert.Equal(0, agent.PlanningCalls);
+
+        var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
+        var (_, treeOutput, _) = await TestSupport.RunGit(
+            barePath, "ls-tree", "-r", "feature/session-planning", "--name-only");
+        Assert.Contains("output.txt", treeOutput);
     }
 
     [Fact]
@@ -162,10 +207,10 @@ public sealed class PlanningPipelineTests : IDisposable
         await setup.Pipeline.RunAsync(item, CancellationToken.None);
 
         Assert.Contains("do not write implementation", agent.LastPlanningPrompt, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("Files/areas to change", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("Test/E2E strategy", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("Risks and mitigations", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("How the plan satisfies the task", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"files\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"testStrategy\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"risks\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"satisfiesTask\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -177,7 +222,15 @@ public sealed class PlanningPipelineTests : IDisposable
         var item = NewItem("feature/resume-plan-review") with
         {
             State = WorkItemState.PlanReview,
-            PlanArtifact = "PLAN:\nApproach: resume from review.",
+            PlanArtifact = """
+                {
+                  "approach": "resume from review.",
+                  "files": ["output.txt"],
+                  "testStrategy": ["pipeline integration verifies final branch"],
+                  "risks": ["none"],
+                  "satisfiesTask": "creates output.txt"
+                }
+                """,
             PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
         };
 
@@ -191,7 +244,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.WorkCalls);
         Assert.NotNull(final.PlanReviewedAt);
         Assert.Equal("Placeholder plan review approved.", final.PlanReviewSummary);
-        Assert.Contains("## Approved plan", agent.LastWorkPrompt, StringComparison.Ordinal);
+        Assert.Contains("## Reviewed planning summary", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.Contains("resume from review", agent.LastWorkPrompt, StringComparison.Ordinal);
     }
 
@@ -204,7 +257,15 @@ public sealed class PlanningPipelineTests : IDisposable
         var item = NewItem("feature/resume-plan-approved") with
         {
             State = WorkItemState.PlanApproved,
-            PlanArtifact = "PLAN:\nApproach: already approved.",
+            PlanArtifact = """
+                {
+                  "approach": "already approved.",
+                  "files": ["output.txt"],
+                  "testStrategy": ["pipeline integration verifies final branch"],
+                  "risks": ["none"],
+                  "satisfiesTask": "creates output.txt"
+                }
+                """,
             PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
             PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-4),
             PlanReviewSummary = "approved earlier",
@@ -248,10 +309,187 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_OversizedPlanArtifact_IsTruncatedWithSentinel()
+    public async Task PlanOn_PlanningAgentFailure_FailsBeforeImplementationWithDetails()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var agent = new PlanningAwareAgent { PlanOutput = "PLAN:\n" + new string('x', 70 * 1024) };
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(false, "planner failed", "planner stdout", "planner stderr"),
+        };
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/planning-failure") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("Planning agent claude reported failure", final.LastError, StringComparison.Ordinal);
+        Assert.Contains("planner stderr", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_MalformedPlanOutput_FailsBeforeImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent { PlanOutput = "PLAN:\nApproach: free form is not structured." };
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/malformed-plan") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("structured JSON PLAN artifact", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_PromptEditDuringPlanning_RequeuesWithoutPersistingStalePlan()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/stale-during-planning") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+        agent.OnPlanningBeforeReturnAsync = async ct =>
+        {
+            await setup.Store.TryReplacePromptAsync(item.Id, "edited while planning", DateTimeOffset.UtcNow, ct);
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Queued, final!.State);
+        Assert.Equal(2, final.PromptRevision);
+        Assert.Equal("edited while planning", final.Prompt);
+        Assert.Null(final.PlanArtifact);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanOn_PromptEditAfterPlanApproval_StopsBeforeImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/stale-after-approval") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+        var edited = false;
+        setup.Webhooks.OnPublishAsync = async (evt, ct) =>
+        {
+            if (!edited && evt.Event == "work_item.plan_approved")
+            {
+                edited = true;
+                await setup.Store.TryReplacePromptAsync(item.Id, "edited after approval", DateTimeOffset.UtcNow, ct);
+            }
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Queued, final!.State);
+        Assert.Equal(2, final.PromptRevision);
+        Assert.Equal("edited after approval", final.Prompt);
+        Assert.Null(final.PlanArtifact);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanReviewWithoutArtifact_FailsBeforeImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/bad-plan-review") with
+        {
+            State = WorkItemState.PlanReview,
+            PlanArtifact = null,
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("Plan review cannot run before the planning artifact exists", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanApprovedWithoutReviewedArtifact_FailsBeforeImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/bad-plan-approved") with
+        {
+            State = WorkItemState.PlanApproved,
+            PlanArtifact = null,
+            PlanReviewedAt = null,
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("PlanApproved item is missing an approved planning artifact", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_OversizedPlanArtifact_IsTruncatedWithinStructuredSchema()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent
+        {
+            PlanOutput = $$"""
+                {
+                  "approach": "{{new string('x', 70 * 1024)}}",
+                  "files": ["output.txt"],
+                  "testStrategy": ["pipeline integration verifies final branch"],
+                  "risks": ["none"],
+                  "satisfiesTask": "creates output.txt"
+                }
+                """,
+        };
         using var setup = BuildPipeline(agent, _workspace, seed);
         var item = NewItem("feature/oversized-plan") with
         {
@@ -266,9 +504,9 @@ public sealed class PlanningPipelineTests : IDisposable
 
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
         Assert.NotNull(final.PlanArtifact);
-        Assert.Contains("planning artifact truncated to 65536 characters", final.PlanArtifact, StringComparison.Ordinal);
+        Assert.Contains(new string('x', 100), final.PlanArtifact, StringComparison.Ordinal);
         Assert.True(final.PlanArtifact!.Length < 70 * 1024);
     }
 
@@ -276,7 +514,9 @@ public sealed class PlanningPipelineTests : IDisposable
         PlanningAwareAgent agent,
         string workspace,
         string seedRepoUrl,
-        IReadOnlyDictionary<string, string>? projectKnobs = null)
+        IReadOnlyDictionary<string, string>? projectKnobs = null,
+        ISessionAgentRunner? sessionRunner = null,
+        bool enableClaudeSession = false)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -297,6 +537,7 @@ public sealed class PlanningPipelineTests : IDisposable
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Claude,
             Knobs = projectKnobs ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+            ClaudeSession = new ProjectClaudeSessionConfig { Enabled = enableClaudeSession },
         });
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
@@ -310,7 +551,9 @@ public sealed class PlanningPipelineTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
-            knobRegistry: new KnobRegistry([new PlanKnob()]));
+            knobRegistry: new KnobRegistry([new PlanKnob()]),
+            sessionAgentRunner: sessionRunner,
+            sessionDispatchOptions: new AgentSessionDispatchOptions { Enabled = enableClaudeSession });
 
         return new PlanningPipelineSetup(pipeline, store, webhooks, gitRoot);
     }
@@ -342,12 +585,13 @@ internal sealed class PlanningPipelineSetup(
 internal sealed partial class PlanningAwareAgent : IAgentRunner
 {
     private const string DefaultPlan = """
-        PLAN:
-        Approach: make the smallest output file change.
-        Files/areas to change: output.txt.
-        Test/E2E strategy: pipeline integration verifies final branch.
-        Risks: none for this fixture.
-        Satisfies task: creates output.txt.
+        {
+          "approach": "make the smallest output file change.",
+          "files": ["output.txt"],
+          "testStrategy": ["pipeline integration verifies final branch."],
+          "risks": ["none for this fixture."],
+          "satisfiesTask": "creates output.txt."
+        }
         """;
 
     public AgentKind Kind => AgentKind.Claude;
@@ -355,6 +599,8 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
     public int WorkCalls { get; private set; }
     public bool TryPushDuringPlanning { get; init; }
     public string PlanOutput { get; init; } = DefaultPlan;
+    public AgentResult? PlanningResult { get; init; }
+    public Func<CancellationToken, Task>? OnPlanningBeforeReturnAsync { get; set; }
     public string LastPlanningPrompt { get; private set; } = string.Empty;
     public string LastWorkPrompt { get; private set; } = string.Empty;
 
@@ -407,6 +653,12 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
                 }, ct);
             }
 
+            if (OnPlanningBeforeReturnAsync is not null)
+                await OnPlanningBeforeReturnAsync(ct);
+
+            if (PlanningResult is not null)
+                return PlanningResult;
+
             stdoutChunkCallback?.Invoke(PlanOutput);
             return new AgentResult(true, "planned", PlanOutput, null);
         }
@@ -449,4 +701,112 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
     [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`",
         RegexOptions.CultureInvariant | RegexOptions.Singleline)]
     private static partial Regex MergePromptShape();
+}
+
+internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner
+{
+    private ISandbox? _sandbox;
+    private string? _workingDirectory;
+
+    public AgentKind Kind => AgentKind.Claude;
+    public int OpenCalls { get; private set; }
+    public int SendTurns { get; private set; }
+    public int CloseCalls { get; private set; }
+    public string? OpenedModelId { get; private set; }
+    public string? OpenedReasoningMode { get; private set; }
+    public List<string> PromptsSent { get; } = [];
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+        => Task.FromResult(new AgentResult(false, "session test should not use one-shot RunAsync", null, null));
+
+    public Task<AgentSessionHandle> OpenSessionAsync(
+        AgentSessionOpenRequest request,
+        CancellationToken ct = default)
+        => OpenSessionAsync(
+            request.Sandbox,
+            request.WorkingDirectory,
+            request.Credential,
+            request.ModelId,
+            request.ReasoningMode,
+            ct);
+
+    public Task<AgentSessionHandle> OpenSessionAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        OpenCalls++;
+        _sandbox = sandbox;
+        _workingDirectory = workingDirectory;
+        OpenedModelId = modelId;
+        OpenedReasoningMode = reasoningMode;
+        return Task.FromResult(new AgentSessionHandle(
+            Kind,
+            "planning-session",
+            new AgentSessionSandboxRef(sandbox.Id),
+            workingDirectory,
+            modelId,
+            reasoningMode));
+    }
+
+    public async Task<AgentResult> SendTurnAsync(
+        AgentSessionHandle sessionHandle,
+        string prompt,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        SendTurns++;
+        PromptsSent.Add(prompt);
+        if (prompt.Contains("planning-only phase", StringComparison.Ordinal))
+        {
+            stdoutChunkCallback?.Invoke(PlanningAwareAgentJson.DefaultPlan);
+            return new AgentResult(true, "planned", PlanningAwareAgentJson.DefaultPlan, null);
+        }
+
+        var write = await _sandbox!.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo 'implemented from warm plan' > \"$0\"", $"{_workingDirectory}/output.txt"],
+        }, ct);
+        return write.Success
+            ? new AgentResult(true, "worked", null, null)
+            : new AgentResult(false, "failed to write output.txt", write.Stdout, write.Stderr);
+    }
+
+    public Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
+    {
+        CloseCalls++;
+        return Task.CompletedTask;
+    }
+}
+
+internal static class PlanningAwareAgentJson
+{
+    public const string DefaultPlan = """
+        {
+          "approach": "make the smallest output file change.",
+          "files": ["output.txt"],
+          "testStrategy": ["pipeline integration verifies final branch."],
+          "risks": ["none for this fixture."],
+          "satisfiesTask": "creates output.txt."
+        }
+        """;
 }

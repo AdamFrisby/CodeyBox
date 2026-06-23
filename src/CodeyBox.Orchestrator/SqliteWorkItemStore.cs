@@ -1953,11 +1953,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     prompt_revision = $rev,
                     updated_at = $ua,
                     state = CASE
-                        WHEN state IN (15, 16, 17) THEN 0
+                        WHEN state IN ($planning_state, $plan_review_state, $plan_approved_state) THEN $queued_state
                         ELSE state
                     END,
                     started_at = CASE
-                        WHEN state IN (15, 16, 17) THEN NULL
+                        WHEN state IN ($planning_state, $plan_review_state, $plan_approved_state) THEN NULL
                         ELSE started_at
                     END,
                     plan_artifact = NULL,
@@ -1969,6 +1969,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             cmd.Parameters.AddWithValue("$prompt", newPrompt);
             cmd.Parameters.AddWithValue("$rev", newRevision);
             cmd.Parameters.AddWithValue("$ua", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$planning_state", (int)WorkItemState.Planning);
+            cmd.Parameters.AddWithValue("$plan_review_state", (int)WorkItemState.PlanReview);
+            cmd.Parameters.AddWithValue("$plan_approved_state", (int)WorkItemState.PlanApproved);
+            cmd.Parameters.AddWithValue("$queued_state", (int)WorkItemState.Queued);
             cmd.Parameters.AddWithValue("$id", id.ToString());
             await cmd.ExecuteNonQueryAsync(ct);
             return new PromptReplaceResult(PromptReplaceOutcome.Updated, newRevision);

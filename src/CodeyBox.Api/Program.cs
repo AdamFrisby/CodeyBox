@@ -2408,6 +2408,7 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
+builder.Services.AddSingleton<IPlanReviewGate, AlwaysPassPlanReviewGate>();
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -2485,7 +2486,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
-    authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>()));
+    authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
+    planReviewGate: sp.GetRequiredService<IPlanReviewGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

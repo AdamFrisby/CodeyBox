@@ -349,6 +349,37 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task AutoRetryEnabled_PeriodicSweepRetriesPlanningQuotaItemThroughRetrier()
+    {
+        using var context = BuildRetryContext();
+        var item = FailedQuotaItem() with
+        {
+            QuotaRetryFrom = "planning",
+            PlanArtifact = """
+                {
+                  "approach": "old plan",
+                  "files": ["output.txt"],
+                  "testStrategy": ["run tests"],
+                  "risks": ["none"],
+                  "satisfiesTask": "do work"
+                }
+                """,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewSummary = "approved",
+        };
+        await context.Store.CreateAsync(item);
+
+        await InvokePrivateAsync(context.Scheduler, "RunPeriodicSweepAsync", CancellationToken.None);
+
+        var retried = await context.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Null(retried.PlanArtifact);
+        Assert.Contains(context.Webhooks.Events, e => e.Event == "work_item.auto_retry");
+    }
+
+    [Fact]
     public async Task QueuePaused_AutoRetrySkipsWithoutChangingItemState()
     {
         using var context = BuildRetryContext(queueController: new QueueControllerStub(globalPaused: true));
