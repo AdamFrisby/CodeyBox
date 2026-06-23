@@ -580,6 +580,9 @@ public sealed class AgenticConflictResolver
 
         if (originalConflictFiles.Count > 0)
         {
+            foreach (var file in originalConflictFiles)
+                MergeConflictPathInspector.ValidateRelativeWorkPath(file);
+
             // Mirror PipelineRunner.FinalizeRebaseConflictResolutionAsync's grep
             // pattern so the agentic and legacy paths agree on what counts as a
             // marker line.
@@ -589,7 +592,11 @@ public sealed class AgenticConflictResolver
                 "^(<<<<<<<|=======|>>>>>>>)", "--",
             };
             argv.AddRange(originalConflictFiles);
-            var markers = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
+            var markers = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = argv,
+                ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
+            }, ct);
             if (markers.ExitCode == 0)
                 return new VerificationOutcome(
                     false,

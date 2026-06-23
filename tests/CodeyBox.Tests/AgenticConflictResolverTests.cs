@@ -962,6 +962,8 @@ public sealed class AgenticConflictResolverTests
         var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
             MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout));
 
+        Assert.Contains("malformed git ls-files -u output segment", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("unsafe conflict file path", ex.Message, StringComparison.Ordinal);
         Assert.Contains(@"src/a\u001B[31mb.cs", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("\u001b", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("\n", ex.Message, StringComparison.Ordinal);
@@ -994,6 +996,23 @@ public sealed class AgenticConflictResolverTests
         var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
 
         Assert.Equal(["src/a.cs"], paths);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_DeduplicatesMultipleStageRecordsPerPath()
+    {
+        var stageOneOid = new string('a', 40);
+        var stageTwoOid = new string('b', 40);
+        var stageThreeOid = new string('c', 40);
+        var stdout =
+            $"100644 {stageOneOid} 1\tsrc/conflict.cs\0" +
+            $"100644 {stageTwoOid} 2\tsrc/conflict.cs\0" +
+            $"100644 {stageThreeOid} 3\tsrc/conflict.cs\0" +
+            $"100644 {stageTwoOid} 2\tsrc/other.cs\0";
+
+        var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal(["src/conflict.cs", "src/other.cs"], paths);
     }
 
     [Fact]
@@ -1088,6 +1107,18 @@ public sealed class AgenticConflictResolverTests
     [InlineData("src/a\u001bb.cs")]
     [InlineData("src/a\u007fb.cs")]
     public void ValidateRelativeWorkPath_RejectsControlCharacters(string path)
+    {
+        Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ValidateRelativeWorkPath(path));
+    }
+
+    [Theory]
+    [InlineData(":(glob)*.cs")]
+    [InlineData(":foo")]
+    [InlineData(":/src/a.cs")]
+    [InlineData(":!*.cs")]
+    [InlineData(":^*.cs")]
+    public void ValidateRelativeWorkPath_RejectsGitPathspecMagicPrefixes(string path)
     {
         Assert.Throws<MergeConflictResolutionFailedException>(() =>
             MergeConflictPathInspector.ValidateRelativeWorkPath(path));

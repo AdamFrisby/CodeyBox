@@ -1163,6 +1163,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void BuildDetachedLaunchScript_DefaultMarkerWaitSecondsIsThirty()
+    {
+        var script = MultipassSandbox.BuildDetachedLaunchScript(
+            "/home/ubuntu/.codeybox-exec-env/env",
+            "/home/ubuntu/.codeybox-exec/detached.pgid",
+            null,
+            ["/bin/sh", "-c", "printf should-run"]);
+
+        Assert.Contains("codeybox_marker_wait_seconds=30\n", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void BuildDetachedLaunchScript_RejectsNegativeLaunchLockAttempts()
     {
         var ex = Assert.Throws<ArgumentOutOfRangeException>(() => MultipassSandbox.BuildDetachedLaunchScript(

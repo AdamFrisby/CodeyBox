@@ -10931,11 +10931,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         var files = conflictHunks.Select(h => h.Path).Distinct(StringComparer.Ordinal).ToArray();
+        foreach (var file in files)
+            MergeConflictPathInspector.ValidateRelativeWorkPath(file);
+
         if (files.Length > 0)
         {
             var addArgv = new List<string> { "git", "-C", SandboxConventions.WorkDir, "add", "--" };
             addArgv.AddRange(files);
-            await RunWithCancellation(sandbox, ct, addArgv.ToArray());
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = addArgv,
+                ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
+            }, ct);
+            if (!add.Success)
+                throw CommandFailed(add, addArgv);
         }
 
         IReadOnlyList<string> remainingUnmergedPaths;
@@ -10962,7 +10971,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "git", "-C", SandboxConventions.WorkDir, "grep", "-n", "-E", "^(<<<<<<<|=======|>>>>>>>)", "--",
             };
             grepArgv.AddRange(files);
-            var markers = await sandbox.ExecAsync(new SandboxExec { Argv = grepArgv }, ct);
+            var markers = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = grepArgv,
+                ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
+            }, ct);
             if (markers.ExitCode == 0)
                 throw new InvalidOperationException($"merge resolver left conflict markers:\n{markers.Stdout}");
             if (markers.ExitCode != 1)
@@ -12016,25 +12029,26 @@ public sealed partial class PipelineRunner : IPipelineRunner
             priorChangedFiles = [];
         }
 
-        var conflictFiles = ExtractConflictFilesFromMessage(originalFailure.Message);
-
-        await TryPublishEventAsync(item, project, "work_item.conflict_rework_started",
-            new ConflictReworkStartedDetails
-            {
-                WorkItemId = item.Id.ToString(),
-                BaseBranch = baseBranch,
-                WorkBranch = workBranch,
-                WorkBranchTip = priorWorkTip,
-                BaseTip = baseTip,
-                ConflictFiles = conflictFiles,
-            }, ct);
+        async Task PublishStartedAsync(IReadOnlyList<string> conflictFiles)
+        {
+            await TryPublishEventAsync(item, project, "work_item.conflict_rework_started",
+                new ConflictReworkStartedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    BaseBranch = baseBranch,
+                    WorkBranch = workBranch,
+                    WorkBranchTip = priorWorkTip,
+                    BaseTip = baseTip,
+                    ConflictFiles = conflictFiles,
+                }, ct);
+        }
 
         ConflictReworkAgentOutcome outcome;
         try
         {
             outcome = await RunConflictReworkAgentAsync(
                 item, project, runner, repoId, baseBranch, workBranch,
-                priorWorkTip, originalFailure, ct, hostShutdownToken);
+                priorWorkTip, originalFailure, PublishStartedAsync, ct, hostShutdownToken);
         }
         catch (TerminalTransientNetworkError ex)
         {
@@ -12193,6 +12207,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string workBranch,
         string priorWorkTip,
         MergeConflictResolutionFailedException originalFailure,
+        Func<IReadOnlyList<string>, Task> publishStartedAsync,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -12289,6 +12304,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     SemanticIncompatibleReason: null,
                     FilesChanged: null, Insertions: null, Deletions: null);
             }
+
+            await publishStartedAsync(sandboxConflictFiles);
 
             var prompt = BuildConflictReworkPrompt(
                 item.Prompt, baseBranch, workBranch, sandboxConflictFiles, originalFailure.Message);
@@ -12623,27 +12640,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var nl = tail.IndexOfAny(['\r', '\n']);
         var reason = (nl < 0 ? tail : tail[..nl]).Trim();
         return reason.Length == 0 ? null : reason;
-    }
-
-    /// <summary>
-    /// Best-effort parse of the conflict-file list from
-    /// <see cref="MergeConflictResolutionFailedException.Message"/> for the
-    /// operator-facing started-event payload. Rework prompts must use the
-    /// sandbox-side git index enumeration instead.
-    /// </summary>
-    private static IReadOnlyList<string> ExtractConflictFilesFromMessage(string message)
-    {
-        const string marker = "conflicts in ";
-        var idx = message.IndexOf(marker, StringComparison.Ordinal);
-        if (idx < 0) return [];
-        var tail = message[(idx + marker.Length)..];
-        var endIdx = tail.IndexOfAny(['\n', '\r']);
-        if (endIdx >= 0) tail = tail[..endIdx];
-        return tail
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(static s => s.TrimEnd('.', ';'))
-            .Where(static s => s.Length > 0)
-            .ToArray();
     }
 
     private static async Task<IReadOnlyList<string>> ListSandboxConflictFilesAsync(

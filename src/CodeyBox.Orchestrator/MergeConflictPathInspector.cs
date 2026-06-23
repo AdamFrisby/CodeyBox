@@ -6,6 +6,12 @@ namespace CodeyBox.Orchestrator;
 
 internal static class MergeConflictPathInspector
 {
+    internal static IReadOnlyDictionary<string, string> GitLiteralPathspecEnvironment { get; } =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GIT_LITERAL_PATHSPECS"] = "1",
+        };
+
     private static readonly Regex LsFilesUnmergedRecord = new(
         @"\A[0-7]{6} (?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}) [1-3]\t(?<path>[^\0\p{Cc}]+)\z",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -69,15 +75,18 @@ internal static class MergeConflictPathInspector
 
     /// <summary>
     /// Reject path patterns that escape the working directory (absolute paths,
-    /// backslashes, traversal segments) or carry terminal/control bytes.
+    /// backslashes, traversal segments, Git pathspec-magic prefixes) or carry
+    /// terminal/control bytes.
     /// Backticks are valid Git path characters; prompt builders must serialize
     /// paths as data instead of broadening filesystem safety checks.
+    /// Git treats leading ':' as pathspec magic, including ':foo' meaning 'foo'.
     /// </summary>
     internal static void ValidateRelativeWorkPath(string path)
     {
         if (string.IsNullOrWhiteSpace(path)
             || Path.IsPathRooted(path)
             || path.Contains('\\', StringComparison.Ordinal)
+            || path[0] == ':'
             || path.Any(static ch => char.IsControl(ch))
             || path.Split('/', StringSplitOptions.None).Any(static part => part is "" or "." or ".."))
         {
