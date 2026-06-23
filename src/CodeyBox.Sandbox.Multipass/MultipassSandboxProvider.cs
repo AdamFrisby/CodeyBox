@@ -6055,6 +6055,7 @@ while True:
         sb.AppendLine("cat > \"$codeybox_child_script\" <<'CODEYBOX_DETACHED_CHILD'");
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("set +e");
+        sb.AppendLine("exec </dev/null >/dev/null 2>/dev/null");
         sb.AppendLine("rm -f \"$0\" 2>/dev/null || true");
         sb.AppendLine("codeybox_pgid_marker=$1");
         sb.AppendLine("codeybox_stdin_file=$2");
