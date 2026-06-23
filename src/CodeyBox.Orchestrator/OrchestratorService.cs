@@ -2566,7 +2566,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item) =>
-        item.State is not WorkItemState.PlanReview;
+        item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanApproved
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
 
     private static bool ShouldGateDirectWorkAgentAtPickup(WorkItem item) =>
         item.State is WorkItemState.Queued

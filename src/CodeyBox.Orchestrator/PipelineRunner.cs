@@ -1087,6 +1087,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         current = await _store.GetAsync(item.Id, ct) ?? current with { State = WorkItemState.PlanReview };
+        if (current.State == WorkItemState.PlanApproved)
+            return current;
+        if (current.State == WorkItemState.Queued
+            && string.IsNullOrWhiteSpace(current.PlanArtifact))
+        {
+            _log.LogInformation(
+                "Plan review for work item {WorkItemId} observed a prompt edit or lifecycle rewind before review; leaving item queued at revision {PromptRevision}.",
+                item.Id,
+                current.PromptRevision);
+            return current;
+        }
+        if (current.State != WorkItemState.PlanReview
+            || string.IsNullOrWhiteSpace(current.PlanArtifact))
+        {
+            _log.LogInformation(
+                "Plan review for work item {WorkItemId} skipped after re-read; current state {State}, hasArtifact={HasArtifact}.",
+                item.Id,
+                current.State,
+                !string.IsNullOrWhiteSpace(current.PlanArtifact));
+            return current;
+        }
+
         var decision = await _planReviewGate.ReviewAsync(current, current.PlanArtifact!, ct);
         if (!decision.Approved)
         {
@@ -1193,103 +1215,47 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var credential = await ResolveAgentCredentialForInvocationAsync(runner, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
+        if (runner is ITextOnlyAgentRunner textOnlyRunner)
+        {
+            return await RunTextOnlyPlanningAgentTurnAsync(
+                item,
+                runner,
+                textOnlyRunner,
+                credential,
+                project,
+                access,
+                baseBranch,
+                ct,
+                hostShutdownToken);
+        }
+
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
         var extraEnv = new Dictionary<string, string>
         {
             [PromptRevisionEnvVar] = item.PromptRevision.ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
+        var readOnlyAccess = BuildReadOnlyPlanningRepositoryAccess(access);
         var spec = BuildSandboxSpec(
-            access,
-            includeAgentCredential: credential,
-            allowAgentNetwork: true,
-            hostNetworkProfile: sandboxTarget.NetworkProfile,
+            readOnlyAccess,
+            includeAgentCredential: null,
+            allowAgentNetwork: false,
+            hostNetworkProfile: null,
             timingWorkItemId: item.Id,
             timingPhase: "planning",
             flavor: sandboxTarget.Flavor,
             extraEnvironment: extraEnv,
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                 project,
-                new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
+                new SandboxTarget(null, sandboxTarget.Flavor),
                 item.BaselineImageRef));
 
-        var selectedMemberForSession = TryResolveSelectedMember(runner.Kind, project, item);
-        var sessionTurnItem = selectedMemberForSession is null
-            ? item
-            : item with
-            {
-                AgentInstanceId = selectedMemberForSession.RouteKey,
-                ModelId = selectedMemberForSession.ModelId,
-                ReasoningMode = selectedMemberForSession.ReasoningMode,
-            };
-        var sessionLifecycle = planningSessionLifecycle ?? _ambientSessionLifecycle.Value;
-        var explicitPlanningSession = planningSessionLifecycle is not null
-            && ReferenceEquals(sessionLifecycle, planningSessionLifecycle);
-        var useClaudeSession = sessionLifecycle is not null
-            && !sessionLifecycle.IsClosed
-            && runner.Kind == AgentKind.Claude
-            && (explicitPlanningSession || sessionLifecycle.CanRunTurn(runner, sessionTurnItem))
-            && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
-
-        ISandbox sandbox;
-        var sandboxOwnedByPhase = true;
-        var skipClone = false;
-        if (useClaudeSession)
-        {
-            try
-            {
-                sandbox = await sessionLifecycle!.GetSandboxAsync(ct);
-                sandboxOwnedByPhase = false;
-                skipClone = sessionLifecycle.FirstTurnComplete;
-            }
-            catch (AgentSessionDegradedException ex)
-            {
-                _log.LogWarning(ex,
-                    "Claude session lifecycle degraded before planning for work item {Id}; using a disposable planning sandbox",
-                    item.Id);
-                _ambientSessionLifecycle.Value = null;
-                sessionLifecycle = null;
-                useClaudeSession = false;
-                sandbox = await _sandboxes.CreateAsync(spec, ct);
-            }
-        }
-        else
-        {
-            if (sessionLifecycle is not null
-                && !sessionLifecycle.IsClosed
-                && runner.Kind == AgentKind.Claude
-                && !sessionLifecycle.CanRunTurn(runner, sessionTurnItem)
-                && !explicitPlanningSession)
-            {
-                await CloseAmbientClaudeSessionAsync(
-                    sessionLifecycle,
-                    item,
-                    project,
-                    "selected Claude fallback member does not match the opened planning session");
-                _ambientSessionLifecycle.Value = null;
-                sessionLifecycle = null;
-            }
-
-            sandbox = await _sandboxes.CreateAsync(spec, ct);
-        }
+        _ = planningSessionLifecycle;
+        var sandbox = await _sandboxes.CreateAsync(spec, ct);
 
         AgentStreamCapture? streamCapture = null;
-        PlanningPushGuard? pushGuard = null;
-        var phaseSucceeded = false;
         try
         {
-            if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
-            if (useClaudeSession)
-                await sessionLifecycle!.RefreshCredentialAsync(credential, ct);
-
-            if (!skipClone)
-            {
-                await RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            }
-            else
-            {
-                await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
-            }
+            await RunWithCancellation(sandbox, ct, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
 
             await RunWithCancellation(
                 sandbox,
@@ -1301,8 +1267,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "-B",
                 "codeybox/planning",
                 $"origin/{baseBranch}");
-
-            pushGuard = await TryInstallPlanningPushGuardAsync(sandbox, access.CloneUrlInsideSandbox, item.Id, ct);
 
             var prompt = await ProcessAgentPromptAsync(
                 item.Id,
@@ -1326,25 +1290,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 log: _log,
                 activitySource: CodeyBoxActivities.Pipeline))
             {
-                var canCaptureStructuredStream = useClaudeSession
-                    || await CanCaptureStructuredStreamAsync(runner, sandbox, "planning", ct);
+                var canCaptureStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "planning", ct);
                 streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
                     ? await BeginAgentStreamCaptureAsync(item.Id, "planning", 1, ct)
                     : null;
                 var stdoutCallback = BuildStdoutCallback(item.Id, "planning", streamCapture);
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                var runTask = useClaudeSession
-                    ? sessionLifecycle!.SendTurnAsync(prompt, runnerCts.Token, stdoutCallback)
-                    : runner.RunAsync(
-                        sandbox,
-                        SandboxConventions.WorkDir,
-                        prompt,
-                        credential,
-                        item.ModelId,
-                        item.ReasoningMode,
-                        runnerCts.Token,
-                        stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: canCaptureStructuredStream);
+                var runTask = runner.RunAsync(
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    prompt,
+                    credential: null,
+                    item.ModelId,
+                    item.ReasoningMode,
+                    runnerCts.Token,
+                    stdoutChunkCallback: stdoutCallback,
+                    captureStructuredStream: canCaptureStructuredStream);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completed != runTask)
                 {
@@ -1383,155 +1344,298 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             if (!result.Success)
             {
-                _quotaAuditEmitter.EmitAdvisoryAuditEvents(
-                    runner.Kind,
-                    result.Stderr,
-                    result.Stdout,
-                    "planning",
-                    sandbox.Id);
-                var detection = _quotaClassifier.Detect(runner.Kind, result.Stderr, result.Stdout);
-                if (detection is not null)
-                {
-                    await _quotaClassifier.RecordIfQuotaFailureAsync(
-                        _quotaFailures,
-                        runner.Kind,
-                        observedModelId,
-                        result.Summary,
-                        result.Stderr,
-                        endedAt,
-                        _auditQuotaOptions.ObservedFailureRetention,
-                        ct,
-                        projectId: item.ProjectId,
-                        stdout: result.Stdout);
-                    throw new TerminalQuotaError(
-                        detection.Kind,
-                        $"Agent {runner.Kind} reported quota failure during planning: {result.Summary}",
-                        detection.ResetAt);
-                }
-
-                ThrowIfTransientAgentFailure(runner, result, "planning");
-                var detail = string.Join("\n",
-                    new[]
-                    {
-                        $"Planning agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(result.Summary)}",
-                        !string.IsNullOrEmpty(result.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(result.Stderr)}" : null,
-                        !string.IsNullOrEmpty(result.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(result.Stdout)}" : null,
-                    }.Where(s => s is not null));
-                throw new InvalidOperationException(detail);
+                await ThrowPlanningAgentFailureAsync(
+                    runner,
+                    item,
+                    project,
+                    result,
+                    observedModelId,
+                    endedAt,
+                    sandbox.Id,
+                    ct);
             }
 
-            await ResetPlanningSandboxWorkTreeAsync(sandbox, throwOnFailure: useClaudeSession, ct);
-            phaseSucceeded = true;
+            await ResetPlanningSandboxWorkTreeAsync(sandbox, throwOnFailure: false, ct);
             return result.Stdout ?? string.Empty;
         }
         finally
         {
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
-            if (pushGuard is not null)
-                await RestorePlanningPushGuardAsync(sandbox, access.CloneUrlInsideSandbox, pushGuard);
 
-            if (sandboxOwnedByPhase)
+            try
             {
-                try
-                {
-                    await sandbox.DisposeAsync();
-                }
-                catch
-                {
-                    // Best-effort disposal; the phase exception, if any, is the useful signal.
-                }
+                await sandbox.DisposeAsync();
             }
-            else if (useClaudeSession && !phaseSucceeded)
+            catch
             {
-                await CloseAmbientClaudeSessionAsync(
-                    sessionLifecycle!,
-                    item,
-                    project,
-                    "session-backed planning attempt failed before phase success");
-                _ambientSessionLifecycle.Value = null;
+                // Best-effort disposal; the phase exception, if any, is the useful signal.
             }
         }
     }
 
-    private sealed record PlanningPushGuard(string HooksPath, string? PreviousHooksPath);
-
-    private static async Task<PlanningPushGuard?> TryInstallPlanningPushGuardAsync(
-        ISandbox sandbox,
-        string repositoryPath,
-        WorkItemId itemId,
-        CancellationToken ct)
+    private async Task<string> RunTextOnlyPlanningAgentTurnAsync(
+        WorkItem item,
+        IAgentRunner runner,
+        ITextOnlyAgentRunner textOnlyRunner,
+        AgentCredential? credential,
+        Project project,
+        SandboxRepositoryAccess access,
+        string baseBranch,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
     {
-        if (!repositoryPath.StartsWith("/", StringComparison.Ordinal))
-            return null;
-
-        var previous = await sandbox.ExecAsync(new SandboxExec
+        var prompt = BuildPlanningPrompt(item);
+        if (_promptPreprocessors.HasPreprocessors)
         {
-            Argv = ["git", "--git-dir", repositoryPath, "config", "--get", "core.hooksPath"],
-        }, ct);
-        var previousHooksPath = previous.Success
-            ? previous.Stdout.Trim()
-            : null;
-        var hooksPath = $"/tmp/codeybox-planning-hooks-{itemId}";
-        await RunWithCancellation(sandbox, ct, "mkdir", "-p", hooksPath);
-        var writeHook = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", "cat > \"$0/pre-receive\" && chmod 0755 \"$0/pre-receive\"", hooksPath],
-            Stdin = "#!/bin/sh\nprintf '%s\\n' 'CodeyBox planning phase is read-only; pushes are rejected.' >&2\nexit 1\n",
-        }, ct);
-        if (!writeHook.Success)
-            throw new InvalidOperationException($"failed to install planning push guard: {writeHook.Stderr}");
+            var readOnlyAccess = BuildReadOnlyPlanningRepositoryAccess(access);
+            var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
+            var preprocessSpec = BuildSandboxSpec(
+                readOnlyAccess,
+                includeAgentCredential: null,
+                allowAgentNetwork: false,
+                hostNetworkProfile: null,
+                timingWorkItemId: item.Id,
+                timingPhase: "planning",
+                flavor: sandboxTarget.Flavor,
+                extraEnvironment: new Dictionary<string, string>
+                {
+                    [PromptRevisionEnvVar] = item.PromptRevision.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                },
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                    project,
+                    new SandboxTarget(null, sandboxTarget.Flavor),
+                    item.BaselineImageRef));
 
-        await RunWithCancellation(
+            await using var preprocessSandbox = await _sandboxes.CreateAsync(preprocessSpec, ct);
+            await RunWithCancellation(preprocessSandbox, ct, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await RunWithCancellation(
+                preprocessSandbox,
+                ct,
+                "git",
+                "-C",
+                SandboxConventions.WorkDir,
+                "checkout",
+                "-B",
+                "codeybox/planning",
+                $"origin/{baseBranch}");
+            prompt = await ProcessAgentPromptAsync(
+                item.Id,
+                runner.Kind,
+                AgentPromptPhase.Planning,
+                1,
+                project,
+                preprocessSandbox,
+                prompt,
+                ct);
+        }
+
+        var direct = await RunTextOnlyPlanningCallAsync(
+            item,
+            runner,
+            textOnlyRunner,
+            credential,
+            prompt,
+            sandbox: null,
+            ct,
+            hostShutdownToken);
+        if (direct.Success)
+            return direct.Output ?? string.Empty;
+        if (!TextOnlyPlanningRequiresSandbox(direct, runner.Kind))
+        {
+            await ThrowPlanningTextOnlyFailureAsync(runner, item, project, direct, sandboxId: null, ct);
+        }
+
+        var target = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
+        var sandboxCredential = credential
+            ?? new AgentCredential(runner.Kind, new Dictionary<string, string>(), new Dictionary<string, string>());
+        var scratchSpec = BuildSandboxSpec(
+            new SandboxRepositoryAccess(SandboxConventions.WorkDir, [], SandboxNetworkPolicy.Denied),
+            includeAgentCredential: sandboxCredential,
+            allowAgentNetwork: true,
+            hostNetworkProfile: target.NetworkProfile,
+            timingWorkItemId: item.Id,
+            timingPhase: "planning",
+            flavor: target.Flavor,
+            extraEnvironment: new Dictionary<string, string>
+            {
+                [PromptRevisionEnvVar] = item.PromptRevision.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            },
+            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                project,
+                new SandboxTarget(target.NetworkProfile, target.Flavor),
+                item.BaselineImageRef));
+        await using var sandbox = await _sandboxes.CreateAsync(scratchSpec, ct);
+        if (credential is not null && credential.Files.Count > 0)
+            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+
+        var sandboxed = await RunTextOnlyPlanningCallAsync(
+            item,
+            runner,
+            textOnlyRunner,
+            credential,
+            prompt,
             sandbox,
             ct,
-            "git",
-            "--git-dir",
-            repositoryPath,
-            "config",
-            "core.hooksPath",
-            hooksPath);
-        return new PlanningPushGuard(hooksPath, string.IsNullOrWhiteSpace(previousHooksPath) ? null : previousHooksPath);
+            hostShutdownToken);
+        if (!sandboxed.Success)
+            await ThrowPlanningTextOnlyFailureAsync(runner, item, project, sandboxed, sandbox.Id, ct);
+
+        return sandboxed.Output ?? string.Empty;
     }
 
-    private static async Task RestorePlanningPushGuardAsync(
-        ISandbox sandbox,
-        string repositoryPath,
-        PlanningPushGuard guard)
+    private async Task<TextOnlyAgentResult> RunTextOnlyPlanningCallAsync(
+        WorkItem item,
+        IAgentRunner runner,
+        ITextOnlyAgentRunner textOnlyRunner,
+        AgentCredential? credential,
+        string prompt,
+        ISandbox? sandbox,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
     {
-        try
+        var sandboxId = sandbox?.Id ?? "host-text-only";
+        AuditLog.AgentStarted(runner.Kind, sandboxId, "planning");
+        var agentSw = Stopwatch.StartNew();
+        TextOnlyAgentResult result;
+        using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var runTask = textOnlyRunner.RunTextOnlyAsync(
+            prompt,
+            credential,
+            item.ModelId,
+            item.ReasoningMode,
+            runnerCts.Token,
+            sandbox,
+            sandbox is null ? null : SandboxConventions.WorkDir);
+        var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
+        if (completed != runTask)
         {
-            if (guard.PreviousHooksPath is { } previous)
-            {
-                await RunWithCancellation(
-                    sandbox,
-                    CancellationToken.None,
-                    "git",
-                    "--git-dir",
-                    repositoryPath,
-                    "config",
-                    "core.hooksPath",
-                    previous);
-            }
-            else
-            {
-                await sandbox.ExecAsync(new SandboxExec
-                {
-                    Argv = ["git", "--git-dir", repositoryPath, "config", "--unset", "core.hooksPath"],
-                }, CancellationToken.None);
-            }
+            await runnerCts.CancelAsync();
+            throw new OperationCanceledException(hostShutdownToken);
+        }
 
-            await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["rm", "-rf", guard.HooksPath],
-            }, CancellationToken.None);
-        }
-        catch
+        result = await runTask;
+        agentSw.Stop();
+        var endedAt = DateTimeOffset.UtcNow;
+        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
+        await TryRecordCostAsync(
+            result.Output,
+            result.Error,
+            runner.Kind,
+            item.AgentInstanceId,
+            item.Id,
+            "planning",
+            iteration: null,
+            endedAt - agentSw.Elapsed,
+            endedAt,
+            observedModelId);
+
+        AuditLog.AgentFinished(
+            runner.Kind,
+            sandboxId,
+            result.Success,
+            null,
+            agentSw.Elapsed,
+            stdoutTail: Tail(result.Output),
+            stderrTail: Tail(result.Error));
+        return result;
+    }
+
+    private static bool TextOnlyPlanningRequiresSandbox(TextOnlyAgentResult result, AgentKind kind) =>
+        !result.Success
+        && string.IsNullOrWhiteSpace(result.Output)
+        && string.IsNullOrWhiteSpace(result.Error)
+        && result.Summary.Contains($"{kind.Value} text-only must run inside", StringComparison.OrdinalIgnoreCase);
+
+    private async Task ThrowPlanningTextOnlyFailureAsync(
+        IAgentRunner runner,
+        WorkItem item,
+        Project project,
+        TextOnlyAgentResult result,
+        string? sandboxId,
+        CancellationToken ct)
+    {
+        var agentResult = new AgentResult(
+            result.Success,
+            result.Summary,
+            result.Output,
+            result.Error);
+        await ThrowPlanningAgentFailureAsync(
+            runner,
+            item,
+            project,
+            agentResult,
+            ResolveObservedModelId(runner, item.ModelId),
+            DateTimeOffset.UtcNow,
+            sandboxId,
+            ct);
+    }
+
+    private async Task ThrowPlanningAgentFailureAsync(
+        IAgentRunner runner,
+        WorkItem item,
+        Project project,
+        AgentResult result,
+        string? observedModelId,
+        DateTimeOffset endedAt,
+        string? sandboxId,
+        CancellationToken ct)
+    {
+        _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+            runner.Kind,
+            result.Stderr,
+            result.Stdout,
+            "planning",
+            sandboxId);
+        var detection = _quotaClassifier.Detect(runner.Kind, result.Stderr, result.Stdout);
+        if (detection is not null)
         {
-            // Best-effort guard cleanup. The planning sandbox may already be gone
-            // during host shutdown; stale reject hooks are visible on the next git
-            // operation and can be cleared by retry recovery.
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                runner.Kind,
+                observedModelId,
+                result.Summary,
+                result.Stderr,
+                endedAt,
+                _auditQuotaOptions.ObservedFailureRetention,
+                ct,
+                projectId: item.ProjectId,
+                stdout: result.Stdout);
+            throw new TerminalQuotaError(
+                detection.Kind,
+                $"Agent {runner.Kind} reported quota failure during planning: {result.Summary}",
+                detection.ResetAt);
         }
+
+        ThrowIfTransientAgentFailure(runner, result, "planning");
+        var detail = string.Join("\n",
+            new[]
+            {
+                $"Planning agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(result.Summary)}",
+                !string.IsNullOrEmpty(result.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(result.Stderr)}" : null,
+                !string.IsNullOrEmpty(result.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(result.Stdout)}" : null,
+            }.Where(s => s is not null));
+        throw new InvalidOperationException(detail);
+    }
+
+    private static SandboxRepositoryAccess BuildReadOnlyPlanningRepositoryAccess(SandboxRepositoryAccess access)
+    {
+        if (!access.CloneUrlInsideSandbox.StartsWith("/", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "Sandbox-backed planning requires a path-mounted repository so CodeyBox can enforce read-only repository access.");
+
+        var mounts = access.Mounts
+            .Select(m => m with { ReadOnly = true })
+            .ToArray();
+        if (mounts.Length == 0)
+            throw new InvalidOperationException(
+                "Sandbox-backed planning requires a repository mount so CodeyBox can enforce read-only repository access.");
+
+        return access with
+        {
+            Mounts = mounts,
+            Network = SandboxNetworkPolicy.Denied,
+        };
     }
 
     private static async Task ResetPlanningSandboxWorkTreeAsync(
@@ -1539,14 +1643,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
         bool throwOnFailure,
         CancellationToken ct)
     {
-        foreach (var argv in new[]
+        foreach (var (argv, required) in new (string[] Argv, bool Required)[]
                  {
-                     new[] { "git", "-C", SandboxConventions.WorkDir, "reset", "--hard" },
-                     new[] { "git", "-C", SandboxConventions.WorkDir, "clean", "-fdx" },
+                     (["git", "-C", SandboxConventions.WorkDir, "checkout", "--detach", "HEAD"], false),
+                     (["git", "-C", SandboxConventions.WorkDir, "branch", "-D", "codeybox/planning"], false),
+                     (["git", "-C", SandboxConventions.WorkDir, "update-ref", "-d", "refs/heads/codeybox/planning"], false),
+                     (["git", "-C", SandboxConventions.WorkDir, "reset", "--hard"], true),
+                     (["git", "-C", SandboxConventions.WorkDir, "clean", "-fdx"], true),
+                     (["git", "-C", SandboxConventions.WorkDir, "reflog", "expire", "--expire=now", "--all"], false),
+                     (["git", "-C", SandboxConventions.WorkDir, "gc", "--prune=now"], false),
                  })
         {
             var result = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
-            if (!result.Success && throwOnFailure)
+            if (!result.Success && throwOnFailure && required)
                 throw CommandFailed(result, argv);
         }
     }
@@ -2034,16 +2143,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     if (enteredWork is null)
                         return;
                     item = enteredWork;
+                    await PublishIterationStartedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase, ct);
+                    await _store.RecordIterationDispatchAsync(
+                        item.Id, AuditProgressIterationNumbers.WorkPhase, item.PromptRevision, workIterationStart, ct);
                 }
                 else
                 {
+                    await PublishIterationStartedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase, ct);
+                    await _store.RecordIterationDispatchAsync(
+                        item.Id, AuditProgressIterationNumbers.WorkPhase, item.PromptRevision, workIterationStart, ct);
                     await Transition(item, WorkItemState.Working, ct, project);
                     item = item with { State = WorkItemState.Working };
                 }
-
-                await PublishIterationStartedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase, ct);
-                await _store.RecordIterationDispatchAsync(
-                    item.Id, AuditProgressIterationNumbers.WorkPhase, item.PromptRevision, workIterationStart, ct);
                 string? workAgentStdout = null;
                 using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
                 {

@@ -120,6 +120,7 @@ public sealed class WorkItemRetrier
         {
             "planning" => WorkItemState.Queued,
             "plan_review" => WorkItemState.PlanReview,
+            "plan_approved" => WorkItemState.PlanApproved,
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
@@ -133,10 +134,10 @@ public sealed class WorkItemRetrier
             return (false, $"invalid 'from' value '{from}'", null, null, null);
 
         var actualFrom = requestedFrom;
-        var clearingQueuedPlan = resumeState.Value == WorkItemState.Queued;
+        var retryingBeforeWork = resumeState.Value is WorkItemState.PlanReview or WorkItemState.PlanApproved;
 
         // For from != "work", the pipeline expects the bare repo to still be present.
-        if (resumeState != WorkItemState.Queued)
+        if (resumeState != WorkItemState.Queued && !retryingBeforeWork)
         {
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
@@ -162,6 +163,7 @@ public sealed class WorkItemRetrier
                 actualFrom = "work";
             }
         }
+        var clearingQueuedPlan = resumeState.Value == WorkItemState.Queued;
 
         // Reset RecoveryAttempts and increment only the counter owned by the
         // auto-retry path that invoked us. Terminal-failure-recovery and manual
@@ -504,6 +506,8 @@ public sealed class WorkItemRetrier
         var resumeState = requestedFrom switch
         {
             "planning" => WorkItemState.Queued,
+            "plan_review" => WorkItemState.PlanReview,
+            "plan_approved" => WorkItemState.PlanApproved,
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
@@ -513,11 +517,11 @@ public sealed class WorkItemRetrier
         if (resumeState is null)
             return new ResumeOutcome(
                 ResumeStatus.BadRequest,
-                $"invalid 'from' value '{from}'; expected one of: planning, plan_review, work, rework, audit, merge",
+                $"invalid 'from' value '{from}'; expected one of: planning, plan_review, plan_approved, work, rework, audit, merge",
                 null,
                 null);
         var resumingFromPlanning = requestedFrom == "planning";
-        var resumingBeforeWork = requestedFrom is "planning" or "plan_review";
+        var resumingBeforeWork = requestedFrom is "planning" or "plan_review" or "plan_approved";
 
         // Resume preserves the prior bare repo + work-branch (that is the
         // entire point — recovering the agent commits the operator's cancel
@@ -554,7 +558,7 @@ public sealed class WorkItemRetrier
         // audit progress. Audit reports are diagnostic rows and may be
         // retention-swept, so they are deliberately not used as a resume
         // precondition.
-        if (resumeState.Value != WorkItemState.Queued && _auditProgress is not null)
+        if (!resumingBeforeWork && resumeState.Value != WorkItemState.Queued && _auditProgress is not null)
         {
             var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
             var progress = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);

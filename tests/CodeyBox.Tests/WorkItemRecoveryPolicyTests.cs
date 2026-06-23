@@ -180,6 +180,27 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal(2, reset.RecoveryAttempts);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning)]
+    [InlineData(WorkItemState.PlanReview)]
+    public void ResetRecoveryAttemptsAfterRealProgress_ClearsPlanningRecoveryOnPlanApproval(
+        WorkItemState sourceState)
+    {
+        var item = MakeItem(WorkItemState.PlanReview) with
+        {
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = sourceState,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            item.With(WorkItemState.PlanApproved),
+            fromState: sourceState,
+            toState: WorkItemState.PlanApproved);
+
+        Assert.Equal(0, reset.RecoveryAttempts);
+        Assert.Null(reset.RecoveryAttemptSourceState);
+    }
+
     [Fact]
     public void ResetRecoveryAttemptsAfterRealProgress_ClearsPlanApprovedRecoveryOnWorkCompletion()
     {

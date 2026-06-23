@@ -149,7 +149,7 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_ClaudeSessionMode_RunsPlanningAsFirstWarmTurnThenImplementation()
+    public async Task PlanOn_ClaudeSessionMode_RunsPlanningOutsideWarmSessionThenImplementation()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
@@ -182,14 +182,14 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(1, sessionRunner.OpenCalls);
-        Assert.Equal(2, sessionRunner.SendTurns);
+        Assert.Equal(1, sessionRunner.SendTurns);
         Assert.Equal(1, sessionRunner.CloseCalls);
         Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
         Assert.Equal("max", sessionRunner.OpenedReasoningMode);
-        Assert.Contains("planning-only phase", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
-        Assert.Contains("Reviewed planning metadata", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
-        Assert.Contains("output.txt", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
-        Assert.Equal(0, agent.PlanningCalls);
+        Assert.DoesNotContain("planning-only phase", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.Contains("Reviewed planning metadata", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.Contains("output.txt", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
 
         var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
@@ -202,6 +202,44 @@ public sealed class PlanningPipelineTests : IDisposable
         var (_, mainTreeOutput, _) = await TestSupport.RunGit(
             barePath, "ls-tree", "-r", "main", "--name-only");
         Assert.DoesNotContain("planning-session-pushed.txt", mainTreeOutput);
+    }
+
+    [Fact]
+    public async Task PlanOn_QueuedItemWithStalePlanArtifactClearsAndReplans()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/stale-plan-replans") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+            PlanArtifact = """
+                {
+                  "approach": "old stale plan",
+                  "files": ["old.txt"],
+                  "testStrategy": ["old tests"],
+                  "risks": ["old risk"],
+                  "satisfiesTask": "old task"
+                }
+                """,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddHours(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            PlanReviewSummary = "old approval",
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.NotNull(final.PlanArtifact);
+        Assert.DoesNotContain("old stale plan", final.PlanArtifact, StringComparison.Ordinal);
+        Assert.Contains("make the smallest output file change", final.PlanArtifact, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -283,7 +321,6 @@ public sealed class PlanningPipelineTests : IDisposable
         await setup.Store.CreateAsync(item);
         await setup.Pipeline.RunAsync(item, CancellationToken.None);
 
-        Assert.True(agent.PlanningReceivedSandbox);
         Assert.Contains("planning rule marker", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 

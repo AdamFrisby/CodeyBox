@@ -165,7 +165,7 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
     }
 
     [Fact]
-    public async Task FullPool_Ms95ProjectDefaultClassRoutesAuditPassedToIdleClaudeBeforeQueuedBacklog()
+    public async Task FullPool_AuditPassedBypassesWorkAgentClassBeforeQueuedBacklog()
     {
         var projectRepo = new InMemoryProjectRepository(new Project
         {
@@ -256,9 +256,9 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         await _store.CreateAsync(auditPassed);
 
         // Queue the high-priority starting work first. When a slot frees, the
-        // DB phase bucket must still choose the already-audited item, and the
-        // project default class must route that ms>=95 item to idle Claude while
-        // Codex/Gemini are quota-exhausted.
+        // DB phase bucket must still choose the already-audited item. AuditPassed
+        // resumes merge work, so it must not reserve or stamp a work-agent class
+        // member before the pipeline runs.
         await queue.EnqueueAsync(highPriorityQueued.Id);
         await queue.EnqueueAsync(auditPassed.Id);
 
@@ -267,10 +267,10 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         Assert.True(await pipeline.WaitForStateAsync(auditPassed.Id, WorkItemState.Merging, DispatchWaitTimeout));
         Assert.False(pipeline.HasEntered(highPriorityQueued.Id));
         Assert.Equal(auditPassed.Id, pipeline.NthEntered(5));
-        Assert.Equal(1, svc.Snapshot().GetValueOrDefault(AgentKind.Claude));
+        Assert.Equal(0, svc.Snapshot().GetValueOrDefault(AgentKind.Claude));
 
         var stored = await _store.GetAsync(auditPassed.Id);
-        Assert.Equal(AgentKind.Claude, stored?.Agent);
+        Assert.Null(stored?.Agent);
 
         pipeline.Release(highPriorityQueued.Id);
         pipeline.Release(auditPassed.Id);

@@ -651,6 +651,29 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public void StageReadOnlyBindSnapshot_PreservesFileAndDirectorySymlinks()
+    {
+        var source = Path.Combine(_workspace, "symlink-source");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "target.txt"), "target");
+        Directory.CreateDirectory(Path.Combine(source, "target-dir"));
+        File.WriteAllText(Path.Combine(source, "target-dir", "nested.txt"), "nested");
+        File.CreateSymbolicLink(Path.Combine(source, "file-link.txt"), "target.txt");
+        Directory.CreateSymbolicLink(Path.Combine(source, "dir-link"), "target-dir");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox-symlink");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var staged = MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/repo");
+
+        var fileLink = new FileInfo(Path.Combine(staged, "file-link.txt"));
+        var dirLink = new DirectoryInfo(Path.Combine(staged, "dir-link"));
+        Assert.Equal("target.txt", fileLink.LinkTarget);
+        Assert.Equal("target-dir", dirLink.LinkTarget);
+        Assert.Equal("target", File.ReadAllText(Path.Combine(staged, "file-link.txt")));
+        Assert.Equal("nested", File.ReadAllText(Path.Combine(staged, "dir-link", "nested.txt")));
+    }
+
+    [Fact]
     public void StageReadOnlyBindSnapshot_MissingSource_ThrowsDirectoryNotFoundException()
     {
         var source = Path.Combine(_workspace, "missing-source");

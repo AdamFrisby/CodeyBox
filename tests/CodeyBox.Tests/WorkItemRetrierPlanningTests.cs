@@ -73,6 +73,89 @@ public sealed class WorkItemRetrierPlanningTests : IDisposable
     }
 
     [Fact]
+    public async Task ResumeCancelled_FromPlanReview_DoesNotRequireWorkBranchAndPreservesPlan()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.Cancelled) with
+        {
+            WorkBranch = null,
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.ResumeAsync(item, "plan_review", "operator resume");
+
+        Assert.Equal(WorkItemRetrier.ResumeStatus.Ok, result.Status);
+        Assert.Equal(WorkItemState.PlanReview, result.ResumeState);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.PlanReview, read!.State);
+        Assert.Equal(ValidPlan, read.PlanArtifact);
+        Assert.Equal(item.PlanGeneratedAt, read.PlanGeneratedAt);
+        Assert.False(read.PreserveWorkBranchOnQueuedPickup);
+    }
+
+    [Fact]
+    public async Task ResumeCancelled_FromPlanApproved_DoesNotRequireWorkBranchAndPreservesApproval()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var reviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = Sample(WorkItemState.Cancelled) with
+        {
+            WorkBranch = null,
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = reviewedAt,
+            PlanReviewSummary = "approved",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.ResumeAsync(item, "plan_approved", "operator resume");
+
+        Assert.Equal(WorkItemRetrier.ResumeStatus.Ok, result.Status);
+        Assert.Equal(WorkItemState.PlanApproved, result.ResumeState);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.PlanApproved, read!.State);
+        Assert.Equal(ValidPlan, read.PlanArtifact);
+        Assert.Equal(reviewedAt, read.PlanReviewedAt);
+        Assert.Equal("approved", read.PlanReviewSummary);
+    }
+
+    [Fact]
+    public async Task RetryManual_FromPlanReview_DoesNotRequireWorkBranchAndPreservesPlan()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.Failed) with
+        {
+            WorkBranch = null,
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            LastError = "review failed",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.RetryAsync(item, "plan_review");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.PlanReview, result.ResumeState);
+        Assert.Equal("plan_review", result.ActualFrom);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.PlanReview, read!.State);
+        Assert.Equal(ValidPlan, read.PlanArtifact);
+        Assert.Equal(item.PlanGeneratedAt, read.PlanGeneratedAt);
+        Assert.Null(read.LastError);
+    }
+
+    [Fact]
     public async Task RetryManual_FromWork_RequeuesAndClearsApprovedPlan()
     {
         using var store = NewStore();
