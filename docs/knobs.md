@@ -84,11 +84,12 @@ clears an inherited `Defaults.Knobs` entry for that known key.
 
 ## Resolution and prompt injection
 
-At every work agent invocation, the
+At every WORK and AUDIT agent invocation, the
 [`KnobWorkPromptPreprocessor`](../src/CodeyBox.Orchestrator/Knobs/KnobWorkPromptPreprocessor.cs)
 loads the work item, resolves each registered knob's effective value
-(item → project default → knob default), asks every knob for its prompt
-fragment, and appends the non-empty fragments to the prompt as a single block:
+(item → project default → knob default), asks every knob for its phase-specific
+prompt fragment, and appends the non-empty fragments to the prompt as a single
+block:
 
 ```
 ## Per-item directives (knobs)
@@ -102,12 +103,17 @@ knobs never display the raw value in that shared label; a descriptor that opts
 in to prompt fragments must delimit, encode, or avoid any raw value it emits in
 its own fragment.
 
-Rework, audit, merge, and check-and-act phases are intentionally left alone —
-knobs only affect the initial work prompt today. Additional seams can be added
-by extending `IKnob` with optional per-phase methods.
+Two prompt seams are wired today:
 
-A knob whose effective value matches its existing default behaviour should
-return `null` from its prompt-fragment method so the prompt stays
+| Phase  | Knob method                | Notes |
+|--------|----------------------------|-------|
+| Work   | `GetWorkPromptFragment`    | Original seam — instructs the coding agent. |
+| Audit  | `GetAuditPromptFragment`   | Lets a knob change how LLM auditors weigh blast radius / breadth / scope-creep on this item. Default implementation returns `null`, so existing knobs need no edits. |
+
+Rework, merge, and check-and-act phases are intentionally left alone —
+additional seams can be added by extending `IKnob` with optional per-phase
+methods. A knob whose effective value matches its existing default behaviour
+should return `null` from its prompt-fragment method so the prompt stays
 byte-identical to the pre-knob output. This is the contract: *"a knob with
 nothing to say contributes nothing"*. Some knobs may affect lifecycle outside
 the prompt preprocessor while still using the same registry and validation
@@ -162,15 +168,30 @@ A new knob is a four-step, localised change. No pipeline edits.
 How aggressively the agent may restructure adjacent code while making the
 requested change.
 
-| Value      | Prompt fragment                                                                                                  |
-|------------|------------------------------------------------------------------------------------------------------------------|
-| `surgical` | "Smallest possible change; touch only the strictly-required code; do not refactor adjacent code; merge-friendly diff." |
-| `moderate` | *(none)* — current default agent behaviour.                                                                       |
-| `refactor` | "May restructure or re-architect the affected area to do this well, even with a larger and harder-to-merge diff." |
+| Value      | Work-prompt fragment                                                                                              | Audit-prompt fragment |
+|------------|-------------------------------------------------------------------------------------------------------------------|----------------------|
+| `surgical` | "Smallest possible change; touch only the strictly-required code; do not refactor adjacent code; merge-friendly diff." | "Minimise blast radius — flag out-of-scope refactor / adjacent rewrites / broadened renames / restructuring beyond the strictly-required code as findings; scope inflation IS a defect for this item." |
+| `moderate` | *(none)* — current default agent behaviour.                                                                       | *(none)* — current default auditor behaviour. |
+| `refactor` | "May restructure or re-architect the affected area to do this well, even with a larger and harder-to-merge diff." | "Do NOT penalise breadth / restructuring / renames per se — restructuring is in scope; focus on whether it is principled and correct, not on whether the diff could have been smaller." |
 
-This item wires `changeScope` into the **work prompt only**. Its audit-side
-enforcement (e.g. an auditor that flags out-of-scope edits when `surgical`) and
-its merge-friendliness gating ship as separate dependent work items.
+`changeScope` shapes the work, audit, and merge phases:
+
+- **Work**: per the work-prompt-fragment column above.
+- **Audit**: per the audit-prompt-fragment column above. Applied to every LLM
+  auditor that runs through the prompt-preprocessor chain (architecture,
+  quality, completeness, security, tests, etc.), so a surgical item flags
+  out-of-scope breadth that a refactor item does not.
+- **Merge**: the effective value is stamped on merge timing metadata (the
+  `merge.agent.exec` timing scope's `changeScope` tag and the `AgentDuration`
+  meter's `changeScope` dimension) and threaded into
+  `AgenticConflictResolverContext.ChangeScope` so the agentic conflict
+  resolver can tag refactor-scoped items as conflict-prone in its logs.
+  Scheduling biases for refactor-vs-normal items remain provided by
+  `JobType.Refactor`'s project-exclusive dispatcher gate (see
+  [`OrchestratorService`](../src/CodeyBox.Orchestrator/OrchestratorService.cs)
+  — `RefactorCandidateBlockedReason` and the surrounding refactor drain
+  logic); operators that want a `changeScope=refactor` item to skip
+  pile-ups in hot files should mark the item `JobType.Refactor` as well.
 
 ### `plan` (default: `off`)
 

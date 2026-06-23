@@ -113,8 +113,11 @@ public sealed class KnobWorkPromptPreprocessorTests
     }
 
     [Fact]
-    public async Task NonWorkPhases_AreSkipped_PromptUnchanged()
+    public async Task NonAuditNonWorkPhases_AreSkipped_PromptUnchanged()
     {
+        // Merge, CheckAndAct, and Rework are intentionally untouched by the
+        // knob preprocessor today. Adding more phase seams is a per-phase
+        // opt-in via new IKnob methods.
         var registry = new KnobRegistry([new ChangeScopeKnob()]);
         var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -122,11 +125,124 @@ public sealed class KnobWorkPromptPreprocessorTests
         }));
         var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
 
-        foreach (var phase in new[] { AgentPromptPhase.Audit, AgentPromptPhase.Merge, AgentPromptPhase.CheckAndAct })
+        foreach (var phase in new[] { AgentPromptPhase.Merge, AgentPromptPhase.CheckAndAct })
         {
             var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, phase), "carried");
             Assert.Equal("carried", result);
         }
+    }
+
+    [Fact]
+    public async Task ChangeScopeSurgical_AppendsBlastRadiusFragmentToAuditPhase()
+    {
+        // Acceptance: a surgical item's audit prompt carries a "penalise
+        // out-of-scope breadth" instruction that a refactor item's does not.
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Audit), "audit task");
+
+        Assert.Contains("Per-item directives (knobs)", result);
+        Assert.Contains("changeScope=surgical", result);
+        Assert.Contains("SURGICAL", result);
+        Assert.Contains("blast radius", result, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("scope inflation", result, StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("audit task", result);
+    }
+
+    [Fact]
+    public async Task ChangeScopeRefactor_AppendsDoNotPenaliseBreadthFragmentToAuditPhase()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Audit), "audit task");
+
+        Assert.Contains("REFACTOR", result);
+        Assert.Contains("changeScope=refactor", result);
+        Assert.Contains("Do NOT penalise", result, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("blast radius", result, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("scope inflation", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ChangeScopeModerate_AuditPhase_ContributesNothing_PromptUnchanged()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueModerate,
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Audit), "stable audit prompt");
+
+        Assert.Equal("stable audit prompt", result);
+    }
+
+    [Fact]
+    public async Task SurgicalVsRefactor_AuditFragmentsDiffer_OnlySurgicalPenalisesBreadth()
+    {
+        // Acceptance pin: side-by-side test that proves the surgical audit
+        // fragment flags out-of-scope breadth where the refactor one does
+        // not. Without this, a future edit could neutralise the
+        // surgical-side language and the per-fragment tests above would
+        // still pass even though the directional contract was lost.
+        var knob = new ChangeScopeKnob();
+        var surgical = knob.GetAuditPromptFragment(ChangeScopeKnob.ValueSurgical);
+        var refactor = knob.GetAuditPromptFragment(ChangeScopeKnob.ValueRefactor);
+        Assert.NotNull(surgical);
+        Assert.NotNull(refactor);
+        Assert.Contains("blast radius", surgical, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("scope inflation", surgical, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("blast radius", refactor, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("scope inflation", refactor, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Do NOT penalise", refactor, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ChangeScopeKnob_GetAuditPromptFragment_ModerateAndUnknownValues_ReturnNull()
+    {
+        var knob = new ChangeScopeKnob();
+        Assert.Null(knob.GetAuditPromptFragment(ChangeScopeKnob.ValueModerate));
+        Assert.Null(knob.GetAuditPromptFragment("yolo"));
+        Assert.Null(knob.GetAuditPromptFragment(""));
+    }
+
+    [Fact]
+    public void ResolveEffectiveValue_HonoursItemOverProjectOverDefault()
+    {
+        // Item override wins.
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            }));
+
+        // Project default applies when item is silent.
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            }));
+
+        // Falls back to the knob's documented default when neither side speaks.
+        Assert.Equal(ChangeScopeKnob.ValueModerate, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: null,
+            projectKnobs: null));
     }
 
     [Fact]

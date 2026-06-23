@@ -1762,6 +1762,27 @@ public sealed class AgenticConflictResolverTests
         }
     }
 
+    [Fact]
+    public void AgenticConflictResolverContext_ChangeScope_CarriesValueForResolverTelemetry()
+    {
+        // changeScope flows into the resolver as context so its logger can tag
+        // refactor-scoped items as conflict-prone (and surgical ones as
+        // conflict-friendly). The pipeline sets this from
+        // ChangeScopeKnob.ResolveEffectiveValue(item, project). Pin the
+        // contract that the field exists, is settable via the record's
+        // with-init syntax, and is preserved across copy-construction.
+        var baseCtx = new AgenticConflictResolverContext(
+            "main", "feature", AgenticConflictResolverOperation.Merge);
+        Assert.Null(baseCtx.ChangeScope);
+
+        var refactor = baseCtx with { ChangeScope = "refactor" };
+        Assert.Equal("refactor", refactor.ChangeScope);
+
+        var withProject = refactor with { ProjectId = new ProjectId("p1") };
+        Assert.Equal("refactor", withProject.ChangeScope);
+        Assert.Equal(new ProjectId("p1"), withProject.ProjectId);
+    }
+
     private sealed class NoopPreprocessor : IAgentPromptPreprocessor
     {
         public int Order => 0;

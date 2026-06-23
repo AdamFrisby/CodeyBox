@@ -7,6 +7,7 @@ using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Git;
+using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 
@@ -12638,11 +12639,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // it. Mirrors the pickup-rebase pattern where chosenResolver swaps in.
             var chosenMergeRunner = runner;
             var chosenMergeCredential = credential;
+            var mergeChangeScope = ChangeScopeKnob.ResolveEffectiveValue(item.Knobs, project.Knobs);
             if (hostMerge.HasConflicts)
             {
                 var mergeExecScope = await TimingScope.BeginAsync(
                     _timings, item.Id, "merge", "agent.exec",
-                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value, ["capability"] = "agentic-in-vm" },
+                    metadata: new Dictionary<string, object>
+                    {
+                        ["agent"] = runner.Kind.Value,
+                        ["capability"] = "agentic-in-vm",
+                        ["changeScope"] = mergeChangeScope,
+                    },
                     log: _log,
                     activitySource: CodeyBoxActivities.Pipeline);
                 await using (mergeExecScope)
@@ -12665,6 +12672,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Merge)
                         {
                             ProjectId = project.Id,
+                            ChangeScope = mergeChangeScope,
                         },
                         candidates,
                         ct);
@@ -12714,7 +12722,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
                 new KeyValuePair<string, object?>("agent.kind", chosenMergeRunner.Kind.Value),
-                new KeyValuePair<string, object?>("phase", "merge"));
+                new KeyValuePair<string, object?>("phase", "merge"),
+                new KeyValuePair<string, object?>("changeScope", mergeChangeScope));
 
             // When the cascade swapped to a cross-kind fallback, item.ModelId
             // belongs to the primary (e.g. "claude-opus-4-7") and is not valid

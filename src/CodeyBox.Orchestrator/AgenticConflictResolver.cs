@@ -85,6 +85,15 @@ public sealed record AgenticConflictResolverContext(
     AgenticConflictResolverOperation Operation)
 {
     public ProjectId? ProjectId { get; init; }
+
+    /// <summary>
+    /// Effective <c>changeScope</c> knob value for the work item driving this
+    /// merge/rebase. Carried through so resolver telemetry (audit log,
+    /// per-attempt failure events) can tag refactor-scoped items as
+    /// merge-conflict-prone and surgical items as conflict-friendly. Empty /
+    /// null when the orchestrator did not resolve the knob (older callers).
+    /// </summary>
+    public string? ChangeScope { get; init; }
 }
 
 public enum AgenticConflictResolverOperation
@@ -254,6 +263,13 @@ public sealed class AgenticConflictResolver
 
         foreach (var file in conflictFiles)
             MergeConflictPathInspector.ValidateRelativeWorkPath(file);
+
+        if (!string.IsNullOrWhiteSpace(context.ChangeScope))
+        {
+            _log.LogInformation(
+                "Agentic conflict resolver: starting for {WorkItemId} on {Operation} (changeScope={ChangeScope}, conflictFiles={Count})",
+                workItemId, context.Operation, context.ChangeScope, conflictFiles.Count);
+        }
 
         var options = _options.Current;
         var maxIterations = Math.Max(1, options.MaxIterations);

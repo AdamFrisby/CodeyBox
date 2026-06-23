@@ -150,9 +150,21 @@ public interface IKnob
     KnobPipelineLifecycle GetPipelineLifecycle(string value) => KnobPipelineLifecycle.None;
 
     /// <summary>
+    /// Optional fragment appended to every audit-phase prompt for the given
+    /// effective <paramref name="value"/>. Lets a knob shape what the
+    /// auditors weigh blast-radius / breadth / scope-creep as on this item
+    /// without editing the auditor's own focus list. Return <c>null</c> or
+    /// whitespace when this value contributes nothing — same contract as
+    /// <see cref="GetWorkPromptFragment"/>. Default implementation returns
+    /// <c>null</c> so existing knobs need no edits.
+    /// </summary>
+    string? GetAuditPromptFragment(string value) => null;
+
+    /// <summary>
     /// Free-form values can be operator/user controlled. Leave this false
-    /// unless <see cref="GetWorkPromptFragment"/> either never emits the raw
-    /// free-form value or explicitly delimits/encodes it as untrusted data.
+    /// unless <see cref="GetWorkPromptFragment"/> and
+    /// <see cref="GetAuditPromptFragment"/> either never emit the raw
+    /// free-form value or explicitly delimit/encode it as untrusted data.
     /// The prompt preprocessor enforces this when a free-form descriptor
     /// contributes a fragment.
     /// </summary>

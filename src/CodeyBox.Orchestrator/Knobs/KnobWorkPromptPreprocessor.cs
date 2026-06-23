@@ -7,8 +7,8 @@ namespace CodeyBox.Orchestrator.Knobs;
 
 /// <summary>
 /// Built-in preprocessor that gathers fragments from every registered
-/// <see cref="IKnob"/> and appends them to the agent's work prompt as a
-/// single block.
+/// <see cref="IKnob"/> and appends them to the agent's prompt as a single
+/// block.
 ///
 /// <para>
 /// Runs at <see cref="AgentPromptPreprocessorOrder.BuiltInLast"/> so the
@@ -18,10 +18,12 @@ namespace CodeyBox.Orchestrator.Knobs;
 /// </para>
 ///
 /// <para>
-/// Only fires for <see cref="AgentPromptPhase.Work"/> today. Rework, audit,
-/// merge, and check-and-act phases are intentionally untouched; knob seams for
-/// those phases can be added by extending <see cref="IKnob"/> with optional
-/// methods.
+/// Fires for <see cref="AgentPromptPhase.Work"/> (via
+/// <see cref="IKnob.GetWorkPromptFragment"/>) and
+/// <see cref="AgentPromptPhase.Audit"/> (via
+/// <see cref="IKnob.GetAuditPromptFragment"/>). Rework, merge, and
+/// check-and-act phases are intentionally untouched; further phase seams
+/// plug in here by adding more optional methods to <see cref="IKnob"/>.
 /// </para>
 /// </summary>
 public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
@@ -51,7 +53,7 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
 
     public async Task<string> ProcessAsync(PromptContext ctx, string prompt, CancellationToken ct = default)
     {
-        if (ctx.Phase != AgentPromptPhase.Work)
+        if (ctx.Phase != AgentPromptPhase.Work && ctx.Phase != AgentPromptPhase.Audit)
             return prompt;
         if (_registry.All.Count == 0)
             return prompt;
@@ -72,7 +74,9 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
         {
             if (!effective.TryGetValue(knob.Key, out var value) || string.IsNullOrWhiteSpace(value))
                 continue;
-            var fragment = knob.GetWorkPromptFragment(value);
+            var fragment = ctx.Phase == AgentPromptPhase.Audit
+                ? knob.GetAuditPromptFragment(value)
+                : knob.GetWorkPromptFragment(value);
             if (string.IsNullOrWhiteSpace(fragment))
                 continue;
             var displayValue = knob.AllowedValues.Count > 0;
