@@ -943,6 +943,26 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task FinalizeConflictResolutionAsync_RejectsUnsafeConflictHunkPathBeforeGitCommands()
+    {
+        var sandbox = new ConflictSandbox();
+
+        var ex = await Assert.ThrowsAsync<MergeConflictResolutionFailedException>(() =>
+            PipelineRunner.FinalizeConflictResolutionAsync(
+                sandbox,
+                [new ConflictHunk("../outside.cs", StartLine: 1, EndLine: 3)],
+                "codeybox/work",
+                "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+                CancellationToken.None));
+
+        Assert.Contains("unsafe conflict file path '../outside.cs'", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, sandbox.AddCallCount);
+        Assert.Equal(0, sandbox.LsFilesCallCount);
+        Assert.Equal(0, sandbox.GrepCallCount);
+        Assert.Empty(sandbox.AddedFiles);
+    }
+
+    [Fact]
     public async Task FinalizeConflictResolutionAsync_UsesLiteralPathspecs_ForGitAddAndMarkerScan()
     {
         const string literalPath = "src/conflict*[ab].txt";
@@ -1101,6 +1121,22 @@ public sealed class AgenticConflictResolverTests
         var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
 
         Assert.Equal(["src/base-only.txt", "src/sha256.txt", "src/theirs-only.txt"], paths);
+    }
+
+    [Theory]
+    [InlineData("../outside.cs")]
+    [InlineData("/tmp/x")]
+    [InlineData(":foo")]
+    [InlineData("foo\\bar")]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsUnsafePathFromValidRecord(string unsafePath)
+    {
+        var oid = new string('a', 40);
+        var stdout = $"100644 {oid} 2\t{unsafePath}\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("unsafe conflict file path", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1277,7 +1313,9 @@ public sealed class AgenticConflictResolverTests
         public Queue<SandboxExecResult?> DiffResponseQueue { get; } = new();
         public Queue<SandboxExecResult?> LsFilesResponseQueue { get; } = new();
         public Queue<SandboxExecResult?> GrepResponseQueue { get; } = new();
+        public int AddCallCount { get; private set; }
         public int DiffCallCount { get; private set; }
+        public int GrepCallCount { get; private set; }
         public int LsFilesCallCount { get; private set; }
 
         public void AddConflictedFile(string relativePath, string content)
@@ -1344,6 +1382,7 @@ public sealed class AgenticConflictResolverTests
             if (argv.Count >= 4
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "grep")
             {
+                GrepCallCount++;
                 if (GrepResponseQueue.TryDequeue(out var queued) && queued is not null)
                     return Task.FromResult(queued);
                 var sepIdx = -1;
@@ -1369,6 +1408,7 @@ public sealed class AgenticConflictResolverTests
             if (argv.Count >= 5
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "add" && argv[4] == "--")
             {
+                AddCallCount++;
                 for (var i = 5; i < argv.Count; i++)
                     GitAdd(argv[i]);
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
