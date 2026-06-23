@@ -271,6 +271,12 @@ builder.Services.AddOptions<CodeyBoxOptions>()
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
+// E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
+// take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
+// CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
+// (for the unbound-key validator's walk and operator visibility); the standalone
+// binding is what gets hot-reloaded into the pool's MaxConcurrent.
+builder.Services.Configure<E2eExecutionOptions>(builder.Configuration.GetSection("CodeyBox:E2eExecution"));
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
 // map-shaped binding (audit-type / language overrides / profile inheritance) on
@@ -2132,6 +2138,18 @@ builder.Services.AddSingleton<ITestCaseStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteTestCaseStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IE2eRunStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteE2eRunStore(opts.StateDatabasePath);
+});
+builder.Services.AddSingleton<IE2eReplayRuntime, E2eReplayRuntime>();
+// Local pool wraps the orchestrator's registered ISandboxProvider but exposes
+// its OWN concurrency gate. The pool is the single architectural seam that
+// keeps E2E load off the coding-worker WorkerPool — there is no DI path from
+// the pool back to WorkerPool, and the dispatcher only takes the pool.
+builder.Services.AddSingleton<IE2eExecutionPool, LocalE2eExecutionPool>();
+builder.Services.AddHostedService<E2eRunDispatcher>();
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -3090,6 +3108,7 @@ IdempotencyMiddleware.Use(app);
 
 WorkItemEndpoints.Map(app);
 TestCaseEndpoints.Map(app);
+E2eRunEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
@@ -4256,6 +4275,16 @@ namespace CodeyBox.Api
         /// behaviour.
         /// </summary>
         public ClaudeSessionOptions ClaudeSession { get; set; } = new();
+
+        /// <summary>
+        /// End-to-end replay execution pool configuration. Bound from
+        /// <c>CodeyBox:E2eExecution</c>. Sizes the cheap CPU-only VM pool that
+        /// runs committed e2e-replay artifacts; intentionally separate from the
+        /// orchestrator's coding-worker fleet so E2E load never competes for
+        /// agent-dispatch slots. Disabled by default — operators opt in per
+        /// deployment.
+        /// </summary>
+        public E2eExecutionOptions E2eExecution { get; set; } = new();
     }
 
     /// <summary>

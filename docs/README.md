@@ -30,6 +30,9 @@ Start here if you're new:
 15. [`test-cases.md`](test-cases.md) — first-class TestCase artifact attached
     to work items: lean schema, SQLite persistence, REST surface, and the
     JobTrack mapping (`SourceWorkItemId` ↔ `SourceTaskId`).
+16. [`e2e-execution.md`](e2e-execution.md) — runtime + pool that deterministically
+    replays committed `E2eReplay` artifacts on cheap CPU-only cloud VMs,
+    in parallel, off the coding-worker fleet.
 
 ## Plugin SDK
 

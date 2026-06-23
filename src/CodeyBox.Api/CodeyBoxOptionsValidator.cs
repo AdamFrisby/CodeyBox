@@ -29,6 +29,30 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxBulkItems must be between 1 and {CodeyBoxOptions.MaximumMaxBulkItems}");
         }
 
+        var e2e = options.E2eExecution;
+        if (e2e is not null)
+        {
+            if (e2e.MaxConcurrent is < E2eExecutionOptions.MinimumMaxConcurrent
+                or > E2eExecutionOptions.MaximumMaxConcurrent)
+            {
+                failures.Add(
+                    $"CodeyBox:E2eExecution:MaxConcurrent must be between {E2eExecutionOptions.MinimumMaxConcurrent} and {E2eExecutionOptions.MaximumMaxConcurrent}");
+            }
+            if (e2e.PollInterval < TimeSpan.Zero)
+            {
+                failures.Add("CodeyBox:E2eExecution:PollInterval must be non-negative");
+            }
+            if (e2e.PerRunTimeout <= TimeSpan.Zero)
+            {
+                failures.Add("CodeyBox:E2eExecution:PerRunTimeout must be positive");
+            }
+            if (!string.Equals(e2e.PoolKind, "local", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
+            {
+                failures.Add("CodeyBox:E2eExecution:PoolKind must be 'local' or 'remote-ssh'");
+            }
+        }
+
         foreach (var (agent, tolerance) in options.AgentNetworkTolerance)
         {
             if (string.IsNullOrWhiteSpace(agent))
