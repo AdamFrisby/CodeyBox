@@ -174,6 +174,69 @@ public sealed class AgenticConflictResolverIntegrationTests
         Assert.Same(fallbackCredential, materialiserCalls[0].Credential);
     }
 
+    [SkippableFact]
+    public async Task ResolveAsync_RealGitMarkerScan_UsesLiteralPathspecs()
+    {
+        Skip.IfNot(HasGit(), "git not on PATH");
+
+        const string literalConflictPath = "src/conflict*.txt";
+        const string wildcardNeighbor = "src/conflict-neighbor.txt";
+        using var workspace = new TempWorkspace();
+        var conflictRepo = await SeedConflictedRebaseAsync(
+            workspace.Root,
+            literalConflictPath,
+            new Dictionary<string, string> { [wildcardNeighbor] = "clean neighbor\n" });
+
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
+                new SandboxMount { SandboxPath = "/seed", HostPath = conflictRepo, ReadOnly = false },
+            ],
+            Network = new SandboxNetworkPolicy { AllowedHosts = [] },
+            WorkingDirectory = SandboxConventions.WorkDir,
+        };
+        await using var sandbox = await provider.CreateAsync(spec);
+
+        await ExecOrThrow(sandbox, "git", "clone", "/seed", SandboxConventions.WorkDir);
+        await ExecOrThrow(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "t@l");
+        await ExecOrThrow(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "T");
+        await ExecOrThrow(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "feature");
+        var rebase = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "origin/main"],
+        });
+        Assert.False(rebase.Success,
+            $"expected the rebase to leave the working tree in a conflict state. stdout={rebase.Stdout} stderr={rebase.Stderr}");
+
+        await WriteFileAsync(
+            sandbox,
+            $"{SandboxConventions.WorkDir}/{wildcardNeighbor}",
+            "<<<<<<< marker in wildcard neighbor\n");
+
+        var resolver = new AgenticConflictResolver();
+        var runner = new MarkerStrippingAgentRunner { StageWithLiteralPathspecs = true };
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            SandboxConventions.WorkDir,
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Equal([literalConflictPath], result.ConflictFiles.ToArray());
+
+        var neighborMarkers = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["grep", "-n", "-E", "^(<<<<<<<|=======|>>>>>>>)", $"{SandboxConventions.WorkDir}/{wildcardNeighbor}"],
+        });
+        Assert.Equal(0, neighborMarkers.ExitCode);
+    }
+
     /// <summary>
     /// Capture path on failure: when the resolver agent exits non-zero, the
     /// stdout/stderr the runner returned MUST end up in the failure
@@ -209,26 +272,44 @@ public sealed class AgenticConflictResolverIntegrationTests
         Assert.Equal("missing ANTHROPIC_API_KEY; aborting", result.Stderr);
     }
 
-    private static async Task<string> SeedConflictedRebaseAsync(string workspace)
+    private static Task<string> SeedConflictedRebaseAsync(string workspace) =>
+        SeedConflictedRebaseAsync(workspace, "conflict.txt");
+
+    private static async Task<string> SeedConflictedRebaseAsync(
+        string workspace,
+        string conflictPath,
+        IReadOnlyDictionary<string, string>? additionalFiles = null)
     {
         var repo = Path.Combine(workspace, "conflict-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(repo);
         await RunGit(repo, "init", "-b", "main");
         await RunGit(repo, "config", "user.email", "seed@example");
         await RunGit(repo, "config", "user.name", "seed");
-        await File.WriteAllTextAsync(Path.Combine(repo, "conflict.txt"), "original\n");
-        await RunGit(repo, "add", "conflict.txt");
+        await WriteRepoFileAsync(repo, conflictPath, "original\n");
+        if (additionalFiles is not null)
+        {
+            foreach (var (path, content) in additionalFiles)
+                await WriteRepoFileAsync(repo, path, content);
+        }
+        await RunGit(repo, "add", ".");
         await RunGit(repo, "commit", "-m", "base");
 
         await RunGit(repo, "checkout", "-b", "feature");
-        await File.WriteAllTextAsync(Path.Combine(repo, "conflict.txt"), "feature-edit\n");
+        await WriteRepoFileAsync(repo, conflictPath, "feature-edit\n");
         await RunGit(repo, "commit", "-am", "feature change");
 
         await RunGit(repo, "checkout", "main");
-        await File.WriteAllTextAsync(Path.Combine(repo, "conflict.txt"), "main-edit\n");
+        await WriteRepoFileAsync(repo, conflictPath, "main-edit\n");
         await RunGit(repo, "commit", "-am", "main change");
         await RunGit(repo, "checkout", "feature");
         return repo;
+    }
+
+    private static async Task WriteRepoFileAsync(string repo, string relativePath, string content)
+    {
+        var path = Path.Combine(repo, relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, content);
     }
 
     private static async Task ExecOrThrow(ISandbox sandbox, params string[] argv)
@@ -237,6 +318,18 @@ public sealed class AgenticConflictResolverIntegrationTests
         if (result.ExitCode != 0)
             throw new InvalidOperationException(
                 $"sandbox exec failed (exit {result.ExitCode}): {string.Join(' ', argv)}\nstdout: {result.Stdout}\nstderr: {result.Stderr}");
+    }
+
+    private static async Task WriteFileAsync(ISandbox sandbox, string path, string content)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$0\"", path],
+            Stdin = content,
+        });
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"sandbox file write failed (exit {result.ExitCode}): {path}\nstdout: {result.Stdout}\nstderr: {result.Stderr}");
     }
 
     private static bool HasGit()
@@ -299,6 +392,7 @@ public sealed class AgenticConflictResolverIntegrationTests
     {
         public AgentKind Kind { get; init; } = new("test-resolver");
         public int InvocationCount { get; private set; }
+        public bool StageWithLiteralPathspecs { get; init; }
 
         public async Task<AgentResult> RunAsync(
             ISandbox sandbox,
@@ -341,6 +435,9 @@ public sealed class AgenticConflictResolverIntegrationTests
                 var add = await sandbox.ExecAsync(new SandboxExec
                 {
                     Argv = ["git", "-C", workingDirectory, "add", "--", file],
+                    ExtraEnvironment = StageWithLiteralPathspecs
+                        ? MergeConflictPathInspector.GitLiteralPathspecEnvironment
+                        : null,
                 }, ct);
                 if (add.ExitCode != 0)
                     return new AgentResult(false, $"add failed: {file}", add.Stdout, add.Stderr);

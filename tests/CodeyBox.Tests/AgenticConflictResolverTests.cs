@@ -1,7 +1,9 @@
 using System.Text;
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests;
 
@@ -591,12 +593,36 @@ public sealed class AgenticConflictResolverTests
             maxAttempts: 3,
             priorVerificationError: null);
 
-        Assert.Contains("`a.txt`", prompt);
-        Assert.Contains("`src/b.cs`", prompt);
+        Assert.Contains("\"a.txt\"", prompt);
+        Assert.Contains("\"src/b.cs\"", prompt);
+        Assert.DoesNotContain("`a.txt`", prompt);
+        Assert.DoesNotContain("`src/b.cs`", prompt);
         Assert.Contains("mid-rebase", prompt, StringComparison.Ordinal);
         Assert.Contains("`feature/x`", prompt);
         Assert.Contains("`main`", prompt);
         Assert.DoesNotContain("rebase --continue", prompt[..prompt.IndexOf("DO NOT", StringComparison.Ordinal)]);
+    }
+
+    [Fact]
+    public void PromptShape_AcceptsBackticksAndRejectsControlCharactersInConflictPaths()
+    {
+        var prompt = AgenticConflictResolver.BuildAgenticConflictResolverPrompt(
+            new AgenticConflictResolverContext("main", "feature/x", AgenticConflictResolverOperation.Rebase),
+            ["src/`valid git path`.cs"],
+            attempt: 1,
+            maxAttempts: 3,
+            priorVerificationError: null);
+
+        Assert.Contains(@"src/\u0060valid git path\u0060.cs", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("src/`valid git path`.cs", prompt, StringComparison.Ordinal);
+
+        Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            AgenticConflictResolver.BuildAgenticConflictResolverPrompt(
+                new AgenticConflictResolverContext("main", "feature/x", AgenticConflictResolverOperation.Rebase),
+                ["src/a\nb.cs"],
+                attempt: 1,
+                maxAttempts: 3,
+                priorVerificationError: null));
     }
 
     [Fact]
@@ -673,9 +699,9 @@ public sealed class AgenticConflictResolverTests
     {
         var sandbox = new ConflictSandbox();
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
-        // First (and only) diff call must fail so ListUnmergedPathsAsync throws
+        // First (and only) unmerged-index call must fail so ListUnmergedPathsAsync throws
         // before any agent invocation happens.
-        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: not a git repository"));
+        sandbox.LsFilesResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: not a git repository"));
 
         var resolver = new AgenticConflictResolver();
         var runner = new FakeAgentResolverRunner(_ => throw new InvalidOperationException("agent should never run"));
@@ -691,6 +717,39 @@ public sealed class AgenticConflictResolverTests
         Assert.Contains("failed to inspect unmerged paths", ex.Message, StringComparison.Ordinal);
         Assert.Contains("fatal: not a git repository", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, runner.InvocationCount);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ListUnmergedPathsIgnoresPrefixedMultipassStartupNoise()
+    {
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, BuildSimpleConflict("b", "m", "w"));
+        sandbox.LsFilesResponseQueue.Enqueue(
+            new SandboxExecResult(0, BuildContaminatedLsFilesStdout(path), ""));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile(path, "m + w\n");
+            sb.GitAdd(path);
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Equal([path], result.ConflictFiles.ToArray());
+        Assert.Equal(1, runner.InvocationCount);
+        Assert.DoesNotContain("unsafe conflict file path", result.Summary, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -767,14 +826,14 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
-    public async Task ResolveAsync_VerifyDiffFails_ReportsDiffFailure()
+    public async Task ResolveAsync_VerifyUnmergedPathInspectionFails_ReportsInspectionFailure()
     {
         var sandbox = new ConflictSandbox();
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
-        // First diff call (in ListUnmergedPathsAsync) returns default success +
-        // the conflict file; second diff call (in VerifyResolutionAsync) fails.
-        sandbox.DiffResponseQueue.Enqueue(null);
-        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: index corrupted"));
+        // First ls-files call (in ListUnmergedPathsAsync) returns default success
+        // plus the conflict file; second call (in VerifyResolutionAsync) fails.
+        sandbox.LsFilesResponseQueue.Enqueue(null);
+        sandbox.LsFilesResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: index corrupted"));
 
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
@@ -795,8 +854,289 @@ public sealed class AgenticConflictResolverTests
             CancellationToken.None);
 
         Assert.False(result.Success);
-        Assert.Contains("git diff failed", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("failed to inspect unmerged paths", result.Summary, StringComparison.Ordinal);
         Assert.Contains("fatal: index corrupted", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_VerifyRemainingUnmergedPathsReportsCleanPath()
+    {
+        const string path = "src/a.txt";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, BuildSimpleConflict("b", "m", "w"));
+        sandbox.LsFilesResponseQueue.Enqueue(null);
+        sandbox.LsFilesResponseQueue.Enqueue(
+            new SandboxExecResult(0, BuildContaminatedLsFilesStdout(path), ""));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile(path, "m + w\n");
+            return new AgentResult(true, "forgot to stage", null, null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("unmerged paths remain after agent: src/a.txt", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("\x1b", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("Starting codeybox", result.Summary, StringComparison.Ordinal);
+        Assert.Equal(1, runner.InvocationCount);
+    }
+
+    [Fact]
+    public async Task FinalizeConflictResolutionAsync_UsesLsFilesInspectorInsteadOfRawDiffStdout()
+    {
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, "resolved content\n");
+        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(
+            0,
+            "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner>  " + path + "\n",
+            ""));
+
+        await PipelineRunner.FinalizeConflictResolutionAsync(
+            sandbox,
+            [new ConflictHunk(path, StartLine: 1, EndLine: 3)],
+            "codeybox/work",
+            "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            CancellationToken.None);
+
+        Assert.Equal(0, sandbox.DiffCallCount);
+        Assert.Equal(1, sandbox.LsFilesCallCount);
+    }
+
+    [Fact]
+    public async Task FinalizeConflictResolutionAsync_WrapsLsFilesInspectorFailure()
+    {
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, "resolved content\n");
+        sandbox.LsFilesResponseQueue.Enqueue(new SandboxExecResult(
+            128,
+            "",
+            "fatal: index corrupted"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            PipelineRunner.FinalizeConflictResolutionAsync(
+                sandbox,
+                [new ConflictHunk(path, StartLine: 1, EndLine: 3)],
+                "codeybox/work",
+                "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+                CancellationToken.None));
+
+        var inspectorFailure = Assert.IsType<MergeConflictResolutionFailedException>(ex.InnerException);
+        Assert.Equal(inspectorFailure.Message, ex.Message);
+        Assert.Contains(
+            "failed to inspect unmerged paths: fatal: index corrupted",
+            ex.Message,
+            StringComparison.Ordinal);
+        Assert.Equal(1, sandbox.LsFilesCallCount);
+    }
+
+    [Fact]
+    public async Task FinalizeConflictResolutionAsync_RejectsUnsafeConflictHunkPathBeforeGitCommands()
+    {
+        var sandbox = new ConflictSandbox();
+
+        var ex = await Assert.ThrowsAsync<MergeConflictResolutionFailedException>(() =>
+            PipelineRunner.FinalizeConflictResolutionAsync(
+                sandbox,
+                [new ConflictHunk("../outside.cs", StartLine: 1, EndLine: 3)],
+                "codeybox/work",
+                "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+                CancellationToken.None));
+
+        Assert.Contains("unsafe conflict file path '../outside.cs'", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, sandbox.AddCallCount);
+        Assert.Equal(0, sandbox.LsFilesCallCount);
+        Assert.Equal(0, sandbox.GrepCallCount);
+        Assert.Empty(sandbox.AddedFiles);
+    }
+
+    [Fact]
+    public async Task FinalizeConflictResolutionAsync_UsesLiteralPathspecs_ForGitAddAndMarkerScan()
+    {
+        const string literalPath = "src/conflict*[ab].txt";
+        const string wildcardNeighbor = "src/conflictZZa.txt";
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "init");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "tests@codeybox.invalid");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "CodeyBox Tests");
+        await Run(sandbox, "mkdir", "-p", $"{SandboxConventions.WorkDir}/src");
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{literalPath}", "resolved\n");
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{wildcardNeighbor}", "clean\n");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", ".");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", "seed");
+
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{literalPath}", "resolved differently\n");
+        await WriteFileAsync(sandbox, $"{SandboxConventions.WorkDir}/{wildcardNeighbor}", "<<<<<<< marker\n");
+
+        await PipelineRunner.FinalizeConflictResolutionAsync(
+            sandbox,
+            [new ConflictHunk(literalPath, StartLine: 1, EndLine: 3)],
+            "codeybox/work",
+            "CodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+            CancellationToken.None);
+
+        var staged = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--name-only"],
+        });
+        Assert.True(staged.Success, staged.Stderr);
+        Assert.Equal(literalPath + "\n", staged.Stdout);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_IgnoresPrefixedMultipassStartupNoise()
+    {
+        const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
+        var stdout = BuildContaminatedLsFilesStdout(path);
+
+        var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal([path], paths);
+        Assert.DoesNotContain(paths, p => p.Contains('\x1b'));
+        Assert.DoesNotContain(paths, p => p.Contains("Starting codeybox", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsAnsiInsideRecordPath()
+    {
+        var oid = new string('a', 40);
+        var stdout = $"100644 {oid} 2\tsrc/a\u001b[31mb.cs\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("malformed git ls-files -u output segment", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("unsafe conflict file path", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(@"src/a\u001B[31mb.cs", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsNonRecordOutput()
+    {
+        var stdout = "\x1b[2K\x1b[0Eworking...\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("malformed git ls-files -u output segment", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(@"\u001B[2K\u001B[0Eworking...", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_IgnoresCrLfOnlyFramingSegments()
+    {
+        var oid = new string('a', 40);
+        var stdout = "\n\0" +
+                     $"100644 {oid} 2\tsrc/a.cs\0" +
+                     "\r\n\0";
+
+        var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal(["src/a.cs"], paths);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_DeduplicatesMultipleStageRecordsPerPath()
+    {
+        var stageOneOid = new string('a', 40);
+        var stageTwoOid = new string('b', 40);
+        var stageThreeOid = new string('c', 40);
+        var stdout =
+            $"100644 {stageOneOid} 1\tsrc/conflict.cs\0" +
+            $"100644 {stageTwoOid} 2\tsrc/conflict.cs\0" +
+            $"100644 {stageThreeOid} 3\tsrc/conflict.cs\0" +
+            $"100644 {stageTwoOid} 2\tsrc/other.cs\0";
+
+        var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal(["src/conflict.cs", "src/other.cs"], paths);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_IgnoresStandaloneTerminalStartupNoise()
+    {
+        var stdout = "\x1b[2K\x1b[0EStarting codeybox-xxxx  <spinner>\0";
+
+        var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Empty(paths);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsUnrecognizedPrefixBeforeRecord()
+    {
+        var oid = new string('a', 40);
+        var stdout = $"unexpected text 100644 {oid} 2\tsrc/a.cs\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("malformed git ls-files -u output segment", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("unexpected text", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsMalformedSegmentAfterValidRecord()
+    {
+        var oid = new string('a', 40);
+        var stdout = $"100644 {oid} 2\tsrc/a.cs\0truncated-stage-record\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("malformed git ls-files -u output segment 'truncated-stage-record'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseUnmergedPathsFromLsFilesStdout_AcceptsStageOneStageThreeAndSha256Records()
+    {
+        var sha1Stage1 = new string('a', 40);
+        var sha1Stage3 = new string('b', 40);
+        var sha256Stage2 = new string('c', 64);
+        var stdout =
+            $"100644 {sha1Stage1} 1\tsrc/base-only.txt\0" +
+            $"100644 {sha1Stage3} 3\tsrc/theirs-only.txt\0" +
+            $"100644 {sha256Stage2} 2\tsrc/sha256.txt\0";
+
+        var paths = MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout);
+
+        Assert.Equal(["src/base-only.txt", "src/sha256.txt", "src/theirs-only.txt"], paths);
+    }
+
+    [Theory]
+    [InlineData("../outside.cs")]
+    [InlineData("/tmp/x")]
+    [InlineData(":foo")]
+    [InlineData("foo\\bar")]
+    public void ParseUnmergedPathsFromLsFilesStdout_RejectsUnsafePathFromValidRecord(string unsafePath)
+    {
+        var oid = new string('a', 40);
+        var stdout = $"100644 {oid} 2\t{unsafePath}\0";
+
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ParseUnmergedPathsFromLsFilesStdout(stdout));
+
+        Assert.Contains("unsafe conflict file path", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -823,13 +1163,49 @@ public sealed class AgenticConflictResolverTests
     public void ValidateRelativeWorkPath_RejectsTraversal()
     {
         Assert.Throws<MergeConflictResolutionFailedException>(() =>
-            AgenticConflictResolver.ValidateRelativeWorkPath("../etc/passwd"));
+            MergeConflictPathInspector.ValidateRelativeWorkPath("../etc/passwd"));
         Assert.Throws<MergeConflictResolutionFailedException>(() =>
-            AgenticConflictResolver.ValidateRelativeWorkPath("/etc/passwd"));
+            MergeConflictPathInspector.ValidateRelativeWorkPath("/etc/passwd"));
         Assert.Throws<MergeConflictResolutionFailedException>(() =>
-            AgenticConflictResolver.ValidateRelativeWorkPath("foo\\bar"));
+            MergeConflictPathInspector.ValidateRelativeWorkPath("foo\\bar"));
         // Sane paths pass.
-        AgenticConflictResolver.ValidateRelativeWorkPath("src/a.cs");
+        MergeConflictPathInspector.ValidateRelativeWorkPath("src/a.cs");
+        MergeConflictPathInspector.ValidateRelativeWorkPath("src/`inject`.cs");
+    }
+
+    [Theory]
+    [InlineData("src/a\nb.cs")]
+    [InlineData("src/a\rb.cs")]
+    [InlineData("src/a\tb.cs")]
+    [InlineData("src/a\u001bb.cs")]
+    [InlineData("src/a\u007fb.cs")]
+    public void ValidateRelativeWorkPath_RejectsControlCharacters(string path)
+    {
+        Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ValidateRelativeWorkPath(path));
+    }
+
+    [Theory]
+    [InlineData(":(glob)*.cs")]
+    [InlineData(":foo")]
+    [InlineData(":/src/a.cs")]
+    [InlineData(":!*.cs")]
+    [InlineData(":^*.cs")]
+    public void ValidateRelativeWorkPath_RejectsGitPathspecMagicPrefixes(string path)
+    {
+        Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ValidateRelativeWorkPath(path));
+    }
+
+    [Fact]
+    public void ValidateRelativeWorkPath_EncodesControlCharactersInErrorMessage()
+    {
+        var ex = Assert.Throws<MergeConflictResolutionFailedException>(() =>
+            MergeConflictPathInspector.ValidateRelativeWorkPath("src/a\nb.cs"));
+
+        Assert.Contains(@"src/a\u000Ab.cs", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", ex.Message, StringComparison.Ordinal);
     }
 
     private static string BuildSimpleConflict(string baseLine, string mainLine, string workLine)
@@ -866,6 +1242,30 @@ public sealed class AgenticConflictResolverTests
         return sb.ToString();
     }
 
+    private static string BuildContaminatedLsFilesStdout(string path)
+    {
+        var oid2 = new string('a', 40);
+        return
+            "\x1b[2K\x1b[0A\x1b[0EStarting codeybox-xxxx  <spinner>  " +
+            $"100644 {oid2} 2\t{path}\0";
+    }
+
+    private static async Task Run(ISandbox sandbox, params string[] argv)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = argv });
+        Assert.True(result.Success, $"command failed ({string.Join(' ', argv)}): {result.Stderr}\n{result.Stdout}");
+    }
+
+    private static async Task WriteFileAsync(ISandbox sandbox, string path, string content)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$0\"", path],
+            Stdin = content,
+        });
+        Assert.True(result.Success, $"write failed for {path}: {result.Stderr}");
+    }
+
     private static string BuildLargeResolved(string conflictedContent)
     {
         // Replace just the conflict block with a merged line. Everything else
@@ -895,9 +1295,9 @@ public sealed class AgenticConflictResolverTests
     /// <summary>
     /// In-memory sandbox that mocks just enough of git to drive the agentic
     /// resolver. Tracks per-path file contents and "unmerged" state; intercepts
-    /// the git invocations the resolver issues (<c>diff --diff-filter=U</c>,
-    /// <c>grep</c>, <c>add</c>) and forwards everything else to a registered
-    /// command map or a permissive default.
+    /// the git invocations the resolver issues (<c>ls-files -u</c>,
+    /// <c>diff --diff-filter=U</c>, <c>grep</c>, <c>add</c>) and forwards
+    /// everything else to a registered command map or a permissive default.
     /// </summary>
     internal sealed class ConflictSandbox : ISandbox
     {
@@ -911,7 +1311,12 @@ public sealed class AgenticConflictResolverTests
         // Per-call response overrides. Null entry = use default behaviour for
         // that call; concrete entry overrides it. Empty queue = always default.
         public Queue<SandboxExecResult?> DiffResponseQueue { get; } = new();
+        public Queue<SandboxExecResult?> LsFilesResponseQueue { get; } = new();
         public Queue<SandboxExecResult?> GrepResponseQueue { get; } = new();
+        public int AddCallCount { get; private set; }
+        public int DiffCallCount { get; private set; }
+        public int GrepCallCount { get; private set; }
+        public int LsFilesCallCount { get; private set; }
 
         public void AddConflictedFile(string relativePath, string content)
         {
@@ -946,9 +1351,28 @@ public sealed class AgenticConflictResolverTests
         {
             var argv = exec.Argv;
             if (argv.Count >= 5
+                && argv[0] == "git" && argv[1] == "-C" && argv[3] == "ls-files"
+                && argv.Contains("-u"))
+            {
+                LsFilesCallCount++;
+                if (!argv.Contains("-z"))
+                    return Task.FromResult(new SandboxExecResult(
+                        129,
+                        "",
+                        "test fake requires git ls-files -u -z so unmerged paths are NUL-delimited"));
+
+                if (LsFilesResponseQueue.TryDequeue(out var queued) && queued is not null)
+                    return Task.FromResult(queued);
+
+                var listed = BuildLsFilesUnmergedOutput(_unmerged.Order(StringComparer.Ordinal));
+                return Task.FromResult(new SandboxExecResult(0, listed, ""));
+            }
+
+            if (argv.Count >= 5
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "diff"
                 && argv.Contains("--diff-filter=U"))
             {
+                DiffCallCount++;
                 if (DiffResponseQueue.TryDequeue(out var queued) && queued is not null)
                     return Task.FromResult(queued);
                 var listed = string.Join('\n', _unmerged.Order(StringComparer.Ordinal));
@@ -958,6 +1382,7 @@ public sealed class AgenticConflictResolverTests
             if (argv.Count >= 4
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "grep")
             {
+                GrepCallCount++;
                 if (GrepResponseQueue.TryDequeue(out var queued) && queued is not null)
                     return Task.FromResult(queued);
                 var sepIdx = -1;
@@ -983,6 +1408,7 @@ public sealed class AgenticConflictResolverTests
             if (argv.Count >= 5
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "add" && argv[4] == "--")
             {
+                AddCallCount++;
                 for (var i = 5; i < argv.Count; i++)
                     GitAdd(argv[i]);
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -996,6 +1422,15 @@ public sealed class AgenticConflictResolverTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private static string BuildLsFilesUnmergedOutput(IEnumerable<string> paths)
+        {
+            var sb = new StringBuilder();
+            var oid = new string('a', 40);
+            foreach (var path in paths)
+                sb.Append("100644 ").Append(oid).Append(" 2\t").Append(path).Append('\0');
+            return sb.ToString();
+        }
 
         private static bool ContainsMarkers(string content)
         {

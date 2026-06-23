@@ -18,6 +18,16 @@ using CodeyBox.Agents.Claude.AcpBridge;
 namespace CodeyBox.Tests;
 
 /// <summary>
+/// ACP bridge fixtures redirect a process-wide static emitter and install
+/// process-wide bridge hooks, so they must not overlap with the parallel
+/// suite.
+/// </summary>
+[CollectionDefinition("ACP bridge", DisableParallelization = true)]
+public sealed class AcpBridgeCollection
+{
+}
+
+/// <summary>
 /// Direct unit tests for the in-sandbox C# bridge. Production tests in
 /// <see cref="ClaudeAcpTransportTests"/> exercise the bridge end-to-end via a
 /// <c>BridgeSandbox</c> fake that synthesises bridge stdout, which means a
@@ -34,6 +44,7 @@ namespace CodeyBox.Tests;
 ///
 /// surfaces here rather than via mysterious turn failures in production.
 /// </summary>
+[Collection("ACP bridge")]
 [SupportedOSPlatform("linux")]
 [Collection("Process environment")]
 public sealed class AcpBridgeUnitTests

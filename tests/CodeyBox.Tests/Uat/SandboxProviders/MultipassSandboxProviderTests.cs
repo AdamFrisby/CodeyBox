@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -1161,6 +1163,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void BuildDetachedLaunchScript_DefaultMarkerWaitSecondsIsThirty()
+    {
+        var script = MultipassSandbox.BuildDetachedLaunchScript(
+            "/home/ubuntu/.codeybox-exec-env/env",
+            "/home/ubuntu/.codeybox-exec/detached.pgid",
+            null,
+            ["/bin/sh", "-c", "printf should-run"]);
+
+        Assert.Contains("codeybox_marker_wait_seconds=30\n", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void BuildDetachedLaunchScript_RejectsNegativeLaunchLockAttempts()
     {
         var ex = Assert.Throws<ArgumentOutOfRangeException>(() => MultipassSandbox.BuildDetachedLaunchScript(
@@ -1171,6 +1185,19 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             launchLockAttempts: -1));
 
         Assert.Equal("launchLockAttempts", ex.ParamName);
+    }
+
+    [Fact]
+    public void BuildDetachedLaunchScript_RejectsNonPositiveMarkerWaitSeconds()
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => MultipassSandbox.BuildDetachedLaunchScript(
+            "/home/ubuntu/.codeybox-exec-env/env",
+            "/home/ubuntu/.codeybox-exec/detached.pgid",
+            null,
+            ["/bin/sh", "-c", "printf should-not-run"],
+            markerWaitSeconds: 0));
+
+        Assert.Equal("markerWaitSeconds", ex.ParamName);
     }
 
     [Fact]
@@ -1280,6 +1307,112 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.True(File.Exists(processGroupMarker));
         await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
         await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_PreflightRejectsListenerWithoutReadyProtocol()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var acceptCts = new CancellationTokenSource();
+        var acceptTask = Task.Run(async () =>
+        {
+            try
+            {
+                using var client = await listener.AcceptTcpClientAsync(acceptCts.Token);
+                await Task.Delay(TimeSpan.FromSeconds(10), acceptCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var envFile = Path.Combine(_workspace, "detached-slow-ready.env");
+        var commandScript = Path.Combine(_workspace, "detached-slow-ready-command.sh");
+        var launchScript = Path.Combine(_workspace, "detached-slow-ready-launch.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-slow-ready.pgid");
+        var doneFile = Path.Combine(_workspace, "detached-slow-ready.done");
+        await File.WriteAllTextAsync(
+            envFile,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] =
+                    $"http://127.0.0.1:{port}/codeybox-agent-output",
+                [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "stream-token",
+                [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "slow-ready",
+            }));
+        await File.WriteAllTextAsync(commandScript, "printf done > \"$1\"\n");
+        File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var sw = Stopwatch.StartNew();
+            var (exit, _, stderr) = await RunLocalProcessAsync(
+                "/bin/bash",
+                [launchScript],
+                timeout.Token,
+                environmentOverrides: FakeSudoPathEnvironment());
+            sw.Stop();
+
+            Assert.Equal(86, exit);
+            Assert.Contains("agent output HTTP ingest unavailable before launch", stderr, StringComparison.Ordinal);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"detached launch waited too long for HTTP readiness for {sw.Elapsed}");
+            Assert.False(File.Exists(doneFile));
+            Assert.False(File.Exists(processGroupMarker));
+        }
+        finally
+        {
+            acceptCts.Cancel();
+            listener.Stop();
+            await acceptTask;
+        }
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_PreflightRejectsMalformedHttpIngestUrlBeforeLaunch()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-malformed-ready.env");
+        var commandScript = Path.Combine(_workspace, "detached-malformed-ready-command.sh");
+        var launchScript = Path.Combine(_workspace, "detached-malformed-ready-launch.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-malformed-ready.pgid");
+        var doneFile = Path.Combine(_workspace, "detached-malformed-ready.done");
+        await File.WriteAllTextAsync(
+            envFile,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = "http://",
+                [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "stream-token",
+                [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "malformed-ready",
+            }));
+        await File.WriteAllTextAsync(commandScript, "printf done > \"$1\"\n");
+        File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var (exit, stdout, stderr) = await RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            environmentOverrides: FakeSudoPathEnvironment());
+
+        Assert.Equal(86, exit);
+        Assert.Equal("", stdout);
+        Assert.Contains("agent output HTTP ingest unavailable before launch", stderr, StringComparison.Ordinal);
+        Assert.False(File.Exists(doneFile));
+        Assert.False(File.Exists(processGroupMarker));
     }
 
     [Fact]
@@ -1608,7 +1741,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", "-c", "printf should-not-run"]));
+                ["/bin/sh", "-c", "printf should-not-run"],
+                markerWaitSeconds: 5));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin(
@@ -1663,7 +1797,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", "-c", "printf should-not-run"]));
+                ["/bin/sh", "-c", "printf should-not-run"],
+                markerWaitSeconds: 5));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin($$"""

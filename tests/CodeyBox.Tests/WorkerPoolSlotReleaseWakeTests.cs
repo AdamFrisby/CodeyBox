@@ -117,6 +117,52 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task DispatchWake_RefillsAllOpenSlotsFromReadyBacklogWithoutPerItemSignals()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 3 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var readyBacklog = new[]
+        {
+            MakeItem(createdAt: now),
+            MakeItem(createdAt: now.AddMilliseconds(1)),
+            MakeItem(createdAt: now.AddMilliseconds(2)),
+        };
+
+        foreach (var item in readyBacklog)
+            await _store.CreateAsync(item);
+
+        await queue.EnqueueDispatchWakeAsync();
+
+        foreach (var item in readyBacklog)
+        {
+            Assert.True(
+                await pipeline.WaitForEnteredAsync(item.Id, DispatchWaitTimeout),
+                "One dispatch wake should keep refilling while free slots and ready backlog remain.");
+            Assert.Equal(0, queue.EnqueueCount(item.Id));
+        }
+
+        Assert.Equal(1, queue.GenericWakeEnqueueCount);
+        Assert.Equal(1, queue.TotalEnqueueCount);
+
+        foreach (var item in readyBacklog)
+            pipeline.Release(item.Id);
+        foreach (var item in readyBacklog)
+            Assert.True(await pipeline.WaitForDoneAsync(item.Id, DispatchWaitTimeout));
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task SlotReleaseWake_DoesNotClearDeferredBacklogItem()
     {
         var queue = new ObservedTaskQueue();
