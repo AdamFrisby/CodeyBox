@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using CodeyBox.Core;
 
 namespace CodeyBox.Deployment;
@@ -16,7 +17,12 @@ public sealed class DeploymentDriverRegistry : IDeploymentDriverRegistry
     public DeploymentDriverRegistry(IEnumerable<IDeploymentDriver> drivers)
     {
         ArgumentNullException.ThrowIfNull(drivers);
-        _byKind = new Dictionary<string, IDeploymentDriver>(StringComparer.Ordinal);
+        // OrdinalIgnoreCase mirrors the case-insensitive JSON config binder so
+        // recipe authors who write "Kind": "Web-App" or "WebApp" still resolve
+        // to the canonical driver Kind. The driver's own Kind string is the
+        // dictionary key, so duplicate-Kind detection treats case-equivalent
+        // strings as duplicates.
+        _byKind = new Dictionary<string, IDeploymentDriver>(StringComparer.OrdinalIgnoreCase);
         foreach (var driver in drivers)
         {
             if (driver is null)
@@ -30,15 +36,15 @@ public sealed class DeploymentDriverRegistry : IDeploymentDriverRegistry
         }
     }
 
-    public bool TryGet(string kind, out IDeploymentDriver driver)
+    public bool TryGet(string kind, [MaybeNullWhen(false)] out IDeploymentDriver driver)
     {
         if (string.IsNullOrWhiteSpace(kind))
         {
-            driver = null!;
+            driver = null;
             return false;
         }
-        return _byKind.TryGetValue(kind, out driver!);
+        return _byKind.TryGetValue(kind, out driver);
     }
 
-    public IReadOnlyCollection<string> AvailableKinds => _byKind.Keys;
+    public IReadOnlyCollection<string> AvailableKinds => _byKind.Keys.ToArray();
 }

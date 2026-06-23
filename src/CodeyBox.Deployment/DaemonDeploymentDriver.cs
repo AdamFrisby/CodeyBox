@@ -34,10 +34,16 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         base.ValidateRecipe(recipe);
         if (string.IsNullOrWhiteSpace(recipe.RunCommand))
             throw new ArgumentException("DeploymentRecipe.RunCommand is required for kind 'daemon'.", nameof(recipe));
-        if (!recipe.Settings.ContainsKey(SettingsKeyLivenessCommand)
-            && recipe.Ports.Count == 0)
+        // Validate with the same predicate the probe uses (IsNullOrWhiteSpace
+        // rather than ContainsKey) so a recipe with Settings['liveness-command']=''
+        // is caught here instead of throwing IndexOutOfRangeException from
+        // recipe.Ports[0] inside the probe.
+        var hasLivenessCommand =
+            recipe.Settings.TryGetValue(SettingsKeyLivenessCommand, out var explicitCmd)
+            && !string.IsNullOrWhiteSpace(explicitCmd);
+        if (!hasLivenessCommand && recipe.Ports.Count == 0)
             throw new ArgumentException(
-                "DeploymentRecipe needs either Settings['liveness-command'] or at least one Port for kind 'daemon'.",
+                "DeploymentRecipe needs either a non-empty Settings['liveness-command'] or at least one Port for kind 'daemon'.",
                 nameof(recipe));
     }
 
@@ -64,19 +70,21 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         DeploymentContext context,
         CancellationToken ct)
     {
-        string probeCommand;
+        string[] probeArgv;
         if (recipe.Settings.TryGetValue(SettingsKeyLivenessCommand, out var explicitCmd)
             && !string.IsNullOrWhiteSpace(explicitCmd))
         {
-            probeCommand = explicitCmd;
+            probeArgv = ["sh", "-c", explicitCmd];
         }
         else
         {
-            // Port-only recipe: probe the first port with /dev/tcp inside a
-            // POSIX shell — portable across busybox / bash sandboxes without
-            // requiring nc.
+            // /dev/tcp is a BASH builtin — it is not in POSIX, dash (Ubuntu's
+            // default /bin/sh) and busybox sh do NOT implement it. Invoke
+            // bash explicitly so the redirection actually works on minimal
+            // sandbox images; recipes that want a different probe shape can
+            // override via SettingsKeyLivenessCommand.
             var port = recipe.Ports[0];
-            probeCommand = $"sh -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' 2>/dev/null";
+            probeArgv = ["bash", "-c", $"exec 3<>/dev/tcp/127.0.0.1/{port}"];
         }
 
         var interval = TimeSpan.FromSeconds(1);
@@ -92,13 +100,13 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
             ct.ThrowIfCancellationRequested();
             var result = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["sh", "-c", probeCommand],
+                Argv = probeArgv,
                 WorkingDirectory = context.WorkingDirectory,
+                ExtraEnvironment = recipe.Environment,
             }, ct).ConfigureAwait(false);
             if (result.Success)
                 return;
-            try { await Task.Delay(interval, ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) { throw; }
+            await Task.Delay(interval, ct).ConfigureAwait(false);
         }
     }
 

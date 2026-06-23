@@ -2180,7 +2180,8 @@ builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
     sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>(),
     sp.GetRequiredService<ILogger<ProjectRepository>>(),
     sp.GetService<PresetCatalogOptions>(),
-    sp.GetRequiredService<IKnobRegistry>()));
+    sp.GetRequiredService<IKnobRegistry>(),
+    sp.GetService<IDeploymentDriverRegistry>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(_ =>
 {
@@ -3571,11 +3572,30 @@ builder.Services.AddSingleton<IDeploymentManager>(sp => new DeploymentManager(
 builder.Services.AddSingleton<DeploymentLeakReaper>(sp =>
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    // The work-item store holds the authoritative SuspendedVmName index — every
+    // VM the startup resume handler is going to multipass-start back to Running
+    // after an orchestrator restart. Without this filter, the deployment reaper
+    // would purge those VMs at LeakAgeThreshold even though SandboxLeakReaper
+    // explicitly preserves them via the same index.
+    var store = sp.GetRequiredService<IWorkItemStore>();
+    Func<CancellationToken, Task<IReadOnlySet<string>>> suspendedNames = async ct =>
+    {
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var item in store.ListSuspendedAsync(ct).ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
+            if (WorkItemDependencies.TerminalStates.Contains(item.State)) continue;
+            set.Add(item.SuspendedVmName!);
+        }
+        return set;
+    };
     return new DeploymentLeakReaper(
         sp.GetRequiredService<ISandboxProvider>(),
         sp.GetRequiredService<IDeploymentManager>(),
         () => monitor.CurrentValue.DeploymentLeak,
-        sp.GetRequiredService<ILogger<DeploymentLeakReaper>>());
+        sp.GetRequiredService<ILogger<DeploymentLeakReaper>>(),
+        clock: null,
+        suspendedNameProvider: suspendedNames);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeploymentLeakReaper>());
 

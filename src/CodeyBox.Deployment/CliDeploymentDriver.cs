@@ -9,6 +9,11 @@ namespace CodeyBox.Deployment;
 /// readiness command (defaults to <c>&lt;artifact-path&gt; --version</c>).
 /// "Expose" returns the in-substrate binary path so callers can invoke the
 /// tool through the same sandbox handle.
+///
+/// <para>The default invocation runs the artifact path through
+/// <see cref="Shell.Quote"/>; recipes that override via
+/// <see cref="SettingsKeyInvocationCommand"/> own quoting in their template
+/// (the <c>{artifact}</c> placeholder substitutes a single-quoted form).</para>
 /// </summary>
 public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
 {
@@ -32,10 +37,14 @@ public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
         DeploymentContext context,
         CancellationToken ct)
     {
+        // {artifact} substitutes a shell-quoted artifact path so a recipe-author
+        // template like `{artifact} --selftest` survives whitespace / quote
+        // metacharacters; the default template applies Shell.Quote directly.
+        var quotedArtifact = Shell.Quote(recipe.ArtifactPath!);
         var invocation = recipe.Settings.TryGetValue(SettingsKeyInvocationCommand, out var c)
             && !string.IsNullOrWhiteSpace(c)
-                ? c.Replace("{artifact}", recipe.ArtifactPath!, StringComparison.Ordinal)
-                : $"{Shell.Quote(recipe.ArtifactPath!)} --version";
+                ? c.Replace("{artifact}", quotedArtifact, StringComparison.Ordinal)
+                : $"{quotedArtifact} --version";
 
         var result = await sandbox.ExecAsync(new SandboxExec
         {
@@ -63,9 +72,9 @@ public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
 internal static class Shell
 {
     /// <summary>Single-quote a path so it survives sh -c. Quotes are escaped via the standard '\'' dance.</summary>
-    public static string Quote(string value)
+    public static string Quote(string? value)
     {
-        if (value is null)
+        if (string.IsNullOrEmpty(value))
             return "''";
         var escaped = value.Replace("'", "'\\''", StringComparison.Ordinal);
         return $"'{escaped}'";

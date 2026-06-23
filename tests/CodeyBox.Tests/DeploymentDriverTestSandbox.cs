@@ -13,6 +13,7 @@ namespace CodeyBox.Tests;
 internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
 {
     private readonly List<FakeDeploymentSandbox> _created = new();
+    private readonly List<SandboxSpec> _specs = new();
     private readonly ConcurrentDictionary<string, byte> _disposedNames = new(StringComparer.Ordinal);
     private bool _createThrows;
 
@@ -23,6 +24,12 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
         get { lock (_created) return _created.ToList(); }
     }
 
+    /// <summary>Every <see cref="SandboxSpec"/> CreateAsync received, in order.</summary>
+    public IReadOnlyList<SandboxSpec> Specs
+    {
+        get { lock (_specs) return _specs.ToList(); }
+    }
+
     public IReadOnlyCollection<string> DisposedNames => _disposedNames.Keys.ToList();
 
     /// <summary>Stable ordered list of every exec invocation across all created sandboxes.</summary>
@@ -31,12 +38,21 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
     /// <summary>Script of (commandPattern → result). First match wins.</summary>
     public List<ExecRule> ExecRules { get; } = new();
 
+    /// <summary>
+    /// Optional override for the synthetic <see cref="ManagedSandboxInfo"/>
+    /// returned by <see cref="ListAllManagedAsync"/>. Set by leak-reaper tests
+    /// that need to model HasPreemptMarker / IsSuspendLifecycleOrFrozen
+    /// preserve-grace shapes without spinning a real provider.
+    /// </summary>
+    public Func<FakeDeploymentSandbox, ManagedSandboxInfo>? ManagedInfoOverride { get; set; }
+
     public void SetCreateThrows() => _createThrows = true;
 
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         if (_createThrows)
             throw new InvalidOperationException("Simulated provisioning failure.");
+        lock (_specs) _specs.Add(spec);
         var sb = new FakeDeploymentSandbox(this);
         lock (_created) _created.Add(sb);
         return Task.FromResult<ISandbox>(sb);
@@ -48,11 +64,13 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
         lock (_created)
         {
             snapshot = _created
-                .Select(sb => new ManagedSandboxInfo(
-                    sb.Id,
-                    sb.CreatedAt,
-                    DiskBytes: null,
-                    IsTrackedActive: !sb.IsDisposed))
+                .Select(sb => ManagedInfoOverride is { } ov
+                    ? ov(sb)
+                    : new ManagedSandboxInfo(
+                        sb.Id,
+                        sb.CreatedAt,
+                        DiskBytes: null,
+                        IsTrackedActive: !sb.IsDisposed))
                 .ToList();
         }
         return Task.FromResult(snapshot);

@@ -93,6 +93,71 @@ public sealed class DeploymentRecipeBinderTests
         Assert.Equal(TimeSpan.FromMinutes(60), recipe.MaxLifetime);
     }
 
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(0.0)]
+    [InlineData(-1.0)]
+    public void ToRecipe_BadStartupTimeoutSeconds_FallsBackToDefault(double bad)
+    {
+        var cfg = new DeploymentRecipeConfig
+        {
+            Kind = "cli",
+            ImageReference = "x",
+            ArtifactPath = "/y",
+            StartupTimeoutSeconds = bad,
+        };
+        var recipe = DeploymentRecipeBinder.ToRecipe(cfg)!;
+        Assert.Equal(TimeSpan.FromMinutes(5), recipe.StartupTimeout);
+    }
+
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(0.0)]
+    [InlineData(-1.0)]
+    public void ToRecipe_BadMaxLifetimeMinutes_FallsBackToDefault(double bad)
+    {
+        var cfg = new DeploymentRecipeConfig
+        {
+            Kind = "cli",
+            ImageReference = "x",
+            ArtifactPath = "/y",
+            MaxLifetimeMinutes = bad,
+        };
+        var recipe = DeploymentRecipeBinder.ToRecipe(cfg)!;
+        Assert.Equal(TimeSpan.FromMinutes(60), recipe.MaxLifetime);
+    }
+
+    [Fact]
+    public void ToRecipe_ServiceMissingName_Throws()
+    {
+        var cfg = new DeploymentRecipeConfig
+        {
+            Kind = "web-app",
+            ImageReference = "x",
+            Services = new List<DeploymentServiceConfig>
+            {
+                new() { ImageReference = "postgres:16" /* Name missing */ },
+            },
+        };
+        Assert.Throws<InvalidOperationException>(() => DeploymentRecipeBinder.ToRecipe(cfg));
+    }
+
+    [Fact]
+    public void ToRecipe_ServiceMissingImageReference_Throws()
+    {
+        var cfg = new DeploymentRecipeConfig
+        {
+            Kind = "web-app",
+            ImageReference = "x",
+            Services = new List<DeploymentServiceConfig>
+            {
+                new() { Name = "db" /* ImageReference missing */ },
+            },
+        };
+        Assert.Throws<InvalidOperationException>(() => DeploymentRecipeBinder.ToRecipe(cfg));
+    }
+
     [Fact]
     public void ToRecipe_BindsFromConfigurationBuilder()
     {

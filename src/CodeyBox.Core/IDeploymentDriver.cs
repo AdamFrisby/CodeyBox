@@ -43,11 +43,13 @@ public interface IDeploymentDriver
     string Kind { get; }
 
     /// <summary>
-    /// Validate the recipe shape this driver understands. Called once per
-    /// recipe load (startup + every <see cref="Microsoft.Extensions.Options.IOptionsMonitor{T}"/>
-    /// reload of project config) so misconfigurations surface at parse time
-    /// rather than mid-pipeline. Throws an exception describing the offending
-    /// field on failure; returns silently on success.
+    /// Validate the recipe shape this driver understands. Invoked at recipe
+    /// load (project config bind + every <see cref="Microsoft.Extensions.Options.IOptionsMonitor{T}"/>
+    /// reload, when a deployment-driver registry is composed into the project
+    /// repository) so misconfigurations surface at parse time, and again from
+    /// <see cref="IDeploymentManager.StartAsync"/> as a defence in depth for
+    /// hand-built recipes that bypass the binder. Throws an exception
+    /// describing the offending field on failure; returns silently on success.
     /// </summary>
     void ValidateRecipe(DeploymentRecipe recipe);
 
@@ -152,9 +154,11 @@ public sealed record DeploymentRecipe
     public IReadOnlyList<int> Ports { get; init; } = [];
 
     /// <summary>
-    /// HTTP(S) path the readiness probe hits when the kind is web. Null
-    /// for non-HTTP kinds; drivers MUST treat null as "no HTTP probe" and
-    /// fall back to a driver-appropriate readiness check.
+    /// HTTP(S) path the readiness probe hits when the kind is web. Required
+    /// for the <c>web-app</c> kind (the only HTTP driver shipped today);
+    /// other drivers treat null as "no HTTP probe" and fall back to a
+    /// driver-appropriate readiness check (process liveness, port check,
+    /// invocation success).
     /// </summary>
     public string? HealthEndpoint { get; init; }
 
@@ -167,11 +171,15 @@ public sealed record DeploymentRecipe
     public TimeSpan StartupTimeout { get; init; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// Hard ceiling on how long an exposed deployment may live before
-    /// auto-teardown. Defaults to 60 minutes — long enough for a thorough
+    /// Operator-declared hint for how long an exposed deployment is expected
+    /// to live before the orchestrator should consider its lifetime
+    /// unreasonable. Defaults to 60 minutes — long enough for a thorough
     /// audit, short enough that a forgotten deployment doesn't squat on
-    /// the host overnight. The leak reaper uses this as the floor for
-    /// orphan detection so a healthy long-running probe doesn't get reaped.
+    /// the host overnight. Not yet enforced by an auto-teardown timer; the
+    /// pipeline integration in link 2 is expected to consume this hint to
+    /// schedule the dispose / extend the leak-reaper grace per-recipe.
+    /// Today the leak reaper only consults its own
+    /// <c>DeploymentLeakOptions.LeakAgeThreshold</c>.
     /// </summary>
     public TimeSpan MaxLifetime { get; init; } = TimeSpan.FromMinutes(60);
 
@@ -324,7 +332,7 @@ public enum DeploymentEndpointKind
 /// </summary>
 public interface IDeploymentDriverRegistry
 {
-    bool TryGet(string kind, out IDeploymentDriver driver);
+    bool TryGet(string kind, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out IDeploymentDriver driver);
     IReadOnlyCollection<string> AvailableKinds { get; }
 }
 

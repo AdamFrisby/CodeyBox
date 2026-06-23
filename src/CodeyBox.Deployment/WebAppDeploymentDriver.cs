@@ -72,9 +72,15 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         var path = recipe.HealthEndpoint!.StartsWith('/') ? recipe.HealthEndpoint! : "/" + recipe.HealthEndpoint;
         var probeUrl = $"{scheme}://127.0.0.1:{port}{path}";
 
+        // Shell-quote the probe URL so a recipe with a single quote (or other
+        // shell metacharacter) in the HealthEndpoint cannot break out of the
+        // curl argument. The override template owns its own quoting; the
+        // {url} substitution feeds a single-quoted form into operator
+        // templates that include the placeholder verbatim.
+        var quotedProbeUrl = Shell.Quote(probeUrl);
         var probeCommand = recipe.Settings.TryGetValue(SettingsKeyHealthProbeCommand, out var p) && !string.IsNullOrWhiteSpace(p)
-            ? p.Replace("{url}", probeUrl, StringComparison.Ordinal)
-            : $"curl -fsS -o /dev/null --max-time 5 '{probeUrl}'";
+            ? p.Replace("{url}", quotedProbeUrl, StringComparison.Ordinal)
+            : $"curl -fsS -o /dev/null --max-time 5 {quotedProbeUrl}";
 
         var interval = TimeSpan.FromSeconds(1);
         if (recipe.Settings.TryGetValue(SettingsKeyProbeIntervalSeconds, out var iv)
@@ -91,11 +97,11 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
             {
                 Argv = ["sh", "-c", probeCommand],
                 WorkingDirectory = context.WorkingDirectory,
+                ExtraEnvironment = recipe.Environment,
             }, ct).ConfigureAwait(false);
             if (result.Success)
                 return;
-            try { await Task.Delay(interval, ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) { throw; }
+            await Task.Delay(interval, ct).ConfigureAwait(false);
         }
     }
 
@@ -112,10 +118,14 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
             Url = url,
             Host = "127.0.0.1",
             Port = port,
-            Path = recipe.HealthEndpoint,
+            // DeploymentEndpoint.Path is documented as a file-path slot for
+            // artifact-bearing kinds. For HTTP deployments the health-probe
+            // URL path is surfaced via Metadata instead so the file-path
+            // semantic stays intact.
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["sandbox.id"] = sandbox.Id,
+                ["http.health-path"] = recipe.HealthEndpoint!,
             },
         };
     }

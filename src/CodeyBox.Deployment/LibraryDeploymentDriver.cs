@@ -11,9 +11,10 @@ namespace CodeyBox.Deployment;
 /// inspect it.
 ///
 /// <para>The harness invocation comes from the recipe's
-/// <see cref="SettingsKeyHarnessCommand"/> setting. Without one the driver
-/// re-runs the build command as the readiness check, which is sufficient
-/// for "compiles cleanly" but does not exercise consumer-side restore.</para>
+/// <see cref="SettingsKeyHarnessCommand"/> setting. Without one the
+/// readiness check is a no-op: a successful build IS the deployment, and
+/// no consumer-side restore is exercised. Recipes that want to verify
+/// downstream restore must declare a harness command.</para>
 /// </summary>
 public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
 {
@@ -37,8 +38,13 @@ public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
         DeploymentContext context,
         CancellationToken ct)
     {
+        // {artifact} substitutes a shell-quoted form so a harness template
+        // like `nuget restore {artifact}` survives spaces / quote characters
+        // in the produced package path. Recipes that need the unquoted form
+        // can read ArtifactPath through Environment.
+        var quotedArtifact = Shell.Quote(recipe.ArtifactPath);
         var harness = recipe.Settings.TryGetValue(SettingsKeyHarnessCommand, out var h) && !string.IsNullOrWhiteSpace(h)
-            ? h.Replace("{artifact}", recipe.ArtifactPath ?? string.Empty, StringComparison.Ordinal)
+            ? h.Replace("{artifact}", quotedArtifact, StringComparison.Ordinal)
             : null;
         if (harness is null)
             return; // build succeeded; no harness configured.

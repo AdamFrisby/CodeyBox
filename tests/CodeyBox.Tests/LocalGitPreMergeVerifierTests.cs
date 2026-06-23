@@ -299,6 +299,53 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
     /// in an infinite loop would block the orchestrator's auto-merge loop
     /// indefinitely.
     /// </summary>
+    /// <summary>
+    /// Regression: the post-kill stdout drain must be BOUNDED. Process.Kill
+    /// (entireProcessTree: true) on Linux walks /proc and can miss a
+    /// grandchild forked between Start and the enumeration; that surviving
+    /// descendant keeps the stdout pipe open, and a naive `await stdoutTask`
+    /// would block until the grandchild naturally exits. With the 30s sleep
+    /// in the grandchild here, a regression that removed the 2-second grace
+    /// would cause the verifier to take ~30s even though the parent argv's
+    /// own timeout fired in ~500ms.
+    /// </summary>
+    [Fact]
+    public async Task RealVerifier_PostKillStdoutDrain_BoundedByGrace()
+    {
+        var (gitHost, repoId, mergeSha) = await SetupBareRepoWithCommitAsync();
+        var verifier = new LocalGitPreMergeVerifier(
+            gitHost,
+            NullLogger<LocalGitPreMergeVerifier>.Instance,
+            commandTimeout: TimeSpan.FromMilliseconds(500));
+
+        var start = DateTime.UtcNow;
+        var result = await verifier.VerifyAsync(new PreMergeVerifyRequest
+        {
+            WorkItemId = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            RepositoryId = repoId,
+            BaseBranch = "main",
+            WorkBranch = "feature/x",
+            MergeSha = mergeSha,
+            // Fork a grandchild that survives the parent and keeps stdout open
+            // for 30 seconds. The shell uses (cmd &) to detach without
+            // job-control plumbing; the grandchild inherits the parent's
+            // stdout (FD 1) because that's how the shell sets it up before
+            // fork. Then the parent sleeps so it exceeds the 500ms timeout.
+            Argv = ["/bin/sh", "-c", "(sleep 30 &); sleep 30"],
+        }, CancellationToken.None);
+        var elapsed = DateTime.UtcNow - start;
+
+        Assert.False(result.Success);
+        Assert.Equal(PreMergeVerifyFailureMode.BuildOrTestFailed, result.FailureMode);
+        Assert.Contains("124", result.FailureReason);
+        // Without the grace cap the elapsed would be ~30s — sleep duration
+        // of the grandchild holding stdout. With the grace cap it should be
+        // ~500ms (timeout) + ~2s (drain grace) + checkout overhead.
+        Assert.True(elapsed < TimeSpan.FromSeconds(15),
+            $"Verifier took {elapsed.TotalSeconds:0}s — post-kill drain grace did not fire");
+    }
+
     [Fact]
     public async Task RealVerifier_ArgvExceedsTimeout_ReportsTimeoutFailure()
     {

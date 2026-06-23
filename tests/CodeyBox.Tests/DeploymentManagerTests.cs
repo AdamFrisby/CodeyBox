@@ -63,8 +63,17 @@ public sealed class DeploymentManagerTests
     public void Registry_NullDriver_IsSkipped()
     {
         var driver = new LibraryDeploymentDriver();
-        var registry = new DeploymentDriverRegistry(new IDeploymentDriver?[] { driver, null! }.Where(_ => true).Cast<IDeploymentDriver>());
+        var registry = new DeploymentDriverRegistry(new IDeploymentDriver[] { driver, null! });
         Assert.True(registry.TryGet(DeploymentKinds.Library, out var resolved));
+        Assert.Same(driver, resolved);
+    }
+
+    [Fact]
+    public void Registry_TryGet_CaseInsensitiveLookup()
+    {
+        var driver = new WebAppDeploymentDriver();
+        var registry = new DeploymentDriverRegistry([driver]);
+        Assert.True(registry.TryGet("WEB-APP", out var resolved));
         Assert.Same(driver, resolved);
     }
 }

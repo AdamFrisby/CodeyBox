@@ -49,8 +49,8 @@ public static class DeploymentRecipeBinder
             Services = services,
             Ports = ports,
             HealthEndpoint = cfg.HealthEndpoint,
-            StartupTimeout = ResolveTimeout(cfg.StartupTimeoutSeconds, TimeSpan.FromMinutes(5)),
-            MaxLifetime = ResolveTimeout(cfg.MaxLifetimeMinutes is null ? null : cfg.MaxLifetimeMinutes * 60.0, TimeSpan.FromMinutes(60)),
+            StartupTimeout = ResolveSecondsTimeout(cfg.StartupTimeoutSeconds, TimeSpan.FromMinutes(5)),
+            MaxLifetime = ResolveMinutesTimeout(cfg.MaxLifetimeMinutes, TimeSpan.FromMinutes(60)),
             NetworkProfile = cfg.NetworkProfile,
             Settings = settings,
         };
@@ -63,12 +63,20 @@ public static class DeploymentRecipeBinder
         return new Dictionary<string, string>(src, StringComparer.Ordinal);
     }
 
-    private static TimeSpan ResolveTimeout(double? seconds, TimeSpan fallback)
+    private static TimeSpan ResolveSecondsTimeout(double? seconds, TimeSpan fallback)
     {
         if (!seconds.HasValue) return fallback;
         if (double.IsNaN(seconds.Value) || double.IsInfinity(seconds.Value) || seconds.Value <= 0)
             return fallback;
         return TimeSpan.FromSeconds(seconds.Value);
+    }
+
+    private static TimeSpan ResolveMinutesTimeout(double? minutes, TimeSpan fallback)
+    {
+        if (!minutes.HasValue) return fallback;
+        if (double.IsNaN(minutes.Value) || double.IsInfinity(minutes.Value) || minutes.Value <= 0)
+            return fallback;
+        return TimeSpan.FromMinutes(minutes.Value);
     }
 }
 

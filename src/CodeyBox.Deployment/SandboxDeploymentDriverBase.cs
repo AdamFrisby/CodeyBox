@@ -16,6 +16,14 @@ namespace CodeyBox.Deployment;
 /// </summary>
 public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
 {
+    /// <summary>
+    /// Length of the hex-encoded deployment id derived from <c>Guid.NewGuid().ToString("N")</c>.
+    /// 16 hex chars = 64 bits of identity — collision probability under any realistic
+    /// deployment count is vanishingly small, while staying short enough to read in log
+    /// lines and dashboards.
+    /// </summary>
+    private const int DeploymentIdHexChars = 16;
+
     protected ILogger Log { get; }
     protected Func<DateTimeOffset> Clock { get; }
 
@@ -60,25 +68,32 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             sandbox = await context.SandboxProvider.CreateAsync(spec, ct).ConfigureAwait(false);
 
             await RunBuildAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
-            await StartRuntimeAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
 
-            using (var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            // StartupTimeout bounds StartRuntimeAsync AND ProbeReadyAsync.
+            // RunCommand is "fire and forget" by convention (recipe authors
+            // background the server via nohup/&/exec), but a misconfigured
+            // recipe that forgets to background can otherwise hang the deploy
+            // indefinitely — neither the startup timeout nor the readiness
+            // probe would fire. Wrapping start under the same bound surfaces
+            // the failure as TimeoutException after StartupTimeout.
+            using (var startupCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                probeCts.CancelAfter(recipe.StartupTimeout);
+                startupCts.CancelAfter(recipe.StartupTimeout);
                 try
                 {
-                    await ProbeReadyAsync(sandbox, recipe, context, probeCts.Token).ConfigureAwait(false);
+                    await StartRuntimeAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
+                    await ProbeReadyAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                 {
                     throw new TimeoutException(
-                        $"Deployment kind '{Kind}' failed readiness probe within {recipe.StartupTimeout}. " +
+                        $"Deployment kind '{Kind}' did not become ready within {recipe.StartupTimeout}. " +
                         "Tearing down substrate.");
                 }
             }
 
             var endpoint = BuildEndpoint(sandbox, recipe, context);
-            var id = Guid.NewGuid().ToString("N")[..16];
+            var id = Guid.NewGuid().ToString("N")[..DeploymentIdHexChars];
             // Capture the sandbox reference in a separate local so nulling the
             // outer one (to skip the catch's cleanup-on-failure path) does not
             // also nil out the closure used by the runtime health check.
@@ -88,7 +103,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                 Kind,
                 owned,
                 endpoint,
-                () => RunHealthCheckAsync(owned, recipe, context));
+                runtimeCt => RunHealthCheckAsync(owned, recipe, context, runtimeCt));
             sandbox = null; // ownership transferred
             return handle;
         }
@@ -106,7 +121,9 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     /// <summary>
     /// Builds the substrate SandboxSpec from the recipe. Default merges the
     /// recipe's environment into a sandbox spec keyed off ImageReference and
-    /// NetworkProfile.
+    /// NetworkProfile. <see cref="SandboxNetworkPolicy.Denied"/> is the safe
+    /// default when no profile is configured — deployment substrates are
+    /// network-isolated unless the recipe declares otherwise.
     /// </summary>
     protected virtual SandboxSpec BuildSandboxSpec(DeploymentRecipe recipe, DeploymentContext context) => new()
     {
@@ -163,13 +180,15 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
 
     /// <summary>
     /// Hook for the runtime <see cref="IDeploymentHandle.HealthCheckAsync"/>.
-    /// Default re-runs the readiness probe with no startup deadline.
+    /// Default re-runs the readiness probe with no startup deadline (callers
+    /// supply their own cancellation/timeout).
     /// </summary>
     protected virtual Task RunHealthCheckAsync(
         ISandbox sandbox,
         DeploymentRecipe recipe,
-        DeploymentContext context)
-        => ProbeReadyAsync(sandbox, recipe, context, CancellationToken.None);
+        DeploymentContext context,
+        CancellationToken ct)
+        => ProbeReadyAsync(sandbox, recipe, context, ct);
 
     protected static string Tail(string? text, int maxChars = 256)
     {
@@ -186,7 +205,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
 /// </summary>
 internal sealed class SandboxDeploymentHandle : IDeploymentHandle
 {
-    private readonly Func<Task> _healthCheck;
+    private readonly Func<CancellationToken, Task> _healthCheck;
     private int _disposed;
 
     public SandboxDeploymentHandle(
@@ -194,7 +213,7 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
         string kind,
         ISandbox sandbox,
         DeploymentEndpoint endpoint,
-        Func<Task> healthCheck)
+        Func<CancellationToken, Task> healthCheck)
     {
         Id = id;
         Kind = kind;
@@ -205,7 +224,7 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
 
     public string Id { get; }
     public string Kind { get; }
-    public ISandbox Sandbox { get; }
+    internal ISandbox Sandbox { get; }
     public DeploymentEndpoint Endpoint { get; }
     public bool IsAlive => Volatile.Read(ref _disposed) == 0;
     public string? SandboxId => Sandbox.Id;
@@ -214,7 +233,7 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
     {
         if (!IsAlive)
             throw new ObjectDisposedException(nameof(SandboxDeploymentHandle));
-        return _healthCheck();
+        return _healthCheck(ct);
     }
 
     public async ValueTask DisposeAsync()

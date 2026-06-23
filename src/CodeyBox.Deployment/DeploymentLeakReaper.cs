@@ -16,16 +16,27 @@ namespace CodeyBox.Deployment;
 /// <see cref="IDeploymentHandle.DisposeAsync"/>; this reaper only acts when
 /// the normal path was interrupted before disposal could run.</para>
 ///
-/// <para>Naming criterion: a sandbox is a deployment-leak candidate when its
-/// id is NOT present in the manager's active deployment set AND its
-/// <see cref="ManagedSandboxInfo.CreatedAt"/> indicates it has been around
-/// for at least <see cref="DeploymentLeakOptions.LeakAgeThreshold"/>. This
-/// shares the underlying <see cref="ISandboxProvider.ListAllManagedAsync"/>
-/// surface with <c>SandboxLeakReaper</c>; running both is safe because each
-/// sweep disposes only the sandboxes it identifies as orphans of its own
-/// concern. The two reapers may converge on the same orphan when a deployment
-/// crashed between sandbox creation and the manager's bookkeeping write —
-/// either reaper disposing it is the correct outcome.</para>
+/// <para>The provider's <see cref="ISandboxProvider.ListAllManagedAsync"/>
+/// surface lists EVERY codeybox-* sandbox — work-item phase VMs, suspended
+/// VMs, preempt-marked VMs, and deployment VMs alike — without a kind
+/// discriminator. To avoid destroying VMs the work pipeline intentionally
+/// preserved, this reaper honours the same skip-gates as
+/// <c>SandboxLeakReaper</c>:</para>
+/// <list type="bullet">
+///   <item><b>HasPreemptMarker</b> — graceful-shutdown-preserved VMs are
+///   exempt for <see cref="DeploymentLeakOptions.PreemptRetention"/>
+///   (default 24h).</item>
+///   <item><b>IsSuspendLifecycleOrFrozen</b> — suspended VMs (multipass
+///   <c>Suspending</c>/<c>Suspended</c>) are exempt; they belong to the
+///   Claude session worker's stop/resume contract.</item>
+///   <item>Optional <c>suspendedNameProvider</c> — the composition root
+///   wires this to the work-item store's SuspendedVmName index so the
+///   startup resume handler can multipass-start them back to Running.</item>
+/// </list>
+/// <para>Running both reapers is safe because any sandbox this reaper
+/// disposes is also a SandboxLeakReaper orphan (same preserve gates, same
+/// LeakAgeThreshold floor). The two reapers converge on the same orphans;
+/// either one disposing is the correct outcome.</para>
 /// </summary>
 public sealed class DeploymentLeakReaper : BackgroundService
 {
@@ -34,46 +45,49 @@ public sealed class DeploymentLeakReaper : BackgroundService
     private readonly Func<DeploymentLeakOptions> _optsAccessor;
     private readonly ILogger<DeploymentLeakReaper> _log;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly Func<CancellationToken, Task<IReadOnlySet<string>>>? _suspendedNameProvider;
     private volatile IReadOnlyList<DeploymentLeakInfo> _latestLeaks = [];
-
-    public DeploymentLeakReaper(
-        ISandboxProvider provider,
-        IDeploymentManager manager,
-        DeploymentLeakOptions opts,
-        ILogger<DeploymentLeakReaper> log)
-        : this(provider, manager, () => opts, log, clock: null) { }
 
     public DeploymentLeakReaper(
         ISandboxProvider provider,
         IDeploymentManager manager,
         Func<DeploymentLeakOptions> optionsAccessor,
         ILogger<DeploymentLeakReaper> log,
-        Func<DateTimeOffset>? clock = null)
+        Func<DateTimeOffset>? clock = null,
+        Func<CancellationToken, Task<IReadOnlySet<string>>>? suspendedNameProvider = null)
     {
         _provider = provider ?? throw new ArgumentNullException(nameof(provider));
         _manager = manager ?? throw new ArgumentNullException(nameof(manager));
         _optsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _suspendedNameProvider = suspendedNameProvider;
     }
 
     public IReadOnlyList<DeploymentLeakInfo> GetLatestLeaks() => _latestLeaks;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var opts = _optsAccessor();
-        if (!opts.Enabled)
+        // Cadence is sampled at PeriodicTimer construction (PeriodicTimer cannot
+        // be retuned without reconstruction), but Enabled is re-checked each tick
+        // so an operator hot-flipping Enabled=false stops the sweep at the next
+        // tick rather than the next process restart. Initial Enabled=false still
+        // short-circuits before allocating the timer.
+        var initial = _optsAccessor();
+        if (!initial.Enabled)
         {
-            _log.LogInformation("DeploymentLeakReaper disabled via configuration; skipping");
-            return;
+            _log.LogInformation("DeploymentLeakReaper disabled via configuration; skipping initial sweep");
+            // Fall through to the per-tick loop so a later Enabled=true takes effect.
         }
-        var interval = opts.CheckInterval < TimeSpan.FromMinutes(1)
+        var interval = initial.CheckInterval < TimeSpan.FromMinutes(1)
             ? TimeSpan.FromMinutes(1)
-            : opts.CheckInterval;
+            : initial.CheckInterval;
         using var timer = new PeriodicTimer(interval);
         do
         {
-            await RunSweepAsync(stoppingToken).ConfigureAwait(false);
+            var current = _optsAccessor();
+            if (current.Enabled)
+                await RunSweepAsync(stoppingToken).ConfigureAwait(false);
         }
         while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false));
     }
@@ -88,16 +102,50 @@ public sealed class DeploymentLeakReaper : BackgroundService
             var activeSandboxIds = new HashSet<string>(
                 active.Where(a => a.SandboxId is not null).Select(a => a.SandboxId!),
                 StringComparer.Ordinal);
+            var suspendedNames = _suspendedNameProvider is null
+                ? (IReadOnlySet<string>)new HashSet<string>(StringComparer.Ordinal)
+                : await _suspendedNameProvider(ct).ConfigureAwait(false);
             var now = _clock();
 
             var leaks = new List<DeploymentLeakInfo>();
             foreach (var info in managed)
             {
+                // Tracked-active: the current orchestrator process owns this
+                // sandbox via a live phase or active deployment handle. Never
+                // a leak.
                 if (info.IsTrackedActive) continue;
+
+                // Currently held by a deployment we know about — the manager's
+                // active set is authoritative for the in-process case.
                 if (activeSandboxIds.Contains(info.Name)) continue;
-                var createdAt = info.CreatedAt ?? now - opts.LeakAgeThreshold;
+
+                // Honour the work-item suspend index. The startup resume
+                // handler reattaches these on the next orchestrator start;
+                // purging them mid-restart strands the work item.
+                if (suspendedNames.Contains(info.Name)) continue;
+
+                // A VM in a suspend lifecycle state (freezing/frozen) without
+                // a live mapping belongs to the Claude session worker's
+                // stop/resume contract or is mid-snapshot. SandboxLeakReaper
+                // applies a dedicated SuspendOrphanGrace here; we conservatively
+                // skip them entirely so we never race the sibling reaper's
+                // grace window — if they're true suspend orphans, the sibling
+                // will dispose them under its dedicated gate.
+                if (info.IsSuspendLifecycleOrFrozen) continue;
+
+                // Unknown CreatedAt is conservative: we treat it as "too young
+                // to know" and skip rather than risk reaping a sandbox whose
+                // staging metadata is just temporarily missing.
+                if (info.CreatedAt is not { } createdAt) continue;
                 var age = now - createdAt;
+
+                // Preempt-marked (graceful-shutdown-preserved) VMs are exempt
+                // for the longer PreemptRetention window. Once the operator's
+                // retention window elapses they're treated like any other leak.
+                if (info.HasPreemptMarker && age < opts.PreemptRetention) continue;
+
                 if (age < opts.LeakAgeThreshold) continue;
+
                 leaks.Add(new DeploymentLeakInfo(info.Name, createdAt, age, info.DiskBytes));
             }
             _latestLeaks = leaks;
@@ -151,14 +199,22 @@ public sealed record DeploymentLeakInfo(
 /// </summary>
 public sealed class DeploymentLeakOptions
 {
-    /// <summary>Enable or disable the deployment leak reaper. Default true.</summary>
+    /// <summary>Enable or disable the deployment leak reaper. Default true. Hot-reloadable.</summary>
     public bool Enabled { get; set; } = true;
 
-    /// <summary>How often to run the leak scan. Minimum 1 minute. Default 15 minutes.</summary>
+    /// <summary>How often to run the leak scan. Minimum 1 minute. Default 15 minutes. Startup-only.</summary>
     public TimeSpan CheckInterval { get; set; } = TimeSpan.FromMinutes(15);
 
     /// <summary>Minimum age before a non-active sandbox is declared a deployment leak. Default 30 minutes.</summary>
     public TimeSpan LeakAgeThreshold { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// How long a sandbox with a graceful-shutdown preempt marker is preserved
+    /// before being treated like a regular leak. Default 24 hours — matches
+    /// <c>SandboxLeakOptions.PreemptRetention</c> so the two reapers do not
+    /// disagree about when a preserved VM is fair game.
+    /// </summary>
+    public TimeSpan PreemptRetention { get; set; } = TimeSpan.FromHours(24);
 
     /// <summary>When true, automatically dispose detected orphans. Default true.</summary>
     public bool AutoDispose { get; set; } = true;
