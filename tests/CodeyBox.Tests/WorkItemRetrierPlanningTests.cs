@@ -72,6 +72,35 @@ public sealed class WorkItemRetrierPlanningTests : IDisposable
         Assert.False(read.PreserveWorkBranchOnQueuedPickup);
     }
 
+    [Fact]
+    public async Task RetryManual_FromWork_RequeuesAndClearsApprovedPlan()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.Failed) with
+        {
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewSummary = "approved",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.RetryAsync(item, "work");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal("work", result.ActualFrom);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Queued, read!.State);
+        Assert.Null(read.PlanArtifact);
+        Assert.Null(read.PlanGeneratedAt);
+        Assert.Null(read.PlanReviewedAt);
+        Assert.Null(read.PlanReviewSummary);
+    }
+
     private SqliteWorkItemStore NewStore()
         => new(Path.Combine(_workspace, Guid.NewGuid().ToString("N") + ".db"));
 

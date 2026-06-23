@@ -522,6 +522,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         IAgentRunner runner,
         string repoId,
+        bool useReadOnlyRepositoryAccess,
         CancellationToken ct)
     {
         if (!ShouldEnterClaudeSessionMode(item, project, runner))
@@ -533,7 +534,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // rework turns reuse the same VM via session resume, so the network
         // profile / flavor / baseline pin established here applies to every
         // worker turn for this item.
-        var access = _gitHost.GetSandboxAccess(repoId);
+        var access = useReadOnlyRepositoryAccess
+            ? _gitHost.GetReadOnlySandboxAccess(repoId)
+            : _gitHost.GetSandboxAccess(repoId);
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
         var selectedMember = TryResolveSelectedMember(runner.Kind, project, item);
         var openedRouteKey = selectedMember?.RouteKey ?? CanonicalAgentRouteKey(runner.Kind, item.AgentInstanceId);
@@ -548,7 +551,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             allowAgentNetwork: true,
             hostNetworkProfile: sandboxTarget.NetworkProfile,
             timingWorkItemId: item.Id,
-            timingPhase: "work",
+            timingPhase: useReadOnlyRepositoryAccess ? "planning" : "work",
             flavor: sandboxTarget.Flavor,
             extraEnvironment: null,
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
@@ -1119,9 +1122,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             && !sessionLifecycle.IsClosed
             && runner.Kind == AgentKind.Claude
             && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
-        var access = useClaudeSession
-            ? _gitHost.GetSandboxAccess(repoId)
-            : _gitHost.GetReadOnlySandboxAccess(repoId);
+        var access = _gitHost.GetReadOnlySandboxAccess(repoId);
 
         ISandbox? sandboxToDispose = null;
         ISandbox sandbox;
@@ -1331,6 +1332,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
 
             var aggregated = aggregator.ToString();
+            if (useClaudeSession && !string.IsNullOrWhiteSpace(result.Stdout))
+                return result.Stdout;
             return aggregated;
         }
         finally
@@ -1453,7 +1456,96 @@ public sealed partial class PipelineRunner : IPipelineRunner
         """;
 
     private static string NormalizePlanArtifact(string artifact)
-        => PlanArtifactDocument.NormalizeRaw(artifact, PlanArtifactMaxChars);
+        => PlanArtifactDocument.NormalizeRaw(ExtractPlanningArtifactText(artifact), PlanArtifactMaxChars);
+
+    private static string ExtractPlanningArtifactText(string artifact)
+    {
+        if (string.IsNullOrWhiteSpace(artifact))
+            return artifact;
+
+        var assistantText = new StringBuilder();
+        var resultText = new StringBuilder();
+        var sawClaudeStreamEvent = false;
+        foreach (var rawLine in artifact.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!rawLine.StartsWith('{'))
+                continue;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(rawLine);
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object
+                    || !root.TryGetProperty("type", out var typeProp)
+                    || typeProp.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var type = typeProp.GetString();
+                if (type == "assistant")
+                {
+                    sawClaudeStreamEvent = true;
+                    if (root.TryGetProperty("message", out var message))
+                        AppendClaudeContentText(message, assistantText);
+                    else
+                        AppendClaudeContentText(root, assistantText);
+                }
+                else if (type == "result")
+                {
+                    sawClaudeStreamEvent = true;
+                    if (root.TryGetProperty("result", out var result)
+                        && result.ValueKind == JsonValueKind.String)
+                    {
+                        AppendTextPart(resultText, result.GetString());
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        if (!sawClaudeStreamEvent)
+            return artifact;
+        if (assistantText.Length > 0)
+            return assistantText.ToString();
+        if (resultText.Length > 0)
+            return resultText.ToString();
+        return artifact;
+    }
+
+    private static void AppendClaudeContentText(JsonElement container, StringBuilder destination)
+    {
+        if (!container.TryGetProperty("content", out var content)
+            || content.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        foreach (var part in content.EnumerateArray())
+        {
+            if (part.ValueKind != JsonValueKind.Object)
+                continue;
+            if (part.TryGetProperty("text", out var text)
+                && text.ValueKind == JsonValueKind.String)
+            {
+                AppendTextPart(destination, text.GetString());
+            }
+        }
+    }
+
+    private static void AppendTextPart(StringBuilder destination, string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return;
+        if (destination.Length > 0)
+            destination.AppendLine();
+        destination.Append(value);
+    }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
@@ -1657,6 +1749,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         ClaudeSessionLifecycle? claudeSessionLifecycle = null;
+        var claudeSessionOpenedReadOnlyForPlanning = false;
         try
         {
             await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
@@ -1679,7 +1772,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // RunAgentPhaseAsync takes the legacy independent-phase branch.
             if (!skipWork && !skipAudit)
             {
-                claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(item, project, agentRunner, repoId, ct);
+                if (planningPendingAtEntry)
+                {
+                    claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
+                        item,
+                        project,
+                        agentRunner,
+                        repoId,
+                        useReadOnlyRepositoryAccess: true,
+                        ct);
+                    claudeSessionOpenedReadOnlyForPlanning = claudeSessionLifecycle is not null;
+                }
+                else if (!planningLifecycleRequiredAtEntry)
+                {
+                    claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
+                        item,
+                        project,
+                        agentRunner,
+                        repoId,
+                        useReadOnlyRepositoryAccess: false,
+                        ct);
+                }
                 // Publish the lifecycle on the AsyncLocal in RunAsync's own
                 // frame. AsyncLocal values set inside an awaited child method
                 // do NOT propagate back to the caller's ExecutionContext, so
@@ -1726,6 +1839,30 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     ReasoningMode = planningEntryReasoningMode,
                     AgentInstanceId = planningEntryAgentInstanceId,
                 };
+
+                if (claudeSessionOpenedReadOnlyForPlanning && claudeSessionLifecycle is not null)
+                {
+                    await CloseAmbientClaudeSessionAsync(
+                        claudeSessionLifecycle,
+                        item,
+                        project,
+                        "read-only planning session completed before writable implementation");
+                    claudeSessionLifecycle = null;
+                    claudeSessionOpenedReadOnlyForPlanning = false;
+                    _ambientSessionLifecycle.Value = null;
+                }
+
+                if (!skipWork && !skipAudit && claudeSessionLifecycle is null)
+                {
+                    claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
+                        item,
+                        project,
+                        agentRunner,
+                        repoId,
+                        useReadOnlyRepositoryAccess: false,
+                        ct);
+                    _ambientSessionLifecycle.Value = claudeSessionLifecycle;
+                }
             }
             if (!string.Equals(item.WorkBranch, workBranch, StringComparison.Ordinal))
             {

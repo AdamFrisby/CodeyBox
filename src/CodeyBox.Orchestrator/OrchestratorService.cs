@@ -2169,7 +2169,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 item,
                                 decision.Reason,
                                 decision.PausedAgents.Count == 1 ? decision.PausedAgents[0] : null,
-                                ct);
+                                ct,
+                                AgentPauseResumeMapper.RetryFromForState(item.State));
                             return;
                         }
 
@@ -2261,7 +2262,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         item,
                         $"agent '{pausedCandidate.Value}' {reason}",
                         pausedCandidate,
-                        ct);
+                        ct,
+                        AgentPauseResumeMapper.RetryFromForState(item.State));
                     return;
                 }
 
@@ -2563,7 +2565,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static bool ShouldRouteWorkAgentAtPickup(WorkItem item) =>
-        item.State is WorkItemState.Queued or WorkItemState.Reworking or WorkItemState.ReworkingForConflict;
+        item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
 
     private static bool IsOperatorPaused(AgentAvailability? availability) =>
         AgentDispatchAvailability.IsPausedVerdict(availability);
@@ -2572,7 +2579,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         WorkItem item,
         string reason,
         AgentKind? pausedAgent,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? retryFrom = null)
         => await WorkItemAgentPauseParking.ParkAsync(
             _store,
             _webhooks,
@@ -2581,7 +2589,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             reason,
             project: null,
             pausedAgent,
-            ct);
+            ct,
+            retryFrom);
 
     private sealed class WorkerSlotLease
     {

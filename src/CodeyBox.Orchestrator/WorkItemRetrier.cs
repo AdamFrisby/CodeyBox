@@ -132,7 +132,7 @@ public sealed class WorkItemRetrier
             return (false, $"invalid 'from' value '{from}'", null, null, null);
 
         var actualFrom = requestedFrom;
-        var retryingFromPlanning = requestedFrom == "planning";
+        var clearingQueuedPlan = resumeState.Value == WorkItemState.Queued;
 
         // For from != "work", the pipeline expects the bare repo to still be present.
         if (resumeState != WorkItemState.Queued)
@@ -189,7 +189,7 @@ public sealed class WorkItemRetrier
             NextTerminalRetryAt = null,
             StartedAt = null
         };
-        if (retryingFromPlanning)
+        if (clearingQueuedPlan)
         {
             resumed = resumed with
             {

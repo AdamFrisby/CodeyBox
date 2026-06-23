@@ -167,7 +167,7 @@ internal sealed record PlanArtifactDocument(
 
             string[] list = value.ValueKind switch
             {
-                JsonValueKind.String => [Truncate(NormalizeText(value.GetString()), MaxListItemChars)],
+                JsonValueKind.String => ScalarStringList(value),
                 JsonValueKind.Array => value.EnumerateArray()
                     .Select((element, index) =>
                     {
@@ -186,6 +186,14 @@ internal sealed record PlanArtifactDocument(
         }
 
         throw new InvalidOperationException($"PLAN artifact is missing required string-array field '{names[0]}'.");
+    }
+
+    private static string[] ScalarStringList(JsonElement value)
+    {
+        var normalized = NormalizeText(value.GetString());
+        return string.IsNullOrWhiteSpace(normalized)
+            ? []
+            : [Truncate(normalized, MaxListItemChars)];
     }
 
     private static string NormalizeText(string? value)

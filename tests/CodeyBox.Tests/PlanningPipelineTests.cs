@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit.Presets;
@@ -150,7 +151,11 @@ public sealed class PlanningPipelineTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
-        var sessionRunner = new PlanningSessionRunner();
+        var sessionRunner = new PlanningSessionRunner
+        {
+            DirtyPlanningSandbox = true,
+            TryPushDuringPlanning = true,
+        };
         using var setup = BuildPipeline(
             agent,
             _workspace,
@@ -174,19 +179,26 @@ public sealed class PlanningPipelineTests : IDisposable
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Equal(1, sessionRunner.OpenCalls);
+        Assert.Equal(2, sessionRunner.OpenCalls);
         Assert.Equal(2, sessionRunner.SendTurns);
-        Assert.Equal(1, sessionRunner.CloseCalls);
+        Assert.Equal(2, sessionRunner.CloseCalls);
         Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
         Assert.Equal("max", sessionRunner.OpenedReasoningMode);
         Assert.Contains(sessionRunner.PromptsSent, p => p.Contains("planning-only phase", StringComparison.Ordinal));
         Assert.Contains(sessionRunner.PromptsSent, p => p.Contains("Reviewed planning summary", StringComparison.Ordinal));
         Assert.Equal(0, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
 
         var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
         var (_, treeOutput, _) = await TestSupport.RunGit(
             barePath, "ls-tree", "-r", "feature/session-planning", "--name-only");
         Assert.Contains("output.txt", treeOutput);
+        Assert.DoesNotContain("planning-session-scratch.txt", treeOutput);
+        Assert.DoesNotContain("planning-session-pushed.txt", treeOutput);
+
+        var (_, mainTreeOutput, _) = await TestSupport.RunGit(
+            barePath, "ls-tree", "-r", "main", "--name-only");
+        Assert.DoesNotContain("planning-session-pushed.txt", mainTreeOutput);
     }
 
     [Fact]
@@ -335,6 +347,158 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(0, agent.WorkCalls);
         Assert.Contains("Planning agent claude reported failure", final.LastError, StringComparison.Ordinal);
         Assert.Contains("planner stderr", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanReviewRejection_FailsBeforeImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            planReviewGate: new RejectingPlanReviewGate());
+        var item = NewItem("feature/rejected-plan") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("Plan review rejected the planning artifact", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_CheckAndActAndAgentControl_BypassPlanningPhase()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var pauses = new SqliteAgentPauseController(
+            Path.Combine(_workspace, "agent-pauses.db"),
+            NullLogger<SqliteAgentPauseController>.Instance);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            agentPauseController: pauses);
+        var knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [PlanKnob.KeyName] = PlanKnob.ValueOn,
+        };
+        var check = NewItem("feature/check-bypass") with
+        {
+            JobType = JobType.CheckAndAct,
+            Knobs = knobs,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is the repository already compliant?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "unused follow-up",
+                    Prompt = "unused because the scripted answer is false",
+                },
+            },
+        };
+        var control = NewItem("feature/control-bypass") with
+        {
+            JobType = JobType.AgentControl,
+            Knobs = knobs,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Codex.Value,
+                Reason = "planning bypass test",
+            },
+        };
+
+        await setup.Store.CreateAsync(check);
+        await setup.Pipeline.RunAsync(check, CancellationToken.None);
+        await setup.Store.CreateAsync(control);
+        await setup.Pipeline.RunAsync(control, CancellationToken.None);
+
+        var finalCheck = await setup.Store.GetAsync(check.Id);
+        var finalControl = await setup.Store.GetAsync(control.Id);
+        Assert.Equal(WorkItemState.Done, finalCheck!.State);
+        Assert.Equal(WorkItemState.Done, finalControl!.State);
+        Assert.Null(finalCheck.PlanArtifact);
+        Assert.Null(finalControl.PlanArtifact);
+        Assert.Equal(0, agent.PlanningCalls);
+        Assert.Equal(1, agent.CheckCalls);
+        Assert.NotNull(await pauses.GetAgentStateAsync(AgentKind.Codex));
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanningQuotaFailure_ParksForPlanningRetryWithoutImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var resetAt = DateTimeOffset.UtcNow.AddMinutes(17);
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(false, "planner quota", null, "planner quota exhausted"),
+        };
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            quotaClassifier: new PlanningQuotaClassifier(resetAt));
+        var item = NewItem("feature/planning-quota") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.Equal("planning", final.QuotaRetryFrom);
+        Assert.Equal("planning", final.QuotaRetryPhase);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanningTransientFailure_ParksForPlanningRetryWithoutImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(false, "planner network", null, "connection reset"),
+            ClassifyPlanningFailureAsTransient = true,
+        };
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/planning-transient") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("planning", final.TransientRetryFrom);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
     }
 
     [Fact]
@@ -516,7 +680,11 @@ public sealed class PlanningPipelineTests : IDisposable
         string seedRepoUrl,
         IReadOnlyDictionary<string, string>? projectKnobs = null,
         ISessionAgentRunner? sessionRunner = null,
-        bool enableClaudeSession = false)
+        bool enableClaudeSession = false,
+        IPlanReviewGate? planReviewGate = null,
+        IQuotaFailureClassifier? quotaClassifier = null,
+        IWorkItemAutoRetryScheduler? retryScheduler = null,
+        IAgentPauseController? agentPauseController = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -552,8 +720,12 @@ public sealed class PlanningPipelineTests : IDisposable
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
             knobRegistry: new KnobRegistry([new PlanKnob()]),
+            quotaClassifier: quotaClassifier,
+            retryScheduler: retryScheduler,
+            agentPauseController: agentPauseController,
             sessionAgentRunner: sessionRunner,
-            sessionDispatchOptions: new AgentSessionDispatchOptions { Enabled = enableClaudeSession });
+            sessionDispatchOptions: new AgentSessionDispatchOptions { Enabled = enableClaudeSession },
+            planReviewGate: planReviewGate);
 
         return new PlanningPipelineSetup(pipeline, store, webhooks, gitRoot);
     }
@@ -596,8 +768,10 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
 
     public AgentKind Kind => AgentKind.Claude;
     public int PlanningCalls { get; private set; }
+    public int CheckCalls { get; private set; }
     public int WorkCalls { get; private set; }
     public bool TryPushDuringPlanning { get; init; }
+    public bool ClassifyPlanningFailureAsTransient { get; init; }
     public string PlanOutput { get; init; } = DefaultPlan;
     public AgentResult? PlanningResult { get; init; }
     public Func<CancellationToken, Task>? OnPlanningBeforeReturnAsync { get; set; }
@@ -617,6 +791,18 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
     {
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
             return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);
+
+        if (prompt.Contains(CheckAndActPipeline.StartSentinel, StringComparison.Ordinal))
+        {
+            CheckCalls++;
+            var verdict = string.Join('\n',
+                "some preamble",
+                CheckAndActPipeline.StartSentinel,
+                """{"answer": false, "evidence": "planning bypass check path", "confidence": "high"}""",
+                CheckAndActPipeline.EndSentinel);
+            stdoutChunkCallback?.Invoke(verdict);
+            return new AgentResult(true, "checked", verdict, null);
+        }
 
         if (prompt.Contains("planning-only phase", StringComparison.Ordinal))
         {
@@ -674,6 +860,20 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner
             : new AgentResult(false, "failed to write output.txt", write.Stdout, write.Stderr);
     }
 
+    public AgentFailureClassification ClassifyFailure(AgentResult result)
+    {
+        if (!result.Success && ClassifyPlanningFailureAsTransient)
+        {
+            return new AgentFailureClassification(
+                AgentFailureKind.TransientNetwork,
+                Reason: "test transient planning failure");
+        }
+
+        return result.Success
+            ? new AgentFailureClassification(AgentFailureKind.Normal)
+            : AgentFailureClassifier.Classify(result.Stderr, result.Stdout, result.Summary);
+    }
+
     private static async Task<AgentResult> HandleMergeAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -714,6 +914,8 @@ internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner
     public int CloseCalls { get; private set; }
     public string? OpenedModelId { get; private set; }
     public string? OpenedReasoningMode { get; private set; }
+    public bool DirtyPlanningSandbox { get; init; }
+    public bool TryPushDuringPlanning { get; init; }
     public List<string> PromptsSent { get; } = [];
 
     public Task<AgentResult> RunAsync(
@@ -772,8 +974,41 @@ internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner
         PromptsSent.Add(prompt);
         if (prompt.Contains("planning-only phase", StringComparison.Ordinal))
         {
+            if (DirtyPlanningSandbox)
+            {
+                await _sandbox!.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", "echo 'discard session scratch' > \"$1/planning-session-scratch.txt\"", "sh", _workingDirectory!],
+                }, ct);
+            }
+
+            if (TryPushDuringPlanning)
+            {
+                await _sandbox!.ExecAsync(new SandboxExec
+                {
+                    Argv =
+                    [
+                        "sh",
+                        "-c",
+                        """
+                        set +e
+                        git -C "$1" config user.email codeybox-test@example.invalid
+                        git -C "$1" config user.name CodeyBoxTest
+                        echo 'should not land from session planning' > "$1/planning-session-pushed.txt"
+                        git -C "$1" add planning-session-pushed.txt
+                        git -C "$1" commit -m planning-session-push-attempt >/tmp/planning-session-push-attempt.out 2>&1
+                        git -C "$1" push origin HEAD:main >>/tmp/planning-session-push-attempt.out 2>&1
+                        git -C "$1" push /repo HEAD:main >>/tmp/planning-session-push-attempt.out 2>&1
+                        exit 0
+                        """,
+                        "sh",
+                        _workingDirectory!,
+                    ],
+                }, ct);
+            }
+
             stdoutChunkCallback?.Invoke(PlanningAwareAgentJson.DefaultPlan);
-            return new AgentResult(true, "planned", PlanningAwareAgentJson.DefaultPlan, null);
+            return new AgentResult(true, "planned", BuildClaudeStreamPlan(PlanningAwareAgentJson.DefaultPlan), null);
         }
 
         var write = await _sandbox!.ExecAsync(new SandboxExec
@@ -783,6 +1018,17 @@ internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner
         return write.Success
             ? new AgentResult(true, "worked", null, null)
             : new AgentResult(false, "failed to write output.txt", write.Stdout, write.Stderr);
+    }
+
+    private static string BuildClaudeStreamPlan(string plan)
+    {
+        var escapedPlan = JsonSerializer.Serialize(plan);
+        return string.Join('\n',
+            """{"type":"system","subtype":"init","session_id":"planning-session","tools":[]}""",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_plan\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-7\",\"content\":[{\"type\":\"text\",\"text\":"
+                + escapedPlan
+                + "}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}",
+            """{"type":"result","subtype":"success","duration_ms":0,"num_turns":1,"result":"Done","is_error":false,"session_id":"planning-session","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}""");
     }
 
     public Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
@@ -809,4 +1055,41 @@ internal static class PlanningAwareAgentJson
           "satisfiesTask": "creates output.txt."
         }
         """;
+}
+
+internal sealed class RejectingPlanReviewGate : IPlanReviewGate
+{
+    public ValueTask<PlanReviewDecision> ReviewAsync(
+        WorkItem item,
+        string planArtifact,
+        CancellationToken ct = default)
+    {
+        _ = item;
+        _ = planArtifact;
+        ct.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(new PlanReviewDecision(
+            Approved: false,
+            Summary: "Rejected by test gate.",
+            RejectionReason: "test review rejection"));
+    }
+}
+
+internal sealed class PlanningQuotaClassifier(DateTimeOffset resetAt) : IQuotaFailureClassifier
+{
+    private readonly QuotaDetection _detection = new(QuotaFailureKind.RateLimitExceeded, resetAt);
+
+    public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+        => Detect(agent, stderr, stdout) is { } detection
+            ? QuotaFailureClassification.Quota(detection)
+            : QuotaFailureClassification.None;
+
+    public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+    {
+        if (agent != AgentKind.Claude)
+            return null;
+        var combined = string.Concat(stderr, "\n", stdout);
+        return combined.Contains("planner quota", StringComparison.OrdinalIgnoreCase)
+            ? _detection
+            : null;
+    }
 }
