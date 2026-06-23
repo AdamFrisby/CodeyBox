@@ -131,6 +131,16 @@ public static class AgentInstanceCredentialResolver
             return true;
         }
 
+        // Crock: deliberately falls through to the global credential provider
+        // chain (CrockEnvironmentCredentialProvider). The crock runner credential
+        // is a TWO-PIECE bundle — the CROCK_CONFIG_JSON env var AND a bind-mount
+        // exposing the host-side `crock daemon` Unix socket's parent directory —
+        // and only the global provider has access to the sandbox-side
+        // CrockSandboxOptions needed to add that bind-mount. Per-instance
+        // CredentialReference still affects the QUOTA probe (see
+        // TryExtractQuotaCredentials below) so two crock members with distinct
+        // Anthropic keys probe with the correct token; the runner-side env+mount
+        // bundle is a sandbox-global concern.
         return false;
     }
 
@@ -208,6 +218,20 @@ public static class AgentInstanceCredentialResolver
             // gemini-cli; reuse the Gemini extractor so a single per-instance
             // file works for either CLI.
             var token = CredentialFileTokenExtractor.ExtractGeminiAccessToken(raw);
+            if (string.IsNullOrWhiteSpace(token)) return false;
+            credentials = new AgentQuotaCredentials(token);
+            return true;
+        }
+
+        if (agent == AgentKind.Crock)
+        {
+            // CrockCode's config.json carries an Anthropic API key under
+            // `anthropic_api_key`. The Crock quota probe is keyed by token, so a
+            // per-instance file (two crock members with distinct keys) MUST
+            // resolve to its own AgentQuotaCredentials rather than silently
+            // collapsing onto the shared CODEYBOX_CROCK_CONFIG_JSON env-var key
+            // (which would defeat per-instance routing and pool-with-yourself).
+            var token = CredentialFileTokenExtractor.ExtractCrockAnthropicApiKey(raw);
             if (string.IsNullOrWhiteSpace(token)) return false;
             credentials = new AgentQuotaCredentials(token);
             return true;

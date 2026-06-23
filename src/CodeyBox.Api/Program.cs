@@ -2924,6 +2924,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Opencode] = new OpencodeCostExtractor(),
         [AgentKind.Copilot] = new CopilotCostExtractor(),
         [AgentKind.Antigravity] = new AntigravityCostExtractor(),
+        [AgentKind.Crock] = new CrockCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)

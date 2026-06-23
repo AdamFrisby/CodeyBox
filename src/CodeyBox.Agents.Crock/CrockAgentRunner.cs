@@ -223,13 +223,17 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
 
     /// <summary>
     /// Marker the unavailability AgentResult surfaces when the operator has
-    /// not configured a host-side <c>crock daemon</c>. Matched by the shared
-    /// <see cref="AgentFailureClassifier"/> as an infrastructure/config issue
-    /// — not a transient quota wait — so the work item routes to operator
-    /// triage instead of bench-and-retry.
+    /// not configured a host-side <c>crock daemon</c>. The leading
+    /// <c>"failed to materialise "</c> prefix is load-bearing: it makes
+    /// <see cref="AgentFailureClassifier.IsMaterialisationFailure"/> match,
+    /// which classifies the failure as
+    /// <see cref="AgentFailureKind.Infrastructure"/> — not a transient quota
+    /// wait — so the work item routes to operator triage instead of
+    /// bench-and-retry.
     /// </summary>
     private const string MissingHostDaemonMarker =
-        "crock: missing host daemon socket (CodeyBox:Crock:HostDaemonSocketPath unset); " +
+        "failed to materialise crock host daemon socket " +
+        "(CodeyBox:Crock:HostDaemonSocketPath unset); " +
         "in-VM public tunnels are not supported by this sandbox model";
 
     /// <summary>

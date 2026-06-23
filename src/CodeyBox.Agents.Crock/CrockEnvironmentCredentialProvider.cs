@@ -11,8 +11,8 @@ namespace CodeyBox.Agents.Crock;
 /// provider:
 ///
 /// <list type="number">
-///   <item><description>Adds a bind-mount that exposes the host daemon Unix
-///   socket inside the sandbox at
+///   <item><description>Adds a bind-mount that exposes the daemon socket's
+///   <em>parent directory</em> inside the sandbox at the parent of
 ///   <see cref="CrockSandboxOptions.SandboxDaemonSocketPath"/>. The mount is
 ///   <em>not</em> read-only (the in-VM CLI must be able to write to the socket
 ///   to send daemon RPCs).</description></item>
@@ -21,11 +21,34 @@ namespace CodeyBox.Agents.Crock;
 ///   sandbox so the in-VM crock CLI knows where to connect.</description></item>
 /// </list>
 ///
+/// <para><b>Directory mount, not file mount — Multipass compatibility.</b>
+/// The Multipass sandbox provider mounts via
+/// <c>multipass mount --type=native</c>, which only accepts a <em>directory</em>
+/// source (virtiofs / 9p passthrough); pointing it at a Unix socket node would
+/// be rejected by the provider. Binding the socket's parent directory works
+/// uniformly across every shipped sandbox provider — Bubblewrap's <c>--bind</c>
+/// accepts both files and directories so the directory binding is equally
+/// correct there, and the Multipass virtiofs/9p passthrough faithfully
+/// exposes any socket node inside the mounted directory so the in-VM
+/// <c>connect(2)</c> reaches the host daemon. Operators sharing one
+/// directory for multiple sockets get all of them at the cost of one mount;
+/// dedicate the directory to the daemon socket if that surface matters.</para>
+///
 /// <para><b>Why a dedicated provider instead of an
 /// <c>EnvironmentCredentialProvider</c> mapping.</b> The generic provider can
 /// only carry env vars; the host-daemon path needs an additional bind-mount,
 /// which only <see cref="AgentCredential.Mounts"/> can carry into the sandbox
 /// spec.</para>
+///
+/// <para><b>Daemon authn/authz is the operator's responsibility.</b> The
+/// bind-mount exposes the daemon's full RPC surface to every process inside
+/// the sandbox — including any prompt-injected agent acting on attacker-
+/// controlled prompt content (the LLM threat model is "prompt injection
+/// happens"). The orchestrator does not enforce socket-level UID gating or
+/// capability-scope tokens; the daemon implementation MUST authenticate the
+/// caller (peer-cred check on <c>SO_PEERCRED</c>, capability tokens, scope-
+/// limited RPC surface) before honouring any request. See
+/// <see cref="CrockSandboxOptions"/> for the documented expectation.</para>
 ///
 /// <para><b>Never logs.</b> Neither the API key (inside the config JSON) nor
 /// the host daemon socket path is written to any log line — only structured
@@ -78,12 +101,32 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
             var sandboxSocketPath = string.IsNullOrWhiteSpace(opts.SandboxDaemonSocketPath)
                 ? "/run/codeybox/crock-daemon.sock"
                 : opts.SandboxDaemonSocketPath;
-            mounts.Add(new SandboxMount
+
+            // Bind the socket's PARENT DIRECTORY (not the socket file).
+            // multipass mount --type=native only accepts a directory source
+            // (virtiofs / 9p passthrough); pointing it at a Unix socket node is
+            // rejected by the provider. The directory shape is universally
+            // compatible — bubblewrap's --bind also accepts directories — and
+            // the virtiofs/9p passthrough faithfully exposes any socket node
+            // inside the mounted directory so the in-VM connect() reaches the
+            // host daemon.
+            var hostDir = Path.GetDirectoryName(opts.HostDaemonSocketPath);
+            var sandboxDir = Path.GetDirectoryName(sandboxSocketPath);
+            if (string.IsNullOrWhiteSpace(hostDir) || string.IsNullOrWhiteSpace(sandboxDir))
             {
-                SandboxPath = sandboxSocketPath,
-                HostPath = opts.HostDaemonSocketPath,
-                ReadOnly = false,
-            });
+                _log?.LogDebug(
+                    "Crock credential: HostDaemonSocketPath has no parent directory; skipping bind-mount " +
+                    "(the runner pre-flight check will refuse to dispatch)");
+            }
+            else
+            {
+                mounts.Add(new SandboxMount
+                {
+                    SandboxPath = sandboxDir,
+                    HostPath = hostDir,
+                    ReadOnly = false,
+                });
+            }
             var daemonEnvVar = string.IsNullOrWhiteSpace(opts.DaemonSocketEnvVar)
                 ? "CROCK_DAEMON_SOCKET"
                 : opts.DaemonSocketEnvVar;

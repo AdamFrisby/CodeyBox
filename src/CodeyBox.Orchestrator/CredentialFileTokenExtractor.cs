@@ -103,6 +103,39 @@ public static class CredentialFileTokenExtractor
         return null;
     }
 
+    /// <summary>
+    /// Extracts an Anthropic API key from a CrockCode <c>config.json</c>
+    /// payload of shape <c>{ "anthropic_api_key": "sk-…", "tunnel_provider": "…" }</c>.
+    /// Tolerant of leading/trailing whitespace and the camelCase /
+    /// SCREAMING_SNAKE_CASE variants operators sometimes hand-write. Returns
+    /// null on any parse failure or when the key is missing/blank.
+    /// </summary>
+    public static string? ExtractCrockAnthropicApiKey(string? rawContents)
+    {
+        if (string.IsNullOrWhiteSpace(rawContents)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(rawContents);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (prop.Value.ValueKind != JsonValueKind.String) continue;
+                if (string.Equals(prop.Name, "anthropic_api_key", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(prop.Name, "anthropicApiKey", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(prop.Name, "ANTHROPIC_API_KEY", StringComparison.Ordinal))
+                {
+                    var raw = prop.Value.GetString();
+                    return string.IsNullOrWhiteSpace(raw) ? null : raw.Trim();
+                }
+            }
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     public static string? ExtractGeminiAccessToken(string? rawContents)
     {
         if (string.IsNullOrWhiteSpace(rawContents))

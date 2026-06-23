@@ -674,7 +674,12 @@ public sealed class CrockAgentRunnerTests
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: CrockCred());
 
         Assert.False(result.Success);
-        Assert.Contains("missing host daemon socket", result.Summary, StringComparison.Ordinal);
+        // Marker prefix is "failed to materialise " so AgentFailureClassifier
+        // routes the work item to Infrastructure (operator triage) instead of
+        // bench-and-retry.
+        Assert.StartsWith(
+            "failed to materialise crock host daemon socket",
+            result.Summary, StringComparison.Ordinal);
         Assert.Contains("HostDaemonSocketPath", result.Summary, StringComparison.Ordinal);
         Assert.False(sandbox.SubmitExecuted);
         Assert.False(sandbox.StatusPolled);
@@ -696,7 +701,9 @@ public sealed class CrockAgentRunnerTests
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: CrockCred());
 
         Assert.NotNull(result.Stderr);
-        Assert.Contains("missing host daemon socket", result.Stderr!, StringComparison.Ordinal);
+        Assert.StartsWith(
+            "failed to materialise crock host daemon socket",
+            result.Stderr!, StringComparison.Ordinal);
     }
 
     // --- Credential-provider behaviour ----------------------------------
@@ -749,10 +756,15 @@ public sealed class CrockAgentRunnerTests
             // Daemon-socket env var present at the in-VM path.
             Assert.Equal("/run/vm/crock-daemon.sock",
                 cred.EnvironmentVariables["CROCK_DAEMON_SOCKET"]);
-            // A read-write bind-mount maps host → sandbox.
+            // A read-write bind-mount maps the socket's PARENT DIRECTORY.
+            // Mounting the socket file itself would be rejected by Multipass
+            // (multipass mount --type=native requires a directory source);
+            // virtiofs/9p passthrough faithfully exposes the socket node
+            // inside the mounted directory so the in-VM connect() reaches
+            // the host daemon.
             var mount = Assert.Single(cred.Mounts);
-            Assert.Equal("/run/host/crock-daemon.sock", mount.HostPath);
-            Assert.Equal("/run/vm/crock-daemon.sock", mount.SandboxPath);
+            Assert.Equal("/run/host", mount.HostPath);
+            Assert.Equal("/run/vm", mount.SandboxPath);
             Assert.False(mount.ReadOnly);
         }
         finally
