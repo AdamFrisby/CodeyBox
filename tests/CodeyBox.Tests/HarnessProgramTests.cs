@@ -56,14 +56,14 @@ public sealed class HarnessProgramTests
     [MemberData(nameof(HelpOrEmptyMainArgs))]
     public async Task RunAsync_HelpOrEmptyArgs_ReturnsUsageExit(string[] args)
     {
-        var rc = await HarnessProgram.RunAsync(args);
+        var rc = await RunMainSilentlyAsync(args);
         Assert.Equal(HarnessProgram.ExitUsage, rc);
     }
 
     [Fact]
     public async Task RunAsync_UnknownTopLevelCommand_ReturnsUsageExit()
     {
-        var rc = await HarnessProgram.RunAsync(["bogus-command"]);
+        var rc = await RunMainSilentlyAsync(["bogus-command"]);
         Assert.Equal(HarnessProgram.ExitUsage, rc);
     }
 
@@ -204,4 +204,7 @@ public sealed class HarnessProgramTests
             ["launch", "--source", "/x"], NoEnv, _ => true);
         Assert.False(result.Interactive);
     }
+
+    private static Task<int> RunMainSilentlyAsync(string[] args)
+        => HarnessProgram.RunAsync(args, TextWriter.Null, TextWriter.Null);
 }
