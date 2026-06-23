@@ -2677,19 +2677,20 @@ public sealed class AcpBridgeUnitTests
             var markerPath = Path.Combine(tmpDir, "sigterm-observed.marker");
             var stubPath = Path.Combine(tmpDir, "claude-ignore-sigterm-stub.sh");
 
-            // Install the SIGTERM trap BEFORE writing the pidfile, so that
-            // observing the pidfile (which the test waits on before triggering
-            // shutdown) guarantees the trap is already armed. The reverse order
-            // leaves a window where SIGTERM could land after the pidfile write
-            // but before the trap install, default-terminating the child and
-            // spuriously failing the marker assertion under capped full-suite
-            // load (same race class as the SIGTERM-first fixture above).
+            // Install the SIGTERM trap BEFORE writing the pidfile or emitting
+            // the stdout readiness line, so observing either signal guarantees
+            // the trap is already armed. The reverse order leaves a window
+            // where SIGTERM could land before the trap install,
+            // default-terminating the child and spuriously failing the marker
+            // assertion under capped full-suite load (same race class as the
+            // SIGTERM-first fixture above).
             File.WriteAllText(stubPath,
                 "#!/bin/bash\n" +
                 "PIDFILE=\"$2\"\n" +
                 "MARKER=\"$3\"\n" +
                 "trap 'echo \"got-sigterm-but-staying-alive\" > \"$MARKER\"' SIGTERM\n" +
                 "echo $$ > \"$PIDFILE\"\n" +
+                "echo \"pid-ready:$$\"\n" +
                 "while true; do sleep 60 & wait $!; done\n");
             File.SetUnixFileMode(stubPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -2703,8 +2704,8 @@ public sealed class AcpBridgeUnitTests
             await ctx.WriteStdinLineAsync(hello);
 
             await ctx.WaitForEnvelopeAsync("ready");
-            for (int i = 0; i < 50 && !File.Exists(pidPath); i++)
-                await Task.Delay(50);
+            var pidReady = await ctx.WaitForEnvelopeAsync("claude_stdout", TimeSpan.FromSeconds(15));
+            Assert.Contains("pid-ready:", pidReady.GetProperty("text").GetString(), StringComparison.Ordinal);
             Assert.True(File.Exists(pidPath), "SIGKILL fallback fixture did not record a child pid.");
             var childPid = int.Parse(File.ReadAllText(pidPath).Trim(), CultureInfo.InvariantCulture);
 
