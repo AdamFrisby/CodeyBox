@@ -104,6 +104,34 @@ file static class AuditorTestHelpers
         WorkBranch = "feature/x",
         PushUpstream = false,
     };
+
+    public static async Task<WorkItem?> WaitForStateAsync(
+        IWorkItemStore store,
+        WorkItemId id,
+        WorkItemState state,
+        TimeSpan timeout)
+    {
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        while (!timeoutCts.IsCancellationRequested)
+        {
+            var current = await store.GetAsync(id);
+            if (current?.State == state)
+                return current;
+            if (current is not null && WorkItemDependencies.TerminalStates.Contains(current.State))
+                return current;
+
+            try
+            {
+                await Task.Delay(50, timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+
+        return await store.GetAsync(id);
+    }
 }
 
 file sealed class CapturingAuditReportStore : IAuditReportStore
@@ -1477,22 +1505,48 @@ public sealed class AuditorParallelismCancellationTests : IDisposable
         using var cts = new CancellationTokenSource();
         var pipelineTask = Task.Run(() => tp.Pipeline.RunAsync(item, cts.Token));
 
-        // Wait until at least one auditor has started (audit phase is live).
-        // Use a generous timeout: under heavy CI/sandbox load the work phase
-        // (git clone + commit + push of a tiny repo) can take longer than a
-        // few seconds, and a false negative here would mask the real
-        // cancellation behaviour the test wants to verify.
-        var started = await auditPhaseStarted.WaitAsync(TimeSpan.FromSeconds(60));
-        Assert.True(started, "audit phase did not start within 60 s");
+        var auditing = await AuditorTestHelpers.WaitForStateAsync(
+            tp.Store,
+            item.Id,
+            WorkItemState.Auditing,
+            TimeSpan.FromSeconds(60));
+        if (auditing?.State != WorkItemState.Auditing)
+        {
+            await CancelAndDrainPipelineAsync(cts, pipelineTask);
+            Assert.Fail($"work item did not enter Auditing within 60 s; state={auditing?.State}, lastError={auditing?.LastError}");
+        }
+
+        // Wait until at least one auditor body has started. This includes the
+        // per-auditor sandbox clone/checkout setup, which can be delayed by
+        // unrelated full-suite git/process contention even after the audit
+        // phase itself is live.
+        var started = await auditPhaseStarted.WaitAsync(TimeSpan.FromMinutes(3));
+        if (!started)
+        {
+            var current = await tp.Store.GetAsync(item.Id);
+            await CancelAndDrainPipelineAsync(cts, pipelineTask);
+            Assert.Fail($"LLM auditor body did not start within 180 s after Auditing; state={current?.State}, lastError={current?.LastError}");
+        }
 
         // Cancel and wait for the pipeline to unwind.
         // RunAsync re-throws OperationCanceledException after setting state=Cancelled.
-        cts.Cancel();
-        try { await pipelineTask.WaitAsync(TimeSpan.FromSeconds(30)); }
-        catch (OperationCanceledException) { /* expected — pipeline re-throws after setting state */ }
+        await CancelAndDrainPipelineAsync(cts, pipelineTask);
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Cancelled, final!.State);
+    }
+
+    private static async Task CancelAndDrainPipelineAsync(CancellationTokenSource cts, Task pipelineTask)
+    {
+        await cts.CancelAsync();
+        try
+        {
+            await pipelineTask.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected: RunAsync re-throws after setting state=Cancelled.
+        }
     }
 
     // Defends the per-task IsCanceled branch in the audit settling loop.
