@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -297,7 +298,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             }
             else if (m.HostPath is not null)
             {
-                bindMounts.Add(new BindMount(m.HostPath, m.SandboxPath, m.ReadOnly));
+                var hostPath = m.ReadOnly
+                    ? StageReadOnlyBindSnapshot(sandboxRoot, m.HostPath, m.SandboxPath)
+                    : m.HostPath;
+                bindMounts.Add(new BindMount(hostPath, m.SandboxPath, m.ReadOnly));
             }
         }
 
@@ -444,6 +448,62 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                     innerException: ex);
             }
             throw;
+        }
+    }
+
+    internal static string StageReadOnlyBindSnapshot(string sandboxRoot, string sourcePath, string sandboxPath)
+    {
+        var sourceFullPath = Path.GetFullPath(sourcePath);
+        var snapshotRoot = Path.Combine(sandboxRoot, "readonly-binds");
+        Directory.CreateDirectory(snapshotRoot);
+        TryChmod0700(snapshotRoot);
+
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sourceFullPath + "\0" + sandboxPath)))[..16];
+        var destination = Path.Combine(snapshotRoot, hash);
+        CopyFileSystemSnapshot(sourceFullPath, destination);
+        return destination;
+    }
+
+    private static void CopyFileSystemSnapshot(string sourcePath, string destinationPath)
+    {
+        if (Directory.Exists(sourcePath))
+        {
+            CopyDirectorySnapshot(new DirectoryInfo(sourcePath), new DirectoryInfo(destinationPath));
+            return;
+        }
+
+        if (File.Exists(sourcePath))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+            File.Copy(sourcePath, destinationPath, overwrite: true);
+            return;
+        }
+
+        throw new DirectoryNotFoundException($"Read-only sandbox mount source '{sourcePath}' does not exist.");
+    }
+
+    private static void CopyDirectorySnapshot(DirectoryInfo source, DirectoryInfo destination)
+    {
+        Directory.CreateDirectory(destination.FullName);
+        foreach (var entry in source.EnumerateFileSystemInfos())
+        {
+            var target = Path.Combine(destination.FullName, entry.Name);
+            if (!string.IsNullOrEmpty(entry.LinkTarget))
+            {
+                if (entry is DirectoryInfo)
+                    Directory.CreateSymbolicLink(target, entry.LinkTarget);
+                else
+                    File.CreateSymbolicLink(target, entry.LinkTarget);
+                continue;
+            }
+
+            if (entry is DirectoryInfo directory)
+            {
+                CopyDirectorySnapshot(directory, new DirectoryInfo(target));
+                continue;
+            }
+
+            File.Copy(entry.FullName, target, overwrite: true);
         }
     }
 

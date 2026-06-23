@@ -611,6 +611,29 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         Assert.Contains(hostSource, ex.Detail);
     }
 
+    [Fact]
+    public void StageReadOnlyBindSnapshot_CopiesHostSourceUnderSandboxRoot()
+    {
+        var source = Path.Combine(_workspace, "durable-repo.git");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "HEAD"), "ref: refs/heads/main\n");
+        Directory.CreateDirectory(Path.Combine(source, "objects"));
+        File.WriteAllText(Path.Combine(source, "objects", "marker"), "durable");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var staged = MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/repo");
+
+        Assert.NotEqual(source, staged);
+        Assert.StartsWith(Path.Combine(sandboxRoot, "readonly-binds"), staged, StringComparison.Ordinal);
+        Assert.Equal("ref: refs/heads/main\n", File.ReadAllText(Path.Combine(staged, "HEAD")));
+        File.WriteAllText(Path.Combine(staged, "HEAD"), "mutated in guest copy\n");
+        File.WriteAllText(Path.Combine(staged, "objects", "marker"), "changed");
+
+        Assert.Equal("ref: refs/heads/main\n", File.ReadAllText(Path.Combine(source, "HEAD")));
+        Assert.Equal("durable", File.ReadAllText(Path.Combine(source, "objects", "marker")));
+    }
+
     private static MultipassSandboxProvider NewProvider(
         IProcessRunner runner,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null) => new(

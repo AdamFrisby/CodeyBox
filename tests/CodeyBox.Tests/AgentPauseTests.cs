@@ -490,6 +490,35 @@ public sealed class AgentPauseTests : IDisposable
         Assert.Equal(retryFrom, parked!.AgentPauseRetryFrom);
         Assert.Equal(AgentKind.Claude, parked.AgentPauseTarget);
         await svc.StopAsync(CancellationToken.None);
+
+        await pauses.ResumeAsync(AgentKind.Claude, "test");
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
+        var retried = await scheduler.RetryWaitingItemsForTestAsync("test");
+        Assert.Equal(1, retried);
+
+        var resumed = await store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.Queued, resumed!.State);
+        Assert.Null(resumed.PlanArtifact);
+        Assert.Null(resumed.PlanGeneratedAt);
+        Assert.Null(resumed.PlanReviewedAt);
+        Assert.Null(resumed.PlanReviewSummary);
+
+        using var resumedRegistry = new CancellationRegistry(CancellationToken.None);
+        using var resumedSvc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            resumedRegistry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: ProjectRepo(),
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+        await resumedSvc.StartAsync(CancellationToken.None);
+        var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
+        Assert.NotNull(done);
+        await resumedSvc.StopAsync(CancellationToken.None);
     }
 
     [Fact]

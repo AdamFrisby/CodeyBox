@@ -191,12 +191,8 @@ public sealed class WorkItemRetrier
         };
         if (clearingQueuedPlan)
         {
-            resumed = resumed with
+            resumed = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(resumed) with
             {
-                PlanArtifact = null,
-                PlanGeneratedAt = null,
-                PlanReviewedAt = null,
-                PlanReviewSummary = null,
                 PreserveWorkBranchOnQueuedPickup = false,
             };
         }
@@ -377,7 +373,7 @@ public sealed class WorkItemRetrier
         var retryFrom = AgentPauseResumeMapper.NormalizeRetryFrom(
             item.AgentPauseRetryFrom ?? item.QuotaRetryFrom);
         var resumeState = AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom);
-        var resumed = item.With(resumeState, error: null) with
+        var resumed = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(item.With(resumeState, error: null) with
         {
             FailureKind = null,
             QuotaResetAt = null,
@@ -390,7 +386,7 @@ public sealed class WorkItemRetrier
             TransientRetryFrom = null,
             AgentPauseRetryFrom = null,
             StartedAt = null,
-        };
+        });
 
         var updated = await _store.TryUpdateIfStateAsync(
                 resumed,

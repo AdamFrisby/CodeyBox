@@ -101,6 +101,36 @@ public sealed class WorkItemRetrierPlanningTests : IDisposable
         Assert.Null(read.PlanReviewSummary);
     }
 
+    [Fact]
+    public async Task AgentPauseResume_FromPlanningRequeuesAndClearsPlan()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.WaitingForAgentResume) with
+        {
+            AgentPauseRetryFrom = "planning",
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewSummary = "approved",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.ResumeAfterAgentPauseAsync(item, "test");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.Resumed!.State);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Queued, read!.State);
+        Assert.Null(read.PlanArtifact);
+        Assert.Null(read.PlanGeneratedAt);
+        Assert.Null(read.PlanReviewedAt);
+        Assert.Null(read.PlanReviewSummary);
+        Assert.Null(read.AgentPauseRetryFrom);
+    }
+
     private SqliteWorkItemStore NewStore()
         => new(Path.Combine(_workspace, Guid.NewGuid().ToString("N") + ".db"));
 

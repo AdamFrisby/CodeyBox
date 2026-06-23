@@ -302,6 +302,28 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
+    public void GracefulShutdownRecovery_PlanningToQueuedClearsPlanFields()
+    {
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            MakeItem(WorkItemState.Planning) with
+            {
+                PlanArtifact = ValidPlan,
+                PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+                PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+                PlanReviewSummary = "approved",
+            },
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Null(recovered.PlanArtifact);
+        Assert.Null(recovered.PlanGeneratedAt);
+        Assert.Null(recovered.PlanReviewedAt);
+        Assert.Null(recovered.PlanReviewSummary);
+    }
+
+    [Fact]
     public void GracefulShutdownRecovery_WorkingWithPreemptCheckpoint_PreservesResumeState()
     {
         var item = MakeItem(WorkItemState.Working) with
@@ -420,6 +442,49 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Null(recovered.TransientRetryFrom);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning, WorkItemState.Queued, true)]
+    [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview, false)]
+    [InlineData(WorkItemState.PlanApproved, WorkItemState.PlanApproved, false)]
+    public void InfrastructureDeferral_PlanningStatesResumeWithValidPlanShape(
+        WorkItemState from,
+        WorkItemState to,
+        bool clearsPlan)
+    {
+        var item = MakeItem(from) with
+        {
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = from == WorkItemState.PlanApproved ? DateTimeOffset.UtcNow.AddMinutes(-1) : null,
+            PlanReviewSummary = from == WorkItemState.PlanApproved ? "approved" : null,
+            LastError = "deferred",
+            FailureKind = "infrastructure",
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
+            item,
+            DateTimeOffset.UtcNow);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(to, recovered!.State);
+        if (clearsPlan)
+        {
+            Assert.Null(recovered.PlanArtifact);
+            Assert.Null(recovered.PlanGeneratedAt);
+            Assert.Null(recovered.PlanReviewedAt);
+            Assert.Null(recovered.PlanReviewSummary);
+        }
+        else
+        {
+            Assert.Equal(item.PlanArtifact, recovered.PlanArtifact);
+            Assert.Equal(item.PlanGeneratedAt, recovered.PlanGeneratedAt);
+            Assert.Equal(item.PlanReviewedAt, recovered.PlanReviewedAt);
+            Assert.Equal(item.PlanReviewSummary, recovered.PlanReviewSummary);
+        }
+        Assert.Null(recovered.LastError);
+        Assert.Null(recovered.FailureKind);
+    }
+
     [Fact]
     public void GracefulShutdownRecovery_SuspendedItem_IsLeftAlone()
     {
@@ -452,4 +517,14 @@ public sealed class WorkItemRecoveryPolicyTests
             Reason = "reserve quota",
         },
     };
+
+    private const string ValidPlan = """
+        {
+          "approach": "recover planning",
+          "files": ["output.txt"],
+          "testStrategy": ["run tests"],
+          "risks": ["none"],
+          "satisfiesTask": "continues safely"
+        }
+        """;
 }
