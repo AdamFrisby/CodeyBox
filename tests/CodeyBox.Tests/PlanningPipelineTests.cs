@@ -149,7 +149,7 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_ClaudeSessionMode_RunsColdPlanningThenWarmImplementation()
+    public async Task PlanOn_ClaudeSessionMode_RunsPlanningAsFirstWarmTurnThenImplementation()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
@@ -182,18 +182,15 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(1, sessionRunner.OpenCalls);
-        Assert.Equal(1, sessionRunner.SendTurns);
+        Assert.Equal(2, sessionRunner.SendTurns);
         Assert.Equal(1, sessionRunner.CloseCalls);
         Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
         Assert.Equal("max", sessionRunner.OpenedReasoningMode);
-        var sessionPrompt = Assert.Single(sessionRunner.PromptsSent);
-        Assert.DoesNotContain("planning-only phase", sessionPrompt, StringComparison.Ordinal);
-        Assert.Contains("Reviewed planning metadata", sessionPrompt, StringComparison.Ordinal);
-        Assert.Contains("output.txt", sessionPrompt, StringComparison.Ordinal);
-        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Contains("planning-only phase", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.Contains("Reviewed planning metadata", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
+        Assert.Contains("output.txt", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
+        Assert.Equal(0, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
-        Assert.Contains("planning-only phase", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.False(agent.PlanningReceivedSandbox);
 
         var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
         var (_, treeOutput, _) = await TestSupport.RunGit(
@@ -256,6 +253,64 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Contains(AgentPromptPhase.Planning, preprocessor.Phases);
         Assert.Contains("planning-preprocessor-marker", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.DoesNotContain("planning-preprocessor-marker", agent.LastWorkPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanningLoadsProjectRulesFromRealSandbox()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await File.WriteAllTextAsync(Path.Combine(seed, "AGENTS.md"), "planning rule marker\n");
+        await TestSupport.RunGit(seed, "add", "AGENTS.md");
+        await TestSupport.RunGit(seed, "commit", "-m", "add agents rules");
+        var agent = new PlanningAwareAgent();
+        var rules = new ProjectRulesPromptPreprocessor(
+            new PlanningStaticOptionsMonitor<AgentPromptPreprocessingOptions>(
+                new AgentPromptPreprocessingOptions { ProjectRulesPath = "AGENTS.md" }),
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            promptPreprocessors: new AgentPromptPreprocessorChain([rules]));
+        var item = NewItem("feature/plan-rules") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.True(agent.PlanningReceivedSandbox);
+        Assert.Contains("planning rule marker", agent.LastPlanningPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_RunnerWithoutTextOnlyCapability_PlansInSandbox()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new SandboxOnlyPlanningAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/no-text-only-plan") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(1, agent.WorkCalls);
+        Assert.True(agent.PlanningReceivedSandbox);
+        Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -834,7 +889,7 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     private static PlanningPipelineSetup BuildPipeline(
-        PlanningAwareAgent agent,
+        IAgentRunner agent,
         string workspace,
         string seedRepoUrl,
         IReadOnlyDictionary<string, string>? projectKnobs = null,
@@ -971,6 +1026,7 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
         {
             PlanningCalls++;
             LastPlanningPrompt = prompt;
+            PlanningReceivedSandbox = true;
             var scratch = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["sh", "-c", "echo 'discard me' > \"$1/planning-scratch.txt\"", "sh", workingDirectory],
@@ -1102,6 +1158,71 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
         return merge.Success
             ? new AgentResult(true, "merged", null, null)
             : new AgentResult(false, "merge failed", merge.Stdout, merge.Stderr);
+    }
+
+    [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`",
+        RegexOptions.CultureInvariant | RegexOptions.Singleline)]
+    private static partial Regex MergePromptShape();
+}
+
+internal sealed partial class SandboxOnlyPlanningAgent : IAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+    public int PlanningCalls { get; private set; }
+    public int WorkCalls { get; private set; }
+    public bool PlanningReceivedSandbox { get; private set; }
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = captureStructuredStream;
+
+        if (prompt.Contains("planning-only phase", StringComparison.Ordinal))
+        {
+            PlanningCalls++;
+            PlanningReceivedSandbox = true;
+            stdoutChunkCallback?.Invoke(PlanningAwareAgentJson.DefaultPlan);
+            return new AgentResult(true, "planned", PlanningAwareAgentJson.DefaultPlan, null);
+        }
+
+        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+        {
+            var match = MergePromptShape().Match(prompt);
+            if (!match.Success)
+                return new AgentResult(false, "could not parse merge prompt", null, null);
+
+            var merge = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "git", "-C", workingDirectory, "merge", "--no-ff",
+                    "-m", $"codeybox: merge {match.Groups[1].Value}", $"origin/{match.Groups[1].Value}",
+                ],
+            }, ct);
+            return merge.Success
+                ? new AgentResult(true, "merged", null, null)
+                : new AgentResult(false, "merge failed", merge.Stdout, merge.Stderr);
+        }
+
+        WorkCalls++;
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo 'implemented without text-only planning' > \"$0\"", $"{workingDirectory}/output.txt"],
+        }, ct);
+        return write.Success
+            ? new AgentResult(true, "worked", null, null)
+            : new AgentResult(false, "failed to write output.txt", write.Stdout, write.Stderr);
     }
 
     [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`",
@@ -1330,4 +1451,11 @@ internal sealed class PlanningQuotaClassifier(DateTimeOffset resetAt) : IQuotaFa
             ? _detection
             : null;
     }
+}
+
+internal sealed class PlanningStaticOptionsMonitor<T>(T value) : Microsoft.Extensions.Options.IOptionsMonitor<T>
+{
+    public T CurrentValue { get; } = value;
+    public T Get(string? name) => CurrentValue;
+    public IDisposable? OnChange(Action<T, string?> listener) => null;
 }

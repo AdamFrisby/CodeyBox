@@ -119,6 +119,7 @@ public sealed class WorkItemRetrier
         var resumeState = requestedFrom switch
         {
             "planning" => WorkItemState.Queued,
+            "plan_review" => WorkItemState.PlanReview,
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
@@ -512,10 +513,11 @@ public sealed class WorkItemRetrier
         if (resumeState is null)
             return new ResumeOutcome(
                 ResumeStatus.BadRequest,
-                $"invalid 'from' value '{from}'; expected one of: planning, work, rework, audit, merge",
+                $"invalid 'from' value '{from}'; expected one of: planning, plan_review, work, rework, audit, merge",
                 null,
                 null);
         var resumingFromPlanning = requestedFrom == "planning";
+        var resumingBeforeWork = requestedFrom is "planning" or "plan_review";
 
         // Resume preserves the prior bare repo + work-branch (that is the
         // entire point — recovering the agent commits the operator's cancel
@@ -523,7 +525,7 @@ public sealed class WorkItemRetrier
         // /replay for a fresh start.
         const string preconditionMessage =
             "bare repo or work-branch no longer present; cannot resume — use POST /workitems/{id}/replay for a fresh start";
-        if (!resumingFromPlanning)
+        if (!resumingBeforeWork)
         {
             var repoPresent = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!repoPresent)

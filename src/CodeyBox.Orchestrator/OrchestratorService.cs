@@ -2149,7 +2149,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // it has already test-and-reserved the chosen member's slot via
             // the gate; the outer finally releases on every exit path.
             var shouldRouteWorkAgentAtPickup = ShouldRouteWorkAgentAtPickup(item);
-            if (_router is not null && !isAgentControlItem)
+            if (_router is not null && !isAgentControlItem && shouldRouteWorkAgentAtPickup)
             {
                 var decision = await _router.ResolveAsync(item, project, ct, slotGate: this);
                 if (decision.ShouldWait)
@@ -2267,7 +2267,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     return;
                 }
 
-                if (item.Agent is { } routedAgent)
+                if (shouldRouteWorkAgentAtPickup && item.Agent is { } routedAgent)
                 {
                     var routeKey = ResolveDirectRouteKey(routedAgent, item.AgentInstanceId);
                     var cap = GetAgentCapForRoute(routedAgent, routeKey);
@@ -2567,7 +2567,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static bool ShouldRouteWorkAgentAtPickup(WorkItem item) =>
         item.State is WorkItemState.Queued
             or WorkItemState.Planning
-            or WorkItemState.PlanReview
             or WorkItemState.PlanApproved
             or WorkItemState.Reworking
             or WorkItemState.ReworkingForConflict;

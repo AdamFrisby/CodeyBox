@@ -634,6 +634,35 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         Assert.Equal("durable", File.ReadAllText(Path.Combine(source, "objects", "marker")));
     }
 
+    [Fact]
+    public void StageReadOnlyBindSnapshot_CopiesSingleFileSource()
+    {
+        var source = Path.Combine(_workspace, "single-file.txt");
+        File.WriteAllText(source, "single file source");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox-file");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var staged = MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/mounted-file");
+
+        Assert.NotEqual(source, staged);
+        Assert.Equal("single file source", File.ReadAllText(staged));
+        File.WriteAllText(staged, "mutated staged copy");
+        Assert.Equal("single file source", File.ReadAllText(source));
+    }
+
+    [Fact]
+    public void StageReadOnlyBindSnapshot_MissingSource_ThrowsDirectoryNotFoundException()
+    {
+        var source = Path.Combine(_workspace, "missing-source");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox-missing");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var ex = Assert.Throws<DirectoryNotFoundException>(
+            () => MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/repo"));
+
+        Assert.Contains(source, ex.Message, StringComparison.Ordinal);
+    }
+
     private static MultipassSandboxProvider NewProvider(
         IProcessRunner runner,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null) => new(

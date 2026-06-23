@@ -82,11 +82,12 @@ public readonly record struct KnobNormalizationResult(
 /// </para>
 ///
 /// <para>
-/// Knobs intentionally do NOT carry runtime behaviour beyond the prompt seam:
-/// they are operator-facing dials, not plug-in handlers. Future seams (audit
-/// prompt fragments, merge strategy hints, post-merge behaviour, …) plug in
-/// here by adding optional methods to this interface with default
-/// implementations that contribute nothing — existing knobs need no edits.
+/// Knobs remain operator-facing dials, not arbitrary plug-in handlers. Runtime
+/// effects are limited to the explicit framework hooks on this interface, such
+/// as prompt fragments and pipeline lifecycle requests. Future seams (audit
+/// prompt fragments, merge strategy hints, post-merge behaviour, ...) plug in
+/// here by adding optional methods with default implementations that contribute
+/// nothing — existing knobs need no edits.
 /// </para>
 /// </summary>
 public interface IKnob

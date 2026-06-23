@@ -65,6 +65,40 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Equal(expected, WorkerProgressWatchdog.IsWatchedState(state));
     }
 
+    [Fact]
+    public async Task Watchdog_PlanningRecoveryToQueued_ClearsPlanFields()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Planning, staleUpdatedAt) with
+        {
+            PlanArtifact = """
+                {
+                  "approach": "stale",
+                  "files": ["old.txt"],
+                  "testStrategy": ["old"],
+                  "risks": ["old"],
+                  "satisfiesTask": "old"
+                }
+                """,
+            PlanGeneratedAt = staleUpdatedAt.AddMinutes(1),
+            PlanReviewedAt = staleUpdatedAt.AddMinutes(2),
+            PlanReviewSummary = "stale approval",
+        };
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        await PlantHeartbeatingWorkerAsync(workerId, item.Id);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Null(recovered.PlanArtifact);
+        Assert.Null(recovered.PlanGeneratedAt);
+        Assert.Null(recovered.PlanReviewedAt);
+        Assert.Null(recovered.PlanReviewSummary);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static WorkItem MakeItem(

@@ -42,6 +42,9 @@ internal sealed record PlanArtifactDocument(
     private const int MaxFieldChars = 4000;
     private const int MaxListItems = 25;
     private const int MaxListItemChars = 600;
+    private const int PressureTrimmedListItems = 10;
+    private const int PressureTrimmedFieldChars = MaxFieldChars / 2;
+    private const int PressureTrimmedListItemChars = MaxListItemChars / 2;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -63,11 +66,11 @@ internal sealed record PlanArtifactDocument(
 
         var trimmed = document with
         {
-            Approach = Truncate(document.Approach, MaxFieldChars / 2),
-            Files = document.Files.Take(10).Select(v => Truncate(v, MaxListItemChars / 2)).ToArray(),
-            TestStrategy = document.TestStrategy.Take(10).Select(v => Truncate(v, MaxListItemChars / 2)).ToArray(),
-            Risks = document.Risks.Take(10).Select(v => Truncate(v, MaxListItemChars / 2)).ToArray(),
-            SatisfiesTask = Truncate(document.SatisfiesTask, MaxFieldChars / 2),
+            Approach = Truncate(document.Approach, PressureTrimmedFieldChars),
+            Files = document.Files.Take(PressureTrimmedListItems).Select(v => Truncate(v, PressureTrimmedListItemChars)).ToArray(),
+            TestStrategy = document.TestStrategy.Take(PressureTrimmedListItems).Select(v => Truncate(v, PressureTrimmedListItemChars)).ToArray(),
+            Risks = document.Risks.Take(PressureTrimmedListItems).Select(v => Truncate(v, PressureTrimmedListItemChars)).ToArray(),
+            SatisfiesTask = Truncate(document.SatisfiesTask, PressureTrimmedFieldChars),
         };
         normalized = JsonSerializer.Serialize(trimmed, JsonOptions);
         if (normalized.Length <= maxChars)
