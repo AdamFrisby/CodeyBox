@@ -198,6 +198,7 @@ public sealed class CrockAgentRunnerTests
             },
             new Dictionary<string, string>());
 
+
     [Fact]
     public async Task RunAsync_NoCredential_FailsWithoutExecutingSubmit()
     {
@@ -257,7 +258,7 @@ public sealed class CrockAgentRunnerTests
         var sandbox = new ScriptedSandbox(
             submit: ("task-abc", 0),
             authExit: (stdout: "", stderr: "permission denied", exit: 17));
-        var runner = new CrockAgentRunner();
+        var runner = MakeRunnerWithZeroDelays();
 
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: CrockCred());
 
@@ -277,7 +278,7 @@ public sealed class CrockAgentRunnerTests
         // Non-zero exit on `crock submit` is a hard failure of the work item
         // — the runner must NOT proceed to poll a synthetic task-id.
         var sandbox = new ScriptedSandbox(submit: ("", 13));
-        var runner = new CrockAgentRunner();
+        var runner = MakeRunnerWithZeroDelays();
 
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: CrockCred());
 
@@ -292,7 +293,7 @@ public sealed class CrockAgentRunnerTests
         // Submit succeeded but emitted no parseable task-id; the runner
         // must fail rather than fabricate one.
         var sandbox = new ScriptedSandbox(submit: ("nothing here\n", 0));
-        var runner = new CrockAgentRunner();
+        var runner = MakeRunnerWithZeroDelays();
 
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: CrockCred());
 
@@ -364,6 +365,10 @@ public sealed class CrockAgentRunnerTests
             InitialPollInterval = TimeSpan.FromMilliseconds(1),
             MaxPollInterval = TimeSpan.FromMilliseconds(1),
             MaxUnknownStreak = 3,
+            SandboxOptions = static () => new CrockSandboxOptions
+            {
+                HostDaemonSocketPath = "/tmp/test-crock-daemon.sock",
+            },
         };
         var sandbox = new ScriptedSandbox(
             submit: ("task-id: task-mute\n", 0),
@@ -391,6 +396,10 @@ public sealed class CrockAgentRunnerTests
             InitialPollInterval = TimeSpan.FromMilliseconds(1),
             MaxPollInterval = TimeSpan.FromMilliseconds(1),
             MaxUnknownStreak = 3,
+            SandboxOptions = static () => new CrockSandboxOptions
+            {
+                HostDaemonSocketPath = "/tmp/test-crock-daemon.sock",
+            },
         };
         var sandbox = new ScriptedSandbox(
             submit: ("task-id: task-bumpy\n", 0),
@@ -584,11 +593,16 @@ public sealed class CrockAgentRunnerTests
         Assert.Equal(AgentKind.Crock, new CrockInVmSmokeProbe().Kind);
     }
 
-    // --- Quota probe placeholder contract --------------------------------
+    // --- Quota probe contract --------------------------------------------
 
     [Fact]
-    public async Task CrockQuotaProbe_ReturnsUnknownPermanent()
+    public async Task CrockQuotaProbe_NoArgCtor_ReturnsUnknownForMissingCredential()
     {
+        // The parameter-less constructor is preserved for the scaffold DI
+        // registration shape, but it has no HTTP client and no API key. It
+        // must still return a structured Unknown snapshot (with NoCredential
+        // when no token is supplied) so the router's QuotaUnknownPolicy gates
+        // dispatch instead of treating the probe as silently OK.
         var probe = new CrockQuotaProbe();
         var member = new AgentMembership
         {
@@ -600,7 +614,11 @@ public sealed class CrockAgentRunnerTests
         var snapshot = await probe.GetAvailabilityAsync(member, ct: CancellationToken.None);
 
         Assert.False(snapshot.IsKnown);
-        Assert.Equal(QuotaUnknownReason.Permanent, snapshot.Unknown);
+        // The default credentials provider for the scaffold path returns
+        // AccessToken=null, so the probe must return NoCredential — not a
+        // generic Permanent — so the last-known-good layer discards any
+        // stale reading (a missing key is not a "transient blip").
+        Assert.Equal(QuotaUnknownReason.NoCredential, snapshot.Unknown);
     }
 
     [Fact]
@@ -609,11 +627,218 @@ public sealed class CrockAgentRunnerTests
         Assert.Equal(AgentKind.Crock, new CrockQuotaProbe().Kind);
     }
 
+    // --- API-key extraction from CrockCode config JSON -------------------
+
+    [Theory]
+    [InlineData("{\"anthropic_api_key\":\"sk-ant-test\",\"tunnel_provider\":\"cloudflared\"}", "sk-ant-test")]
+    [InlineData("{\"anthropicApiKey\":\"sk-camel\"}", "sk-camel")]
+    [InlineData("{\"ANTHROPIC_API_KEY\":\"sk-upper\"}", "sk-upper")]
+    [InlineData("{\"anthropic_api_key\":\"  sk-trimmed  \"}", "sk-trimmed")]
+    public void CrockQuotaProbe_TryExtractApiKey_RecognisesKeyVariants(string json, string expected)
+    {
+        Assert.Equal(expected, CrockQuotaProbe.TryExtractApiKey(json));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData(null)]
+    [InlineData("{\"tunnel_provider\":\"cloudflared\"}")]
+    [InlineData("{\"anthropic_api_key\":\"\"}")]
+    [InlineData("{\"anthropic_api_key\":\"   \"}")]
+    [InlineData("not json at all")]
+    [InlineData("[\"anthropic_api_key\",\"sk-array\"]")]
+    public void CrockQuotaProbe_TryExtractApiKey_ReturnsNullOnAbsentOrInvalid(string? json)
+    {
+        Assert.Null(CrockQuotaProbe.TryExtractApiKey(json));
+    }
+
+    // --- Pre-flight host-daemon gate ------------------------------------
+
+    [Fact]
+    public async Task RunAsync_NoHostDaemonConfigured_FailsBeforeSubmit()
+    {
+        // Dispatching crock without a host-side daemon socket would leave the
+        // Anthropic batch worker with no callback path. The runner must
+        // refuse to dispatch and surface a clear MissingHostDaemonMarker
+        // through Stderr so the failure shows up in lastError instead of as
+        // a multi-hour batch hang.
+        var sandbox = new ScriptedSandbox(submit: ("task-id: task-x\n", 0));
+        var runner = new CrockAgentRunner
+        {
+            InitialPollInterval = TimeSpan.FromMilliseconds(1),
+            MaxPollInterval = TimeSpan.FromMilliseconds(1),
+            // No SandboxOptions accessor — defaults to no daemon socket.
+        };
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: CrockCred());
+
+        Assert.False(result.Success);
+        Assert.Contains("missing host daemon socket", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("HostDaemonSocketPath", result.Summary, StringComparison.Ordinal);
+        Assert.False(sandbox.SubmitExecuted);
+        Assert.False(sandbox.StatusPolled);
+    }
+
+    [Fact]
+    public async Task RunAsync_NoHostDaemonConfigured_StderrCarriesMarker()
+    {
+        // The pre-flight marker must travel through Stderr (mirroring the
+        // missing-credential shape) so the operator sees the same lastError
+        // marker class regardless of which guard fired.
+        var sandbox = new ScriptedSandbox(submit: ("task-id: task-x\n", 0));
+        var runner = new CrockAgentRunner
+        {
+            InitialPollInterval = TimeSpan.FromMilliseconds(1),
+            MaxPollInterval = TimeSpan.FromMilliseconds(1),
+        };
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: CrockCred());
+
+        Assert.NotNull(result.Stderr);
+        Assert.Contains("missing host daemon socket", result.Stderr!, StringComparison.Ordinal);
+    }
+
+    // --- Credential-provider behaviour ----------------------------------
+
+    [Fact]
+    public async Task CrockCredentialProvider_NoConfig_ReturnsNull()
+    {
+        var previous = Environment.GetEnvironmentVariable(
+            CrockEnvironmentCredentialProvider.HostConfigEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, null);
+            var provider = new CrockEnvironmentCredentialProvider(
+                static () => new CrockSandboxOptions());
+            var cred = await provider.GetAsync(AgentKind.Crock);
+            Assert.Null(cred);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, previous);
+        }
+    }
+
+    [Fact]
+    public async Task CrockCredentialProvider_DaemonConfigured_AddsBindMountAndEnvVar()
+    {
+        var previous = Environment.GetEnvironmentVariable(
+            CrockEnvironmentCredentialProvider.HostConfigEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar,
+                "{\"anthropic_api_key\":\"sk-test\"}");
+            var provider = new CrockEnvironmentCredentialProvider(
+                static () => new CrockSandboxOptions
+                {
+                    HostDaemonSocketPath = "/run/host/crock-daemon.sock",
+                    SandboxDaemonSocketPath = "/run/vm/crock-daemon.sock",
+                    DaemonSocketEnvVar = "CROCK_DAEMON_SOCKET",
+                });
+
+            var cred = await provider.GetAsync(AgentKind.Crock);
+
+            Assert.NotNull(cred);
+            // Config JSON ships through the runner's expected env var.
+            Assert.Equal("{\"anthropic_api_key\":\"sk-test\"}",
+                cred!.EnvironmentVariables[CrockAgentRunner.ConfigEnvVar]);
+            // Daemon-socket env var present at the in-VM path.
+            Assert.Equal("/run/vm/crock-daemon.sock",
+                cred.EnvironmentVariables["CROCK_DAEMON_SOCKET"]);
+            // A read-write bind-mount maps host → sandbox.
+            var mount = Assert.Single(cred.Mounts);
+            Assert.Equal("/run/host/crock-daemon.sock", mount.HostPath);
+            Assert.Equal("/run/vm/crock-daemon.sock", mount.SandboxPath);
+            Assert.False(mount.ReadOnly);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, previous);
+        }
+    }
+
+    [Fact]
+    public async Task CrockCredentialProvider_NoDaemonConfigured_ShipsConfigWithoutMount()
+    {
+        // When config is present but no daemon socket is configured, the
+        // credential ships so the runner's pre-flight check fires with the
+        // expected MissingHostDaemonMarker (not the credential-missing one).
+        // Mount list is empty.
+        var previous = Environment.GetEnvironmentVariable(
+            CrockEnvironmentCredentialProvider.HostConfigEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, "{}");
+            var provider = new CrockEnvironmentCredentialProvider(
+                static () => new CrockSandboxOptions());
+
+            var cred = await provider.GetAsync(AgentKind.Crock);
+
+            Assert.NotNull(cred);
+            Assert.Empty(cred!.Mounts);
+            Assert.False(cred.EnvironmentVariables.ContainsKey("CROCK_DAEMON_SOCKET"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, previous);
+        }
+    }
+
+    [Fact]
+    public async Task CrockCredentialProvider_NonCrockAgent_ReturnsNull()
+    {
+        var provider = new CrockEnvironmentCredentialProvider(
+            static () => new CrockSandboxOptions { HostDaemonSocketPath = "/x" });
+        Assert.Null(await provider.GetAsync(AgentKind.Claude));
+        Assert.Null(await provider.GetAsync(AgentKind.Codex));
+    }
+
+    // --- Model-list probe contract --------------------------------------
+
+    [Fact]
+    public async Task CrockModelListProbe_ReturnsCuratedClaudeModels()
+    {
+        var probe = new CrockModelListProbe();
+        Assert.Equal(AgentKind.Crock, probe.Kind);
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+        Assert.Null(result.FailureReason);
+        Assert.NotEmpty(result.ModelIds);
+        // Smoke-check the curated set includes the canonical tiers.
+        Assert.Contains(result.ModelIds, m => m.Contains("opus", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(result.ModelIds, m => m.Contains("sonnet", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(result.ModelIds, m => m.Contains("haiku", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void CrockKnownModels_IsKnown_HandlesCasingAndNulls()
+    {
+        Assert.True(CrockKnownModels.IsKnown("claude-opus-4-7"));
+        Assert.True(CrockKnownModels.IsKnown("CLAUDE-OPUS-4-7"));
+        Assert.False(CrockKnownModels.IsKnown(null));
+        Assert.False(CrockKnownModels.IsKnown(""));
+        Assert.False(CrockKnownModels.IsKnown("   "));
+        Assert.False(CrockKnownModels.IsKnown("not-a-real-model"));
+    }
+
     private static CrockAgentRunner MakeRunnerWithZeroDelays() => new()
     {
         // Sub-tick poll intervals so the test wall-clock stays in microseconds.
         InitialPollInterval = TimeSpan.FromMilliseconds(1),
         MaxPollInterval = TimeSpan.FromMilliseconds(1),
+        // Satisfy the runner's host-daemon pre-flight check; tests that
+        // specifically exercise the missing-daemon path supply their own
+        // runner without this accessor.
+        SandboxOptions = static () => new CrockSandboxOptions
+        {
+            HostDaemonSocketPath = "/tmp/test-crock-daemon.sock",
+        },
     };
 
     /// <summary>

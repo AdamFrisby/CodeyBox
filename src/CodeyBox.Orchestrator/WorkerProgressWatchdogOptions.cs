@@ -1,3 +1,5 @@
+using CodeyBox.Core;
+
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
@@ -138,6 +140,66 @@ public sealed class WorkerProgressWatchdogOptions
     public int ItemStaleMaxRecoveryAttempts { get; set; } = 3;
 
     /// <summary>
+    /// Per-agent override map for <see cref="ProgressTimeout"/> and
+    /// <see cref="ItemStaleTimeout"/>. Keyed on the lowercase
+    /// <see cref="AgentKind.Value"/> (e.g. <c>"crock"</c>). When an in-flight
+    /// item's <see cref="CodeyBox.Core.WorkItem.Agent"/> matches a key, the
+    /// per-agent override wins over the global default for that sweep.
+    ///
+    /// <para>
+    /// Motivation: agents with intrinsically long no-emission windows
+    /// (notably <c>crock</c>, which submits to Anthropic's Message Batches
+    /// API and waits minutes-to-hours on the batch worker) would otherwise
+    /// be killed by the default 60-minute ProgressTimeout. Per-agent
+    /// overrides keep the global default tight for synchronous agents while
+    /// giving batch-latency agents room to breathe — without bumping the
+    /// global value and losing protection for genuinely-wedged synchronous
+    /// workers.
+    /// </para>
+    ///
+    /// <para>
+    /// Items with an unset or unmatched <see cref="CodeyBox.Core.WorkItem.Agent"/>
+    /// fall back to the global timeouts. Hot-reloadable on the next sweep.
+    /// </para>
+    /// </summary>
+    public Dictionary<string, AgentWatchdogOverride> PerAgent { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Resolves the effective <see cref="ProgressTimeout"/> for an item bound
+    /// to <paramref name="agent"/>. Returns the per-agent override when one is
+    /// configured for the kind, otherwise the global default.
+    /// </summary>
+    public TimeSpan ResolveProgressTimeout(AgentKind? agent)
+    {
+        if (agent is { } kind
+            && PerAgent.TryGetValue(kind.Value, out var per)
+            && per.ProgressTimeout is { } overrideValue
+            && overrideValue >= TimeSpan.Zero)
+        {
+            return overrideValue;
+        }
+        return ProgressTimeout;
+    }
+
+    /// <summary>
+    /// Resolves the effective <see cref="ItemStaleTimeout"/> for an item bound
+    /// to <paramref name="agent"/>. Returns the per-agent override when one is
+    /// configured for the kind, otherwise the global default.
+    /// </summary>
+    public TimeSpan ResolveItemStaleTimeout(AgentKind? agent)
+    {
+        if (agent is { } kind
+            && PerAgent.TryGetValue(kind.Value, out var per)
+            && per.ItemStaleTimeout is { } overrideValue
+            && overrideValue >= TimeSpan.Zero)
+        {
+            return overrideValue;
+        }
+        return ItemStaleTimeout;
+    }
+
+    /// <summary>
     /// Validates the configured values. Throws
     /// <see cref="InvalidOperationException"/> on misconfiguration.
     /// </summary>
@@ -180,5 +242,60 @@ public sealed class WorkerProgressWatchdogOptions
         if (ItemStaleMaxRecoveryAttempts < 0)
             throw new InvalidOperationException(
                 $"CodeyBox:WorkerProgressWatchdog:ItemStaleMaxRecoveryAttempts ({ItemStaleMaxRecoveryAttempts}) must be >= 0 (0 = unlimited).");
+
+        foreach (var (key, per) in PerAgent)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                throw new InvalidOperationException(
+                    "CodeyBox:WorkerProgressWatchdog:PerAgent contains an empty or whitespace key; use the lowercase agent kind value (e.g. \"crock\").");
+
+            if (per is null)
+                throw new InvalidOperationException(
+                    $"CodeyBox:WorkerProgressWatchdog:PerAgent:{key} is null; remove the entry or supply at least one override field.");
+
+            if (per.ProgressTimeout is { } pt && pt < TimeSpan.Zero)
+                throw new InvalidOperationException(
+                    $"CodeyBox:WorkerProgressWatchdog:PerAgent:{key}:ProgressTimeout ({pt}) must be >= 0.");
+
+            if (per.ItemStaleTimeout is { } it && it < TimeSpan.Zero)
+                throw new InvalidOperationException(
+                    $"CodeyBox:WorkerProgressWatchdog:PerAgent:{key}:ItemStaleTimeout ({it}) must be >= 0.");
+
+            if (per.ProgressTimeout is { } ptCheck && ptCheck > TimeSpan.Zero && ptCheck < CheckInterval)
+                throw new InvalidOperationException(
+                    $"CodeyBox:WorkerProgressWatchdog:PerAgent:{key}:ProgressTimeout ({ptCheck.TotalSeconds}s) must be >= CheckInterval ({CheckInterval.TotalSeconds}s).");
+
+            if (per.ItemStaleTimeout is { } itCheck && itCheck > TimeSpan.Zero && itCheck < ItemStaleCheckInterval)
+                throw new InvalidOperationException(
+                    $"CodeyBox:WorkerProgressWatchdog:PerAgent:{key}:ItemStaleTimeout ({itCheck.TotalSeconds}s) must be >= ItemStaleCheckInterval ({ItemStaleCheckInterval.TotalSeconds}s).");
+        }
     }
+}
+
+/// <summary>
+/// Per-agent override of <see cref="WorkerProgressWatchdogOptions.ProgressTimeout"/>
+/// and <see cref="WorkerProgressWatchdogOptions.ItemStaleTimeout"/>. Unset
+/// fields fall back to the global value; only the fields explicitly set on
+/// the override participate. Both timeouts are validated against the global
+/// <c>CheckInterval</c> / <c>ItemStaleCheckInterval</c> so a misconfigured
+/// override surfaces at DI resolve time.
+/// </summary>
+public sealed class AgentWatchdogOverride
+{
+    /// <summary>
+    /// Wall-clock window without observed progress for items bound to this
+    /// agent kind. <see cref="TimeSpan.Zero"/> disables the per-worker
+    /// watchdog for the agent kind (useful for an agent whose progress signal
+    /// is entirely external to the orchestrator); leave null to inherit the
+    /// global <see cref="WorkerProgressWatchdogOptions.ProgressTimeout"/>.
+    /// </summary>
+    public TimeSpan? ProgressTimeout { get; set; }
+
+    /// <summary>
+    /// Per-item <see cref="WorkItem.UpdatedAt"/>-stale window for items bound
+    /// to this agent kind. <see cref="TimeSpan.Zero"/> disables the per-item
+    /// stale watchdog for the agent kind; leave null to inherit the global
+    /// <see cref="WorkerProgressWatchdogOptions.ItemStaleTimeout"/>.
+    /// </summary>
+    public TimeSpan? ItemStaleTimeout { get; set; }
 }

@@ -136,6 +136,16 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         return true;
     }
 
+    private static bool HasPerAgentItemStaleOverride(WorkerProgressWatchdogOptions opts)
+    {
+        foreach (var (_, per) in opts.PerAgent)
+        {
+            if (per?.ItemStaleTimeout is { } it && it > TimeSpan.Zero)
+                return true;
+        }
+        return false;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (_startupRecoveryBarrier is not null)
@@ -168,13 +178,15 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     public async Task RunOnceAsync(CancellationToken ct)
     {
         var opts = _opts;
-        if (opts.ItemStaleTimeout <= TimeSpan.Zero)
+        // Per-agent overrides may keep some kinds active even when the global
+        // ItemStaleTimeout is disabled, so the global short-circuit is
+        // conditional on no opt-in overrides existing either.
+        if (opts.ItemStaleTimeout <= TimeSpan.Zero && !HasPerAgentItemStaleOverride(opts))
             return;
 
         try
         {
             var now = _time.GetUtcNow();
-            var cutoff = now - opts.ItemStaleTimeout;
 
             foreach (var state in Enum.GetValues<WorkItemState>())
             {
@@ -192,6 +204,10 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                     if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
                         continue;
 
+                    var effectiveTimeout = opts.ResolveItemStaleTimeout(item.Agent);
+                    if (effectiveTimeout <= TimeSpan.Zero) continue;
+
+                    var cutoff = now - effectiveTimeout;
                     if (item.UpdatedAt > cutoff)
                         continue;
 
@@ -199,7 +215,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                     await RecoverItemAsync(
                         item,
                         reason:
-                            $"item-stale: state {item.State}, UpdatedAt frozen for {sinceUpdated}s (threshold {(long)opts.ItemStaleTimeout.TotalSeconds}s)",
+                            $"item-stale: state {item.State}, UpdatedAt frozen for {sinceUpdated}s (threshold {(long)effectiveTimeout.TotalSeconds}s)",
                         trigger: "watchdog",
                         ct);
                 }

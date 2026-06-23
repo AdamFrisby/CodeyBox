@@ -131,7 +131,11 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     public async Task RunOnceAsync(CancellationToken ct)
     {
         var opts = _opts;
-        if (opts.ProgressTimeout <= TimeSpan.Zero)
+        // Per-agent overrides may keep some kinds active even when the global
+        // ProgressTimeout is set to zero (disable-by-default with explicit
+        // opt-ins) and vice-versa, so the global short-circuit is conditional
+        // on there being no opt-in overrides either.
+        if (opts.ProgressTimeout <= TimeSpan.Zero && !HasPerAgentProgressOverride(opts))
             return;
 
         try
@@ -140,7 +144,6 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             if (workers.Count == 0) return;
 
             var now = DateTimeOffset.UtcNow;
-            var cutoff = now - opts.ProgressTimeout;
 
             foreach (var worker in workers)
             {
@@ -153,6 +156,15 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 if (!IsWatchedState(item.State)) continue;
                 if (!string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
                 if (_recoveredWorkers.ContainsKey(worker.WorkerId)) continue;
+
+                // Per-agent ProgressTimeout override resolution. Batch-latency
+                // agents (notably crock — minutes-to-hours per task) MUST NOT
+                // be killed by the synchronous-agent default 60-minute window;
+                // operators configure the override under
+                // CodeyBox:WorkerProgressWatchdog:PerAgent:<kind>:ProgressTimeout.
+                var effectiveTimeout = opts.ResolveProgressTimeout(item.Agent);
+                if (effectiveTimeout <= TimeSpan.Zero) continue;
+                var cutoff = now - effectiveTimeout;
 
                 var activityKey = new WorkerActivityKey(worker.WorkerId, itemId);
                 var lastStreamAt = await GetLastStreamActivityAsync(itemId, ct);
@@ -204,6 +216,16 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         {
             _log.LogWarning(ex, "Worker-progress watchdog sweep failed");
         }
+    }
+
+    private static bool HasPerAgentProgressOverride(WorkerProgressWatchdogOptions opts)
+    {
+        foreach (var (_, per) in opts.PerAgent)
+        {
+            if (per?.ProgressTimeout is { } pt && pt > TimeSpan.Zero)
+                return true;
+        }
+        return false;
     }
 
     private async ValueTask<WorkerProgressActivity?> GetWorkerActivityAsync(
