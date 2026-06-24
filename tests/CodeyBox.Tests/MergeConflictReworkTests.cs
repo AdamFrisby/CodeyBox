@@ -252,7 +252,10 @@ public sealed class MergeConflictReworkTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotNull(final.MergeSha);
+        // LocalSquashSha tracks the bare-repo merge commit the merge phase
+        // produced (PushUpstream=false here, so MergeSha — the GitHub-side
+        // forge sha — never lands).
+        Assert.NotNull(final.LocalSquashSha);
 
         // Anti-abandonment post-check: the work agent's file changes must be
         // reflected in the final merge commit. A clean rebase preserves the
@@ -262,7 +265,7 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.NotNull(workCommitSha);
         var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
         var (lsExit, lsOut, _) = await TestSupport.RunGitNoThrow(
-            barePath, "show", $"{final.MergeSha}:README.md");
+            barePath, "show", $"{final.LocalSquashSha}:README.md");
         Assert.Equal(0, lsExit);
         // Both the work side and main side intents must be reflected.
         Assert.Contains("work side", lsOut);

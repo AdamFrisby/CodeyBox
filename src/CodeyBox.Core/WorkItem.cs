@@ -470,10 +470,54 @@ public sealed record WorkItem
     public WorkItemId? ReplayOfWorkItemId { get; init; }
 
     /// <summary>
-    /// SHA of the merge commit produced during the merge phase. Populated by the
-    /// pipeline runner when the merge completes; null until then.
+    /// SHA of the merge commit on the upstream forge after the auto-merge
+    /// API call succeeds — i.e. the commit GitHub created and published on
+    /// the base branch (for squash merges, the squash commit GitHub minted).
+    /// This is the authoritative cross-reference: it resolves on the forge
+    /// API (<c>GET /repos/{owner}/{repo}/commits/{sha}</c>) and is what
+    /// monitoring / audits / dashboards should use to verify a merge landed.
+    ///
+    /// <para>Null when no upstream merge has happened (item still in flight,
+    /// AutoMerge disabled, upstream kind <c>noop</c>). The local bare-repo
+    /// merge sha produced by the merge phase agent is tracked separately on
+    /// <see cref="LocalSquashSha"/>.</para>
+    ///
+    /// <para><b>Historical note (pre-2026-06):</b> this column previously
+    /// held the local bare-repo merge sha, which never matched the squash
+    /// commit GitHub created at auto-merge time and silently failed to
+    /// resolve on the GitHub commits API. Rows that predate this change
+    /// still carry the old local sha here. Verify historical-row merges by
+    /// PR title / number rather than by looking up the stored value on
+    /// GitHub.</para>
     /// </summary>
     public string? MergeSha { get; init; }
+
+    /// <summary>
+    /// SHA of the merge commit produced locally by the merge phase agent
+    /// against the per-work-item bare repo. This is the commit the
+    /// orchestrator pushes upstream for auto-merge; it is NOT the same as
+    /// the commit GitHub squash-merges into the base branch
+    /// (see <see cref="MergeSha"/> for that). Used by the auto-merge race
+    /// recovery flow to read the local merge's first-parent ancestry when
+    /// detecting upstream base motion.
+    /// </summary>
+    public string? LocalSquashSha { get; init; }
+
+    /// <summary>
+    /// Forge-assigned pull-request number for the PR opened during the
+    /// upstream push phase. Null when no PR was opened (upstream kind has
+    /// no PR concept, AutoMerge disabled and PR creation skipped, or 422
+    /// soft-fail). Paired with <see cref="MergedPrUrl"/> so traceability
+    /// tools have both the canonical number and the operator-clickable URL
+    /// without having to reassemble them.
+    /// </summary>
+    public int? MergedPrNumber { get; init; }
+
+    /// <summary>
+    /// URL of the pull-request the upstream forge opened for this item.
+    /// Null when no PR was opened. See <see cref="MergedPrNumber"/>.
+    /// </summary>
+    public string? MergedPrUrl { get; init; }
 
     /// <summary>
     /// The release this work item belongs to. When set, the orchestrator targets the

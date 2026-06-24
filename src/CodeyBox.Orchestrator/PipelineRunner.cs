@@ -1365,7 +1365,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     (mergeSha, agentStdout) = await RunMergePhase(ct);
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
-                await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
+                // mergeSha is the LOCAL bare-repo merge sha produced by the
+                // agent; it does NOT match the squash commit GitHub mints at
+                // auto-merge time. Persist it on LocalSquashSha so race
+                // recovery can still walk its first-parent ancestry; MergeSha
+                // is reserved for the GitHub-side authoritative sha returned
+                // by upstream.CompleteAsync, written in RunUpstreamPushPhaseAsync.
+                await _store.UpdateAsync(item with { LocalSquashSha = mergeSha }, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
                 await PublishMergeCompletedAsync(item, project, baseBranch, workBranch, mergeSha, ct);
             }
@@ -11702,6 +11708,35 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             if (completed is not null)
             {
+                // Persist the forge-authoritative merge identity BEFORE
+                // publishing pull_request_opened / transitioning to Done so
+                // the webhook + DTO surfaces read the new fields off the
+                // already-saved row rather than the stale local-merge
+                // snapshot. MergeSha gets the GitHub-side sha (the squash
+                // commit GitHub mints — the one that resolves on the
+                // commits API). LocalSquashSha keeps the bare-repo merge
+                // sha for diagnostics. PR number / URL land here so
+                // operator monitoring tools have a single canonical
+                // reference instead of having to reassemble from logs.
+                //
+                // Auto-merge-disabled / graceful-soft-fail outcomes return
+                // MergedSha=null; in that case MergeSha stays null (the
+                // work item is Done but the GitHub merge has not yet
+                // happened — a human will merge later) and the prior
+                // local-only sha lives on LocalSquashSha.
+                if (completed.MergedSha is not null ||
+                    completed.PullRequestNumber is not null ||
+                    completed.PullRequestUrl is not null)
+                {
+                    var preMergePersist = await _store.GetAsync(item.Id, ct) ?? item;
+                    await _store.UpdateAsync(preMergePersist with
+                    {
+                        MergeSha = completed.MergedSha ?? preMergePersist.MergeSha,
+                        MergedPrNumber = completed.PullRequestNumber ?? preMergePersist.MergedPrNumber,
+                        MergedPrUrl = completed.PullRequestUrl ?? preMergePersist.MergedPrUrl,
+                    }, ct);
+                }
+
                 if (completed.PullRequestUrl is not null && completed.PullRequestNumber is not null)
                 {
                     var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -11778,7 +11813,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // gates retry; we always re-run the merge phase after refetching.
         string? preMergeBaseSha = null;
         var currentItem = await _store.GetAsync(item.Id, ct) ?? item;
-        var localMergeSha = currentItem.MergeSha;
+        // Read LocalSquashSha (the local bare-repo merge sha) rather than
+        // MergeSha — the latter holds the GitHub-side authoritative sha
+        // (or is null on the first attempt, since the auto-merge hasn't
+        // succeeded yet during race recovery) and would never resolve via
+        // `git cat-file` against the local bare repo.
+        var localMergeSha = currentItem.LocalSquashSha;
         if (!string.IsNullOrEmpty(localMergeSha))
         {
             try
@@ -11894,7 +11934,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 NewAgentStdout: null);
         }
 
-        await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { MergeSha = newMergeSha }, ct);
+        await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { LocalSquashSha = newMergeSha }, ct);
         return new AutoMergeRaceRecovery(
             ParkReason: null,
             NewMergeSha: newMergeSha,
