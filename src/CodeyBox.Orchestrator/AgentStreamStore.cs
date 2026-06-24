@@ -289,13 +289,23 @@ public sealed class AgentStreamStore : IAgentStreamStore
         if (!TryParseFileName(info.Name, out var phase, out var iteration))
             return null;
 
+        // Use Max(creation, lastWrite) so each per-poll append to the
+        // same .jsonl advances the stamp. Long-batch agents (notably
+        // crock) append a stream chunk per status poll while waiting on
+        // an Anthropic Message Batches API task; if this only read
+        // CreationTimeUtc the watchdog's stream signal would never see
+        // the heartbeats and the per-poll progress emission would be
+        // dead weight from the watchdog's perspective.
+        var capturedAt = info.LastWriteTimeUtc > info.CreationTimeUtc
+            ? info.LastWriteTimeUtc
+            : info.CreationTimeUtc;
         return new AgentStreamFile(
             info.Name,
             phase,
             iteration,
             info.Length,
             includeLineCount ? CountLines(info.FullName, ct) : null,
-            new DateTimeOffset(info.CreationTimeUtc, TimeSpan.Zero));
+            new DateTimeOffset(capturedAt, TimeSpan.Zero));
     }
 
     private static long CountLines(string path, CancellationToken ct)

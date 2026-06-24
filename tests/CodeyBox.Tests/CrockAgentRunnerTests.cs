@@ -807,9 +807,89 @@ public sealed class CrockAgentRunnerTests
     public async Task CrockCredentialProvider_NonCrockAgent_ReturnsNull()
     {
         var provider = new CrockEnvironmentCredentialProvider(
-            static () => new CrockSandboxOptions { HostDaemonSocketPath = "/x" });
+            static () => new CrockSandboxOptions { HostDaemonSocketPath = "/run/host/crock-daemon.sock" });
         Assert.Null(await provider.GetAsync(AgentKind.Claude));
         Assert.Null(await provider.GetAsync(AgentKind.Codex));
+    }
+
+    [Theory]
+    [InlineData("/crock-daemon.sock")]       // parent → "/" (whole host root!)
+    [InlineData("/etc/crock-daemon.sock")]    // parent → "/etc"
+    [InlineData("/run/crock-daemon.sock")]    // parent → "/run"
+    [InlineData("/var/run/crock-daemon.sock")] // parent → "/var/run"
+    [InlineData("/tmp/crock-daemon.sock")]    // parent → "/tmp"
+    [InlineData("/root/crock-daemon.sock")]   // parent → "/root"
+    [InlineData("/proc/crock-daemon.sock")]   // parent → "/proc"
+    [InlineData("/dev/crock-daemon.sock")]    // parent → "/dev"
+    public async Task CrockCredentialProvider_ForbiddenParentDirectory_RefusesCredential(string hostSocketPath)
+    {
+        // Hard catastrophe gate: a misconfigured HostDaemonSocketPath whose
+        // parent directory is a system shared root must NOT produce a
+        // credential bundle. Returning null forces the runner's pre-flight
+        // gate to fire the MissingHostDaemonMarker; the alternative would be
+        // bind-mounting / (or /etc, /run, etc.) read-write into the sandbox
+        // and exposing every host secret to a prompt-injected agent on a
+        // single-character operator typo.
+        var previous = Environment.GetEnvironmentVariable(
+            CrockEnvironmentCredentialProvider.HostConfigEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, "{}");
+            var provider = new CrockEnvironmentCredentialProvider(
+                () => new CrockSandboxOptions { HostDaemonSocketPath = hostSocketPath });
+
+            var cred = await provider.GetAsync(AgentKind.Crock);
+
+            Assert.Null(cred);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, previous);
+        }
+    }
+
+    [Fact]
+    public async Task CrockCredentialProvider_RelativeHostSocketPath_RefusesCredential()
+    {
+        // A bare relative filename (no parent directory) resolves
+        // Path.GetDirectoryName to empty; the provider must refuse rather
+        // than ship a daemon env var pointing at an unmounted location and
+        // letting the in-VM CLI fail late with an opaque connection error.
+        var previous = Environment.GetEnvironmentVariable(
+            CrockEnvironmentCredentialProvider.HostConfigEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, "{}");
+            var provider = new CrockEnvironmentCredentialProvider(
+                static () => new CrockSandboxOptions
+                {
+                    HostDaemonSocketPath = "crock-daemon.sock",
+                });
+
+            var cred = await provider.GetAsync(AgentKind.Crock);
+
+            Assert.Null(cred);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, previous);
+        }
+    }
+
+    [Fact]
+    public void CrockCredentialProvider_ForbiddenParentDirectory_PinsAllowedShape()
+    {
+        // The "good" shape — an operator-dedicated subdirectory under
+        // /run/codeybox — must NOT be flagged as forbidden. Pins the
+        // contract so a future tightening of the catastrophe gate can't
+        // accidentally lock operators out of the documented setup.
+        Assert.False(CrockEnvironmentCredentialProvider.IsForbiddenParentDirectory("/run/codeybox"));
+        Assert.False(CrockEnvironmentCredentialProvider.IsForbiddenParentDirectory("/var/run/codeybox"));
+        Assert.False(CrockEnvironmentCredentialProvider.IsForbiddenParentDirectory("/run/host"));
     }
 
     // --- Model-list probe contract --------------------------------------

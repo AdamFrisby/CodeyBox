@@ -845,6 +845,133 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         Assert.Equal(WorkItemState.NeedsOperatorInput, result.NewState);
     }
 
+    // ── Per-agent ItemStaleTimeout overrides (crock batch-latency liveness) ──
+
+    [Fact]
+    public async Task PerAgentItemStaleOverride_SavesCrockItemFromGlobalCutoff()
+    {
+        // Headline acceptance criterion for crock runtime-enablement on this
+        // watchdog: a crock work item legitimately parked waiting on an
+        // Anthropic Message Batches API task (minutes-to-hours) must NOT be
+        // recovered by the synchronous-agent default ItemStaleTimeout. The
+        // per-agent override under
+        // CodeyBox:WorkerProgressWatchdog:PerAgent:crock:ItemStaleTimeout
+        // extends the per-item stale window for crock items only.
+        _opts.ItemStaleTimeout = TimeSpan.FromMinutes(75);
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(8),
+        };
+
+        // Stale 100 minutes — well past the 75-min global default but inside
+        // the 8h crock override. The watchdog must leave it alone.
+        var crockItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100)) with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
+    public async Task PerAgentItemStaleOverride_StillRecoversCrockItemPastOverrideCeiling()
+    {
+        // Defence-in-depth: the per-agent override extends but does not
+        // disable the watchdog. A crock item stale past the override window
+        // still gets recovered — operators sized the override to the
+        // realistic batch latency, not to "never kill crock".
+        _opts.ItemStaleTimeout = TimeSpan.FromMinutes(75);
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(2),
+        };
+
+        var crockItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddHours(-3),
+            workBranch: "codeybox/auto/work-crock-stuck") with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task PerAgentItemStaleOverride_DoesNotApplyToOtherAgents()
+    {
+        // The override is scoped to the configured kind. A Claude (or any
+        // non-crock) item stale past the global default still gets recovered
+        // even though a crock override is configured — defending against a
+        // bug where an override entry silently widens the window for every
+        // kind.
+        _opts.ItemStaleTimeout = TimeSpan.FromMinutes(75);
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(8),
+        };
+
+        var claudeItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/auto/work-claude-stuck") with
+        { Agent = AgentKind.Claude };
+        await _store.CreateAsync(claudeItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(claudeItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task GlobalItemStaleTimeoutZero_PerAgentOverrideStillFires()
+    {
+        // Off-by-default + per-agent opt-in: the global ItemStaleTimeout=0
+        // would normally short-circuit the sweep entirely (see
+        // Sweep_DisabledByZeroTimeout above). The per-agent override is the
+        // explicit opt-in for the kind, so the sweep must still execute when
+        // one is configured.
+        _opts.ItemStaleTimeout = TimeSpan.Zero;
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(2),
+        };
+
+        // Crock item stale past the override → should be recovered.
+        var crockItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddHours(-3),
+            workBranch: "codeybox/auto/work-crock-zero-global") with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+
+        // A non-crock item past the (zero, ergo disabled) global timeout
+        // must NOT be touched — defending against the override accidentally
+        // re-enabling the sweep for every kind.
+        var claudeItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-200)) with
+        { Agent = AgentKind.Claude };
+        await _store.CreateAsync(claudeItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var afterCrock = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, afterCrock!.State);
+        Assert.Equal(1, afterCrock.RecoveryAttempts);
+
+        var afterClaude = await _store.GetAsync(claudeItem.Id);
+        Assert.Equal(WorkItemState.Working, afterClaude!.State);
+        Assert.Equal(0, afterClaude.RecoveryAttempts);
+    }
+
     // ── Test doubles ────────────────────────────────────────────────────────
 
     private sealed class RecordingSlotReleaser : IWorkerPoolRecoverySlotReleaser

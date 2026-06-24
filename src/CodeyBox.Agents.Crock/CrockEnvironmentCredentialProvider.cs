@@ -115,18 +115,39 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
             if (string.IsNullOrWhiteSpace(hostDir) || string.IsNullOrWhiteSpace(sandboxDir))
             {
                 _log?.LogDebug(
-                    "Crock credential: HostDaemonSocketPath has no parent directory; skipping bind-mount " +
-                    "(the runner pre-flight check will refuse to dispatch)");
+                    "Crock credential: HostDaemonSocketPath has no parent directory; refusing to ship " +
+                    "credential so the runner's pre-flight check fires with the missing-daemon marker");
+                return Task.FromResult<AgentCredential?>(null);
             }
-            else
+
+            if (IsForbiddenParentDirectory(hostDir))
             {
-                mounts.Add(new SandboxMount
-                {
-                    SandboxPath = sandboxDir,
-                    HostPath = hostDir,
-                    ReadOnly = false,
-                });
+                // Catastrophe gate: an operator typo such as
+                // HostDaemonSocketPath="/foo.sock" resolves the parent to "/"
+                // and would bind-mount the entire host filesystem read-write
+                // into the sandbox — defeating sandbox isolation in one
+                // character. The shared-system-root list also blocks /run,
+                // /var/run, /tmp, /var/tmp, /etc, $HOME and the home
+                // directory's parent ("/home") because every one of those
+                // exposes co-located secrets (peer sockets, system D-Bus,
+                // every other tenant's home dir, host shell history, etc.)
+                // to a prompt-injected agent. Operators MUST dedicate a
+                // subdirectory to the daemon socket — see
+                // CrockSandboxOptions docs.
+                _log?.LogWarning(
+                    "Crock credential: refusing to bind-mount catastrophic parent directory (configured " +
+                    "HostDaemonSocketPath resolves to a system root). Operator must dedicate a subdirectory " +
+                    "to the daemon socket. Dispatch will fail at the runner's pre-flight check.");
+                return Task.FromResult<AgentCredential?>(null);
             }
+
+            mounts.Add(new SandboxMount
+            {
+                SandboxPath = sandboxDir,
+                HostPath = hostDir,
+                ReadOnly = false,
+            });
+
             var daemonEnvVar = string.IsNullOrWhiteSpace(opts.DaemonSocketEnvVar)
                 ? "CROCK_DAEMON_SOCKET"
                 : opts.DaemonSocketEnvVar;
@@ -150,5 +171,79 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
         {
             Mounts = mounts,
         });
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="hostDir"/> is one of the shared
+    /// system directories that a bind-mount would expose huge swathes of
+    /// the host to a prompt-injected sandboxed agent (peer sockets, system
+    /// D-Bus, journald, every other tenant's home directory, etc.). The
+    /// match is canonical-path based; comparisons normalise trailing
+    /// slashes and case (Linux is case-sensitive but the operator may
+    /// have hand-typed mixed casing). HOME and HOME's parent are computed
+    /// at call time so the gate tracks the runtime user, not a baked-in
+    /// constant.
+    /// </summary>
+    internal static bool IsForbiddenParentDirectory(string hostDir)
+    {
+        if (string.IsNullOrWhiteSpace(hostDir))
+            return true;
+
+        var normalized = NormalizePath(hostDir);
+        if (normalized.Length == 0)
+            return true;
+
+        // Filesystem root (/, C:\, etc.) — Path.GetDirectoryName for
+        // anything at the root returns this. The single most dangerous
+        // shape because it bind-mounts /etc/shadow, /root/.ssh, every
+        // tenant home dir and every host socket into the VM at once.
+        if (normalized == "/" || normalized == "." || normalized == "..")
+            return true;
+
+        // Hard-coded shared system directories. Operator-friendly: the
+        // log line names the gate so an operator can read the failure
+        // and pick a dedicated subdirectory instead.
+        var forbidden = new[]
+        {
+            "/", "/etc", "/run", "/var", "/var/run", "/tmp", "/var/tmp",
+            "/usr", "/usr/bin", "/usr/lib", "/usr/local", "/usr/local/bin",
+            "/bin", "/sbin", "/lib", "/lib64", "/root", "/home", "/dev",
+            "/proc", "/sys", "/boot", "/opt", "/srv", "/mnt", "/media",
+        };
+        foreach (var f in forbidden)
+        {
+            if (string.Equals(normalized, f, StringComparison.Ordinal))
+                return true;
+        }
+
+        // The current operator's HOME directly (would expose
+        // .ssh / .aws / .config / shell history) and HOME's parent
+        // (would expose every co-tenant home directory).
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrWhiteSpace(home))
+        {
+            var normalizedHome = NormalizePath(home);
+            if (string.Equals(normalized, normalizedHome, StringComparison.Ordinal))
+                return true;
+            var homeParent = Path.GetDirectoryName(normalizedHome);
+            if (!string.IsNullOrWhiteSpace(homeParent)
+                && string.Equals(normalized, NormalizePath(homeParent!), StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string NormalizePath(string path)
+    {
+        var trimmed = path.Trim();
+        if (trimmed.Length == 0) return trimmed;
+        // Strip trailing slashes except for the bare root.
+        while (trimmed.Length > 1
+            && (trimmed.EndsWith('/') || trimmed.EndsWith(Path.DirectorySeparatorChar)))
+        {
+            trimmed = trimmed[..^1];
+        }
+        return trimmed;
     }
 }

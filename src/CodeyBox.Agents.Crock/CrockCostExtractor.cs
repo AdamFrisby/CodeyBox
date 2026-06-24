@@ -33,8 +33,13 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
     /// <summary>
     /// Post-batch-discount fallback for any model id the pricing file does
     /// not enumerate. Half the Anthropic on-demand <c>/v1/messages</c>
-    /// Opus-tier rate (the conservative top end among CrockCode's accepted
-    /// model set), so spend never under-bills relative to the upper bound.
+    /// Opus-tier rate (the conservative top end <em>within CrockCode's
+    /// curated Anthropic-Claude set</em>). Operators pinning an unknown
+    /// model id from a pricier family (e.g. a future frontier model
+    /// released after this list was curated) should configure an explicit
+    /// per-model rate in <c>agent-pricing-defaults.json</c> rather than
+    /// relying on this fallback — the fallback only guarantees the upper
+    /// bound for ids the curated set already covers.
     /// </summary>
     public ModelRateConfig? DefaultPricing { get; } = new()
     {
@@ -77,9 +82,17 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
     {
         if (string.IsNullOrWhiteSpace(stdout)) return null;
 
-        int inputTokens = 0, outputTokens = 0, cachedTokens = 0;
+        // Prefer the typed `type:"result"` envelope (Anthropic's terminal
+        // billable totals); fall back to the bare `usage` shape only when
+        // no result envelope is seen. ClaudeCostExtractor uses the same
+        // ordering precisely because a per-message partial `usage` line
+        // emitted AFTER the result envelope would otherwise clobber the
+        // final totals.
+        int resultInput = 0, resultOutput = 0, resultCached = 0;
+        bool sawResult = false;
+        int bareInput = 0, bareOutput = 0, bareCached = 0;
+        bool sawBareUsage = false;
         string? modelId = null;
-        bool foundUsage = false;
 
         foreach (var line in stdout.Split('\n',
             StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -90,37 +103,27 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
                 using var doc = JsonDocument.Parse(line);
                 var root = doc.RootElement;
 
-                // CrockCode mirrors Anthropic's terminal "result" / "usage"
-                // shape (the message batches API returns the same envelope as
-                // /v1/messages). When the CLI surfaces a wrapper "type" field,
-                // honour it; otherwise treat any object that carries a
-                // "usage" property as the terminal envelope.
-                JsonElement usage = default;
-                bool hasUsage = false;
-                if (root.TryGetProperty("type", out var typeProp)
+                var isResult = root.TryGetProperty("type", out var typeProp)
                     && typeProp.ValueKind == JsonValueKind.String
-                    && string.Equals(typeProp.GetString(), "result", StringComparison.Ordinal)
-                    && root.TryGetProperty("usage", out var typedUsage))
+                    && string.Equals(typeProp.GetString(), "result", StringComparison.Ordinal);
+
+                if (isResult && root.TryGetProperty("usage", out var typedUsage))
                 {
-                    usage = typedUsage;
-                    hasUsage = true;
+                    ExtractUsageCounts(typedUsage, out var input, out var output, out var cached);
+                    resultInput = input;
+                    resultOutput = output;
+                    resultCached = cached;
+                    sawResult = true;
                 }
-                else if (root.TryGetProperty("usage", out var bareUsage)
+                else if (!isResult
+                    && root.TryGetProperty("usage", out var bareUsage)
                     && bareUsage.ValueKind == JsonValueKind.Object)
                 {
-                    usage = bareUsage;
-                    hasUsage = true;
-                }
-
-                if (hasUsage)
-                {
-                    var freshInput = usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv) ? itv : 0;
-                    var cacheCreation = usage.TryGetProperty("cache_creation_input_tokens", out var cct) && cct.TryGetInt32(out var cctv) ? cctv : 0;
-                    var cacheRead = usage.TryGetProperty("cache_read_input_tokens", out var ct) && ct.TryGetInt32(out var ctv) ? ctv : 0;
-                    inputTokens = freshInput + cacheCreation;
-                    outputTokens = usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv) ? otv : 0;
-                    cachedTokens = cacheRead;
-                    foundUsage = true;
+                    ExtractUsageCounts(bareUsage, out var input, out var output, out var cached);
+                    bareInput = input;
+                    bareOutput = output;
+                    bareCached = cached;
+                    sawBareUsage = true;
                 }
 
                 if (modelId is null && root.TryGetProperty("model", out var topModel)
@@ -142,8 +145,22 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
             catch (InvalidOperationException) { }
         }
 
-        if (!foundUsage) return null;
-        return new AgentCostSnapshot(inputTokens, cachedTokens, outputTokens, modelId);
+        if (sawResult)
+            return new AgentCostSnapshot(resultInput, resultCached, resultOutput, modelId);
+        if (sawBareUsage)
+            return new AgentCostSnapshot(bareInput, bareCached, bareOutput, modelId);
+        return null;
+    }
+
+    private static void ExtractUsageCounts(
+        JsonElement usage, out int inputTokens, out int outputTokens, out int cachedTokens)
+    {
+        var freshInput = usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv) ? itv : 0;
+        var cacheCreation = usage.TryGetProperty("cache_creation_input_tokens", out var cct) && cct.TryGetInt32(out var cctv) ? cctv : 0;
+        var cacheRead = usage.TryGetProperty("cache_read_input_tokens", out var crt) && crt.TryGetInt32(out var crtv) ? crtv : 0;
+        inputTokens = freshInput + cacheCreation;
+        outputTokens = usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv) ? otv : 0;
+        cachedTokens = cacheRead;
     }
 
     private static AgentCostSnapshot? TryParseHumanReadable(string? text)

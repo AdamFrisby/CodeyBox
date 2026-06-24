@@ -44,10 +44,17 @@ namespace CodeyBox.Agents.Crock;
 /// availability check. The list-models endpoint is the canonical zero-cost
 /// auth check.</para>
 ///
-/// <para><b>Reactive 429 gating.</b> The runner calls
-/// <see cref="MarkExhaustedAsync"/> when a real dispatch returns 429 so the
-/// next pickup of the same member is gated immediately, without waiting for
-/// the next periodic probe.</para>
+/// <para><b>Reactive 429 gating (planned).</b>
+/// <see cref="MarkExhaustedAsync"/> is the hook the pipeline calls when a
+/// real dispatch returns 429 so the next pickup of the same member is gated
+/// immediately, without waiting for the next periodic probe. Wiring is
+/// driven by the pipeline's <c>CompositeQuotaFailureClassifier</c> +
+/// <c>TerminalQuotaError</c> path; today no <c>IAgentQuotaFailureDetector</c>
+/// is registered for <see cref="AgentKind.Crock"/>, so the override fires
+/// only when an operator drives it directly (and via dedicated unit tests).
+/// Adding a <c>CrockQuotaFailureDetector</c> mirroring
+/// <c>ClaudeQuotaFailureDetector</c> (CrockCode rides Anthropic's
+/// <c>/v1/messages</c> wire shapes) is the follow-up.</para>
 ///
 /// <para><b>Subscription OAuth NEVER reaches Anthropic via this path.</b> The
 /// caller supplies <see cref="AgentQuotaCredentials.AccessToken"/> derived
