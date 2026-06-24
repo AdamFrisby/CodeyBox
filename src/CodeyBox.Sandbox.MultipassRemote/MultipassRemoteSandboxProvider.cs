@@ -283,8 +283,11 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 name, opts.VmNamePrefix);
             return;
         }
-        await BestEffortRemoteDeleteAsync(name, JoinRemote(opts.RemoteStagingRoot, name)).ConfigureAwait(false);
-        _ = ct;
+        // Honor the reaper's cancellation token: if the orchestrator is
+        // shutting down, abandon this sweep — the leak isn't going anywhere
+        // and the next sweep will retry. The CreateAsync rollback path uses a
+        // different overload pinned to CancellationToken.None.
+        await BestEffortRemoteDeleteAsync(name, JoinRemote(opts.RemoteStagingRoot, name), ct).ConfigureAwait(false);
     }
 
     public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
@@ -411,21 +414,32 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
     }
 
-    internal async Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot)
+    internal Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot)
+        => BestEffortRemoteDeleteAsync(vmName, remoteSandboxRoot, CancellationToken.None);
+
+    internal async Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot, CancellationToken ct)
     {
-        // Use a no-cancellation context: cleanup MUST run even when the outer
-        // call was cancelled.
+        // Callers pass CancellationToken.None when the cleanup MUST run
+        // regardless of outer cancellation (e.g. CreateAsync rollback after a
+        // partial launch); the leak reaper passes its own token so it can
+        // abandon mid-sweep on orchestrator shutdown.
         try
         {
             var opts = _optsAccessor();
             await _transport.RunAsync(
                 [opts.RemoteMultipassPath, "delete", "--purge", vmName],
                 stdin: null,
-                ct: CancellationToken.None).ConfigureAwait(false);
+                ct: ct).ConfigureAwait(false);
             await _transport.RunAsync(
                 ["rm", "-rf", remoteSandboxRoot],
                 stdin: null,
-                ct: CancellationToken.None).ConfigureAwait(false);
+                ct: ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Honored cancellation — not a failure. Let it propagate so the
+            // caller (reaper) can finish its shutdown promptly.
+            throw;
         }
         catch (RemoteSshTransportException ex)
         {
