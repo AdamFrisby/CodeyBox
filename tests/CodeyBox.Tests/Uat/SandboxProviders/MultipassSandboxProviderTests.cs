@@ -1279,6 +1279,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stderr);
         Assert.Equal("", await File.ReadAllTextAsync(visibleEnvironmentFile));
         Assert.Equal("poison-agent-run-id", await File.ReadAllTextAsync(visibleRunIdFile));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
     }
 
     [Fact]
