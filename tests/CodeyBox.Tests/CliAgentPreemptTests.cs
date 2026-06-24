@@ -109,23 +109,29 @@ public sealed class CliAgentPreemptTests
         var run1 = runner.RunAsync(sandbox1, "/work", prompt, credential: null);
         var run2 = runner.RunAsync(sandbox2, "/work", prompt, credential: null, ct: keepSecondRunning.Token);
 
+        // Deadlines here intentionally exceed the sibling single-sandbox test's
+        // 10s: this case runs two sandboxes and two trapped shells in parallel,
+        // and under whole-suite CPU saturation the per-sandbox readiness and
+        // post-preempt teardown can each consume several real-time seconds.
+        // See watchdog-progress test (commit 36e7e54) for the same bump rationale.
         var ready1 = await WaitForAsync(
             () => sandbox1.ExecAsync(new SandboxExec { Argv = ["test", "-f", "preempt-ready"], WorkingDirectory = "/work" }),
-            TimeSpan.FromSeconds(10));
+            TimeSpan.FromSeconds(30));
         var ready2 = await WaitForAsync(
             () => sandbox2.ExecAsync(new SandboxExec { Argv = ["test", "-f", "preempt-ready"], WorkingDirectory = "/work" }),
-            TimeSpan.FromSeconds(10));
+            TimeSpan.FromSeconds(30));
         Assert.True(ready1.Success, ready1.Stderr);
         Assert.True(ready2.Success, ready2.Stderr);
 
         await runner.RequestPreemptAsync(sandbox1, "/work");
 
-        var stopped = await run1.WaitAsync(TimeSpan.FromSeconds(10));
+        var stopped = await run1.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.True(stopped.Success, stopped.Stderr);
         Assert.False(run2.IsCompleted);
 
         await keepSecondRunning.CancelAsync();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run2);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => run2.WaitAsync(TimeSpan.FromSeconds(30)));
     }
 
     [Fact]
