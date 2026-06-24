@@ -427,6 +427,36 @@ public sealed class KnobWorkPromptPreprocessorTests
     }
 
     [Fact]
+    public async Task MissingWorkItem_AuditPhase_ReturnsPromptUnchanged_NoThrow()
+    {
+        // Release deep audits (ReleaseService.RunDeepAuditIterationAsync) wrap
+        // the auditor's runner with a SYNTHETIC WorkItemId built from the
+        // release id. That id never matches a row in IWorkItemStore — releases
+        // are stored separately — so a null return here is the expected shape
+        // for the release-level deep-audit path. The preprocessor MUST NOT
+        // throw on that path: throwing here regressed every LLM-based deep
+        // auditor (LlmReviewAuditor, OwaspAsvsDeepAuditor, …) to zero findings
+        // because ReleaseService swallows the exception as a LogWarning and
+        // the iteration completes with no findings recorded.
+        //
+        // Pin the tolerant behaviour: when the Audit-phase preprocessor is
+        // called with a WorkItemId that the store can't see, fall through
+        // with the prompt unchanged. Mirrors the existing unknown-key
+        // tolerance: the preprocessor never fails the pipeline when the
+        // per-item knob context is unavailable on the audit phase.
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem());
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var unknownId = WorkItemId.New();
+        var result = await preprocessor.ProcessAsync(
+            NewContext(unknownId, AgentPromptPhase.Audit),
+            "deep-audit prompt body");
+
+        Assert.Equal("deep-audit prompt body", result);
+    }
+
+    [Fact]
     public async Task FreeFormPromptFragment_WithoutSafetyOptIn_Throws()
     {
         var registry = new KnobRegistry([new UnsafeFreeFormKnob()]);

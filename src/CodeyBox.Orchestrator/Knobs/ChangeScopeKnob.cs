@@ -95,70 +95,35 @@ public sealed class ChangeScopeKnob : IKnob
     /// Telemetry-side helper for callers that already have an item's and a
     /// project's knob maps but no <see cref="IKnobRegistry"/> on hand. Resolves
     /// the effective <c>changeScope</c> value following the registry's
-    /// item → project → default precedence and returns the registry's
-    /// <see cref="ValueModerate"/> default when neither map carries a value.
-    /// Used by the merge path to stamp <c>changeScope</c> on merge timing
-    /// metadata and on the agentic conflict resolver context without taking
-    /// a registry dependency in <c>PipelineRunner</c>.
+    /// item → project → default precedence and returns <see cref="ValueModerate"/>
+    /// when neither map carries a value. Used by the merge path to stamp
+    /// <c>changeScope</c> on merge timing metadata and on the agentic conflict
+    /// resolver context without taking a registry dependency in
+    /// <c>PipelineRunner</c>.
     ///
     /// <para>
-    /// Defense-in-depth: each tier's value is canonicalised against
-    /// <see cref="AllowedValues"/> (case-insensitive, whitespace-trimmed). A
-    /// stored value that does not parse as a known value (older descriptor
-    /// retired the value, manual tampering) falls through to the next
-    /// precedence tier rather than leaking onto telemetry tags. Dictionary
-    /// lookups also defend against case-sensitive comparers on the supplied
-    /// maps by re-scanning when the direct lookup misses.
+    /// Implementation delegates to a private singleton <see cref="KnobRegistry"/>
+    /// scoped to this one descriptor, so precedence, case-insensitive lookup,
+    /// whitespace handling, and AllowedValues canonicalisation all flow through
+    /// the same code path that <see cref="IKnobRegistry.Resolve"/> uses on the
+    /// prompt-assembly side — the two surfaces cannot drift, and any future
+    /// addition to <see cref="AllowedValues"/> is picked up automatically here.
     /// </para>
     /// </summary>
     public static string ResolveEffectiveValue(
         IReadOnlyDictionary<string, string>? itemKnobs,
         IReadOnlyDictionary<string, string>? projectKnobs)
     {
-        if (TryGetCanonical(itemKnobs, out var itemValue))
-            return itemValue;
-        if (TryGetCanonical(projectKnobs, out var projectValue))
-            return projectValue;
-        return ValueModerate;
+        var resolved = SingletonRegistry.Resolve(itemKnobs, projectKnobs);
+        return resolved.TryGetValue(KeyName, out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : ValueModerate;
     }
 
-    private static bool TryGetCanonical(
-        IReadOnlyDictionary<string, string>? map,
-        out string canonical)
-    {
-        canonical = string.Empty;
-        if (map is null)
-            return false;
-
-        if (!map.TryGetValue(KeyName, out var raw))
-        {
-            // The interface carries no comparer guarantee. If the direct
-            // lookup misses, re-scan case-insensitively so a map built with
-            // a case-sensitive (default) comparer still hits.
-            foreach (var kv in map)
-            {
-                if (string.Equals(kv.Key, KeyName, StringComparison.OrdinalIgnoreCase))
-                {
-                    raw = kv.Value;
-                    goto found;
-                }
-            }
-            return false;
-        }
-found:
-        if (string.IsNullOrWhiteSpace(raw))
-            return false;
-        var trimmed = raw.Trim();
-        foreach (var allowed in new[] { ValueSurgical, ValueModerate, ValueRefactor })
-        {
-            if (string.Equals(allowed, trimmed, StringComparison.OrdinalIgnoreCase))
-            {
-                canonical = allowed;
-                return true;
-            }
-        }
-        // Unknown value — fall through to next precedence tier so telemetry
-        // and the registry-driven prompt path agree on the effective value.
-        return false;
-    }
+    // Process-scoped registry seeded with a single ChangeScopeKnob descriptor.
+    // Reuses KnobRegistry's existing precedence / canonicalisation logic
+    // instead of duplicating it — single source of truth shared with the
+    // prompt-assembly path. The registry is immutable after construction so
+    // sharing it across calls is safe.
+    private static readonly KnobRegistry SingletonRegistry = new([new ChangeScopeKnob()]);
 }

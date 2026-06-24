@@ -61,6 +61,24 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
         var item = await _store.GetAsync(ctx.ItemId, ct).ConfigureAwait(false);
         if (item is null)
         {
+            // Audit-phase callers include release-level deep audits, which wrap
+            // the runner with a SYNTHETIC WorkItemId built from a release id
+            // (ReleaseService.RunDeepAuditIterationAsync). That id never has a
+            // row in IWorkItemStore — releases are stored separately — so a
+            // null return here is the expected shape for the deep-audit path,
+            // not a bug. Fall through without item-knob fragments: project
+            // knobs alone do not contribute (the Resolve call below needs an
+            // item knob map, and the audit fragment surface today is per-item
+            // only). Returning the prompt unchanged matches the
+            // "knob with nothing to say contributes nothing" framework rule.
+            //
+            // Work phase keeps the historical fail-closed behaviour: a missing
+            // item there means the orchestrator handed us an id the store
+            // can't see, which is a real defect we want surfaced rather than
+            // silently dropping item knobs that the agent depends on.
+            if (ctx.Phase == AgentPromptPhase.Audit)
+                return prompt;
+
             _log.LogError(
                 "Work item {WorkItemId} was not found while applying knob prompt directives",
                 ctx.ItemId);

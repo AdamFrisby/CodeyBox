@@ -1840,6 +1840,55 @@ public sealed class AgenticConflictResolverTests
             e => e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("surgical", true)]
+    [InlineData("refactor", true)]
+    [InlineData("moderate", false)]
+    [InlineData("SURGICAL", true)]
+    [InlineData("  refactor  ", true)]
+    [InlineData("", false)]
+    public async Task ResolveAsync_StartingLogGatedOnNonDefaultChangeScope(
+        string changeScope,
+        bool expectLogEmitted)
+    {
+        // The orchestrator always supplies an effective changeScope via the
+        // knob registry, defaulting to "moderate" when neither the item nor
+        // the project sets the knob. If the resolver emitted the start log
+        // unconditionally, every conflict resolution would tag the line with
+        // changeScope=moderate — drowning out the surgical/refactor signal
+        // operators rely on for correlating conflict-prone behaviour. Pin
+        // the gating: only the non-default values (surgical, refactor) light
+        // the log. Mirrors the prompt-fragment contract — "moderate" is the
+        // existing default and contributes nothing.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var logger = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            log: logger);
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "claimed", null, null);
+        });
+
+        _ = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge)
+            {
+                ChangeScope = changeScope,
+            },
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        var emitted = logger.Entries.Any(
+            e => e.Level == LogLevel.Information &&
+                 e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+        Assert.Equal(expectLogEmitted, emitted);
+    }
+
     [Fact]
     public void AgenticConflictResolverContext_ChangeScope_SurvivesRecordCopy()
     {

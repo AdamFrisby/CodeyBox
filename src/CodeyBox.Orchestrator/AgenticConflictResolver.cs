@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Orchestrator;
@@ -92,9 +93,13 @@ public sealed record AgenticConflictResolverContext(
     /// the start-of-resolve <c>LogInformation</c> in
     /// <see cref="AgenticConflictResolver.ResolveAsync"/>, which tags the line
     /// with <c>changeScope=…</c> so operators can correlate refactor-scoped
-    /// items with merge-conflict-prone behaviour. Empty / null when the
-    /// orchestrator did not resolve the knob (older callers); the log line is
-    /// then suppressed rather than emitting an empty tag.
+    /// items with merge-conflict-prone behaviour. The log line only fires for
+    /// non-default values (<c>surgical</c> / <c>refactor</c>) — the default
+    /// <c>moderate</c> matches today's behaviour and would drown out the
+    /// signal the log is meant to surface (the orchestrator always supplies an
+    /// effective value, so an unconditional log would tag every single merge).
+    /// Empty / null is treated the same as <c>moderate</c>: the log line is
+    /// suppressed rather than emitting a noisy unset tag.
     /// </summary>
     public string? ChangeScope { get; init; }
 }
@@ -267,7 +272,13 @@ public sealed class AgenticConflictResolver
         foreach (var file in conflictFiles)
             MergeConflictPathInspector.ValidateRelativeWorkPath(file);
 
-        if (!string.IsNullOrWhiteSpace(context.ChangeScope))
+        // Gate the start-of-resolve log on non-default scopes only. The
+        // orchestrator always supplies an effective changeScope (defaulting to
+        // ValueModerate), so an unconditional log would tag every conflict
+        // resolution — drowning out the surgical/refactor signal this line
+        // exists to surface. Match the prompt-fragment contract: moderate is
+        // the existing default and contributes nothing.
+        if (ChangeScopeIsActionable(context.ChangeScope))
         {
             _log.LogInformation(
                 "Agentic conflict resolver: starting for {WorkItemId} on {Operation} (changeScope={ChangeScope}, conflictFiles={Count})",
@@ -908,4 +919,21 @@ public sealed class AgenticConflictResolver
         {
             RequiresStructuredStreamForSessionId: true,
         };
+
+    /// <summary>
+    /// True when the resolved <c>changeScope</c> value is something operators
+    /// want a log signal about (i.e. <c>surgical</c> or <c>refactor</c>). The
+    /// default <c>moderate</c> matches today's behaviour and is intentionally
+    /// silent — the start-of-resolve log exists to highlight the conflict-
+    /// prone (refactor) and conflict-friendly (surgical) cases against the
+    /// background of moderate runs, so emitting it for every merge would
+    /// drown out the signal.
+    /// </summary>
+    private static bool ChangeScopeIsActionable(string? changeScope)
+    {
+        if (string.IsNullOrWhiteSpace(changeScope)) return false;
+        var trimmed = changeScope.Trim();
+        return string.Equals(trimmed, ChangeScopeKnob.ValueSurgical, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, ChangeScopeKnob.ValueRefactor, StringComparison.OrdinalIgnoreCase);
+    }
 }
