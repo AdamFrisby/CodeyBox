@@ -9,7 +9,13 @@ namespace CodeyBox.Tests;
 /// background sweep feeds the registry, and that per-agent probes invoked via
 /// <see cref="PeriodicSmokeProbeService.ProbeAsync"/> are exposed for the
 /// <c>/admin/agent/{name}/smoke</c> endpoint.
+///
+/// <para>Pinned to the "Background service timing" collection because
+/// <see cref="BackgroundSweep_DisabledThenEnabled_ResumesAfterHotReload"/>
+/// asserts on a 20 ms BackgroundService loop tick — suite-level threadpool
+/// contention from parallel fixtures was tripping its WaitUntilAsync timeout.</para>
 /// </summary>
+[Xunit.Collection("Background service timing")]
 public sealed class PeriodicSmokeProbeServiceTests
 {
     private static PeriodicSmokeProbeService Build(
