@@ -8,6 +8,11 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Verifies that OrchestratorService never exceeds MaxConcurrentWorkers
 /// simultaneous in-flight items regardless of queue depth.
+///
+/// <para>Pinned to the "Background service timing" collection because the
+/// assertions count in-flight pipelines under wall-clock deadlines — suite-
+/// level threadpool contention from parallel fixtures was producing
+/// "At least one item should have run" failures.</para>
 /// </summary>
 // Serialised with other BackgroundService timing-sensitive tests: the test gives
 // the orchestrator 15s to dispatch and complete N items, which can miss under

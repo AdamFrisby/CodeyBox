@@ -10,6 +10,11 @@ namespace CodeyBox.Tests;
 /// Verifies priority-aware dispatch ordering, PATCH /workitems/{id}/priority
 /// validation and re-ordering, persistence across restart, and the
 /// equal-priority FIFO tie-break.
+///
+/// <para>Pinned to the "Background service timing" collection because the
+/// dispatch ordering tests poll a live <see cref="OrchestratorService"/> with
+/// a 30s wall-clock budget — suite-level threadpool contention from parallel
+/// fixtures was tripping the timeout.</para>
 /// </summary>
 [Collection("Background service timing")]
 public sealed class WorkItemPriorityTests : IDisposable

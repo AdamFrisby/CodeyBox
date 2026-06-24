@@ -19,8 +19,14 @@ namespace CodeyBox.Tests.Uat.SandboxProviders;
 /// <summary>
 /// UAT coverage for <c>Multipass sandbox provider - Runs agents in isolated Ubuntu VMs with host-enforced network profiles</c>.
 /// Plan anchor: docs/uat/00-plan.md#multipass-sandbox-provider---runs-agents-in-isolated-ubuntu-vms-with-host-enforced-network-profiles
+///
+/// <para>Pinned to the "Background service timing" collection because the
+/// detached-exec poll/exit-poster tests budget 10–25s of wall-clock for
+/// loopback HTTP ingest plus retry-with-health-probe traffic — suite-level
+/// threadpool contention from parallel fixtures was tripping the per-test
+/// <see cref="CancellationTokenSource"/> deadline.</para>
 /// </summary>
-[Collection("Background service timing")]
+[Xunit.Collection("Background service timing")]
 public sealed class MultipassSandboxProviderTests : IDisposable
 {
     private static readonly byte[] TinyPng = Convert.FromBase64String(
