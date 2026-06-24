@@ -107,6 +107,23 @@ public sealed class TerminalFailureRecoveryServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AuthRequired_failure_is_not_retried_or_scheduled()
+    {
+        var fixture = BuildFixture();
+        var item = CreateFailedItem(failureKind: WorkItemFailureKinds.AuthRequired);
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.RunSweepAsync();
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal(0, stored.TerminalRetryAttempts);
+        Assert.Null(stored.NextTerminalRetryAt);
+        AssertEvent(item, action: "parked", failureClass: "Deterministic");
+    }
+
+    [Fact]
     public async Task AuditFailed_is_swept_and_parked_as_Deterministic()
     {
         var fixture = BuildFixture();

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
@@ -219,6 +220,214 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Contains("did not pass after 1 iterations", final.LastError);
+    }
+
+    [Fact]
+    public async Task LlmAuditAgent_Exit0StderrAuthPromptWithoutResult_BenchesAgentAndPublishesAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
+        agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        agent.AuditAgentResults.Enqueue(new AgentResult(true, "ok", null, transcript));
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = agent,
+            ReviewFocus = "security review",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            maxAuditIterations: 1,
+            webhookDispatcher: webhooks,
+            availabilityRegistry: availability,
+            requiredBuildVerifier: new TestRequiredBuildVerifier(
+                RequiredBuildProbeResult.Applies,
+                RequiredBuildVerificationResult.Passed(0, "ok")),
+            agentOverride: agent);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("audit:security:llm-review", final.LastError);
+
+        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("audit:security:llm-review", details.Reason);
+    }
+
+    [Fact]
+    public async Task LlmAuditAgent_Exit0StdoutAuthPromptWithoutResult_FailsBenchesAndAlerts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
+        agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        agent.AuditAgentResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = agent,
+            ReviewFocus = "security review",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            maxAuditIterations: 1,
+            webhookDispatcher: webhooks,
+            availabilityRegistry: availability,
+            requiredBuildVerifier: new TestRequiredBuildVerifier(
+                RequiredBuildProbeResult.Applies,
+                RequiredBuildVerificationResult.Passed(0, "ok")),
+            agentOverride: agent);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("audit:security:llm-review", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+
+        var agentAvailability = availability.GetAvailability(AgentKind.Claude);
+        Assert.False(agentAvailability.Available, agentAvailability.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+    }
+
+    [Fact]
+    public async Task LlmAuditAgent_NonzeroStderrAuthPrompt_BenchesBeforeTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
+        agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        agent.AuditAgentResults.Enqueue(new AgentResult(false, "agent exited 1", null, transcript));
+        agent.AuditAgentResults.Enqueue(new AgentResult(true, "would be retry", "retry should not run", null));
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = agent,
+            ReviewFocus = "security review",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            maxAuditIterations: 1,
+            webhookDispatcher: webhooks,
+            availabilityRegistry: availability,
+            requiredBuildVerifier: new TestRequiredBuildVerifier(
+                RequiredBuildProbeResult.Applies,
+                RequiredBuildVerificationResult.Passed(0, "ok")),
+            agentOverride: agent);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("audit:security:llm-review", final.LastError);
+
+        Assert.Single(agent.AuditAgentResults);
+        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("audit:security:llm-review", details.Reason);
+    }
+
+    [Fact]
+    public async Task LlmAuditAgent_StdoutAuthPromptWithQuotaDiagnostic_FailsBeforeQuotaParkingAndBenches()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
+        agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        agent.AuditAgentResults.Enqueue(new AgentResult(
+            false,
+            "agent exited 1",
+            "Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted",
+            "RESOURCE_EXHAUSTED quota exceeded"));
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = agent,
+            ReviewFocus = "security review",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            maxAuditIterations: 1,
+            webhookDispatcher: webhooks,
+            availabilityRegistry: availability,
+            requiredBuildVerifier: new TestRequiredBuildVerifier(
+                RequiredBuildProbeResult.Applies,
+                RequiredBuildVerificationResult.Passed(0, "ok")),
+            agentOverride: agent);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Null(final.QuotaRetryFrom);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+
+        var agentAvailability = availability.GetAvailability(AgentKind.Claude);
+        Assert.False(agentAvailability.Available, agentAvailability.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
     }
 
     [Fact]

@@ -101,6 +101,67 @@ public static class AgentFailureClassifier
         "OAuth token expired",
     };
 
+    private static readonly IReadOnlyList<string> AuthRequiredLoginPromptPrefixes = new[]
+    {
+        "Authentication required. Please visit",
+        "Please visit the URL to log in",
+    };
+
+    private static readonly IReadOnlyList<string> AuthRequiredWaitOrTimeoutLinePrefixes = new[]
+    {
+        "Waiting for authentication (timeout",
+        "Error: authentication timed out",
+    };
+
+    private static readonly IReadOnlyList<string> AuthRequiredLinePrefixes =
+        AuthRequiredLoginPromptPrefixes
+            .Concat(AuthRequiredWaitOrTimeoutLinePrefixes)
+            .ToArray();
+
+    private static readonly IReadOnlyList<string> AuthRequiredExactLines = new[]
+    {
+        "authentication timed out",
+    };
+
+    private static readonly IReadOnlyList<string> OAuthLoginUrlFragments = new[]
+    {
+        "accounts.google.com/o/oauth2",
+    };
+
+    private static readonly IReadOnlyList<string> CliLoginCommandFragments = new[]
+    {
+        "run `agy login`",
+        "run `gemini auth login`",
+        "run `agent login`",
+        "run `opencode auth login`",
+        "run `codex login`",
+        "run `claude login`",
+    };
+
+    /// <summary>
+    /// Substrings that signal a CLI is prompting for interactive login rather
+    /// than running the task. These are separated from <see cref="AuthPatterns"/>
+    /// because they can occur on exit-0 runs that otherwise look like a benign
+    /// no-diff outcome.
+    ///
+    /// <para>Patterns are deliberately CLI-specific phrasings (full-sentence
+    /// prompts, OAuth-callback URLs, <c>`agy login`</c>-style suggestions) so a
+    /// matching string in a model's task response — e.g. explaining a 401
+    /// response shape, or coding an auth flow — does NOT trip the breaker on
+    /// an otherwise healthy agent. Generic substrings like "not logged in"
+    /// were intentionally rejected after the auditor flagged them as too
+    /// broad. The orchestrator-side <c>AgentAuthFailureClassifier</c> applies
+    /// operator-supplied <c>CodeyBox:AuthFailurePatterns</c> to stderr/stdout
+    /// with stream scoping; stdout additions should remain tightly formed CLI
+    /// transcript signatures.</para>
+    /// </summary>
+    public static readonly IReadOnlyList<string> AuthRequiredPatterns =
+        AuthRequiredLinePrefixes
+            .Concat(AuthRequiredExactLines)
+            .Concat(OAuthLoginUrlFragments)
+            .Concat(CliLoginCommandFragments)
+            .ToArray();
+
     /// <summary>
     /// Substrings that signal a transient connectivity failure where a retry
     /// (against the same agent or another) may succeed without operator action.
@@ -215,13 +276,22 @@ public static class AgentFailureClassifier
     /// Order of checks is fixed: prerequisite materialisation and exit-127
     /// sandbox provisioning failures first, then quota (so a 429 in stderr is
     /// never stolen by a generic "connection reset" hint somewhere else in the
-    /// payload), then auth, then network. Never throws.
+    /// payload), then interactive-login auth, then auth, then network. Never
+    /// throws.
     /// </para>
     /// </summary>
     public static AgentFailureClassification Classify(string? stderr, string? stdout = null) =>
         Classify(stderr, stdout, summary: null);
 
     public static AgentFailureClassification Classify(string? stderr, string? stdout, string? summary)
+        => Classify(default, stderr, stdout, summary);
+
+    public static AgentFailureClassification Classify(
+        AgentKind kind,
+        string? stderr,
+        string? stdout,
+        string? summary,
+        IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>>? additionalAuthPatternsByAgent = null)
     {
         if (IsMaterialisationFailure(summary))
             return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent prerequisite materialisation failed");
@@ -245,7 +315,18 @@ public static class AgentFailureClassifier
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
-        if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
+        var authRequired = DetectAuthRequired(
+            kind,
+            stderr,
+            stdout,
+            additionalAuthPatternsByAgent);
+        if (authRequired is not null)
+        {
+            return authRequired.Classification;
+        }
+
+        var stderrAuthError = ContainsAuthErrorPattern(stderr);
+        if (stderrAuthError || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
         // The transient list is intentionally conservative; apply it to the
@@ -263,6 +344,83 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
         return new AgentFailureClassification(AgentFailureKind.Normal);
+    }
+
+    public static AgentAuthFailureDetection? DetectAuthRequired(
+        AgentKind kind,
+        string? stderr,
+        string? stdout,
+        IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>>? additionalPatternsByAgent = null)
+    {
+        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
+            return null;
+
+        var matchedStderr = ContainsAuthRequiredPatternInStderr(stderr);
+        var matchedStderrAuthError = ContainsAuthErrorPattern(stderr);
+        // Compute the trusted-transcript hit once and reuse it: the public
+        // ContainsAuthRequiredPatternInStdout helper would otherwise re-split
+        // the stdout buffer line-by-line a second time on the hot path.
+        var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
+        var matchedDefaultStdout = matchedTrustedStdoutTranscript
+            || ContainsShortAuthRequiredStdout(stdout);
+        var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
+        var matchedConfiguredStdout = false;
+
+        foreach (var pattern in AdditionalAuthPatternsFor(kind, additionalPatternsByAgent))
+        {
+            if (string.IsNullOrWhiteSpace(pattern.Pattern))
+                continue;
+
+            if (pattern.MatchesStderr
+                && !string.IsNullOrEmpty(stderr)
+                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedStderr = true;
+            }
+
+            if (pattern.MatchesStdout
+                && !string.IsNullOrEmpty(stdout)
+                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedConfiguredStdout = true;
+            }
+        }
+
+        var matchedStdout = matchedDefaultStdout || matchedConfiguredStdout
+            || matchedStderrAuthError && matchedStdoutFragment;
+        if (matchedStderrAuthError && (matchedStdout || matchedStdoutFragment))
+            matchedStderr = true;
+
+        if (!matchedStderr && !matchedStdout)
+            return null;
+
+        var source = matchedStderr && matchedStdout
+            ? "stderr/stdout"
+            : matchedStderr ? "stderr" : "stdout";
+        return new AgentAuthFailureDetection(
+            new AgentFailureClassification(
+                AgentFailureKind.AuthRequired,
+                Reason: $"auth/login prompt pattern matched in {source}"),
+            matchedStderr,
+            matchedStdout,
+            matchedTrustedStdoutTranscript,
+            matchedConfiguredStdout,
+            matchedDefaultStdout);
+    }
+
+    private static IEnumerable<AuthFailurePattern> AdditionalAuthPatternsFor(
+        AgentKind kind,
+        IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>>? additionalPatternsByAgent)
+    {
+        if (additionalPatternsByAgent is null
+            || string.IsNullOrWhiteSpace(kind.Value)
+            || !additionalPatternsByAgent.TryGetValue(kind.Value, out var exact))
+        {
+            yield break;
+        }
+
+        foreach (var pattern in exact)
+            yield return pattern;
     }
 
     private static bool IsBinaryNotFoundFailure(string? summary, string? stderr, string? stdout)
@@ -399,4 +557,123 @@ public static class AgentFailureClassifier
         return ContainsAny(message, TransientNetworkPatterns)
             || ContainsAny(message, StructuredTurnFailedTimeoutPatterns);
     }
+
+    public static bool ContainsAuthRequiredPatternInStderr(string? stderr) =>
+        ContainsAny(stderr, AuthRequiredPatterns)
+        || ContainsStandaloneOAuthLoginUrlLine(stderr)
+        || ContainsCliLoginLine(stderr);
+
+    public static bool ContainsAuthErrorPattern(string? text) =>
+        ContainsAny(text, AuthPatterns);
+
+    public static bool ContainsAuthRequiredPatternInStdout(string? stdout) =>
+        ContainsTrustedStdoutLoginTranscript(stdout) || ContainsShortAuthRequiredStdout(stdout);
+
+    private static bool ContainsCliLoginLine(string? text) =>
+        !string.IsNullOrWhiteSpace(text)
+        && text
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(IsCliLoginLine);
+
+    private static bool ContainsShortAuthRequiredStdout(string? stdout)
+    {
+        // Stdout can be model-controlled, so accept only short outputs whose
+        // non-empty lines are themselves CLI-shaped login prompts. This catches
+        // one-line auth prompts without accepting prose that embeds the same
+        // strings as examples.
+        const int maxTrustedStdoutLoginChars = 4096;
+        const int maxTrustedStdoutLoginLines = 8;
+
+        if (string.IsNullOrWhiteSpace(stdout))
+            return false;
+        if (stdout.Length > maxTrustedStdoutLoginChars)
+            return false;
+
+        var lines = stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+        return lines.Length is > 0 and <= maxTrustedStdoutLoginLines
+            && lines.All(IsCliLoginLine);
+    }
+
+    public static bool ContainsAuthRequiredFragmentInStdout(string? stdout)
+    {
+        if (string.IsNullOrWhiteSpace(stdout))
+            return false;
+
+        return stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(IsCliLoginLine);
+    }
+
+    public static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
+    {
+        // Stdout is often model-controlled. Trust only a short output that is
+        // entirely the CLI login transcript, not task prose embedding one.
+        const int maxTrustedStdoutLoginTranscriptChars = 8192;
+        const int maxTrustedStdoutLoginTranscriptLines = 8;
+
+        if (string.IsNullOrWhiteSpace(stdout))
+            return false;
+        if (stdout.Length > maxTrustedStdoutLoginTranscriptChars)
+            return false;
+
+        var lines = stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+        if (lines.Length == 0 || lines.Length > maxTrustedStdoutLoginTranscriptLines)
+            return false;
+        if (lines.Any(static line => !IsTrustedStdoutLoginTranscriptLine(line)))
+            return false;
+
+        var hasLoginPrompt = AuthRequiredLoginPromptPrefixes
+            .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+        var hasWaitOrTimeout =
+            AuthRequiredWaitOrTimeoutLinePrefixes
+                .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            || AuthRequiredExactLines
+                .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+        return hasLoginPrompt && hasWaitOrTimeout;
+    }
+
+    private static bool IsTrustedStdoutLoginTranscriptLine(string line) =>
+        AuthRequiredLinePrefixes.Any(pattern => line.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
+        || AuthRequiredExactLines.Any(pattern => line.Equals(pattern, StringComparison.OrdinalIgnoreCase))
+        || IsStandaloneOAuthLoginUrl(line);
+
+    private static bool IsCliLoginLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return false;
+
+        if (AuthRequiredLinePrefixes.Any(pattern => line.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
+            || AuthRequiredExactLines.Any(pattern => line.Equals(pattern, StringComparison.OrdinalIgnoreCase))
+            || IsStandaloneOAuthLoginUrl(line))
+        {
+            return true;
+        }
+
+        if (CliLoginCommandFragments.Any(pattern => line.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        // "not logged into ..." is a strict prefix of "not logged in", so a
+        // single startswith check covers both shapes.
+        var lower = line.ToLowerInvariant();
+        return lower.StartsWith("not logged in", StringComparison.Ordinal)
+            && lower.Contains("run ", StringComparison.Ordinal)
+            && lower.Contains(" login", StringComparison.Ordinal);
+    }
+
+    private static bool ContainsStandaloneOAuthLoginUrlLine(string? text) =>
+        !string.IsNullOrWhiteSpace(text)
+        && text.Split('\n').Any(static line => IsStandaloneOAuthLoginUrl(line.Trim()));
+
+    private static bool IsStandaloneOAuthLoginUrl(string line) =>
+        line.StartsWith("https://accounts.google.com/o/oauth2", StringComparison.OrdinalIgnoreCase)
+        || line.StartsWith("http://accounts.google.com/o/oauth2", StringComparison.OrdinalIgnoreCase)
+        || ((line.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            && line.Contains("/oauth-callback", StringComparison.OrdinalIgnoreCase));
 }

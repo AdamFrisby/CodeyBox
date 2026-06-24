@@ -329,10 +329,32 @@ public sealed class AgentAvailabilityRegistryTests
         Assert.False(t2.NowExcluded);
         Assert.False(t3.PreviouslyExcluded);
         Assert.True(t3.NowExcluded);
+        Assert.True(t3.SourceChanged);
 
         var av = reg.GetAvailability(Claude);
         Assert.False(av.Available);
         Assert.Contains("no-changes circuit breaker", av.Reason);
+    }
+
+    [Fact]
+    public void NoChangesTripReportsSourceChanged_WhenAgentAlreadyExcludedByAnotherSource()
+    {
+        var reg = NewRegistry(maxConsecutiveNoChanges: 2);
+        reg.MarkSmokeResult(
+            Claude,
+            new AgentSmokeResult(false, "host smoke failed", TimeSpan.Zero),
+            SmokeExclusionSource.HostSmoke);
+
+        var t1 = reg.RecordNoChangesOutcome(Claude, NewItem());
+        var t2 = reg.RecordNoChangesOutcome(Claude, NewItem());
+
+        Assert.True(t1.PreviouslyExcluded);
+        Assert.False(t1.SourceChanged);
+        Assert.True(t2.PreviouslyExcluded);
+        Assert.True(t2.NowExcluded);
+        Assert.True(t2.SourceChanged);
+        Assert.Contains("host smoke failed", reg.GetAvailability(Claude).Reason);
+        Assert.Contains("no-changes circuit breaker", reg.GetAvailability(Claude).Reason);
     }
 
     [Fact]

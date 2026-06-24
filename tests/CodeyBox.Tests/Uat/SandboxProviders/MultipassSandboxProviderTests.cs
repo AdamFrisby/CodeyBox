@@ -1156,6 +1156,22 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
         Assert.Contains("while kill -0 \"-$codeybox_detached_pid\"", script);
         Assert.Contains("kill -KILL \"-$codeybox_detached_pid\"", script);
+        Assert.Contains("wait \"$codeybox_detached_pid\" 2>/dev/null", script);
+        var termIndex = script.IndexOf("kill -TERM \"-$codeybox_detached_pid\"", StringComparison.Ordinal);
+        var sleepIndex = script.IndexOf("sleep 0.05", termIndex, StringComparison.Ordinal);
+        var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pid\"", termIndex, StringComparison.Ordinal);
+        var waitIndex = script.IndexOf("wait \"$codeybox_detached_pid\" 2>/dev/null", termIndex, StringComparison.Ordinal);
+        var timeoutExitIndex = script.IndexOf(
+            "exit 88",
+            waitIndex,
+            StringComparison.Ordinal);
+        Assert.True(termIndex >= 0, "TERM not emitted");
+        Assert.True(sleepIndex > termIndex, "sleep must follow TERM");
+        Assert.True(killIndex > sleepIndex, "KILL must follow the post-TERM sleep");
+        Assert.True(waitIndex > killIndex, "wait must follow KILL");
+        Assert.True(timeoutExitIndex > waitIndex, "timeout path must report supervisor-setup exit code");
+        Assert.Contains("if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then", script);
+        Assert.Contains("exit \"$codeybox_child_rc\"", script);
         Assert.DoesNotContain("codeybox_output_exit_token=\"${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}\"", script);
         Assert.DoesNotContain("CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN=\"$codeybox_output_exit_token\"", script);
         Assert.DoesNotContain("codeybox_exit_marker", script);
@@ -1263,6 +1279,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stderr);
         Assert.Equal("", await File.ReadAllTextAsync(visibleEnvironmentFile));
         Assert.Equal("poison-agent-run-id", await File.ReadAllTextAsync(visibleRunIdFile));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
     }
 
     [Fact]

@@ -124,12 +124,194 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
         Assert.Contains(auditStore.Reports, r => r.AuditorName == "merge-security-review");
     }
 
+    [Fact]
+    public async Task PrimaryExit0AuthPromptThenFallbackSucceeds_PrimaryIsBenchedAndAlerted()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var claudeAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codexAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+
+        // Exit-0 auth prompt with no tree changes: the resolver should detect
+        // the login prompt before verification and advance to the fallback
+        // candidate without retrying the unauthenticated primary.
+        claudeAgent.AgenticConflictResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+        codexAgent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var fix = BuildFixture(
+            seed,
+            [claudeAgent, codexAgent],
+            new CapturingAuditReportStore(),
+            webhooks,
+            availability,
+            new AgenticConflictResolver(
+                new AgenticConflictResolverOptionsSnapshot(
+                    new AgenticConflictResolverOptions
+                    {
+                        MaxIterations = 2,
+                        MaxAttemptsPerAgent = 1,
+                    })));
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(claudeAgent.AgenticConflictInvocations);
+        Assert.Single(codexAgent.AgenticConflictInvocations);
+
+        var availabilityVerdict = availability.GetAvailability(AgentKind.Claude);
+        Assert.False(availabilityVerdict.Available);
+        Assert.Contains("auth required from agent output", availabilityVerdict.Reason);
+        Assert.True(availability.GetAvailability(AgentKind.Codex).Available);
+
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("rebase-resolver", details.Reason);
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolverAuthPromptOnEveryCandidate_BenchesAndAlertsEveryCandidate()
+    {
+        // Both candidates emit exit-0 auth prompts. The resolver records an
+        // AgenticConflictResolverAuthFailureEvidence entry per candidate, then
+        // HandleAgenticResolverAuthRequiredOutputAsync MUST publish side
+        // effects for EVERY entry before throwing. A regression to
+        // throw-on-first-iteration would bench only the first candidate and
+        // leave the rest of the class routable in a whole-class outage —
+        // exactly the bug the loop rewrite at PipelineRunner.cs:5570 fixes.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var claudeAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codexAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        claudeAgent.AgenticConflictResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+        codexAgent.AgenticConflictResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var fix = BuildFixture(
+            seed,
+            [claudeAgent, codexAgent],
+            new CapturingAuditReportStore(),
+            webhooks,
+            availability,
+            new AgenticConflictResolver(
+                new AgenticConflictResolverOptionsSnapshot(
+                    new AgenticConflictResolverOptions
+                    {
+                        MaxIterations = 4,
+                        MaxAttemptsPerAgent = 1,
+                    })));
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // Both candidates were tried (resolver did not short-circuit after the
+        // first auth failure).
+        Assert.Single(claudeAgent.AgenticConflictInvocations);
+        Assert.Single(codexAgent.AgenticConflictInvocations);
+
+        // BOTH agents must be benched under the auth-required source — not
+        // just the primary that threw.
+        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
+        Assert.False(availability.GetAvailability(AgentKind.Codex).Available);
+        Assert.True(availability.GetAuthRequiredAvailability(AgentKind.Claude).AuthRequired);
+        Assert.True(availability.GetAuthRequiredAvailability(AgentKind.Codex).AuthRequired);
+
+        // One webhook per benched candidate — single-throw-then-skip would
+        // emit only one event for the primary.
+        var smokeFails = webhooks.Events
+            .Where(e => e.Event == "agent.smoke_failed")
+            .Select(e => Assert.IsType<AgentSmokeFailedDetails>(e.Details))
+            .ToList();
+        Assert.Contains(smokeFails, d => d.AgentKind == "claude");
+        Assert.Contains(smokeFails, d => d.AgentKind == "codex");
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolverAuthPromptWithoutFallback_FailsAsAuthRequired()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var claudeAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        claudeAgent.AgenticConflictResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var fix = BuildFixture(
+            seed,
+            [claudeAgent],
+            new CapturingAuditReportStore(),
+            webhooks,
+            availability,
+            new AgenticConflictResolver(
+                new AgenticConflictResolverOptionsSnapshot(
+                    new AgenticConflictResolverOptions { MaxIterations = 3 })));
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("rebase-resolver", final.LastError);
+        Assert.Single(claudeAgent.AgenticConflictInvocations);
+        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
+        Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
     // ── Harness ────────────────────────────────────────────────────────────
 
     private CascadeFixture BuildFixture(
         string seedRepoUrl,
         IReadOnlyList<IAgentRunner> agents,
-        IAuditReportStore auditReportStore)
+        IAuditReportStore auditReportStore,
+        IWebhookDispatcher? webhooks = null,
+        AgentAvailabilityRegistry? availability = null,
+        AgenticConflictResolver? agenticConflictResolver = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -176,8 +358,13 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = 1 },
         };
         var projects = new InMemoryProjectRepository(project);
-        var webhooks = new NullWebhookDispatcher();
-        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
+        var webhookDispatcher = webhooks ?? new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhookDispatcher, projects);
+        var authAvailability = availability
+            ?? new AgentAvailabilityRegistry(
+                new AvailabilityOptions(),
+                TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -189,12 +376,15 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
-            webhooks,
+            webhookDispatcher,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaOptions: quotaOptions,
             classRouter: router,
             auditReports: auditReportStore,
+            availability: availability,
+            authAvailability: authAvailability,
+            agenticConflictResolver: agenticConflictResolver,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);

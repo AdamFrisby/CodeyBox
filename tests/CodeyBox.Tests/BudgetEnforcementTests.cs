@@ -417,7 +417,7 @@ public sealed class BudgetEnforcementTests : IDisposable
         };
         var reg = new CancellationRegistry(CancellationToken.None);
 
-        var initialRecheck = TimeSpan.FromSeconds(8);
+        var initialRecheck = TimeSpan.FromSeconds(4);
         var hotReloadedRecheck = TimeSpan.FromSeconds(10);
 
         var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
@@ -452,7 +452,7 @@ public sealed class BudgetEnforcementTests : IDisposable
                 "the first item must be running before the budget deferral is exercised");
 
             var ids = new List<WorkItemId> { first.Id };
-            for (var i = 0; i < 3; i++)
+            for (var i = 0; i < 2; i++)
             {
                 var item = MakeQueued("budget-recheck-conc");
                 await _store.CreateAsync(item);

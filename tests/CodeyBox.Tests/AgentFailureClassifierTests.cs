@@ -1,6 +1,7 @@
 using System.Text;
 using CodeyBox.Api;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -77,6 +78,265 @@ public sealed class AgentFailureClassifierTests
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.AuthError, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
+    }
+
+    [Theory]
+    [InlineData("Authentication required. Please visit the URL to log in:")]
+    [InlineData("Waiting for authentication (timeout 30s)... Error: authentication timed out.")]
+    [InlineData("not logged into agy; run `agy login`")]
+    [InlineData("not logged into agy; run agy login")]
+    [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
+    public void LoginPromptPatterns_InStderr_Classified_AsAuthRequired(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Fact]
+    public async Task LoginPromptTranscript_InStdout_Classified_AsAuthRequired()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: transcript);
+
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Fact]
+    public async Task LoginPromptTranscript_EmbeddedInTaskStdout_IsNotAuthRequired()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var stdout = $"""
+            I found a failing authentication flow. The captured CLI transcript was:
+            {transcript}
+            The fix is to detect this as an environment failure.
+            """;
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: stdout);
+        var detection = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: stdout);
+
+        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.Null(detection);
+    }
+
+    [Theory]
+    [InlineData("not logged into opencode; run `opencode auth login`")]
+    [InlineData("not logged into agy; run agy login")]
+    [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
+    [InlineData("Error: authentication timed out.")]
+    public void LoginPromptFragments_InStdout_AreAuthRequiredByDefault(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Theory]
+    // Plausible task-response phrasing that previously tripped the breaker on a
+    // healthy agent. Pinning these as NOT-AuthRequired catches a regression
+    // that reintroduces the over-broad "Authentication required" / "not logged
+    // in" substrings into the default pattern list.
+    [InlineData("The endpoint requires Authentication required for users in role admin.")]
+    [InlineData("If the user is not logged in we should redirect to /signin.")]
+    [InlineData("Waiting for authentication to complete before issuing the JWT.")]
+    [InlineData("The OAuth callback endpoint is http://localhost:3000/oauth-callback.")]
+    [InlineData("Use https://accounts.google.com/o/oauth2/auth when implementing Google sign-in.")]
+    public void GenericTaskResponse_NotClassified_AsAuthRequired(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Fact]
+    public async Task AgentAuthFailureClassifier_DetectsCapturedAgyLoginPrompt()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        var detection = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: transcript);
+
+        Assert.NotNull(detection);
+        Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
+        Assert.True(detection.IsStdoutOnly);
+        Assert.True(detection.MatchedTrustedStdoutTranscript);
+        Assert.True(detection.MatchedDefaultStdoutPattern);
+    }
+
+    [Theory]
+    [InlineData("not logged into opencode; run `opencode auth login`")]
+    [InlineData("not logged into agy; run agy login")]
+    [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    public void AgentAuthFailureClassifier_DetectsDefaultFragments_InStdout(string snippet)
+    {
+        var detection = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Opencode,
+            stderr: null,
+            stdout: snippet);
+
+        Assert.NotNull(detection);
+        Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
+        Assert.True(detection.IsStdoutOnly);
+        Assert.True(detection.MatchedDefaultStdoutPattern);
+    }
+
+    [Theory]
+    [InlineData("Use https://accounts.google.com/o/oauth2/auth when implementing Google sign-in.")]
+    [InlineData("The OAuth callback endpoint is http://localhost:3000/oauth-callback.")]
+    [InlineData("Waiting for authentication to complete before issuing the JWT.")]
+    [InlineData("The login test should assert that authentication timed out is shown to the user.")]
+    public void AgentAuthFailureClassifier_DefaultPatterns_DoNotMatchGenericStdout(string snippet)
+    {
+        var hit = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: snippet);
+
+        Assert.Null(hit);
+    }
+
+    [Fact]
+    public void AgentAuthFailureClassifier_HonorsPerAgentConfiguredPatterns()
+    {
+        var classifier = new AgentAuthFailureClassifier(
+            new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["custom"] = [new AuthFailurePattern("custom auth ceremony required")],
+            });
+
+        Assert.NotNull(classifier.Detect(new AgentKind("custom"), "custom auth ceremony required", null));
+        Assert.Null(classifier.Detect(AgentKind.Codex, "custom auth ceremony required", null));
+    }
+
+    [Fact]
+    public void AgentAuthFailureClassifier_AppliesPerAgentConfiguredPatternsInStdout()
+    {
+        var classifier = new AgentAuthFailureClassifier(
+            new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["custom"] = [new AuthFailurePattern(
+                    "stdout-only login ceremony required",
+                    AuthFailurePatternStream.Stdout)],
+            });
+
+        var stdoutHit = classifier.DetectDetailed(
+            new AgentKind("custom"),
+            stderr: null,
+            stdout: "stdout-only login ceremony required");
+
+        Assert.NotNull(stdoutHit);
+        Assert.True(stdoutHit.IsStdoutOnly);
+        Assert.True(stdoutHit.MatchedConfiguredStdoutPattern);
+        Assert.Equal(AgentFailureKind.AuthRequired, stdoutHit.Classification.Kind);
+        var stderrHit = classifier.DetectDetailed(
+            new AgentKind("custom"),
+            stderr: "stdout-only login ceremony required",
+            stdout: null);
+        Assert.Null(stderrHit);
+        Assert.Null(classifier.Detect(
+            AgentKind.Codex,
+            stderr: null,
+            stdout: "stdout-only login ceremony required"));
+    }
+
+    [Fact]
+    public void SharedClassifier_AppliesPerAgentConfiguredAuthPattern()
+    {
+        var extras = new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["custom"] = [new AuthFailurePattern("custom auth ceremony required")],
+        };
+
+        var hit = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+        var miss = AgentFailureClassifier.Classify(
+            AgentKind.Codex,
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+
+        Assert.Equal(AgentFailureKind.AuthRequired, hit.Kind);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, miss.Kind);
+    }
+
+    [Fact]
+    public void AuthFailurePatternStreamNone_MatchesNoStreams()
+    {
+        var extras = new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["custom"] = [new AuthFailurePattern("custom auth ceremony required", AuthFailurePatternStream.None)],
+        };
+
+        var stderr = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+        var stdout = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: null,
+            stdout: "custom auth ceremony required",
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+
+        Assert.NotEqual(AgentFailureKind.AuthRequired, stderr.Kind);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, stdout.Kind);
+    }
+
+    [Fact]
+    public void AuthFailurePatternStreamStderrAndStdout_MatchesBothStreams()
+    {
+        var extras = new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["custom"] = [new AuthFailurePattern("custom auth ceremony required", AuthFailurePatternStream.StderrAndStdout)],
+        };
+
+        var stderr = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: "custom auth ceremony required",
+            stdout: null,
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+        var stdout = AgentFailureClassifier.Classify(
+            new AgentKind("custom"),
+            stderr: null,
+            stdout: "custom auth ceremony required",
+            summary: "agent exited 0",
+            additionalAuthPatternsByAgent: extras);
+
+        Assert.Equal(AgentFailureKind.AuthRequired, stderr.Kind);
+        Assert.Equal(AgentFailureKind.AuthRequired, stdout.Kind);
+    }
+
+    [Fact]
+    public void AgentAuthFailureClassifier_StdoutPromptWithStderr401_IsCorroboratedByStderr()
+    {
+        var classifier = new AgentAuthFailureClassifier();
+
+        var hit = classifier.DetectDetailed(
+            AgentKind.Codex,
+            stderr: "API Error: 401 Unauthorized",
+            stdout: "Authentication required. Please visit the URL to log in:\nWaiting for authentication (timeout 30s)...\nError: authentication timed out.");
+
+        Assert.NotNull(hit);
+        Assert.False(hit.IsStdoutOnly);
+        Assert.True(hit.MatchedStderr);
+        Assert.True(hit.MatchedStdout);
     }
 
     [Theory]
@@ -213,6 +473,7 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(3, (int)AgentFailureKind.AuthError);
         Assert.Equal(4, (int)AgentFailureKind.Unknown);
         Assert.Equal(5, (int)AgentFailureKind.Infrastructure);
+        Assert.Equal(6, (int)AgentFailureKind.AuthRequired);
     }
 
     [Theory]
@@ -465,6 +726,21 @@ public sealed class AgentFailureClassifierTests
         var c = runner.ClassifyFailure(new AgentResult(true, "ok", "", null));
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
+    }
+
+    [Fact]
+    public void DefaultClassifyFailure_OnSuccessLoginPrompt_ReturnsAuthRequired()
+    {
+        IAgentRunner runner = new ProbeOnlyRunner();
+        var stdout = """
+            Authentication required. Please visit the URL to log in:
+            Waiting for authentication (timeout 30s)...
+            Error: authentication timed out.
+            """;
+
+        var c = runner.ClassifyFailure(new AgentResult(true, "ok", stdout, null));
+
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Fact]

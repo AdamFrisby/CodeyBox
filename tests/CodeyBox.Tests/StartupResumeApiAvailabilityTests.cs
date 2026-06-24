@@ -27,7 +27,7 @@ public sealed class StartupResumeApiAvailabilityTests
         SandboxResumeMode mode)
     {
         var configuredTimeout = mode == SandboxResumeMode.Background
-            ? TimeSpan.FromSeconds(10)
+            ? TimeSpan.FromSeconds(4)
             : TimeSpan.FromSeconds(3);
         using var factory = new StartupResumeFullHostFactory(behavior, mode, configuredTimeout);
         var item = new WorkItem
@@ -66,13 +66,13 @@ public sealed class StartupResumeApiAvailabilityTests
             var availabilityDeadline = mode == SandboxResumeMode.Background
                 ? configuredTimeout
                 : configuredTimeout + TimeSpan.FromSeconds(30);
-            response = await Task.Run(async () =>
+            response = await RunOnDedicatedThreadAsync(() =>
             {
                 bootstrapClient = factory.CreateClient();
                 var baseAddress = bootstrapClient.BaseAddress
                     ?? throw new InvalidOperationException("Kestrel-backed client did not expose a base address");
                 networkClient = new HttpClient { BaseAddress = baseAddress };
-                return await networkClient.GetAsync("/quota");
+                return networkClient.GetAsync("/quota").GetAwaiter().GetResult();
             }).WaitAsync(availabilityDeadline);
             sw.Stop();
 
@@ -174,13 +174,13 @@ public sealed class StartupResumeApiAvailabilityTests
             // guard broad enough for parallel audit-suite load; the persisted
             // work item assertion below proves the hot-reloaded 250 ms timeout
             // was the value used by the resume handler.
-            response = await Task.Run(async () =>
+            response = await RunOnDedicatedThreadAsync(() =>
             {
                 bootstrapClient = factory.CreateClient();
                 var baseAddress = bootstrapClient.BaseAddress
                     ?? throw new InvalidOperationException("Kestrel-backed client did not expose a base address");
                 networkClient = new HttpClient { BaseAddress = baseAddress };
-                return await networkClient.GetAsync("/quota");
+                return networkClient.GetAsync("/quota").GetAwaiter().GetResult();
             }).WaitAsync(initialTimeout + TimeSpan.FromSeconds(10));
             sw.Stop();
 
@@ -242,6 +242,13 @@ public sealed class StartupResumeApiAvailabilityTests
 
         Assert.True(condition(), "condition was not met before the timeout elapsed");
     }
+
+    private static Task<T> RunOnDedicatedThreadAsync<T>(Func<T> work) =>
+        Task.Factory.StartNew(
+            work,
+            CancellationToken.None,
+            TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
 
     private sealed class StartupResumeFullHostFactory : WebApplicationFactory<Program>
     {

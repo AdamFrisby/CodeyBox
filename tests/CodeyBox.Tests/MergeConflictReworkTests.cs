@@ -4,6 +4,7 @@ using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -733,6 +734,110 @@ public sealed class MergeConflictReworkTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(1, final.ConflictReworkAttempts);
+    }
+
+    [Fact]
+    public async Task ConflictRework_AuthPrompt_BenchesAgentAndFailsAsInfrastructure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            webhookDispatcher: webhooks,
+            availabilityRegistry: availability);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox;
+            _ = workDir;
+            _ = ct;
+            return Task.FromResult(new AgentResult(
+                Success: false,
+                Summary: "login required",
+                Stdout: transcript,
+                Stderr: null));
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.True(final!.State == WorkItemState.Failed,
+            $"expected Failed, got {final.State}; error={final.LastError}; conflict prompts={tp.Agent.ConflictReworkPrompts.Count}");
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("conflict_rework", final.LastError);
+        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
+
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("conflict_rework", details.Reason);
+    }
+
+    [Fact]
+    public async Task ConflictRework_SessionResumeAuthPrompt_BenchesAgentAndFailsAsInfrastructure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            webhookDispatcher: webhooks,
+            availabilityRegistry: availability);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox;
+            _ = workDir;
+            _ = ct;
+            throw new AgentSessionResumeExhaustedException(
+                tp.Agent.Kind,
+                maxResumeAttempts: 2,
+                new AgentResult(
+                    Success: false,
+                    Summary: "agent exited 1",
+                    Stdout: transcript,
+                    Stderr: null));
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("conflict_rework", final.LastError);
+        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
+
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("conflict_rework", details.Reason);
     }
 
     [Fact]

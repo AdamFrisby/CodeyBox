@@ -56,10 +56,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IInVmSmokeProbe> _probes;
     private readonly ISmokeAvailabilityRegistry _availability;
+    private readonly IAgentAuthAvailabilityRegistry? _authAvailability;
     private readonly IInVmSmokeCache _cache;
     private readonly IWebhookDispatcher _webhooks;
     private readonly InVmSmokeOptions _opts;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
     private readonly ILogger<InVmSmokeProber> _log;
 
     public InVmSmokeProber(
@@ -73,7 +75,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         IWebhookDispatcher webhooks,
         InVmSmokeOptions opts,
         ILogger<InVmSmokeProber> log,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         _provider = provider;
         _resolver = resolver;
@@ -81,10 +85,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _credentials = credentials;
         _probes = probes.ToList();
         _availability = availability;
+        _authAvailability = authAvailability;
         _cache = cache;
         _webhooks = webhooks;
         _opts = opts;
         _smokeOptions = smokeOptions;
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
         _log = log;
     }
 
@@ -163,8 +169,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// </summary>
     public async Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
     {
-        if (!Enabled) return null;
-        if (_probes.All(p => p.Kind != kind)) return null;
+        if (!CanForceProbe(kind)) return null;
         if (!TryGetConfiguredTarget(out var target))
         {
             _log.LogWarning(
@@ -173,8 +178,47 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             return null;
         }
 
-        await EnsureProbedAsync(kind, target, ct, bypassCache: true);
-        return _availability.GetAvailability(kind);
+        return await ForceProbeTargetAsync(kind, target, ct);
+    }
+
+    public async Task<AgentAvailability?> ForceProbeAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        if (!CanForceProbe(kind)) return null;
+
+        return await ForceProbeTargetAsync(kind, target, ct);
+    }
+
+    private bool CanForceProbe(AgentKind kind)
+        => Enabled && _probes.Any(p => p.Kind == kind);
+
+    private async Task<AgentAvailability?> ForceProbeTargetAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        try
+        {
+            await EnsureProbedAsync(kind, target, ct, bypassCache: true);
+            return _availability.GetAvailability(kind);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning("In-VM smoke force-probe for {Agent} was cancelled; no verdict available", kind.Value);
+            return null;
+        }
+        catch (SandboxProvisioningDeferredException ex)
+        {
+            _log.LogWarning(ex, "In-VM smoke force-probe for {Agent} was deferred; no verdict available", kind.Value);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "In-VM smoke force-probe for {Agent} failed; no verdict available", kind.Value);
+            return null;
+        }
     }
 
     /// <summary>
@@ -496,9 +540,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 
         var sw = Stopwatch.StartNew();
         AgentSmokeResult result;
+        bool authRequired;
         try
         {
-            result = await RunStepsInSandboxAsync(credential, target, resolvedBaselineRef, steps, sw, ct);
+            (result, authRequired) = await RunStepsInSandboxAsync(probe.Kind, credential, target, resolvedBaselineRef, steps, sw, ct);
         }
         catch (TimeoutException ex)
         {
@@ -552,11 +597,31 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             _cache.Set(probe.Kind, resolvedBaselineRef, result);
         else
             _cache.Invalidate(probe.Kind, resolvedBaselineRef);
-        // clearsFastFail:true — this verdict comes from a freshly executed in-VM
-        // probe that actually ran the binary in a sandbox, so a pass is valid
-        // evidence the CLI launches and may lift the fast-fail circuit breaker.
-        var transition = _availability.MarkSmokeResult(
-            probe.Kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
+
+        // Auth-required detection during the in-VM probe must be benched under
+        // SmokeExclusionSource.AuthRequired (not InVmSmoke): the operator may
+        // run with CodeyBox:Smoke:Enabled=false, and IsNonSmokeExclusion filters
+        // every smoke-gate source out of GetAvailabilityWithoutSmokeGateExclusions
+        // — defeating exactly the protection this signal exists to provide. The
+        // AuthRequired source is the documented outside-the-smoke-gate channel
+        // for authoritative login-prompt evidence (see SmokeExclusionSource
+        // doc-comments). Fall back to the smoke source only when the auth
+        // registry is not wired (legacy embedders / minimal tests) so behaviour
+        // doesn't regress for them.
+        AvailabilityTransition transition;
+        if (authRequired && _authAvailability is not null)
+        {
+            transition = _authAvailability.MarkAuthRequired(
+                probe.Kind, result.FailureReason ?? "in-VM smoke step detected auth/login prompt");
+        }
+        else
+        {
+            // clearsFastFail:true — this verdict comes from a freshly executed in-VM
+            // probe that actually ran the binary in a sandbox, so a pass is valid
+            // evidence the CLI launches and may lift the fast-fail circuit breaker.
+            transition = _availability.MarkSmokeResult(
+                probe.Kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
+        }
         await EmitTransitionEventsAsync(probe.Kind, result, transition);
         return result;
     }
@@ -584,7 +649,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         return result;
     }
 
-    private async Task<AgentSmokeResult> RunStepsInSandboxAsync(
+    private async Task<(AgentSmokeResult Result, bool AuthRequired)> RunStepsInSandboxAsync(
+        AgentKind kind,
         AgentCredential? credential,
         InVmSmokeSandboxTarget target,
         string baselineRef,
@@ -606,6 +672,22 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                 Stdin = step.Stdin,
             }, linked.Token);
 
+            var authDetection = _authFailureClassifier.DetectDetailed(
+                kind,
+                exec.Stderr,
+                exec.Stdout);
+            if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            {
+                sw.Stop();
+                var hint = step.FailureHint ?? (step.Argv.Count > 0 ? step.Argv[0] : "step");
+                var smokeResult = new AgentSmokeResult(
+                    false,
+                    $"{hint} (auth/login prompt detected)",
+                    sw.Elapsed,
+                    SmokeFailureCategory.Persistent);
+                return (smokeResult, true);
+            }
+
             if (exec.ExitCode != 0)
             {
                 sw.Stop();
@@ -614,13 +696,13 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                 // any other nonzero exit from a smoke step (e.g. --version
                 // returning 1 due to auth failure) is also operator-actionable —
                 // the binary IS launching, so the bench is not a network blip.
-                return new AgentSmokeResult(
-                    false, $"{hint} (exit {exec.ExitCode})", sw.Elapsed, SmokeFailureCategory.Persistent);
+                return (new AgentSmokeResult(
+                    false, $"{hint} (exit {exec.ExitCode})", sw.Elapsed, SmokeFailureCategory.Persistent), false);
             }
         }
 
         sw.Stop();
-        return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
+        return (new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None), false);
     }
 
     /// <summary>

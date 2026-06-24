@@ -108,6 +108,27 @@ internal sealed class PausingTargetInVmSmokeGate : IInVmSmokeGate
         Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
 }
 
+internal sealed class StaticHostSmokeProbeRunner : IHostSmokeProbeRunner
+{
+    private readonly AgentSmokeResult? _result;
+
+    public int CallCount { get; private set; }
+
+    public StaticHostSmokeProbeRunner(AgentSmokeResult? result) => _result = result;
+
+    public Task<AgentSmokeResult?> ProbeAsync(AgentKind kind, CancellationToken ct)
+    {
+        CallCount++;
+        return Task.FromResult(_result);
+    }
+}
+
+internal static class HostSmokeProbeRunners
+{
+    public static StaticHostSmokeProbeRunner PersistentAuth() =>
+        new(new AgentSmokeResult(false, "auth", TimeSpan.Zero, SmokeFailureCategory.Persistent));
+}
+
 // ── Shared probe fakes ────────────────────────────────────────────────────────
 
 /// <summary>

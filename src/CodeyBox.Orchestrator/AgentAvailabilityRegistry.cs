@@ -52,7 +52,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry, IAgentAuthRequiredAvailabilityReader
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -82,6 +82,19 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     public AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind)
     {
         return GetAvailability(kind, IsNonSmokeExclusion);
+    }
+
+    public AgentAuthRequiredAvailability GetAuthRequiredAvailability(AgentKind kind)
+    {
+        if (!_entries.TryGetValue(kind, out var entry))
+            return new AgentAuthRequiredAvailability(false, null);
+
+        lock (entry.Sync)
+        {
+            return entry.Exclusions.TryGetValue(SmokeExclusionSource.AuthRequired, out var reason)
+                ? new AgentAuthRequiredAvailability(true, reason)
+                : new AgentAuthRequiredAvailability(false, null);
+        }
     }
 
     private AgentAvailability GetAvailability(AgentKind kind, Func<SmokeExclusionSource, bool> include)
@@ -129,6 +142,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         lock (entry.Sync)
         {
             var wasExcluded = entry.IsExcluded;
+            var hadSourceExclusion = entry.Exclusions.ContainsKey(source);
             if (result.Ok)
             {
                 entry.LastSmokePassedAt = now;
@@ -146,7 +160,8 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                 return new AvailabilityTransition(
                     PreviouslyExcluded: wasExcluded,
                     NowExcluded: stillExcluded,
-                    Reason: entry.CombinedReason());
+                    Reason: entry.CombinedReason(),
+                    SourceChanged: hadSourceExclusion);
             }
 
             entry.LastSmokeFailedAt = now;
@@ -186,7 +201,8 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             return new AvailabilityTransition(
                 PreviouslyExcluded: wasExcluded,
                 NowExcluded: true,
-                Reason: entry.CombinedReason());
+                Reason: entry.CombinedReason(),
+                SourceChanged: !hadSourceExclusion);
         }
     }
 
@@ -228,7 +244,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                 _log.LogWarning(
                     "Agent {Agent} excluded by fast-fail circuit breaker after {Count} consecutive sub-{Threshold}s failures",
                     kind.Value, entry.ConsecutiveFastFails, _opts.FastFailThresholdSeconds);
-                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason(), SourceChanged: true);
             }
 
             return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
@@ -273,7 +289,11 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                 _log.LogWarning(
                     "Agent {Agent} excluded by no-changes circuit breaker after {Count} consecutive distinct work items produced no changes — operator action required (reset via /admin/agent/{Agent}/reset after diagnosing)",
                     kind.Value, entry.ConsecutiveNoChanges, kind.Value);
-                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+                return new AvailabilityTransition(
+                    wasExcluded,
+                    true,
+                    entry.CombinedReason(),
+                    SourceChanged: true);
             }
 
             return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
@@ -314,10 +334,43 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         lock (entry.Sync)
         {
             var wasExcluded = entry.IsExcluded;
+            var hadSourceExclusion = entry.Exclusions.ContainsKey(SmokeExclusionSource.MissingProbe);
             entry.Exclusions[SmokeExclusionSource.MissingProbe] = reason;
             if (!wasExcluded)
                 _log.LogWarning("Agent {Agent} benched: {Reason}", kind.Value, reason);
-            return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+            return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason(), SourceChanged: !hadSourceExclusion);
+        }
+    }
+
+    /// <summary>
+    /// Benches <paramref name="kind"/> because a real runtime invocation was
+    /// authoritatively classified as blocked on interactive authentication.
+    /// This is not a smoke probe result: it is stored under its own non-smoke
+    /// source so dispatch still honors it when the operator disables smoke
+    /// gating.
+    /// </summary>
+    public AvailabilityTransition MarkAuthRequired(AgentKind kind, string reason)
+    {
+        var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
+        var now = _time.GetUtcNow();
+
+        lock (entry.Sync)
+        {
+            var wasExcluded = entry.IsExcluded;
+            var hadSourceExclusion = entry.Exclusions.ContainsKey(SmokeExclusionSource.AuthRequired);
+            entry.Exclusions[SmokeExclusionSource.AuthRequired] = $"auth required: {reason}";
+            if (!wasExcluded)
+            {
+                _log.LogError(
+                    "Agent {Agent} requires interactive authentication at {At}; operator action required: {Reason}",
+                    kind.Value, now, reason);
+            }
+
+            return new AvailabilityTransition(
+                PreviouslyExcluded: wasExcluded,
+                NowExcluded: true,
+                Reason: entry.CombinedReason(),
+                SourceChanged: !hadSourceExclusion);
         }
     }
 
@@ -466,6 +519,15 @@ public enum SmokeExclusionSource
     /// operator <see cref="AgentAvailabilityRegistry.Reset"/>.
     /// </summary>
     NoChangesBreaker,
+
+    /// <summary>
+    /// Runtime auth/login prompt detected from real agent output.
+    /// Tracked outside the smoke gate so a deployment with
+    /// <c>CodeyBox:Smoke:Enabled=false</c> still benches an unauthenticated
+    /// agent when the non-model-controlled stream proves the CLI printed an
+    /// OAuth login URL and exited 0.
+    /// </summary>
+    AuthRequired,
 }
 
 /// <summary>
@@ -516,6 +578,20 @@ public interface ISmokeAvailabilityRegistry : IAgentEffectiveAvailabilityReader
     /// cannot clear the registry without also dropping the cache.
     /// </summary>
     void Reset(AgentKind kind);
+}
+
+/// <summary>
+/// Source-neutral mutator for runtime auth failures. Pipeline code depends on
+/// this instead of the smoke registry because the signal is not a probe verdict
+/// and should not manufacture <see cref="AgentSmokeResult"/> values.
+/// </summary>
+public interface IAgentAuthAvailabilityRegistry
+{
+    /// <summary>
+    /// Excludes <paramref name="kind"/> until an operator reset because a
+    /// runtime invocation was classified as needing interactive auth.
+    /// </summary>
+    AvailabilityTransition MarkAuthRequired(AgentKind kind, string reason);
 }
 
 /// <summary>

@@ -99,8 +99,24 @@ public enum AgenticConflictResolverOperation
 /// and (when enabled) build-verify checks all pass after one of the candidate
 /// agents finished. <see cref="ChosenRunner"/> / <see cref="ChosenCredential"/>
 /// carry the agent that actually succeeded so callers can attribute the work
-/// for audit-log and usage accounting.
+/// for audit-log and usage accounting. <see cref="FailureRunner"/> /
+/// <see cref="FailureCredential"/> / <see cref="FailureClassificationResult"/>
+/// carry the candidate and concrete output that caused the terminal resolver
+/// failure. <see cref="LastAttemptedRunner"/> is also populated when at least
+/// one candidate ran so older/custom callers can still bench the specific
+/// agent whose output is captured in <see cref="Stdout"/>/<see cref="Stderr"/>.
+/// <see cref="AuthFailures"/> carries narrow auth/login-prompt evidence so
+/// callers can attribute the exact failed candidate without exposing every
+/// candidate's raw output through the public result API. Stdout-only evidence
+/// is flagged so the caller can include that detail in the operator-facing
+/// reason.
 /// </summary>
+public sealed record AgenticConflictResolverAuthFailureEvidence(
+    IAgentRunner Runner,
+    bool AgentSucceeded,
+    AgentFailureClassification Classification,
+    bool StdoutOnlyEvidence = false);
+
 public sealed record AgenticConflictResolverResult(
     bool Success,
     string Summary,
@@ -109,7 +125,9 @@ public sealed record AgenticConflictResolverResult(
     IReadOnlyList<string> ConflictFiles,
     int IterationsUsed,
     string? Stdout,
-    string? Stderr)
+    string? Stderr,
+    IAgentRunner? LastAttemptedRunner = null,
+    IReadOnlyList<AgenticConflictResolverAuthFailureEvidence>? AuthFailures = null)
 {
     public IAgentRunner? FailureRunner { get; init; }
     public AgentCredential? FailureCredential { get; init; }
@@ -167,12 +185,22 @@ public sealed class AgenticConflictResolver
     private readonly ILogger _log;
     private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
     private readonly IAgentSupervisionService? _agentSupervision;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
+
+    private enum AuthRequiredAttemptFailure
+    {
+        SessionResumeExhausted,
+        DirectOutput,
+        FailedAgentStdout,
+        VerificationFailedStdout,
+    }
 
     public AgenticConflictResolver(
         AgenticConflictResolverOptionsSnapshot? options = null,
         ILogger<AgenticConflictResolver>? log = null,
         Func<ISandbox, AgentCredential, CancellationToken, Task>? credentialFileMaterialiser = null,
-        IAgentSupervisionService? agentSupervision = null)
+        IAgentSupervisionService? agentSupervision = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null)
     {
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
@@ -185,6 +213,7 @@ public sealed class AgenticConflictResolver
         // which most agent CLIs also accept.
         _credentialFileMaterialiser = credentialFileMaterialiser;
         _agentSupervision = agentSupervision;
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
     }
 
     /// <summary>
@@ -219,7 +248,8 @@ public sealed class AgenticConflictResolver
                 ConflictFiles: [],
                 IterationsUsed: 0,
                 Stdout: null,
-                Stderr: null);
+                Stderr: null,
+                AuthFailures: []);
         }
 
         foreach (var file in conflictFiles)
@@ -232,8 +262,10 @@ public sealed class AgenticConflictResolver
         var triedStrongest = false;
 
         var attemptTrail = new List<string>();
+        var authFailures = new List<AgenticConflictResolverAuthFailureEvidence>();
         int totalIterations = 0;
         AgentResult? lastAgentResult = null;
+        IAgentRunner? lastAttemptedRunner = null;
         IAgentRunner? lastFailureRunner = null;
         AgentCredential? lastFailureCredential = null;
         AgentResult? lastFailureClassificationResult = null;
@@ -258,7 +290,7 @@ public sealed class AgenticConflictResolver
             AgentFailureClassification classification;
             try
             {
-                classification = failureRunner.ClassifyFailure(classificationResult);
+                classification = _authFailureClassifier.ClassifyFailure(failureRunner, classificationResult);
             }
             catch (Exception ex)
             {
@@ -275,6 +307,71 @@ public sealed class AgenticConflictResolver
             transientFailureRunner = failureRunner;
             transientFailureCredential = failureCredential;
             transientFailureClassificationResult = classificationResult;
+        }
+
+        void RecordAuthRequiredAttemptFailure(
+            IAgentRunner authRunner,
+            AgentCredential? authCredential,
+            int attemptNumber,
+            AgentAuthFailureDetection detection,
+            bool agentSucceeded,
+            AgentResult resultForFailureClassification,
+            AuthRequiredAttemptFailure failureKind,
+            Exception? exception = null)
+        {
+            var authEvidence = RecordAuthFailure(
+                authRunner,
+                detection,
+                agentSucceeded,
+                authFailures);
+            var authReason = authEvidence.Classification.Reason ?? "auth/login prompt matched";
+
+            switch (failureKind)
+            {
+                case AuthRequiredAttemptFailure.SessionResumeExhausted:
+                    _log.LogWarning(exception,
+                        "Agentic conflict resolver: agent '{Agent}' exhausted session resume with auth/login prompt on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
+                        authRunner.Kind.Value, attemptNumber, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
+                    break;
+                case AuthRequiredAttemptFailure.DirectOutput:
+                    _log.LogWarning(
+                        "Agentic conflict resolver: agent '{Agent}' emitted auth/login prompt on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
+                        authRunner.Kind.Value, attemptNumber, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
+                    break;
+                case AuthRequiredAttemptFailure.FailedAgentStdout:
+                    _log.LogWarning(
+                        "Agentic conflict resolver: failed agent '{Agent}' emitted stdout auth/login prompt on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
+                        authRunner.Kind.Value, attemptNumber, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
+                    break;
+                case AuthRequiredAttemptFailure.VerificationFailedStdout:
+                    _log.LogWarning(
+                        "Agentic conflict resolver: agent '{Agent}' emitted stdout auth/login prompt and failed verification on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
+                        authRunner.Kind.Value, attemptNumber, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
+                    break;
+            }
+
+            var trailLabel = failureKind == AuthRequiredAttemptFailure.SessionResumeExhausted
+                ? "auth required after session resume exhausted"
+                : "auth required";
+            AuditLog.AgenticConflictResolverAttemptFailed(
+                workItemId, authRunner.Kind, sandbox.Id, workingDirectory,
+                attemptNumber, maxAttemptsPerAgent,
+                $"{trailLabel}: {authReason}",
+                stdoutTail: RedactAuditTail(resultForFailureClassification.Stdout),
+                stderrTail: RedactAuditTail(resultForFailureClassification.Stderr));
+            attemptTrail.Add($"{authRunner.Kind.Value}#{attemptNumber}({trailLabel}: {Truncate(authReason, 120)})");
+            lastFailureRunner = authRunner;
+            lastFailureCredential = authCredential;
+            lastFailureClassificationResult = new AgentResult(
+                false,
+                $"auth required: {authReason}",
+                resultForFailureClassification.Stdout,
+                resultForFailureClassification.Stderr);
+            lastVerificationError = $"auth required: {authReason}";
+            // Auth/login prompts are infrastructure evidence, not a failed
+            // merge edit. Keep fallback candidates from losing a global
+            // resolution-attempt slot to an unauthenticated runner.
+            totalIterations = Math.Max(0, totalIterations - 1);
         }
 
         foreach (var candidate in candidates)
@@ -341,15 +438,20 @@ public sealed class AgenticConflictResolver
                     lastVerificationError);
 
                 AgentResult agentResult;
+                // Record the attempted runner BEFORE the call so a throw still
+                // identifies which candidate the captured exception came from —
+                // callers (auth detector, audit log) need the runner identity
+                // even when no AgentResult survives.
+                lastAttemptedRunner = runner;
                 var supervision = await StartSupervisionSessionAsync(
                     workItemId,
                     context,
                     runner,
                     candidate,
                     sandbox,
-                        workingDirectory,
-                        attempt,
-                        ct);
+                    workingDirectory,
+                    attempt,
+                    ct);
                 Action<string>? stdoutCallback = null;
                 var captureStructuredStream = NeedsStructuredStreamForResume(runner);
                 try
@@ -385,6 +487,25 @@ public sealed class AgenticConflictResolver
                 }
                 catch (AgentSessionResumeExhaustedException ex)
                 {
+                    lastAgentResult = ex.LastResult;
+                    var resumeAuthDetection = _authFailureClassifier.DetectDetailed(
+                        runner.Kind,
+                        ex.LastResult.Stderr,
+                        ex.LastResult.Stdout);
+                    if (resumeAuthDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+                    {
+                        RecordAuthRequiredAttemptFailure(
+                            runner,
+                            candidate.Credential,
+                            attempt,
+                            resumeAuthDetection,
+                            agentSucceeded: false,
+                            ex.LastResult,
+                            AuthRequiredAttemptFailure.SessionResumeExhausted,
+                            ex);
+                        break;
+                    }
+
                     _log.LogWarning(ex,
                         "Agentic conflict resolver: agent '{Agent}' exhausted session resume on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir})",
                         runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
@@ -396,7 +517,6 @@ public sealed class AgenticConflictResolver
                         stderrTail: RedactAuditTail(ex.LastResult.Stderr));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(session resume exhausted: {RedactAndTruncate(ex.LastResult.Summary, 120)}; stderr: {RedactAndTruncate(ex.LastResult.Stderr, 200)})");
-                    lastAgentResult = ex.LastResult;
                     RecordFailureForClassification(runner, candidate.Credential, ex.LastResult, allowTransientBackoff: true);
                     break;
                 }
@@ -435,8 +555,35 @@ public sealed class AgenticConflictResolver
                 }
 
                 lastAgentResult = agentResult;
+                var authDetection = _authFailureClassifier.DetectDetailed(runner.Kind, agentResult.Stderr, agentResult.Stdout);
+                if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired, IsStdoutOnly: false })
+                {
+                    RecordAuthRequiredAttemptFailure(
+                        runner,
+                        candidate.Credential,
+                        attempt,
+                        authDetection,
+                        agentSucceeded: agentResult.Success,
+                        agentResult,
+                        AuthRequiredAttemptFailure.DirectOutput);
+                    break;
+                }
+
                 if (!agentResult.Success)
                 {
+                    if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired, IsStdoutOnly: true })
+                    {
+                        RecordAuthRequiredAttemptFailure(
+                            runner,
+                            candidate.Credential,
+                            attempt,
+                            authDetection,
+                            agentSucceeded: false,
+                            agentResult,
+                            AuthRequiredAttemptFailure.FailedAgentStdout);
+                        break;
+                    }
+
                     // Bumped to Warning + full stdout/stderr capture: the prior
                     // Information log + Summary-only trail made
                     // "agent exited 1" failures impossible to diagnose without
@@ -477,10 +624,24 @@ public sealed class AgenticConflictResolver
                         ConflictFiles: conflictFiles,
                         IterationsUsed: totalIterations,
                         Stdout: agentResult.Stdout,
-                        Stderr: agentResult.Stderr);
+                        Stderr: agentResult.Stderr,
+                        LastAttemptedRunner: runner,
+                        AuthFailures: authFailures.ToArray());
                 }
 
                 lastVerificationError = verification.Reason;
+                if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired, IsStdoutOnly: true })
+                {
+                    RecordAuthRequiredAttemptFailure(
+                        runner,
+                        candidate.Credential,
+                        attempt,
+                        authDetection,
+                        agentSucceeded: true,
+                        agentResult,
+                        AuthRequiredAttemptFailure.VerificationFailedStdout);
+                    break;
+                }
                 var redactedVerificationReason = RedactText(verification.Reason);
                 attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(redactedVerificationReason, 200)})");
                 RecordFailureForClassification(
@@ -516,7 +677,9 @@ public sealed class AgenticConflictResolver
             ConflictFiles: conflictFiles,
             IterationsUsed: totalIterations,
             Stdout: lastAgentResult?.Stdout,
-            Stderr: lastAgentResult?.Stderr)
+            Stderr: lastAgentResult?.Stderr,
+            LastAttemptedRunner: lastAttemptedRunner,
+            AuthFailures: authFailures.ToArray())
         {
             FailureRunner = transientFailureRunner ?? lastFailureRunner,
             FailureCredential = transientFailureCredential ?? lastFailureCredential,
@@ -555,6 +718,22 @@ public sealed class AgenticConflictResolver
                 Source: "agentic-conflict-resolver"),
             ct);
     }
+
+    private static AgenticConflictResolverAuthFailureEvidence RecordAuthFailure(
+        IAgentRunner runner,
+        AgentAuthFailureDetection detection,
+        bool agentSucceeded,
+        List<AgenticConflictResolverAuthFailureEvidence> authFailures)
+    {
+        var evidence = new AgenticConflictResolverAuthFailureEvidence(
+            runner,
+            agentSucceeded,
+            detection.Classification,
+            detection.IsStdoutOnly);
+        authFailures.Add(evidence);
+        return evidence;
+    }
+
 
     internal sealed record VerificationOutcome(bool Success, string Reason);
 
@@ -703,7 +882,7 @@ public sealed class AgenticConflictResolver
         Truncate(RedactText(value), maxChars);
 
     private static string? RedactAuditTail(string? value) =>
-        value is null ? null : RawOutputRedactor.Redact(value);
+        value is null ? null : RedactAndTruncate(value, 4096);
 
     private static bool NeedsStructuredStreamForResume(IAgentRunner runner)
         => runner is ICliSessionResumableAgentRunner

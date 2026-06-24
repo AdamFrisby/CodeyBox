@@ -41,6 +41,14 @@ public sealed class DefaultTerminalFailureClassifier : ITerminalFailureClassifie
                 TerminalFailureClass.PolicyQuota,
                 "failureKind=quota: owned by QuotaRetryScheduler");
 
+        // Runtime login prompts require operator re-authentication. Retrying the
+        // same item before credentials are repaired only sends work back to the
+        // benched agent.
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase))
+            return new TerminalFailureClassification(
+                TerminalFailureClass.Deterministic,
+                "failureKind=auth_required: operator re-authentication required");
+
         // Cancellations are operator/host actions, not flaky infrastructure.
         // Auto-retrying would override the operator's explicit decision.
         if (string.Equals(item.FailureKind, "cancelled", StringComparison.OrdinalIgnoreCase))

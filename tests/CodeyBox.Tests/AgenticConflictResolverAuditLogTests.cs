@@ -153,6 +153,93 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     }
 
     [Fact]
+    public async Task ResolveAsync_AgentReportsFailure_RedactsSecretLikeStdoutAndStderrBeforeAudit()
+    {
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
+
+        var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
+        sandbox.AddConflictedFile("conflict.txt",
+            "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");
+
+        const string StdoutToken = "sk-proj-resolverstdout123";
+        const string StderrToken = "sk-ant-resolverstderr123";
+        var runner = new StubFailingAgentRunner(
+            stdout: $"agent stdout leaked {StdoutToken}",
+            stderr: $"agent stderr leaked {StderrToken}");
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
+            NullLogger<AgenticConflictResolver>.Instance);
+
+        var workItemId = WorkItemId.New();
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            workItemId,
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
+        var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
+        Assert.DoesNotContain(StdoutToken, stdoutTail, StringComparison.Ordinal);
+        Assert.DoesNotContain(StderrToken, stderrTail, StringComparison.Ordinal);
+        Assert.Contains("agent stdout leaked ***", stdoutTail, StringComparison.Ordinal);
+        Assert.Contains("agent stderr leaked ***", stderrTail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_AgentReportsFailure_TruncatesAuditStdoutAndStderrTails()
+    {
+        var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
+        sandbox.AddConflictedFile("conflict.txt",
+            "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");
+
+        var runner = new StubFailingAgentRunner(
+            stdout: string.Join('\n', Enumerable.Range(0, 700).Select(static i => $"stdout line {i:D4} value")),
+            stderr: string.Join('\n', Enumerable.Range(0, 700).Select(static i => $"stderr line {i:D4} value")));
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
+            NullLogger<AgenticConflictResolver>.Instance);
+
+        var workItemId = WorkItemId.New();
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            workItemId,
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
+        var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
+        Assert.Equal(2049, stdoutTail.Length);
+        Assert.Equal(2049, stderrTail.Length);
+        Assert.StartsWith("…", stdoutTail, StringComparison.Ordinal);
+        Assert.StartsWith("…", stderrTail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RedactAuditTail_TruncatesRedactedOutputToResolverWindow()
+    {
+        var method = typeof(AgenticConflictResolver).GetMethod(
+            "RedactAuditTail",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+        var input = string.Join('\n', Enumerable.Range(0, 700).Select(static i => $"resolver tail line {i:D4} value"));
+        var value = Assert.IsType<string>(method!.Invoke(null, [input]));
+
+        Assert.Equal(4097, value.Length);
+        Assert.EndsWith("…", value, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ResolveAsync_VerificationFails_EmitsAttemptFailedAuditWithStdoutAndStderr()
     {
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();

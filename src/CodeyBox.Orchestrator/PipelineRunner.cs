@@ -84,6 +84,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
+    private readonly IAgentAuthAvailabilityRegistry _authAvailability;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentPauseController? _agentPauses;
     private readonly IAgentSupervisionService? _agentSupervision;
@@ -152,6 +153,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
     private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
+    private readonly IAgentAuthRequiredHandler _authRequiredHandler;
+    // Structured port replacing the freeform AgentAvailability.Reason
+    // substring sniff in IsAuthCorroboratingSmokeFailure. Wired through DI in
+    // production (same singleton as the registry); legacy embedders that pass
+    // the registry positionally fall through to the registry-as-reader cast.
+    private readonly IAgentAuthRequiredAvailabilityReader? _authRequiredReader;
+    private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
     private readonly CancellationRegistry? _cancellations;
@@ -279,7 +288,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IWorkItemTerminalTransition? terminalTransitions = null,
         IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null,
         ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
-        IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null)
+        IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null,
+        IInVmSmokeGate? inVmSmokeGate = null,
+        // Composition-root path. When supplied, the registry plumbing is owned
+        // by the host's DI graph and not rebuilt here, removing the two-class
+        // duplication. Legacy embedders / tests that don't wire this still get
+        // the registry-built path below.
+        IAgentAuthRequiredHandler? authRequiredHandler = null,
+        IAgentAuthRequiredAvailabilityReader? authRequiredReader = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -325,6 +343,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _quotaAuditEmitter = quotaClassifier as IQuotaFailureAuditEmitter
                 ?? NullQuotaFailureAuditEmitter.Instance;
         }
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
+        _inVmSmokeGate = inVmSmokeGate;
         _toolCallCounters = toolCallCounters;
         _retryScheduler = retryScheduler;
         _classRouter = classRouter;
@@ -352,6 +372,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _cancellations = cancellationRegistry;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
+        // Prefer the DI-injected handler when supplied: keeps the registry
+        // plumbing in one place (the composition root) rather than duplicated
+        // here and in ReleaseService. When neither the handler nor the
+        // registry is wired, fall back to a fail-loud placeholder so a
+        // legacy embedder that never trips an auth-required side effect keeps
+        // working while a regression that does silently rely on it surfaces
+        // an InvalidOperationException at the first publish.
+        _authAvailability = authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance;
+        _authRequiredReader = authRequiredReader
+            ?? (authAvailability as IAgentAuthRequiredAvailabilityReader);
+        _authRequiredHandler = authRequiredHandler
+            ?? new AgentAuthRequiredHandler(_authAvailability, _webhooks, _log);
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
         _agentSupervision = agentSupervision;
@@ -387,7 +419,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _agenticConflictResolver = agenticConflictResolver
             ?? new AgenticConflictResolver(
                 credentialFileMaterialiser: MaterialiseCredentialFilesAsync,
-                agentSupervision: _agentSupervision);
+                agentSupervision: _agentSupervision,
+                authFailureClassifier: _authFailureClassifier);
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
@@ -1532,6 +1565,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item.Id, ex.Message);
             await TransitionWaitingForAgentResumeAsync(item, ex.Message, project, ex.Agent);
         }
+        catch (AgentAuthRequiredException ex)
+        {
+            _log.LogWarning(
+                "Work item {Id} failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
+                item.Id, ex.Agent.Value, ex.Phase, ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
+        }
         catch (AgentUnavailableException ex)
         {
             // Distinct from MergeConflictResolutionFailed: the resolver never
@@ -1631,6 +1671,41 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var exhaustedRunner = _agents.TryGet(ex.Agent, out var resolvedRunner)
                 ? resolvedRunner
                 : agentRunner;
+            var authDetection = _authFailureClassifier.DetectDetailed(
+                exhaustedRunner.Kind,
+                ex.LastResult.Stderr,
+                ex.LastResult.Stdout);
+            if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            {
+                // Route stdout-only evidence through the corroboration policy
+                // so a single model-controlled stdout match cannot globally
+                // bench the agent without the forced in-VM probe confirming
+                // the prompt. This matches the rebase/merge/audit/check-and-act
+                // call sites; previously this branch published side effects
+                // unconditionally on the stdout-only path, defeating the
+                // corroboration safety net for resumable runners.
+                await HandleAuthRequiredDetectionAsync(
+                    item,
+                    project,
+                    exhaustedRunner.Kind,
+                    "session-resume",
+                    authDetection.Classification,
+                    throwOnMatch: false,
+                    stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                    requireStdoutOnlyCorroboration: true,
+                    ct: CancellationToken.None);
+                _log.LogWarning(
+                    "Work item {Id} failed because agent {Agent} requires re-authentication after session resume exhaustion: {Reason}",
+                    item.Id, exhaustedRunner.Kind.Value, ex.Message);
+                await TransitionFailed(
+                    item,
+                    _authRequiredHandler.BuildReason("session-resume", authDetection.Classification, authDetection.IsStdoutOnly),
+                    CancellationToken.None,
+                    project,
+                    failureKind: WorkItemFailureKinds.AuthRequired);
+                return;
+            }
+
             var transient = TryBuildTransientAgentFailure(
                 exhaustedRunner,
                 ex.LastResult,
@@ -2419,6 +2494,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         project);
                 }
 
+                // The post-resolver HandleAgenticResolverAuthRequiredOutputAsync
+                // call below is the single, deduplicated side-effect path for
+                // auth-required evidence — it iterates the resolver's
+                // AuthFailures with full result.Success context (so a fallback
+                // success doesn't bench a candidate that produced a benign
+                // login-prompt string in its diagnostics).
                 var resolveResult = await _agenticConflictResolver.ResolveAsync(
                     sandbox,
                     SandboxConventions.WorkDir,
@@ -2433,8 +2514,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 foreach (var path in resolveResult.ConflictFiles)
                     conflictFiles.Add(path);
 
+                await HandleAgenticResolverAuthRequiredOutputAsync(
+                    item, project, "rebase-resolver", resolveResult, ct);
+
                 if (!resolveResult.Success || resolveResult.ChosenRunner is null)
                 {
+                    // Inspect the captured agent output for a login prompt
+                    // BEFORE raising MergeConflictResolutionFailedException —
+                    // an exit-0 login prompt that left unmerged paths would
+                    // otherwise park as a generic conflict failure with no
+                    // bench, no alert, and the unauthenticated agent stays
+                    // routable. Use LastAttemptedRunner (populated by the
+                    // resolver even on the failure path) so the correct
+                    // candidate gets benched when a fallback emitted the
+                    // prompt rather than the primary.
+                    var emittingAgent = resolveResult.LastAttemptedRunner?.Kind ?? runner.Kind;
+                    await ThrowIfAuthRequiredOutputAsync(
+                        item, project, emittingAgent, "rebase-resolver",
+                        resolveResult.Stdout, resolveResult.Stderr,
+                        requireStdoutOnlyCorroboration: true,
+                        ct: ct);
+
                     if (candidateResult is { HasTransientlyUnavailableStrongerAgent: true })
                     {
                         throw new AgentClassExhaustedException(
@@ -2481,12 +2581,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
                 }, CancellationToken.None);
-                // Routing, pause, quota, and transient failures are not merge
-                // conflict failures — let them propagate so the catch in
-                // RunAsync preserves the classified work-item outcome.
+                // Routing, auth, pause, quota, and transient failures are not
+                // merge conflict failures — let them propagate so RunAsync
+                // preserves the classified work-item outcome instead of
+                // overwriting them as MergeConflictResolutionFailed.
                 if (ex is MergeConflictResolutionFailedException
                     or AgentUnavailableException
                     or AgentPausedException
+                    or AgentAuthRequiredException
                     or AgentClassExhaustedException
                     or TerminalTransientNetworkError)
                     throw;
@@ -3478,8 +3580,55 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // but produces no useful diff — without this log, we have no
             // visibility into what the agent reasoned.
             LogAgentOutput(_log, runner.Kind, agentResult);
+            AgentAuthFailureDetection? deferredSuccessStdoutOnlyAuthDetection = null;
+            if (agentResult.Success)
+            {
+                var authDetection = _authFailureClassifier.DetectDetailed(
+                    runner.Kind,
+                    agentResult.Stderr,
+                    agentResult.Stdout);
+                if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+                {
+                    if (authDetection.IsStdoutOnly)
+                    {
+                        // Normal work stdout is the channel that carried the
+                        // original exit-0/no-diff login prompt outage. Defer
+                        // stdout-only handling until the staged-diff check so a
+                        // run that actually changed files is not globally
+                        // benched just because model output echoed a login
+                        // transcript. The no-diff branch below treats the same
+                        // evidence as authoritative.
+                        deferredSuccessStdoutOnlyAuthDetection = authDetection;
+                    }
+                    else
+                    {
+                        await HandleAuthRequiredDetectionAsync(
+                            item,
+                            project,
+                            runner.Kind,
+                            agentPhase,
+                            authDetection.Classification,
+                            throwOnMatch: true,
+                            stdoutOnlyEvidence: false,
+                            ct: ct);
+                    }
+                }
+            }
             if (!agentResult.Success)
             {
+                // Same policy as the success branch: a nonzero CLI can also
+                // print the login prompt on stdout before exiting. Require
+                // forced in-VM probe corroboration before publishing the
+                // global bench — the auth-failure detector matches a CLI-
+                // login-shaped substring, and a nonzero work-phase exit
+                // whose stderr is a generic CLI failure with stdout
+                // containing one OAuth-callback URL line would otherwise
+                // bench the agent fleet-wide on model-controllable evidence.
+                await ThrowIfAuthRequiredOutputAsync(
+                    item, project, runner.Kind, agentPhase, agentResult,
+                    requireStdoutOnlyCorroboration: true,
+                    ct: ct);
+
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
                 // stderr/stdout and structured stream events. Per-CLI classification +
                 // reset-window parsing now live in the per-provider library.
@@ -3599,6 +3748,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var shaAfter = afterHead.Stdout.Trim();
             if (string.Equals(shaBefore, shaAfter, StringComparison.Ordinal))
             {
+                if (deferredSuccessStdoutOnlyAuthDetection is not null)
+                {
+                    // Stdout is model-controlled: a Normal work item whose prompt
+                    // coerces the agent into emitting a one-line OAuth-callback
+                    // URL must NOT bench the whole fleet. Require the same
+                    // forced-in-VM corroboration every other stdout-only call
+                    // site uses (audit / merge / rebase / session-resume /
+                    // conflict-rework) — without it, a single crafted prompt
+                    // would dismantle availability for every member of the
+                    // class via SmokeExclusionSource.AuthRequired.
+                    await HandleAuthRequiredDetectionAsync(
+                        item,
+                        project,
+                        runner.Kind,
+                        agentPhase,
+                        deferredSuccessStdoutOnlyAuthDetection.Classification,
+                        throwOnMatch: true,
+                        stdoutOnlyEvidence: true,
+                        requireStdoutOnlyCorroboration: true,
+                        ct: ct);
+                }
+
                 if (resumingPreempt)
                 {
                     await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",
@@ -3982,6 +4153,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning("Work item {Id} check-and-act hit transient transport failure: {Error}", item.Id, ex.Message);
             await TransitionWaitingForTransientRetryAsync(item, ex, project);
         }
+        catch (AgentAuthRequiredException authEx)
+        {
+            // TerminalFailureClassifier treats AuthRequired as Deterministic
+            // (no auto-retry), so this is a terminal failure, not a pause —
+            // word the log accordingly so operators grepping for "paused"
+            // don't think the item is parked awaiting auth.
+            _log.LogWarning(
+                "Work item {Id} check-and-act failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
+                item.Id, authEx.Agent.Value, authEx.Phase, authEx.Message);
+            await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} check-and-act failed", item.Id);
@@ -4341,6 +4523,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
+        // Check-and-act stdout is parsed model output. Detect auth evidence so
+        // the item fails as infrastructure instead of verdict-parse noise, but
+        // force an in-VM corroboration attempt before publishing the fleet-wide
+        // auth bench reason. A missing/inconclusive probe must not suppress the
+        // fail-fast auth exclusion because smoke can be disabled during the exact
+        // outage this detector is meant to catch.
+        await ThrowIfAuthRequiredOutputAsync(
+            item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
+            requireStdoutOnlyCorroboration: true,
+            ct: ct);
+
         if (!result.Success)
         {
             ThrowIfTransientAgentFailure(agentRunner, result, "check");
@@ -4351,7 +4544,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return aggregatedStdout;
     }
 
-    private static void ThrowIfTransientAgentFailure(
+    private void ThrowIfTransientAgentFailure(
         IAgentRunner runner,
         AgentResult result,
         string phase)
@@ -4360,7 +4553,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throw transient;
     }
 
-    private static void ThrowIfTransientAgentFailure(
+    private void ThrowIfTransientAgentFailure(
         IAgentRunner runner,
         AgentSessionResumeExhaustedException resumeEx,
         string phase)
@@ -4375,13 +4568,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private static TerminalTransientNetworkError? TryBuildTransientAgentFailure(
+    private TerminalTransientNetworkError? TryBuildTransientAgentFailure(
         IAgentRunner runner,
         AgentResult result,
         string? phase,
         string failureContext)
     {
-        var classification = runner.ClassifyFailure(result);
+        var classification = _authFailureClassifier.ClassifyFailure(runner, result);
         if (classification.Kind != AgentFailureKind.TransientNetwork)
             return null;
 
@@ -4834,6 +5027,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             agentRunner.Kind, item.AgentInstanceId, item.Id, "post-act-recheck", iteration,
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
+        // See RunCheckAndActAgentAsync above for the phase policy.
+        await ThrowIfAuthRequiredOutputAsync(
+            item, project, agentRunner.Kind, "post-act-recheck", aggregatedStdout, result.Stderr,
+            requireStdoutOnlyCorroboration: true,
+            ct: ct);
+
         if (!result.Success)
         {
             ThrowIfTransientAgentFailure(agentRunner, result, "post-act-recheck");
@@ -5065,8 +5264,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         if (!result.Success)
         {
-            var classification = runner.ClassifyFailure(classificationResult ?? result);
-            if (classification.Kind is AgentFailureKind.Infrastructure or AgentFailureKind.TransientNetwork)
+            var classification = _authFailureClassifier.ClassifyFailure(runner, classificationResult ?? result);
+            if (classification.Kind is AgentFailureKind.Infrastructure
+                or AgentFailureKind.TransientNetwork
+                or AgentFailureKind.AuthRequired)
             {
                 if (classification.Kind == AgentFailureKind.Infrastructure)
                 {
@@ -5178,6 +5379,257 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             RequiresStructuredStreamForSessionId: true,
         };
+
+    private async Task<bool> HandleAuthRequiredOutputAsync(
+        WorkItem? item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        string? stdout,
+        string? stderr,
+        bool throwOnMatch,
+        bool requireStdoutOnlyCorroboration = false,
+        CancellationToken ct = default)
+    {
+        var detection = _authFailureClassifier.DetectDetailed(agent, stderr, stdout);
+        if (detection is null || detection.Classification.Kind != AgentFailureKind.AuthRequired)
+            return false;
+
+        return await HandleAuthRequiredDetectionAsync(
+            item,
+            project,
+            agent,
+            phase,
+            detection.Classification,
+            throwOnMatch,
+            detection.IsStdoutOnly,
+            requireStdoutOnlyCorroboration,
+            ct);
+    }
+
+    private async Task<bool> HandleAuthRequiredDetectionAsync(
+        WorkItem? item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        AgentFailureClassification classification,
+        bool throwOnMatch,
+        bool stdoutOnlyEvidence = false,
+        bool requireStdoutOnlyCorroboration = false,
+        CancellationToken ct = default)
+    {
+        if (classification.Kind != AgentFailureKind.AuthRequired)
+            return false;
+
+        var publishSideEffects = true;
+        string? stdoutOnlyNote = null;
+        if (stdoutOnlyEvidence && requireStdoutOnlyCorroboration)
+        {
+            var corroboration = await TryCorroborateStdoutOnlyAuthRequiredAsync(item, project, agent, phase, ct);
+            publishSideEffects = corroboration != StdoutOnlyAuthCorroboration.NotCorroborated;
+            stdoutOnlyNote = corroboration switch
+            {
+                StdoutOnlyAuthCorroboration.Corroborated =>
+                    "stdout corroborated by forced in-VM smoke probe for global benching",
+                StdoutOnlyAuthCorroboration.NotCorroborated =>
+                    "stdout accepted for item failure only; forced in-VM smoke probe did not corroborate auth",
+                _ =>
+                    "stdout auth evidence accepted for global benching; forced in-VM smoke corroboration unavailable",
+            };
+        }
+
+        var reason = _authRequiredHandler.BuildReason(phase, classification, stdoutOnlyEvidence, stdoutOnlyNote);
+
+        if (publishSideEffects)
+            await _authRequiredHandler.PublishSideEffectsAsync(agent, reason, item, project, ct: ct);
+
+        if (throwOnMatch)
+            throw new AgentAuthRequiredException(agent, phase, reason);
+
+        return true;
+    }
+
+    private enum StdoutOnlyAuthCorroboration
+    {
+        Unavailable,
+        NotCorroborated,
+        Corroborated,
+    }
+
+    private async Task<StdoutOnlyAuthCorroboration> TryCorroborateStdoutOnlyAuthRequiredAsync(
+        WorkItem? item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        CancellationToken ct)
+    {
+        if (_inVmSmokeGate is not { Enabled: true })
+            return StdoutOnlyAuthCorroboration.Unavailable;
+
+        try
+        {
+            var target = ResolveAuthCorroborationSmokeTarget(project, phase, item?.BaselineImageRef);
+            var availability = await _inVmSmokeGate.ForceProbeAsync(agent, target, ct);
+            if (availability is null)
+                return StdoutOnlyAuthCorroboration.Unavailable;
+            return IsAuthCorroboratingSmokeFailure(agent, availability)
+                ? StdoutOnlyAuthCorroboration.Corroborated
+                : StdoutOnlyAuthCorroboration.NotCorroborated;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Forced in-VM smoke corroboration failed for stdout-only auth evidence from agent {Agent} during {Phase}; continuing global auth bench from matched output",
+                agent.Value,
+                phase);
+            return StdoutOnlyAuthCorroboration.Unavailable;
+        }
+    }
+
+    private static InVmSmokeSandboxTarget ResolveAuthCorroborationSmokeTarget(
+        Project project,
+        string phase,
+        string? baselineRef)
+    {
+        var normalizedPhase =
+            phase.StartsWith("audit:", StringComparison.OrdinalIgnoreCase) ? "audit"
+            : phase.Contains("check", StringComparison.OrdinalIgnoreCase) ? "check"
+            : phase.Contains("rework", StringComparison.OrdinalIgnoreCase) ? "rework"
+            : phase.Contains("merge", StringComparison.OrdinalIgnoreCase) ? "merge"
+            : phase.Contains("rebase", StringComparison.OrdinalIgnoreCase) ? "rebase"
+            : phase;
+
+        return ResolvePhaseSmokeTarget(project, normalizedPhase, baselineRef);
+    }
+
+    private bool IsAuthCorroboratingSmokeFailure(AgentKind agent, AgentAvailability? availability)
+    {
+        // The forced in-VM probe ran just before this check. If it observed an
+        // auth/login prompt, InVmSmokeProber escalates via MarkAuthRequired
+        // (not MarkSmokeResult), so the structured AuthRequired channel is now
+        // populated. Read that channel directly instead of substring-sniffing
+        // AgentAvailability.Reason — the freeform text is operator-facing and
+        // any future reword would silently break corroboration without a test
+        // signal.
+        if (_authRequiredReader is not null
+            && _authRequiredReader.GetAuthRequiredAvailability(agent).AuthRequired)
+        {
+            return true;
+        }
+
+        // Backstop for legacy/embedded paths where the auth registry isn't
+        // wired or the prober ran without the auth-routing patch: any other
+        // probe failure here is NOT treated as corroboration, because a
+        // generic smoke-fail reason ("credential file path missing", future
+        // "authoring policy mismatch", etc.) is not authoritative login-prompt
+        // evidence. Silence over false-positive: a misbehaving agent will
+        // still be benched per-item, just not globally without a structured
+        // AuthRequired signal.
+        _ = availability;
+        return false;
+    }
+
+    private Task ThrowIfAuthRequiredOutputAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        string? stdout,
+        string? stderr,
+        bool requireStdoutOnlyCorroboration = false,
+        CancellationToken ct = default)
+    {
+        return HandleAuthRequiredOutputAsync(
+            item, project, agent, phase, stdout, stderr,
+            throwOnMatch: true,
+            requireStdoutOnlyCorroboration: requireStdoutOnlyCorroboration,
+            ct: ct);
+    }
+
+    // The AgentResult-form wrapper mirrors the explicit-stream overload's
+    // requireStdoutOnlyCorroboration knob so callers don't silently fall back
+    // to the policy default by passing an AgentResult instead of (stdout,
+    // stderr). Every retrofit call site that runs on model-controlled stdout
+    // (audit / merge / rebase-resolver / session-resume / conflict-rework /
+    // check / post-act-recheck / work-phase failure) opts into corroboration;
+    // leaving the AgentResult overload at the false default reintroduces the
+    // single-crafted-prompt fleet-wide bench the corroboration path exists
+    // to prevent. Keep the parameter explicit at every call site rather than
+    // flipping the default so the security-relevant choice is visible in diff.
+    private Task ThrowIfAuthRequiredOutputAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        AgentResult result,
+        bool requireStdoutOnlyCorroboration,
+        CancellationToken ct = default)
+        => ThrowIfAuthRequiredOutputAsync(
+            item, project, agent, phase, result.Stdout, result.Stderr,
+            requireStdoutOnlyCorroboration: requireStdoutOnlyCorroboration,
+            ct: ct);
+
+    private async Task HandleAgenticResolverAuthRequiredOutputAsync(
+        WorkItem item,
+        Project project,
+        string phase,
+        AgenticConflictResolverResult result,
+        CancellationToken ct = default)
+    {
+        var authFailures = result.AuthFailures ?? [];
+        if (authFailures.Count == 0)
+        {
+            var emittingAgent = result.LastAttemptedRunner?.Kind ?? result.ChosenRunner?.Kind ?? item.Agent ?? project.DefaultAgent;
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, emittingAgent, phase, result.Stdout, result.Stderr,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
+            return;
+        }
+
+        // Publish side effects for EVERY auth-failed candidate before throwing.
+        // Previously this loop passed throwOnMatch=!result.Success directly to
+        // HandleAuthRequiredDetectionAsync, which threw on the first iteration
+        // and skipped the remaining failures — meaning a multi-agent outage
+        // (e.g. the whole class unauthenticated) only benched and alerted on
+        // the first candidate while leaving the rest routable. Coalesce into
+        // one publish-all-then-throw sequence so the breaker reflects every
+        // affected agent.
+        AgentAuthRequiredException? firstThrow = null;
+        foreach (var failure in authFailures)
+        {
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                failure.Runner.Kind,
+                phase,
+                failure.Classification,
+                throwOnMatch: false,
+                failure.StdoutOnlyEvidence,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
+
+            // If the resolver ultimately succeeded, a failed earlier candidate's
+            // login prompt should bench that candidate and alert the operator,
+            // but it should not discard the fallback's valid resolution.
+            if (!result.Success && firstThrow is null)
+            {
+                var reason = _authRequiredHandler.BuildReason(
+                    phase,
+                    failure.Classification,
+                    failure.StdoutOnlyEvidence);
+                firstThrow = new AgentAuthRequiredException(failure.Runner.Kind, phase, reason);
+            }
+        }
+
+        if (firstThrow is not null)
+            throw firstThrow;
+    }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
         WorkItemId workItemId,
@@ -6944,7 +7396,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         passedBuildTestGateEvidence |= passedGateEvidence;
                         buildTestGateFailed |= failedGate;
 
-                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
                         if (needsCreds && runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= runner.Kind;
                         findings.AddRange(run.Result.Findings);
@@ -7110,24 +7562,26 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     }
 
                     // A nonzero review-agent exit is audit infrastructure, not a
-                    // source-code finding. Quota and transient transport shapes must
-                    // leave this attempt immediately so the durable quota/transient
-                    // schedulers own the backoff. Unknown non-quota/non-transient
-                    // execution failures still get one fresh-sandbox retry.
+                    // source-code finding. Auth, quota, and transient transport
+                    // shapes must leave this attempt immediately so the durable
+                    // availability/quota/transient schedulers own the backoff.
+                    // Unknown non-quota/non-transient execution failures still get
+                    // one fresh-sandbox retry.
                     if (IsLlmAgentExecutionFailure(run.Result))
                     {
+                        await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, attemptCt);
                         await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
                         ThrowIfTransientAgentFailure(
                             run.Runner,
                             ToAgentResultForAuditFailureClassification(run.Result),
                             "audit");
-
                         _log.LogWarning(
                             "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
                             run.Auditor.Name);
                         run = await RunLlmPairOnceAsync(pair, candidateRunner, trialItem, attemptCt);
                     }
 
+                    await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, attemptCt);
                     await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
 
                     // HARD INVARIANT: an auditor that could not RUN must surface as
@@ -7336,7 +7790,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     foreach (var entry in completedSnapshot)
                     {
                         var run = entry.Run;
-                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
                         if (needsCreds && run.Runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= run.Runner.Kind;
                         if (detectDeclaredShortCircuit
@@ -7380,7 +7834,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 foreach (var entry in llmRuns)
                 {
                     var run = entry.Run;
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
                     if (needsCreds && run.Runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= run.Runner.Kind;
                     findings.AddRange(run.Result.Findings);
@@ -7982,11 +8436,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AuditorRunRecord run,
         IAgentRunner workRunner,
         bool needsCreds,
-        ProjectId projectId,
+        WorkItem item,
+        Project project,
         AuditContext ctx,
         CancellationToken ct)
     {
-        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, projectId, ct);
+        // Auth/login-prompt check runs alongside the quota check: an exit-0
+        // login prompt from an LLM auditor's agent that suppressed
+        // audit/result.json was previously surfaced as a normal "agent did not
+        // write audit/result.json" finding, leaving the unauthenticated agent
+        // routable for the next iteration. Inspects AgentStdout / AgentStderr
+        // (now populated unconditionally by LlmReviewAuditor) plus RawOutput
+        // as a fallback for any auditor that did not propagate the stream.
+        //
+        // Auth has precedence over quota because OAuth/login prompts can include
+        // 401 diagnostics that are also quota-detector inputs; the operator
+        // action is to re-authenticate, not to park the item for quota reset.
+        await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, ct);
+        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, ct);
 
         if (needsCreds)
         {
@@ -8015,6 +8482,71 @@ public sealed partial class PipelineRunner : IPipelineRunner
             : "none";
         AuditLog.AuditorRun(run.Auditor.Name, worstSeverity, run.Elapsed, run.Runner.Kind);
         await PersistAuditReportAsync(ctx, run.Auditor, run.Result, run.StartedAt, run.Elapsed, ct);
+    }
+
+    private async Task ThrowIfAuditorRunAuthRequiredAsync(
+        AuditorRunRecord run,
+        bool needsCreds,
+        WorkItem item,
+        Project project,
+        CancellationToken ct)
+    {
+        if (!needsCreds)
+            return;
+
+        // AgentStdout / AgentStderr are the structured agent-output fields
+        // (set by LlmReviewAuditor on every return path now). RawOutput is the
+        // belt-and-braces fallback — some auditors fold the agent's last reply
+        // into RawOutput without splitting into stdout/stderr, and an exit-0
+        // login prompt that landed only there would otherwise escape the
+        // detector and surface as an "agent did not write audit/result.json"
+        // finding.
+        var stdout = !string.IsNullOrEmpty(run.Result.AgentStdout)
+            ? run.Result.AgentStdout
+            : run.Result.RawOutput;
+        var stderr = run.Result.AgentStderr;
+        if (string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(stderr))
+            return;
+
+        var phase = $"audit:{run.Auditor.Name}";
+        var detection = _authFailureClassifier.DetectDetailed(run.Runner.Kind, stderr, stdout);
+        if (detection is { Classification.Kind: AgentFailureKind.AuthRequired })
+        {
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                run.Runner.Kind,
+                phase,
+                detection.Classification,
+                throwOnMatch: true,
+                stdoutOnlyEvidence: detection.IsStdoutOnly,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
+        }
+
+        // LLM audit-agent execution failures report CLI diagnostics through
+        // AgentStdout/AgentStderr, not source-code review prose. Accept guarded
+        // stdout login fragments here so auth wins over a companion quota
+        // diagnostic for the item outcome. Forced smoke corroboration is attempted
+        // for stdout-only evidence, but an unavailable probe cannot leave a matched
+        // login prompt routable. Routed through the injected classifier so
+        // operator-configured stdout patterns participate alongside defaults.
+        if (IsLlmAgentExecutionFailure(run.Result)
+            && _authFailureClassifier.ContainsAuthRequiredFragmentInStdout(run.Runner.Kind, stdout))
+        {
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                run.Runner.Kind,
+                phase,
+                new AgentFailureClassification(
+                    AgentFailureKind.AuthRequired,
+                    Reason: "auth/login prompt pattern matched in audit agent stdout"),
+                throwOnMatch: true,
+                stdoutOnlyEvidence: true,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
+        }
     }
 
     private async Task ThrowIfAuditorRunQuotaAsync(
@@ -9402,6 +9934,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (AgentSessionResumeExhaustedException ex)
             {
+                if (await TryConvertResumeExhaustionToAuthRequiredAsync(runner, trialItem, ex, attemptCt)
+                    .ConfigureAwait(false) is { } authEx)
+                {
+                    await FinalizeInvolvementAsync(involvementId, "failure:auth");
+                    throw authEx;
+                }
+
                 if (await TryConvertResumeExhaustionToQuotaAsync(runner, trialItem, ex, attemptCt)
                     .ConfigureAwait(false) is { } quotaEx)
                 {
@@ -9434,6 +9973,38 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     new KeyValuePair<string, object?>("phase", phase),
                     new KeyValuePair<string, object?>("outcome", outcome));
             }
+        }
+
+        async Task<AgentAuthRequiredException?> TryConvertResumeExhaustionToAuthRequiredAsync(
+            IAgentRunner runner,
+            WorkItem trialItem,
+            AgentSessionResumeExhaustedException resumeEx,
+            CancellationToken token)
+        {
+            var last = resumeEx.LastResult;
+            var detection = _authFailureClassifier.DetectDetailed(runner.Kind, last.Stderr, last.Stdout);
+            if (detection is not { Classification.Kind: AgentFailureKind.AuthRequired })
+                return null;
+
+            // Route stdout-only evidence through the shared corroboration
+            // policy so a model-controlled stdout match cannot globally bench
+            // the agent without the forced in-VM probe confirming the prompt.
+            // The exception we return still fails the work item terminally —
+            // that's the deterministic per-item handling — but the global
+            // bench side effect only fires when corroborated.
+            await HandleAuthRequiredDetectionAsync(
+                trialItem,
+                project,
+                runner.Kind,
+                phase,
+                detection.Classification,
+                throwOnMatch: false,
+                stdoutOnlyEvidence: detection.IsStdoutOnly,
+                requireStdoutOnlyCorroboration: true,
+                ct: token).ConfigureAwait(false);
+
+            var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
+            return new AgentAuthRequiredException(runner.Kind, phase, reason);
         }
 
         async Task<TerminalQuotaError?> TryConvertResumeExhaustionToQuotaAsync(
@@ -9479,7 +10050,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AgentSessionResumeExhaustedException resumeEx)
         {
             var last = resumeEx.LastResult;
-            var classification = runner.ClassifyFailure(last);
+            var classification = _authFailureClassifier.ClassifyFailure(runner, last);
             if (classification.Kind != AgentFailureKind.TransientNetwork)
                 return null;
 
@@ -10126,7 +10697,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (_quotaClassifier.Detect(runner.Kind, result.AgentStderr, result.AgentStdout) is not null)
             return "failure:quota";
 
-        var classification = runner.ClassifyFailure(ToAgentResultForAuditFailureClassification(result));
+        var classification = _authFailureClassifier.ClassifyFailure(runner, ToAgentResultForAuditFailureClassification(result));
         if (classification.Kind == AgentFailureKind.QuotaExhausted)
             return "failure:quota";
         if (classification.Kind == AgentFailureKind.TransientNetwork)
@@ -10266,34 +10837,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Normalises a reason string for log / webhook serialisation: strips
-    /// CR/LF and other control characters (replaced with spaces) so plain-text
-    /// log sinks cannot be spoofed by embedded newlines (CWE-117), collapses
-    /// runs of whitespace, and trims. Returns an empty string for null input.
+    /// Reason-string normaliser shared with <see cref="ReleaseService"/> via the
+    /// auth-required handler. Strips CR/LF and other control characters (replaced
+    /// with spaces) so plain-text log sinks cannot be spoofed by embedded
+    /// newlines (CWE-117), collapses runs of whitespace, and trims. Returns an
+    /// empty string for null input.
     /// </summary>
     internal static string SingleLineSummary(string? text)
-    {
-        if (string.IsNullOrEmpty(text)) return "";
-        var sb = new StringBuilder(text.Length);
-        var lastWasSpace = false;
-        foreach (var ch in text)
-        {
-            if (ch is '\r' or '\n' or '\t' || char.IsControl(ch))
-            {
-                if (!lastWasSpace) { sb.Append(' '); lastWasSpace = true; }
-            }
-            else if (ch == ' ')
-            {
-                if (!lastWasSpace) { sb.Append(' '); lastWasSpace = true; }
-            }
-            else
-            {
-                sb.Append(ch);
-                lastWasSpace = false;
-            }
-        }
-        return sb.ToString().Trim();
-    }
+        => AgentAuthRequiredHandler.SingleLineSummary(text);
 
     /// <summary>
     /// Merge phase: invoke the work-item's agent inside a sandbox to perform
@@ -10420,6 +10971,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         AgentPromptPhase.Merge,
                         iteration: 1,
                         project);
+                    // Single auth-required side-effect path: post-resolver.
+                    // See HandleAgenticResolverAuthRequiredOutputAsync.
                     var resolverResult = await _agenticConflictResolver.ResolveAsync(
                         sandbox,
                         SandboxConventions.WorkDir,
@@ -10430,6 +10983,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         },
                         candidates,
                         ct);
+                    await HandleAgenticResolverAuthRequiredOutputAsync(
+                        item, project, "merge-resolver", resolverResult, ct);
                     agentResult = new AgentResult(
                         resolverResult.Success,
                         resolverResult.Summary,
@@ -10445,6 +11000,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         chosenMergeRunner = resolverResult.FailureRunner;
                         chosenMergeCredential = resolverResult.FailureCredential;
                         agentResultForAvailabilityClassification = resolverResult.FailureClassificationResult;
+                    }
+                    else if (!resolverResult.Success && resolverResult.LastAttemptedRunner is not null)
+                    {
+                        // ChosenRunner is success-only; on a failed resolver
+                        // result it stays null and the catch-all below would
+                        // bench the original work runner even when a fallback
+                        // candidate actually emitted the failure. Surfacing the
+                        // last-attempted candidate here keeps the auth detector,
+                        // quota classifier, and availability breaker pointed at
+                        // the agent whose stdout/stderr we captured.
+                        chosenMergeRunner = resolverResult.LastAttemptedRunner;
                     }
                 }
                 mergeExecElapsedMs = mergeExecScope.ElapsedMs;
@@ -10573,6 +11139,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AuditLog.AgentFinished(chosenMergeRunner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
             LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
+            // Scan for a login prompt regardless of agent exit status: a
+            // success-exit auth-prompt is the OG outage shape (exit 0, no
+            // diff) and a failure-exit auth-prompt must also bench the agent
+            // before downstream classifiers convert it into a quota / transient
+            // error and lose the auth signal. Require forced in-VM probe
+            // corroboration before publishing the global bench so a single
+            // crafted merge-agent stdout cannot dismantle availability for
+            // every class member.
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, chosenMergeRunner.Kind, "merge", agentResult,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
             if (!agentResult.Success)
             {
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
@@ -10611,6 +11189,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     ct,
                     projectId: item.ProjectId,
                     stdout: classificationResult.Stdout);
+
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
@@ -11099,7 +11678,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 sandbox,
                 ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException and not AgentAuthRequiredException)
         {
             _log.LogWarning(ex, "Advisory merge security review failed for work item {WorkItemId}", workItemId);
             return;
@@ -11197,6 +11776,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ct,
             sandbox,
             sandbox is null ? null : SandboxConventions.WorkDir);
+        var item = await _store.GetAsync(workItemId, ct);
+        var authDetection = _authFailureClassifier.DetectDetailed(
+            runner.Kind,
+            result.Error,
+            result.Output);
+        if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+        {
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                runner.Kind,
+                "merge-security-review",
+                authDetection.Classification,
+                throwOnMatch: true,
+                stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
+        }
+
         if (!result.Success)
         {
             _log.LogWarning(
@@ -11655,7 +12253,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 catch (Exception ex) when (ex is not MergeConflictResolutionFailedException
                     && ex is not TerminalTransientNetworkError
                     && ex is not SandboxProvisioningDeferredException
-                    && ex is not AgentPausedException)
+                    && ex is not AgentPausedException
+                    && ex is not AgentAuthRequiredException)
                 {
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {
@@ -12125,7 +12724,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not SandboxProvisioningDeferredException
-            && ex is not AgentPausedException)
+            && ex is not AgentPausedException
+            && ex is not AgentAuthRequiredException)
         {
             _log.LogWarning(ex,
                 "Conflict rework agent invocation failed for work item {Id}: {Message}",
@@ -12442,7 +13042,29 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (AgentSessionResumeExhaustedException ex)
             {
-                var classification = runner.ClassifyFailure(ex.LastResult);
+                var classification = _authFailureClassifier.ClassifyFailure(runner, ex.LastResult);
+                var authDetection = _authFailureClassifier.DetectDetailed(
+                    runner.Kind,
+                    ex.LastResult.Stderr,
+                    ex.LastResult.Stdout);
+                if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
+                {
+                    await FinalizeInvolvementAsync(conflictInvolvementId, "failure:agent");
+                    // Match the work-phase session-resume catch (see RunWorkAgentAsync):
+                    // a single model-controlled stdout match must not globally bench
+                    // the agent without forced in-VM probe corroboration.
+                    await HandleAuthRequiredDetectionAsync(
+                        item,
+                        project,
+                        runner.Kind,
+                        ConflictReworkPhaseKey,
+                        authDetection.Classification,
+                        throwOnMatch: true,
+                        stdoutOnlyEvidence: authDetection.IsStdoutOnly,
+                        requireStdoutOnlyCorroboration: true,
+                        ct: ct);
+                }
+
                 await FinalizeInvolvementAsync(
                     conflictInvolvementId,
                     classification.Kind == AgentFailureKind.TransientNetwork
@@ -12482,12 +13104,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // before the generic !Success → failure:agent fallback, otherwise the
             // involvement outcome would mislabel it as a plain agent failure.
             var transientFailure = !agentResult.Success
-                && runner.ClassifyFailure(agentResult).Kind == AgentFailureKind.TransientNetwork;
+                && _authFailureClassifier.ClassifyFailure(runner, agentResult).Kind == AgentFailureKind.TransientNetwork;
             await FinalizeInvolvementAsync(conflictInvolvementId,
                 semanticIncompatible is not null ? "failure:semantic-incompatible"
                 : transientFailure ? "failure:transient"
                 : !agentResult.Success ? "failure:agent"
                 : "success");
+            // An exit-0 conflict-rework run that printed a login prompt would
+            // otherwise fall through to the rebase/status handling below and be
+            // recorded as an ordinary dirty/conflict rework failure, leaving
+            // the unauthenticated agent routable. Detection runs before the
+            // semantic-incompatible branch so an auth break is always reported
+            // as the breaking signal, not as the agent's own reasoned refusal.
+            // Require forced in-VM probe corroboration before publishing the
+            // global bench — the session-resume catch sibling at line ~12929
+            // is already corroborated; pairing this steady-state scan
+            // preserves the symmetry the b946c6f / b8d9d09 retrofit work
+            // established.
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, runner.Kind, ConflictReworkPhaseKey, agentResult,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
             if (semanticIncompatible is not null)
             {
                 return new ConflictReworkAgentOutcome(

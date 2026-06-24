@@ -202,6 +202,113 @@ public sealed class LlmReviewAuditorTests
     }
 
     [Fact]
+    public async Task RunAsync_ValidResult_CarriesAgentOutputMetadata()
+    {
+        var runner = new FixedResultRunner(new AgentResult(
+            Success: true,
+            Summary: "agent summary",
+            Stdout: "agent stdout",
+            Stderr: "agent stderr"));
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        var sandbox = new WritableResultFileSandbox
+        {
+            ResultJson = "{\"passed\":true,\"findings\":[]}",
+        };
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work");
+
+        var result = await auditor.RunAsync(sandbox, "/work", ctx);
+
+        Assert.True(result.Passed);
+        Assert.Equal("agent stdout", result.RawOutput);
+        Assert.Equal("agent stdout", result.AgentStdout);
+        Assert.Equal("agent stderr", result.AgentStderr);
+        Assert.Equal("agent summary", result.AgentSummary);
+    }
+
+    [Fact]
+    public async Task RunAsync_InvalidJsonResult_CarriesAgentOutputMetadata()
+    {
+        var runner = new FixedResultRunner(new AgentResult(
+            Success: true,
+            Summary: "agent summary",
+            Stdout: "agent stdout",
+            Stderr: "agent stderr"));
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        var sandbox = new WritableResultFileSandbox
+        {
+            ResultJson = "{not valid json",
+        };
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work");
+
+        var result = await auditor.RunAsync(sandbox, "/work", ctx);
+
+        Assert.False(result.Passed);
+        Assert.Contains(result.Findings, f => f.Title == "review agent produced invalid JSON");
+        Assert.Equal("agent stdout", result.RawOutput);
+        Assert.Equal("agent stdout", result.AgentStdout);
+        Assert.Equal("agent stderr", result.AgentStderr);
+        Assert.Equal("agent summary", result.AgentSummary);
+    }
+
+    [Fact]
+    public async Task RunAsync_MissingResult_CarriesStderrOnlyAgentOutputMetadata()
+    {
+        var runner = new FixedResultRunner(new AgentResult(
+            Success: true,
+            Summary: "agent summary",
+            Stdout: null,
+            Stderr: "Authentication required. Please visit the URL to log in:"));
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        var sandbox = new WritableResultFileSandbox
+        {
+            ResultJson = "",
+        };
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work");
+
+        var result = await auditor.RunAsync(sandbox, "/work", ctx);
+
+        Assert.False(result.Passed);
+        Assert.Contains(result.Findings, f => f.Title == "agent did not write audit/result.json");
+        Assert.Null(result.RawOutput);
+        Assert.Null(result.AgentStdout);
+        Assert.Equal("Authentication required. Please visit the URL to log in:", result.AgentStderr);
+        Assert.Equal("agent summary", result.AgentSummary);
+    }
+
+    [Fact]
     public async Task RunAsync_TestCoveragePromptDoesNotScoreUnrunnableE2EProjects()
     {
         var runner = new UnrunnableE2ERuleAwareRunner();
@@ -285,6 +392,26 @@ public sealed class LlmReviewAuditorTests
             RunCalled = true;
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
         }
+    }
+
+    private sealed class FixedResultRunner : IAgentRunner
+    {
+        private readonly AgentResult _result;
+
+        public FixedResultRunner(AgentResult result) => _result = result;
+        public AgentKind Kind => AgentKind.Codex;
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+            => Task.FromResult(_result);
     }
 
     private sealed class UnrunnableE2ERuleAwareRunner : IAgentRunner

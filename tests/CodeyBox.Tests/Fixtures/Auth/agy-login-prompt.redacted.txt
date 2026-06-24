@@ -1,0 +1,4 @@
+Authentication required. Please visit the URL to log in:
+https://accounts.google.com/o/oauth2/auth?client_id=REDACTED.apps.googleusercontent.com&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Foauth-callback
+Waiting for authentication (timeout 30s)...
+Error: authentication timed out.

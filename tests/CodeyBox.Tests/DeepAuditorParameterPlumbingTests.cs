@@ -13,6 +13,12 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class DeepAuditorParameterPlumbingTests
 {
+    public static IEnumerable<object[]> DeepAuditorCases()
+    {
+        yield return [new OwaspAsvsDeepAuditor(), "/audit/owasp-result.json"];
+        yield return [new ArchCoherenceDeepAuditor(), "/audit/arch-result.json"];
+    }
+
     [Fact]
     public async Task OwaspAsvsDeepAuditor_ForwardsModelAndReasoningToRunner()
     {
@@ -74,12 +80,114 @@ public sealed class DeepAuditorParameterPlumbingTests
         Assert.Null(runner.ObservedReasoningMode);
     }
 
+    [Theory]
+    [MemberData(nameof(DeepAuditorCases))]
+    public async Task DeepAuditors_AgentFailure_PreserveAgentAuthMetadata(
+        IDeepAuditor auditor,
+        string resultFile)
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var runner = new CapturingAgentRunner
+        {
+            Result = new AgentResult(false, "agent exited 1", transcript, "stderr auth prompt"),
+        };
+
+        var result = await auditor.RunAsync(
+            new VerdictSandbox(resultFile),
+            "/work",
+            NewContext(runner));
+
+        Assert.False(result.Passed);
+        Assert.Equal(transcript, result.RawOutput);
+        Assert.Equal(transcript, result.AgentStdout);
+        Assert.Equal("stderr auth prompt", result.AgentStderr);
+        Assert.Equal("agent exited 1", result.AgentSummary);
+    }
+
+    [Theory]
+    [MemberData(nameof(DeepAuditorCases))]
+    public async Task DeepAuditors_MissingResult_PreserveStderrOnlyAuthMetadata(
+        IDeepAuditor auditor,
+        string resultFile)
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var runner = new CapturingAgentRunner
+        {
+            Result = new AgentResult(true, "ok", "ordinary stdout", transcript),
+        };
+
+        var result = await auditor.RunAsync(
+            new VerdictSandbox(resultFile, resultJson: null),
+            "/work",
+            NewContext(runner));
+
+        Assert.False(result.Passed);
+        Assert.Equal("ordinary stdout", result.RawOutput);
+        Assert.Equal("ordinary stdout", result.AgentStdout);
+        Assert.Equal(transcript, result.AgentStderr);
+        Assert.Equal("ok", result.AgentSummary);
+    }
+
+    [Theory]
+    [MemberData(nameof(DeepAuditorCases))]
+    public async Task DeepAuditors_InvalidJson_PreserveAgentAuthMetadata(
+        IDeepAuditor auditor,
+        string resultFile)
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var runner = new CapturingAgentRunner
+        {
+            Result = new AgentResult(true, "ok", "ordinary stdout", transcript),
+        };
+
+        var result = await auditor.RunAsync(
+            new VerdictSandbox(resultFile, resultJson: "{not json"),
+            "/work",
+            NewContext(runner));
+
+        Assert.False(result.Passed);
+        Assert.Equal("ordinary stdout", result.RawOutput);
+        Assert.Equal("ordinary stdout", result.AgentStdout);
+        Assert.Equal(transcript, result.AgentStderr);
+        Assert.Equal("ok", result.AgentSummary);
+    }
+
+    [Theory]
+    [MemberData(nameof(DeepAuditorCases))]
+    public async Task DeepAuditors_ValidVerdict_PreserveAgentAuthMetadata(
+        IDeepAuditor auditor,
+        string resultFile)
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var runner = new CapturingAgentRunner
+        {
+            Result = new AgentResult(true, "ok", transcript, "stderr auth prompt"),
+        };
+
+        var result = await auditor.RunAsync(
+            new VerdictSandbox(resultFile),
+            "/work",
+            NewContext(runner));
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+        Assert.Equal(transcript, result.RawOutput);
+        Assert.Equal(transcript, result.AgentStdout);
+        Assert.Equal("stderr auth prompt", result.AgentStderr);
+        Assert.Equal("ok", result.AgentSummary);
+    }
+
     private sealed class CapturingAgentRunner : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
         public string? ObservedModelId { get; private set; }
         public string? ObservedReasoningMode { get; private set; }
         public bool RunCalled { get; private set; }
+        public AgentResult Result { get; init; } = new(true, "ok", "stdout", null);
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox,
@@ -95,7 +203,7 @@ public sealed class DeepAuditorParameterPlumbingTests
             RunCalled = true;
             ObservedModelId = modelId;
             ObservedReasoningMode = reasoningMode;
-            return Task.FromResult(new AgentResult(true, "ok", "stdout", null));
+            return Task.FromResult(Result);
         }
     }
 
@@ -106,18 +214,37 @@ public sealed class DeepAuditorParameterPlumbingTests
     private sealed class VerdictSandbox : ISandbox
     {
         private readonly string _resultFile;
+        private readonly string? _resultJson;
 
-        public VerdictSandbox(string resultFile) => _resultFile = resultFile;
+        public VerdictSandbox(
+            string resultFile,
+            string? resultJson = "{\"passed\":true,\"findings\":[]}")
+        {
+            _resultFile = resultFile;
+            _resultJson = resultJson;
+        }
 
         public string Id => "verdict-sandbox";
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "cat" && exec.Argv[1] == _resultFile)
-                return Task.FromResult(new SandboxExecResult(0, "{\"passed\":true,\"findings\":[]}", ""));
+            {
+                return _resultJson is null
+                    ? Task.FromResult(new SandboxExecResult(1, "", "missing result"))
+                    : Task.FromResult(new SandboxExecResult(0, _resultJson, ""));
+            }
             return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
+
+    private static DeepAuditContext NewContext(IAgentRunner runner)
+        => new(
+            ReleaseId.New(),
+            new ProjectId("p"),
+            BranchName: "release/v1",
+            Iteration: 1,
+            AuditRunner: runner);
 }

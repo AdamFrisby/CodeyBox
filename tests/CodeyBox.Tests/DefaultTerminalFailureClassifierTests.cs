@@ -57,6 +57,15 @@ public sealed class DefaultTerminalFailureClassifierTests
     }
 
     [Fact]
+    public void AuthRequired_failure_is_Deterministic_operator_action()
+    {
+        var item = BuildItem(state: WorkItemState.Failed, failureKind: WorkItemFailureKinds.AuthRequired);
+        var verdict = _sut.Classify(item);
+        Assert.Equal(TerminalFailureClass.Deterministic, verdict.Class);
+        Assert.Contains("re-authentication", verdict.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void AuditFailed_state_is_Deterministic()
     {
         var item = BuildItem(state: WorkItemState.AuditFailed, failureKind: null);
@@ -92,7 +101,7 @@ public sealed class DefaultTerminalFailureClassifierTests
         foreach (var kind in new[]
         {
             "quota", "infrastructure", "agent_unavailable", "timeout",
-            "build", "agent", "configuration", "cancelled", "other", null,
+            "build", "agent", "configuration", "cancelled", WorkItemFailureKinds.AuthRequired, "other", null,
         })
         {
             var item = BuildItem(state: WorkItemState.Failed, failureKind: kind);

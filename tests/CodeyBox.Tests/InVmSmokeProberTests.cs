@@ -43,7 +43,9 @@ public sealed class InVmSmokeProberTests
         ICredentialProvider? credentials = null,
         IEnumerable<IInVmSmokeProbe>? probes = null,
         bool fillDefaultNetworkProfile = true,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         var effectiveOpts = opts ?? new InVmSmokeOptions
         {
@@ -66,7 +68,9 @@ public sealed class InVmSmokeProberTests
             new NullWebhookDispatcher(),
             effectiveOpts,
             NullLogger<InVmSmokeProber>.Instance,
-            smokeOptions);
+            smokeOptions,
+            authFailureClassifier,
+            authAvailability);
     }
 
     private static InVmSmokeCache NewCache() => new(TimeSpan.FromMinutes(60));
@@ -124,6 +128,137 @@ public sealed class InVmSmokeProberTests
         var availability = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(availability.Available);
         Assert.Contains("agent status failed", availability.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_ExcludesAgent()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("auth/login prompt detected", availability.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_RoutesViaAuthRegistry_PopulatesAuthRequiredChannel()
+    {
+        // The prober's documented contract: when the auth registry is wired,
+        // login-prompt detection MUST escalate via MarkAuthRequired so the
+        // exclusion lives under SmokeExclusionSource.AuthRequired — not the
+        // smoke-gate source. A regression that re-routed back through
+        // MarkSmokeResult would silently break the survive-smoke-disabled
+        // guarantee (GetAvailabilityWithoutSmokeGateExclusions would let the
+        // agent through), and the existing pre-finding tests only assert
+        // `Available==false` which the smoke-gate source also satisfies.
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            authAvailability: registry);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var authChannel = registry.GetAuthRequiredAvailability(AgentKind.Cursor);
+        Assert.True(authChannel.AuthRequired);
+        Assert.NotNull(authChannel.Reason);
+        Assert.Contains("auth/login prompt detected", authChannel.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_RoutedViaAuthRegistry_StaysGatedEvenWhenSmokeDisabled()
+    {
+        // Pair the auth-registry route with a smoke-disabled dispatch read.
+        // SmokeExclusionSource.AuthRequired is in the IsNonSmokeExclusion
+        // allowlist, so an agent benched via the auth path stays gated even
+        // when CodeyBox:Smoke:Enabled=false — the exact "survive smoke
+        // disabled" property the route exists to guarantee.
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            authAvailability: registry);
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var smokeDisabled = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var dispatch = new AgentDispatchAvailability(registry, inVmSmokeGate: null, smokeOptions: smokeDisabled);
+
+        var availability = dispatch.GetAvailability(AgentKind.Cursor);
+        Assert.NotNull(availability);
+        Assert.False(availability!.Available);
+        Assert.Contains("auth required", availability.Reason);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithAuthPrompt_NoAuthRegistry_FallsBackToSmokeSource()
+    {
+        // Documents the fallback contract: when the auth registry is NOT
+        // wired (legacy embedders / minimal tests), the prober still benches
+        // the agent — just under SmokeExclusionSource.InVmSmoke. Verifies the
+        // structured AuthRequired channel stays empty so this path doesn't
+        // accidentally satisfy the survive-smoke-disabled guarantee.
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.False(registry.GetAuthRequiredAvailability(AgentKind.Cursor).AuthRequired);
+    }
+
+    [Fact]
+    public async Task StatusExitZeroWithConfiguredAuthPrompt_ExcludesAgent()
+    {
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status")
+                ? new SandboxExecResult(0, "operator-only cursor login prompt", "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var classifier = new AgentAuthFailureClassifier(
+            new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["cursor"] =
+                [
+                    new AuthFailurePattern(
+                        "operator-only cursor login prompt",
+                        AuthFailurePatternStream.Stdout),
+                ],
+            });
+        var prober = Build(
+            provider,
+            registry,
+            NewCache(),
+            new FakeBaselineResolver("base-A"),
+            authFailureClassifier: classifier);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("auth/login prompt detected", availability.Reason);
     }
 
     [Fact]
@@ -917,6 +1052,42 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task ForceProbeAsync_WithDispatchTarget_UsesTargetAndBypassesCache()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        cache.Set(AgentKind.Cursor, "base-DISPATCH",
+            new AgentSmokeResult(true, null, TimeSpan.Zero, SmokeFailureCategory.None));
+        var resolver = new FakeBaselineResolver("base-CONFIGURED");
+        var target = new InVmSmokeSandboxTarget(
+            "dispatch-profile",
+            SandboxProfileFlavor.Headless,
+            "base-DISPATCH");
+        var prober = Build(provider, registry, cache, resolver,
+            opts: new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                NetworkProfile = "configured-smoke-profile",
+                SweepIntervalSeconds = 0,
+            });
+
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, target, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result!.Available);
+        Assert.Equal(1, provider.CreateCount);
+        Assert.Equal("base-DISPATCH", provider.LastBaselineRef);
+        Assert.Equal("dispatch-profile", provider.LastProfileName);
+        Assert.Equal(target.Flavor, provider.LastFlavor);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal("dispatch-profile", ensureCall.Profile);
+        Assert.Equal(target.Flavor, ensureCall.Flavor);
+        Assert.Equal("base-DISPATCH", ensureCall.PinnedRef);
+    }
+
+    [Fact]
     public async Task StalePass_RegressesWithinSameRef_ForceProbeReExecsAndInvalidates_NextSweepStaysBenched()
     {
         // Production regression the smoke gate exists to catch: a baseline that
@@ -1010,6 +1181,30 @@ public sealed class InVmSmokeProberTests
         Assert.Null(result);
         Assert.Equal(0, provider.CreateCount);
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task ForceProbeAsync_ProvisioningDeferred_ReturnsNullWithoutBenching()
+    {
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "clone",
+            errorClass: "multipass-instance-lock-contention",
+            detail: "clone retry exhausted",
+            recheckIn: TimeSpan.FromSeconds(30));
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""))
+        {
+            ThrowOnCreate = deferred,
+        };
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, WorkTarget, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
     }
 
     [Fact]

@@ -1585,6 +1585,10 @@ builder.Services.AddSingleton<IAgentEffectiveAvailabilityReader>(sp =>
 // surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
 builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentAuthAvailabilityRegistry>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentAuthRequiredAvailabilityReader>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
@@ -1649,7 +1653,9 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>(),
-    sp.GetRequiredService<SmokeOptionsSnapshot>()));
+    sp.GetRequiredService<SmokeOptionsSnapshot>(),
+    sp.GetRequiredService<IAgentAuthFailureClassifier>(),
+    sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
 // The router consults the prober as a dispatch gate (IInVmSmokeGate) so the
 // first work item per baseline is verified in-VM before routing; share the
 // single InVmSmokeProber instance so the gate, the background sweep service,
@@ -1847,6 +1853,9 @@ builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
     sp.GetRequiredService<IAgentQuotaGate>(),
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
+builder.Services.AddSingleton<ICondition>(sp => new AgentAuthRequiredCondition(
+    sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
+    sp.GetRequiredService<IAgentRegistry>()));
 builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new OrchestratorStallCondition(
     sp.GetRequiredService<OrchestratorProgressClock>(),
@@ -1858,6 +1867,9 @@ builder.Services.AddSingleton<INotificationBuilder, QueueEmptyNotificationBuilde
 builder.Services.AddSingleton<INotificationBuilder>(sp => new AllQuotasExhaustedNotificationBuilder(
     sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct));
+builder.Services.AddSingleton<INotificationBuilder>(sp => new AgentAuthRequiredNotificationBuilder(
+    sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
+    sp.GetRequiredService<IAgentRegistry>()));
 builder.Services.AddSingleton<INotificationBuilder, WorkItemPermanentlyFailedNotificationBuilder>();
 builder.Services.AddSingleton<INotificationBuilder>(sp => new OrchestratorStallNotificationBuilder(
     sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));
@@ -2272,6 +2284,19 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDe
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
+builder.Services.AddSingleton<IAgentAuthFailureClassifier>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return AuthFailurePatternBinder.Build(cbOpts);
+});
+// Single composition-root point for the auth-required side-effect handler.
+// PipelineRunner and ReleaseService consume the abstraction directly so the
+// registry / webhook / logger plumbing is not duplicated across both classes.
+builder.Services.AddSingleton<IAgentAuthRequiredHandler>(sp =>
+    new AgentAuthRequiredHandler(
+        sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
+        sp.GetRequiredService<IWebhookDispatcher>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentAuthRequiredHandler>()));
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
@@ -2396,7 +2421,12 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>(),
     terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>(),
     mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
-    mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>()));
+    mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
+    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
+    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
+    inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
+    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
+    authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2541,7 +2571,10 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditMaxConcurrency,
     () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
     agentStreams: sp.GetService<IAgentStreamStore>(),
-    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>()));
+    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
+    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
+    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
+    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
@@ -3732,6 +3765,15 @@ namespace CodeyBox.Api
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
+        /// Operator-extensible per-agent auth/login-prompt output patterns.
+        /// Keys are agent kind values (e.g. <c>antigravity</c>); each entry adds
+        /// a case-insensitive stderr/stdout substring to the built-in login-prompt
+        /// detector. Keep stdout patterns narrowly tied to CLI login transcripts
+        /// because stdout can contain model-produced task text.
+        /// </summary>
+        public Dictionary<string, List<AuthFailurePatternOptions>> AuthFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
         /// Time-of-day score modifiers. Applied as small effective-score adjustments
         /// to act as tiebreakers between near-equivalent models during peak cost windows.
         /// See docs/configuration.md for the schedule schema.
@@ -4742,6 +4784,54 @@ namespace CodeyBox.Api
         public string Pattern { get; set; } = string.Empty;
         /// <summary>How to classify the failure when the substring matches.</summary>
         public QuotaFailureKind Kind { get; set; } = QuotaFailureKind.LimitReached;
+    }
+
+    /// <summary>
+    /// One operator-supplied auth/login-prompt pattern entry. Appended to the
+    /// built-in defaults and matched case-insensitively against the configured
+    /// stream. Bound from <c>CodeyBox:AuthFailurePatterns:&lt;agent-kind&gt;</c>.
+    /// Defaults to stderr-only because stdout can contain model-controlled task
+    /// text; stdout patterns should be narrowly formed CLI login transcripts.
+    /// </summary>
+    public sealed class AuthFailurePatternOptions
+    {
+        /// <summary>The substring to search for.</summary>
+        public string Pattern { get; set; } = string.Empty;
+        /// <summary>
+        /// Stream to search. Defaults to stderr. Use Stdout or StderrAndStdout
+        /// only for narrow CLI-auth transcript signatures.
+        /// </summary>
+        public AuthFailurePatternStream Stream { get; set; } = AuthFailurePatternStream.Stderr;
+    }
+
+    /// <summary>
+    /// Pure conversion from operator-supplied
+    /// <see cref="CodeyBoxOptions.AuthFailurePatterns"/> to a wired
+    /// <see cref="IAgentAuthFailureClassifier"/>. Extracted from the DI factory
+    /// so the binding shape (config section name, per-agent dictionary,
+    /// pattern filtering, conversion to <see cref="AuthFailurePattern"/>) is
+    /// reachable from unit tests without booting the full host — a bug in
+    /// any of those steps would otherwise silently disable the operator's
+    /// extensibility hook for new CLI login prompts.
+    /// </summary>
+    public static class AuthFailurePatternBinder
+    {
+        public static IAgentAuthFailureClassifier Build(CodeyBoxOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            var extras = options.AuthFailurePatterns is null
+                ? new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+                : options.AuthFailurePatterns
+                    .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Key))
+                    .ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => (IReadOnlyList<AuthFailurePattern>)(kvp.Value ?? new List<AuthFailurePatternOptions>())
+                            .Where(p => !string.IsNullOrWhiteSpace(p.Pattern))
+                            .Select(p => new AuthFailurePattern(p.Pattern, p.Stream))
+                            .ToArray(),
+                        StringComparer.OrdinalIgnoreCase);
+            return new AgentAuthFailureClassifier(extras);
+        }
     }
 
     /// <summary>

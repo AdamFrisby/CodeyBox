@@ -41,6 +41,8 @@ public sealed class ReleaseService
     private readonly ILogger<ReleaseService> _log;
     private readonly IAgentStreamStore? _agentStreams;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
+    private readonly IAgentAuthRequiredHandler _authRequiredHandler;
 
     // Hot-reloadable deep-audit concurrency gate — resolved from IOptionsMonitor on every
     // acquire/remediate call so config edits take effect without restart.
@@ -67,7 +69,14 @@ public sealed class ReleaseService
         Func<int> deepAuditMaxConcurrency,
         Func<TimeSpan> deepAuditRemediationItemTimeout,
         IAgentStreamStore? agentStreams = null,
-        AgentPromptPreprocessorChain? promptPreprocessors = null)
+        AgentPromptPreprocessorChain? promptPreprocessors = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        IAgentAuthAvailabilityRegistry? authAvailability = null,
+        // Composition-root path. When supplied, the registry plumbing is owned
+        // by the host's DI graph and not rebuilt here, removing the duplication
+        // between this class and PipelineRunner. Legacy embedders / tests that
+        // don't wire this still get the registry-built path below.
+        IAgentAuthRequiredHandler? authRequiredHandler = null)
     {
         _releases = releases;
         _workItems = workItems;
@@ -88,6 +97,12 @@ public sealed class ReleaseService
         _deepAuditRemediationItemTimeout = deepAuditRemediationItemTimeout;
         _agentStreams = agentStreams;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
+        _authRequiredHandler = authRequiredHandler
+            ?? new AgentAuthRequiredHandler(
+                authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance,
+                _webhooks,
+                _log);
     }
 
     private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)
@@ -415,7 +430,16 @@ public sealed class ReleaseService
         {
             _log.LogInformation("Release {Id}: deep audit iteration {Iter}/{Max}", release.Id, iteration, maxIterations);
 
-            var findings = await RunDeepAuditIterationAsync(release, project, auditors, iteration, ct);
+            IReadOnlyList<AuditFinding> findings;
+            try
+            {
+                findings = await RunDeepAuditIterationAsync(release, project, auditors, iteration, ct);
+            }
+            catch (AgentAuthRequiredException ex)
+            {
+                await FailReleaseAsync(release, ex.Message, ct);
+                return;
+            }
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
 
             var current = await _releases.GetAsync(release.Id, ct) ?? release;
@@ -610,9 +634,17 @@ public sealed class ReleaseService
                 try
                 {
                     var result = await auditor.RunAsync(sandbox, "/work/repo", ctx, ct);
+                    await ThrowIfDeepAuditAuthRequiredAsync(
+                        release,
+                        project,
+                        auditor,
+                        runner,
+                        needsCreds,
+                        result,
+                        ct);
                     allFindings.AddRange(result.Findings);
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is not AgentAuthRequiredException)
                 {
                     _log.LogWarning(ex, "Deep auditor {Name} threw for release {Id}", auditor.Name, release.Id);
                 }
@@ -625,6 +657,57 @@ public sealed class ReleaseService
         }
 
         return allFindings;
+    }
+
+    private async Task ThrowIfDeepAuditAuthRequiredAsync(
+        Release release,
+        Project project,
+        IDeepAuditor auditor,
+        IAgentRunner? runner,
+        bool needsCreds,
+        AuditResult result,
+        CancellationToken ct)
+    {
+        if (!needsCreds || runner is null)
+            return;
+
+        var stdout = !string.IsNullOrEmpty(result.AgentStdout)
+            ? result.AgentStdout
+            : result.RawOutput;
+        var stderr = result.AgentStderr;
+        if (string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(stderr))
+            return;
+
+        var detection = _authFailureClassifier.DetectDetailed(runner.Kind, stderr, stdout);
+        if (detection is null || detection.Classification.Kind != AgentFailureKind.AuthRequired)
+            return;
+
+        var phase = $"release-deep-audit:{auditor.Name}";
+        // Deep-audit stdout is model-controlled prose, so a stdout-only login-
+        // prompt match fails the release but does not bench the agent globally —
+        // override the handler's default stdout-only annotation to record that
+        // distinction in the reason string.
+        var stdoutOnlyNote = detection.IsStdoutOnly
+            ? "stdout accepted for release failure only because deep-audit stdout is model-controlled"
+            : null;
+        var reason = _authRequiredHandler.BuildReason(
+            phase,
+            detection.Classification,
+            detection.IsStdoutOnly,
+            stdoutOnlyNote,
+            release);
+
+        if (!detection.IsStdoutOnly)
+        {
+            await _authRequiredHandler.PublishSideEffectsAsync(
+                runner.Kind,
+                reason,
+                project: project,
+                release: release,
+                ct: ct);
+        }
+
+        throw new AgentAuthRequiredException(runner.Kind, phase, reason);
     }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(

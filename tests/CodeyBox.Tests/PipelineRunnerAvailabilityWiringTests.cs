@@ -420,6 +420,764 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_NoInVmGate_ExcludesFailOpen()
+    {
+        // With no in-VM smoke gate wired the corroboration check returns
+        // Unavailable, which the policy currently treats as fail-open (publish
+        // side effects). The fleet bench still fires, but the reason carries
+        // the "corroboration unavailable" qualifier so operators know it was
+        // not corroborated. This is the documented trade-off — stronger
+        // protection requires an in-VM gate that can run --version inside a
+        // fresh sandbox; see PipelineRunner.TryCorroborateStdoutOnlyAuthRequiredAsync.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task SuccessfulWorkRun_WithCapturedStdoutAuthPromptAndDiff_DoesNotBenchAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "changed\n"));
+        fix.Codex.WorkStdouts.Enqueue(transcript);
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotEqual(WorkItemState.Failed, final!.State);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task FailedWorkRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        // The work-phase fix scans BOTH the Success=true (exit 0, no diff) and
+        // Success=false (non-zero exit) outputs for a login prompt. Without
+        // this case, a regression that only kept the Success=true call would
+        // still pass the pre-existing test but silently regress the more
+        // common failure shape: a nonzero exit whose stderr/stdout contains
+        // the captured login transcript.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: transcript));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task FailedWorkRun_WithAuthLoginPromptAnd401_IsAuthRequired_NotQuotaParked()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: """
+                Authentication required. Please visit the URL to log in:
+                Waiting for authentication (timeout 30s)...
+                Error: authentication timed out.
+                """,
+            Stderr: "API Error: 401 Unauthorized"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Null(final.QuotaRetryFrom);
+        Assert.Contains("auth required from agent output", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+    }
+
+    [Fact]
+    public async Task AuthLoginPrompt_SurvivesSmokeDisabled_GateBenchesAgentForNextItem()
+    {
+        // Master smoke switch OFF. The non-smoke exclusion source
+        // (SmokeExclusionSource.AuthRequired) MUST still hold the agent
+        // benched — if the auth source were tracked as InVmSmoke/HostSmoke,
+        // AgentDispatchAvailability.GetAvailabilityWithoutSmokeGateExclusions
+        // would silently ignore it and route the next item to the same
+        // unauthenticated CLI. Pin the regression so a future refactor that
+        // re-classifies AuthRequired as a smoke source fails this test.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: null,
+            Stderr: transcript));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // Even with smoke disabled the dispatch-availability view must
+        // report the agent as unavailable.
+        var dispatch = new AgentDispatchAvailability(fix.Registry, inVmSmokeGate: null, smokeOptions: smokeOptions);
+        var verdict = dispatch.GetAvailability(AgentKind.Codex);
+        Assert.NotNull(verdict);
+        Assert.False(verdict!.Available);
+        Assert.Contains("auth required from agent output", verdict.Reason);
+    }
+
+    [Fact]
+    public async Task AuthLoginPrompt_PublishesAlertEvenWhenAgentAlreadyExcludedByOtherSource()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
+        fix.Registry.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(false, "host probe already failed", TimeSpan.Zero, SmokeFailureCategory.Persistent),
+            SmokeExclusionSource.HostSmoke);
+
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: null,
+            Stderr: transcript));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("auth required from agent output", details.Reason);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("host probe already failed", availability.Reason);
+        Assert.Contains("auth required from agent output", availability.Reason);
+    }
+
+    [Fact]
+    public async Task MergePhaseDirectAgentRun_WithStderrAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        // The merge-phase fix call site is decoupled from the work-phase call
+        // site: a regression that drops EITHER would leave half the outage
+        // unmitigated. Pin the merge path independently so a removed/wrong-
+        // phase-name detector call there can't pass off the work-phase test
+        // as full coverage.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        // Work phase succeeds; merge phase returns exit 0 with a captured
+        // login prompt — the silent-broken-agent shape from the antigravity
+        // outage, but inside the merge call site.
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
+        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: null,
+            Stderr: transcript));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("merge", final.LastError);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        // Pin the phase tag so a future refactor that copies the work-phase
+        // call into merge without updating the label is caught — operator
+        // dashboards need merge vs. work attribution.
+        Assert.Contains("merge", details.Reason);
+    }
+
+    [Fact]
+    public async Task MergePhaseDirectAgentRun_WithNonzeroAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
+        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("merge", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("merge", details.Reason);
+    }
+
+    [Fact]
+    public async Task MergePhaseAgenticResolver_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: null,
+            Stderr: transcript));
+
+        var item = NewItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/merge-resolver-auth-" + Guid.NewGuid().ToString("N")[..8],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchAsync(barePath, item.WorkBranch!, "README.md", "work side\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main side\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("merge-resolver", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("merge-resolver", details.Reason);
+    }
+
+    [Fact]
+    public async Task SuccessfulNoDiffRun_WithoutAuthLoginPrompt_RemainsNormalNoChangesFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "No repository changes were necessary.",
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Agent produced no changes to commit", final.LastError);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task StdoutOnlyAuthFragment_FromNoDiffWorkRun_ExcludesAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted",
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.DoesNotContain("Agent produced no changes to commit", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithCorroboratingInVmProbe_BenchesAndAlerts()
+    {
+        // Mirror the audit-side AuditStdoutOnlyAuthPrompt_WithPersistentAuthInVmFailure
+        // shape on the work-phase no-diff path: when the in-VM smoke gate is
+        // wired AND the forced probe corroborates the stdout-only auth
+        // evidence, the work-phase path benches the agent globally and alerts
+        // operators. The work-phase no-diff branch must require corroboration
+        // (PipelineRunner.cs:3741-3752) so a single crafted prompt line in
+        // model-controlled stdout cannot DoS the fleet — only authoritative
+        // sandbox-side evidence triggers the global bench.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new AuthCorroboratingInVmSmokeGate();
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: """
+                Authentication required. Please visit the URL to log in:
+                https://accounts.google.com/o/oauth2/auth?client_id=redacted
+                Waiting for authentication (timeout 30s)...
+                Error: authentication timed out.
+                """,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("stdout corroborated by forced in-VM smoke probe", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithPassingInVmProbe_FailsItemWithoutFleetBench()
+    {
+        // The protective half of the no-diff corroboration requirement: when
+        // the forced in-VM probe passes (binary launches OK), the stdout-only
+        // auth evidence is treated as item-level failure ONLY, not a global
+        // bench. This is the regression test for the DoS surface: a crafted
+        // prompt that coerces the agent into echoing an OAuth URL must NOT
+        // bench the fleet, because the in-VM probe disagrees with the
+        // model-controlled stdout.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new AuthCorroboratingInVmSmokeGate(new AgentAvailability(true, null, null));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
+
+        // The exact attack shape from the audit finding: a single attacker-
+        // controlled OAuth callback URL line that the detector's loose
+        // /oauth-callback fragment matches. Under the prior buggy no-diff
+        // branch this would have triggered the fleet bench without any
+        // sandbox-side corroboration.
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "https://attacker.example.com/oauth-callback?code=redacted",
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("stdout accepted for item failure only", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task SuccessfulWorkRun_WithDiffAndStderrAuthPrompt_ExcludesAgentImmediately()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("auth-diff.txt", "changed\n"));
+        fix.Codex.WorkStderrs.Enqueue("""
+            Authentication required. Please visit the URL to log in:
+            https://accounts.google.com/o/oauth2/auth?client_id=redacted
+            Waiting for authentication (timeout 30s)...
+            Error: authentication timed out.
+            """);
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.DoesNotContain("Agent produced no changes to commit", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithThrowingInVmCorroboration_FailsOpenAndBenches()
+    {
+        // Mirrors the audit-side AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration
+        // shape: when the forced in-VM smoke probe throws, the corroboration
+        // path catches and returns Unavailable. The policy currently treats
+        // Unavailable as fail-open — global bench fires, but the reason
+        // carries the "corroboration unavailable" qualifier so operators see
+        // that the in-VM signal was indeterminate.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new ThrowingForceProbeInVmSmokeGate();
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: """
+                Authentication required. Please visit the URL to log in:
+                https://accounts.google.com/o/oauth2/auth?client_id=redacted
+                Waiting for authentication (timeout 30s)...
+                Error: authentication timed out.
+                """,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task AuditStdoutOnlyAuthPrompt_WithoutInVmSmoke_FailsBenchesAndAlerts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            AgentStdout: transcript));
+        using var fix = BuildPipeline(seed, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available, availability.Reason);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+    }
+
+    [Fact]
+    public async Task AuditRawOutputOnlyAuthPrompt_WithoutInVmSmoke_FailsBenchesAndAlerts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            RawOutput: transcript));
+        using var fix = BuildPipeline(seed, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available, availability.Reason);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+    }
+
+    [Fact]
+    public async Task AuditStdoutOnlyAuthPrompt_WithPersistentAuthInVmFailure_BenchesAfterProbeCorroboration()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var gate = new AuthCorroboratingInVmSmokeGate();
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            AgentStdout: transcript));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("stdout corroborated by forced in-VM smoke probe", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+        Assert.Single(gate.ForceProbeTargets);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration_StillBenchesAndAlerts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var gate = new ThrowingForceProbeInVmSmokeGate();
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            AgentStdout: transcript));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+        Assert.Single(gate.ForceProbeTargets);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available, availability.Reason);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+    }
+
+    [Fact]
+    public async Task AuditStdoutOnlyAuthPrompt_WithPassingInVmProbe_FailsWithoutFleetBench()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var gate = new AuthCorroboratingInVmSmokeGate(new AgentAvailability(true, null, null));
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            AgentStdout: transcript));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("stdout accepted for item failure only", final.LastError);
+        Assert.Contains("forced in-VM smoke probe did not corroborate auth", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+        Assert.Single(gate.ForceProbeTargets);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available, availability.Reason);
+
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task AuditStdoutOnlyAuthPrompt_WithNonAuthInVmFailure_FailsWithoutFleetBench()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var gate = new AuthCorroboratingInVmSmokeGate(
+            new AgentAvailability(false, "transient: try later", null));
+        var auditor = new CredentialAuditOutputAuditor(new AuditResult(
+            Passed: true,
+            Findings: [],
+            AgentStdout: transcript));
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate, auditors: [auditor]);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("stdout accepted for item failure only", final.LastError);
+        Assert.Contains("forced in-VM smoke probe did not corroborate auth", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
+        Assert.Single(gate.ForceProbeTargets);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available, availability.Reason);
+
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
     public async Task SuccessfulWorkRun_ResetsFastFailCounterFromPipeline()
     {
         // Pin the contract that a SUCCESSFUL run also feeds the registry — a
@@ -666,6 +1424,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, prober),
             terminalTransitions: terminalTransitions,
@@ -793,6 +1552,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, gate, smokeOptions),
             terminalTransitions: terminalTransitions,
@@ -848,7 +1608,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         string seedRepoUrl,
         int maxConsecutiveFastFails = 3,
         SmokeOptionsSnapshot? smokeOptions = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        IReadOnlyList<IAuditor>? auditors = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -864,6 +1625,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // sees the outcome via PipelineRunner's RecordRunOutcome call.
         var codex = new ScriptableAgent(AgentKind.Codex);
         var registry = new AgentRegistry([codex]);
+        var auditorList = auditors is { Count: > 0 }
+            ? TestAuditGates.WithPassedBuildAndTest(auditors)
+            : Array.Empty<IAuditor>();
 
         var project = new Project
         {
@@ -875,11 +1639,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             Audit = new ProjectAudit
             {
                 MaxIterations = 1,
-                AuditTypes = [],
+                AuditTypes = auditorList.Count > 0 ? ["scripted"] : [],
             },
         };
         var projects = new InMemoryProjectRepository(project);
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
 
         var availability = new AgentAvailabilityRegistry(
             new AvailabilityOptions
@@ -889,6 +1653,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             },
             TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
+        // The fake gate is constructed before the registry exists; wire the
+        // registry in now so MarkAuthRequired flows the same way the real
+        // InVmSmokeProber does when it detects an auth/login prompt in-VM.
+        if (inVmSmokeGate is AuthCorroboratingInVmSmokeGate corroboratingGate)
+            corroboratingGate.AttachAuthRegistry(availability, webhooks);
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
@@ -908,10 +1677,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            inVmSmokeGate: inVmSmokeGate);
 
         return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
     }
@@ -987,6 +1758,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
@@ -1013,6 +1785,157 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
             Task.FromResult<AgentAvailability?>(new AgentAvailability(false, "transient: try later", null));
+    }
+
+    private sealed class AuthCorroboratingInVmSmokeGate : IInVmSmokeGate
+    {
+        private readonly AgentAvailability _forcedAvailability;
+        // Mirrors what the real InVmSmokeProber now does on auth detection:
+        // populates the structured AuthRequired channel on the availability
+        // registry AND emits the agent.smoke_failed webhook directly, so the
+        // pipeline's corroboration check (which now reads
+        // IAgentAuthRequiredAvailabilityReader directly instead of substring-
+        // matching the freeform reason) sees the corroboration signal and
+        // the test's existing webhook assertion still holds. The registry
+        // and webhook dispatcher are attached post-construction by
+        // BuildPipeline because the gate is constructed before they exist.
+        private IAgentAuthAvailabilityRegistry? _authAvailability;
+        private IWebhookDispatcher? _webhooks;
+        private readonly bool _corroboratesAuth;
+
+        public AuthCorroboratingInVmSmokeGate(AgentAvailability? forcedAvailability = null)
+        {
+            _forcedAvailability = forcedAvailability
+                ?? new AgentAvailability(false, "smoke probe failed [persistent]: credential login required", null);
+            // The default forced-availability simulates the in-VM probe seeing
+            // an auth/login prompt; an explicit failing availability is taken
+            // as the non-auth (transient or other smoke) path. A passing
+            // availability never corroborates.
+            _corroboratesAuth = forcedAvailability is null;
+        }
+
+        public void AttachAuthRegistry(
+            IAgentAuthAvailabilityRegistry authAvailability,
+            IWebhookDispatcher webhooks)
+        {
+            _authAvailability = authAvailability;
+            _webhooks = webhooks;
+        }
+
+        public int EnsureCalls { get; private set; }
+        public int ForceProbeCalls { get; private set; }
+        public List<InVmSmokeSandboxTarget> ForceProbeTargets { get; } = [];
+        public bool Enabled => true;
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            EnsureCalls++;
+            return Task.FromResult(new AgentAvailability(true, null, null));
+        }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+        {
+            ForceProbeCalls++;
+            MarkAuthIfNeeded(kind);
+            return Task.FromResult<AgentAvailability?>(_forcedAvailability);
+        }
+
+        public Task<AgentAvailability?> ForceProbeAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            ForceProbeCalls++;
+            ForceProbeTargets.Add(target);
+            MarkAuthIfNeeded(kind);
+            return Task.FromResult<AgentAvailability?>(_forcedAvailability);
+        }
+
+        private void MarkAuthIfNeeded(AgentKind kind)
+        {
+            if (!_corroboratesAuth || _authAvailability is null) return;
+            var reason = _forcedAvailability.Reason ?? "in-VM smoke detected auth/login prompt";
+            var transition = _authAvailability.MarkAuthRequired(kind, reason);
+            if (transition is { PreviouslyExcluded: false, NowExcluded: true } && _webhooks is not null)
+            {
+                _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_failed",
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = kind.Value,
+                        Reason = reason,
+                        Category = SmokeFailureCategory.Persistent,
+                    },
+                }, CancellationToken.None).GetAwaiter().GetResult();
+            }
+        }
+    }
+
+    private sealed class ThrowingForceProbeInVmSmokeGate : IInVmSmokeGate
+    {
+        public int ForceProbeCalls { get; private set; }
+        public List<InVmSmokeSandboxTarget> ForceProbeTargets { get; } = [];
+        public bool Enabled => true;
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+            => Task.FromResult(new AgentAvailability(true, null, null));
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+        {
+            ForceProbeCalls++;
+            throw new InvalidOperationException("forced probe failed");
+        }
+
+        public Task<AgentAvailability?> ForceProbeAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            ForceProbeCalls++;
+            ForceProbeTargets.Add(target);
+            throw new InvalidOperationException("forced probe failed");
+        }
+    }
+
+    private sealed class CredentialAuditOutputAuditor : IAuditor
+    {
+        private readonly AuditResult _result;
+
+        public CredentialAuditOutputAuditor(AuditResult result, string name = "security:llm-review")
+        {
+            _result = result;
+            Name = name;
+        }
+
+        public string Name { get; }
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(_result);
+        }
     }
 
     private static WorkItem NewItem(AgentKind initialAgent) => new()
@@ -1077,7 +2000,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         await TestSupport.RunGit(repoPath, "commit", "-m", message);
     }
 
-    private static async Task CommitWorkBranchAsync(string bareRepoPath, string workBranch)
+    private static async Task CommitWorkBranchAsync(
+        string bareRepoPath,
+        string workBranch,
+        string path = "merge-phase.txt",
+        string contents = "ready\n",
+        string subject = "work already audited")
     {
         var clone = Path.Combine(Path.GetTempPath(), "codeybox-merge-pause-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(clone);
@@ -1087,9 +2015,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
             await TestSupport.RunGit(clone, "config", "user.name", "Test");
             await TestSupport.RunGit(clone, "checkout", "-b", workBranch, "origin/main");
-            await File.WriteAllTextAsync(Path.Combine(clone, "merge-phase.txt"), "ready\n");
-            await TestSupport.RunGit(clone, "add", "merge-phase.txt");
-            await TestSupport.RunGit(clone, "commit", "-m", "work already audited");
+            await File.WriteAllTextAsync(Path.Combine(clone, path), contents);
+            await TestSupport.RunGit(clone, "add", path);
+            await TestSupport.RunGit(clone, "commit", "-m", subject);
             await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{workBranch}");
         }
         finally

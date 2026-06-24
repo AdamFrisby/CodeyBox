@@ -423,6 +423,59 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_SessionResumeExhaustedAuthPrompt_FallbackSuccessPreservesAuthEvidence()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions
+            {
+                MaxIterations = 2,
+                MaxAttemptsPerAgent = 1,
+            }));
+
+        var authTranscript = """
+            Authentication required. Please visit the URL to log in:
+            https://accounts.google.com/o/oauth2/auth?client_id=redacted
+            Waiting for authentication (timeout 30s)...
+            Error: authentication timed out.
+            """;
+        var primary = new FakeAgentResolverRunner(_ =>
+            throw new AgentSessionResumeExhaustedException(
+                new AgentKind("primary"),
+                maxResumeAttempts: 2,
+                new AgentResult(false, "agent exited 1", authTranscript, null)))
+        { Kind = new AgentKind("primary") };
+        var fallback = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "resolved", null, null);
+        })
+        { Kind = new AgentKind("fallback") };
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [
+                new AgenticConflictResolverCandidate(primary, Credential: null),
+                new AgenticConflictResolverCandidate(fallback, Credential: null),
+            ],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Same(fallback, result.ChosenRunner);
+        var authFailure = Assert.Single(result.AuthFailures ?? []);
+        Assert.Same(primary, authFailure.Runner);
+        Assert.False(authFailure.AgentSucceeded);
+        Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
+        Assert.True(authFailure.StdoutOnlyEvidence);
+    }
+
+    [Fact]
     public async Task ResolveAsync_SessionResumeExhausted_RedactsStderrFromSummary()
     {
         var sandbox = new ConflictSandbox();
@@ -581,6 +634,109 @@ public sealed class AgenticConflictResolverTests
         // pointless to retry on the same prompt — break out and either try the
         // next candidate or fail.
         Assert.Equal(1, runner.InvocationCount);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_Exit0AuthPrompt_DoesNotRetrySameCandidate()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 5 }));
+        var runner = new FakeAgentResolverRunner(_ => new AgentResult(
+            true,
+            "ok",
+            "Authentication required. Please visit the URL to log in:\nWaiting for authentication (timeout 30s)...\nError: authentication timed out.",
+            null));
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(1, runner.InvocationCount);
+        var authFailure = Assert.Single(result.AuthFailures ?? []);
+        Assert.Same(runner, authFailure.Runner);
+        Assert.True(authFailure.AgentSucceeded);
+        Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
+        Assert.True(authFailure.StdoutOnlyEvidence);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_StdoutOnlyAuthPrompt_DoesNotBenchWhenVerificationSucceeds()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 5 }));
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(
+                true,
+                "ok",
+                """
+                Authentication required. Please visit the URL to log in:
+                https://accounts.google.com/o/oauth2/auth?client_id=redacted
+                Waiting for authentication (timeout 30s)...
+                Error: authentication timed out.
+                """,
+                null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Equal(1, runner.InvocationCount);
+        Assert.Empty(result.AuthFailures ?? []);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_NonzeroAuthPrompt_IsRecordedAsAuthRequiredBeforeGenericFailure()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 5 }));
+        var runner = new FakeAgentResolverRunner(_ => new AgentResult(
+            false,
+            "agent exited 1",
+            "Authentication required. Please visit the URL to log in:\nWaiting for authentication (timeout 30s)...\nError: authentication timed out.",
+            null));
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(1, runner.InvocationCount);
+        var authFailure = Assert.Single(result.AuthFailures ?? []);
+        Assert.Same(runner, authFailure.Runner);
+        Assert.False(authFailure.AgentSucceeded);
+        Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
+        Assert.True(authFailure.StdoutOnlyEvidence);
+
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        Assert.Contains("auth required", classificationResult.Summary);
+        Assert.DoesNotContain("agent exited 1", classificationResult.Summary);
     }
 
     [Fact]

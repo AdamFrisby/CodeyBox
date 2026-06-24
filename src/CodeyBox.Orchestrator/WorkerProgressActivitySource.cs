@@ -51,33 +51,45 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     // Confirm over multiple short samples with early-exit so the watchdog
     // doesn't block longer than necessary on already-progressing workers.
     private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(50);
-    private const int InitialCpuSampleAttempts = 10;
+    private const int DefaultInitialCpuSampleAttempts = 10;
     private readonly IActiveSandboxProgressProvider? _activeSandboxProvider;
     private readonly ProcessCpuSampleReader _processCpuSampleReader;
     private readonly bool _requireLinuxProcFs;
+    private readonly int _initialCpuSampleAttempts;
     private readonly ConcurrentDictionary<WorkItemId, ProcessCpuSample> _processSamples = new();
     private readonly ConcurrentDictionary<WorkItemId, string> _activeSandboxSignatures = new();
 
     public DefaultWorkerProgressActivitySource(IActiveSandboxProgressProvider? activeSandboxProvider = null)
-        : this(activeSandboxProvider, TryReadWorkItemCpuTicks, requireLinuxProcFs: true)
+        : this(
+            activeSandboxProvider,
+            TryReadWorkItemCpuTicks,
+            requireLinuxProcFs: true,
+            initialCpuSampleAttempts: DefaultInitialCpuSampleAttempts)
     {
     }
 
     internal DefaultWorkerProgressActivitySource(
         IActiveSandboxProgressProvider? activeSandboxProvider,
-        ProcessCpuSampleReader processCpuSampleReader)
-        : this(activeSandboxProvider, processCpuSampleReader, requireLinuxProcFs: false)
+        ProcessCpuSampleReader processCpuSampleReader,
+        int initialCpuSampleAttempts = DefaultInitialCpuSampleAttempts)
+        : this(
+            activeSandboxProvider,
+            processCpuSampleReader,
+            requireLinuxProcFs: false,
+            initialCpuSampleAttempts: initialCpuSampleAttempts)
     {
     }
 
     private DefaultWorkerProgressActivitySource(
         IActiveSandboxProgressProvider? activeSandboxProvider,
         ProcessCpuSampleReader processCpuSampleReader,
-        bool requireLinuxProcFs)
+        bool requireLinuxProcFs,
+        int initialCpuSampleAttempts)
     {
         _activeSandboxProvider = activeSandboxProvider;
         _processCpuSampleReader = processCpuSampleReader;
         _requireLinuxProcFs = requireLinuxProcFs;
+        _initialCpuSampleAttempts = Math.Max(1, initialCpuSampleAttempts);
     }
 
     public ValueTask<WorkerProgressActivity?> ObserveAsync(
@@ -178,7 +190,12 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
 
         if (!_processSamples.TryGetValue(itemId, out var previous))
         {
-            if (TryConfirmImmediateCpuProgress(itemId, sample, _processCpuSampleReader, out var observedSample))
+            if (TryConfirmImmediateCpuProgress(
+                    itemId,
+                    sample,
+                    _processCpuSampleReader,
+                    _initialCpuSampleAttempts,
+                    out var observedSample))
             {
                 _processSamples[itemId] = observedSample;
                 reason = "process-cpu";
@@ -200,7 +217,12 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
                 return true;
             }
 
-            if (TryConfirmImmediateCpuProgress(itemId, sample, _processCpuSampleReader, out var observedSample))
+            if (TryConfirmImmediateCpuProgress(
+                    itemId,
+                    sample,
+                    _processCpuSampleReader,
+                    _initialCpuSampleAttempts,
+                    out var observedSample))
             {
                 _processSamples[itemId] = observedSample;
                 reason = "process-cpu";
@@ -226,6 +248,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         WorkItemId itemId,
         ProcessCpuSample baseline,
         ProcessCpuSampleReader processCpuSampleReader,
+        int initialCpuSampleAttempts,
         out ProcessCpuSample observedSample)
     {
         observedSample = baseline;
@@ -234,7 +257,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         // progress is already stale without treating mere process presence as
         // progress. A single scheduler tick is too tight under parallel-suite
         // or host CPU contention, so confirm over a bounded short window.
-        for (var attempt = 0; attempt < InitialCpuSampleAttempts; attempt++)
+        for (var attempt = 0; attempt < initialCpuSampleAttempts; attempt++)
         {
             Thread.Sleep(InitialCpuSampleDelay);
 

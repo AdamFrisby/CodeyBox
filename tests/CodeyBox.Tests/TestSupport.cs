@@ -142,7 +142,9 @@ internal static class TestSupport
         AgentSessionDispatchOptions? sessionDispatchOptions = null,
         AutoRetryOnTransientFailureOptions? transientRetryOptions = null,
         TimeProvider? retryTimeProvider = null,
-        CancellationRegistry? cancellationRegistry = null)
+        CancellationRegistry? cancellationRegistry = null,
+        AgentAvailabilityRegistry? availabilityRegistry = null,
+        ScriptedAgent? agentOverride = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -158,13 +160,19 @@ internal static class TestSupport
         var sandboxes = sandboxProvider ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var mergeStrategies = mergeStrategy?.ToList() ?? [MergeStrategy.RealMerge];
-        ScriptedAgent agent = cliSessionResumableAgent
-            ? new CliSessionResumableScriptedAgent(mergeStrategies)
-            : new ScriptedAgent(mergeStrategies);
+        ScriptedAgent agent = agentOverride
+            ?? (cliSessionResumableAgent
+                ? new CliSessionResumableScriptedAgent(mergeStrategies)
+                : new ScriptedAgent(mergeStrategies));
         var runnerList = new List<IAgentRunner> { agent };
         if (extraAgentRunners is not null)
             runnerList.AddRange(extraAgentRunners);
         var registry = new AgentRegistry(runnerList);
+        var authAvailability = availabilityRegistry
+            ?? new AgentAvailabilityRegistry(
+                new AvailabilityOptions(),
+                TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance);
         var auditorList = (auditors ?? []).ToList();
 
         // Project repo: a single in-memory project pointing at the seed.
@@ -271,6 +279,8 @@ internal static class TestSupport
             incrementalRebase: incrementalRebase,
             pipelineTuning: pipelineTuning,
             taskQueue: queue,
+            availability: availabilityRegistry,
+            authAvailability: authAvailability,
             involvement: involvement,
             requiredBuildVerifier: requiredBuildVerifier ?? new SandboxRequiredBuildVerifier(
                 sandboxes,
@@ -302,7 +312,8 @@ internal static class TestSupport
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
             mechanicalFixerComposer: mechanicalComposer,
-            mechanicalFixerInputProviders: mechanicalFixerInputProviders);
+            mechanicalFixerInputProviders: mechanicalFixerInputProviders,
+            inVmSmokeGate: inVmSmokeGate);
 
         return new TestPipeline(
             pipeline,
@@ -493,6 +504,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// </summary>
     public Queue<string> CheckPlan { get; } = new();
     public Queue<AgentResult> CheckResults { get; } = new();
+    public Queue<AgentResult> AuditAgentResults { get; } = new();
     public List<bool> CaptureStructuredStreamCalls { get; } = new();
     public Func<ISandbox, string, CancellationToken, Task>? BeforeWorkAsync { get; set; }
     public int StructuredStreamSupportProbeCount { get; private set; }
@@ -695,6 +707,11 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         if (prompt.StartsWith("# Check-and-Act task", StringComparison.Ordinal))
         {
             return await HandleCheckAsync(prompt, stdoutChunkCallback, ct);
+        }
+        if (prompt.Contains("audit/result.json", StringComparison.Ordinal)
+            && AuditAgentResults.Count > 0)
+        {
+            return AuditAgentResults.Dequeue();
         }
         return await HandleWorkAsync(sandbox, workingDirectory, prompt, ct);
     }
