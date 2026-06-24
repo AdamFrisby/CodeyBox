@@ -137,7 +137,7 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotNull(final.MergeSha);
+        Assert.NotNull(final.LocalSquashSha);
 
         // Reaper ran at least once during the merge phase. Without this
         // assertion, a regression where the reaper never ticked would make
@@ -217,7 +217,7 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotNull(final.MergeSha);
+        Assert.NotNull(final.LocalSquashSha);
 
         // The reap-and-throw branch must have fired at least once — that
         // is the whole point of this test (the orchestrator-driven heal
@@ -347,7 +347,7 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotNull(final.MergeSha);
+        Assert.NotNull(final.LocalSquashSha);
 
         // The deleter must have observed the in-flight marker at least
         // once — otherwise the test passed vacuously (e.g. if the
@@ -503,7 +503,7 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotNull(final.MergeSha);
+        Assert.NotNull(final.LocalSquashSha);
         // The rework iteration must have actually engaged. Without this
         // assertion the test could pass vacuously if the merge phase
         // somehow recovered and skipped rework altogether.

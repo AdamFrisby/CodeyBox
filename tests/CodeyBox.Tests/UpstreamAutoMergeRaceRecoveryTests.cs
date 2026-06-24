@@ -718,7 +718,20 @@ internal sealed record RacingResponse(
     bool AdvanceSeedBeforeReturning,
     bool OmitPullRequestNumber = false,
     string? AdvanceSeedFilePath = null,
-    string? AdvanceSeedFileContent = null);
+    string? AdvanceSeedFileContent = null,
+    // Optional explicit override for the MergedSha returned by CompleteAsync.
+    // When null on a non-raced response, falls back to the legacy behaviour
+    // (echo request.MergeSha or "merged-sha"). Use this in capture-side tests
+    // to assert the orchestrator persists the FORGE response sha rather than
+    // the local merge sha — they're the same in the default fixture only
+    // because the legacy fixture conflates them.
+    string? MergedShaOverride = null,
+    int? PullRequestNumberOverride = null,
+    string? PullRequestUrlOverride = null,
+    // When true, force MergedSha=null on the outcome regardless of the
+    // override. Mirrors GitHub's AutoMerge=false response (PR opened, no
+    // merge commit yet — a human will merge later).
+    bool ForceMergedShaNull = false);
 
 internal sealed class ThrowingNthTimingPhaseSandboxProvider : ISandboxProvider
 {
@@ -880,12 +893,18 @@ internal sealed class RacingUpstreamRemote : IUpstreamRemote
         return new UpstreamCompletionOutcome
         {
             BranchPushed = true,
-            PullRequestUrl = response.OmitPullRequestNumber ? null : "https://example.invalid/pr/1",
+            PullRequestUrl = response.OmitPullRequestNumber
+                ? null
+                : response.PullRequestUrlOverride ?? "https://example.invalid/pr/1",
             // Park-branch test: when AutoMerge raced but no PR number is
             // returned the orchestrator has nothing to retry against and must
             // park with the "no PR number returned" message.
-            PullRequestNumber = response.OmitPullRequestNumber ? null : 1,
-            MergedSha = response.AutoMergeRaced ? null : request.MergeSha ?? "merged-sha",
+            PullRequestNumber = response.OmitPullRequestNumber
+                ? null
+                : response.PullRequestNumberOverride ?? 1,
+            MergedSha = response.AutoMergeRaced || response.ForceMergedShaNull
+                ? null
+                : response.MergedShaOverride ?? request.MergeSha ?? "merged-sha",
             AutoMergeRaced = response.AutoMergeRaced,
             Notes = response.AutoMergeRaced ? "racing" : null,
         };

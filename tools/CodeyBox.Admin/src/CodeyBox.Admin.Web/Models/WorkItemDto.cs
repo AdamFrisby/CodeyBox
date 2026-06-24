@@ -30,7 +30,23 @@ public sealed class WorkItemDto
     public string? AgentClassId { get; set; }
     public int? AuditIterations { get; set; }
     public int? FinalAuditBlockingFindings { get; set; }
+    /// <summary>
+    /// GitHub-side authoritative merge commit sha — resolves on
+    /// <c>GET /repos/{owner}/{repo}/commits/{sha}</c>. Null until the auto-merge
+    /// API call lands. Historical rows (pre-2026-06) may carry a stale local
+    /// sha here that does NOT resolve on the GitHub API; cross-reference by
+    /// <see cref="MergedPrNumber"/> / <see cref="MergedPrUrl"/> for those.
+    /// </summary>
     public string? MergeSha { get; set; }
+
+    /// <summary>Local bare-repo merge sha; not resolvable on GitHub.</summary>
+    public string? LocalSquashSha { get; set; }
+
+    /// <summary>Forge-assigned PR number once the upstream push opens one.</summary>
+    public int? MergedPrNumber { get; set; }
+
+    /// <summary>URL of the upstream PR opened for this work item.</summary>
+    public string? MergedPrUrl { get; set; }
 
     public bool IsTerminal => State is "Done" or "Failed" or "Cancelled" or "AuditFailed";
     public bool IsQueued => State == "Queued";

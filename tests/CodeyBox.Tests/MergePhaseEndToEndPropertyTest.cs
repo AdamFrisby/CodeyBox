@@ -52,10 +52,13 @@ public sealed class MergePhaseEndToEndPropertyTest : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotNull(final.MergeSha);
+        // LocalSquashSha is the bare-repo merge sha; MergeSha is the
+        // forge-side authoritative sha and stays null in this test
+        // because BuildPipeline defaults to the noop upstream.
+        Assert.NotNull(final.LocalSquashSha);
 
         var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
-        var (_, preMergeMain, _) = await TestSupport.RunGit(barePath, "rev-parse", $"{final.MergeSha}^1");
+        var (_, preMergeMain, _) = await TestSupport.RunGit(barePath, "rev-parse", $"{final.LocalSquashSha}^1");
         var (_, mainCommitsBeforeMerge, _) = await TestSupport.RunGit(barePath, "rev-list", preMergeMain.Trim());
         foreach (var commit in mainCommitsBeforeMerge.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", commit, "main");

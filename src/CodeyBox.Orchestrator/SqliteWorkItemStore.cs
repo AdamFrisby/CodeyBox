@@ -141,6 +141,18 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
             // Additive migration: store the SHA of the merge commit produced during the merge phase.
             RunMigration("ALTER TABLE work_items ADD COLUMN merge_sha TEXT;");
+            // Additive migration: capture the merge identity from the upstream forge.
+            //   - local_squash_sha: the LOCAL bare-repo merge sha the merge phase
+            //     produced. Used by auto-merge race recovery for first-parent ancestry.
+            //   - merged_pr_number / merged_pr_url: forge-assigned identifiers of
+            //     the PR opened during the upstream push phase.
+            // merge_sha itself is repurposed (going forward) to hold the GitHub-side
+            // squash commit returned by the auto-merge API — the value that actually
+            // resolves on GET /repos/{owner}/{repo}/commits/{sha}. Historical rows
+            // keep their old local-sha values; see WorkItem.MergeSha doc-comment.
+            RunMigration("ALTER TABLE work_items ADD COLUMN local_squash_sha TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN merged_pr_number INTEGER;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN merged_pr_url TEXT;");
             // Additive migration: minimum quality-score floor for routing.
             // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
             RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
@@ -428,6 +440,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
+                        local_squash_sha, merged_pr_number, merged_pr_url,
                         min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
@@ -444,6 +457,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         knobs_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
+                        $local_squash_sha, $merged_pr_number, $merged_pr_url,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
@@ -552,6 +566,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at,
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                    local_squash_sha = $local_squash_sha,
+                    merged_pr_number = $merged_pr_number,
+                    merged_pr_url = $merged_pr_url,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -625,6 +642,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at,
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                    local_squash_sha = $local_squash_sha,
+                    merged_pr_number = $merged_pr_number,
+                    merged_pr_url = $merged_pr_url,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -703,6 +723,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at,
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                    local_squash_sha = $local_squash_sha,
+                    merged_pr_number = $merged_pr_number,
+                    merged_pr_url = $merged_pr_url,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -1100,6 +1123,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at,
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                    local_squash_sha = $local_squash_sha,
+                    merged_pr_number = $merged_pr_number,
+                    merged_pr_url = $merged_pr_url,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -2243,6 +2269,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$external_id", (object?)legacyValue ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$replay_of", (object?)item.ReplayOfWorkItemId?.ToString() ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$merge_sha", (object?)item.MergeSha ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$local_squash_sha", (object?)item.LocalSquashSha ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$merged_pr_number",
+            item.MergedPrNumber.HasValue ? (object)item.MergedPrNumber.Value : DBNull.Value);
+        cmd.Parameters.AddWithValue("$merged_pr_url", (object?)item.MergedPrUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$min_model_score", item.MinModelScore);
         cmd.Parameters.AddWithValue("$cancellation_reason",
             item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
@@ -2363,6 +2393,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // side table is the canonical source.
         ReplayOfWorkItemId = ReadNullableWorkItemId(r, "replay_of_work_item_id"),
         MergeSha = r.IsDBNull(r.GetOrdinal("merge_sha")) ? null : r.GetString(r.GetOrdinal("merge_sha")),
+        LocalSquashSha = ReadNullableString(r, "local_squash_sha"),
+        MergedPrNumber = ReadNullableInt32(r, "merged_pr_number"),
+        MergedPrUrl = ReadNullableString(r, "merged_pr_url"),
         MinModelScore = ReadInt32OrDefault(r, "min_model_score", defaultValue: 95),
         CancellationReason = ReadCancellationReason(r),
         RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
