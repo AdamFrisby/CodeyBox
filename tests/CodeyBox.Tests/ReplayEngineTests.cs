@@ -2185,8 +2185,198 @@ public sealed class ReplayEngineTests
         Assert.All(scrolls, s =>
         {
             Assert.NotNull(s.X);
+            Assert.True((s.X ?? 0) > 0, "rightward scroll must carry a POSITIVE X magnitude");
             Assert.True((s.Y ?? 0) == 0, "horizontal-only scroll must not carry a Y magnitude");
         });
+    }
+
+    [Fact]
+    public async Task Reachability_ScrollsUpward_WhenTargetIsAboveViewport()
+    {
+        // Upward-scroll branch of ResolveScrollDelta (t.CenterY < 0). A
+        // target with a recorded centre above Y=0 must trigger a vertical
+        // scroll with a NEGATIVE ScrollY magnitude, not a positive one — a
+        // bug like dropping the unary minus would silently regress traces
+        // whose recorded centre is above the viewport (e.g. a reload /
+        // hash-route restore that scrolled the page back to the top).
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Top"),
+        };
+        // Region centre = (220, -90): X is in viewport, Y is above.
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 200, Y = -100, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Top" }));
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.OffScreen, result.FailedStep!.FailureKind);
+        var scrolls = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Scroll).ToList();
+        Assert.NotEmpty(scrolls);
+        // Every emitted scroll must be vertical AND negative (upward).
+        Assert.All(scrolls, s =>
+        {
+            Assert.NotNull(s.Y);
+            Assert.True((s.Y ?? 0) < 0, "upward scroll must carry a NEGATIVE Y magnitude");
+            Assert.True((s.X ?? 0) == 0, "vertical-only scroll must not carry an X magnitude");
+        });
+    }
+
+    [Fact]
+    public async Task Reachability_ScrollsLeftward_WhenTargetIsLeftOfViewport()
+    {
+        // Leftward-scroll branch of ResolveScrollDelta (t.CenterX < 0). A
+        // target with a recorded centre left of X=0 must trigger a horizontal
+        // scroll with a NEGATIVE ScrollX magnitude. Mirrors the upward
+        // branch and protects against the same drop-the-sign regression on
+        // the X axis.
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Left"),
+        };
+        // Region centre = (-80, 110): Y is in viewport, X is left of it.
+        var trace = MakeTrace(
+            ClickEntry(seq: 1, region: new TraceBoundingRegion { X = -100, Y = 100, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Left" }));
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.OffScreen, result.FailedStep!.FailureKind);
+        var scrolls = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Scroll).ToList();
+        Assert.NotEmpty(scrolls);
+        // Every emitted scroll must be horizontal AND negative (leftward).
+        Assert.All(scrolls, s =>
+        {
+            Assert.NotNull(s.X);
+            Assert.True((s.X ?? 0) < 0, "leftward scroll must carry a NEGATIVE X magnitude");
+            Assert.True((s.Y ?? 0) == 0, "horizontal-only scroll must not carry a Y magnitude");
+        });
+    }
+
+    [Fact]
+    public async Task Reachability_FailsWithLayoutReflowed_WhenLocatorMissesTwiceAfterScroll()
+    {
+        // ReachabilityChecker.cs:114-123 emits a distinct OffScreen outcome
+        // with a 'locator could not re-find the target ... (layout likely
+        // reflowed)' diagnostic when the post-scroll re-locate returns null
+        // on two consecutive attempts. The existing
+        // Replay_FailsWithOffScreen_WhenTargetNeverScrollsIntoView test
+        // keeps the locator hitting at the unchanged recorded centre, so
+        // consecutiveRelocateMisses stays at 0 and that branch is never
+        // entered — this test specifically arranges the re-locate to fail.
+        //
+        // Setup: the AccessibilityAtPoint hook returns a matching element on
+        // the FIRST probe (the engine's initial Locate) and null on every
+        // probe after that (each post-scroll re-locate). The recorded centre
+        // is far below the viewport so ring offsets are filtered out by the
+        // locator's InScreen guard — guaranteeing the re-locate returns null
+        // rather than picking up an in-viewport ring hit.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var probeCalls = 0;
+        sandbox.AccessibilityAtPoint = (_, _) =>
+        {
+            probeCalls++;
+            return probeCalls == 1 ? Accessible("button", "Login") : null;
+        };
+        var trace = MakeTrace(
+            ClickEntry(seq: 1,
+                region: new TraceBoundingRegion { X = 200, Y = 1500, Width = 40, Height = 20 },
+                accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
+
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.NotNull(result.FailedStep);
+        Assert.Equal(ReplayFailureKind.OffScreen, result.FailedStep.FailureKind);
+        // Distinct diagnostic wording — distinguishes 'genuinely off-screen
+        // after MaxScrollAttempts' from 'locator stopped recognising the
+        // target after the scroll.'
+        Assert.Contains("layout likely reflowed", result.FailedStep.Diagnostic);
+        Assert.Contains("locator could not re-find", result.FailedStep.Diagnostic);
+        // Exactly two scrolls — the consecutive-miss bail trips on
+        // attempt=1, well before MaxScrollAttempts (default 3) would be
+        // reached. A regression that flipped >= 2 to >= 3 (or fell through
+        // to the generic OffScreen branch) would record more scrolls.
+        var scrolls = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Scroll).ToList();
+        Assert.Equal(2, scrolls.Count);
+    }
+
+    [Fact]
+    public async Task Replay_DrivesClick_WhenDescriptorIsVisualOnly_SkippingAccessibilityProbe()
+    {
+        // ReachabilityChecker.cs:127 gates the top-most accessibility probe
+        // on 'descriptor.Accessibility is not null && HasAnyAccessibilitySignal'.
+        // For a canvas / 3D / untagged target — the VisualSignatureElementLocator's
+        // canonical use case — the descriptor carries no accessibility signal
+        // and the checker must SKIP the probe entirely and return Reachable.
+        //
+        // This is an integration test on purpose: it drives a full replay
+        // through CompositeElementLocator → VisualSignatureElementLocator →
+        // ReachabilityChecker (no-accessibility branch) → real input dispatch.
+        // The VisualSignatureLocator unit tests cover only the locator; the
+        // brief's primary motivation for shipping a visual-signature locator
+        // is canvas / 3D recordings, so this end-to-end path is what must not
+        // regress.
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var probeCalls = 0;
+        sandbox.AccessibilityAtPoint = (_, _) =>
+        {
+            probeCalls++;
+            // Defends the assertion: a regression that always probed (rather
+            // than gating on the descriptor) would surface as probeCalls > 0
+            // even though we return a value that would still pass matching.
+            return Accessible("canvas", "anything");
+        };
+        var trace = MakeTrace(new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 170, Y = 90 }],
+                Kind = "click",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    // No accessibility signature — visual-signature is the
+                    // only locator that can resolve this descriptor.
+                    Accessibility = null,
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
+                        // Strict pixel-equal source — the locator returns the
+                        // recorded centre because the current screen matches
+                        // byte-for-byte.
+                        SourceScreenshotPng = StableScreenshotA,
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        });
+
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        // The reachability check never invoked the accessibility probe —
+        // the visual-only descriptor branch skipped it.
+        Assert.Equal(0, probeCalls);
+        // The located target came from the visual-signature locator, not
+        // from accessibility recognition.
+        Assert.NotNull(result.Steps[0].LocatedTarget);
+        Assert.Equal("visual-signature", result.Steps[0].LocatedTarget!.Source);
+        // Real input was dispatched at the located visual-signature centre
+        // — the engine drove a real click, not a synthetic selector dispatch.
+        var clicks = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Click).ToList();
+        Assert.Single(clicks);
+        Assert.Equal(170, clicks[0].X);
+        Assert.Equal(90, clicks[0].Y);
     }
 
     [Fact]
