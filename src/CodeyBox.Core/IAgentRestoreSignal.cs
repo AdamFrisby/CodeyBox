@@ -28,11 +28,16 @@ public interface IAgentRestoreSignal
 /// </summary>
 /// <param name="Agent">The agent whose availability just transitioned to routable.</param>
 /// <param name="OutageStartedAt">
-/// UTC timestamp of the last observed smoke / availability failure before
-/// the restore, or null when the registry never recorded a prior failure
-/// (operator reset on a never-failed agent, startup probe pass). Consumers
-/// should treat null as "no outage window known" and skip retroactive
-/// sweeps rather than retrying every Failed item.
+/// UTC timestamp of the FIRST exclusion in the outage streak that just ended
+/// — anchored to the moment the agent transitioned healthy → excluded under
+/// ANY source (smoke probe, fast-fail breaker, no-changes breaker,
+/// missing-probe, runtime auth-required), and pinned across follow-up
+/// failures so a long multi-hour outage keeps the outage start, not the
+/// most recent failure. Null when the registry never recorded an outage
+/// (operator reset on a never-excluded agent, startup probe pass with
+/// nothing to clear). Consumers should treat null as "no outage window
+/// known" and skip retroactive sweeps rather than retrying every Failed
+/// item.
 /// </param>
 /// <param name="RestoredAt">UTC timestamp of the transition.</param>
 public sealed record AgentRestoredEvent(

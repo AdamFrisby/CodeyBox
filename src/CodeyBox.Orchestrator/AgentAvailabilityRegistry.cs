@@ -164,7 +164,9 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                     _log.LogInformation(
                         "Agent {Agent} smoke transitioned FAIL -> PASS at {At} (source {Source})",
                         kind.Value, now, source);
-                    restored = new AgentRestoredEvent(kind, entry.LastSmokeFailedAt, now);
+                    var outageStart = entry.FirstExcludedAt;
+                    entry.FirstExcludedAt = null;
+                    restored = new AgentRestoredEvent(kind, outageStart, now);
                 }
                 recovered = wasExcluded && !stillExcluded;
                 transition = new AvailabilityTransition(
@@ -196,6 +198,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         bool hadSourceExclusion)
     {
         entry.LastSmokeFailedAt = now;
+        entry.FirstExcludedAt ??= now;
         // Encode category in the reason string so downstream consumers
         // (router log, /concurrency, audit log) can distinguish persistent
         // (operator must re-authorize) from transient (will recover on
@@ -240,11 +243,11 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     {
         var handlers = AgentRestored;
         if (handlers is null) return;
-        foreach (Action<AgentRestoredEvent> handler in handlers.GetInvocationList().Cast<Action<AgentRestoredEvent>>())
+        foreach (var d in handlers.GetInvocationList())
         {
             try
             {
-                handler(payload);
+                ((Action<AgentRestoredEvent>)d)(payload);
             }
             catch (Exception ex)
             {
@@ -288,6 +291,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             {
                 entry.Exclusions[SmokeExclusionSource.FastFail] =
                     $"fast-fail circuit breaker: {entry.ConsecutiveFastFails} consecutive sub-{_opts.FastFailThresholdSeconds}s non-zero exits";
+                entry.FirstExcludedAt ??= now;
                 _log.LogWarning(
                     "Agent {Agent} excluded by fast-fail circuit breaker after {Count} consecutive sub-{Threshold}s failures",
                     kind.Value, entry.ConsecutiveFastFails, _opts.FastFailThresholdSeconds);
@@ -333,6 +337,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             {
                 entry.Exclusions[SmokeExclusionSource.NoChangesBreaker] =
                     $"no-changes circuit breaker: {entry.ConsecutiveNoChanges} consecutive distinct work items produced no changes (silent-failure signature)";
+                entry.FirstExcludedAt ??= now;
                 _log.LogWarning(
                     "Agent {Agent} excluded by no-changes circuit breaker after {Count} consecutive distinct work items produced no changes — operator action required (reset via /admin/agent/{Agent}/reset after diagnosing)",
                     kind.Value, entry.ConsecutiveNoChanges, kind.Value);
@@ -378,11 +383,13 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     public AvailabilityTransition ExcludeForMissingProbe(AgentKind kind, string reason)
     {
         var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
+        var now = _time.GetUtcNow();
         lock (entry.Sync)
         {
             var wasExcluded = entry.IsExcluded;
             var hadSourceExclusion = entry.Exclusions.ContainsKey(SmokeExclusionSource.MissingProbe);
             entry.Exclusions[SmokeExclusionSource.MissingProbe] = reason;
+            entry.FirstExcludedAt ??= now;
             if (!wasExcluded)
                 _log.LogWarning("Agent {Agent} benched: {Reason}", kind.Value, reason);
             return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason(), SourceChanged: !hadSourceExclusion);
@@ -406,6 +413,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             var wasExcluded = entry.IsExcluded;
             var hadSourceExclusion = entry.Exclusions.ContainsKey(SmokeExclusionSource.AuthRequired);
             entry.Exclusions[SmokeExclusionSource.AuthRequired] = $"auth required: {reason}";
+            entry.FirstExcludedAt ??= now;
             if (!wasExcluded)
             {
                 _log.LogError(
@@ -439,7 +447,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         lock (entry.Sync)
         {
             var wasExcluded = entry.IsExcluded;
-            var priorFailureAt = entry.LastSmokeFailedAt;
+            var outageStart = entry.FirstExcludedAt;
             entry.ConsecutiveFastFails = 0;
             entry.Exclusions.Clear();
             entry.LastFastFailAt = null;
@@ -450,8 +458,9 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             entry.ConsecutiveNoChanges = 0;
             entry.LastNoChangesAt = null;
             recovered = wasExcluded;
+            entry.FirstExcludedAt = null;
             if (wasExcluded)
-                restored = new AgentRestoredEvent(kind, priorFailureAt, now);
+                restored = new AgentRestoredEvent(kind, outageStart, now);
         }
         _log.LogInformation("Agent {Agent} availability reset by operator", kind.Value);
         if (restored is not null)
@@ -507,6 +516,19 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
 
         public int ConsecutiveNoChanges;
         public DateTimeOffset? LastNoChangesAt;
+
+        /// <summary>
+        /// Timestamp at which the agent transitioned from healthy → excluded
+        /// for the CURRENT outage streak. Set on the first exclusion under any
+        /// source (smoke, fast-fail, no-changes, missing-probe, auth-required)
+        /// and cleared the moment the agent returns to fully routable
+        /// (last exclusion removed). Pinned across follow-up failures so a
+        /// long outage with repeating smoke probes keeps the FIRST failure's
+        /// timestamp — not the last — as the outage anchor. The
+        /// <see cref="AgentRestoredEvent.OutageStartedAt"/> consumer scopes its
+        /// sweep against this value.
+        /// </summary>
+        public DateTimeOffset? FirstExcludedAt;
 
         /// <summary>
         /// Active exclusions keyed by the signal that raised them. The agent is

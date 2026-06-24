@@ -934,9 +934,19 @@ public static class AuditLog
     /// Emitted once per agent-restore sweep: the agent's availability
     /// transitioned from excluded to routable and the sweep evaluated
     /// candidate infra-failed work items. <paramref name="requeued"/> counts
-    /// items the sweep actually transitioned back to Queued; items skipped
-    /// for filter reasons (wrong agent, wrong failureKind, outside window,
-    /// concurrent state change) are reflected in <paramref name="skipped"/>.
+    /// items the sweep actually transitioned back to Queued.
+    /// <paramref name="skipped"/> counts candidates that matched the
+    /// IsCandidate filter (right agent, infra-shaped failure, inside window)
+    /// but were not requeued: the per-restore cap was reached, or the
+    /// underlying retrier returned success=false (e.g. concurrent state
+    /// change, open operator question), or the retrier threw and the item
+    /// was skipped to keep the sweep going. Candidates rejected by IsCandidate
+    /// (wrong agent, wrong failureKind, outside window) are NOT counted —
+    /// they aren't visible at this layer. Also emitted (with zeros) when
+    /// the sweep is skipped because <c>outageStartedAt</c> is null, so
+    /// operators can tell "feature disabled" (no event) from "no window
+    /// known" (event with outageStartedAt=(unknown)) from "no candidates
+    /// matched" (event with zeros and a real outage start).
     /// </summary>
     public static void AgentRestoreRequeueSwept(
         AgentKind agent,

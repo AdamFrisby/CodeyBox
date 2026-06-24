@@ -138,6 +138,14 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             {
                 return;
             }
+            catch (System.Threading.Channels.ChannelClosedException)
+            {
+                // StopAsync completed the writer before the host's stopping
+                // token flipped — exit cleanly instead of looping back into a
+                // never-readable channel and spamming "sweep loop iteration
+                // failed".
+                return;
+            }
             catch (Exception ex)
             {
                 _log.LogError(ex, "AgentRestoreRetryScheduler: sweep loop iteration failed");
@@ -163,6 +171,14 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             _log.LogDebug(
                 "AgentRestoreRetryScheduler: no outage window known for {Agent} (no prior failure timestamp); skipping sweep",
                 evt.Agent.Value);
+            // Emit the audit event anyway so operators monitoring
+            // `agent.restore_requeue_swept` can distinguish "feature disabled"
+            // (no event), "no candidates matched" (event with requeued=0,
+            // skipped=0, outageStartedAt non-null), and the null-window
+            // degenerate case (event with outageStartedAt=null) instead of
+            // seeing silence in all three.
+            AuditLog.AgentRestoreRequeueSwept(
+                evt.Agent, evt.OutageStartedAt, evt.RestoredAt, 0, 0);
             return new AgentRestoreSweepSummary(0, 0);
         }
 
@@ -170,6 +186,8 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         var windowEnd = evt.RestoredAt + opts.PostRestoreMargin;
         var requeued = 0;
         var skipped = 0;
+        var capHitDropped = 0;
+        var capWasHit = false;
 
         var candidateStates = new[]
         {
@@ -179,6 +197,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 
         foreach (var state in candidateStates)
         {
+            if (capWasHit) break;
             await foreach (var item in _store.ListByStateAsync(state, ct))
             {
                 if (!IsCandidate(item, evt.Agent, windowStart, windowEnd))
@@ -188,15 +207,34 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 
                 if (requeued >= opts.MaxItemsPerRestore)
                 {
+                    capWasHit = true;
+                    capHitDropped++;
+                    // Drop the per-row warning: with a multi-thousand-row
+                    // backlog this loop would otherwise spam the log once per
+                    // candidate. Break out of both loops below; the single
+                    // summary line + audit event carry the durable signal.
+                    break;
+                }
+
+                bool success; string? error; string? actualFrom;
+                try
+                {
+                    (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
+                        item, from: null, trigger: "agent-restore", ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
                     skipped++;
-                    _log.LogWarning(
-                        "AgentRestoreRetryScheduler: per-restore cap {Cap} reached for {Agent}; further candidates left parked (item {Id})",
-                        opts.MaxItemsPerRestore, evt.Agent.Value, item.Id);
+                    _log.LogWarning(ex,
+                        "AgentRestoreRetryScheduler: retry threw for {Id}; skipping and continuing sweep",
+                        item.Id);
                     continue;
                 }
 
-                var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
-                    item, from: null, trigger: "agent-restore", ct).ConfigureAwait(false);
                 if (!success)
                 {
                     skipped++;
@@ -209,8 +247,16 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 requeued++;
                 AuditLog.AgentRestoreRequeueItem(
                     item.Id, evt.Agent, item.FailureKind, actualFrom ?? "work");
-                await EmitAutoRetryWebhookAsync(item, evt, actualFrom).ConfigureAwait(false);
+                await EmitAutoRetryWebhookAsync(item, evt, actualFrom, ct).ConfigureAwait(false);
             }
+        }
+
+        if (capWasHit)
+        {
+            skipped += capHitDropped;
+            _log.LogWarning(
+                "AgentRestoreRetryScheduler: per-restore cap {Cap} reached for {Agent}; remaining candidates left parked (operator can re-trigger via /admin/agent/{Agent}/reset)",
+                opts.MaxItemsPerRestore, evt.Agent.Value, evt.Agent.Value);
         }
 
         AuditLog.AgentRestoreRequeueSwept(
@@ -229,7 +275,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 
         if (item.Agent is not { } itemAgent)
             return false;
-        if (!string.Equals(itemAgent.Value, restoredAgent.Value, StringComparison.OrdinalIgnoreCase))
+        if (itemAgent != restoredAgent)
             return false;
 
         if (item.UpdatedAt < windowStart || item.UpdatedAt > windowEnd)
@@ -241,7 +287,8 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
     private async Task EmitAutoRetryWebhookAsync(
         WorkItem item,
         AgentRestoredEvent evt,
-        string? actualFrom)
+        string? actualFrom,
+        CancellationToken ct)
     {
         if (_webhooks is null) return;
         try
@@ -249,13 +296,14 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             Project? project = null;
             if (_projects is not null)
             {
-                try { project = await _projects.GetAsync(item.ProjectId, CancellationToken.None).ConfigureAwait(false); }
+                try { project = await _projects.GetAsync(item.ProjectId, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
                 catch (Exception lookupEx)
                 {
                     _log.LogDebug(lookupEx, "AgentRestoreRetryScheduler: project lookup failed for {Id}; emitting webhook without project context", item.Id);
                 }
             }
-            var updated = await _store.GetAsync(item.Id, CancellationToken.None).ConfigureAwait(false);
+            var updated = await _store.GetAsync(item.Id, ct).ConfigureAwait(false);
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "work_item.auto_retry",
@@ -272,7 +320,12 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                     outageStartedAt = evt.OutageStartedAt,
                     restoredAt = evt.RestoredAt,
                 },
-            }, CancellationToken.None).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Host shutdown — propagate so the sweep loop drains promptly.
+            throw;
         }
         catch (Exception ex)
         {
