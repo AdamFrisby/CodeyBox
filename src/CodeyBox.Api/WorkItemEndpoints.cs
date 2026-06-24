@@ -1241,14 +1241,15 @@ internal static class WorkItemEndpoints
             updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Queued-only fields go through a guarded row UPDATE. Knob-only PATCHes
-        // still use the partial knob write below so worker state transitions from
-        // stale snapshots cannot erase an accepted queued edit. Mixed knob PATCHes
-        // use the combined guarded row+knob write here so a conflict cannot leave
-        // only part of the request persisted. When knobs and audit budget fields
-        // are sent together, include the audit budget in that same guarded write;
-        // otherwise the later audit-budget write could conflict after the knob
-        // map had already been replaced.
+        // Queued-only fields go through a guarded row UPDATE. Any PATCH that
+        // touches the knob map routes through the combined guarded row+knob
+        // write so the plan-clearing performed by ClearPlanReview above (which
+        // runs for every queuedOnlyPatch, knobs included) is persisted in the
+        // same transaction as the knob replacement — a partial knob write would
+        // leave stale plan_* columns behind. When knobs and audit budget fields
+        // are sent together, include the audit budget in that same guarded
+        // write; otherwise the later audit-budget write could conflict after
+        // the knob map had already been replaced.
         var auditBudgetWrittenWithQueuedUpdate = normalisedPatchKnobs is not null && auditBudgetPatch;
         var needsQueuedRowUpdate =
             queuedRowPatch
@@ -1280,18 +1281,6 @@ internal static class WorkItemEndpoints
             if (!written)
                 return Results.Conflict(new { error = "item changed before the queued-field update could be written" });
             queuedUpdateExpectedUpdatedAt = now;
-        }
-        if (normalisedPatchKnobs is not null && !needsQueuedRowUpdate)
-        {
-            var written = await store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
-                updated.Id,
-                normalisedPatchKnobs,
-                now,
-                WorkItemState.Queued,
-                queuedUpdateExpectedUpdatedAt,
-                ct);
-            if (!written)
-                return Results.Conflict(new { error = "item changed before the queued knob update could be written" });
         }
         if (auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate)
         {

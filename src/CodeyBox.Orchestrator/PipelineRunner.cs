@@ -810,18 +810,42 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
+    private int _missingKnobRegistryWarned;
+
     private bool ShouldUsePlanningPhase(WorkItem item, Project project)
     {
         if (item.JobType is JobType.CheckAndAct or JobType.AgentControl)
             return false;
         if (_knobRegistry is null)
+        {
+            // Without the registry we cannot know if any planning-lifecycle
+            // knob is on for this item; treat planning as disabled but surface
+            // a one-shot warning so a misconfigured DI graph is visible.
+            // Planning would otherwise be silently lost for every plan=on
+            // item with no log signal.
+            if (LooksLikePlanRequested(item.Knobs) || LooksLikePlanRequested(project.Knobs))
+            {
+                if (Interlocked.Exchange(ref _missingKnobRegistryWarned, 1) == 0)
+                {
+                    _log.LogWarning(
+                        "PipelineRunner has no IKnobRegistry wired but observed a 'plan=on' knob on work item {WorkItemId} (or its project); planning lifecycle is disabled for every item until IKnobRegistry is registered in DI.",
+                        item.Id);
+                }
+            }
             return false;
+        }
 
         var effective = _knobRegistry.Resolve(item.Knobs, project.Knobs);
         return _knobRegistry.All.Any(knob =>
             effective.TryGetValue(knob.Key, out var value)
             && knob.GetPipelineLifecycle(value).HasFlag(KnobPipelineLifecycle.Planning));
     }
+
+    private static bool LooksLikePlanRequested(IReadOnlyDictionary<string, string>? knobs)
+        => knobs is not null
+            && knobs.TryGetValue("plan", out var value)
+            && value is not null
+            && value.Equals("on", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsPlanningLifecycleState(WorkItemState state) =>
         state is WorkItemState.Planning or WorkItemState.PlanReview or WorkItemState.PlanApproved;
@@ -975,7 +999,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         current = PreserveEntryRouting(await _store.GetAsync(current.Id, ct) ?? current with { State = WorkItemState.Planning });
 
         string planArtifact;
-        AgentKind producingAgent = default;
+        IPlanArtifactExtractor? producingExtractor = null;
         using (var planningPhase = new PhaseCancellation("planning", ct, _opts.TimeProvider))
         {
             planningPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(current.WorkTimeout));
@@ -997,7 +1021,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             ct,
                             phaseCt =>
                             {
-                                producingAgent = runner.Kind;
+                                producingExtractor = runner as IPlanArtifactExtractor;
                                 return RunPlanningAgentTurnAsync(
                                     trialItem,
                                     runner,
@@ -1020,7 +1044,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
         }
 
-        var planned = await PersistPlanArtifactAsync(current.Id, current.PromptRevision, producingAgent, planArtifact, ct);
+        var planned = await PersistPlanArtifactAsync(current.Id, current.PromptRevision, producingExtractor, planArtifact, ct);
         if (planned is null)
             return await _store.GetAsync(current.Id, ct) ?? current;
 
@@ -1038,7 +1062,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private async Task<WorkItem?> PersistPlanArtifactAsync(
         WorkItemId itemId,
         int promptRevisionAtPlanningDispatch,
-        AgentKind producingAgent,
+        IPlanArtifactExtractor? producingExtractor,
         string artifact,
         CancellationToken ct)
     {
@@ -1054,7 +1078,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return null;
         }
 
-        var normalized = NormalizePlanArtifact(producingAgent, artifact);
+        var normalized = NormalizePlanArtifact(producingExtractor, artifact);
         if (string.IsNullOrWhiteSpace(normalized))
             throw new InvalidOperationException("Planning phase completed without producing a PLAN artifact.");
 
@@ -1702,117 +1726,31 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {{item.Prompt}}
         """;
 
-    private string NormalizePlanArtifact(AgentKind producingAgent, string artifact)
+    private string NormalizePlanArtifact(IPlanArtifactExtractor? producingExtractor, string artifact)
     {
-        // Only Claude wraps its stdout in a stream-json NDJSON envelope when the
-        // planning runner enables structured stream capture; the agent-side text
-        // we want is buried in {type:"assistant"|"result"} events. Other runners
-        // emit plain stdout that PlanArtifactDocument can parse directly. Keeping
-        // the unwrapping behind an AgentKind gate matches the orchestrator's
-        // agent-agnostic contract (per AGENTS.md) — if a non-Claude agent ever
-        // does need similar treatment, lift the extractor onto a runner-side hook.
-        var extracted = string.Equals(producingAgent.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase)
-            ? ExtractClaudeAssistantText(artifact)
-            : artifact;
+        // Runners whose planning-phase stdout is wrapped in a provider-specific
+        // envelope (e.g. Claude's stream-json NDJSON) implement
+        // IPlanArtifactExtractor to surface the agent-visible plan text. Runners
+        // that emit plain stdout (no extractor) feed PlanArtifactDocument
+        // directly. Keeping the unwrap behind a runner-side hook matches the
+        // orchestrator's agent-agnostic contract — no AgentKind switch here.
+        var extracted = producingExtractor?.ExtractPlanArtifactText(artifact);
+        if (extracted is null)
+        {
+            // Either the producing runner has no envelope (every non-Claude
+            // runner today), or the envelope was absent in this stdout (e.g.
+            // structured stream capture wasn't engaged). Pass the raw text on
+            // and log so a silent format change is at least visible in debug.
+            if (producingExtractor is not null)
+            {
+                _log.LogDebug(
+                    "Planning extractor returned null for {Extractor}; passing raw artifact to PlanArtifactDocument.",
+                    producingExtractor.GetType().Name);
+            }
+            extracted = artifact;
+        }
+
         return PlanArtifactDocument.NormalizeRaw(extracted, PlanArtifactMaxChars);
-    }
-
-    private string ExtractClaudeAssistantText(string artifact)
-    {
-        if (string.IsNullOrWhiteSpace(artifact))
-            return artifact;
-
-        var assistantText = new StringBuilder();
-        var resultText = new StringBuilder();
-        var sawClaudeStreamEvent = false;
-        foreach (var rawLine in artifact.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            if (!rawLine.StartsWith('{'))
-                continue;
-
-            try
-            {
-                using var doc = JsonDocument.Parse(rawLine);
-                var root = doc.RootElement;
-                if (root.ValueKind != JsonValueKind.Object
-                    || !root.TryGetProperty("type", out var typeProp)
-                    || typeProp.ValueKind != JsonValueKind.String)
-                {
-                    continue;
-                }
-
-                var type = typeProp.GetString();
-                if (type == "assistant")
-                {
-                    sawClaudeStreamEvent = true;
-                    if (root.TryGetProperty("message", out var message))
-                        AppendClaudeContentText(message, assistantText);
-                    else
-                        AppendClaudeContentText(root, assistantText);
-                }
-                else if (type == "result")
-                {
-                    sawClaudeStreamEvent = true;
-                    if (root.TryGetProperty("result", out var result)
-                        && result.ValueKind == JsonValueKind.String)
-                    {
-                        AppendTextPart(resultText, result.GetString());
-                    }
-                }
-            }
-            catch (JsonException)
-            {
-            }
-            catch (InvalidOperationException)
-            {
-            }
-        }
-
-        if (!sawClaudeStreamEvent)
-        {
-            // Either Claude's stream-json envelope changed names, or the runner
-            // returned plain stdout (older CLI / structured stream disabled).
-            // Either way, fall through to feeding the raw artifact to
-            // PlanArtifactDocument — but log so a silent format change surfaces
-            // as a noticeable signal rather than a confusing parse failure.
-            _log.LogDebug(
-                "Planning extractor saw no Claude stream-json events; passing raw artifact to PlanArtifactDocument.");
-            return artifact;
-        }
-        if (assistantText.Length > 0)
-            return assistantText.ToString();
-        if (resultText.Length > 0)
-            return resultText.ToString();
-        return artifact;
-    }
-
-    private static void AppendClaudeContentText(JsonElement container, StringBuilder destination)
-    {
-        if (!container.TryGetProperty("content", out var content)
-            || content.ValueKind != JsonValueKind.Array)
-        {
-            return;
-        }
-
-        foreach (var part in content.EnumerateArray())
-        {
-            if (part.ValueKind != JsonValueKind.Object)
-                continue;
-            if (part.TryGetProperty("text", out var text)
-                && text.ValueKind == JsonValueKind.String)
-            {
-                AppendTextPart(destination, text.GetString());
-            }
-        }
-    }
-
-    private static void AppendTextPart(StringBuilder destination, string? value)
-    {
-        if (string.IsNullOrEmpty(value))
-            return;
-        if (destination.Length > 0)
-            destination.AppendLine();
-        destination.Append(value);
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)

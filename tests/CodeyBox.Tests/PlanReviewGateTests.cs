@@ -157,6 +157,58 @@ public sealed class PlanReviewGateTests
         Assert.Contains("overriding policy", guidance, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void NormalizeRaw_Throws_WhenPressureTrimmedDocumentStillExceedsMaxChars()
+    {
+        // Build a plan whose pressure-trimmed shape (Approach: 2000 chars,
+        // SatisfiesTask: 2000 chars, 10 list items of 300 chars each) is still
+        // larger than the configured max — forces the second-pass throw.
+        // The fields above sum to about (2000 + 2000 + 10*300 + 10*300 +
+        // 10*300) = 13000 chars of payload, so a maxChars of 1024 is well
+        // below the pressure-trimmed floor.
+        var approach = new string('A', 5000);
+        var satisfies = new string('B', 5000);
+        var listItem = new string('c', 1000);
+        var files = string.Join(',', Enumerable.Range(0, 20).Select(_ => $"\"{listItem}\""));
+        var tests = string.Join(',', Enumerable.Range(0, 20).Select(_ => $"\"{listItem}\""));
+        var risks = string.Join(',', Enumerable.Range(0, 20).Select(_ => $"\"{listItem}\""));
+        var raw = $$"""
+            {
+              "approach": "{{approach}}",
+              "files": [{{files}}],
+              "testStrategy": [{{tests}}],
+              "risks": [{{risks}}],
+              "satisfiesTask": "{{satisfies}}"
+            }
+            """;
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => PlanArtifactDocument.NormalizeRaw(raw, maxChars: 1024));
+
+        Assert.Contains("larger than 1024 characters after normalization", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("[]")]
+    [InlineData("[\"approach\"]")]
+    [InlineData("```json\n[]\n```")]
+    public void NormalizeRaw_Throws_WhenArtifactIsArrayInsteadOfObject(string raw)
+    {
+        // ExtractJsonObject's brace-spanning fallback cannot find a '{' in a
+        // pure-array root, so the artifact is rejected before reaching the
+        // post-parse "must produce a JSON object" guard. The post-parse guard
+        // (PlanArtifactDocument.ParseJson) defends against a future change to
+        // ExtractJsonObject that lets a non-object value through; this theory
+        // pins the visible contract — any array-shaped artifact must fail.
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => PlanArtifactDocument.NormalizeRaw(raw, maxChars: 20_000));
+
+        Assert.True(
+            ex.Message.Contains("must produce a structured JSON PLAN artifact", StringComparison.Ordinal)
+            || ex.Message.Contains("must produce a JSON object", StringComparison.Ordinal),
+            $"Expected non-object root rejection, but got: {ex.Message}");
+    }
+
     private static WorkItem SampleItem() => new()
     {
         Id = WorkItemId.New(),

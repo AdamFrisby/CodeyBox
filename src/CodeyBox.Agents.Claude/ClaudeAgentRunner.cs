@@ -25,7 +25,7 @@ namespace CodeyBox.Agents.Claude;
 /// failure leaves the requested id untouched (best-effort, so we never
 /// degrade a working call).</para>
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IPlanArtifactExtractor
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
 
@@ -420,6 +420,15 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// </summary>
     public string? TryExtractSessionId(string? stdout)
         => ClaudeSessionIdExtractor.Extract(stdout);
+
+    /// <summary>
+    /// Unwraps the Claude CLI's stream-json envelope so the orchestrator's
+    /// plan-artifact parser sees the agent-visible plan text rather than the
+    /// raw NDJSON. Returns <c>null</c> when no stream-json events were observed
+    /// — the caller then feeds the raw stdout to the parser directly.
+    /// </summary>
+    public string? ExtractPlanArtifactText(string rawStdout)
+        => ClaudePlanArtifactExtractor.Extract(rawStdout);
 
     /// <summary>
     /// Builds the argv for a CLI-native session resume after a transient crash.

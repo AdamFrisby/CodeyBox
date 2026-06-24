@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -1057,8 +1058,11 @@ internal sealed class PlanningPipelineSetup(
     public void Dispose() => Store.Dispose();
 }
 
-internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentRunner
+internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentRunner, IPlanArtifactExtractor
 {
+    public string? ExtractPlanArtifactText(string rawStdout)
+        => ClaudePlanArtifactExtractor.Extract(rawStdout);
+
     private const string DefaultPlan = """
         {
           "approach": "make the smallest output file change.",
@@ -1319,12 +1323,15 @@ internal sealed partial class SandboxOnlyPlanningAgent : IAgentRunner
     private static partial Regex MergePromptShape();
 }
 
-internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner
+internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner, IPlanArtifactExtractor
 {
     private ISandbox? _sandbox;
     private string? _workingDirectory;
 
     public AgentKind Kind => AgentKind.Claude;
+
+    public string? ExtractPlanArtifactText(string rawStdout)
+        => ClaudePlanArtifactExtractor.Extract(rawStdout);
     public int OpenCalls { get; private set; }
     public int SendTurns { get; private set; }
     public int CloseCalls { get; private set; }
