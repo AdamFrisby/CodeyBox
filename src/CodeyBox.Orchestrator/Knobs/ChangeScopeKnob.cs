@@ -100,19 +100,65 @@ public sealed class ChangeScopeKnob : IKnob
     /// Used by the merge path to stamp <c>changeScope</c> on merge timing
     /// metadata and on the agentic conflict resolver context without taking
     /// a registry dependency in <c>PipelineRunner</c>.
+    ///
+    /// <para>
+    /// Defense-in-depth: each tier's value is canonicalised against
+    /// <see cref="AllowedValues"/> (case-insensitive, whitespace-trimmed). A
+    /// stored value that does not parse as a known value (older descriptor
+    /// retired the value, manual tampering) falls through to the next
+    /// precedence tier rather than leaking onto telemetry tags. Dictionary
+    /// lookups also defend against case-sensitive comparers on the supplied
+    /// maps by re-scanning when the direct lookup misses.
+    /// </para>
     /// </summary>
     public static string ResolveEffectiveValue(
         IReadOnlyDictionary<string, string>? itemKnobs,
         IReadOnlyDictionary<string, string>? projectKnobs)
     {
-        if (itemKnobs is not null
-            && itemKnobs.TryGetValue(KeyName, out var itemValue)
-            && !string.IsNullOrWhiteSpace(itemValue))
+        if (TryGetCanonical(itemKnobs, out var itemValue))
             return itemValue;
-        if (projectKnobs is not null
-            && projectKnobs.TryGetValue(KeyName, out var projectValue)
-            && !string.IsNullOrWhiteSpace(projectValue))
+        if (TryGetCanonical(projectKnobs, out var projectValue))
             return projectValue;
         return ValueModerate;
+    }
+
+    private static bool TryGetCanonical(
+        IReadOnlyDictionary<string, string>? map,
+        out string canonical)
+    {
+        canonical = string.Empty;
+        if (map is null)
+            return false;
+
+        if (!map.TryGetValue(KeyName, out var raw))
+        {
+            // The interface carries no comparer guarantee. If the direct
+            // lookup misses, re-scan case-insensitively so a map built with
+            // a case-sensitive (default) comparer still hits.
+            foreach (var kv in map)
+            {
+                if (string.Equals(kv.Key, KeyName, StringComparison.OrdinalIgnoreCase))
+                {
+                    raw = kv.Value;
+                    goto found;
+                }
+            }
+            return false;
+        }
+found:
+        if (string.IsNullOrWhiteSpace(raw))
+            return false;
+        var trimmed = raw.Trim();
+        foreach (var allowed in new[] { ValueSurgical, ValueModerate, ValueRefactor })
+        {
+            if (string.Equals(allowed, trimmed, StringComparison.OrdinalIgnoreCase))
+            {
+                canonical = allowed;
+                return true;
+            }
+        }
+        // Unknown value — fall through to next precedence tier so telemetry
+        // and the registry-driven prompt path agree on the effective value.
+        return false;
     }
 }

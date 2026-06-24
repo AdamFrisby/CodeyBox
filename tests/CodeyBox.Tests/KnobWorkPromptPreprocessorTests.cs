@@ -246,6 +246,88 @@ public sealed class KnobWorkPromptPreprocessorTests
     }
 
     [Fact]
+    public void ResolveEffectiveValue_CanonicalisesCasingAndTrimsWhitespace()
+    {
+        // Defense-in-depth: a non-canonical value (mixed casing, whitespace)
+        // is normalised to the AllowedValues entry rather than leaking onto
+        // telemetry tags. The registry-driven prompt path does the same
+        // canonicalisation, so the two paths agree on the effective value.
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "  REFACTOR  ",
+            },
+            projectKnobs: null));
+
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "Surgical",
+            },
+            projectKnobs: null));
+    }
+
+    [Fact]
+    public void ResolveEffectiveValue_InvalidValueFallsThroughToNextTier()
+    {
+        // An obsolete / tampered item value must NOT leak onto telemetry —
+        // it falls through to the project tier, then to the default. Mirrors
+        // KnobRegistry.Resolve, which rejects-and-falls-through via ParseValue.
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "yolo",
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            }));
+
+        Assert.Equal(ChangeScopeKnob.ValueModerate, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "yolo",
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "also-yolo",
+            }));
+    }
+
+    [Fact]
+    public void ResolveEffectiveValue_WhitespaceItemValueFallsThroughToProject()
+    {
+        // The fallthrough guard must also catch whitespace-only stored values
+        // (a non-defense-in-depth helper would treat them as "set" and leak
+        // an empty tag onto telemetry).
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "   ",
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+            }));
+    }
+
+    [Fact]
+    public void ResolveEffectiveValue_CaseSensitiveCallerMapStillHitsKey()
+    {
+        // The IReadOnlyDictionary interface carries no comparer guarantee. A
+        // caller-supplied map with the default (Ordinal) comparer must still
+        // find the key — otherwise telemetry would silently fall through to
+        // the default while the registry's case-insensitive lookup would
+        // have found it.
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, ChangeScopeKnob.ResolveEffectiveValue(
+            itemKnobs: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["ChangeScope"] = ChangeScopeKnob.ValueRefactor,
+            },
+            projectKnobs: null));
+    }
+
+    [Fact]
     public async Task ReworkPhase_IsSkipped_PromptUnchanged()
     {
         var registry = new KnobRegistry([new ChangeScopeKnob()]);

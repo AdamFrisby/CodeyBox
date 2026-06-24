@@ -3511,6 +3511,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Rebase)
                     {
                         ProjectId = project.Id,
+                        ChangeScope = ChangeScopeKnob.ResolveEffectiveValue(item.Knobs, project.Knobs),
                     },
                     candidates,
                     ct);
@@ -12648,7 +12649,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     {
                         ["agent"] = runner.Kind.Value,
                         ["capability"] = "agentic-in-vm",
-                        ["changeScope"] = mergeChangeScope,
+                        ["change_scope"] = mergeChangeScope,
                     },
                     log: _log,
                     activitySource: CodeyBoxActivities.Pipeline);
@@ -12723,7 +12724,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
                 new KeyValuePair<string, object?>("agent.kind", chosenMergeRunner.Kind.Value),
                 new KeyValuePair<string, object?>("phase", "merge"),
-                new KeyValuePair<string, object?>("changeScope", mergeChangeScope));
+                new KeyValuePair<string, object?>("change_scope", mergeChangeScope));
 
             // When the cascade swapped to a cross-kind fallback, item.ModelId
             // belongs to the primary (e.g. "claude-opus-4-7") and is not valid

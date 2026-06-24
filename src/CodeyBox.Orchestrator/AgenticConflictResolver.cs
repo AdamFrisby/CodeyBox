@@ -88,10 +88,13 @@ public sealed record AgenticConflictResolverContext(
 
     /// <summary>
     /// Effective <c>changeScope</c> knob value for the work item driving this
-    /// merge/rebase. Carried through so resolver telemetry (audit log,
-    /// per-attempt failure events) can tag refactor-scoped items as
-    /// merge-conflict-prone and surgical items as conflict-friendly. Empty /
-    /// null when the orchestrator did not resolve the knob (older callers).
+    /// merge/rebase. Today the resolver consumes this in exactly one place:
+    /// the start-of-resolve <c>LogInformation</c> in
+    /// <see cref="AgenticConflictResolver.ResolveAsync"/>, which tags the line
+    /// with <c>changeScope=…</c> so operators can correlate refactor-scoped
+    /// items with merge-conflict-prone behaviour. Empty / null when the
+    /// orchestrator did not resolve the knob (older callers); the log line is
+    /// then suppressed rather than emitting an empty tag.
     /// </summary>
     public string? ChangeScope { get; init; }
 }

@@ -3,16 +3,16 @@
 A **knob** is a small, registered directive that nudges the agent's behaviour
 on a single work item — without editing the pipeline core. Each knob is a
 self-contained descriptor: a key, a value type / allowed-values set, a default,
-a description, and a small set of optional per-phase hooks (today: the
-work-prompt fragment seam).
+a description, and a small set of optional per-phase prompt hooks (today: the
+work-prompt and audit-prompt fragment seams).
 
 Knobs are designed for *fan-out*: this surface is expected to grow to dozens of
 small dials over time. Adding a new knob is a **localised** change — implement
 [`IKnob`](../src/CodeyBox.Core/IKnob.cs), register it as a DI singleton, and
 the knob is immediately visible to the API for set/validate, persisted on every
-new work item, and consulted at work-prompt assembly time. No edits to the API
-endpoints, the orchestrator, the SQLite store, or the preprocessor chain are
-required.
+new work item, and consulted at prompt-assembly time (work and audit). No
+edits to the API endpoints, the orchestrator, the SQLite store, or the
+preprocessor chain are required.
 
 ## Setting knobs on a work item
 
@@ -159,7 +159,8 @@ A new knob is a four-step, localised change. No pipeline edits.
 3. Add a row to this document describing the knob.
 
 4. Done — the new knob is automatically validated by the API, persisted on
-   work items, and injected by the work-prompt preprocessor.
+   work items, and injected by the prompt preprocessor (work and audit
+   phases). Override `GetAuditPromptFragment` to also steer LLM auditors.
 
 ## Registered knobs
 
@@ -182,10 +183,14 @@ requested change.
   quality, completeness, security, tests, etc.), so a surgical item flags
   out-of-scope breadth that a refactor item does not.
 - **Merge**: the effective value is stamped on merge timing metadata (the
-  `merge.agent.exec` timing scope's `changeScope` tag and the `AgentDuration`
-  meter's `changeScope` dimension) and threaded into
-  `AgenticConflictResolverContext.ChangeScope` so the agentic conflict
-  resolver can tag refactor-scoped items as conflict-prone in its logs.
+  `merge.agent.exec` timing scope's `change_scope` tag and the `AgentDuration`
+  meter's `change_scope` dimension, matching the surrounding snake_case tag
+  convention) and threaded into `AgenticConflictResolverContext.ChangeScope`
+  so the agentic conflict resolver can tag refactor-scoped items as
+  conflict-prone in its logs. The merge-phase rebase path (when a rebase
+  hits conflicts) also carries the value through; work/rework/audit phases
+  intentionally do NOT tag this dimension on the meter — the lever is on
+  the merge surface today.
   Scheduling biases for refactor-vs-normal items remain provided by
   `JobType.Refactor`'s project-exclusive dispatcher gate (see
   [`OrchestratorService`](../src/CodeyBox.Orchestrator/OrchestratorService.cs)

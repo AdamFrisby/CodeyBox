@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -1763,21 +1764,93 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
-    public void AgenticConflictResolverContext_ChangeScope_CarriesValueForResolverTelemetry()
+    public async Task ResolveAsync_EmitsStartingLogWithChangeScope_WhenSet()
     {
-        // changeScope flows into the resolver as context so its logger can tag
-        // refactor-scoped items as conflict-prone (and surgical ones as
-        // conflict-friendly). The pipeline sets this from
-        // ChangeScopeKnob.ResolveEffectiveValue(item, project). Pin the
-        // contract that the field exists, is settable via the record's
-        // with-init syntax, and is preserved across copy-construction.
-        var baseCtx = new AgenticConflictResolverContext(
-            "main", "feature", AgenticConflictResolverOperation.Merge);
-        Assert.Null(baseCtx.ChangeScope);
+        // The resolver tags its start-of-resolve log line with the effective
+        // changeScope so operators can correlate refactor-scoped items with
+        // merge-conflict-prone behaviour. Pin the actual log emission, not
+        // just the record-field plumbing — a regression that drops the log
+        // or inverts the guard must fail this test.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var logger = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            log: logger);
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "claimed", null, null);
+        });
+        var workItemId = WorkItemId.New();
 
-        var refactor = baseCtx with { ChangeScope = "refactor" };
-        Assert.Equal("refactor", refactor.ChangeScope);
+        _ = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            workItemId,
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge)
+            {
+                ChangeScope = "refactor",
+            },
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
 
+        var startLog = Assert.Single(
+            logger.Entries,
+            e =>
+                e.Level == LogLevel.Information &&
+                e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+        Assert.True(startLog.Properties.TryGetValue("ChangeScope", out var scopeProp));
+        Assert.Equal("refactor", scopeProp);
+        Assert.True(startLog.Properties.TryGetValue("WorkItemId", out var idProp));
+        Assert.Equal(workItemId, idProp);
+        Assert.True(startLog.Properties.TryGetValue("Operation", out var opProp));
+        Assert.Equal(AgenticConflictResolverOperation.Merge, opProp);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_DoesNotEmitStartingLog_WhenChangeScopeUnset()
+    {
+        // Guards against the inverted-condition bug class: when the context
+        // carries no changeScope (e.g. older callers that did not thread the
+        // knob through), the resolver must NOT emit the changeScope start
+        // log — otherwise the log would carry an empty/null tag every time.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var logger = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            log: logger);
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "claimed", null, null);
+        });
+
+        _ = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.DoesNotContain(
+            logger.Entries,
+            e => e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void AgenticConflictResolverContext_ChangeScope_SurvivesRecordCopy()
+    {
+        // Smaller plumbing pin: the record's with-init syntax must preserve
+        // ChangeScope across copies so the pipeline can layer ProjectId on
+        // top of a base context without dropping the resolved changeScope.
+        var refactor = new AgenticConflictResolverContext(
+            "main", "feature", AgenticConflictResolverOperation.Merge)
+        {
+            ChangeScope = "refactor",
+        };
         var withProject = refactor with { ProjectId = new ProjectId("p1") };
         Assert.Equal("refactor", withProject.ChangeScope);
         Assert.Equal(new ProjectId("p1"), withProject.ProjectId);
