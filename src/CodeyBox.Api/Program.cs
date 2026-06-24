@@ -2419,7 +2419,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.ClockDriftSafetyMargin,
             current.MaxAutoRetriesPerWorkItem);
     },
-    quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
+    quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
+    pauseSignal: sp.GetRequiredService<IAgentPauseSignal>()));
 builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<WorkItemRetrier>(),
