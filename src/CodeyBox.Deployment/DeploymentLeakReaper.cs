@@ -179,7 +179,13 @@ public sealed class DeploymentLeakReaper : BackgroundService
                 }
             }
         }
-        catch (OperationCanceledException) { }
+        // Only swallow OCEs that are NOT the outer shutdown-cancellation. Without
+        // the `when` clause, the inner `catch (...) when (ct.IsCancellationRequested) { throw; }`
+        // above is dead code because this outer handler re-catches the rethrown
+        // exception. Narrowing here lets the inner rethrow propagate up to
+        // ExecuteAsync (which expects OCE on shutdown) and still absorb any
+        // transient per-leak timeout OCEs that escape the inner handler.
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "DeploymentLeakReaper: sweep failed");

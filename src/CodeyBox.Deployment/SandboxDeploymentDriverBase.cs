@@ -76,12 +76,30 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             // indefinitely — neither the startup timeout nor the readiness
             // probe would fire. Wrapping start under the same bound surfaces
             // the failure as TimeoutException after StartupTimeout.
+            //
+            // The two stages share the deadline but are caught separately so
+            // the operator-facing message tells them which stage hit it. A
+            // start-stage timeout almost always means the recipe forgot to
+            // background the run command (sandbox.ExecAsync is one-shot and
+            // blocks until the child exits); a probe-stage timeout means the
+            // server started but readiness never converged.
             using (var startupCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 startupCts.CancelAfter(recipe.StartupTimeout);
                 try
                 {
                     await StartRuntimeAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new TimeoutException(
+                        $"Deployment kind '{Kind}' StartRuntime did not return within {recipe.StartupTimeout}. " +
+                        "RunCommand likely runs the server in the foreground — sandbox.ExecAsync waits for the " +
+                        "child process to exit, so the recipe must background the server (e.g. nohup ... &, exec, " +
+                        "or a process supervisor) for StartRuntime to return. Tearing down substrate.");
+                }
+                try
+                {
                     await ProbeReadyAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
