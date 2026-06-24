@@ -1975,6 +1975,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var auditors = _auditorComposer.Compose(project, agentRunner);
             AuditLog.AuditProfileSelected(project.Audit.Profile, auditors.Select(a => a.Name).ToArray());
 
+            // Snapshot the self-review-checklist gate once per pickup so the
+            // work prompt, the audit-iteration tag, and the audit-log event
+            // all agree on the same state even if the operator hot-reloads
+            // PipelineTuningOptions mid-item. The audit-log event fires only
+            // when this pickup is actually dispatching work; resume pickups
+            // skip it because the prompt that built the code under audit was
+            // emitted (with its own gate state) on an earlier pickup.
+            var selfReviewChecklistEnabled = _pipelineTuning.Current.SelfReviewChecklistEnabled;
+            if (!skipWork)
+                AuditLog.SelfReviewChecklistInjected(item.Id, selfReviewChecklistEnabled);
+
             // -------- Phase 1: Work --------
             if (!skipWork)
             {
@@ -2017,6 +2028,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                             trialItem.Prompt,
                                             project.AllowAgentQuestions,
                                             auditors,
+                                            selfReviewChecklistEnabled,
                                             ApprovedPlanForImplementation(trialItem, planningLifecycleRequiredAtEntry)),
                                         isInitial: true,
                                         networkProfile: sandboxTarget.NetworkProfile,
@@ -2123,7 +2135,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var mechanicalFixersConfigured = project.Audit.MechanicalFixers.Count > 0;
             if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies || mechanicalFixersConfigured))
             {
-                var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
+                var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, selfReviewChecklistEnabled, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
                 if (resumingPreempt)
                 {
@@ -3907,6 +3919,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string userPrompt,
         bool allowAgentQuestions = false,
         IReadOnlyList<IAuditor>? auditors = null,
+        bool selfReviewChecklistEnabled = true,
         string? approvedPlan = null)
     {
         var sb = new System.Text.StringBuilder();
@@ -3929,11 +3942,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         // Post-work self-review checklist composed at runtime from active auditors.
-        var checklist = SelfReviewChecklistComposer.Compose(auditors);
-        if (!string.IsNullOrWhiteSpace(checklist))
+        // Gated by PipelineTuningOptions.SelfReviewChecklistEnabled so operators
+        // can A/B-compare audit-iteration count and first-audit pass-rate with
+        // the checklist on vs off. Framing is "fix genuine issues you spot" —
+        // the formal audit (separate, fresh) still owns pass/fail.
+        if (selfReviewChecklistEnabled)
         {
-            sb.Append("\n\nOnce you're done working and the build passes, review your changes against the following self-review checklist before committing. Read these only after your functional work is complete — do not let them reshape the task:\n\n");
-            sb.Append(checklist);
+            var checklist = SelfReviewChecklistComposer.Compose(auditors);
+            if (!string.IsNullOrWhiteSpace(checklist))
+            {
+                sb.Append("\n\nOnce your functional work is complete and the build passes, scan your changes against the checklist below and fix any GENUINE issues you spot. Do not pad the review or invent issues to satisfy items — the formal audit runs separately and owns pass/fail. Read the checklist only after the functional work is done; do not let it reshape the task:\n\n");
+                sb.Append(checklist);
+            }
         }
 
         if (allowAgentQuestions)
@@ -6747,6 +6767,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string repoId,
         string baseBranch,
         string workBranch,
+        bool selfReviewChecklistEnabled,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -7030,12 +7051,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "audit-verdict-produced",
                 ct);
 
+            // Tag every audit-iteration meter with the self-review-checklist
+            // gate state so dashboards can compare iteration count + first-audit
+            // pass-rate WITH vs WITHOUT the injected checklist. `iteration` is
+            // tagged too so passed/failed at iter 1 (first-audit pass-rate) can
+            // be sliced directly.
+            var selfReviewTag = new KeyValuePair<string, object?>(
+                "self_review_checklist", selfReviewChecklistEnabled ? "on" : "off");
+            var iterationTag = new KeyValuePair<string, object?>(
+                "iteration", iteration.ToString());
+
             if (blocking.Count == 0)
             {
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
                     iteration, item.Id, nonBlocking);
                 AuditLog.AuditPassed(iteration);
-                CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "passed"));
+                CodeyBoxMeters.AuditIterations.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "passed"),
+                    selfReviewTag,
+                    iterationTag);
                 return false;
             }
 
@@ -7047,19 +7081,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (HasAuditConvergenceProgress(auditHistory))
                 {
                     CodeyBoxMeters.AuditIterations.Add(1,
-                        new KeyValuePair<string, object?>("outcome", "needs_operator_input"));
+                        new KeyValuePair<string, object?>("outcome", "needs_operator_input"),
+                        selfReviewTag,
+                        iterationTag);
                     await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
                     return true;
                 }
 
-                CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
+                CodeyBoxMeters.AuditIterations.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "failed"),
+                    selfReviewTag,
+                    iterationTag);
                 AuditLog.AuditFailed(iteration, blocking.Count);
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
             }
 
-            CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
+            CodeyBoxMeters.AuditIterations.Add(1,
+                new KeyValuePair<string, object?>("outcome", "reworking"),
+                selfReviewTag,
+                iterationTag);
             // Close the audit phase scope before the incremental rebase and
             // rework begins; neither should contribute to audit duration.
             auditPhaseScope.Dispose();

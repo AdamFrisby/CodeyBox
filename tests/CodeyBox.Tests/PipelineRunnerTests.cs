@@ -321,7 +321,7 @@ public sealed class PipelineRunnerTests
         var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
 
         // Checklist should be empty because cheating opted out
-        Assert.DoesNotContain("following self-review checklist before committing", prompt);
+        Assert.DoesNotContain("scan your changes against the checklist", prompt);
     }
 
     [Fact]
@@ -332,8 +332,60 @@ public sealed class PipelineRunnerTests
 
         var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
 
-        Assert.Contains("Once you're done working and the build passes, review your changes against the following self-review checklist before committing", prompt);
+        Assert.Contains("scan your changes against the checklist below and fix any GENUINE issues you spot", prompt);
+        Assert.Contains("the formal audit runs separately and owns pass/fail", prompt);
         Assert.Contains("New Auditor Standard", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_DefaultIsOn()
+    {
+        var auditor = new GuidanceAuditor("style:auditor", "- **Default-on marker**: dummy guidance.");
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: [auditor]);
+        // Default preserved: with the gate omitted, the checklist is injected.
+        Assert.Contains("Default-on marker", prompt);
+        Assert.Contains("scan your changes against the checklist", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_GateOnInjects()
+    {
+        var auditor = new GuidanceAuditor("style:auditor", "- **Gate-on marker**: dummy guidance.");
+        var prompt = PipelineRunner.BuildInitialWorkPrompt(
+            "do work", auditors: [auditor], selfReviewChecklistEnabled: true);
+        Assert.Contains("Gate-on marker", prompt);
+        Assert.Contains("scan your changes against the checklist", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_GateOffOmits()
+    {
+        var auditor = new GuidanceAuditor("style:auditor", "- **Gate-off marker**: should NOT appear.");
+        var prompt = PipelineRunner.BuildInitialWorkPrompt(
+            "do work", auditors: [auditor], selfReviewChecklistEnabled: false);
+        // Checklist body and the framing sentence must both be absent.
+        Assert.DoesNotContain("Gate-off marker", prompt);
+        Assert.DoesNotContain("scan your changes against the checklist", prompt);
+        // The user prompt and trailers must still be present.
+        Assert.Contains("do work", prompt);
+        Assert.Contains("Co-Authored-By: CodeyBox <noreply@codeybox.invalid>", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_GateOffPreservesShellPreflight()
+    {
+        // The shell-preflight section is independent of the self-review gate —
+        // turning off the checklist must not also suppress the mechanical-check
+        // pre-flight instructions, since those still pre-empt iter-1 rework.
+        IReadOnlyList<IAuditor> auditors =
+        [
+            new FakeShellAuditor("csharp:format-check", ["dotnet", "format", "--verify-no-changes"]),
+            new GuidanceAuditor("style:auditor", "- **Should-not-appear**: gated off."),
+        ];
+        var prompt = PipelineRunner.BuildInitialWorkPrompt(
+            "do work", auditors: auditors, selfReviewChecklistEnabled: false);
+        Assert.Contains("`dotnet format --verify-no-changes`", prompt);
+        Assert.DoesNotContain("Should-not-appear", prompt);
     }
 
     private sealed class GuidanceAuditor : IAuditor

@@ -691,6 +691,20 @@ public static class AuditLog
             .Warning("Audit failed after {Iteration} iterations: {BlockingCount} blocking findings",
                 iteration, blockingCount);
 
+    /// <summary>
+    /// Emitted once per dispatched work pickup recording whether the runtime-
+    /// composed self-review checklist (from
+    /// <c>PipelineTuningOptions.SelfReviewChecklistEnabled</c>) was injected
+    /// into the work-phase prompt. Correlate against
+    /// <c>codeybox.audit.iterations</c> tagged with the same
+    /// <c>self_review_checklist</c> value to measure audit-iteration count and
+    /// first-audit pass-rate WITH vs WITHOUT the checklist.
+    /// </summary>
+    public static void SelfReviewChecklistInjected(WorkItemId workItemId, bool injected) =>
+        Audit("work_prompt.self_review_checklist")
+            .Information("Self-review checklist {State} for work item {WorkItemId}",
+                injected ? "INJECTED" : "OMITTED", workItemId.ToString());
+
     // ── Webhook delivery ─────────────────────────────────────────────────────
 
     public static void WebhookDelivered(string endpoint, string eventName, int statusCode, int attempt) =>

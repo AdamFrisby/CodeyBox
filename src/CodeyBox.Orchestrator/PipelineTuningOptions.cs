@@ -126,6 +126,19 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public bool EnableHandoffSeeding { get; set; }
 
+    /// <summary>
+    /// Whether to inject the runtime-composed self-review checklist into the
+    /// one-shot work-phase prompt. The checklist is assembled by
+    /// <see cref="CodeyBox.Projects.SelfReviewChecklistComposer"/> from the
+    /// active auditors' <see cref="CodeyBox.Core.IAuditor.SelfReviewGuidance"/>
+    /// and asks the agent to fix genuine issues it spots before committing;
+    /// the formal audit (separate, fresh sandbox) still owns pass/fail.
+    /// Default <c>true</c> to preserve the always-on stopgap that the runtime
+    /// composer replaced. Hot-reloadable; set to <c>false</c> to dispatch
+    /// without the checklist for measurement / A-B comparison.
+    /// </summary>
+    public bool SelfReviewChecklistEnabled { get; set; } = true;
+
     public void Validate()
     {
         if (MaxSandboxReuses < 1)
