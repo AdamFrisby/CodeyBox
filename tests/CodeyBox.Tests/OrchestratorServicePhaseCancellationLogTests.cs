@@ -14,6 +14,10 @@ namespace CodeyBox.Tests;
 /// the phase/source placeholders would silently regress the operator dashboard
 /// contract advertised in docs/audit-logging.md and docs/work-items.md.
 /// </summary>
+// Serialised with other BackgroundService timing-sensitive tests: the host-shutdown
+// case waits up to 10s for the pipeline's Started TCS to signal, which can miss
+// under parallel CPU contention from heavy suites running alongside.
+[Collection("Background service timing")]
 public sealed class OrchestratorServicePhaseCancellationLogTests : IDisposable
 {
     // Positive event-driven waits below (pipeline-start signal, log-entry match)

@@ -24,6 +24,7 @@ namespace CodeyBox.Tests;
 ///   touched (architectural separation enforced by a fake provider that asserts no
 ///   external collaborators reach into it)
 /// </summary>
+[Collection("Background service timing")]
 public sealed class E2eExecutionTests : IDisposable
 {
     private readonly string _dbPath;

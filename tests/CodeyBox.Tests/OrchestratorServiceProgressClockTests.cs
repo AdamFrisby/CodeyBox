@@ -5,6 +5,11 @@ using System.Diagnostics;
 
 namespace CodeyBox.Tests;
 
+// Serialised with other BackgroundService timing-sensitive tests: the asserts
+// here gate on a 10s deadline for the worker loop to dequeue, process, and stamp
+// the progress clock, which gets flaky under parallel CPU contention from other
+// suites running heavy Task.Run / sandbox-simulation workloads alongside.
+[Collection("Background service timing")]
 public sealed class OrchestratorServiceProgressClockTests : IDisposable
 {
     // Positive event-driven poll-deadlines below use this as a backstop only:
