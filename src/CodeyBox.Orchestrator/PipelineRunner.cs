@@ -5259,7 +5259,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (!result.Success)
         {
             var classification = _authFailureClassifier.ClassifyFailure(runner, classificationResult ?? result);
-            if (classification.Kind is AgentFailureKind.Infrastructure or AgentFailureKind.TransientNetwork)
+            if (classification.Kind is AgentFailureKind.Infrastructure
+                or AgentFailureKind.TransientNetwork
+                or AgentFailureKind.AuthRequired)
             {
                 if (classification.Kind == AgentFailureKind.Infrastructure)
                 {

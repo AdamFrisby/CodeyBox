@@ -1162,7 +1162,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pid\"", termIndex, StringComparison.Ordinal);
         var waitIndex = script.IndexOf("wait \"$codeybox_detached_pid\" 2>/dev/null", termIndex, StringComparison.Ordinal);
         var timeoutExitIndex = script.IndexOf(
-            $"exit {MultipassSandbox.DetachedSupervisorSetupFailedExitCode}",
+            "exit 88",
             waitIndex,
             StringComparison.Ordinal);
         Assert.True(termIndex >= 0, "TERM not emitted");

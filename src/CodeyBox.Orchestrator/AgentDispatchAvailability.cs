@@ -34,7 +34,6 @@ public interface IAgentDispatchAvailability
     AgentAvailability? GetAvailability(AgentKind kind);
 
     AgentAvailability? GetAvailability(AgentMembership member) => GetAvailability(member.Agent);
-
 }
 
 /// <summary>

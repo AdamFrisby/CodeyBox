@@ -69,21 +69,14 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     }
 
     internal DefaultWorkerProgressActivitySource(
-        TryReadProcessCpuSample tryReadWorkItemCpuTicks,
-        IActiveSandboxProgressProvider? activeSandboxProvider = null)
-        : this(activeSandboxProvider, (WorkItemId itemId, out ProcessCpuSample sample) =>
-            tryReadWorkItemCpuTicks(itemId, out sample), requireLinuxProcFs: false, initialCpuSampleAttempts: 1)
-    {
-    }
-
-    internal DefaultWorkerProgressActivitySource(
         IActiveSandboxProgressProvider? activeSandboxProvider,
-        ProcessCpuSampleReader processCpuSampleReader)
+        ProcessCpuSampleReader processCpuSampleReader,
+        int initialCpuSampleAttempts = DefaultInitialCpuSampleAttempts)
         : this(
             activeSandboxProvider,
             processCpuSampleReader,
             requireLinuxProcFs: false,
-            initialCpuSampleAttempts: DefaultInitialCpuSampleAttempts)
+            initialCpuSampleAttempts: initialCpuSampleAttempts)
     {
     }
 
@@ -413,25 +406,9 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
 
     internal delegate bool ProcessCpuSampleReader(WorkItemId itemId, out ProcessCpuSample sample);
 
-    internal delegate bool TryReadProcessCpuSample(WorkItemId itemId, out ProcessCpuSample sample);
-
     internal readonly record struct ProcessCpuSample(
         long CpuTicks,
         string ProcessSetSignature,
         bool HasActiveProcessState,
-        bool HasConfirmedProgress)
-    {
-        // Test-only convenience overload. Existing fixtures script samples
-        // using a 0/1 "runnable processes seen this tick" sentinel; we
-        // collapse it to the persistent HasActiveProcessState bool because
-        // the watchdog only ever consults presence, not the count.
-        public ProcessCpuSample(long cpuTicks, string processSetSignature, int runnableProcessCount)
-            : this(
-                cpuTicks,
-                processSetSignature,
-                HasActiveProcessState: runnableProcessCount > 0,
-                HasConfirmedProgress: false)
-        {
-        }
-    }
+        bool HasConfirmedProgress);
 }

@@ -599,9 +599,12 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             return;
 
         var itemId = WorkItemId.New();
-        var source = new DefaultWorkerProgressActivitySource(ScriptedCpuSamples(
-            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 1),
-            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 1)));
+        var source = new DefaultWorkerProgressActivitySource(
+            activeSandboxProvider: null,
+            processCpuSampleReader: ScriptedCpuSamples(
+                new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", HasActiveProcessState: true, HasConfirmedProgress: false),
+                new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", HasActiveProcessState: true, HasConfirmedProgress: false)),
+            initialCpuSampleAttempts: 1);
         var probe = new WorkerProgressActivityProbe(
             ProcessCpuProgressSignalEnabled: true,
             ActiveSandboxProgressSignalEnabled: false);
@@ -623,10 +626,13 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             return;
 
         var itemId = WorkItemId.New();
-        var source = new DefaultWorkerProgressActivitySource(ScriptedCpuSamples(
-            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 0),
-            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 0),
-            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 1)));
+        var source = new DefaultWorkerProgressActivitySource(
+            activeSandboxProvider: null,
+            processCpuSampleReader: ScriptedCpuSamples(
+                new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", HasActiveProcessState: false, HasConfirmedProgress: false),
+                new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", HasActiveProcessState: false, HasConfirmedProgress: false),
+                new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", HasActiveProcessState: true, HasConfirmedProgress: false)),
+            initialCpuSampleAttempts: 1);
         var probe = new WorkerProgressActivityProbe(
             ProcessCpuProgressSignalEnabled: true,
             ActiveSandboxProgressSignalEnabled: false);
@@ -1573,7 +1579,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         CurrentWorkItemId = itemId.ToString(),
     };
 
-    private static DefaultWorkerProgressActivitySource.TryReadProcessCpuSample ScriptedCpuSamples(
+    private static DefaultWorkerProgressActivitySource.ProcessCpuSampleReader ScriptedCpuSamples(
         params DefaultWorkerProgressActivitySource.ProcessCpuSample[] samples)
     {
         var queue = new Queue<DefaultWorkerProgressActivitySource.ProcessCpuSample>(samples);

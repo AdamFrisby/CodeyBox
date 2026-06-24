@@ -773,7 +773,6 @@ public sealed class ReleaseService
         providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase) ||
         providerName.Equals("process", StringComparison.OrdinalIgnoreCase);
 
-
     private IAgentRunner WrapPromptPreprocessedRunner(
         IAgentRunner runner,
         WorkItemId itemId,
