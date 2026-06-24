@@ -519,6 +519,117 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Null(recovered);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning, WorkItemState.Queued)]
+    [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview)]
+    [InlineData(WorkItemState.PlanApproved, WorkItemState.PlanApproved)]
+    [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.WorkComplete, WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed, WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged, WorkItemState.Merged)]
+    [InlineData(WorkItemState.ReworkingForConflict, WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.UpstreamPushing, WorkItemState.Merged)]
+    public void MapToRecoveryState_MapsRecoverableStatesToTheirDurableResumePoints(
+        WorkItemState from,
+        WorkItemState expectedTarget)
+    {
+        var target = WorkItemRecoveryPolicy.MapToRecoveryState(from);
+
+        Assert.Equal(expectedTarget, target);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Queued)]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Done)]
+    [InlineData(WorkItemState.Failed)]
+    [InlineData(WorkItemState.Cancelled)]
+    [InlineData(WorkItemState.WaitingForQuotaReset)]
+    [InlineData(WorkItemState.WaitingForTransientRetry)]
+    [InlineData(WorkItemState.WaitingForAgentResume)]
+    [InlineData(WorkItemState.NeedsOperatorInput)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts)]
+    [InlineData(WorkItemState.AuditFailed)]
+    public void MapToRecoveryState_ReturnsNull_ForNonRecoverableOrTerminalStates(WorkItemState state)
+    {
+        var target = WorkItemRecoveryPolicy.MapToRecoveryState(state);
+
+        Assert.Null(target);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Queued, true)]
+    [InlineData(WorkItemState.PlanReview, true)]
+    [InlineData(WorkItemState.PlanApproved, true)]
+    [InlineData(WorkItemState.WorkComplete, false)]
+    [InlineData(WorkItemState.AuditPassed, false)]
+    [InlineData(WorkItemState.Merged, false)]
+    [InlineData(WorkItemState.Working, false)]
+    [InlineData(WorkItemState.Planning, false)]
+    [InlineData(WorkItemState.Reworking, false)]
+    [InlineData(WorkItemState.Auditing, false)]
+    [InlineData(WorkItemState.Merging, false)]
+    [InlineData(WorkItemState.ReworkingForConflict, false)]
+    [InlineData(WorkItemState.UpstreamPushing, false)]
+    public void ShouldClearStartedAtForRecoveryTarget_ClearsOnlyPhaseBoundaryTargets(
+        WorkItemState target,
+        bool expectedClear)
+    {
+        Assert.Equal(expectedClear, WorkItemRecoveryPolicy.ShouldClearStartedAtForRecoveryTarget(target));
+    }
+
+    [Fact]
+    public void ClearPlanFieldsIfQueued_ClearsAllFourPlanColumnsWhenQueued()
+    {
+        var item = MakeItem(WorkItemState.Queued) with
+        {
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewSummary = "approved",
+        };
+
+        var cleared = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(item);
+
+        Assert.Null(cleared.PlanArtifact);
+        Assert.Null(cleared.PlanGeneratedAt);
+        Assert.Null(cleared.PlanReviewedAt);
+        Assert.Null(cleared.PlanReviewSummary);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Planning)]
+    [InlineData(WorkItemState.PlanReview)]
+    [InlineData(WorkItemState.PlanApproved)]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged)]
+    [InlineData(WorkItemState.Done)]
+    public void ClearPlanFieldsIfQueued_PreservesPlanFieldsForNonQueuedStates(WorkItemState state)
+    {
+        var planGenerated = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var planReviewed = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = MakeItem(state) with
+        {
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = planGenerated,
+            PlanReviewedAt = planReviewed,
+            PlanReviewSummary = "approved",
+        };
+
+        var preserved = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(item);
+
+        Assert.Equal(ValidPlan, preserved.PlanArtifact);
+        Assert.Equal(planGenerated, preserved.PlanGeneratedAt);
+        Assert.Equal(planReviewed, preserved.PlanReviewedAt);
+        Assert.Equal("approved", preserved.PlanReviewSummary);
+    }
+
     private static WorkItem MakeItem(WorkItemState state) => new()
     {
         Id = WorkItemId.New(),

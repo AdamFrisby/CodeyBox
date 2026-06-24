@@ -156,6 +156,39 @@ public sealed class WorkItemRetrierPlanningTests : IDisposable
     }
 
     [Fact]
+    public async Task RetryManual_FromPlanApproved_PreservesApprovedPlanAndResumesAtPlanApproved()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var reviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = Sample(WorkItemState.Failed) with
+        {
+            WorkBranch = null,
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = reviewedAt,
+            PlanReviewSummary = "approved",
+            LastError = "implementation failed",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.RetryAsync(item, "plan_approved");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.PlanApproved, result.ResumeState);
+        Assert.Equal("plan_approved", result.ActualFrom);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.PlanApproved, read!.State);
+        Assert.Equal(ValidPlan, read.PlanArtifact);
+        Assert.Equal(item.PlanGeneratedAt, read.PlanGeneratedAt);
+        Assert.Equal(reviewedAt, read.PlanReviewedAt);
+        Assert.Equal("approved", read.PlanReviewSummary);
+        Assert.Null(read.LastError);
+    }
+
+    [Fact]
     public async Task RetryManual_FromWork_RequeuesAndClearsApprovedPlan()
     {
         using var store = NewStore();

@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
@@ -122,6 +123,55 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.WorkCalls);
         Assert.DoesNotContain("## Reviewed planning metadata", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.DoesNotContain("STALE PLAN", agent.LastWorkPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_WithoutKnobRegistry_DisablesPlanningAndWarnsOnce()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            omitKnobRegistry: true,
+            pipelineLogger: logger);
+
+        var first = NewItem("feature/no-knob-registry-1") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+        var second = NewItem("feature/no-knob-registry-2") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(first);
+        await setup.Pipeline.RunAsync(first, CancellationToken.None);
+        await setup.Store.CreateAsync(second);
+        await setup.Pipeline.RunAsync(second, CancellationToken.None);
+
+        // Planning is disabled when the registry is missing: items go straight
+        // to implementation without producing or persisting a plan.
+        var firstFinal = await setup.Store.GetAsync(first.Id);
+        Assert.NotNull(firstFinal);
+        Assert.Equal(WorkItemState.Done, firstFinal!.State);
+        Assert.Null(firstFinal.PlanArtifact);
+        Assert.Equal(0, agent.PlanningCalls);
+        Assert.Equal(2, agent.WorkCalls);
+
+        var warnings = logger.Entries
+            .Where(entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains("PipelineRunner has no IKnobRegistry wired", StringComparison.Ordinal))
+            .ToList();
+        Assert.Single(warnings);
     }
 
     [Fact]
@@ -395,6 +445,67 @@ public sealed class PlanningPipelineTests : IDisposable
             PlanningMarkerCredentialProvider.MarkerValue,
             planningSpec.Environment[PlanningMarkerCredentialProvider.MarkerKey]);
         Assert.Contains(PlanningMarkerCredentialProvider.MarkerHost, planningSpec.Network.AllowedHosts);
+
+        // Defense-in-depth: every repository host-bind on the planning spec
+        // must be ReadOnly AND SnapshotForIsolation. The snapshot flag forces
+        // multipass (and any provider with no kernel-level RO option) to stage
+        // an isolated copy of the bare repo so a malicious plan agent that
+        // breaks out of the read-only mount can't follow symlinks back into
+        // the host tree. The writable workspace and credentials tmpfs are
+        // exempt — they are tmpfs mounts, not bare-repo binds. A regression
+        // that drops either flag from a repo mount silently weakens the
+        // planning-phase isolation contract.
+        var repoMounts = planningSpec.Mounts
+            .Where(m => !m.Tmpfs && m.HostPath is not null)
+            .ToList();
+        Assert.NotEmpty(repoMounts);
+        foreach (var mount in repoMounts)
+        {
+            Assert.True(mount.ReadOnly,
+                $"Planning mount at {mount.SandboxPath} must be ReadOnly=true.");
+            Assert.True(mount.SnapshotForIsolation,
+                $"Planning mount at {mount.SandboxPath} must be SnapshotForIsolation=true.");
+        }
+    }
+
+    [Fact]
+    public async Task PlanOn_ExtractorReturnsNull_FallsBackToRawStdoutAndPersistsPlan()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // AlwaysReturnNullFromExtractor forces NormalizePlanArtifact down the
+        // null-return fallback branch that every non-Claude runner relies on.
+        // Plain JSON stdout is delivered as-is; the parser still accepts it.
+        var agent = new PlanningAwareAgent
+        {
+            StreamPlanningOutput = false,
+            AlwaysReturnNullFromExtractor = true,
+        };
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/null-extractor-fallback") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(1, agent.WorkCalls);
+
+        // Confirm the fallback branch — not the extractor's parsed output — fed
+        // the plan into NormalizeRaw. Every extractor invocation returned null,
+        // proving the orchestrator routed the raw stdout straight to
+        // PlanArtifactDocument when the runner-provided extractor declined.
+        Assert.True(agent.ExtractorInvocations > 0,
+            "Extractor must have been invoked at least once by the orchestrator.");
+        Assert.Equal(agent.ExtractorInvocations, agent.LastExtractorNullReturns);
     }
 
     [Fact]
@@ -892,6 +1003,78 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
+    public void ApprovedPlanSnapshotMatches_RejectsMismatchedPlanStateFields()
+    {
+        // TryEnterWorkFromApprovedPlanAsync uses ApprovedPlanSnapshotMatches
+        // as its race-detection guard. The existing PlanOn_PromptEditAfter
+        // PlanApproval_StopsBeforeImplementation test exercises the
+        // prompt-revision-bump branch (because TryReplacePromptAsync clears
+        // plan_* alongside bumping the revision). This direct unit test
+        // pins the broader snapshot contract: ANY of the six fields
+        // (State, PromptRevision, PlanReviewedAt, PlanGeneratedAt,
+        // PlanArtifact, PlanReviewSummary) changing INDEPENDENTLY drives
+        // the match check to false. The static helper is private, so the
+        // test invokes it via reflection through the
+        // [InternalsVisibleTo("CodeyBox.Tests")] surface.
+        var generatedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var reviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var planArtifact = """
+            {
+              "approach": "original plan",
+              "files": ["output.txt"],
+              "testStrategy": ["run"],
+              "risks": ["none"],
+              "satisfiesTask": "yes"
+            }
+            """;
+        var approved = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.PlanApproved,
+            PromptRevision = 1,
+            PlanArtifact = planArtifact,
+            PlanGeneratedAt = generatedAt,
+            PlanReviewedAt = reviewedAt,
+            PlanReviewSummary = "approved",
+        };
+
+        var method = typeof(PipelineRunner).GetMethod(
+            "ApprovedPlanSnapshotMatches",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        bool Match(WorkItem current, WorkItem snap)
+            => (bool)method!.Invoke(null, [current, snap])!;
+
+        // Identical snapshots match.
+        Assert.True(Match(approved, approved));
+
+        // State change → mismatch (Working / Failed / Queued etc.).
+        Assert.False(Match(approved with { State = WorkItemState.Working }, approved));
+        Assert.False(Match(approved with { State = WorkItemState.Queued }, approved));
+
+        // PromptRevision bump → mismatch.
+        Assert.False(Match(approved with { PromptRevision = 2 }, approved));
+
+        // PlanArtifact text mutated → mismatch (the audit's specific race
+        // scenario: a concurrent writer swaps the plan body without
+        // touching the prompt).
+        Assert.False(Match(approved with { PlanArtifact = planArtifact + " " }, approved));
+        Assert.False(Match(approved with { PlanArtifact = null }, approved));
+
+        // PlanReviewSummary mutated → mismatch.
+        Assert.False(Match(approved with { PlanReviewSummary = "tampered" }, approved));
+        Assert.False(Match(approved with { PlanReviewSummary = null }, approved));
+
+        // Plan timestamps drift → mismatch.
+        Assert.False(Match(approved with { PlanGeneratedAt = generatedAt.AddSeconds(1) }, approved));
+        Assert.False(Match(approved with { PlanReviewedAt = reviewedAt.AddSeconds(1) }, approved));
+    }
+
+    [Fact]
     public async Task PlanReviewWithoutArtifact_FailsBeforeImplementation()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -986,7 +1169,9 @@ public sealed class PlanningPipelineTests : IDisposable
         AgentPromptPreprocessorChain? promptPreprocessors = null,
         ICredentialProvider? credentials = null,
         ISandboxProvider? sandboxProvider = null,
-        PipelineOptions? pipelineOptions = null)
+        PipelineOptions? pipelineOptions = null,
+        bool omitKnobRegistry = false,
+        ILogger<PipelineRunner>? pipelineLogger = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1018,11 +1203,11 @@ public sealed class PlanningPipelineTests : IDisposable
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
             pipelineOptions ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance,
+            pipelineLogger ?? NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
-            knobRegistry: new KnobRegistry([new PlanKnob()]),
+            knobRegistry: omitKnobRegistry ? null : new KnobRegistry([new PlanKnob()]),
             quotaClassifier: quotaClassifier,
             retryScheduler: retryScheduler,
             agentPauseController: agentPauseController,
@@ -1058,10 +1243,34 @@ internal sealed class PlanningPipelineSetup(
     public void Dispose() => Store.Dispose();
 }
 
+
 internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentRunner, IPlanArtifactExtractor
 {
+    /// <summary>
+    /// When true, the extractor unconditionally returns null regardless of
+    /// stdout shape. Used to drive PipelineRunner.NormalizePlanArtifact's
+    /// fallback-to-raw branch under test (the production trigger for null is
+    /// "no stream envelope observed", which is also how every non-Claude
+    /// runner's stdout shape arrives).
+    /// </summary>
+    public bool AlwaysReturnNullFromExtractor { get; init; }
+
+    public int ExtractorInvocations { get; private set; }
+    public int LastExtractorNullReturns { get; private set; }
+
     public string? ExtractPlanArtifactText(string rawStdout)
-        => ClaudePlanArtifactExtractor.Extract(rawStdout);
+    {
+        ExtractorInvocations++;
+        if (AlwaysReturnNullFromExtractor)
+        {
+            LastExtractorNullReturns++;
+            return null;
+        }
+        var extracted = ClaudePlanArtifactExtractor.Extract(rawStdout);
+        if (extracted is null)
+            LastExtractorNullReturns++;
+        return extracted;
+    }
 
     private const string DefaultPlan = """
         {

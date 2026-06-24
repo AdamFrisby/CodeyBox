@@ -244,6 +244,73 @@ public sealed class ClaudeSessionLifecycleTests
     }
 
     [Fact]
+    public async Task PlanningTurn_AfterSuspendedSessionDegradesOnResume_ThrowsForPipelineCatch()
+    {
+        // PipelineRunner.RunSessionPlanningAgentTurnAsync's catch block (the
+        // one that clears the ambient session lifecycle and recursively
+        // re-enters the non-session planning code path) is triggered by an
+        // AgentSessionDegradedException thrown from
+        // planningSessionLifecycle.GetSandboxAsync(...). This test exercises
+        // the source-of-throw the planning catch handles: first turn runs,
+        // session suspends, next GetSandboxAsync resumes and sees the
+        // worker's fallback-to-one-shot metadata, throws the exception, and
+        // closes the lifecycle so the recursive non-session path the pipeline
+        // catch hands control to is forced to allocate a fresh sandbox.
+        var worker = new FakeSessionRunner(disposeSandboxOnClose: true)
+        {
+            MarkFallbackOnResume = true,
+        };
+        var sandbox = new RecordingSandbox("planning-degrade-vm");
+        worker.SandboxToDisposeOnClose = sandbox;
+
+        AgentSessionHandle Snapshot(AgentSessionHandle h)
+        {
+            if (!worker.FallbackMarked)
+                return h;
+            var metadata = h.Metadata is null
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : new Dictionary<string, string>(h.Metadata, StringComparer.Ordinal);
+            metadata[AgentSessionMetadataKeys.FallbackToOneShot] = "true";
+            return h with { Metadata = metadata };
+        }
+
+        var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
+            worker,
+            handleSnapshot: Snapshot,
+            sandbox,
+            workingDirectory: "/work",
+            credential: null,
+            modelId: null,
+            reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value,
+            projectId: null,
+            agentClassMember: null,
+            ct: CancellationToken.None);
+
+        // First planning turn — fresh lifecycle, no resume needed.
+        var planningSandbox = await lifecycle.GetSandboxAsync(CancellationToken.None);
+        Assert.Same(sandbox, planningSandbox);
+        await lifecycle.SendTurnAsync("planning-only phase", CancellationToken.None, stdoutChunkCallback: null);
+
+        // Pipeline normally suspends between phase boundaries — model that
+        // here so the next GetSandboxAsync triggers a Resume cycle.
+        await lifecycle.SuspendAsync(CancellationToken.None);
+
+        // PipelineRunner.RunSessionPlanningAgentTurnAsync's GetSandboxAsync
+        // call sees the worker's fallback metadata after resume and throws.
+        // The pipeline catch is structurally identical to the work-phase
+        // fallback catch at PipelineRunner.cs:4083: clear AsyncLocal,
+        // recursively re-enter the non-session code path with a fresh sandbox.
+        await Assert.ThrowsAsync<AgentSessionDegradedException>(() =>
+            lifecycle.GetSandboxAsync(CancellationToken.None));
+
+        // Lifecycle self-closes on the throw so the pipeline's recursive
+        // non-session call cannot accidentally re-use the dead VM.
+        Assert.True(lifecycle.IsClosed);
+        Assert.True(sandbox.Disposed);
+    }
+
+    [Fact]
     public async Task GetSandboxAsync_WhenResumeMarksFallback_ClosesAndRequiresFreshSandbox()
     {
         var worker = new FakeSessionRunner(disposeSandboxOnClose: true)

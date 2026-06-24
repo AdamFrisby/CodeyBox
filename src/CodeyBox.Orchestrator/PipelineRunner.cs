@@ -1169,9 +1169,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         var updatedAt = DateTimeOffset.UtcNow;
-        var reviewed = current with
+        var reviewed = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+            current.With(WorkItemState.PlanApproved),
+            current.State,
+            WorkItemState.PlanApproved) with
         {
-            State = WorkItemState.PlanApproved,
             PlanReviewedAt = updatedAt,
             PlanReviewSummary = decision.Summary,
             UpdatedAt = updatedAt,

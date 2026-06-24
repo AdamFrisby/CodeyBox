@@ -2154,63 +2154,52 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // agent and deferring. When ResolveAsync returns Chosen != null
             // it has already test-and-reserved the chosen member's slot via
             // the gate; the outer finally releases on every exit path.
-            var shouldResolveAgentClassAtPickup = ShouldResolveAgentClassAtPickup(item);
-            var shouldGateDirectWorkAgentAtPickup = ShouldGateDirectWorkAgentAtPickup(item);
-            if (_router is not null && !isAgentControlItem && shouldResolveAgentClassAtPickup)
+            if (_router is not null && !isAgentControlItem && ShouldResolveAgentClassAtPickup(item))
             {
                 var decision = await _router.ResolveAsync(item, project, ct, slotGate: this);
                 if (decision.ShouldWait)
                 {
-                    if (decision.WaitingForPausedAgent && !shouldGateDirectWorkAgentAtPickup)
+                    if (decision.WaitingForPausedAgent)
                     {
-                        _log.LogInformation(
-                            "Work item {Id}: paused class-routing verdict deferred to pipeline phase handling for state {State}",
-                            item.Id, item.State);
-                    }
-                    else
-                    {
-                        if (decision.WaitingForPausedAgent)
-                        {
-                            ClearPreStartRefactorDrainClaim(item);
-                            await ParkForAgentResumeAsync(
-                                item,
-                                decision.Reason,
-                                decision.PausedAgents.Count == 1 ? decision.PausedAgents[0] : null,
-                                ct,
-                                AgentPauseResumeMapper.RetryFromForState(item.State));
-                            return;
-                        }
-
-                        // Honour the router's suggested delay verbatim — when a
-                        // quota-passing member was at cap, the router has already
-                        // picked the short cap-retry interval; pure quota stalls
-                        // use the longer QuotaRecheckInterval. AnyMemberAtCap only
-                        // drives the per-agent ConcurrencyGated audit emission.
-                        var deferDelay = decision.SuggestedRecheckIn;
-                        if (decision.AnyMemberAtCap)
-                        {
-                            if (decision.AtCapMembers.Count > 0)
-                            {
-                                foreach (var atCapMember in decision.AtCapMembers)
-                                {
-                                    AuditLog.ConcurrencyGated(item.Id, atCapMember.Agent,
-                                        GetRunning(atCapMember), GetAgentCap(atCapMember));
-                                }
-                            }
-                            else
-                            {
-                                foreach (var atCapAgent in decision.AtCapAgents)
-                                {
-                                    AuditLog.ConcurrencyGated(item.Id, atCapAgent,
-                                        GetRunning(atCapAgent), GetAgentCap(atCapAgent));
-                                }
-                            }
-                        }
-                        AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
                         ClearPreStartRefactorDrainClaim(item);
-                        ScheduleDeferredRequeue(item.Id, deferDelay, ct);
+                        await ParkForAgentResumeAsync(
+                            item,
+                            decision.Reason,
+                            decision.PausedAgents.Count == 1 ? decision.PausedAgents[0] : null,
+                            ct,
+                            AgentPauseResumeMapper.RetryFromForState(item.State));
                         return;
                     }
+
+                    // Honour the router's suggested delay verbatim — when a
+                    // quota-passing member was at cap, the router has already
+                    // picked the short cap-retry interval; pure quota stalls
+                    // use the longer QuotaRecheckInterval. AnyMemberAtCap only
+                    // drives the per-agent ConcurrencyGated audit emission.
+                    var deferDelay = decision.SuggestedRecheckIn;
+                    if (decision.AnyMemberAtCap)
+                    {
+                        if (decision.AtCapMembers.Count > 0)
+                        {
+                            foreach (var atCapMember in decision.AtCapMembers)
+                            {
+                                AuditLog.ConcurrencyGated(item.Id, atCapMember.Agent,
+                                    GetRunning(atCapMember), GetAgentCap(atCapMember));
+                            }
+                        }
+                        else
+                        {
+                            foreach (var atCapAgent in decision.AtCapAgents)
+                            {
+                                AuditLog.ConcurrencyGated(item.Id, atCapAgent,
+                                    GetRunning(atCapAgent), GetAgentCap(atCapAgent));
+                            }
+                        }
+                    }
+                    AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
+                    ClearPreStartRefactorDrainClaim(item);
+                    ScheduleDeferredRequeue(item.Id, deferDelay, ct);
+                    return;
                 }
                 if (decision.Chosen is { } chosen)
                 {
@@ -2250,8 +2239,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // released in the outer finally.
             if (!agentSlotReserved && !isAgentControlItem)
             {
+                var gateDirectWorkAgent = ShouldResolveAgentClassAtPickup(item);
                 var effectiveDirectAgent = item.Agent ?? project?.DefaultAgent;
-                var directAvailability = shouldGateDirectWorkAgentAtPickup && effectiveDirectAgent is { } directAgent
+                var directAvailability = gateDirectWorkAgent && effectiveDirectAgent is { } directAgent
                     ? _dispatchAvailability?.GetAvailability(new AgentMembership
                     {
                         Agent = directAgent,
@@ -2274,7 +2264,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     return;
                 }
 
-                if (shouldGateDirectWorkAgentAtPickup && item.Agent is { } routedAgent)
+                if (gateDirectWorkAgent && item.Agent is { } routedAgent)
                 {
                     var routeKey = ResolveDirectRouteKey(routedAgent, item.AgentInstanceId);
                     var cap = GetAgentCapForRoute(routedAgent, routeKey);
@@ -2572,14 +2562,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item) =>
-        item.State is WorkItemState.Queued
-            or WorkItemState.Planning
-            or WorkItemState.PlanReview
-            or WorkItemState.PlanApproved
-            or WorkItemState.Reworking
-            or WorkItemState.ReworkingForConflict;
-
-    private static bool ShouldGateDirectWorkAgentAtPickup(WorkItem item) =>
         item.State is WorkItemState.Queued
             or WorkItemState.Planning
             or WorkItemState.PlanReview
