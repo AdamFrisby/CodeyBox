@@ -162,6 +162,42 @@ public static class OrchestratorOptionsFactory
         };
     }
 
+    public static AgentRestoreRetryOptions BuildAgentRestoreRetryOptions(
+        bool enabled,
+        string lookbackGrace,
+        string postRestoreMargin,
+        int maxItemsPerRestore)
+    {
+        if (!enabled)
+            return new AgentRestoreRetryOptions { Enabled = false };
+
+        if (!TimeSpan.TryParse(lookbackGrace, out TimeSpan lookback))
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace must be a valid TimeSpan (e.g. '00:30:00')");
+        if (lookback < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace must be non-negative");
+
+        if (!TimeSpan.TryParse(postRestoreMargin, out TimeSpan margin))
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin must be a valid TimeSpan (e.g. '00:05:00')");
+        if (margin < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin must be non-negative");
+
+        if (maxItemsPerRestore <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:MaxItemsPerRestore must be positive");
+
+        return new AgentRestoreRetryOptions
+        {
+            Enabled = true,
+            LookbackGrace = lookback,
+            PostRestoreMargin = margin,
+            MaxItemsPerRestore = maxItemsPerRestore,
+        };
+    }
+
     public static AutoRetryOnQuotaFailureOptions BuildAutoRetryOptions(
         bool enabled,
         string periodicCheckInterval,

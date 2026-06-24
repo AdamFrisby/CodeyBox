@@ -3039,6 +3039,29 @@ builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetr
     sp.GetRequiredService<IAgentPauseSignal>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentPauseRetryScheduler>());
 
+// IAgentRestoreSignal is implemented by the same AgentAvailabilityRegistry
+// singleton — exposed here as the narrow port so the restore-retry scheduler
+// can subscribe without depending on the concrete registry type.
+builder.Services.AddSingleton<IAgentRestoreSignal>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<AgentRestoreRetryScheduler>(sp => new AgentRestoreRetryScheduler(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    () =>
+    {
+        var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRequeueOnAgentRestore;
+        return OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
+            live.Enabled,
+            live.LookbackGrace,
+            live.PostRestoreMargin,
+            live.MaxItemsPerRestore);
+    },
+    sp.GetRequiredService<ILogger<AgentRestoreRetryScheduler>>(),
+    sp.GetRequiredService<IAgentRestoreSignal>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IProjectRepository>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentRestoreRetryScheduler>());
+
 // --- Failure-class recovery -------------------------------------------------
 // Pure deterministic classifier in front of the hosted recovery service.
 // Operators wire alternate classifiers (e.g. LLM-precision layer) by replacing
@@ -4639,6 +4662,14 @@ namespace CodeyBox.Api
         /// </summary>
         public TerminalFailureRecoveryConfig TerminalFailureRecovery { get; set; } = new();
 
+        /// <summary>
+        /// Auto-requeue policy for infra-failed work items on agent recovery —
+        /// see <see cref="AutoRequeueOnAgentRestoreConfig"/>. OFF by default;
+        /// enable after confirming the failure-class signal partitions cleanly
+        /// in your audit log.
+        /// </summary>
+        public AutoRequeueOnAgentRestoreConfig AutoRequeueOnAgentRestore { get; set; } = new();
+
         /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
@@ -4956,6 +4987,19 @@ namespace CodeyBox.Api
         public string MaxBackoff { get; set; } = "00:30:00";
         public double JitterFraction { get; set; } = 0.2;
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+    }
+
+    /// <summary>
+    /// Bound from <c>CodeyBox:AutoRequeueOnAgentRestore</c>. Hot-reloadable.
+    /// See <see cref="CodeyBox.Orchestrator.AgentRestoreRetryScheduler"/> for
+    /// runtime semantics.
+    /// </summary>
+    public sealed class AutoRequeueOnAgentRestoreConfig
+    {
+        public bool Enabled { get; set; } = false;
+        public string LookbackGrace { get; set; } = "00:30:00";
+        public string PostRestoreMargin { get; set; } = "00:05:00";
+        public int MaxItemsPerRestore { get; set; } = 200;
     }
 
     /// <summary>

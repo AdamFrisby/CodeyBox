@@ -930,6 +930,39 @@ public static class AuditLog
                 "Work item {WorkItemId} re-enqueued after agent pause change: source={Source} from={RetryFrom}",
                 id.ToString(), source, retryFrom);
 
+    /// <summary>
+    /// Emitted once per agent-restore sweep: the agent's availability
+    /// transitioned from excluded to routable and the sweep evaluated
+    /// candidate infra-failed work items. <paramref name="requeued"/> counts
+    /// items the sweep actually transitioned back to Queued; items skipped
+    /// for filter reasons (wrong agent, wrong failureKind, outside window,
+    /// concurrent state change) are reflected in <paramref name="skipped"/>.
+    /// </summary>
+    public static void AgentRestoreRequeueSwept(
+        AgentKind agent,
+        DateTimeOffset? outageStartedAt,
+        DateTimeOffset restoredAt,
+        int requeued,
+        int skipped) =>
+        Audit("agent.restore_requeue_swept")
+            .Information(
+                "Agent {Agent} restored at {RestoredAt}; infra-failure sweep requeued {Requeued} item(s), skipped {Skipped} (outageStartedAt={OutageStartedAt})",
+                agent.Value, restoredAt, requeued, skipped, outageStartedAt?.ToString("O") ?? "(unknown)");
+
+    /// <summary>
+    /// Emitted per work item the agent-restore sweep auto-requeues. Pairs
+    /// with <see cref="AgentRestoreRequeueSwept"/> for per-item traceability.
+    /// </summary>
+    public static void AgentRestoreRequeueItem(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        string? failureKind,
+        string actualFrom) =>
+        Audit("agent.restore_requeue_item")
+            .Information(
+                "Work item {WorkItemId} re-enqueued after {Agent} restore: failureKind={FailureKind} from={From}",
+                id.ToString(), restoredAgent.Value, failureKind ?? "(null)", actualFrom);
+
     // ── Suggestions ─────────────────────────────────────────────────────────
 
     public static void SuggestionDismissed(string suggestionId, string? reason) =>
