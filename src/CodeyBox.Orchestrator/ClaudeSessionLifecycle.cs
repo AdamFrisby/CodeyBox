@@ -137,6 +137,27 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
     public bool IsClosed => _closed;
 
     /// <summary>
+    /// True once the pipeline has fired a pre-emptive self-review turn
+    /// against this session (regardless of whether the turn produced new
+    /// commits). The audit-loop metric emitter reads this to tag
+    /// <see cref="CodeyBox.Core.CodeyBoxMeters.SessionAuditIterations"/>
+    /// and <see cref="CodeyBox.Core.CodeyBoxMeters.SessionFirstAuditOutcome"/>
+    /// with <c>self_review=on</c> for items that ran the extra turn,
+    /// <c>self_review=off</c> for items that did not (either feature off, or
+    /// no auditor contributed guidance). The audit itself never reads this
+    /// flag — it's a measurement-only marker.
+    /// </summary>
+    public bool PreemptiveSelfReviewRan { get; private set; }
+
+    /// <summary>
+    /// Marks this session as having run a pre-emptive self-review turn.
+    /// Called by <c>PipelineRunner</c> after the extra turn fires (whether
+    /// or not it produced new commits) so downstream metrics can compare
+    /// audit-iteration counts WITH vs WITHOUT the enhancement.
+    /// </summary>
+    public void MarkPreemptiveSelfReviewRan() => PreemptiveSelfReviewRan = true;
+
+    /// <summary>
     /// Opens the resumable session against a freshly-provisioned worker
     /// sandbox. The sandbox is owned by the returned lifecycle: callers
     /// must NOT separately dispose the sandbox — <see cref="DisposeAsync"/>

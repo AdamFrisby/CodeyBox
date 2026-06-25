@@ -25,4 +25,19 @@ public sealed class AgentSessionDispatchOptions
     /// <see cref="PipelineRunner.ShouldEnterClaudeSessionMode"/>.
     /// </summary>
     public bool Enabled { get; set; }
+
+    /// <summary>
+    /// Session-path enhancement: when <c>true</c> AND the session pipeline is
+    /// active for the item, the orchestrator injects ONE extra warm-session
+    /// turn after the initial work turn (before the formal audit) carrying
+    /// the composed self-review guidance derived from the project's active
+    /// auditors. The formal audit still runs independently in its own fresh
+    /// sandbox and owns the pass/fail decision.
+    ///
+    /// <para>Default <c>false</c> — until an operator flips this, session-
+    /// path items see no behaviour change. Has no effect on the legacy one-
+    /// shot path (which already gets the same guidance baked into its
+    /// initial work prompt).</para>
+    /// </summary>
+    public bool PreemptiveSelfReviewEnabled { get; set; }
 }

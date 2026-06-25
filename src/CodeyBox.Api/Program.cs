@@ -715,9 +715,17 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>
 builder.Services.AddSingleton<CodeyBox.Orchestrator.AgentSessionDispatchOptions>(sp =>
 {
     var workerOptions = sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>();
-    var dispatch = new CodeyBox.Orchestrator.AgentSessionDispatchOptions { Enabled = workerOptions.Enabled };
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
-    monitor.OnChange(opts => dispatch.Enabled = opts.ClaudeSession?.Enabled ?? false);
+    var dispatch = new CodeyBox.Orchestrator.AgentSessionDispatchOptions
+    {
+        Enabled = workerOptions.Enabled,
+        PreemptiveSelfReviewEnabled = monitor.CurrentValue.ClaudeSession?.PreemptiveSelfReview?.Enabled ?? false,
+    };
+    monitor.OnChange(opts =>
+    {
+        dispatch.Enabled = opts.ClaudeSession?.Enabled ?? false;
+        dispatch.PreemptiveSelfReviewEnabled = opts.ClaudeSession?.PreemptiveSelfReview?.Enabled ?? false;
+    });
     return dispatch;
 });
 // Default metrics sink is the no-op; operators wire a logging/metrics-backed
@@ -4191,6 +4199,27 @@ namespace CodeyBox.Api
         /// </summary>
         public Dictionary<string, string> TransportOverridesByProject { get; set; }
             = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Session-path enhancement: inject a single pre-emptive self-review
+        /// turn after the initial work turn (before the formal audit) using
+        /// the composed checklist from the project's auditors. Default off.
+        /// </summary>
+        public PreemptiveSelfReviewConfig PreemptiveSelfReview { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Sub-config block for <see cref="ClaudeSessionOptions.PreemptiveSelfReview"/>.
+    /// </summary>
+    public sealed class PreemptiveSelfReviewConfig
+    {
+        /// <summary>
+        /// Default <c>false</c>. When <c>true</c>, session-mode work items run
+        /// one extra warm-session turn after the initial work turn carrying
+        /// the auditor-derived self-review guidance. The formal audit remains
+        /// independent and owns the pass/fail decision.
+        /// </summary>
+        public bool Enabled { get; set; }
     }
 
     public sealed class AutoRetryOnQuotaFailureConfig

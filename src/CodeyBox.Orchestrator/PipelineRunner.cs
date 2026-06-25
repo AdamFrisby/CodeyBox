@@ -2035,7 +2035,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                         project: project,
                                         phaseCt,
                                         hostShutdownToken,
-                                        buildFailurePolicy: RequiredBuildPolicy.Terminal),
+                                        buildFailurePolicy: RequiredBuildPolicy.Terminal,
+                                        auditorsForPreemptiveSelfReview: auditors),
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: workPhase,
@@ -4014,7 +4015,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken,
         RequiredBuildPolicy buildFailurePolicy,
-        int? iteration = null)
+        int? iteration = null,
+        IReadOnlyList<IAuditor>? auditorsForPreemptiveSelfReview = null)
     {
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
         var selectedMemberForSession = TryResolveSelectedMember(runner.Kind, project, item);
@@ -4762,6 +4764,33 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
 
+            // Session-path enhancement (config-gated, default OFF): inject ONE
+            // pre-emptive self-review turn in the SAME warm session right after
+            // the initial work commit lands, BEFORE the formal audit fires in
+            // its own fresh sandbox. The turn uses the runtime-composed
+            // checklist from the project's active auditors. The auditor is
+            // intentionally NOT informed of this turn — pass/fail still belongs
+            // to the separate fresh-sandbox audit pipeline (item 3 of the
+            // session brief is non-negotiable on auditor isolation).
+            if (useClaudeSession
+                && isInitial
+                && !resumingPreempt
+                && _claudeSessionOptions.PreemptiveSelfReviewEnabled
+                && auditorsForPreemptiveSelfReview is not null
+                && auditorsForPreemptiveSelfReview.Count > 0)
+            {
+                await TryRunPreemptiveSelfReviewTurnAsync(
+                    sessionLifecycle!,
+                    sandbox,
+                    item,
+                    project,
+                    runner,
+                    branch,
+                    auditorsForPreemptiveSelfReview,
+                    promptRevisionAtDispatch,
+                    ct);
+            }
+
             phaseSucceeded = true;
             return agentResult.Stdout;
         }
@@ -4877,6 +4906,148 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 },
                 ct)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Pre-emptive self-review turn for the session pipeline. Fires ONE extra
+    /// warm-session turn after the initial work turn lands (cache-hot, near-
+    /// free) carrying the composer-built guidance derived from the project's
+    /// active auditors. Any edits the agent makes are staged and committed
+    /// on top of the work commit so the formal audit (which runs in its OWN
+    /// fresh sandbox) sees the fixed code without ever being shown the
+    /// self-review prompt or guidance. Failures here are SOFT — the work item
+    /// proceeds to audit regardless, because the formal audit + rework loop
+    /// still owns convergence.
+    /// </summary>
+    internal async Task TryRunPreemptiveSelfReviewTurnAsync(
+        ClaudeSessionLifecycle sessionLifecycle,
+        ISandbox sandbox,
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string branch,
+        IReadOnlyList<IAuditor> auditors,
+        int promptRevisionAtDispatch,
+        CancellationToken ct)
+    {
+        var guidance = SelfReviewChecklistComposer.Compose(auditors);
+        if (string.IsNullOrWhiteSpace(guidance))
+        {
+            CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                new KeyValuePair<string, object?>("outcome", "skipped_empty_guidance"));
+            return;
+        }
+
+        var selfReviewPrompt = BuildPreemptiveSelfReviewPrompt(guidance, promptRevisionAtDispatch);
+
+        AgentResult turnResult;
+        try
+        {
+            turnResult = await sessionLifecycle.SendTurnAsync(selfReviewPrompt, ct, stdoutChunkCallback: null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Pre-emptive self-review turn faulted for work item {Id} session {SessionId}; continuing to audit without it",
+                item.Id, sessionLifecycle.Handle.SessionId);
+            CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                new KeyValuePair<string, object?>("outcome", "failed"));
+            sessionLifecycle.MarkPreemptiveSelfReviewRan();
+            return;
+        }
+
+        // Mark that the turn fired regardless of commit outcome so the
+        // audit-iteration metric tags this item with self_review=on.
+        sessionLifecycle.MarkPreemptiveSelfReviewRan();
+
+        if (!turnResult.Success)
+        {
+            _log.LogInformation(
+                "Pre-emptive self-review turn for work item {Id} returned non-success; skipping commit and continuing to audit.",
+                item.Id);
+            CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                new KeyValuePair<string, object?>("outcome", "failed"));
+            return;
+        }
+
+        // Stage anything the self-review turn left dirty, mirroring the
+        // work-phase staging policy: strip suggestions.json so the audit
+        // branch never carries it.
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
+                ".codeybox/suggestions.json"],
+        }, ct);
+
+        var staged = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
+        }, ct);
+        var hasStagedDiff = staged.ExitCode != 0;
+
+        if (!hasStagedDiff)
+        {
+            // Self-review turn produced no edits — the work was already clean
+            // by the auditor's criteria. That's a successful outcome, not a
+            // failure: the formal audit still runs and judges independently.
+            CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                new KeyValuePair<string, object?>("outcome", "no_changes"));
+            return;
+        }
+
+        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
+        var trailerBlock = await ComposeCommitTrailerBlockAsync(
+            item.Id, runner.Kind, observedModelId, ct,
+            promptRevisionAtDispatch: promptRevisionAtDispatch);
+        var commitMessage = $"codeybox: pre-emptive self-review fixes\n\n{trailerBlock}";
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+
+        // Stamp the prompt-revision trailer on HEAD if the agent forgot,
+        // mirroring the work-phase commit hygiene so the
+        // process:prompt-revision-trailer auditor doesn't fire on the extra
+        // commit.
+        await EnsureHeadCarriesPromptRevisionTrailerAsync(
+            sandbox, item, runner.Kind, observedModelId,
+            promptRevisionAtDispatch, agentPhase: "self-review", ct);
+
+        await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
+
+        CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+            new KeyValuePair<string, object?>("outcome", "committed_changes"));
+    }
+
+    /// <summary>
+    /// Builds the prompt for the pre-emptive self-review turn. Composed from
+    /// the runtime guidance the active auditors contribute (cheating opted
+    /// out at the auditor source). Framed as "fix any GENUINE issues" so the
+    /// agent acts in good faith rather than maximising compliance — a
+    /// compliance-maximising prompt would invite tactical edits that the
+    /// independent auditor catches anyway.
+    /// </summary>
+    internal static string BuildPreemptiveSelfReviewPrompt(
+        string guidance,
+        int promptRevisionAtDispatch)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append(
+            "An independent auditor is about to review the changes you just committed in this session. ");
+        sb.Append(
+            "Before that review fires, take ONE pass over your own diff and fix any GENUINE issues you can see against the criteria below. ");
+        sb.Append(
+            "This is not a compliance exercise — the auditor catches tactical edits and rubber-stamping. ");
+        sb.Append(
+            "If your changes are already clean against these criteria, make no edits and exit; that is a perfectly valid outcome.");
+        sb.Append("\n\nReview criteria:\n\n");
+        sb.Append(guidance);
+        sb.Append("\n\n");
+        sb.Append(
+            $"If you make any edits, commit them on top of the current HEAD. The `{CodeyBoxTrailers.PromptRevisionTrailerKey}` trailer value for any commit you create MUST be the literal integer **{promptRevisionAtDispatch.ToString(System.Globalization.CultureInfo.InvariantCulture)}** (the same revision the prior work turn used). Do not run build / test commands; the orchestrator will run the formal audit gates in its own sandbox after this turn.");
+        return sb.ToString();
     }
 
     private static string PreemptRefFor(WorkItemId id) => $"refs/heads/codeybox/preempt/{id}";
@@ -7069,8 +7240,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     new KeyValuePair<string, object?>("outcome", "passed"),
                     selfReviewTag,
                     iterationTag);
+                EmitSessionAuditOutcomeMetrics(iteration, "passed");
+                if (iteration == 1)
+                    EmitSessionFirstAuditOutcomeMetric("passed");
                 return false;
             }
+            if (iteration == 1)
+                EmitSessionFirstAuditOutcomeMetric("failed");
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
                 iteration, maxIterations, blocking.Count, item.Id);
@@ -7083,6 +7259,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         new KeyValuePair<string, object?>("outcome", "needs_operator_input"),
                         selfReviewTag,
                         iterationTag);
+                    EmitSessionAuditOutcomeMetrics(iteration, "needs_operator_input");
                     await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
                     return true;
                 }
@@ -7091,6 +7268,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     new KeyValuePair<string, object?>("outcome", "failed"),
                     selfReviewTag,
                     iterationTag);
+                EmitSessionAuditOutcomeMetrics(iteration, "failed");
                 AuditLog.AuditFailed(iteration, blocking.Count);
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
@@ -7126,6 +7304,58 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (parked) return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Emits the session-mode audit-iteration histogram with the
+    /// <c>self_review</c> tag derived from the live ambient lifecycle.
+    /// Skipped when no session lifecycle is active so the metric records
+    /// session items only — that's exactly the comparison the brief asks for
+    /// (audit-iteration count for session items WITH vs WITHOUT the
+    /// pre-emptive self-review turn). Failure to read the flag is silent;
+    /// metrics must never break the pipeline.
+    /// </summary>
+    private void EmitSessionAuditOutcomeMetrics(int iteration, string outcome)
+    {
+        var lifecycle = _ambientSessionLifecycle.Value;
+        if (lifecycle is null)
+            return;
+        try
+        {
+            var selfReviewTag = lifecycle.PreemptiveSelfReviewRan ? "on" : "off";
+            CodeyBoxMeters.SessionAuditIterations.Record(iteration,
+                new KeyValuePair<string, object?>("self_review", selfReviewTag),
+                new KeyValuePair<string, object?>("outcome", outcome));
+        }
+        catch
+        {
+            // Observability must never break a pipeline step.
+        }
+    }
+
+    /// <summary>
+    /// Emits the session-mode first-audit-outcome counter with the
+    /// <c>self_review</c> tag. Called once per session item (only at
+    /// iteration == 1) so dashboards can chart first-audit pass-rate WITH vs
+    /// WITHOUT the pre-emptive self-review turn — the primary measurement
+    /// the brief asks for.
+    /// </summary>
+    private void EmitSessionFirstAuditOutcomeMetric(string outcome)
+    {
+        var lifecycle = _ambientSessionLifecycle.Value;
+        if (lifecycle is null)
+            return;
+        try
+        {
+            var selfReviewTag = lifecycle.PreemptiveSelfReviewRan ? "on" : "off";
+            CodeyBoxMeters.SessionFirstAuditOutcome.Add(1,
+                new KeyValuePair<string, object?>("self_review", selfReviewTag),
+                new KeyValuePair<string, object?>("outcome", outcome));
+        }
+        catch
+        {
+            // Observability must never break a pipeline step.
+        }
     }
 
     // RunMechanicalFixersAsync and its helpers (MakeReadOnlyRepositoryMount,
