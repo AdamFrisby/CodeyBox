@@ -602,7 +602,15 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CodexAgentRunner(
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
-builder.Services.AddSingleton<IAgentRunner, AntigravityAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
+{
+    // agy's built-in --print-timeout default (5m) aborts a one-shot session with
+    // "timed out waiting for response" and zero changes the first time a single
+    // gemini turn on a large work item exceeds it. Override with a generous,
+    // operator-tunable budget. CodeyBox:Antigravity:PrintTimeoutMinutes (default 20).
+    PrintTimeout = TimeSpan.FromMinutes(
+        builder.Configuration.GetValue<int?>("CodeyBox:Antigravity:PrintTimeoutMinutes") ?? 20),
+});
 // Crock: scaffolded and registered, but DISABLED in shipped agent-class config.
 // Operators opt in by adding `crock` to an AgentClass member list once the
 // dependent follow-up (cost/usage accounting, watchdog accommodation,
