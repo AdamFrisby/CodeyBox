@@ -32,6 +32,18 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     public string Binary { get; init; } = DefaultBinary;
 
     /// <summary>
+    /// Per-model-response wait passed to agy as <c>--print-timeout</c>. agy's
+    /// built-in default is 5m: the first time a single gemini turn on a large
+    /// CodeyBox work item exceeds it, agy aborts the entire one-shot session
+    /// with <c>Error: timed out waiting for response</c> and ZERO committed
+    /// changes — which then trips the no-changes circuit breaker. A generous
+    /// budget lets a slow large-context turn complete. Configurable via
+    /// <c>CodeyBox:Antigravity:PrintTimeoutMinutes</c>; <see cref="TimeSpan.Zero"/>
+    /// leaves agy's own default in place.
+    /// </summary>
+    public TimeSpan PrintTimeout { get; init; } = TimeSpan.FromMinutes(20);
+
+    /// <summary>
     /// Probes <c>agy --help</c> for structured-stream support. The agy CLI is
     /// shape-compatible with Claude Code (see <see cref="AntigravityCostExtractor"/>'s
     /// comment about the terminal <c>type:result</c> NDJSON envelope), so when
@@ -153,6 +165,17 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // that auto-approves tool calls. The sandbox boundary is the real
         // permission boundary — same shape we use for Claude.
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+
+        // Override agy's 5m default --print-timeout (the per-response wait). On a
+        // large work item a single gemini turn can exceed 5m; agy then aborts the
+        // whole session with "timed out waiting for response" and no committed
+        // changes, tripping the no-changes circuit breaker. A generous budget
+        // (Go duration syntax, e.g. "1200s") gives slow turns room to complete.
+        if (PrintTimeout > TimeSpan.Zero)
+        {
+            argv.Add("--print-timeout");
+            argv.Add($"{(long)PrintTimeout.TotalSeconds}s");
+        }
 
         if (!string.IsNullOrWhiteSpace(resumeConversationId))
         {
