@@ -4857,10 +4857,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // retried doesn't advance the counter.
                 await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
 
-                var msg = isInitial
-                    ? "Agent produced no changes to commit"
-                    : "Rework agent produced no changes; cannot resolve audit findings";
-                throw new InvalidOperationException(msg);
+                if (isInitial)
+                {
+                    // Initial work phase stays fail-fast: there is no audit /
+                    // rework loop sitting behind it to converge a "declined to
+                    // work" outcome. Same shape as before this change.
+                    throw new InvalidOperationException("Agent produced no changes to commit");
+                }
+
+                // Rework phase: surface the empty-diff outcome via a typed
+                // exception the audit/rework loop catches. The loop applies
+                // converge-aware handling (escalation re-dispatch, then park,
+                // and only terminal when there is no budget AND no convergence
+                // progress) instead of unconditionally terminal-failing the
+                // item on the FIRST empty pass.
+                throw new ReworkProducedNoChangesException(
+                    runner.Kind,
+                    agentStdout: agentResult.Stdout,
+                    agentStderr: agentResult.Stderr,
+                    message: "Rework agent produced no changes; cannot resolve audit findings");
             }
 
             // HEAD advanced: this run produced real changes. Clear the
@@ -7591,7 +7606,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var reworkIterationNumber = iteration + 1;
             var parked = await RunAuditReworkAsync(
                 item, project, runner, repoId, baseBranch, workBranch,
-                findings, iteration, reworkIterationNumber, maxIterations, ct, hostShutdownToken);
+                findings, iteration, reworkIterationNumber, maxIterations,
+                auditHistory, ct, hostShutdownToken);
             if (parked) return true;
         }
         return false;
@@ -7719,7 +7735,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
         return await RunAuditReworkAsync(
             item, project, runner, repoId, baseBranch, workBranch,
-            findings, last.Iteration, startIteration, maxIterations, ct, hostShutdownToken);
+            findings, last.Iteration, startIteration, maxIterations,
+            auditHistory, ct, hostShutdownToken);
     }
 
     private async Task<bool> HasCompletedAuditReworkAsync(
@@ -7778,6 +7795,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         int auditIteration,
         int reworkIterationNumber,
         int maxIterations,
+        IReadOnlyList<AuditProgressSnapshot> auditHistory,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -7803,20 +7821,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
             ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
             : (IReadOnlyList<WorkItemQuestion>)[];
-        var reworkPrompt = ReworkPromptBuilder.Build(
+        var baseReworkPrompt = ReworkPromptBuilder.Build(
             freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
         using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
         reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
         reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
-        string? reworkStdout;
-        try
+
+        async Task<string?> DispatchAsync(string prompt)
         {
-            reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
+            return await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
                 async (workerRunner, trialItem, attemptCt) =>
                     await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
                         phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
-                            reworkPrompt, isInitial: false,
+                            prompt, isInitial: false,
                             networkProfile: sandboxTarget.NetworkProfile,
                             sandboxFlavor: sandboxTarget.Flavor,
                             project: project,
@@ -7833,9 +7851,36 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 phaseCancellation: reworkPhase,
                 attemptTimeout: item.WorkTimeout);
         }
+
+        string? reworkStdout;
+        try
+        {
+            reworkStdout = await DispatchAsync(baseReworkPrompt);
+        }
         catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
         {
             throw reworkPhase.Wrap(oce);
+        }
+        catch (ReworkProducedNoChangesException emptyEx)
+        {
+            // The agent finished cleanly without committing any change AND no
+            // infra (auth / quota) signature was matched on its output — those
+            // would have thrown TerminalQuotaError / AgentAuthRequiredException
+            // before reaching here, which the availability breaker handles by
+            // benching the agent and re-routing the item.
+            //
+            // Apply converge-aware item-level handling: if the audit history
+            // shows convergence, re-dispatch with an escalated instruction so a
+            // single empty pass on a converging item does not discard the
+            // remaining iteration budget. If retries are still empty, fall back
+            // to ParkAuditMaxIterationsForOperatorAsync (operator picks up the
+            // partially-converged item) rather than terminal-failing it. Only
+            // hard-fail when both budget AND convergence are absent — that path
+            // is handled by the audit-loop ceiling branch.
+            var parked = await HandleEmptyReworkAsync(
+                item, project, emptyEx, auditHistory, reworkIterationNumber, maxIterations,
+                baseReworkPrompt, DispatchAsync, reworkStart, repoId, workBranch, ct);
+            return parked;
         }
 
         await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
@@ -7854,14 +7899,165 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return false;
     }
 
+    /// <summary>
+    /// Item-level resilience for an empty rework (no commit, no infra signature).
+    /// Re-dispatches with an escalated instruction up to
+    /// <c>PipelineTuning.EmptyReworkEscalationRetries</c> times when the audit
+    /// history shows convergence progress; otherwise (or when retries exhaust)
+    /// parks the item via the same operator-input flow the audit-iteration
+    /// ceiling uses, so a partially-converged item is preserved instead of
+    /// being terminal-failed on a single declined pass.
+    /// </summary>
+    /// <remarks>
+    /// Hard terminal-fail for genuinely-empty rework is left to the audit-loop
+    /// ceiling branch (no budget AND no convergence). Inside this helper we
+    /// always still have audit budget (RunAuditReworkAsync is only invoked
+    /// below the ceiling), so the worst case is "park" — never a fresh
+    /// AuditFailedException for the empty-rework case.
+    /// </remarks>
+    private async Task<bool> HandleEmptyReworkAsync(
+        WorkItem item,
+        Project project,
+        ReworkProducedNoChangesException emptyEx,
+        IReadOnlyList<AuditProgressSnapshot> auditHistory,
+        int reworkIterationNumber,
+        int maxIterations,
+        string baseReworkPrompt,
+        Func<string, Task<string?>> dispatchAsync,
+        DateTimeOffset reworkStart,
+        string repoId,
+        string workBranch,
+        CancellationToken ct)
+    {
+        var converging = HasAuditConvergenceProgress(auditHistory);
+        var configuredRetries = Math.Max(0, _pipelineTuning.Current.EmptyReworkEscalationRetries);
+        var attempts = converging ? configuredRetries : 0;
+
+        _log.LogWarning(
+            "Work item {Id} rework iteration {Iter} produced no changes (agent {Agent}); " +
+            "converging={Converging}, configured escalation retries={Retries}",
+            item.Id, reworkIterationNumber, emptyEx.Agent.Value, converging, attempts);
+        CodeyBoxMeters.AuditIterations.Add(1,
+            new KeyValuePair<string, object?>("outcome", "rework_empty_detected"));
+
+        string? lastStdout = null;
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            if (ct.IsCancellationRequested)
+                break;
+
+            var escalatedPrompt = BuildEmptyReworkEscalationPrompt(
+                originalPrompt: baseReworkPrompt,
+                attempt: attempt,
+                totalAttempts: attempts);
+            _log.LogInformation(
+                "Re-dispatching empty rework iteration {Iter} for work item {Id} with escalation attempt {Attempt}/{Total}",
+                reworkIterationNumber, item.Id, attempt, attempts);
+            try
+            {
+                lastStdout = await dispatchAsync(escalatedPrompt);
+                CodeyBoxMeters.AuditIterations.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "rework_empty_escalation_succeeded"));
+                // The escalation pass committed changes; resume the normal
+                // post-rework bookkeeping the catch-free path would have run.
+                await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
+                    repoId, workBranch, reworkStart, ct);
+                await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+                    item.Id,
+                    RecoveryProgressEvent.AuditReworkCompleted,
+                    "audit-rework-completed",
+                    ct);
+                if (project.AllowAgentQuestions && _questionStore is not null && lastStdout is not null)
+                {
+                    var parked = await TryParkForQuestionsAsync(item, project, lastStdout, ct);
+                    if (parked) return true;
+                }
+                return false;
+            }
+            catch (ReworkProducedNoChangesException)
+            {
+                // Still empty — try the next escalation, or fall through to
+                // park when the retry budget is exhausted.
+                continue;
+            }
+        }
+
+        // Either we never had convergence, escalation retries are disabled, or
+        // every escalation pass came back empty. Park for operator review using
+        // the same flow the audit ceiling uses when the run still shows
+        // convergence — both are "in-budget but the agent won't make progress
+        // unaided." Auditors and operators can resume the item with a clearer
+        // prompt or merge by hand.
+        CodeyBoxMeters.AuditIterations.Add(1,
+            new KeyValuePair<string, object?>("outcome", "rework_empty_parked"));
+        var parkHistory = auditHistory.Count > 0
+            ? auditHistory
+            : BuildSyntheticEmptyReworkHistory(reworkIterationNumber, maxIterations);
+        var parkMessage =
+            $"Rework agent {emptyEx.Agent.Value} produced no changes for audit iteration {reworkIterationNumber} " +
+            $"(converging={converging}, escalation retries attempted={attempts}); " +
+            "no infra (auth / quota) signature was matched on the agent output. " +
+            "Parked for operator review instead of terminal-failing the work item — operator can re-prompt " +
+            "or merge by hand.";
+        await ParkAuditMaxIterationsForOperatorAsync(
+            item, project, parkHistory, ct,
+            messageOverride: parkMessage,
+            auditLogReasonOverride: "rework produced no changes");
+        return true;
+    }
+
+    private static string BuildEmptyReworkEscalationPrompt(
+        string originalPrompt,
+        int attempt,
+        int totalAttempts)
+    {
+        var header = $"""
+            [empty-rework escalation attempt {attempt}/{totalAttempts}]
+            Your previous pass committed NO changes. You MUST modify files to
+            address the listed audit findings, OR for each finding state
+            precisely why it is invalid / already-satisfied in your output so
+            the operator can re-classify it. Returning again with no commit
+            AND no per-finding justification will park this work item for
+            operator review.
+
+            """;
+        return string.IsNullOrEmpty(originalPrompt) ? header : header + originalPrompt;
+    }
+
+    /// <summary>
+    /// Build a single-snapshot synthetic history covering the empty-rework
+    /// iteration, used when the persisted history is empty (legacy data or
+    /// resume from parked state with no prior snapshots). Ensures the park
+    /// flow has a non-empty record to attribute the escalation to.
+    /// </summary>
+    private static IReadOnlyList<AuditProgressSnapshot> BuildSyntheticEmptyReworkHistory(
+        int reworkIterationNumber,
+        int maxIterations)
+    {
+        return [new AuditProgressSnapshot(
+            Math.Max(1, reworkIterationNumber - 1),
+            maxIterations,
+            BlockingFindings: 0,
+            NonBlockingFindings: 0,
+            BlockingFindingIds: [],
+            BlockingFindingsDetails: [],
+            Findings: [],
+            WorkBranchTip: null,
+            Status: AuditProgressStatuses.Incomplete,
+            ScheduledAuditors: null,
+            CompletedAuditors: null)];
+    }
+
     private async Task ParkAuditMaxIterationsForOperatorAsync(
         WorkItem item,
         Project project,
         IReadOnlyList<AuditProgressSnapshot> history,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? messageOverride = null,
+        string? auditLogReasonOverride = null)
     {
         var last = history[^1];
-        var message = BuildAuditMaxIterationEscalationMessage(history);
+        var message = messageOverride ?? BuildAuditMaxIterationEscalationMessage(history);
         var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
 
         await RunBoundedPostAgentAsync(item.Id, "audit-max-iterations-escalate", ct, async transitionCt =>
@@ -7878,9 +8074,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
 
             _log.LogWarning(
-                "Work item {Id} reached audit iteration ceiling {Iteration}/{MaxIterations} while still showing progress; parked for operator review",
-                item.Id, last.Iteration, last.MaxIterations);
-            AuditLog.WorkItemTransitioned(item.Id, "NeedsOperatorInput (audit max iterations with progress)");
+                "Work item {Id} parked at iteration {Iteration}/{MaxIterations} for operator review: {Reason}",
+                item.Id, last.Iteration, last.MaxIterations,
+                auditLogReasonOverride ?? "audit max iterations with progress");
+            AuditLog.WorkItemTransitioned(
+                item.Id,
+                $"NeedsOperatorInput ({auditLogReasonOverride ?? "audit max iterations with progress"})");
             CodeyBoxMeters.PipelineTransitions.Add(1,
                 new KeyValuePair<string, object?>("to_state", WorkItemState.NeedsOperatorInput.ToString()));
 

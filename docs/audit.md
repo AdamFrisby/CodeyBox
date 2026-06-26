@@ -317,23 +317,97 @@ Findings are grouped by auditor, sorted within a group with errors first
 then warnings, then info. The original prompt is appended at the end so
 the agent has full context.
 
-## Rework no-changes guard
+## Rework no-changes disambiguation
 
-If the rework agent commits nothing new, the pipeline fails fast with
-"Rework agent produced no changes". This prevents an infinite loop where
-the agent declines to fix issues but the auditors keep failing the same
-way.
+When a rework agent commits nothing new, the pipeline does **not**
+unconditionally terminal-fail the work item. The empty result is
+disambiguated into three causes, each with its own item-level handling.
+The asymmetry with the initial-work phase (still fail-fast) is deliberate:
+no audit/rework loop sits behind initial work to recover a "declined to
+do anything" outcome.
 
-Practically this happens when:
+### Step 1: classify before deciding
 
-* The agent decided the audit was wrong (and didn't push back via the
-  prompt).
-* The agent's output got truncated.
-* The findings were so vague the agent couldn't act on them.
+Before treating an empty rework as the agent's verdict on the findings,
+the pipeline runs the agent failure classifiers over the run's captured
+stdout/stderr:
 
-In all cases the work item moves to `Failed`. An operator can inspect
-the work branch in the host bare repo, decide what to do, and either
-re-queue the work item with a clearer prompt or merge by hand.
+1. The **auth-required classifier** fires *before* the no-diff branch is
+   reached — a Success exit with an auth-required signature in stderr
+   throws `AgentAuthRequiredException` from `RunAgentPhaseAsync`, which
+   the availability breaker turns into a per-agent exclusion. The
+   work item re-routes through the agent-class router's normal scoring.
+2. The **quota / usage classifier** runs on the no-diff branch
+   (clean-exit-but-no-commit). Several CLIs (Antigravity / `agy` in
+   particular) swallow usage-cap errors as exit-0 with the cap signature
+   printed to stdout/stderr; without this check the failure would be
+   mis-attributed to "the agent declined to fix findings" instead of
+   infrastructure exhaustion. A quota match throws `TerminalQuotaError`,
+   which the agent-class fallback wrapper converts into a re-route to
+   a healthy class member.
+
+Neither infra path counts against convergence, parks the item, or
+terminal-fails it as "cannot resolve findings."
+
+### Step 2: converge-aware handling
+
+If no infra signature matched, the no-diff outcome is genuinely the
+agent declining to commit anything. `RunAgentPhaseAsync` throws
+`ReworkProducedNoChangesException` and `RunAuditReworkAsync` catches it:
+
+* **Converging + escalation budget remains** — when the audit history
+  shows convergence progress (blocking-findings decreased, fingerprint
+  changed, work-branch tip moved, &c — see `HasAuditConvergenceProgress`)
+  and `CodeyBox:PipelineTuning:EmptyReworkEscalationRetries` is positive,
+  the rework is re-dispatched up to that many times. Each retry appends
+  an escalation header to the rework prompt instructing the agent that
+  its previous pass committed nothing and it MUST either modify files or
+  justify each finding as already-satisfied / invalid in its output. If
+  any retry produces a real commit the loop continues normally; otherwise
+  it falls through to the park path below.
+* **Park for operator review** — when escalation is disabled, the history
+  has no convergence, or every escalation pass came back empty, the item
+  parks via the same `ParkAuditMaxIterationsForOperatorAsync` flow used
+  by the audit-iteration ceiling. The operator can resume the item with a
+  clearer prompt or merge by hand.
+
+Hard terminal failure for genuinely-empty rework is reserved for the
+audit-loop ceiling branch (no budget *and* no convergence) — the existing
+"no progress" path through `AuditFailedException`. Inside
+`RunAuditReworkAsync` we still have audit budget by construction (the
+ceiling check fires before `RunAuditReworkAsync` is invoked), so the
+worst case is "park," never a fresh terminal failure for the empty-rework
+reason.
+
+### Configuration
+
+`CodeyBox:PipelineTuning:EmptyReworkEscalationRetries` — non-negative
+integer. Default `1`. Set to `0` to skip escalation entirely (empty
+non-infra rework parks straight away). Hot-reloaded with the rest of
+`PipelineTuning`.
+
+### Why initial work stays fail-fast
+
+The initial work phase (`isInitial==true` in `RunAgentPhaseAsync`)
+continues to throw `InvalidOperationException("Agent produced no changes
+to commit")` on an empty commit. There is no audit/rework loop sitting
+behind it to converge a "declined to work" outcome — the failure must be
+visible to the operator immediately so they can re-prompt or re-route to
+a different agent rather than the orchestrator silently spending budget on
+escalation retries that have nowhere to land.
+
+### Relation to the agent-level no-changes breaker
+
+Item-level park / escalation is one of two layers:
+
+* **Item-level resilience** (this section): protects a single converging
+  item from being discarded on one empty pass.
+* **Agent-level breaker** (`RecordNoChangesOutcomeAsync` /
+  `IAgentAvailabilityRegistry`): tracks N consecutive distinct work items
+  with no diff and excludes the agent across the fleet when the streak
+  trips. The breaker still fires on a genuinely-empty rework — only the
+  auth / quota classifier branches skip it, because an infra failure
+  isn't evidence the agent itself is broken.
 
 ## Rework non-compile loop-back
 
@@ -359,9 +433,10 @@ work phase that leaves the branch non-compiling still terminal-fails
 with `failureKind=build`, because no audit/rework loop sits behind the
 initial work to converge on a fix.
 
-**Sibling brittleness.** The rework no-changes guard above (empty
-commit) is still terminal today; the same loop-back-not-terminal
-unification is in flight for that case.
+**Sibling unification.** The rework no-changes guard above no longer
+unconditionally terminal-fails the work item — empty rework on a
+converging item now escalates or parks. See *Rework no-changes
+disambiguation* above for the full policy.
 
 ## Configuration
 
