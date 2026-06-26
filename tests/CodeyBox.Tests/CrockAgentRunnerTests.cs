@@ -582,7 +582,64 @@ public sealed class CrockAgentRunnerTests
         Assert.Equal(AgentKind.Crock, new CrockInVmSmokeProbe().Kind);
     }
 
+    // --- Host-side smoke probe tests ------------------------------------
+
+    [Fact]
+    public void CrockSmokeProbe_Kind_IsCrock()
+    {
+        Assert.Equal(AgentKind.Crock, new CrockSmokeProbe().Kind);
+    }
+
+    [Fact]
+    public async Task CrockSmokeProbe_NoCredential_ReturnsFailPersistent()
+    {
+        var probe = new CrockSmokeProbe();
+        var credential = new AgentCredential(
+            AgentKind.Crock,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+
+        var result = await probe.SmokeTestAsync(credential, CancellationToken.None);
+
+        Assert.False(result.Ok);
+        Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
+        Assert.Contains("no config in credential bundle", result.FailureReason);
+    }
+
+    [Fact]
+    public async Task CrockSmokeProbe_EmptyCredential_ReturnsFailPersistent()
+    {
+        var probe = new CrockSmokeProbe();
+        var credential = new AgentCredential(
+            AgentKind.Crock,
+            new Dictionary<string, string> { [CrockAgentRunner.ConfigEnvVar] = "" },
+            new Dictionary<string, string>());
+
+        var result = await probe.SmokeTestAsync(credential, CancellationToken.None);
+
+        Assert.False(result.Ok);
+        Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
+        Assert.Contains("no config in credential bundle", result.FailureReason);
+    }
+
+    [Fact]
+    public async Task CrockSmokeProbe_ValidCredential_ReturnsOk()
+    {
+        var probe = new CrockSmokeProbe();
+        var credential = new AgentCredential(
+            AgentKind.Crock,
+            new Dictionary<string, string> { [CrockAgentRunner.ConfigEnvVar] = "{}" },
+            new Dictionary<string, string>());
+
+        var result = await probe.SmokeTestAsync(credential, CancellationToken.None);
+
+        Assert.True(result.Ok);
+        Assert.Equal(SmokeFailureCategory.None, result.Category);
+        Assert.Null(result.FailureReason);
+    }
+
     // --- Quota probe placeholder contract --------------------------------
+
 
     [Fact]
     public async Task CrockQuotaProbe_ReturnsUnknownPermanent()
