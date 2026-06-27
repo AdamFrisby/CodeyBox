@@ -506,6 +506,7 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
                 VmStopTimeout = multipassSandbox.VmStopTimeout,
                 MaxConcurrentBoots = multipassSandbox.MaxConcurrentBoots,
                 BootLaunchDelay = TimeSpan.FromMilliseconds(multipassSandbox.BootLaunchDelayMs),
+                DisableAgentOutputHttpIngest = multipassSandbox.DisableAgentOutputHttpIngest,
                 DiskGuard = diskGuard,
                 PackageCacheSeeds = live.MultipassPackageCacheSeeds?.Select(s => new PackageCacheSeedOptions
                 {
@@ -3481,6 +3482,14 @@ namespace CodeyBox.Api
         /// </summary>
         public int BootLaunchDelayMs { get; set; } =
             (int)MultipassSandboxOptions.DefaultBootLaunchDelay.TotalMilliseconds;
+
+        /// <summary>
+        /// When true, disables the detached agent-output HTTP-ingest transport
+        /// (#290) so all agent execs use the attached <c>multipass exec</c> pipe.
+        /// Repair switch for the merge-phase regression where the detached
+        /// transport drops a freshly-created sandbox's agent stdout + exit code.
+        /// </summary>
+        public bool DisableAgentOutputHttpIngest { get; set; }
     }
 
     /// <summary>

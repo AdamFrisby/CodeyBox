@@ -4814,6 +4814,17 @@ public sealed record MultipassSandboxOptions
         = new Dictionary<string, string>();
 
     /// <summary>
+    /// When true, the detached agent-output HTTP-ingest transport (#290) is
+    /// disabled and all agent execs fall back to the attached <c>multipass exec</c>
+    /// pipe — the pre-#290 behaviour. Repair switch for the merge-phase regression
+    /// where the detached transport drops a freshly-created sandbox's agent stdout
+    /// and exit code (0 output / exit=null / "no merge commit"); see the
+    /// fresh-sandbox readiness fix tracked separately. Trade-off: the attached
+    /// exec pump busy-loops a CPU core per run (the cost #290 set out to fix).
+    /// </summary>
+    public bool DisableAgentOutputHttpIngest { get; init; }
+
+    /// <summary>
     /// When true, the provider bakes a per-profile baseline VM
     /// (<c>{BaselineNamePrefix}{profile}</c>) on first use of each profile
     /// by launching with cloud-init, running the install runcmds, and
@@ -5627,6 +5638,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     private System.Net.IPAddress? TryResolveAgentOutputBindAddress()
     {
+        // Repair switch: null bind address forces ExecPipe/Attached transport
+        // (pre-#290), bypassing the detached HTTP-ingest path that drops a fresh
+        // merge sandbox's agent output + exit code.
+        if (_opts.DisableAgentOutputHttpIngest)
+            return null;
         if (string.IsNullOrWhiteSpace(_spec.Network.ProfileName))
             return null;
         if (!_opts.NetworkProfiles.TryGetValue(_spec.Network.ProfileName, out var bridge))
