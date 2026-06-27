@@ -156,12 +156,25 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
     public async Task AutoMergeRace_ProvisioningDeferredDuringMergeRerun_Rethrows()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // A clean (non-conflicting) merge now completes host-side with no
+        // sandbox. The FIRST merge here is clean (work writes README from a
+        // pristine base) → host-side → no merge sandbox. The upstream race then
+        // drifts the SAME file the work branch touched, so the merge RERUN
+        // genuinely conflicts → agentic conflict resolver → the merge sandbox is
+        // created (occurrence 1), where the provisioning defer is injected. This
+        // still pins the original intent: a sandbox-provisioning defer raised
+        // during the merge-rerun sandbox create must propagate (be rethrown),
+        // not be swallowed into a terminal failure.
         var remote = new RacingUpstreamRemote
         {
             SeedRepoPath = seed,
             ResponsePlan =
             {
-                new RacingResponse(AutoMergeRaced: true, AdvanceSeedBeforeReturning: false),
+                new RacingResponse(
+                    AutoMergeRaced: true,
+                    AdvanceSeedBeforeReturning: true,
+                    AdvanceSeedFilePath: "README.md",
+                    AdvanceSeedFileContent: "main drift side\n"),
             },
         };
         var deferAt = new SandboxProvisioningDeferredException(
@@ -173,7 +186,7 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         var sandboxes = new ThrowingNthTimingPhaseSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             "merge",
-            throwOnOccurrence: 2,
+            throwOnOccurrence: 1,
             deferAt);
         var factory = new SingleRemoteFactory(remote);
 
@@ -189,7 +202,7 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
             mergeStrategy: [MergeStrategy.RealMerge, MergeStrategy.RealMerge],
             sandboxProvider: sandboxes);
         remote.BareRepoRoot = tp.GitRoot;
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("race-fix.txt", "fixes race\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
         var item = NewItem("feature/race-recovery-defer");
         await tp.Store.CreateAsync(item);
@@ -199,7 +212,7 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
 
         Assert.Same(deferAt, thrown);
         Assert.Equal(1, remote.CompleteCalls);
-        Assert.Equal(2, sandboxes.MatchingCreateCalls);
+        Assert.Equal(1, sandboxes.MatchingCreateCalls);
         var final = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.NotEqual(WorkItemState.Failed, final!.State);
@@ -211,17 +224,25 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
+        // The first merge is clean (host-side, no sandbox). The upstream race
+        // drifts the SAME file the work branch touched, so the merge RERUN
+        // genuinely conflicts → agentic conflict resolver → merge sandbox
+        // (occurrence 1). Inside that sandbox the `git merge` reports a
+        // transport-channel failure, which must be classified transient and
+        // park the item for retry — the original intent, now exercised on the
+        // resolver path (the only merge sandbox that exists).
         var remote = new RacingUpstreamRemote
         {
             SeedRepoPath = seed,
             ResponsePlan =
             {
-                new RacingResponse(AutoMergeRaced: true, AdvanceSeedBeforeReturning: false),
+                new RacingResponse(
+                    AutoMergeRaced: true,
+                    AdvanceSeedBeforeReturning: true,
+                    AdvanceSeedFilePath: "README.md",
+                    AdvanceSeedFileContent: "main drift side\n"),
             },
         };
-        var sandboxes = new FailingNthMergeCommandSandboxProvider(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
-            failOnMergePhaseOccurrence: 2);
         var factory = new SingleRemoteFactory(remote);
 
         using var tp = TestSupport.BuildPipeline(
@@ -234,11 +255,18 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
             },
             upstreamFactory: factory,
             mergeStrategy: [MergeStrategy.RealMerge, MergeStrategy.RealMerge],
-            sandboxProvider: sandboxes,
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
         remote.BareRepoRoot = tp.GitRoot;
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("race-fix.txt", "fixes race\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+        // The rerun's conflict resolver agent fails with a transport-channel
+        // error — a transient connectivity blip, not a real conflict — which
+        // must be classified transient and park the item for retry.
+        tp.Agent.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "Transport channel closed"));
 
         var item = NewItem("feature/race-rerun-transient");
         await tp.Store.CreateAsync(item);
@@ -252,7 +280,6 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Contains("transient transport failure", final.LastError, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(1, remote.CompleteCalls);
-        Assert.Equal(2, sandboxes.MatchingMergePhaseCreates);
     }
 
     [Fact]
@@ -697,6 +724,8 @@ internal sealed class SetBranchThrowingGitHost : IGitHost
         => _inner.GetDiffAsync(repositoryId, baseBranch, workBranch, ct);
     public Task<GitMergeTreeResult> ComputeMergeTreeAsync(string repositoryId, string mainCommit, string workCommit, CancellationToken ct = default)
         => _inner.ComputeMergeTreeAsync(repositoryId, mainCommit, workCommit, ct);
+    public Task<string> CreateMergeCommitAsync(string repositoryId, string treeSha, string firstParentCommit, string secondParentCommit, string message, string authorName, string authorEmail, CancellationToken ct = default)
+        => _inner.CreateMergeCommitAsync(repositoryId, treeSha, firstParentCommit, secondParentCommit, message, authorName, authorEmail, ct);
     public Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
         => _inner.ResolveCommitAsync(repositoryId, commitish, ct);
     public Task ResetWorkBranchToBaseAsync(string repositoryId, string workBranch, string baseBranch, CancellationToken ct = default)

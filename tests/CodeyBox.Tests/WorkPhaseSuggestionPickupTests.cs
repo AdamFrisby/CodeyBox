@@ -133,7 +133,10 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
     public async Task MergePhase_SuggestionsJson_PersistedToStore()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var setup = BuildPipelineWith(new MergeOnlySuggestionEmittingAgent(MergeSuggestionsJson), _workspace, seed);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var setup = BuildPipelineWith(
+            new MergeOnlySuggestionEmittingAgent(MergeSuggestionsJson), _workspace, seed, auditors: [auditor]);
+        auditor.GitRoot = setup.GitRoot;
 
         var item = NewItem("feature/merge-pickup-persist");
         await setup.Store.CreateAsync(item);
@@ -157,7 +160,10 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
     public async Task MergePhase_SuggestionsJson_FiresOneWebhookPerSuggestion()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var setup = BuildPipelineWith(new MergeOnlySuggestionEmittingAgent(MergeSuggestionsJson), _workspace, seed);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var setup = BuildPipelineWith(
+            new MergeOnlySuggestionEmittingAgent(MergeSuggestionsJson), _workspace, seed, auditors: [auditor]);
+        auditor.GitRoot = setup.GitRoot;
 
         var item = NewItem("feature/merge-pickup-webhook");
         await setup.Store.CreateAsync(item);
@@ -177,7 +183,10 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
     public async Task MergePhase_SuggestionsJson_NotCommittedToBaseBranch()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var setup = BuildPipelineWith(new MergeOnlySuggestionEmittingAgent(MergeSuggestionsJson), _workspace, seed);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var setup = BuildPipelineWith(
+            new MergeOnlySuggestionEmittingAgent(MergeSuggestionsJson), _workspace, seed, auditors: [auditor]);
+        auditor.GitRoot = setup.GitRoot;
 
         var item = NewItem("feature/merge-pickup-nocommit");
         await setup.Store.CreateAsync(item);
@@ -197,7 +206,8 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
     private SuggestionTestSetup BuildPipeline(string workspace, string seedRepoUrl)
         => BuildPipelineWith(new SuggestionEmittingAgent(SuggestionsJson), workspace, seedRepoUrl);
 
-    private static SuggestionTestSetup BuildPipelineWith(IAgentRunner agent, string workspace, string seedRepoUrl)
+    private static SuggestionTestSetup BuildPipelineWith(
+        IAgentRunner agent, string workspace, string seedRepoUrl, IReadOnlyList<IAuditor>? auditors = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -211,6 +221,7 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
         var prs = new InMemoryPullRequestService();
         var registry = new AgentRegistry([agent]);
         var webhooks = new CapturingWebhookDispatcher();
+        var auditorList = auditors ?? [];
         var projects = new InMemoryProjectRepository(new Project
         {
             Id = new ProjectId("test-project"),
@@ -218,8 +229,13 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = auditorList.Count > 0 ? ["scripted"] : [],
+            },
         });
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
 
         var pipeline = new PipelineRunner(
@@ -234,6 +250,51 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
             terminalRevisionBuilder: terminalTransitions);
 
         return new SuggestionTestSetup(pipeline, store, suggestionStore, webhooks, gitRoot);
+    }
+
+    /// <summary>
+    /// Tool auditor that advances <c>main</c>'s copy of a file during the audit
+    /// phase, so a work branch touching the same file merges with a conflict —
+    /// routing the merge phase through the agentic conflict resolver (the only
+    /// merge path that now runs an agent in the merge sandbox, where the
+    /// merge-phase suggestions.json pickup occurs).
+    /// </summary>
+    private sealed class MainAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MainAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            return new AuditResult(true, []);
+        }
     }
 
     private static WorkItem NewItem(string branch) => new()
@@ -333,9 +394,12 @@ internal sealed partial class SuggestionEmittingAgent : IAgentRunner
 }
 
 /// <summary>
-/// Writes a regular file in the work phase (no suggestions.json).
-/// During the merge phase, performs the git merge AND writes .codeybox/suggestions.json
-/// to exercise the merge-phase pickup path in PipelineRunner.
+/// Writes README.md in the work phase so the merge conflicts with the
+/// auditor-advanced main side. On the agentic conflict-resolver pass it
+/// resolves the conflict AND writes .codeybox/suggestions.json into the merge
+/// sandbox — exercising the merge-phase suggestion pickup path in
+/// PipelineRunner (a clean merge runs host-side with no agent, so the resolver
+/// path is the only merge agent run that can drop suggestions.json).
 /// </summary>
 internal sealed partial class MergeOnlySuggestionEmittingAgent : IAgentRunner
 {
@@ -349,38 +413,41 @@ internal sealed partial class MergeOnlySuggestionEmittingAgent : IAgentRunner
         ISandbox sandbox, string workingDirectory, string prompt,
         AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
     {
-        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
-            return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);
+        if (prompt.StartsWith("# Conflict-resolution mode (in-sandbox agentic resolver)", StringComparison.Ordinal))
+            return await HandleAgenticResolveAsync(sandbox, workingDirectory, ct);
 
-        // Work phase: write output.txt only — no suggestions.json so merge-phase tests
-        // get an unambiguous count of exactly one suggestion (the merge-phase one).
+        // Work phase: write README.md (no suggestions.json) so the merge-phase
+        // tests get an unambiguous count of exactly one suggestion (the
+        // merge-phase one) and so the merge genuinely conflicts with main.
         var r = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "echo 'hello from merge-only agent' > \"$0\"", $"{workingDirectory}/output.txt"],
+            Argv = ["sh", "-c", "echo 'work side' > \"$0\"", $"{workingDirectory}/README.md"],
         }, ct);
         return r.Success
             ? new AgentResult(true, "ok", null, null)
-            : new AgentResult(false, "failed to write output.txt", r.Stdout, r.Stderr);
+            : new AgentResult(false, "failed to write README.md", r.Stdout, r.Stderr);
     }
 
-    private async Task<AgentResult> HandleMergeAsync(
-        ISandbox sandbox, string workingDirectory, string prompt, CancellationToken ct)
+    private async Task<AgentResult> HandleAgenticResolveAsync(
+        ISandbox sandbox, string workingDirectory, CancellationToken ct)
     {
-        var m = MergePromptShape().Match(prompt);
-        if (!m.Success)
-            return new AgentResult(false, "could not parse merge prompt", null, null);
+        // Resolve the README conflict (keep both intents) and stage it so the
+        // resolver's post-run verification finds no remaining conflicts.
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
+            Stdin = "main side\nwork side\n",
+        }, ct);
+        if (!write.Success)
+            return new AgentResult(false, "failed to resolve README.md", write.Stdout, write.Stderr);
+        var add = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", workingDirectory, "add", "--", "README.md"],
+        }, ct);
+        if (!add.Success)
+            return new AgentResult(false, "failed to git add README.md", add.Stdout, add.Stderr);
 
-        var workBranch = m.Groups[1].Value;
-        var baseBranch = m.Groups[2].Value;
-        _ = baseBranch;
-
-        string[] mergeArgv = ["git", "-C", workingDirectory, "merge", "--no-ff",
-            "-m", $"codeybox: merge {workBranch}", $"origin/{workBranch}"];
-        var rc = await sandbox.ExecAsync(new SandboxExec { Argv = mergeArgv }, ct);
-        if (!rc.Success)
-            return new AgentResult(false, $"merge failed: {string.Join(' ', mergeArgv)}", rc.Stdout, rc.Stderr);
-
-        // Write suggestions.json to exercise the merge-phase pickup path in PipelineRunner.
+        // Write suggestions.json to exercise the merge-phase pickup path.
         var r2 = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && cat > \"$0\"",
@@ -390,10 +457,6 @@ internal sealed partial class MergeOnlySuggestionEmittingAgent : IAgentRunner
         if (!r2.Success)
             return new AgentResult(false, "failed to write suggestions.json during merge", r2.Stdout, r2.Stderr);
 
-        return new AgentResult(true, "merged with suggestions", null, null);
+        return new AgentResult(true, "resolved with suggestions", null, null);
     }
-
-    [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`",
-        RegexOptions.CultureInvariant | RegexOptions.Singleline)]
-    private static partial Regex MergePromptShape();
 }

@@ -547,10 +547,16 @@ public sealed class GraphicalSandboxTests
                 AuditTool = "audit-tool-profile",
                 Merge = "merge-profile",
             };
+            // A clean merge is completed host-side with no sandbox, so the merge
+            // sandbox profile/flavor is observable only on the agentic conflict
+            // resolver path. Induce a README conflict (work writes README; the
+            // one-shot auditor advances main's README during audit) so the merge
+            // phase creates its sandbox, then resolve it.
+            var mergeConflictAuditor = new MainAdvancingAuditor(workspace, "README.md", "main side\n");
             using var tp = TestSupport.BuildPipeline(
                 workspace,
                 seed,
-                auditors: [auditor, graphicalAuditor],
+                auditors: [auditor, graphicalAuditor, mergeConflictAuditor],
                 projectAudit: audit,
                 sandboxProvider: sandboxes,
                 graphicalSandbox: true,
@@ -560,8 +566,13 @@ public sealed class GraphicalSandboxTests
                     new Dictionary<string, string> { ["WORK_TOKEN"] = "secret" },
                     new Dictionary<string, string>())),
                 pipelineTuning: new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = false }));
-            tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
-            tp.Agent.WorkPlan.Enqueue(new FileWrite("rework.txt", "rework\n"));
+            mergeConflictAuditor.GitRoot = tp.GitRoot;
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "rework\n"));
+            tp.Agent.ConflictResolutionPlan.Enqueue(_ => new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main side\nrework\n",
+            });
             var item = new WorkItem
             {
                 Id = WorkItemId.New(),
@@ -947,6 +958,55 @@ public sealed class GraphicalSandboxTests
 
         private static TaskCompletionSource CreateOperationEnteredSource() =>
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    /// <summary>
+    /// One-shot tool auditor that advances <c>main</c>'s copy of a file on the
+    /// first audit iteration so a work branch touching the same file merges with
+    /// a conflict — routing the merge phase through the agentic conflict resolver
+    /// (which creates the merge sandbox this test inspects). Advancing only once
+    /// keeps later audit iterations from re-committing an unchanged tree.
+    /// </summary>
+    private sealed class MainAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+        private bool _advanced;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MainAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (_advanced)
+                return new AuditResult(true, []);
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            _advanced = true;
+            return new AuditResult(true, []);
+        }
     }
 
     private sealed class QueueAuditor : IAuditor

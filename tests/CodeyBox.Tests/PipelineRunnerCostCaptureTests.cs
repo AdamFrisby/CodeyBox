@@ -54,18 +54,35 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     [Fact]
     public async Task SuccessfulRun_WritesMergePhaseCostRow()
     {
+        // A clean (non-conflicting) merge is completed entirely host-side with
+        // no agent, so it emits no merge cost row. To assert the merge-phase
+        // cost-capture call site, drive the agentic conflict resolver: the work
+        // phase writes README, the auditor advances main's README during audit
+        // (→ merge conflict), and the resolver runs the agent in the merge
+        // sandbox — the only merge path that produces a "merge" cost row.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var costStore = new RecordingCostStore();
-        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main\n");
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore, auditors: [auditor]);
+        auditor.GitRoot = tp.GitRoot;
 
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("merge-cost.txt", "merge\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(_ => new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["README.md"] = "main\nwork\n",
+        });
 
         var item = NewItem("feature/cost-merge");
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
         var mergeRows = costStore.Recorded.Where(r => r.Phase == "merge").ToList();
         Assert.Single(mergeRows);
+        // Exactly two extractor-backed rows: the work phase and the merge
+        // resolver. The tool auditor (AuditCapabilities.None) produces none.
         Assert.Equal(2, costStore.Recorded.Count);
     }
 
@@ -1030,6 +1047,51 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
             => Task.FromResult(new AuditResult(true, []));
+    }
+
+    /// <summary>
+    /// Tool auditor that advances <c>main</c>'s copy of <paramref name="path"/>
+    /// during the audit phase, so a work branch that wrote the same file merges
+    /// with a conflict — forcing the merge phase down the agentic conflict
+    /// resolver path (which runs an agent and emits a merge cost row) instead of
+    /// the agent-less host-side clean merge.
+    /// </summary>
+    private sealed class MainAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MainAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            return new AuditResult(true, []);
+        }
     }
 
     private sealed class OnceFailingAuditor : IAuditor

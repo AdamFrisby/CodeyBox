@@ -489,13 +489,20 @@ public sealed class PipelineIntegrationTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
+        // A clean merge runs host-side with no agent, so a merge-phase agent
+        // transport failure can only arise on the agentic conflict-resolver
+        // path. Induce a README conflict so the resolver agent runs and returns
+        // a transport-channel failure, which must be classified transient.
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
+            auditors: [auditor],
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "work complete\n"));
-        tp.Agent.MergeResults.Enqueue(new AgentResult(
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+        tp.Agent.AgenticConflictResults.Enqueue(new AgentResult(
             Success: false,
             Summary: "merge transport failed",
             Stdout: null,
@@ -583,18 +590,66 @@ public sealed class PipelineIntegrationTests : IDisposable
     [Fact]
     public async Task MergeAgentDoesNothing_PipelineFailsVerification()
     {
+        // A clean merge is now completed host-side and cannot "do nothing" — it
+        // is deterministic git plumbing. The merge agent only runs on a genuine
+        // conflict, via the agentic resolver. Reproduce the "merge work not
+        // actually done" failure there: induce a README conflict but supply no
+        // resolution plan, so the resolver agent produces no clean resolution.
+        // The pipeline must FAIL (not silently pass) when the conflict is left
+        // unresolved.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var tp = TestSupport.BuildPipeline(_workspace, seed,
-            mergeStrategy: [MergeStrategy.NoOp]);
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("hello.txt", "hi\n"));
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+        // No ConflictResolutionPlan / AgenticConflictResults enqueued: the
+        // resolver runs out of plan entries and fails to resolve.
 
         var item = NewItem("feature/hello");
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("merge agent", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEqual(WorkItemState.Done, final!.State);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final.State);
+    }
+
+    private sealed class MainAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MainAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            return new AuditResult(true, []);
+        }
     }
 
     [Fact]

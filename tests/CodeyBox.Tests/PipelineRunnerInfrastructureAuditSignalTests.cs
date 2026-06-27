@@ -89,11 +89,12 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
 
-        // Work phase succeeds end-to-end (a single file write) so the pipeline
-        // reaches the merge phase, which is where the scripted infra failure
-        // fires.
-        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
-        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+        // A clean merge runs host-side with no agent, so the merge-phase infra
+        // signal only fires on the agentic conflict-resolver path. Induce a real
+        // README conflict so the resolver agent runs and returns a missing-binary
+        // (exit-127) failure. The work phase is already complete (AuditPassed),
+        // so the single ScriptedFailures entry is consumed by the merge resolver.
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: false,
             Summary: "agent exited 127",
             Stdout: null,
@@ -107,8 +108,14 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
             Prompt = "do thing",
             BaseBranch = "main",
             Agent = AgentKind.Codex,
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/infra-merge-" + Guid.NewGuid().ToString("N")[..8],
             PushUpstream = false,
         };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchAsync(barePath, item.WorkBranch!, "README.md", "work side\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main side\n", "main readme");
         await fix.Store.CreateAsync(item);
 
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
@@ -180,7 +187,38 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
 
-        return new TestFixture(pipeline, store, codex, webhooks, availability);
+        return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
+    }
+
+    private static async Task CommitWorkBranchAsync(
+        string bareRepoPath, string workBranch, string path, string contents, string subject)
+    {
+        var clone = Path.Combine(Path.GetTempPath(), "codeybox-infra-merge-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(clone);
+        try
+        {
+            await TestSupport.RunGit(clone, "clone", bareRepoPath, ".");
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", "-b", workBranch, "origin/main");
+            await File.WriteAllTextAsync(Path.Combine(clone, path), contents);
+            await TestSupport.RunGit(clone, "add", path);
+            await TestSupport.RunGit(clone, "commit", "-m", subject);
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{workBranch}");
+        }
+        finally
+        {
+            try { Directory.Delete(clone, recursive: true); } catch { }
+        }
+    }
+
+    private static async Task CommitToSeedAsync(string repoPath, string path, string content, string message)
+    {
+        await TestSupport.RunGit(repoPath, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(repoPath, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoPath, path), content);
+        await TestSupport.RunGit(repoPath, "add", path);
+        await TestSupport.RunGit(repoPath, "commit", "-m", message);
     }
 
     private static T? GetScalar<T>(LogEvent evt, string key)
@@ -201,19 +239,22 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
         public ScriptableAgent Codex { get; }
         public CapturingWebhookDispatcher Webhooks { get; }
         public AgentAvailabilityRegistry Registry { get; }
+        public LocalGitHost GitHost { get; }
 
         public TestFixture(
             PipelineRunner pipeline,
             SqliteWorkItemStore store,
             ScriptableAgent codex,
             CapturingWebhookDispatcher webhooks,
-            AgentAvailabilityRegistry registry)
+            AgentAvailabilityRegistry registry,
+            LocalGitHost gitHost)
         {
             Pipeline = pipeline;
             Store = store;
             Codex = codex;
             Webhooks = webhooks;
             Registry = registry;
+            GitHost = gitHost;
         }
 
         public void Dispose() => Store.Dispose();

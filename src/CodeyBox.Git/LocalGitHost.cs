@@ -738,6 +738,56 @@ public sealed class LocalGitHost : IGitHost
             RawOutput: rc.Stdout);
     }
 
+    public async Task<string> CreateMergeCommitAsync(
+        string repositoryId,
+        string treeSha,
+        string firstParentCommit,
+        string secondParentCommit,
+        string message,
+        string authorName,
+        string authorEmail,
+        CancellationToken ct = default)
+    {
+        Validation.ValidateCommitSha(firstParentCommit, nameof(firstParentCommit));
+        Validation.ValidateCommitSha(secondParentCommit, nameof(secondParentCommit));
+        if (!LooksLikeSha(treeSha))
+            throw new InvalidOperationException($"invalid merge tree sha '{treeSha}'");
+        if (string.IsNullOrEmpty(message))
+            throw new ArgumentException("merge commit message must not be empty", nameof(message));
+
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+
+        // Identity is supplied via env rather than repo config so a concurrent
+        // merge on the same bare repo can't race on `git config`. git
+        // commit-tree honours GIT_AUTHOR_*/GIT_COMMITTER_* for both roles.
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GIT_AUTHOR_NAME"] = authorName,
+            ["GIT_AUTHOR_EMAIL"] = authorEmail,
+            ["GIT_COMMITTER_NAME"] = authorName,
+            ["GIT_COMMITTER_EMAIL"] = authorEmail,
+        };
+
+        // -m preserves embedded newlines (each ArgumentList entry is one argv
+        // element, so the trailer block survives intact).
+        var rc = await RunGitAsync(
+            workdir: path, ct, extraEnv: env,
+            "commit-tree", treeSha,
+            "-p", firstParentCommit,
+            "-p", secondParentCommit,
+            "-m", message);
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git commit-tree (merge of {secondParentCommit} into {firstParentCommit}) failed: {rc.Stderr}");
+
+        var sha = rc.Stdout.Trim();
+        if (!LooksLikeSha(sha))
+            throw new InvalidOperationException(
+                $"git commit-tree did not return a commit sha: {rc.Stderr}{rc.Stdout}");
+        return sha;
+    }
+
     public async Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);

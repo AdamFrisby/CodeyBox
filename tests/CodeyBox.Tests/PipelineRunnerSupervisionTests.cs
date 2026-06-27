@@ -24,12 +24,23 @@ public sealed class PipelineRunnerSupervisionTests : IDisposable
             notifier);
         notifier.Service = supervision;
 
+        // A clean merge runs host-side with no agent, so there is no merge-phase
+        // supervision session. Induce a README conflict (work writes README; the
+        // auditor advances main's README during audit) so the merge runs the
+        // agentic resolver, which opens a supervised "merge" session.
+        var mergeConflictAuditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
+            auditors: [mergeConflictAuditor],
             agentSupervision: supervision);
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "autonomous\n"));
+        mergeConflictAuditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "autonomous\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("operator.txt", "human\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(_ => new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["README.md"] = "main side\nautonomous\n",
+        });
 
         var item = new WorkItem
         {
@@ -49,7 +60,11 @@ public sealed class PipelineRunnerSupervisionTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         Assert.Contains(notifier.StartedSessions, s => s.Phase == "work");
-        Assert.Contains(notifier.StartedSessions, s => s.Phase == "merge");
+        // The merge supervision session now comes from the agentic conflict
+        // resolver (Phase "conflict-merge", Source "agentic-conflict-resolver").
+        Assert.Contains(
+            notifier.StartedSessions,
+            s => s.Phase == "conflict-merge" && s.Source == "agentic-conflict-resolver");
         Assert.Contains(notifier.Commands, c => c.Kind == "autonomous" && c.Phase == "work");
         Assert.Contains(notifier.Commands, c => c.Kind == "human-injection" && c.Phase == "work");
         var completed = Assert.Single(notifier.CompletedInjections);
@@ -103,6 +118,50 @@ public sealed class PipelineRunnerSupervisionTests : IDisposable
         {
             CompletedInjections.Add(injection);
             return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// Tool auditor that advances <c>main</c>'s copy of a file during the audit
+    /// phase, so a work branch touching the same file merges with a conflict —
+    /// routing the merge phase through the agentic conflict resolver, which opens
+    /// a supervised "merge" session.
+    /// </summary>
+    private sealed class MainAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MainAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            return new AuditResult(true, []);
         }
     }
 }

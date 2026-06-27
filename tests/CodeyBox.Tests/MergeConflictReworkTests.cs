@@ -348,15 +348,27 @@ public sealed class MergeConflictReworkTests : IDisposable
     }
 
     [Fact]
-    public async Task ConflictRework_BranchAdvanceResetsRecoveryAttemptsBeforeMergeRetryFailure()
+    public async Task ConflictRework_BranchAdvanceResetsRecoveryAttempts()
     {
+        // The conflict-rework branch-advance is a real-progress event that must
+        // RESET RecoveryAttempts to 0 (ResetRecoveryAttemptsAfterRealProgressEvent
+        // / ConflictReworkBranchAdvanced). This pins that reset: the rework
+        // handler bumps RecoveryAttempts to 2 mid-flight, and after the branch
+        // is advanced to the rework tip it must read back as 0.
+        //
+        // The original variant forced the *subsequent* merge retry to fail via a
+        // no-op merge AGENT so it could assert the reset survived into the
+        // failure. That mechanism is gone: a clean merge (which a successful
+        // rework's rebase produces) is now completed host-side with no agent and
+        // cannot no-op, so the retry deterministically succeeds to Done. The
+        // load-bearing invariant — RecoveryAttempts reset on branch-advance — is
+        // preserved and asserted directly here.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
-            mergeStrategy: [MergeStrategy.NoOp]);
+            auditors: [auditor]);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
@@ -379,9 +391,9 @@ public sealed class MergeConflictReworkTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("merge agent produced no merge commit", final.LastError);
+        Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(1, final.ConflictReworkAttempts);
+        // The branch-advance reset wins over the mid-rework bump to 2.
         Assert.Equal(0, final.RecoveryAttempts);
     }
 

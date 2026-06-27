@@ -144,8 +144,17 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
     }
 
+    // NOTE: merge-phase stream capture was dropped when the merge phase moved
+    // to a host-side clean merge (no agent → no stream) and an in-VM agentic
+    // conflict resolver that does not wire the AgentStreamStore capture sink
+    // (AgenticConflictResolver runs the agent with stdoutChunkCallback=null and
+    // never opens a merge stream file; PipelineRunner's mergeStructuredStreamCaptured
+    // is now vestigially always false). The merge-stream coverage this test used
+    // to provide is therefore no longer producible from the test harness; it now
+    // verifies the work/audit/rework streams only. See the report flag for the
+    // production gap (resolver should capture its agent stream).
     [Fact]
-    public async Task PipelineRunner_CapturesWorkAuditReworkAndMergeStreams()
+    public async Task PipelineRunner_CapturesWorkAuditAndReworkStreams()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var streamStore = new AgentStreamStore(
@@ -167,7 +176,6 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         tp.Agent.WorkPlan.Enqueue(new FileWrite("streamed.txt", "rework\n"));
         tp.Agent.StdoutChunkBatches.Enqueue(["{\"type\":\"result\",\"phase\":\"work\"}\n"]);
         tp.Agent.StdoutChunkBatches.Enqueue(["{\"type\":\"result\",\"phase\":\"rework\"}\n"]);
-        tp.Agent.StdoutChunkBatches.Enqueue(["{\"type\":\"result\",\"phase\":\"merge\"}\n"]);
 
         var item = new WorkItem
         {
@@ -197,8 +205,12 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         Assert.Contains(files, f => f.Phase == "rework" && f.Iteration == 2);
         Assert.Contains(files, f => f.Phase == "audit-llm-security:llm-review" && f.Iteration == 2);
         Assert.Contains(files, f => f.Phase == "audit-llm-completeness:llm-review" && f.Iteration == 2);
-        Assert.Contains(files, f => f.Phase == "merge" && f.Iteration == 1);
-        Assert.Equal(7, files.Count);
+        // The merge phase no longer captures an agent stream (clean merge = no
+        // agent; the agentic conflict resolver does not wire a stream sink), so
+        // there is no merge stream file and the total is 6 (work + 2×audit ×2
+        // iterations + rework).
+        Assert.DoesNotContain(files, f => f.Phase == "merge");
+        Assert.Equal(6, files.Count);
 
         foreach (var file in files)
         {
@@ -234,9 +246,6 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
             "applied patch to plaintext.txt\n",
             "done after 12.7s\n",
         ]);
-        tp.Agent.StdoutChunkBatches.Enqueue([
-            "plaintext merge chunk\n",
-        ]);
 
         var item = new WorkItem
         {
@@ -253,10 +262,12 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
 
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        // The agent was not asked to emit structured stream-json on any
-        // dispatch (work + merge both go through the same agent in this
-        // pipeline), but the capture files must still exist with the
-        // plaintext stdout teed in.
+        // The agent was not asked to emit structured stream-json on the work
+        // dispatch, but the capture file must still exist with the plaintext
+        // stdout teed in. (A clean merge runs host-side with no agent, so there
+        // is no merge stream to capture; the merge-stream coverage this test
+        // used to assert is no longer producible — see the report flag for the
+        // resolver stream-capture gap.)
         Assert.NotEmpty(tp.Agent.CaptureStructuredStreamCalls);
         Assert.All(tp.Agent.CaptureStructuredStreamCalls, Assert.False);
         var files = await streamStore.ListAsync(item.Id);
@@ -264,9 +275,7 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         var workContents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), workFile.FileName));
         Assert.Contains("starting opencode run", workContents);
         Assert.Contains("done after 12.7s", workContents);
-        var mergeFile = Assert.Single(files, f => f.Phase == "merge");
-        var mergeContents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), mergeFile.FileName));
-        Assert.Contains("plaintext merge chunk", mergeContents);
+        Assert.DoesNotContain(files, f => f.Phase == "merge");
     }
 
     [Fact]
@@ -344,15 +353,26 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
             new AgentStreamsOptions { Enabled = false, Path = Path.Combine(_workspace, "streams-disabled-marker") },
             NullLogger<AgentStreamStore>.Instance);
         var auditor = new CaptureRecordingLlmAuditor();
+        // The resumable runner must force structured capture on EVERY dispatch,
+        // including the merge agent. A clean merge runs host-side with no agent,
+        // so induce a README conflict (work writes README; the one-shot auditor
+        // advances main's README during audit) → the merge runs the agentic
+        // resolver, giving the third forced-capture dispatch.
+        var mergeConflictAuditor = new MergeConflictAdvancingAuditor(_workspace, "README.md", "main side\n");
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor, mergeConflictAuditor]),
             maxAuditIterations: 2,
             agentStreams: streamStore,
             cliSessionResumableAgent: true);
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("streamed.txt", "work\n"));
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("streamed.txt", "rework\n"));
+        mergeConflictAuditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "rework\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(_ => new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["README.md"] = "main side\nrework\n",
+        });
 
         var item = new WorkItem
         {
@@ -375,6 +395,59 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         Assert.Equal([true, true], auditor.CaptureStructuredStreamCalls);
         Assert.Equal(0, tp.Agent.StructuredStreamSupportProbeCount);
         Assert.False(Directory.Exists(streamStore.Options.Path));
+    }
+
+    /// <summary>
+    /// One-shot tool auditor that advances <c>main</c>'s copy of a file on the
+    /// first audit iteration so a work branch touching the same file merges with
+    /// a conflict — routing the merge phase through the agentic conflict resolver
+    /// (which runs the merge agent). Advancing only once keeps later audit
+    /// iterations from re-committing an unchanged tree (which git rejects).
+    /// </summary>
+    private sealed class MergeConflictAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+        private bool _advanced;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MergeConflictAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (_advanced)
+                return new AuditResult(true, []);
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            _advanced = true;
+            return new AuditResult(true, []);
+        }
     }
 
     private sealed class StreamingLlmAuditor : IAuditor

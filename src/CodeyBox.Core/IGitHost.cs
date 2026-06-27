@@ -350,6 +350,24 @@ public interface IGitHost
         CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side merge-tree verification.");
 
+    /// <summary>
+    /// Creates a merge commit in the host bare repo directly from an
+    /// already-computed merge tree (see <see cref="ComputeMergeTreeAsync"/>)
+    /// with the two given parents, and returns the new commit sha. Used to land
+    /// a clean (non-conflicting) merge entirely host-side — no sandbox, no
+    /// agent — since a clean three-way merge is deterministic git plumbing.
+    /// </summary>
+    Task<string> CreateMergeCommitAsync(
+        string repositoryId,
+        string treeSha,
+        string firstParentCommit,
+        string secondParentCommit,
+        string message,
+        string authorName,
+        string authorEmail,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side merge commits.");
+
     /// <summary>Resolves a ref or commit expression in the host bare repo.</summary>
     Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side commit resolution.");

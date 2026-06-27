@@ -10868,14 +10868,48 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var preMergeSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
         var workTipSha = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct);
         var hostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
-        // Both the clean-merge branch (BuildMergePrompt + runner.RunAsync) and
-        // the conflict branch (AgenticConflictResolver.ResolveAsync → the agent
-        // CLI inside this same sandbox) invoke an in-VM agent. The pre-#168
-        // conditional that nulled the credential and disabled network when
-        // hostMerge.HasConflicts assumed the conflict path resolved text-only
-        // from the host, which is no longer true: the resolver runs the CLI
-        // in-VM and needs both auth and egress. Always bake creds + open
-        // network for the merge sandbox.
+
+        // Clean merge: pure git plumbing, done entirely host-side in the bare
+        // repo — no sandbox/VM, no agent. The host already computed the exact
+        // merge tree via `git merge-tree --write-tree` (hostMerge.TreeSha), so
+        // the merge commit is created directly with `git commit-tree`.
+        //
+        // This path used to hand the clean merge to an in-VM agent (a literal
+        // `git merge --no-ff` wrapped in BuildMergePrompt). That is wasteful
+        // (a VM boot + agent turn for a deterministic git op) and — more
+        // importantly — unreliable: the agent prompt has the full AGENTS.md
+        // project rules prepended, so a weak or distracted agent reads the
+        // rules, kicks off a project build, and never runs the merge; the
+        // phase then times out with the work branch unmerged. git produces the
+        // identical result deterministically, regardless of which agent (if
+        // any) is available. The agentic path below remains ONLY for genuine
+        // content conflicts, where a model is actually needed.
+        if (!hostMerge.HasConflicts)
+        {
+            var (cleanGitName, cleanGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            var cleanTrailerBlock = await ComposeCommitTrailerBlockAsync(
+                item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct);
+            var cleanMessage = $"codeybox: merge {workBranch}\n\n{cleanTrailerBlock}\n";
+            var cleanMergeSha = await _gitHost.CreateMergeCommitAsync(
+                repoId, hostMerge.TreeSha, preMergeSha, workTipSha, cleanMessage,
+                cleanGitName, cleanGitEmail, ct);
+            // Defence-in-depth: confirm ancestry (both parents reachable) and
+            // that the committed tree matches the host merge-tree. By
+            // construction it does; this also re-checks the prediction didn't
+            // go stale between compute and commit. No sandbox needed — a clean
+            // merge has no conflict files to security-review.
+            await VerifyMergeResultAgainstHostAsync(
+                item.Id, repoId, preMergeSha, workTipSha, cleanMergeSha, hostMerge,
+                project.Audit.MergeScopeBufferLines, ct);
+            await UpdateHostBaseRefAsync(repoId, baseBranch, cleanMergeSha, preMergeSha, ct);
+            return (cleanMergeSha, null);
+        }
+
+        // Conflict path only. The agentic resolver runs the agent CLI inside
+        // the merge sandbox and needs both auth and egress, so always bake
+        // creds + open network for the merge sandbox (the pre-#168 conditional
+        // that nulled the credential when hostMerge.HasConflicts was wrong: it
+        // assumed the conflict path resolved text-only from the host).
         var mergeCredential = credential;
         var isolatedMergeRepoPath = hostMerge.HasConflicts
             ? await CreateIsolatedMergeRepositoryAsync(repoId, item.Id, ct)
@@ -11018,92 +11052,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             else
             {
-                AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
-                var mergePrompt = BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
-                mergePrompt = await ProcessAgentPromptAsync(
-                    item.Id,
-                    runner.Kind,
-                    AgentPromptPhase.Merge,
-                    1,
-                    project,
-                    sandbox,
-                    mergePrompt,
-                    ct);
-                var mergeExecScope = await TimingScope.BeginAsync(
-                    _timings, item.Id, "merge", "agent.exec",
-                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-                    log: _log,
-                    activitySource: CodeyBoxActivities.Pipeline);
-                var canCaptureMergeStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "merge", ct);
-                var mergeStreamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
-                    ? await BeginAgentStreamCaptureAsync(item.Id, "merge", 1, ct)
-                    : null;
-                mergeStructuredStreamCaptured = canCaptureMergeStructuredStream;
-                var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
-                // Decouple from AgentStreams when the runner's session-id
-                // extractor needs structured output (see work-phase comment).
-                var mergeNeedsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
-                var supervision = await StartAgentSupervisionSessionAsync(
-                    item.Id,
-                    project,
-                    "merge",
-                    1,
-                    runner,
-                    item.AgentInstanceId,
-                    item.ModelId,
-                    item.ReasoningMode,
-                    sandbox,
-                    SandboxConventions.WorkDir,
-                    source: "pipeline",
-                    ct);
-                using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                try
-                {
-                    await using (mergeExecScope)
-                    {
-                        var captureMergeStream = canCaptureMergeStructuredStream || mergeNeedsStreamForResume;
-                        var runTask = supervision is null
-                            ? runner.RunAsync(sandbox, SandboxConventions.WorkDir, mergePrompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
-                                stdoutChunkCallback: mergeStdoutCallback,
-                                captureStructuredStream: captureMergeStream)
-                            : AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
-                                runner,
-                                sandbox,
-                                SandboxConventions.WorkDir,
-                                mergePrompt,
-                                mergeCredential,
-                                item.ModelId,
-                                item.ReasoningMode,
-                                supervision,
-                                mergeStdoutCallback,
-                                captureMergeStream,
-                                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
-                                    item.Id, runner.Kind, AgentPromptPhase.Merge,
-                                    1, project, sandbox, raw, pct),
-                                runnerCts.Token);
-                        var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
-                        if (completed != runTask)
-                        {
-                            await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
-                            completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
-                            if (completed != runTask)
-                                await runnerCts.CancelAsync();
-                        }
-
-                        agentResult = await runTask;
-                        if (hostShutdownToken.IsCancellationRequested)
-                            throw new OperationCanceledException(hostShutdownToken);
-                    }
-                }
-                finally
-                {
-                    if (mergeStreamCapture is not null)
-                        await mergeStreamCapture.DisposeAsync();
-                    if (supervision is not null)
-                        await supervision.DisposeAsync();
-                }
-                mergeExecElapsedMs = mergeExecScope.ElapsedMs;
-                mergeEndedAt = DateTimeOffset.UtcNow;
+                // Unreachable: a clean (non-conflicting) merge is completed
+                // host-side at the top of this method and returns before any
+                // sandbox is created, so by here hostMerge.HasConflicts is
+                // always true. Kept as a guard so a future refactor that drops
+                // the early return fails loudly instead of silently skipping
+                // the merge.
+                throw new InvalidOperationException(
+                    "unreachable: a clean merge is completed host-side before the merge sandbox is created");
             }
             CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
                 new KeyValuePair<string, object?>("agent.kind", chosenMergeRunner.Kind.Value),
@@ -11263,29 +11219,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             else
             {
-                mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
-                try
-                {
-                    await VerifyMergeResultAgainstHostAsync(
-                        item.Id,
-                        repoId,
-                        preMergeSha,
-                        workTipSha,
-                        mergeSha,
-                        hostMerge,
-                        project.Audit.MergeScopeBufferLines,
-                        ct,
-                        project,
-                        runner,
-                        credential,
-                        sandbox);
-                    await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
-                }
-                finally
-                {
-                    await DeleteHostRefBestEffortAsync(repoId, verificationRef, CancellationToken.None);
-                }
+                // Unreachable: see the clean-merge early return at the top of
+                // the method — a clean merge never enters the sandbox path.
+                throw new InvalidOperationException(
+                    "unreachable: a clean merge is completed host-side before the merge sandbox is created");
             }
 
             if (mergeSuggestionsJson is not null)
@@ -11878,86 +11815,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private sealed record MergeSecurityReviewJson(List<MergeSecurityReviewFindingJson>? Findings);
     private sealed record MergeSecurityReviewFindingJson(string? Title, string? Description, string? Location);
-
-    private static string BuildMergePrompt(
-        string baseBranch,
-        string workBranch,
-        GitMergeTreeResult hostMerge,
-        int bufferLines)
-    {
-        var scopeContract = hostMerge.HasConflicts
-            ? $"""
-
-        Host-side git detected content conflicts in these files:
-        {string.Join('\n', hostMerge.ConflictedFiles.Select(f => $"          - {f}"))}
-
-        Conflict scope contract:
-          - You may modify ONLY lines within the conflict hunks in those files.
-          - A buffer of +/-{bufferLines} lines around each hunk is permitted only for mechanical adjustments.
-          - You MAY NOT add, delete, or rename files.
-          - You MAY NOT modify any file outside the conflict list.
-          - Out-of-scope changes will be rejected by deterministic host verification.
-        """
-            : """
-
-        Host-side git predicts this merge is clean. Your final commit tree must
-        match the host `git merge-tree --write-tree` result exactly.
-        """;
-        return $$"""
-        # Merge task
-
-        You are operating inside a sandbox at /work that contains a clone of a
-        git repository. Your task: merge branch `{{workBranch}}` into branch `{{baseBranch}}`.
-        {{scopeContract}}
-
-        Constraints:
-          - DO NOT push. The orchestrator pushes after verifying your work.
-          - DO NOT amend or rebase the existing history.
-          - DO NOT delete or comment out code to make conflicts go away.
-          - DO NOT take one side blindly when resolving — read both versions
-            and preserve the intent of each.
-          - Every commit message MUST include the Co-Authored-By trailer below,
-            separated from the subject by a blank line.
-
-        Co-Authored-By trailer (copy exactly into every commit message):
-
-            {{CodeyBoxTrailers.CoAuthoredBy}}
-
-        Steps:
-          1. `git fetch origin` (already done by the orchestrator, but safe to repeat)
-          2. Confirm you are on `{{baseBranch}}`: `git branch --show-current`
-          3. Merge using a portable commit message file (works with sh/dash/bash):
-             ```
-             printf 'codeybox: merge {{workBranch}}\n\n{{CodeyBoxTrailers.CoAuthoredBy}}\n' > /tmp/merge-msg.txt
-             git merge --no-ff origin/{{workBranch}} -F /tmp/merge-msg.txt
-             ```
-          4. If the merge succeeds without conflicts, you are done. Verify with
-             `git log --oneline -3` and exit.
-          5. If there are conflicts:
-             a. List conflicting files: `git status`
-             b. For each file, read both sides (look for `<<<<<<<`, `=======`, `>>>>>>>`)
-             c. Resolve carefully, preserving both sides' intent
-             d. `git add <file>` for each resolved file
-             e. Commit using the same portable approach:
-                ```
-                printf 'codeybox: merge {{workBranch}}\n\n{{CodeyBoxTrailers.CoAuthoredBy}}\n' > /tmp/merge-msg.txt
-                git commit -F /tmp/merge-msg.txt
-                ```
-             f. Verify: `git status` should be clean; `git log --oneline -3`
-
-        If during your merge you notice adjacent issues that are out of scope — bugs
-        you saw, gaps in tests, missing validation, dead code — write them to
-        `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`).
-        Do **not** fix them here; the operator will triage. If you have nothing to
-        suggest, do not create the file.
-
-        After committing, exit. The orchestrator will:
-          - run `git status --porcelain` (must be empty)
-          - confirm HEAD is on `{{baseBranch}}`
-          - confirm `{{workBranch}}` is reachable from HEAD
-          - push `{{baseBranch}}` back to the host bare repo
-        """;
-    }
 
     private async Task RunUpstreamPushPhaseAsync(
         WorkItem item,

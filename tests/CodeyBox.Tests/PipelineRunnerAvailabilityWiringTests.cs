@@ -629,22 +629,36 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // unmitigated. Pin the merge path independently so a removed/wrong-
         // phase-name detector call there can't pass off the work-phase test
         // as full coverage.
+        //
+        // A clean merge now runs entirely host-side with no agent, so the
+        // merge-phase auth detector only fires on the agentic conflict-resolver
+        // path. Induce a real conflict (work branch + main both touch README)
+        // so the resolver agent runs; it returns exit 0 with a captured login
+        // prompt — the silent-broken-agent shape from the antigravity outage,
+        // now surfacing inside the merge-resolver call site.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
-        // Work phase succeeds; merge phase returns exit 0 with a captured
-        // login prompt — the silent-broken-agent shape from the antigravity
-        // outage, but inside the merge call site.
-        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
-        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+        // The work phase is already complete (AuditPassed) so the single
+        // ScriptedFailures entry is consumed by the merge resolver, not work.
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
             Stdout: null,
             Stderr: transcript));
 
-        var item = NewItem(AgentKind.Codex);
+        var item = NewItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/merge-stderr-auth-" + Guid.NewGuid().ToString("N")[..8],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchAsync(barePath, item.WorkBranch!, "README.md", "work side\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main side\n", "main readme");
+
         await fix.Store.CreateAsync(item);
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
@@ -671,19 +685,32 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     [Fact]
     public async Task MergePhaseDirectAgentRun_WithNonzeroAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
+        // Distinct from the stderr/exit-0 variant above: an exit-1 merge
+        // resolver run whose login prompt is on STDOUT. The merge-resolver
+        // auth detector must catch it before downstream quota/transient
+        // classifiers swallow the auth signal. Same conflict setup so the
+        // agentic resolver actually runs the agent.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
-        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
-        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: false,
             Summary: "agent exited 1",
             Stdout: transcript,
             Stderr: null));
 
-        var item = NewItem(AgentKind.Codex);
+        var item = NewItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/merge-nonzero-auth-" + Guid.NewGuid().ToString("N")[..8],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchAsync(barePath, item.WorkBranch!, "README.md", "work side\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main side\n", "main readme");
+
         await fix.Store.CreateAsync(item);
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
@@ -1215,27 +1242,37 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     public async Task MergePhaseFastFail_ExcludesAgent_AndPublishesWebhookWithMergeContext()
     {
         // Pin the second RecordRunOutcome call site in PipelineRunner —
-        // RunAgentMergePhaseAsync, which fires *after* the work phase has
-        // already reset the fast-fail counter to 0 on a successful work-phase
-        // exit. A regression that deletes the merge-phase block (or wires it
-        // to the wrong stopwatch/event name) would leave the counter at 0
-        // because the work-phase reset masks the merge-phase fast-fail.
+        // RunAgentMergePhaseAsync's agentic-conflict-resolver path. A
+        // regression that deletes the merge-phase block (or wires it to the
+        // wrong stopwatch/event name) would leave the counter at 0 and never
+        // bench the agent.
         //
-        // Build a fixture with MaxConsecutiveFastFails=1 so a single merge-
-        // phase fast-fail trips the breaker. The work phase succeeds (counter
-        // ← 0); then the merge phase returns a non-quota, sub-threshold
-        // failure (counter ← 1 = threshold, exclusion + webhook fire).
+        // A clean merge now runs host-side with no agent and cannot fast-fail,
+        // so the merge sandbox + agent run only exist on the conflict path.
+        // Induce a real README conflict so the resolver agent runs and returns
+        // a non-quota, sub-threshold failure. With MaxConsecutiveFastFails=1 a
+        // single merge fast-fail trips the breaker (counter ← 1 = threshold,
+        // exclusion + webhook fire). The work phase is already complete so the
+        // single ScriptedFailures entry is consumed by the merge resolver.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed, maxConsecutiveFastFails: 1);
 
-        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
-        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: false,
             Summary: "agent exited 2",
             Stdout: null,
             Stderr: "panic: fatal merge agent runtime crash"));
 
-        var item = NewItem(AgentKind.Codex);
+        var item = NewItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/merge-fastfail-" + Guid.NewGuid().ToString("N")[..8],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchAsync(barePath, item.WorkBranch!, "README.md", "work side\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main side\n", "main readme");
+
         await fix.Store.CreateAsync(item);
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
@@ -1268,29 +1305,45 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     [Fact]
     public async Task MergePhaseInfrastructureFailure_DoesNotFeedFastFailBreaker()
     {
-        // Pin the merge-phase branch of the infra filter separately: the work
-        // phase succeeds, then merge sees a missing-binary-shaped failure. Even
-        // with a threshold of 1, this must not bench the agent.
+        // Pin the merge-phase branch of the infra filter separately: a clean
+        // merge runs host-side with no agent, so a merge-phase infra failure
+        // can only arise on the agentic conflict-resolver path. Induce a real
+        // README conflict so the resolver agent runs and returns a
+        // missing-binary-shaped failure. Even with a threshold of 1, this must
+        // not bench the agent. The work phase is already complete (AuditPassed)
+        // so the single ScriptedFailures entry is consumed by the merge resolver.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed, maxConsecutiveFastFails: 1);
 
-        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
-        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: false,
             Summary: "agent exited 127",
             Stdout: null,
             Stderr: "env: 'codex': No such file or directory"));
 
-        var item = NewItem(AgentKind.Codex);
+        var item = NewItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/merge-infra-nobench-" + Guid.NewGuid().ToString("N")[..8],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchAsync(barePath, item.WorkBranch!, "README.md", "work side\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main side\n", "main readme");
+
         await fix.Store.CreateAsync(item);
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
-        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
 
-        var snap = fix.Registry.Snapshot().Single(s => s.Agent == AgentKind.Codex);
-        Assert.Equal(0, snap.ConsecutiveFastFails);
+        // An infra failure must not touch the breaker. Because work is skipped
+        // here, the agent may have no snapshot row at all — equivalent to zero
+        // fast-fails. A non-zero ConsecutiveFastFails would mean the merge infra
+        // failure leaked into the breaker.
+        var snap = fix.Registry.Snapshot().SingleOrDefault(s => s.Agent == AgentKind.Codex);
+        Assert.True(snap is null || snap.ConsecutiveFastFails == 0);
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 

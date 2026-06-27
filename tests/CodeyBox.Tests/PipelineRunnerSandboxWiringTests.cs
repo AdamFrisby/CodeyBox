@@ -104,14 +104,28 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             AgentAllowedHosts = [MarkerHost],
         };
 
+        // A clean (non-conflicting) merge is now completed entirely host-side
+        // with no sandbox, so it builds no merge spec to inspect. The merge
+        // sandbox is created ONLY on the agentic conflict-resolver path; induce
+        // a real conflict (work writes README, the auditor advances main's
+        // README during audit) so RunAgentMergePhaseAsync reaches
+        // BuildSandboxSpec(... timingPhase: "merge" ...) — the call site whose
+        // credential + open-network wiring this test pins.
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main\n");
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
+            auditors: [auditor],
             pipelineOptions: pipelineOptions,
             credentials: new MarkerCredentialProvider(),
             sandboxProvider: recorder);
+        auditor.GitRoot = tp.GitRoot;
 
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("merge.txt", "merge\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(_ => new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["README.md"] = "main\nwork\n",
+        });
         var item = NewItem("feature/merge-wiring");
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
@@ -244,6 +258,50 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         WorkBranch = workBranch,
         PushUpstream = false,
     };
+
+    /// <summary>
+    /// Tool auditor that advances <c>main</c>'s copy of a file during the audit
+    /// phase, so a work branch touching the same file merges with a conflict —
+    /// routing the merge phase through the agentic conflict resolver, which
+    /// builds the merge sandbox this test inspects.
+    /// </summary>
+    private sealed class MainAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MainAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            return new AuditResult(true, []);
+        }
+    }
 
     /// <summary>
     /// Returns a credential with a single marker env var so the recorded
