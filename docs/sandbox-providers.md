@@ -226,13 +226,101 @@ Three ways to install what your project needs:
    your install set is heavy enough that the per-profile baseline bake
    gets long.
 
+## `multipass-remote` — same kernel isolation, VM execution off-box
+
+Drives `multipass` on a REMOTE host over SSH while the orchestrator
+brain — work-item DB, dispatch loop, agent stream capture — stays local.
+This is "CHEAP-PATH distributed VMs, step 1 of 2": one orchestrator
+process, one SQLite database, sandboxes elsewhere. Lets you scale VM
+throughput by adding a beefy remote host without re-architecting the
+orchestrator into a multi-process service.
+
+**Provider name:** `multipass-remote`.
+
+**Architecture.** Every `multipass` command (launch / exec / mount /
+stop / delete / info / list) is issued through an `IRemoteHostTransport`
+seam. The default implementation is OpenSSH — the orchestrator already
+ships with `ssh` on every supported OS, no managed dependency required,
+and the existing `IProcessRunner` infrastructure already streams the
+child process's stdout/stderr line-by-line. That's exactly what
+`AgentStreamCapture` needs so the agent CLI's output is visible on the
+orchestrator host in real time, not after the remote command exits.
+
+**Bind mounts.** Host-side bind-mount sources (e.g. the per-item bare
+git repo from `LocalGitHost`) are staged to a per-sandbox directory
+under `RemoteStagingRoot` via `tar | ssh tar`, then attached to the
+remote VM with `multipass mount`. Writable mounts are synced BACK on
+disposal (host ← remote) so the merge phase on the orchestrator host
+sees commits the in-VM agent pushed. Read-only mounts skip the sync-back.
+
+**Git remotes.** The orchestrator's `IGitHost` still issues a
+`CloneUrlInsideSandbox` of `/repo`; that's the same shape local multipass
+sees. The per-item bare repo is what gets staged across to the remote
+host, so the in-VM `git clone /repo /work` works identically. After the
+work phase, the bare repo is synced back to the host before the staging
+dir is deleted. No remote git-daemon or SSH reverse tunnel is required
+in this iteration.
+
+**Failure classification.** OpenSSH reserves exit code 255 for "the SSH
+client itself failed before the remote command even ran" — connection
+refused, auth rejected, network partition, key permission error. The
+transport raises `RemoteSshTransportException` on that code; the
+orchestrator maps it to a sandbox-level failure (recoverable: re-pickup
+the work item) rather than an agent crash. A remote command running and
+returning non-zero (an agent CLI failure, a build error, etc.) is
+returned as a normal `SandboxExecResult.ExitCode`, exactly like local
+multipass.
+
+**Setup.**
+1. Install OpenSSH on the orchestrator host (almost always already
+   there).
+2. On the remote host: `snap install multipass`. Same install command as
+   for local multipass, same `MultipassExtraRuncmd` baseline-bake
+   workflow when you switch in step 2.
+3. Provision an SSH key for the orchestrator that authorizes a
+   non-interactive user on the remote host. Use a key dedicated to
+   CodeyBox so revocation has clean blast radius.
+4. Add to the host's `~/.ssh/known_hosts` (or leave `AcceptUnknownHostKeys=true`
+   on first contact — see config below).
+5. Set the config block:
+
+   ```jsonc
+   {
+     "CodeyBox": {
+       "SandboxProvider": "multipass-remote",
+       "MultipassRemoteSandbox": {
+         "SshTarget": "codeybox@remote.example.com",
+         "SshKeyPath": "/etc/codeybox/ssh/id_ed25519",
+         "RemoteMultipassPath": "/snap/bin/multipass",
+         "RemoteStagingRoot": "/home/codeybox/snap/multipass/common/codeybox-remote-staging",
+         "DefaultImage": "24.04"
+       }
+     }
+   }
+   ```
+
+**Hot reload.** Every field on `MultipassRemoteSandbox` is read fresh on
+each `CreateAsync` via `IOptionsMonitor`, so rotating an SSH key or
+re-pointing at a different remote host takes effect on the next sandbox
+launch without an orchestrator restart.
+
+**Scope (step 1 of 2).** This provider deliberately does NOT implement:
+baseline image bake/clone, suspend/resume, host-shutdown teardown,
+disk-guard preflight, package-cache seeding. Those host-side concerns
+either don't translate cleanly to a remote host without further design
+(suspend/resume needs network-stable VM identity across orchestrator
+restarts; baselines need a per-remote-host cache) or are operator-tuning
+concerns deferred until the basic distributed-VM path is working
+end-to-end. Step 2 picks those up.
+
 ## Choosing
 
-| Use case                                                    | Pick           |
-|-------------------------------------------------------------|----------------|
-| Local development of the orchestrator itself                | `process`      |
-| Pre-prod / trusted prompts / "just give me a sandbox"       | `bubblewrap`   |
-| **Production on Ubuntu / kernel isolation**                 | **`multipass`**|
+| Use case                                                    | Pick                |
+|-------------------------------------------------------------|---------------------|
+| Local development of the orchestrator itself                | `process`           |
+| Pre-prod / trusted prompts / "just give me a sandbox"       | `bubblewrap`        |
+| **Production on Ubuntu / kernel isolation**                 | **`multipass`**     |
+| Production where VM throughput needs a separate host        | `multipass-remote`  |
 
 ## Adding a new provider
 

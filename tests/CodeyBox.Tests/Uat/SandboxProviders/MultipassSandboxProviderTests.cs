@@ -1473,8 +1473,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdin: "retry-token-line-that-must-be-drained\n" + new string('x', 1024 * 1024));
         await Task.Delay(200);
 
-        Assert.Equal(0, first.Exit);
-        Assert.Equal(0, second.Exit);
+        Assert.True(
+            first.Exit == 0,
+            $"first launch exited {first.Exit}; stderr=<{first.Stderr}>; stdout=<{first.Stdout}>");
+        Assert.True(
+            second.Exit == 0,
+            $"second launch exited {second.Exit}; stderr=<{second.Stderr}>; stdout=<{second.Stdout}>");
         Assert.Equal("run", await File.ReadAllTextAsync(countFile));
     }
 
