@@ -3256,7 +3256,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Equal(1, result.ExitCode);
+        Assert.Contains("agent output transport produced nothing / detached run reported no exit", result.Stderr);
         Assert.Contains("detached exec process group 12345 exited without authenticated exit completion", result.Stderr);
+        var classification = AgentFailureClassifier.Classify(result.Stderr, result.Stdout, $"agent exited {result.ExitCode}");
+        Assert.Equal(AgentFailureKind.TransientNetwork, classification.Kind);
     }
 
     [Fact]
