@@ -257,6 +257,32 @@ internal sealed class CodeyBoxClient
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
+    internal async Task<string> PutPromptAsync(string id, string prompt, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            token => _http.PutAsJsonAsync(
+                $"/workitems/{Uri.EscapeDataString(id)}/prompt",
+                new PutPromptRequest(prompt),
+                CliJsonContext.Default.PutPromptRequest,
+                token),
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
+    internal async Task<string> PatchPriorityAsync(string id, int priority, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            token => _http.PatchAsJsonAsync(
+                $"/workitems/{Uri.EscapeDataString(id)}/priority",
+                new PatchPriorityRequest(priority),
+                CliJsonContext.Default.PatchPriorityRequest,
+                token),
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     private async Task<string> GetRawAsync(string path, CancellationToken ct)
     {
         var resp = await SendAsync(token => _http.GetAsync(path, token), ct);

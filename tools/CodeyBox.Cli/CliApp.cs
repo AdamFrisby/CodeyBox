@@ -55,6 +55,8 @@ internal static class CliApp
         queueCmd.AddCommand(QueueStatus.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueReorder.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueTemplate.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueuePrompt.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueuePriority.Build(apiUrlOpt, apiKeyOpt, clientFactory));
 
         root.AddCommand(queueCmd);
         root.AddCommand(WorkersCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
