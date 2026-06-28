@@ -17,10 +17,11 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 public interface IVisualWait
 {
     /// <summary>
-    /// Wait for the screen to settle (when <paramref name="predicate"/> is
-    /// null) or for the predicate to return true on a captured screenshot.
-    /// Returns the last captured screenshot on success, or null when the
-    /// wait timed out.
+    /// Wait for the screen to settle. When <paramref name="predicate"/> is
+    /// supplied, a matching screenshot may return early, but implementations
+    /// may still return a stable non-matching frame so the caller can run a
+    /// richer assertion verifier and report a precise mismatch. Returns the
+    /// selected screenshot on success, or null when the wait timed out.
     /// </summary>
     Task<byte[]?> WaitAsync(
         ISandbox sandbox,

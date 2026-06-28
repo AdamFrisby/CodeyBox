@@ -5,8 +5,8 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 
 /// <summary>
 /// Replays a recorded (or trimmed) <see cref="SessionTrace"/> against a
-/// live <see cref="ISandbox"/> as a regression test, driving the app with
-/// real keyboard / mouse input via <see cref="ComputerUseBridge"/> — never
+/// fresh <see cref="AppUnderTestSession"/> as a regression test, driving the
+/// app with real keyboard / mouse input via <see cref="ComputerUseBridge"/> - never
 /// synthetic selector dispatch.
 ///
 /// <para>For each step the engine:</para>
@@ -28,7 +28,7 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// </list>
 ///
 /// <para>The engine is stateless: it owns nothing across calls and can be
-/// reused / fanned out across many sandboxes in parallel. The recorded
+/// reused / fanned out across many harness sessions in parallel. The recorded
 /// screenshot for visual-match assertions flows through
 /// <see cref="IAssertionVerifier.VerifyAsync"/> as a parameter, not through
 /// a shared mutable property — so a single verifier instance is safe to
@@ -41,16 +41,17 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// </summary>
 public sealed class ReplayEngine
 {
-    private readonly ComputerUseBridge _bridge;
+    private readonly Func<ComputerUseBridge> _bridgeFactory;
     private readonly IElementLocator _locator;
-    private readonly IReachabilityChecker _reachability;
+    private readonly IReachabilityChecker? _reachability;
     private readonly IVisualWait _visualWait;
     private readonly IAssertionVerifier _assertions;
     private readonly ILocatorHealer? _healer;
+    private readonly IAccessibilityMatcher _accessibilityMatcher;
     private readonly TimeProvider _timeProvider;
 
     public ReplayEngine(
-        ComputerUseBridge bridge,
+        Func<ComputerUseBridge>? bridgeFactory = null,
         IElementLocator? locator = null,
         IReachabilityChecker? reachability = null,
         IVisualWait? visualWait = null,
@@ -59,7 +60,7 @@ public sealed class ReplayEngine
         IAccessibilityMatcher? accessibilityMatcher = null,
         TimeProvider? timeProvider = null)
     {
-        _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
+        _bridgeFactory = bridgeFactory ?? (() => new ComputerUseBridge());
         var matcher = accessibilityMatcher ?? DefaultAccessibilityMatcher.Instance;
         // Default chain: accessibility-tree recognition first (cheap, exact),
         // then visual-signature recognition for canvas / 3D / untagged targets
@@ -69,19 +70,41 @@ public sealed class ReplayEngine
         _locator = locator ?? new CompositeElementLocator(
             new AccessibilityElementLocator(matcher),
             new VisualSignatureElementLocator());
-        _reachability = reachability ?? new ReachabilityChecker(_bridge, _locator, matcher);
+        _reachability = reachability;
         _visualWait = visualWait ?? new ScreenshotStabilityWait(timeProvider);
         _assertions = assertions ?? new DefaultAssertionVerifier();
         _healer = healer;
+        _accessibilityMatcher = matcher;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
-    /// Replay <paramref name="trace"/> against <paramref name="sandbox"/>
-    /// and return a structured <see cref="ReplayResult"/>. The first failed
-    /// step terminates the replay; remaining steps are not attempted.
+    /// Launch a fresh harness session, replay <paramref name="trace"/>, and
+    /// tear the session down. This is the production boundary: every replay
+    /// gets its own seeded app instance and per-session input driver.
     /// </summary>
     public async Task<ReplayResult> ReplayAsync(
+        IAppUnderTestHarness harness,
+        WebAppRecipe recipe,
+        SessionTrace trace,
+        ReplayOptions? options = null,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(harness);
+        ArgumentNullException.ThrowIfNull(recipe);
+        ArgumentNullException.ThrowIfNull(trace);
+
+        await using var session = await harness.LaunchAsync(recipe, ct).ConfigureAwait(false);
+        return await ReplaySessionAsync(session.Sandbox, session.ComputerUse, trace, options, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Test seam for replaying against an already-created sandbox. Production
+    /// callers should use the harness overload so seeded-state and lifecycle
+    /// isolation cannot be bypassed.
+    /// </summary>
+    internal async Task<ReplayResult> ReplayAsync(
         ISandbox sandbox,
         SessionTrace trace,
         ReplayOptions? options = null,
@@ -90,7 +113,20 @@ public sealed class ReplayEngine
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(trace);
 
+        var bridge = _bridgeFactory()
+            ?? throw new InvalidOperationException("ReplayEngine bridge factory returned null.");
+        return await ReplaySessionAsync(sandbox, bridge, trace, options, ct).ConfigureAwait(false);
+    }
+
+    private async Task<ReplayResult> ReplaySessionAsync(
+        ISandbox sandbox,
+        ComputerUseBridge bridge,
+        SessionTrace trace,
+        ReplayOptions? options,
+        CancellationToken ct)
+    {
         var opts = options ?? new ReplayOptions();
+        var reachability = _reachability ?? new ReachabilityChecker(bridge, _locator, _accessibilityMatcher);
         var start = _timeProvider.GetUtcNow();
         var steps = new List<ReplayStepResult>(trace.Entries.Count);
 
@@ -98,7 +134,8 @@ public sealed class ReplayEngine
         {
             ct.ThrowIfCancellationRequested();
 
-            var step = await ReplayStepAsync(sandbox, entry, opts, ct).ConfigureAwait(false);
+            var step = await ReplayStepAsync(sandbox, bridge, reachability, entry, opts, ct)
+                .ConfigureAwait(false);
             steps.Add(step);
             if (!step.Passed)
             {
@@ -122,6 +159,8 @@ public sealed class ReplayEngine
 
     private async Task<ReplayStepResult> ReplayStepAsync(
         ISandbox sandbox,
+        ComputerUseBridge bridge,
+        IReachabilityChecker reachability,
         TraceEntry entry,
         ReplayOptions options,
         CancellationToken ct)
@@ -130,18 +169,24 @@ public sealed class ReplayEngine
 
         if (action.Kind == "screenshot")
         {
-            return await RunScreenshotStepAsync(sandbox, entry, ct).ConfigureAwait(false);
+            return await RunScreenshotStepAsync(sandbox, entry, options, ct).ConfigureAwait(false);
         }
 
         LocatedTarget? located = null;
+        var effectiveDescriptor = action.TargetDescriptor;
         if (NeedsLocator(action.Kind))
         {
-            located = await _locator.LocateAsync(sandbox, action.TargetDescriptor, options, ct)
+            located = await _locator.LocateAsync(sandbox, effectiveDescriptor, options, ct)
                 .ConfigureAwait(false);
 
             if (located is null && _healer is not null)
             {
-                located = await _healer.HealAsync(sandbox, entry, options, ct).ConfigureAwait(false);
+                var healed = await _healer.HealAsync(sandbox, entry, options, ct).ConfigureAwait(false);
+                if (healed is not null)
+                {
+                    located = healed.Target;
+                    effectiveDescriptor = healed.UpdatedDescriptor ?? effectiveDescriptor;
+                }
             }
 
             if (located is null)
@@ -149,7 +194,7 @@ public sealed class ReplayEngine
                 return await FailAsync(
                     sandbox, entry,
                     ReplayFailureKind.NotFound,
-                    $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): recorded target not found on current screen (descriptor={DescribeDescriptor(action.TargetDescriptor)})",
+                    $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): recorded target not found on current screen (descriptor={DescribeDescriptor(effectiveDescriptor)})",
                     locatedTarget: null,
                     ct).ConfigureAwait(false);
             }
@@ -157,8 +202,8 @@ public sealed class ReplayEngine
             ReachabilityOutcome reach;
             try
             {
-                reach = await _reachability.EnsureReachableAsync(
-                    sandbox, located, action.TargetDescriptor, options, ct).ConfigureAwait(false);
+                reach = await reachability.EnsureReachableAsync(
+                    sandbox, located, effectiveDescriptor, options, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -190,7 +235,7 @@ public sealed class ReplayEngine
 
         try
         {
-            await DispatchActionAsync(sandbox, action, located, ct).ConfigureAwait(false);
+            await DispatchActionAsync(sandbox, bridge, action, located, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -302,12 +347,14 @@ public sealed class ReplayEngine
     private async Task<ReplayStepResult> RunScreenshotStepAsync(
         ISandbox sandbox,
         TraceEntry entry,
+        ReplayOptions options,
         CancellationToken ct)
     {
-        ComputerUseResult bridgeResult;
+        byte[]? current;
         try
         {
-            bridgeResult = await _bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "screenshot" }, ct)
+            current = await _visualWait
+                .WaitAsync(sandbox, BuildExpectedStatePredicate(entry), options, ct)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -323,12 +370,17 @@ public sealed class ReplayEngine
                 ct).ConfigureAwait(false);
         }
 
+        if (current is null)
+        {
+            return await FailAsync(
+                sandbox, entry, ReplayFailureKind.WaitTimeout,
+                $"step {entry.Sequence} (screenshot): screen did not settle within {options.VisualWaitTimeout}",
+                locatedTarget: null,
+                ct).ConfigureAwait(false);
+        }
+
         if (entry.Assertion is { } assertion)
         {
-            // Reuse the bridge's captured frame instead of issuing a second
-            // GetScreenshotAsync — two captures can disagree on a moving UI
-            // and the user only asked for one screenshot at this checkpoint.
-            var current = bridgeResult.ScreenshotPng;
             var accessibility = AssertionConsumesAccessibilityTree(assertion)
                 ? await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
                 : null;
@@ -396,12 +448,13 @@ public sealed class ReplayEngine
 
     private async Task DispatchActionAsync(
         ISandbox sandbox,
+        ComputerUseBridge bridge,
         TraceAction action,
         LocatedTarget? located,
         CancellationToken ct)
     {
         var request = BuildRequestForReplay(action, located);
-        await _bridge.ExecuteAsync(sandbox, request, ct).ConfigureAwait(false);
+        await bridge.ExecuteAsync(sandbox, request, ct).ConfigureAwait(false);
     }
 
     private static ComputerUseRequest BuildRequestForReplay(TraceAction action, LocatedTarget? located)
@@ -426,7 +479,7 @@ public sealed class ReplayEngine
                 X = located!.CenterX,
                 Y = located.CenterY,
             },
-            "scroll" => BuildScrollRequest(action),
+            "scroll" => BuildScrollRequest(action, located),
             "key" => new ComputerUseRequest
             {
                 Action = "key",
@@ -446,7 +499,7 @@ public sealed class ReplayEngine
         };
     }
 
-    private static ComputerUseRequest BuildScrollRequest(TraceAction action)
+    private static ComputerUseRequest BuildScrollRequest(TraceAction action, LocatedTarget? located)
     {
         // The bridge resolves the scroll event from (ScrollX ?? X, ScrollY ?? Y)
         // and the validator rejects events with both axes non-zero. We:
@@ -489,6 +542,29 @@ public sealed class ReplayEngine
             if (Math.Abs(sx) > Math.Abs(sy)) sy = 0;
             else sx = 0;
         }
+        if (located is not null)
+        {
+            return new ComputerUseRequest
+            {
+                Action = "events",
+                Events =
+                [
+                    new SandboxInputEvent
+                    {
+                        Type = SandboxInputEventType.Move,
+                        X = located.CenterX,
+                        Y = located.CenterY,
+                    },
+                    new SandboxInputEvent
+                    {
+                        Type = SandboxInputEventType.Scroll,
+                        X = sx == 0 ? null : sx,
+                        Y = sy == 0 ? null : sy,
+                    },
+                ],
+            };
+        }
+
         return new ComputerUseRequest
         {
             Action = "scroll",
@@ -541,11 +617,6 @@ public sealed class ReplayEngine
                 return (x, y);
             }
         }
-        // Fall back to the recorded descriptor's centre when no Click/Move is
-        // present — covers events sequences that only carry keyboard input.
-        var region = action.TargetDescriptor.Visual.Region;
-        if (region.Width > 0 && region.Height > 0)
-            return (region.X + region.Width / 2, region.Y + region.Height / 2);
         return null;
     }
 
@@ -581,7 +652,7 @@ public sealed class ReplayEngine
     }
 
     private static bool NeedsLocator(string actionKind) =>
-        actionKind is "click" or "double_click" or "move" or "events";
+        actionKind is "click" or "double_click" or "move" or "events" or "scroll" or "key" or "type";
 
     private async Task<ReplayStepResult> FailAsync(
         ISandbox sandbox,

@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using System.Text.Json;
 
 namespace CodeyBox.ExploratoryTesting.Replay;
 
@@ -7,9 +8,12 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 ///
 /// <list type="number">
 ///   <item>If the descriptor carries at least one non-empty accessibility
-///   field (role, name, text, or element-type), probe at the recorded centre
-///   with <see cref="ISandbox.GetAccessibilityAtPointAsync"/>. On a match,
-///   return a high-confidence hit at the recorded centre.</item>
+///   field (role, name, text, or element-type), search the current
+///   accessibility tree for a matching node with bounds. On a match, return a
+///   high-confidence hit at the node's current centre.</item>
+///   <item>If the tree has no usable bounded match, probe at the recorded
+///   centre with <see cref="ISandbox.GetAccessibilityAtPointAsync"/>. On a
+///   match, return a hit at that point.</item>
 ///   <item>If the point probe misses, scan outward in concentric square rings
 ///   at <see cref="ReplayOptions.RingSearchStep"/>-pixel granularity up to
 ///   <see cref="ReplayOptions.RingSearchRadius"/> — every step-aligned cell
@@ -22,11 +26,10 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 ///   wiring includes <see cref="VisualSignatureElementLocator"/>).</item>
 /// </list>
 ///
-/// <para>The recorded centre is the central anchor for the point probe; it
-/// survives small viewport shifts but not full layout re-flows. A future
-/// vision-assisted heal seam (see <see cref="ILocatorHealer"/>) closes that
-/// gap; this locator deliberately fails fast on a layout regression rather
-/// than silently rewriting it.</para>
+/// <para>The point/ring probes are compatibility fallbacks for providers that
+/// do not yet expose tree bounds. Tree recognition is the primary path so a
+/// target that moved elsewhere on the current screen is found by identity, not
+/// by stale coordinates.</para>
 /// </summary>
 public sealed class AccessibilityElementLocator : IElementLocator
 {
@@ -64,6 +67,9 @@ public sealed class AccessibilityElementLocator : IElementLocator
 
         var region = descriptor.Visual.Region;
         var hasPoint = region.Width > 0 && region.Height > 0;
+        var treeHit = await LocateFromAccessibilityTreeAsync(sandbox, expected, ct).ConfigureAwait(false);
+        if (treeHit is not null) return treeHit;
+
         if (!hasPoint) return null;
 
         var cx = region.X + region.Width / 2;
@@ -96,7 +102,6 @@ public sealed class AccessibilityElementLocator : IElementLocator
                 ct.ThrowIfCancellationRequested();
                 var px = cx + dx;
                 var py = cy + dy;
-                if (!InScreen(px, py, options)) continue;
                 var match = await ProbeAccessibilityAsync(sandbox, px, py, expected, ct).ConfigureAwait(false);
                 if (match is not null)
                 {
@@ -114,9 +119,6 @@ public sealed class AccessibilityElementLocator : IElementLocator
 
         return null;
     }
-
-    private static bool InScreen(int x, int y, ReplayOptions options) =>
-        x >= 0 && x < options.ScreenWidth && y >= 0 && y < options.ScreenHeight;
 
     private async Task<SandboxAccessibilitySnapshot?> ProbeAccessibilityAsync(
         ISandbox sandbox,
@@ -145,6 +147,206 @@ public sealed class AccessibilityElementLocator : IElementLocator
         }
         if (snap is null) return null;
         return _matcher.Matches(snap, expected) ? snap : null;
+    }
+
+    private async Task<LocatedTarget?> LocateFromAccessibilityTreeAsync(
+        ISandbox sandbox,
+        TraceAccessibilityDescriptor expected,
+        CancellationToken ct)
+    {
+        string? json;
+        try
+        {
+            json = await sandbox.GetAccessibilityTreeJsonAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(json)) return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            return SearchTree(doc.RootElement, expected);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private LocatedTarget? SearchTree(JsonElement element, TraceAccessibilityDescriptor expected)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var snap = SnapshotFromObject(element);
+            if (_matcher.Matches(snap, expected) && TryReadBounds(element, out var region))
+            {
+                return new LocatedTarget
+                {
+                    CenterX = region.X + region.Width / 2,
+                    CenterY = region.Y + region.Height / 2,
+                    Region = region,
+                    Source = "accessibility-tree",
+                    Confidence = 1.0,
+                };
+            }
+
+            foreach (var property in element.EnumerateObject())
+            {
+                var hit = SearchTree(property.Value, expected);
+                if (hit is not null) return hit;
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                var hit = SearchTree(item, expected);
+                if (hit is not null) return hit;
+            }
+        }
+
+        return null;
+    }
+
+    private static SandboxAccessibilitySnapshot SnapshotFromObject(JsonElement obj) => new()
+    {
+        Role = ReadString(obj, "role", "Role", "controlType", "type"),
+        Name = ReadString(obj, "name", "Name", "label", "title", "accessibleName"),
+        Text = ReadString(obj, "text", "Text", "value", "description"),
+        ElementType = ReadString(obj, "elementType", "ElementType", "tagName", "className"),
+    };
+
+    private static bool TryReadBounds(JsonElement obj, out TraceBoundingRegion region)
+    {
+        if (TryReadRectObject(obj, out region)) return true;
+
+        foreach (var name in new[] { "bounds", "Bounds", "rect", "Rect", "boundingBox", "BoundingBox" })
+        {
+            if (!TryGetProperty(obj, name, out var child)) continue;
+            if (child.ValueKind == JsonValueKind.Object && TryReadRectObject(child, out region)) return true;
+            if (child.ValueKind == JsonValueKind.Array && TryReadRectArray(child, out region)) return true;
+        }
+
+        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+        return false;
+    }
+
+    private static bool TryReadRectObject(JsonElement obj, out TraceBoundingRegion region)
+    {
+        if (TryReadInt(obj, "x", out var x)
+            && TryReadInt(obj, "y", out var y)
+            && TryReadInt(obj, "width", out var width)
+            && TryReadInt(obj, "height", out var height)
+            && width > 0
+            && height > 0)
+        {
+            region = new TraceBoundingRegion { X = x, Y = y, Width = width, Height = height };
+            return true;
+        }
+
+        if (TryReadInt(obj, "left", out var left)
+            && TryReadInt(obj, "top", out var top)
+            && TryReadInt(obj, "right", out var right)
+            && TryReadInt(obj, "bottom", out var bottom)
+            && right > left
+            && bottom > top)
+        {
+            region = new TraceBoundingRegion
+            {
+                X = left,
+                Y = top,
+                Width = right - left,
+                Height = bottom - top,
+            };
+            return true;
+        }
+
+        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+        return false;
+    }
+
+    private static bool TryReadRectArray(JsonElement array, out TraceBoundingRegion region)
+    {
+        if (array.GetArrayLength() >= 4)
+        {
+            var values = new int[4];
+            var i = 0;
+            foreach (var item in array.EnumerateArray())
+            {
+                if (i >= 4) break;
+                if (!TryReadInt(item, out values[i]))
+                {
+                    region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+                    return false;
+                }
+                i++;
+            }
+
+            if (values[2] > 0 && values[3] > 0)
+            {
+                region = new TraceBoundingRegion
+                {
+                    X = values[0],
+                    Y = values[1],
+                    Width = values[2],
+                    Height = values[3],
+                };
+                return true;
+            }
+        }
+
+        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+        return false;
+    }
+
+    private static string? ReadString(JsonElement obj, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (TryGetProperty(obj, name, out var value) && value.ValueKind == JsonValueKind.String)
+                return value.GetString();
+        }
+        return null;
+    }
+
+    private static bool TryReadInt(JsonElement obj, string name, out int value)
+    {
+        value = 0;
+        return TryGetProperty(obj, name, out var property) && TryReadInt(property, out value);
+    }
+
+    private static bool TryReadInt(JsonElement element, out int value)
+    {
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out value))
+            return true;
+        if (element.ValueKind == JsonValueKind.String
+            && int.TryParse(element.GetString(), out value))
+            return true;
+        value = 0;
+        return false;
+    }
+
+    private static bool TryGetProperty(JsonElement obj, string name, out JsonElement value)
+    {
+        if (obj.TryGetProperty(name, out value)) return true;
+        foreach (var property in obj.EnumerateObject())
+        {
+            if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                return true;
+            }
+        }
+        value = default;
+        return false;
     }
 
     // Yields every (dx, dy) on the square ring at max(|dx|, |dy|) == radius,

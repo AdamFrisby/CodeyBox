@@ -322,6 +322,23 @@ public sealed class SessionTraceTests
     }
 
     [Fact]
+    public async Task RecordingBridge_TypeActionInheritsPreviousTargetDescriptor()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new RecordingGraphicalSandbox(SamplePng);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "type", Text = "hello world" });
+
+        var clickVisual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
+        var typeVisual = recorder.Trace.Entries[1].Action.TargetDescriptor.Visual;
+        Assert.Equal(clickVisual.Region, typeVisual.Region);
+        Assert.NotNull(typeVisual.SourceScreenshotPng);
+    }
+
+    [Fact]
     public async Task RecordingBridge_CapturesScreenshotAction()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
@@ -410,6 +427,9 @@ public sealed class SessionTraceTests
         Assert.Equal(2, entry.Action.InputEvents.Count);
         Assert.Equal(SandboxInputEventType.Move, entry.Action.InputEvents[0].Type);
         Assert.Equal(SandboxInputEventType.Click, entry.Action.InputEvents[1].Type);
+        Assert.True(entry.Action.TargetDescriptor.Visual.Region.Width > 0);
+        Assert.True(entry.Action.TargetDescriptor.Visual.Region.Height > 0);
+        Assert.NotNull(entry.Action.TargetDescriptor.Visual.SourceScreenshotPng);
 
         events[0] = new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = "mutated" };
         Assert.Equal(SandboxInputEventType.Move, entry.Action.InputEvents[0].Type);

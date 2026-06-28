@@ -20,13 +20,26 @@ public interface ILocatorHealer
 {
     /// <summary>
     /// Attempt to re-locate the target by a richer signal than the default
-    /// locator was able to use. Return null when no heal is possible — the
+    /// locator was able to use. Return null when no heal is possible - the
     /// engine will surface the original
     /// <see cref="ReplayFailureKind.NotFound"/>.
     /// </summary>
-    Task<LocatedTarget?> HealAsync(
+    Task<LocatorHealResult?> HealAsync(
         ISandbox sandbox,
         TraceEntry entry,
         ReplayOptions options,
         CancellationToken ct);
+}
+
+/// <summary>
+/// Result from a future self-heal implementation. The located target is what
+/// the engine should act on now; the optional descriptor is the recognition
+/// artifact that should be used for reachability and persisted back to the
+/// trace artifact by the caller that owns storage.
+/// </summary>
+public sealed record LocatorHealResult
+{
+    public required LocatedTarget Target { get; init; }
+    public TraceTargetDescriptor? UpdatedDescriptor { get; init; }
+    public string? ArtifactPatchDiagnostic { get; init; }
 }

@@ -23,11 +23,10 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 ///   <see cref="ReachabilityStatus.Occluded"/> — display:none, opacity:0,
 ///   and other invisibility classes drop the element out of the
 ///   accessibility tree, so a null probe is equivalent to "user can't see
-///   it." A non-accessibility descriptor's visibility is implicit in its
-///   locator hit: the only shipped non-accessibility locator
-///   (<see cref="VisualSignatureElementLocator"/>) only returns when the
-///   current screen matches the recorded screen pixel-for-pixel, which
-///   carries its own visibility guarantee.</item>
+///   it." For visual-only descriptors, the checker still performs a
+///   top-most accessibility probe: a returned accessibility element means
+///   an accessible surface is on top of an untagged target, and a probe
+///   failure fails closed.</item>
 ///   <item><b>Top-most</b>: when the descriptor carries a usable
 ///   accessibility signature, probe
 ///   <see cref="ISandbox.GetAccessibilityAtPointAsync"/> at the centre and
@@ -127,7 +126,6 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         if (expectedAccessibility is not null && _matcher.HasAnyAccessibilitySignal(expectedAccessibility))
         {
             SandboxAccessibilitySnapshot? snap;
-            var probeFailed = false;
             try
             {
                 snap = await sandbox.GetAccessibilityAtPointAsync(current.CenterX, current.CenterY, ct)
@@ -137,18 +135,17 @@ public sealed class ReachabilityChecker : IReachabilityChecker
             {
                 throw;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // A transient accessibility-probe failure cannot be
-                // distinguished from "no element here". Fall through to
-                // Reachable so a flaky IPC blip does not falsely report
-                // Occluded; the input dispatch that follows will surface a
-                // real failure if the element is genuinely gone.
-                snap = null;
-                probeFailed = true;
+                return new ReachabilityOutcome
+                {
+                    Status = ReachabilityStatus.Occluded,
+                    Target = current,
+                    Diagnostic = $"top-most accessibility probe failed at ({current.CenterX},{current.CenterY}); cannot verify target is visible and unobstructed: {DiagnosticText.Sanitize(ex.Message)}",
+                };
             }
 
-            if (snap is null && !probeFailed)
+            if (snap is null)
             {
                 // No element answers at the located centre even though the
                 // recorded descriptor had a clear accessibility signature.
@@ -173,6 +170,36 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                     Status = ReachabilityStatus.Occluded,
                     Target = current,
                     Diagnostic = $"another element ({Describe(snap)}) is on top of the expected target ({Describe(expectedAccessibility)}) at ({current.CenterX},{current.CenterY})",
+                };
+            }
+        }
+        else
+        {
+            try
+            {
+                var snap = await sandbox.GetAccessibilityAtPointAsync(current.CenterX, current.CenterY, ct)
+                    .ConfigureAwait(false);
+                if (snap is not null)
+                {
+                    return new ReachabilityOutcome
+                    {
+                        Status = ReachabilityStatus.Occluded,
+                        Target = current,
+                        Diagnostic = $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
+                    };
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return new ReachabilityOutcome
+                {
+                    Status = ReachabilityStatus.Occluded,
+                    Target = current,
+                    Diagnostic = $"top-most accessibility probe failed at ({current.CenterX},{current.CenterY}); cannot verify visual-only target is unobstructed: {DiagnosticText.Sanitize(ex.Message)}",
                 };
             }
         }

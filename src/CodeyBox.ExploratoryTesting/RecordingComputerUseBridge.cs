@@ -45,6 +45,7 @@ public sealed class RecordingComputerUseBridge
     private readonly RecordingComputerUseBridgeOptions _options;
     private readonly List<TraceEntry> _entries = [];
     private SessionTrace _trace;
+    private TraceTargetDescriptor? _lastTargetDescriptor;
     private int _sequence;
 
     public RecordingComputerUseBridge(
@@ -164,6 +165,8 @@ public sealed class RecordingComputerUseBridge
         string? postAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
 
         var targetDescriptor = BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility);
+        if (HasUsableTargetDescriptor(targetDescriptor))
+            _lastTargetDescriptor = targetDescriptor;
 
         var entry = new TraceEntry
         {
@@ -260,6 +263,19 @@ public sealed class RecordingComputerUseBridge
         }
         else
         {
+            if (_lastTargetDescriptor is { } last
+                && action is "key" or "type" or "scroll"
+                && HasUsableTargetDescriptor(last))
+            {
+                return last with
+                {
+                    Visual = last.Visual with
+                    {
+                        SourceScreenshotPng = preScreenshot ?? last.Visual.SourceScreenshotPng,
+                    },
+                };
+            }
+
             region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
         }
 
@@ -276,11 +292,33 @@ public sealed class RecordingComputerUseBridge
 
     private static (int? X, int? Y) ResolveActionCentre(string action, SandboxInputEvent[] events)
     {
-        if (events.Length > 0 && action is "click" or "double_click" or "move" or "scroll")
+        if (events.Length > 0 && action is "click" or "double_click" or "move")
         {
             var first = events[0];
             return (first.X, first.Y);
         }
+        if (action is "events")
+        {
+            foreach (var evt in events)
+            {
+                if (evt.Type is SandboxInputEventType.Click or SandboxInputEventType.Move
+                    && evt.X.HasValue
+                    && evt.Y.HasValue)
+                    return (evt.X, evt.Y);
+            }
+        }
         return (null, null);
+    }
+
+    private static bool HasUsableTargetDescriptor(TraceTargetDescriptor descriptor)
+    {
+        var region = descriptor.Visual.Region;
+        if (region.Width > 0 && region.Height > 0) return true;
+        var acc = descriptor.Accessibility;
+        return acc is not null
+            && (!string.IsNullOrEmpty(acc.Role)
+                || !string.IsNullOrEmpty(acc.Name)
+                || !string.IsNullOrEmpty(acc.Text)
+                || !string.IsNullOrEmpty(acc.ElementType));
     }
 }

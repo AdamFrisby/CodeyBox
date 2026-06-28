@@ -80,8 +80,9 @@ public sealed class DefaultAssertionVerifier : IAssertionVerifier
         string? accessibilitySnapshotJson,
         CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(assertion);
-        _ = sandbox; _ = ct;
+        ct.ThrowIfCancellationRequested();
 
         return Task.FromResult(VerifyCore(assertion, currentScreenshotPng, recordedScreenshotPng, accessibilitySnapshotJson));
     }

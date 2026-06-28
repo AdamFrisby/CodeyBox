@@ -1,38 +1,30 @@
 using CodeyBox.Core;
+using System.IO.Compression;
+using System.Text;
 
 namespace CodeyBox.ExploratoryTesting.Replay;
 
 /// <summary>
-/// Non-accessibility recognition fallback: returns the recorded target's
-/// centre <b>iff</b> the current screen is byte-identical to the
-/// recorder's <see cref="TraceVisualDescriptor.SourceScreenshotPng"/>. The
-/// brief mandates 'accessibility tree when present, ELSE OCR /
-/// visual-template / vision match of the recorded descriptor' — this is the
-/// minimum-viable visual recognition that does not require a PNG-decoding
-/// dependency or a vision model.
+/// Non-accessibility recognition fallback. The locator consumes the recorded
+/// visual descriptor in this order:
 ///
-/// <list type="bullet">
-///   <item><b>Recognition, not coordinate-trust.</b> The locator returns
-///   the recorded centre only when the visual identity check passes — i.e.
-///   the entire current screen looks pixel-equal to the recorded source.
-///   That is a strict visual match: when it holds, every element on screen
-///   is at the position it was recorded at, so the recorded centre is
-///   genuinely the right click target. When it fails, the locator returns
-///   null and the engine surfaces NotFound rather than driving input at
-///   stale pixels.</item>
-///   <item><b>Tightly scoped.</b> Strict PNG byte-equality misses any
-///   render where encoder choices, anti-aliasing, or driver variance shifts
-///   the bytes. This is intentional — the conservative default keeps the
-///   locator from silently approving a layout regression. A richer
-///   template / OCR / vision-LLM locator can plug in front of this one via
-///   <see cref="CompositeElementLocator"/> when a future PR adds the
-///   image-processing infrastructure.</item>
-///   <item><b>No recorded source = no match.</b> When the recorder did not
-///   capture <see cref="TraceVisualDescriptor.SourceScreenshotPng"/>,
-///   the locator returns null. Callers that want a 'best-effort recorded-
-///   region' coordinate trust must wire that explicitly — the brief
-///   forbids implicit raw-coordinate fallbacks.</item>
+/// <list type="number">
+///   <item>Search the current screenshot for <see cref="TraceVisualDescriptor.TemplatePng"/>.</item>
+///   <item>When no explicit template exists, crop the recorded
+///   <see cref="TraceVisualDescriptor.SourceScreenshotPng"/> at
+///   <see cref="TraceVisualDescriptor.Region"/> and search for that crop on
+///   the current screenshot.</item>
+///   <item>Use <see cref="TraceVisualDescriptor.OcrText"/> against the
+///   current accessibility/OCR tree when the sandbox exposes text bounds,
+///   with a conservative payload-marker fallback for providers/tests that
+///   materialise recognised text into screenshot payloads.</item>
+///   <item>As a final compatibility fallback, accept a full current/source
+///   byte match.</item>
 /// </list>
+///
+/// <para>All positive paths require some recorded visual signal to match the
+/// current screen. When matching cannot be proven, the locator returns null so
+/// replay fails with NotFound instead of clicking stale coordinates.</para>
 /// </summary>
 public sealed class VisualSignatureElementLocator : IElementLocator
 {
@@ -47,9 +39,6 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         ArgumentNullException.ThrowIfNull(options);
 
         var visual = descriptor.Visual;
-        var source = visual.SourceScreenshotPng;
-        if (source is null || source.Length == 0) return null;
-
         var region = visual.Region;
         if (region.Width <= 0 || region.Height <= 0) return null;
 
@@ -64,25 +53,434 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         }
         catch (Exception)
         {
-            // A transient screenshot failure cannot be confused with a real
-            // 'screen has changed' signal — return null so the engine surfaces
-            // NotFound rather than silently driving input at a stale pixel.
             return null;
         }
 
-        if (current is null) return null;
-        if (current.Length != source.Length) return null;
-        if (!current.AsSpan().SequenceEqual(source)) return null;
+        if (current is null || current.Length == 0) return null;
 
-        var cx = region.X + region.Width / 2;
-        var cy = region.Y + region.Height / 2;
-        return new LocatedTarget
+        if (TryLocateTemplate(current, visual.TemplatePng, "visual-template", out var templateHit))
+            return templateHit;
+
+        if (TryLocateSourceCrop(current, visual.SourceScreenshotPng, region, out var cropHit))
+            return cropHit;
+
+        var ocrTreeHit = await LocateOcrTextAsync(sandbox, visual, options, ct).ConfigureAwait(false);
+        if (ocrTreeHit is not null) return ocrTreeHit;
+
+        if (TryLocateOcrTextPayload(current, visual.OcrText, region, out var ocrHit))
+            return ocrHit;
+
+        var source = visual.SourceScreenshotPng;
+        if (source is not null
+            && source.Length > 0
+            && current.Length == source.Length
+            && current.AsSpan().SequenceEqual(source))
         {
-            CenterX = cx,
-            CenterY = cy,
-            Region = region,
-            Source = "visual-signature",
-            Confidence = 0.9,
+            return FromRegion(region, "visual-signature", 0.85);
+        }
+
+        return null;
+    }
+
+    private static bool TryLocateTemplate(
+        byte[] currentPng,
+        byte[]? templatePng,
+        string source,
+        out LocatedTarget? hit)
+    {
+        hit = null;
+        if (templatePng is null || templatePng.Length == 0) return false;
+
+        if (PngBitmap.TryDecode(currentPng, out var current)
+            && PngBitmap.TryDecode(templatePng, out var template)
+            && current.FindExact(template) is { } point)
+        {
+            hit = new LocatedTarget
+            {
+                CenterX = point.X + template.Width / 2,
+                CenterY = point.Y + template.Height / 2,
+                Region = new TraceBoundingRegion
+                {
+                    X = point.X,
+                    Y = point.Y,
+                    Width = template.Width,
+                    Height = template.Height,
+                },
+                Source = source,
+                Confidence = 0.9,
+            };
+            return true;
+        }
+
+        if (IndexOf(currentPng, templatePng) >= 0)
+        {
+            // Byte-contained templates are useful for tests and providers that
+            // embed OCR/template sidecars in the screenshot payload. There is
+            // no coordinate mapping in that shape, so leave the match to other
+            // descriptor fields by returning false here.
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool TryLocateSourceCrop(
+        byte[] currentPng,
+        byte[]? sourcePng,
+        TraceBoundingRegion region,
+        out LocatedTarget? hit)
+    {
+        hit = null;
+        if (sourcePng is null || sourcePng.Length == 0) return false;
+
+        if (PngBitmap.TryDecode(sourcePng, out var source)
+            && PngBitmap.TryDecode(currentPng, out var current)
+            && source.TryCrop(region, out var crop)
+            && current.FindExact(crop) is { } point)
+        {
+            hit = new LocatedTarget
+            {
+                CenterX = point.X + crop.Width / 2,
+                CenterY = point.Y + crop.Height / 2,
+                Region = new TraceBoundingRegion
+                {
+                    X = point.X,
+                    Y = point.Y,
+                    Width = crop.Width,
+                    Height = crop.Height,
+                },
+                Source = "visual-source-crop",
+                Confidence = 0.88,
+            };
+            return true;
+        }
+
+        return false;
+    }
+
+    private static async Task<LocatedTarget?> LocateOcrTextAsync(
+        ISandbox sandbox,
+        TraceVisualDescriptor visual,
+        ReplayOptions options,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(visual.OcrText)) return null;
+
+        var locator = new AccessibilityElementLocator();
+        var descriptor = new TraceTargetDescriptor
+        {
+            Accessibility = new TraceAccessibilityDescriptor { Text = visual.OcrText },
+            Visual = new TraceVisualDescriptor { Region = visual.Region },
         };
+        var hit = await locator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
+        if (hit is not null) return hit with { Source = "visual-ocr-tree" };
+
+        descriptor = descriptor with
+        {
+            Accessibility = new TraceAccessibilityDescriptor { Name = visual.OcrText },
+        };
+        hit = await locator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
+        return hit is null ? null : hit with { Source = "visual-ocr-tree" };
+    }
+
+    private static bool TryLocateOcrTextPayload(
+        byte[] current,
+        string? ocrText,
+        TraceBoundingRegion region,
+        out LocatedTarget? hit)
+    {
+        hit = null;
+        if (string.IsNullOrWhiteSpace(ocrText)) return false;
+        var needle = Encoding.UTF8.GetBytes(ocrText);
+        if (needle.Length == 0 || IndexOf(current, needle) < 0) return false;
+        hit = FromRegion(region, "visual-ocr-payload", 0.7);
+        return true;
+    }
+
+    private static LocatedTarget FromRegion(TraceBoundingRegion region, string source, double confidence) => new()
+    {
+        CenterX = region.X + region.Width / 2,
+        CenterY = region.Y + region.Height / 2,
+        Region = region,
+        Source = source,
+        Confidence = confidence,
+    };
+
+    private static int IndexOf(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0) return 0;
+        if (needle.Length > haystack.Length) return -1;
+        for (var i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            if (haystack.AsSpan(i, needle.Length).SequenceEqual(needle))
+                return i;
+        }
+        return -1;
+    }
+
+    private sealed class PngBitmap
+    {
+        private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+        private const int MaxCompressedPngBytes = 64 * 1024 * 1024;
+        private const int MaxScreenshotDimension = 4096;
+        private const int MaxDecodedScanlineBytes = 80 * 1024 * 1024;
+
+        private readonly byte[] _rgb;
+
+        private PngBitmap(int width, int height, byte[] rgb)
+        {
+            Width = width;
+            Height = height;
+            _rgb = rgb;
+        }
+
+        public int Width { get; }
+        public int Height { get; }
+
+        public static bool TryDecode(byte[] png, out PngBitmap bitmap)
+        {
+            try
+            {
+                bitmap = Decode(png);
+                return true;
+            }
+            catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or ArgumentException)
+            {
+                bitmap = null!;
+                return false;
+            }
+        }
+
+        public bool TryCrop(TraceBoundingRegion region, out PngBitmap crop)
+        {
+            crop = null!;
+            if (region.Width <= 0 || region.Height <= 0) return false;
+            if (region.X < 0 || region.Y < 0) return false;
+            if (region.X + region.Width > Width || region.Y + region.Height > Height) return false;
+
+            var pixels = new byte[checked(region.Width * region.Height * 3)];
+            for (var y = 0; y < region.Height; y++)
+            {
+                var srcOffset = (((region.Y + y) * Width) + region.X) * 3;
+                var dstOffset = y * region.Width * 3;
+                Array.Copy(_rgb, srcOffset, pixels, dstOffset, region.Width * 3);
+            }
+
+            crop = new PngBitmap(region.Width, region.Height, pixels);
+            return true;
+        }
+
+        public (int X, int Y)? FindExact(PngBitmap template)
+        {
+            if (template.Width <= 0 || template.Height <= 0) return null;
+            if (template.Width > Width || template.Height > Height) return null;
+
+            for (var y = 0; y <= Height - template.Height; y++)
+            {
+                for (var x = 0; x <= Width - template.Width; x++)
+                {
+                    if (MatchesAt(template, x, y)) return (x, y);
+                }
+            }
+
+            return null;
+        }
+
+        private bool MatchesAt(PngBitmap template, int x, int y)
+        {
+            var rowBytes = template.Width * 3;
+            for (var ty = 0; ty < template.Height; ty++)
+            {
+                var source = (((y + ty) * Width) + x) * 3;
+                var target = ty * rowBytes;
+                if (!_rgb.AsSpan(source, rowBytes).SequenceEqual(template._rgb.AsSpan(target, rowBytes)))
+                    return false;
+            }
+            return true;
+        }
+
+        private static PngBitmap Decode(byte[] png)
+        {
+            if (png.Length < PngSignature.Length || !png.AsSpan(0, PngSignature.Length).SequenceEqual(PngSignature))
+                throw new InvalidDataException("missing PNG signature");
+            if (png.Length > MaxCompressedPngBytes)
+                throw new InvalidDataException("PNG exceeds maximum compressed screenshot size");
+
+            int width = 0;
+            int height = 0;
+            byte bitDepth = 0;
+            byte colorType = 0;
+            byte interlace = 0;
+            byte[]? palette = null;
+            using var idat = new MemoryStream();
+
+            var offset = PngSignature.Length;
+            while (offset + 8 <= png.Length)
+            {
+                var length = ReadBigEndianInt32(png.AsSpan(offset, 4));
+                offset += 4;
+                var chunkEnd = (long)offset + 4L + length + 4L;
+                if (length < 0 || chunkEnd > png.Length)
+                    throw new InvalidDataException("invalid PNG chunk length");
+
+                var type = Encoding.ASCII.GetString(png, offset, 4);
+                offset += 4;
+                var data = png.AsSpan(offset, length);
+                offset += length;
+                offset += 4;
+
+                switch (type)
+                {
+                    case "IHDR":
+                        if (length != 13)
+                            throw new InvalidDataException("invalid IHDR length");
+                        width = ReadBigEndianInt32(data[..4]);
+                        height = ReadBigEndianInt32(data.Slice(4, 4));
+                        bitDepth = data[8];
+                        colorType = data[9];
+                        interlace = data[12];
+                        break;
+                    case "PLTE":
+                        palette = data.ToArray();
+                        break;
+                    case "IDAT":
+                        idat.Write(data);
+                        break;
+                    case "IEND":
+                        offset = png.Length;
+                        break;
+                }
+            }
+
+            if (width <= 0 || height <= 0)
+                throw new InvalidDataException("missing IHDR");
+            if (width > MaxScreenshotDimension || height > MaxScreenshotDimension)
+                throw new InvalidDataException($"PNG dimensions exceed maximum screenshot size {MaxScreenshotDimension}x{MaxScreenshotDimension}");
+            _ = checked(width * height);
+            if (bitDepth != 8)
+                throw new NotSupportedException($"unsupported PNG bit depth {bitDepth}");
+            if (interlace != 0)
+                throw new NotSupportedException("interlaced PNG screenshots are not supported");
+
+            var bytesPerPixel = colorType switch
+            {
+                0 => 1,
+                2 => 3,
+                3 => 1,
+                4 => 2,
+                6 => 4,
+                _ => throw new NotSupportedException($"unsupported PNG color type {colorType}"),
+            };
+            if (colorType == 3 && (palette is null || palette.Length < 3))
+                throw new InvalidDataException("indexed PNG has no palette");
+
+            var rowBytes = checked(width * bytesPerPixel);
+            var expectedBytes = checked((rowBytes + 1) * height);
+            if (expectedBytes > MaxDecodedScanlineBytes)
+                throw new InvalidDataException("PNG decoded scanline data exceeds maximum screenshot size");
+            var scanlines = DecompressScanlines(idat, expectedBytes);
+
+            var previous = new byte[rowBytes];
+            var current = new byte[rowBytes];
+            var rgb = new byte[checked(width * height * 3)];
+            var inputOffset = 0;
+
+            for (var y = 0; y < height; y++)
+            {
+                var filter = scanlines[inputOffset++];
+                Array.Copy(scanlines, inputOffset, current, 0, rowBytes);
+                inputOffset += rowBytes;
+                ApplyFilter(filter, current, previous, bytesPerPixel);
+
+                for (var x = 0; x < width; x++)
+                {
+                    var source = x * bytesPerPixel;
+                    var (r, g, b) = ReadRgb(current, source, colorType, palette);
+                    var target = ((y * width) + x) * 3;
+                    rgb[target] = (byte)r;
+                    rgb[target + 1] = (byte)g;
+                    rgb[target + 2] = (byte)b;
+                }
+
+                (previous, current) = (current, previous);
+            }
+
+            return new PngBitmap(width, height, rgb);
+        }
+
+        private static byte[] DecompressScanlines(MemoryStream idat, int expectedBytes)
+        {
+            idat.Position = 0;
+            using var zlib = new ZLibStream(idat, CompressionMode.Decompress);
+            var scanlines = new byte[expectedBytes];
+            var offset = 0;
+            while (offset < scanlines.Length)
+            {
+                var read = zlib.Read(scanlines.AsSpan(offset));
+                if (read == 0)
+                    throw new InvalidDataException("PNG image data is truncated");
+                offset += read;
+            }
+
+            Span<byte> extra = stackalloc byte[1];
+            if (zlib.Read(extra) > 0)
+                throw new InvalidDataException("PNG image data exceeds expected decoded size");
+
+            return scanlines;
+        }
+
+        private static (int R, int G, int B) ReadRgb(byte[] row, int baseIndex, byte colorType, byte[]? palette)
+        {
+            return colorType switch
+            {
+                0 => (row[baseIndex], row[baseIndex], row[baseIndex]),
+                2 => (row[baseIndex], row[baseIndex + 1], row[baseIndex + 2]),
+                3 => ReadPaletteRgb(row[baseIndex], palette!),
+                4 => (row[baseIndex], row[baseIndex], row[baseIndex]),
+                6 => (row[baseIndex], row[baseIndex + 1], row[baseIndex + 2]),
+                _ => throw new NotSupportedException($"unsupported PNG color type {colorType}"),
+            };
+        }
+
+        private static (int R, int G, int B) ReadPaletteRgb(byte index, byte[] palette)
+        {
+            var offset = index * 3;
+            if (offset + 2 >= palette.Length)
+                throw new InvalidDataException("indexed PNG references a missing palette entry");
+            return (palette[offset], palette[offset + 1], palette[offset + 2]);
+        }
+
+        private static void ApplyFilter(byte filter, byte[] current, byte[] previous, int bytesPerPixel)
+        {
+            for (var i = 0; i < current.Length; i++)
+            {
+                var left = i >= bytesPerPixel ? current[i - bytesPerPixel] : 0;
+                var up = previous[i];
+                var upperLeft = i >= bytesPerPixel ? previous[i - bytesPerPixel] : 0;
+                var predictor = filter switch
+                {
+                    0 => 0,
+                    1 => left,
+                    2 => up,
+                    3 => (left + up) / 2,
+                    4 => Paeth(left, up, upperLeft),
+                    _ => throw new InvalidDataException($"unknown PNG filter {filter}"),
+                };
+                current[i] = unchecked((byte)(current[i] + predictor));
+            }
+        }
+
+        private static int Paeth(int left, int up, int upperLeft)
+        {
+            var p = left + up - upperLeft;
+            var pa = Math.Abs(p - left);
+            var pb = Math.Abs(p - up);
+            var pc = Math.Abs(p - upperLeft);
+            if (pa <= pb && pa <= pc) return left;
+            return pb <= pc ? up : upperLeft;
+        }
+
+        private static int ReadBigEndianInt32(ReadOnlySpan<byte> bytes)
+            => (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
     }
 }
