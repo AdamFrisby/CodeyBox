@@ -156,7 +156,21 @@ public interface ISandbox : IAsyncDisposable
 
     Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
         Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Resource metrics captured at teardown/disposal, or null if not yet captured or not supported.
+    /// </summary>
+    SandboxResourceMetrics? ResourceMetrics => null;
 }
+
+/// <summary>
+/// Resource metrics captured at sandbox teardown (peak RAM, avg CPU, total net I/O).
+/// </summary>
+public sealed record SandboxResourceMetrics(
+    long? PeakRamBytes,
+    double? AvgCpuPercent,
+    long? TotalNetIoBytes);
+
 
 /// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider

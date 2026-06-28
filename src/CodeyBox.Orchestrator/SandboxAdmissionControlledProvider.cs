@@ -823,6 +823,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
     public string Id => _inner.Id;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+    public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
         _inner.ExecAsync(exec, ct);

@@ -328,9 +328,21 @@ public static class AuditLog
                 "Agent infrastructure failure for work item {WorkItemId}: agent={Agent} sandbox={Sandbox} phase={Phase} summary={Summary} reason={Reason}",
                 workItemId.ToString(), agent.Value, sandboxName, phase, AuditSingleLine(summary), AuditSingleLine(reason));
 
-    public static void SandboxDisposed(string vmName) =>
+    public static void SandboxDisposed(
+        string vmName,
+        long? peakRamBytes = null,
+        double? avgCpuPercent = null,
+        long? totalNetIoBytes = null) =>
         Audit("sandbox.disposed")
-            .Information("Sandbox {VmName} disposed", vmName);
+            .ForContext("PeakRamBytes", peakRamBytes)
+            .ForContext("AvgCpuPercent", avgCpuPercent)
+            .ForContext("TotalNetIoBytes", totalNetIoBytes)
+            .Information(
+                "Sandbox {VmName} disposed (peakRAM={PeakRam}MB avgCPU={AvgCpu} netIO={NetIo}MB)",
+                vmName,
+                peakRamBytes.HasValue ? (peakRamBytes.Value / (1024 * 1024)).ToString() : "unknown",
+                avgCpuPercent.HasValue ? avgCpuPercent.Value.ToString("F1") + "%" : "unknown",
+                totalNetIoBytes.HasValue ? (totalNetIoBytes.Value / (1024 * 1024)).ToString() : "unknown");
 
     public static void SandboxLeakDetected(string name, double ageMinutes, long? diskMb, string? reason = null) =>
         Audit("sandbox.leak_detected")
@@ -362,10 +374,23 @@ public static class AuditLog
             .Information("Stopped sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
                 vmName, workItemId.ToString());
 
-    public static void SandboxDisposedOnShutdown(WorkItemId workItemId, string vmName) =>
+    public static void SandboxDisposedOnShutdown(
+        WorkItemId workItemId,
+        string vmName,
+        long? peakRamBytes = null,
+        double? avgCpuPercent = null,
+        long? totalNetIoBytes = null) =>
         Audit("sandbox.disposed_on_shutdown")
-            .Information("Disposed sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
-                vmName, workItemId.ToString());
+            .ForContext("PeakRamBytes", peakRamBytes)
+            .ForContext("AvgCpuPercent", avgCpuPercent)
+            .ForContext("TotalNetIoBytes", totalNetIoBytes)
+            .Information(
+                "Disposed sandbox {VmName} for work item {WorkItemId} on graceful shutdown (peakRAM={PeakRam}MB avgCPU={AvgCpu} netIO={NetIo}MB)",
+                vmName,
+                workItemId.ToString(),
+                peakRamBytes.HasValue ? (peakRamBytes.Value / (1024 * 1024)).ToString() : "unknown",
+                avgCpuPercent.HasValue ? avgCpuPercent.Value.ToString("F1") + "%" : "unknown",
+                totalNetIoBytes.HasValue ? (totalNetIoBytes.Value / (1024 * 1024)).ToString() : "unknown");
 
     public static void SandboxStartupReconciled(string vmName, string action) =>
         Audit("sandbox.startup_reconciled")

@@ -5186,6 +5186,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     /// </summary>
     public void MarkOwnedByShutdownHandler() => _ownedByShutdownHandler = true;
 
+    private SandboxResourceMetrics? _resourceMetrics;
+    public SandboxResourceMetrics? ResourceMetrics => _resourceMetrics;
+
     /// <summary>
     /// RAM size this VM was provisioned with, surfaced so the shutdown teardown
     /// service can scale its per-VM timeout: a larger VM has more RAM to flush to
@@ -6712,11 +6715,20 @@ while True:
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
-        _disposed = true;
         if (_preserveOnDispose)
         {
+            _disposed = true;
             return;
         }
+
+        var (peakRam, avgCpu, netIo) = await CaptureResourceMetricsAsync(CancellationToken.None).ConfigureAwait(false);
+        if (peakRam.HasValue || avgCpu.HasValue || netIo.HasValue)
+        {
+            _resourceMetrics = new SandboxResourceMetrics(peakRam, avgCpu, netIo);
+        }
+
+        _disposed = true;
+
         try
         {
             _onNoLongerTrackedActive?.Invoke(_name);
@@ -6745,9 +6757,70 @@ while True:
             return;
         }
         _onDisposed?.Invoke(_name);
-        AuditLog.SandboxDisposed(_name);
+        AuditLog.SandboxDisposed(_name, peakRam, avgCpu, netIo);
         try { Directory.Delete(_sandboxRoot, recursive: true); }
         catch (Exception ex) { _log.LogWarning(ex, "Failed to clean sandbox root {Root}", _sandboxRoot); }
+    }
+
+    private async Task<(long? PeakRamBytes, double? AvgCpuPercent, long? TotalNetIoBytes)> CaptureResourceMetricsAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+            var script = """
+            peak_ram=0
+            if [ -f /sys/fs/cgroup/memory.peak ]; then
+              peak_ram=$(cat /sys/fs/cgroup/memory.peak)
+            elif [ -f /sys/fs/cgroup/memory/memory.max_usage_in_bytes ]; then
+              peak_ram=$(cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes)
+            fi
+
+            read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+            total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+            active=$((user + nice + system + irq + softirq + steal))
+            avg_cpu=0
+            if [ $total -gt 0 ]; then
+              avg_cpu=$((active * 100 / total))
+            fi
+
+            net_io=0
+            for d in /sys/class/net/*; do
+              name=$(basename "$d")
+              if [ "$name" != "lo" ]; then
+                rx=$(cat "$d/statistics/rx_bytes" 2>/dev/null || echo 0)
+                tx=$(cat "$d/statistics/tx_bytes" 2>/dev/null || echo 0)
+                net_io=$((net_io + rx + tx))
+              fi
+            done
+
+            echo "$peak_ram $avg_cpu $net_io"
+            """;
+
+            var result = await ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", script]
+            }, cts.Token).ConfigureAwait(false);
+
+            if (result.ExitCode == 0)
+            {
+                var output = result.Stdout.Trim();
+                var parts = output.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 3)
+                {
+                    long? peakRam = long.TryParse(parts[0], out var r) && r > 0 ? r : null;
+                    double? avgCpu = double.TryParse(parts[1], out var c) && c >= 0 ? c : null;
+                    long? netIo = long.TryParse(parts[2], out var n) && n >= 0 ? n : null;
+                    return (peakRam, avgCpu, netIo);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to capture resource metrics for multipass VM {Name} before teardown", _name);
+        }
+        return (null, null, null);
     }
 
     public async Task KillActiveExecsAsync(CancellationToken ct = default)
