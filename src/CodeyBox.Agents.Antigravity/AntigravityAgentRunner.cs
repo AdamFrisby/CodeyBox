@@ -23,7 +23,13 @@ namespace CodeyBox.Agents.Antigravity;
 /// </summary>
 public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
+    private sealed class InvocationTracker
+    {
+        public bool Invoked { get; set; }
+    }
+
     private readonly AsyncLocal<string?> _currentLogPath = new();
+    private readonly AsyncLocal<InvocationTracker?> _agentInvoked = new();
 
     public override AgentKind Kind => AgentKind.Antigravity;
 
@@ -139,14 +145,21 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     {
         var logFile = $"/home/ubuntu/.gemini/antigravity-cli/agy-run-{Guid.NewGuid():N}.log";
         _currentLogPath.Value = logFile;
+        var tracker = new InvocationTracker();
+        _agentInvoked.Value = tracker;
         try
         {
             var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback, captureStructuredStream).ConfigureAwait(false);
-            return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream, ct).ConfigureAwait(false);
+            if (tracker.Invoked)
+            {
+                return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream, ct).ConfigureAwait(false);
+            }
+            return result;
         }
         finally
         {
             _currentLogPath.Value = null;
+            _agentInvoked.Value = null;
         }
     }
 
@@ -163,14 +176,21 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     {
         var logFile = $"/home/ubuntu/.gemini/antigravity-cli/agy-run-{Guid.NewGuid():N}.log";
         _currentLogPath.Value = logFile;
+        var tracker = new InvocationTracker();
+        _agentInvoked.Value = tracker;
         try
         {
             var result = await base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, stdoutChunkCallback).ConfigureAwait(false);
-            return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream: false, ct).ConfigureAwait(false);
+            if (tracker.Invoked)
+            {
+                return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream: false, ct).ConfigureAwait(false);
+            }
+            return result;
         }
         finally
         {
             _currentLogPath.Value = null;
+            _agentInvoked.Value = null;
         }
     }
 
@@ -271,6 +291,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         bool useContinue,
         bool captureStructuredStream)
     {
+        if (_agentInvoked.Value is { } tracker)
+        {
+            tracker.Invoked = true;
+        }
         // agy --print --dangerously-skip-permissions [...]: one-shot prompt
         // that auto-approves tool calls. The sandbox boundary is the real
         // permission boundary — same shape we use for Claude.

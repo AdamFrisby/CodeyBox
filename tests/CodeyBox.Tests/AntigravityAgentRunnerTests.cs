@@ -21,7 +21,7 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_Argv_StartsWithAgyBinary()
     {
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", "do the thing", credential: null);
@@ -32,7 +32,7 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_Argv_ContainsPrintAndSkipPermissions()
     {
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", "go", credential: null);
@@ -44,7 +44,7 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_Argv_PassesModelWhenSet()
     {
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", "go", credential: null, modelId: "gemini-3.5-flash-high");
@@ -62,7 +62,7 @@ public sealed class AntigravityAgentRunnerTests
         // Linux's 128 KiB MAX_ARG_STRLEN per single argv element. Verify the
         // prompt flows through stdin, not argv.
         const string prompt = "rebuild the build pipeline";
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", prompt, credential: null);
@@ -83,7 +83,7 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunResumedAsync_WithCheckpointId_PassesConversationFlag()
     {
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         var resume = new AgentResumeContext(
@@ -109,7 +109,7 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunResumedAsync_WithoutCheckpointId_FallsBackToContinue()
     {
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         var resume = new AgentResumeContext(
@@ -134,7 +134,7 @@ public sealed class AntigravityAgentRunnerTests
         // providers (refresh_token retained so the in-VM agy can self-refresh —
         // see AntigravityEnvironmentCredentialProvider / AgentInstanceCredentialResolver
         // / CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle).
-        var sandbox = new MultiExecCapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
         var credential = new AgentCredential(
             AgentKind.Antigravity,
@@ -147,8 +147,9 @@ public sealed class AntigravityAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential);
 
-        Assert.Equal(2, sandbox.AllExecs.Count);
-        var prep = sandbox.AllExecs[0];
+        var nonTailExecs = sandbox.AllExecs.Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail").ToList();
+        Assert.Equal(2, nonTailExecs.Count);
+        var prep = nonTailExecs[0];
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
@@ -156,7 +157,7 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Contains(AntigravityConstants.OAuthCredsEnvVar, script);
         Assert.Contains("chmod 600", script);
         // Second exec is the agy CLI invocation, not the prep hook.
-        Assert.Equal("agy", sandbox.AllExecs[1].Argv[0]);
+        Assert.Equal("agy", nonTailExecs[1].Argv[0]);
     }
 
     [Fact]
@@ -165,7 +166,7 @@ public sealed class AntigravityAgentRunnerTests
         // Credentials with no OAuth-creds env var (e.g. operators using only
         // legacy auth paths or with creds already on the image) must skip the
         // prep hook entirely — single exec is just the agy CLI.
-        var sandbox = new MultiExecCapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
         var credential = new AgentCredential(
             AgentKind.Antigravity,
@@ -174,8 +175,9 @@ public sealed class AntigravityAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential);
 
-        Assert.Single(sandbox.AllExecs);
-        Assert.Equal("agy", sandbox.AllExecs[0].Argv[0]);
+        var nonTailExecs = sandbox.AllExecs.Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail").ToList();
+        Assert.Single(nonTailExecs);
+        Assert.Equal("agy", nonTailExecs[0].Argv[0]);
     }
 
     [Fact]
@@ -183,13 +185,14 @@ public sealed class AntigravityAgentRunnerTests
     {
         // No credential at all must also skip the prep hook — the runner
         // tolerates running without injected auth (e.g. image-baked creds).
-        var sandbox = new MultiExecCapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
-        Assert.Single(sandbox.AllExecs);
-        Assert.Equal("agy", sandbox.AllExecs[0].Argv[0]);
+        var nonTailExecs = sandbox.AllExecs.Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail").ToList();
+        Assert.Single(nonTailExecs);
+        Assert.Equal("agy", nonTailExecs[0].Argv[0]);
     }
 
     [Fact]
@@ -203,7 +206,7 @@ public sealed class AntigravityAgentRunnerTests
         // --output-format / stream-json would silently downgrade the run to
         // plaintext-fallback capture — invisible to the new parser tests,
         // which hand-write the NDJSON themselves.
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(
@@ -224,7 +227,7 @@ public sealed class AntigravityAgentRunnerTests
         // NOT pass --output-format. Passing it on a CLI that doesn't recognise
         // it bombs the run with "unknown option" — exactly the cascade the
         // gated capability check was added to prevent.
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(
@@ -243,7 +246,7 @@ public sealed class AntigravityAgentRunnerTests
         // never carries the flag even when SupportsStructuredStreamAsync would
         // have said yes, so a resumed agy run doesn't introduce a
         // capture-format change mid-conversation.
-        var sandbox = new CapturingSandbox();
+        var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         var resume = new AgentResumeContext(
@@ -263,7 +266,7 @@ public sealed class AntigravityAgentRunnerTests
         // home), surface the failure rather than racing on to the agy
         // invocation, which would 401 against the gateway with a confusing
         // shape and chew through a request slot.
-        var sandbox = new MultiExecCapturingSandbox(prepExitCode: 1, prepStderr: "permission denied");
+        var sandbox = new AntigravityCapturingSandbox(prepExitCode: 1, prepStderr: "permission denied");
         var runner = new AntigravityAgentRunner();
         var credential = new AgentCredential(
             AgentKind.Antigravity,
@@ -370,6 +373,52 @@ public sealed class AntigravityAgentRunnerTests
                 return Task.FromResult(new SandboxExecResult(0, _logFileContent, string.Empty));
             }
             return Task.FromResult(new SandboxExecResult(0, "stdout-response", "stderr-response"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class AntigravityCapturingSandbox : ISandbox
+    {
+        private readonly int _prepExitCode;
+        private readonly string _prepStderr;
+        private readonly int _exitCode;
+        private readonly string _stdout;
+        private readonly string _stderr;
+        private readonly string? _logFileContent;
+
+        public AntigravityCapturingSandbox(
+            int prepExitCode = 0,
+            string prepStderr = "",
+            int exitCode = 0,
+            string stdout = "stdout",
+            string stderr = "stderr",
+            string? logFileContent = null)
+        {
+            _prepExitCode = prepExitCode;
+            _prepStderr = prepStderr;
+            _exitCode = exitCode;
+            _stdout = stdout;
+            _stderr = stderr;
+            _logFileContent = logFileContent;
+        }
+
+        public string Id => "fake-antigravity";
+        public List<SandboxExec> AllExecs { get; } = new();
+        public SandboxExec? CapturedExec => AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "agy");
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
+            {
+                return Task.FromResult(new SandboxExecResult(_prepExitCode, string.Empty, _prepStderr));
+            }
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
+            {
+                return Task.FromResult(new SandboxExecResult(0, _logFileContent ?? string.Empty, string.Empty));
+            }
+            return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
