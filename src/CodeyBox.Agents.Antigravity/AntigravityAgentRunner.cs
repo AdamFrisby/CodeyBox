@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Threading;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -21,6 +23,8 @@ namespace CodeyBox.Agents.Antigravity;
 /// </summary>
 public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
+    private readonly AsyncLocal<string?> _currentLogPath = new();
+
     public override AgentKind Kind => AgentKind.Antigravity;
 
     /// <summary>Default agy binary name on the sandbox PATH. The in-VM smoke
@@ -122,6 +126,112 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         return null;
     }
 
+    public override async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        var logFile = $"/home/ubuntu/.gemini/antigravity-cli/agy-run-{Guid.NewGuid():N}.log";
+        _currentLogPath.Value = logFile;
+        try
+        {
+            var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback, captureStructuredStream).ConfigureAwait(false);
+            return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _currentLogPath.Value = null;
+        }
+    }
+
+    public override async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        var logFile = $"/home/ubuntu/.gemini/antigravity-cli/agy-run-{Guid.NewGuid():N}.log";
+        _currentLogPath.Value = logFile;
+        try
+        {
+            var result = await base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, stdoutChunkCallback).ConfigureAwait(false);
+            return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream: false, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _currentLogPath.Value = null;
+        }
+    }
+
+    private async Task<AgentResult> ProcessResultAsync(
+        ISandbox sandbox,
+        AgentResult result,
+        string logFile,
+        Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream,
+        CancellationToken ct)
+    {
+        try
+        {
+            var tailCmd = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["tail", "-c", "262144", logFile],
+            }, ct).ConfigureAwait(false);
+
+            if (!tailCmd.Success || string.IsNullOrEmpty(tailCmd.Stdout))
+            {
+                return result;
+            }
+
+            var logContent = tailCmd.Stdout;
+            var redactedLog = RawOutputRedactor.Redact(logContent);
+
+            var mergedStderr = string.IsNullOrEmpty(result.Stderr)
+                ? redactedLog
+                : result.Stderr + "\n" + redactedLog;
+
+            if (stdoutChunkCallback is not null)
+            {
+                var lines = redactedLog.Replace("\r", "", StringComparison.Ordinal).Split('\n');
+                var count = lines.Length;
+                if (count > 0 && string.IsNullOrEmpty(lines[count - 1]))
+                {
+                    count--;
+                }
+                for (int i = 0; i < count; i++)
+                {
+                    var line = lines[i];
+                    if (captureStructuredStream)
+                    {
+                        var envelope = JsonSerializer.Serialize(new { type = "codeybox.stderr", text = line }) + "\n";
+                        stdoutChunkCallback(envelope);
+                    }
+                    else
+                    {
+                        stdoutChunkCallback(line + "\n");
+                    }
+                }
+            }
+
+            return result with { Stderr = mergedStderr };
+        }
+        catch
+        {
+            return result;
+        }
+    }
+
     protected override AgentInvocation BuildInvocation(
         string prompt,
         AgentCredential? credential,
@@ -165,6 +275,12 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // that auto-approves tool calls. The sandbox boundary is the real
         // permission boundary — same shape we use for Claude.
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+
+        if (_currentLogPath.Value is { } logPath)
+        {
+            argv.Add("--log-file");
+            argv.Add(logPath);
+        }
 
         // Override agy's 5m default --print-timeout (the per-response wait). On a
         // large work item a single gemini turn can exceed 5m; agy then aborts the

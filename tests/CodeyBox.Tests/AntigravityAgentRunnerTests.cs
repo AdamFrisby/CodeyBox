@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -277,5 +278,100 @@ public sealed class AntigravityAgentRunnerTests
         Assert.False(result.Success);
         Assert.Contains("antigravity auth", result.Summary);
         Assert.Single(sandbox.AllExecs);
+    }
+
+    [Fact]
+    public async Task RunAsync_CapturesAgyLogFileAndAppendsToStderrAndStreams()
+    {
+        // Arrange
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Model resolved: gemini-3.5-flash\nRESOURCE_EXHAUSTED (code 429): Individual quota reached"
+        );
+        var runner = new AntigravityAgentRunner();
+        
+        var streamedChunks = new List<string>();
+        Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
+
+        // Act
+        var result = await runner.RunAsync(
+            sandbox, 
+            "/work", 
+            "do something", 
+            credential: null, 
+            stdoutChunkCallback: stdoutChunkCallback, 
+            captureStructuredStream: false
+        );
+
+        // Assert
+        // 1. Verify tail was executed with the expected log file path.
+        var tailExec = sandbox.AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "tail");
+        Assert.NotNull(tailExec);
+        Assert.Equal("tail", tailExec.Argv[0]);
+        Assert.Equal("-c", tailExec.Argv[1]);
+        Assert.Equal("262144", tailExec.Argv[2]);
+        var logFilePath = tailExec.Argv[3];
+        Assert.StartsWith("/home/ubuntu/.gemini/antigravity-cli/agy-run-", logFilePath);
+        Assert.EndsWith(".log", logFilePath);
+
+        // 2. Verify the log file contents were merged into the result's Stderr.
+        Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr);
+        Assert.Contains("Model resolved: gemini-3.5-flash", result.Stderr);
+
+        // 3. Verify the log file contents were streamed.
+        Assert.Contains("Model resolved: gemini-3.5-flash\n", streamedChunks);
+        Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithStructuredStream_EnvelopesLogLines()
+    {
+        // Arrange
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Line 1\nLine 2"
+        );
+        var runner = new AntigravityAgentRunner();
+        
+        var streamedChunks = new List<string>();
+        Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
+
+        // Act
+        var result = await runner.RunAsync(
+            sandbox, 
+            "/work", 
+            "do something", 
+            credential: null, 
+            stdoutChunkCallback: stdoutChunkCallback, 
+            captureStructuredStream: true
+        );
+
+        // Assert
+        // Verify the log file contents were streamed as JSON envelopes.
+        Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 1\"}\n", streamedChunks);
+        Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 2\"}\n", streamedChunks);
+    }
+
+    private sealed class AntigravityLogCapturingSandbox : ISandbox
+    {
+        private readonly string _logFileContent;
+
+        public AntigravityLogCapturingSandbox(string logFileContent)
+        {
+            _logFileContent = logFileContent;
+        }
+
+        public string Id => "fake-antigravity-log-sandbox";
+        public List<SandboxExec> AllExecs { get; } = new();
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
+            {
+                return Task.FromResult(new SandboxExecResult(0, _logFileContent, string.Empty));
+            }
+            return Task.FromResult(new SandboxExecResult(0, "stdout-response", "stderr-response"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
