@@ -25,6 +25,15 @@ public sealed class QuotaRouterProgramWiringTests
         Assert.Equal(1.0, codexFloor.StartFloorPct);
         Assert.Equal(0.0, codexFloor.EndFloorPct);
         Assert.Equal(TimeSpan.FromDays(1), codexFloor.RampWindow);
+        Assert.Equal(1.75, options.DrainAggressiveness);
+        Assert.True(options.ExpectedResets.TryGetValue("CODEX", out var codexReset));
+        Assert.Equal(TimeSpan.FromDays(7), codexReset.Cadence);
+        Assert.Equal(
+            new DateTimeOffset(2026, 6, 1, 0, 20, 0, TimeSpan.Zero),
+            codexReset.CadenceAnchor);
+        Assert.Contains(
+            new DateTimeOffset(2026, 6, 1, 0, 20, 0, TimeSpan.Zero),
+            codexReset.Timestamps);
     }
 
     [Fact]
@@ -112,6 +121,58 @@ public sealed class QuotaRouterProgramWiringTests
         Assert.Null(gemini.Value.RampWindow);
     }
 
+    [Fact]
+    public void Mapper_DropsInvalidExpectedResetEntriesAndFields()
+    {
+        var timestamp = new DateTimeOffset(2026, 6, 1, 0, 20, 0, TimeSpan.Zero);
+        var config = new QuotaRouterConfig
+        {
+            ExpectedResets = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["valid"] = new QuotaRouterExpectedResetConfig
+                {
+                    Timestamps = [timestamp],
+                    CadenceSeconds = 3600,
+                    CadenceAnchor = timestamp,
+                },
+                ["timestamps-only"] = new QuotaRouterExpectedResetConfig
+                {
+                    Timestamps = [timestamp.AddDays(1)],
+                },
+                ["cadence-without-anchor"] = new QuotaRouterExpectedResetConfig
+                {
+                    CadenceSeconds = 3600,
+                },
+                ["anchor-without-cadence"] = new QuotaRouterExpectedResetConfig
+                {
+                    CadenceAnchor = timestamp,
+                },
+                ["bad-cadence"] = new QuotaRouterExpectedResetConfig
+                {
+                    CadenceSeconds = 0,
+                    CadenceAnchor = timestamp,
+                },
+                [" "] = new QuotaRouterExpectedResetConfig { Timestamps = [timestamp] },
+                ["null-entry"] = null!,
+            },
+        };
+
+        var options = QuotaRouterConfigMapper.ToOptions(config);
+
+        Assert.True(options.ExpectedResets.TryGetValue("valid", out var valid));
+        Assert.Equal(TimeSpan.FromHours(1), valid.Cadence);
+        Assert.Equal(timestamp, valid.CadenceAnchor);
+        Assert.Equal([timestamp], valid.Timestamps);
+        Assert.True(options.ExpectedResets.TryGetValue("timestamps-only", out var timestampsOnly));
+        Assert.Null(timestampsOnly.Cadence);
+        Assert.Single(timestampsOnly.Timestamps);
+        Assert.DoesNotContain("cadence-without-anchor", options.ExpectedResets.Keys);
+        Assert.DoesNotContain("anchor-without-cadence", options.ExpectedResets.Keys);
+        Assert.DoesNotContain("bad-cadence", options.ExpectedResets.Keys);
+        Assert.DoesNotContain(" ", options.ExpectedResets.Keys);
+        Assert.DoesNotContain("null-entry", options.ExpectedResets.Keys);
+    }
+
     private sealed class QuotaRouterWiringFactory : WebApplicationFactory<Program>
     {
         private readonly string _dbPath = Path.Combine(
@@ -136,6 +197,10 @@ public sealed class QuotaRouterProgramWiringTests
                     ["CodeyBox:QuotaRouter:FloorByAgent:codex:StartFloorPct"] = "1",
                     ["CodeyBox:QuotaRouter:FloorByAgent:codex:EndFloorPct"] = "0",
                     ["CodeyBox:QuotaRouter:FloorByAgent:codex:RampWindowSeconds"] = "86400",
+                    ["CodeyBox:QuotaRouter:DrainAggressiveness"] = "1.75",
+                    ["CodeyBox:QuotaRouter:ExpectedResets:codex:Timestamps:0"] = "2026-06-01T00:20:00Z",
+                    ["CodeyBox:QuotaRouter:ExpectedResets:codex:CadenceSeconds"] = "604800",
+                    ["CodeyBox:QuotaRouter:ExpectedResets:codex:CadenceAnchor"] = "2026-06-01T00:20:00Z",
                 });
             });
             builder.ConfigureTestServices(services =>

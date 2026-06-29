@@ -81,9 +81,12 @@ also fall back to `MinQuotaPct`.
 
 All knobs are hot-reloadable via the `CodeyBox:QuotaRouter` config block —
 edits to `~/codeybox-extra.json` take effect on the next gate decision.
-`IntraKindRoutingPolicy` controls how same-kind subscription instances are
-ordered after class scoring: `MostQuotaFirst` (default), `RoundRobin`, or
-`Sticky`.
+`IntraKindRoutingPolicy` controls how eligible class members are ordered after
+the quality and capability gates: `MostQuotaFirst` (default), `RoundRobin`,
+`Sticky`, or `DeadlineAwareDrain`. `DeadlineAwareDrain` can reorder across agent
+kinds that already satisfy the item quality bar, using quota headroom divided by
+hours to the nearest live or configured expected reset. `DrainAggressiveness`
+and per-agent `ExpectedResets` are hot-reloadable in the same block.
 
 ## Probe Model
 

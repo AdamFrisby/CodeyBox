@@ -4886,10 +4886,24 @@ namespace CodeyBox.Api
         /// </summary>
         public double ColdStartFitInWindow { get; set; } = 2.0;
         /// <summary>
+        /// Multiplier for DeadlineAwareDrain. Default 1.0 follows the even pace;
+        /// values above 1.0 bias dispatch ahead of pace so free/manual refills are
+        /// less likely to strand quota. Hot-reloadable.
+        /// </summary>
+        public double DrainAggressiveness { get; set; } = 1.0;
+        /// <summary>
+        /// Operator-declared expected free/manual reset points, keyed by agent kind
+        /// value. Each entry may provide explicit <c>Timestamps</c> and/or a
+        /// recurring <c>CadenceSeconds</c> with <c>CadenceAnchor</c>. Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, QuotaRouterExpectedResetConfig> ExpectedResets { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
         /// How pooled instances of the same agent kind are ordered. Default
         /// MostQuotaFirst maximizes runway; RoundRobin spreads wear; Sticky
-        /// keeps later phases on the selected instance when available.
-        /// Hot-reloadable.
+        /// keeps later phases on the selected instance when available;
+        /// DeadlineAwareDrain drains use-it-or-lose-it subscription quota toward
+        /// its floor by the nearest known or expected reset. Hot-reloadable.
         /// </summary>
         public IntraKindRoutingPolicy IntraKindRoutingPolicy { get; set; } =
             IntraKindRoutingPolicy.MostQuotaFirst;
@@ -4934,6 +4948,22 @@ namespace CodeyBox.Api
 
         /// <summary>Optional ramp-window length in seconds for this agent.</summary>
         public int? RampWindowSeconds { get; set; }
+    }
+
+    /// <summary>
+    /// Declared quota refills that the provider probe cannot see until they fire.
+    /// Used only by DeadlineAwareDrain.
+    /// </summary>
+    public sealed class QuotaRouterExpectedResetConfig
+    {
+        /// <summary>Explicit reset timestamps. Past values are ignored by the router.</summary>
+        public List<DateTimeOffset> Timestamps { get; set; } = [];
+
+        /// <summary>Recurring reset period in seconds. Requires <see cref="CadenceAnchor"/>.</summary>
+        public int? CadenceSeconds { get; set; }
+
+        /// <summary>Anchor timestamp for the recurring cadence.</summary>
+        public DateTimeOffset? CadenceAnchor { get; set; }
     }
 
     /// <summary>

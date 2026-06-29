@@ -1581,7 +1581,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var policy = _opts.IntraKindRoutingPolicy;
         if (policy == IntraKindRoutingPolicy.MostQuotaFirst)
-            await PrecomputeQuotaForSameKindGroupsAsync(sorted, precomputedQuotas, ct);
+            await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, includeSingleMemberGroups: false, ct);
+        else if (policy == IntraKindRoutingPolicy.DeadlineAwareDrain)
+            await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, includeSingleMemberGroups: true, ct);
+
+        if (policy == IntraKindRoutingPolicy.DeadlineAwareDrain)
+            return OrderDeadlineAwareDrain(sorted, precomputedQuotas, _time.GetUtcNow());
 
         var buckets = sorted
             .GroupBy(x => x.Member.Agent)
@@ -1608,12 +1613,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return buckets.SelectMany(g => g.Members).ToList();
     }
 
-    private async Task PrecomputeQuotaForSameKindGroupsAsync(
+    private async Task PrecomputeQuotaForPolicyAsync(
         List<ScoredMember> sorted,
         Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        bool includeSingleMemberGroups,
         CancellationToken ct)
     {
-        foreach (var group in sorted.GroupBy(x => x.Member.Agent).Where(g => g.Count() > 1))
+        foreach (var group in sorted
+                     .GroupBy(x => x.Member.Agent)
+                     .Where(g => includeSingleMemberGroups || g.Count() > 1))
         {
             foreach (var entry in group)
             {
@@ -1629,6 +1637,38 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 RecordObservedAvailability(member, budgeted.Quota);
             }
         }
+    }
+
+    private List<ScoredMember> OrderDeadlineAwareDrain(
+        List<ScoredMember> sorted,
+        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        DateTimeOffset nowUtc)
+    {
+        var ranked = sorted
+            .Select(entry =>
+            {
+                var signal = ComputeDeadlineDrainSignal(entry.Member, precomputedQuotas, nowUtc);
+                return new
+                {
+                    Entry = entry,
+                    Signal = signal,
+                    FallbackKindRank = DrainFallbackKindRank(entry.Member, precomputedQuotas),
+                    FallbackQuotaRank = QuotaRank(entry.Member, precomputedQuotas),
+                };
+            });
+
+        return ranked
+            .OrderByDescending(x => x.Signal.HasSignal)
+            .ThenByDescending(x => x.Signal.HasPaceDeficit)
+            .ThenByDescending(x => x.Signal.PaceDeficit)
+            .ThenByDescending(x => x.Signal.Urgency)
+            .ThenByDescending(x => x.FallbackKindRank)
+            .ThenByDescending(x => x.FallbackQuotaRank)
+            .ThenByDescending(x => x.Entry.EffectiveScore)
+            .ThenBy(x => x.Entry.Member.Billing == AgentBilling.Subscription ? 0 : 1)
+            .ThenBy(x => x.Entry.ConfigIndex)
+            .Select(x => x.Entry)
+            .ToList();
     }
 
     private List<ScoredMember> OrderIntraKindGroup(
@@ -1699,6 +1739,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (!precomputedQuotas.TryGetValue(ExhaustionKey(member), out var precomputed))
             return member.Billing == AgentBilling.PayPerApi ? 100.0 : double.NegativeInfinity;
         return precomputed.Budgeted.Quota.AvailablePct;
+    }
+
+    private static int DrainFallbackKindRank(
+        AgentMembership member,
+        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas)
+    {
+        if (member.Billing == AgentBilling.PayPerApi)
+            return 0;
+        if (!precomputedQuotas.TryGetValue(ExhaustionKey(member), out var precomputed))
+            return 1;
+        return precomputed.Budgeted.Quota.IsKnown ? 2 : 1;
     }
 
     /// <summary>
@@ -1884,6 +1935,184 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
 
         return earliest;
+    }
+
+    private DeadlineDrainSignal ComputeDeadlineDrainSignal(
+        AgentMembership member,
+        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        DateTimeOffset nowUtc)
+    {
+        if (member.Billing != AgentBilling.Subscription)
+            return DeadlineDrainSignal.None;
+        if (!precomputedQuotas.TryGetValue(ExhaustionKey(member), out var precomputed))
+            return DeadlineDrainSignal.None;
+
+        var quota = precomputed.Budgeted.Quota;
+        if (!quota.IsKnown)
+            return DeadlineDrainSignal.None;
+
+        var liveResetAt = SelectDrainResetAt(quota);
+        var deadline = ResolveEffectiveDrainDeadline(member.Agent, liveResetAt, nowUtc);
+        if (deadline is not { } resetAt || resetAt <= nowUtc)
+            return DeadlineDrainSignal.None;
+
+        var hoursToReset = (resetAt - nowUtc).TotalHours;
+        if (hoursToReset <= 0 || double.IsNaN(hoursToReset) || double.IsInfinity(hoursToReset))
+            return DeadlineDrainSignal.None;
+
+        var floor = _quotaGatePolicy.ComputeEffectiveFloorPct(member.Agent, quota, nowUtc);
+        var headroom = Math.Max(0.0, quota.AvailablePct - floor);
+        if (headroom <= 0)
+            return DeadlineDrainSignal.None;
+
+        var aggressiveness = NormalizedDrainAggressiveness();
+        var urgency = (headroom / hoursToReset) * aggressiveness;
+        if (double.IsNaN(urgency) || double.IsInfinity(urgency))
+            return DeadlineDrainSignal.None;
+
+        var pace = ComputeDrainPace(member, quota, headroom, resetAt, nowUtc, aggressiveness);
+        return new DeadlineDrainSignal(
+            HasSignal: true,
+            Urgency: urgency,
+            PaceDeficit: pace.PaceDeficit,
+            PerCycleBurnTarget: pace.PerCycleBurnTarget);
+    }
+
+    private double NormalizedDrainAggressiveness()
+    {
+        var value = _opts.DrainAggressiveness;
+        return value > 0 && !double.IsNaN(value) && !double.IsInfinity(value)
+            ? value
+            : 1.0;
+    }
+
+    private DateTimeOffset? ResolveEffectiveDrainDeadline(
+        AgentKind agent,
+        DateTimeOffset? liveResetAt,
+        DateTimeOffset nowUtc)
+    {
+        var deadline = liveResetAt;
+        var expected = ResolveNextExpectedReset(agent, nowUtc);
+        if (expected is not null && (deadline is null || expected.Value < deadline.Value))
+            deadline = expected;
+        return deadline;
+    }
+
+    private DateTimeOffset? ResolveNextExpectedReset(AgentKind agent, DateTimeOffset nowUtc)
+    {
+        if (string.IsNullOrEmpty(agent.Value)
+            || _opts.ExpectedResets is not { } expectedResets
+            || !expectedResets.TryGetValue(agent.Value, out var expected)
+            || expected is null)
+            return null;
+
+        DateTimeOffset? next = null;
+        foreach (var timestamp in expected.Timestamps)
+            Consider(timestamp.ToUniversalTime());
+
+        if (expected.Cadence is { } cadence
+            && cadence > TimeSpan.Zero
+            && expected.CadenceAnchor is { } anchor)
+            Consider(ResolveNextCadenceReset(anchor.ToUniversalTime(), cadence, nowUtc));
+
+        return next;
+
+        void Consider(DateTimeOffset? candidate)
+        {
+            if (candidate is not { } reset || reset <= nowUtc)
+                return;
+            if (next is null || reset < next.Value)
+                next = reset;
+        }
+    }
+
+    private static DateTimeOffset? ResolveNextCadenceReset(
+        DateTimeOffset anchorUtc,
+        TimeSpan cadence,
+        DateTimeOffset nowUtc)
+    {
+        if (cadence <= TimeSpan.Zero)
+            return null;
+        if (anchorUtc > nowUtc)
+            return anchorUtc;
+
+        try
+        {
+            var elapsedTicks = nowUtc.UtcDateTime.Ticks - anchorUtc.UtcDateTime.Ticks;
+            if (elapsedTicks < 0)
+                return anchorUtc;
+
+            var periodsElapsed = elapsedTicks / cadence.Ticks;
+            return anchorUtc.AddTicks(checked((periodsElapsed + 1) * cadence.Ticks));
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+    }
+
+    private DeadlineDrainPace ComputeDrainPace(
+        AgentMembership member,
+        EffectiveQuota quota,
+        double headroom,
+        DateTimeOffset deadline,
+        DateTimeOffset nowUtc,
+        double aggressiveness)
+    {
+        var rateWindow = SelectRateWindow(quota, nowUtc);
+        if (rateWindow?.ResetAt is not { } rateResetAt || rateResetAt <= nowUtc)
+            return DeadlineDrainPace.None;
+
+        var hoursToDeadline = (deadline - nowUtc).TotalHours;
+        var hoursToRateReset = (rateResetAt - nowUtc).TotalHours;
+        if (hoursToDeadline <= 0
+            || hoursToRateReset <= 0
+            || double.IsNaN(hoursToDeadline)
+            || double.IsNaN(hoursToRateReset)
+            || double.IsInfinity(hoursToDeadline)
+            || double.IsInfinity(hoursToRateReset))
+            return DeadlineDrainPace.None;
+
+        var cyclesToReset = Math.Max(1.0, hoursToDeadline / hoursToRateReset);
+        var evenTarget = headroom / cyclesToReset;
+        var rateFloor = ResolveWindowFloorPct(member.Agent, rateWindow.Name);
+        var maxCycleBurn = Math.Max(0.0, 100.0 - rateFloor);
+        var perCycleTarget = Math.Clamp(evenTarget * aggressiveness, 0.0, maxCycleBurn);
+        var burnedThisCycle = Math.Clamp(100.0 - rateWindow.AvailablePct, 0.0, 100.0);
+        var deficit = Math.Max(0.0, perCycleTarget - burnedThisCycle);
+        return new DeadlineDrainPace(perCycleTarget, deficit);
+    }
+
+    private static WindowQuota? SelectRateWindow(EffectiveQuota quota, DateTimeOffset nowUtc)
+    {
+        if (quota.Windows is not { Count: > 0 } windows)
+            return null;
+
+        WindowQuota? best = null;
+        foreach (var window in windows)
+        {
+            if (window.AvailablePct < 0 || window.ResetAt is not { } resetAt || resetAt <= nowUtc)
+                continue;
+            if (best?.ResetAt is not { } bestReset || resetAt < bestReset)
+                best = window;
+        }
+        return best;
+    }
+
+    private static DateTimeOffset? SelectDrainResetAt(EffectiveQuota quota)
+    {
+        var resetAt = quota.ResetAt;
+        if (quota.Windows is not { Count: > 0 } windows)
+            return resetAt;
+
+        foreach (var window in windows)
+        {
+            if (window.ResetAt is not { } windowReset)
+                continue;
+            if (resetAt is null || windowReset > resetAt.Value)
+                resetAt = windowReset;
+        }
+        return resetAt;
     }
 
     private void LogMemberExcluded(WorkItemId itemId, AgentMembership member, string reason)
@@ -2303,6 +2532,23 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         int EffectiveScore,
         int ConfigIndex);
 
+    private readonly record struct DeadlineDrainSignal(
+        bool HasSignal,
+        double Urgency,
+        double PaceDeficit,
+        double PerCycleBurnTarget)
+    {
+        public static DeadlineDrainSignal None => default;
+        public bool HasPaceDeficit => HasSignal && PaceDeficit > 0;
+    }
+
+    private readonly record struct DeadlineDrainPace(
+        double PerCycleBurnTarget,
+        double PaceDeficit)
+    {
+        public static DeadlineDrainPace None => default;
+    }
+
     /// <summary>
     /// Result of MIN-combining a probe quota with the local operator budget.
     /// <see cref="BudgetExhausted"/> is true only when a budget is configured and
@@ -2568,6 +2814,21 @@ public sealed class QuotaRouterOptions
     public double ColdStartFitInWindow { get; set; } = 2.0;
 
     /// <summary>
+    /// Multiplier for <see cref="IntraKindRoutingPolicy.DeadlineAwareDrain"/>.
+    /// Values above 1.0 bias the router to run ahead of the even burn line; invalid
+    /// or non-positive values are treated as 1.0 by the router.
+    /// </summary>
+    public double DrainAggressiveness { get; set; } = 1.0;
+
+    /// <summary>
+    /// Operator-declared expected reset points keyed by <see cref="AgentKind.Value"/>.
+    /// These are separate from live probe resets and model free/manual resets that
+    /// refill quota before the provider's scheduled reset.
+    /// </summary>
+    public Dictionary<string, ExpectedQuotaResetOptions> ExpectedResets { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// How the router orders multiple eligible instances of the same agent kind.
     /// Hot-reloadable through the shared options instance.
     /// </summary>
@@ -2580,6 +2841,7 @@ public enum IntraKindRoutingPolicy
     MostQuotaFirst,
     RoundRobin,
     Sticky,
+    DeadlineAwareDrain,
 }
 
 /// <summary>
@@ -2602,6 +2864,22 @@ public sealed class QuotaFloorOverrideOptions
 
     /// <summary>Optional per-agent ramp-window length.</summary>
     public TimeSpan? RampWindow { get; set; }
+}
+
+/// <summary>
+/// Declared reset points that are not visible in the live provider quota probe
+/// until they fire, such as manual or hidden free refills.
+/// </summary>
+public sealed class ExpectedQuotaResetOptions
+{
+    /// <summary>Explicit reset timestamps. Past values are ignored.</summary>
+    public IReadOnlyList<DateTimeOffset> Timestamps { get; set; } = [];
+
+    /// <summary>Recurring reset period. Ignored unless <see cref="CadenceAnchor"/> is also set.</summary>
+    public TimeSpan? Cadence { get; set; }
+
+    /// <summary>Anchor instant for the recurring cadence.</summary>
+    public DateTimeOffset? CadenceAnchor { get; set; }
 }
 
 public enum QuotaUnknownPolicy
