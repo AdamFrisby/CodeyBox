@@ -107,4 +107,20 @@ public sealed record LocatedTarget
     /// against a threshold today.
     /// </summary>
     public required double Confidence { get; init; }
+
+    /// <summary>
+    /// Stable evidence supplied by the locator. Reachability uses this instead
+    /// of parsing <see cref="Source"/> strings so custom locators can participate
+    /// without mimicking the default locator's diagnostic provenance values.
+    /// </summary>
+    public LocatedTargetEvidence Evidence { get; init; } = LocatedTargetEvidence.None;
+}
+
+[Flags]
+public enum LocatedTargetEvidence
+{
+    None = 0,
+    Accessibility = 1,
+    Visual = 2,
+    Ocr = 4,
 }

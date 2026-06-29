@@ -64,6 +64,14 @@ public sealed record TraceAction
     /// recognition — never by raw coordinates.
     /// </summary>
     public required TraceTargetDescriptor TargetDescriptor { get; init; }
+
+    /// <summary>
+    /// True only for deliberately global input that is not scoped to a recorded
+    /// focus target, such as an application-wide Escape shortcut. Targetless
+    /// key/type steps default to false so trimmed or legacy traces cannot type
+    /// into incidental focus by accident.
+    /// </summary>
+    public bool IsGlobalInput { get; init; }
 }
 
 /// <summary>

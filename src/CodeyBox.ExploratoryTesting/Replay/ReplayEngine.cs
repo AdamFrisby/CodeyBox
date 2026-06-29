@@ -126,7 +126,11 @@ public sealed class ReplayEngine
         CancellationToken ct)
     {
         var opts = options ?? new ReplayOptions();
-        var reachability = _reachability ?? new ReachabilityChecker(bridge, _locator, _accessibilityMatcher);
+        var reachability = _reachability ?? new ReachabilityChecker(
+            bridge,
+            _locator,
+            _accessibilityMatcher,
+            _visualWait);
         var start = _timeProvider.GetUtcNow();
         var steps = new List<ReplayStepResult>(trace.Entries.Count);
 
@@ -174,6 +178,16 @@ public sealed class ReplayEngine
 
         LocatedTarget? located = null;
         var effectiveDescriptor = action.TargetDescriptor;
+        if (IsTargetlessKeyboardAction(action))
+        {
+            return await FailAsync(
+                sandbox, entry,
+                ReplayFailureKind.NotFound,
+                $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): keyboard input has no focus target descriptor; mark the action as global input only for deliberate application-wide shortcuts",
+                locatedTarget: null,
+                ct).ConfigureAwait(false);
+        }
+
         if (NeedsLocator(action))
         {
             try
@@ -444,8 +458,7 @@ public sealed class ReplayEngine
     private static TraceAssertion? EffectiveAssertion(TraceEntry entry)
     {
         if (entry.Assertion is not null) return entry.Assertion;
-        if (entry.Action.Kind == "screenshot"
-            && entry.Observation.ScreenshotPng is { Length: > 0 })
+        if (entry.Observation.ScreenshotPng is { Length: > 0 })
         {
             return new TraceAssertion { Kind = "visual-match" };
         }
@@ -696,6 +709,10 @@ public sealed class ReplayEngine
         {
             var scroll = BuildVisualSearchScrollRequest(descriptor.Visual, options, attempt);
             await bridge.ExecuteAsync(sandbox, scroll, ct).ConfigureAwait(false);
+            var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct)
+                .ConfigureAwait(false);
+            if (settled is null) return null;
+
             var relocated = await _locator.LocateAsync(sandbox, descriptor, options, ct)
                 .ConfigureAwait(false);
             if (relocated is not null) return relocated;
@@ -789,6 +806,11 @@ public sealed class ReplayEngine
             "scroll" or "key" or "type" => HasUsableTargetSignal(action.TargetDescriptor),
             _ => false,
         };
+
+    private static bool IsTargetlessKeyboardAction(TraceAction action) =>
+        action.Kind is "key" or "type"
+        && !action.IsGlobalInput
+        && !HasUsableTargetSignal(action.TargetDescriptor);
 
     private static bool HasUsableTargetSignal(TraceTargetDescriptor descriptor)
     {

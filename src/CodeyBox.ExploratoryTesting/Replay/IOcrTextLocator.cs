@@ -145,6 +145,7 @@ internal sealed class TesseractOcrTextLocator : IOcrTextLocator
         Region = region,
         Source = "visual-ocr",
         Confidence = 0.72,
+        Evidence = LocatedTargetEvidence.Ocr,
     };
 
     private static TraceBoundingRegion Union(TraceBoundingRegion left, TraceBoundingRegion right)

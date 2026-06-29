@@ -7,7 +7,7 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// kinds the recorder emits today:
 ///
 /// <list type="bullet">
-///   <item><c>visual-match</c>: PNG byte-equality between the recorded
+///   <item><c>visual-match</c>: decoded-pixel equality between the recorded
 ///   observation screenshot and the current screenshot. <c>Detail</c> may
 ///   name a screenshot in the named-recordings map; when unset, the engine's
 ///   per-step recorded screenshot (threaded through VerifyAsync) is the
@@ -36,7 +36,7 @@ public sealed class DefaultAssertionVerifier : IAssertionVerifier
     public DefaultAssertionVerifier()
         : this(
             recordedScreenshots: new Dictionary<string, byte[]>(StringComparer.Ordinal),
-            screenshotComparer: ExactBytesScreenshotComparer.Instance)
+            screenshotComparer: DecodedPixelsScreenshotComparer.Instance)
     {
     }
 
@@ -52,7 +52,7 @@ public sealed class DefaultAssertionVerifier : IAssertionVerifier
     /// the wrong reference image).
     /// </summary>
     public DefaultAssertionVerifier(IReadOnlyDictionary<string, byte[]> recordedScreenshots)
-        : this(recordedScreenshots, ExactBytesScreenshotComparer.Instance)
+        : this(recordedScreenshots, DecodedPixelsScreenshotComparer.Instance)
     {
     }
 

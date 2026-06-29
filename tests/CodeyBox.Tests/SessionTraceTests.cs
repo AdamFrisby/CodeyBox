@@ -229,7 +229,7 @@ public sealed class SessionTraceTests
     public async Task RecordingBridge_CapturesClickActionWithVisualDescriptor()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
-        var sandbox = new RecordingGraphicalSandbox(SamplePng);
+        var sandbox = new AccessibleGraphicalSandbox(SamplePng);
         var inner = new ComputerUseBridge(timeProvider: timeProvider);
         var recorder = new RecordingComputerUseBridge(inner, timeProvider);
 
@@ -263,7 +263,7 @@ public sealed class SessionTraceTests
     public async Task RecordingBridge_DoubleClickEmitsTwoClickEvents()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
-        var sandbox = new RecordingGraphicalSandbox(SamplePng);
+        var sandbox = new AccessibleGraphicalSandbox(SamplePng);
         var inner = new ComputerUseBridge(timeProvider: timeProvider);
         var recorder = new RecordingComputerUseBridge(inner, timeProvider);
 
@@ -331,7 +331,7 @@ public sealed class SessionTraceTests
     public async Task RecordingBridge_TypeActionInheritsPreviousTargetDescriptor()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
-        var sandbox = new RecordingGraphicalSandbox(SamplePng);
+        var sandbox = new AccessibleGraphicalSandbox(SamplePng);
         var inner = new ComputerUseBridge(timeProvider: timeProvider);
         var recorder = new RecordingComputerUseBridge(inner, timeProvider);
 
@@ -340,17 +340,21 @@ public sealed class SessionTraceTests
 
         var clickVisual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
         var typeVisual = recorder.Trace.Entries[1].Action.TargetDescriptor.Visual;
+        var clickAccessibility = recorder.Trace.Entries[0].Action.TargetDescriptor.Accessibility;
+        var typeAccessibility = recorder.Trace.Entries[1].Action.TargetDescriptor.Accessibility;
         Assert.Equal(clickVisual.Region, typeVisual.Region);
         Assert.Equal(clickVisual.ClickOffsetX, typeVisual.ClickOffsetX);
         Assert.Equal(clickVisual.ClickOffsetY, typeVisual.ClickOffsetY);
         Assert.NotNull(typeVisual.SourceScreenshotPng);
+        Assert.NotNull(clickAccessibility);
+        Assert.Equal(clickAccessibility, typeAccessibility);
     }
 
     [Fact]
     public async Task RecordingBridge_KeyActionInheritsPreviousTargetDescriptor()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
-        var sandbox = new RecordingGraphicalSandbox(SamplePng);
+        var sandbox = new AccessibleGraphicalSandbox(SamplePng);
         var inner = new ComputerUseBridge(timeProvider: timeProvider);
         var recorder = new RecordingComputerUseBridge(inner, timeProvider);
 
@@ -359,10 +363,14 @@ public sealed class SessionTraceTests
 
         var clickVisual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
         var keyVisual = recorder.Trace.Entries[1].Action.TargetDescriptor.Visual;
+        var clickAccessibility = recorder.Trace.Entries[0].Action.TargetDescriptor.Accessibility;
+        var keyAccessibility = recorder.Trace.Entries[1].Action.TargetDescriptor.Accessibility;
         Assert.Equal(clickVisual.Region, keyVisual.Region);
         Assert.Equal(clickVisual.ClickOffsetX, keyVisual.ClickOffsetX);
         Assert.Equal(clickVisual.ClickOffsetY, keyVisual.ClickOffsetY);
         Assert.NotNull(keyVisual.SourceScreenshotPng);
+        Assert.NotNull(clickAccessibility);
+        Assert.Equal(clickAccessibility, keyAccessibility);
     }
 
     [Fact]

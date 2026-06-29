@@ -91,6 +91,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
                 Region = region,
                 Source = "accessibility-point",
                 Confidence = 1.0,
+                Evidence = LocatedTargetEvidence.Accessibility,
             };
         }
 
@@ -113,6 +114,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
                         Region = region,
                         Source = "accessibility-ring",
                         Confidence = RingHitConfidence,
+                        Evidence = LocatedTargetEvidence.Accessibility,
                     };
                 }
             }
@@ -206,6 +208,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
                     Region = region,
                     Source = "accessibility-tree",
                     Confidence = 1.0,
+                    Evidence = LocatedTargetEvidence.Accessibility,
                 });
             }
 

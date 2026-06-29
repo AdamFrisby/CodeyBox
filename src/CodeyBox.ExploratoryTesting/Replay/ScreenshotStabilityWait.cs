@@ -86,8 +86,8 @@ public sealed class ScreenshotStabilityWait : IVisualWait
 
     private static bool ScreenshotsRepresentSamePixels(byte[] a, byte[] b)
     {
-        if (VisualSignatureElementLocator.PngBitmap.TryDecode(a, out var left)
-            && VisualSignatureElementLocator.PngBitmap.TryDecode(b, out var right))
+        if (PngBitmap.TryDecode(a, out var left)
+            && PngBitmap.TryDecode(b, out var right))
         {
             return left.HasSamePixelsAs(right);
         }

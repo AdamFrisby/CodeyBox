@@ -41,15 +41,21 @@ public sealed class ReachabilityChecker : IReachabilityChecker
     private readonly ComputerUseBridge _bridge;
     private readonly IElementLocator _locator;
     private readonly IAccessibilityMatcher _matcher;
+    private readonly IVisualWait _visualWait;
+    private readonly IVisualTargetVerifier _visualVerifier;
 
     public ReachabilityChecker(
         ComputerUseBridge bridge,
         IElementLocator? locator = null,
-        IAccessibilityMatcher? matcher = null)
+        IAccessibilityMatcher? matcher = null,
+        IVisualWait? visualWait = null,
+        IVisualTargetVerifier? visualVerifier = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _matcher = matcher ?? DefaultAccessibilityMatcher.Instance;
         _locator = locator ?? new AccessibilityElementLocator(_matcher);
+        _visualWait = visualWait ?? new ScreenshotStabilityWait();
+        _visualVerifier = visualVerifier ?? DescriptorVisualTargetVerifier.Instance;
     }
 
     public async Task<ReachabilityOutcome> EnsureReachableAsync(
@@ -90,6 +96,17 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                 ? new ComputerUseRequest { Action = "scroll", ScrollX = dx }
                 : new ComputerUseRequest { Action = "scroll", ScrollY = dy };
             await _bridge.ExecuteAsync(sandbox, scrollRequest, ct).ConfigureAwait(false);
+            var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct)
+                .ConfigureAwait(false);
+            if (settled is null)
+            {
+                return new ReachabilityOutcome
+                {
+                    Status = ReachabilityStatus.OffScreen,
+                    Target = current,
+                    Diagnostic = $"screen did not settle after scrolling toward target centre ({current.CenterX},{current.CenterY}) within {options.VisualWaitTimeout}",
+                };
+            }
 
             // Re-locate on the CURRENT screen — the brief mandates recognition,
             // not arithmetic on stale coordinates.
@@ -147,14 +164,12 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 
             if (snap is null)
             {
-                // No element answers at the located centre even though the
-                // recorded descriptor had a clear accessibility signature.
-                // Display:none / opacity:0 / removed-from-DOM all drop a
-                // node out of the accessibility tree, so this is the
-                // "visible" leg of the reachability check: a vanished
-                // target is not user-reachable. Report as Occluded —
-                // categorically a "the element the recording trusted is no
-                // longer here at click time" failure class.
+                if (!await HasAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
+                    && await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct).ConfigureAwait(false) == VisualTargetVerificationStatus.Verified)
+                {
+                    return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
+                }
+
                 return new ReachabilityOutcome
                 {
                     Status = ReachabilityStatus.Occluded,
@@ -177,13 +192,13 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         {
             try
             {
-                if (IsOcrLocatedTarget(current))
-                    return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
-
                 var snap = await sandbox.GetAccessibilityAtPointAsync(current.CenterX, current.CenterY, ct)
                     .ConfigureAwait(false);
                 if (snap is not null)
                 {
+                    if (TopMostAccessibilityMatchesOcrTarget(snap, descriptor.Visual, current))
+                        return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
+
                     return new ReachabilityOutcome
                     {
                         Status = ReachabilityStatus.Occluded,
@@ -192,7 +207,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                     };
                 }
 
-                var visualStatus = await VerifyVisualOnlyTargetAsync(sandbox, current, descriptor, ct)
+                var visualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct)
                     .ConfigureAwait(false);
                 if (visualStatus != VisualTargetVerificationStatus.Verified)
                 {
@@ -202,7 +217,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                         Target = current,
                         Diagnostic = visualStatus == VisualTargetVerificationStatus.Mismatch
                             ? $"visual-only target pixels no longer match the recorded descriptor at ({current.CenterX},{current.CenterY}); cannot verify it is visible and unobstructed"
-                            : $"visual-only target at ({current.CenterX},{current.CenterY}) has no verifiable current visual signature; cannot prove it is visible and unobstructed",
+                            : $"visual-only target at ({current.CenterX},{current.CenterY}) has no verifiable current visual signature or OCR evidence; cannot prove it is visible and unobstructed",
                     };
                 }
             }
@@ -224,13 +239,13 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
     }
 
-    private static async Task<VisualTargetVerificationStatus> VerifyVisualOnlyTargetAsync(
+    private async Task<VisualTargetVerificationStatus> GetCurrentVisualEvidenceStatusAsync(
         ISandbox sandbox,
         LocatedTarget current,
         TraceTargetDescriptor descriptor,
         CancellationToken ct)
     {
-        if (IsOcrLocatedTarget(current))
+        if ((current.Evidence & (LocatedTargetEvidence.Visual | LocatedTargetEvidence.Ocr)) != 0)
             return VisualTargetVerificationStatus.Verified;
 
         byte[] screenshot;
@@ -248,14 +263,11 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         }
 
         if (screenshot.Length == 0) return VisualTargetVerificationStatus.Unverifiable;
-        return VisualSignatureElementLocator.VerifyVisualTargetAt(screenshot, descriptor.Visual, current);
+        return _visualVerifier.Verify(screenshot, descriptor.Visual, current);
     }
 
     private static bool InViewport(LocatedTarget t, ReplayOptions o) =>
         t.CenterX >= 0 && t.CenterX < o.ScreenWidth && t.CenterY >= 0 && t.CenterY < o.ScreenHeight;
-
-    private static bool IsOcrLocatedTarget(LocatedTarget target) =>
-        target.Source is "visual-ocr-tree" or "visual-ocr";
 
     private static (int Dx, int Dy) ResolveScrollDelta(LocatedTarget t, ReplayOptions o)
     {
@@ -280,4 +292,37 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 
     private static string Describe(TraceAccessibilityDescriptor d) =>
         $"role={DiagnosticText.Sanitize(d.Role ?? "?")} name={DiagnosticText.Sanitize(d.Name ?? "?")}";
+
+    private static async Task<bool> HasAccessibilityTreeAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        try
+        {
+            var tree = await sandbox.GetAccessibilityTreeJsonAsync(ct).ConfigureAwait(false);
+            return !string.IsNullOrWhiteSpace(tree);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TopMostAccessibilityMatchesOcrTarget(
+        SandboxAccessibilitySnapshot snap,
+        TraceVisualDescriptor visual,
+        LocatedTarget current)
+    {
+        if ((current.Evidence & LocatedTargetEvidence.Ocr) == 0) return false;
+        var expected = visual.OcrText;
+        if (string.IsNullOrWhiteSpace(expected)) return false;
+        return Contains(snap.Name, expected)
+            || Contains(snap.Text, expected)
+            || Contains(snap.ElementType, expected);
+    }
+
+    private static bool Contains(string? value, string expected)
+        => value?.Contains(expected, StringComparison.OrdinalIgnoreCase) == true;
 }

@@ -5,14 +5,10 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// Default-injected into <see cref="DefaultAssertionVerifier"/> so callers can
 /// swap the comparison strategy without rewriting the verifier.
 ///
-/// <para><b>Why a seam:</b> the shipped <see cref="ExactBytesScreenshotComparer"/>
-/// is byte-equality of raw PNG bytes — a deliberately conservative default that
-/// matches only when the recorded and current PNGs are bit-identical. Real
-/// renders are non-deterministic (PNG encoder choices, anti-aliasing, font
-/// hinting, GPU/driver variance), so byte-equality alone is too strict for any
-/// host-to-host replay. Production callers wire a perceptual-diff or
-/// pixel-tolerance comparator (e.g. SSIM, PSNR, ΔE2000) here without touching
-/// the verifier.</para>
+/// <para><b>Why a seam:</b> the shipped default compares decoded PNG pixels,
+/// not the encoded byte stream. Callers can still wire a perceptual-diff or
+/// wider tolerance comparator (e.g. SSIM, PSNR, DeltaE) without touching the
+/// verifier.</para>
 /// </summary>
 public interface IScreenshotComparer
 {
@@ -32,11 +28,7 @@ public interface IScreenshotComparer
 public readonly record struct ScreenshotComparison(bool Matches, string? Diagnostic = null);
 
 /// <summary>
-/// Default screenshot comparator: byte-equality of raw PNG bytes. Conservative
-/// by design — it accepts only bit-identical renders, so a flaky diff never
-/// silently passes. For production renders where bit-identical capture is
-/// impossible, supply a perceptual-diff implementation via
-/// <see cref="DefaultAssertionVerifier"/>'s comparer constructor.
+/// Comparator for tests or callers that really need encoded byte equality.
 /// </summary>
 public sealed class ExactBytesScreenshotComparer : IScreenshotComparer
 {
@@ -44,6 +36,31 @@ public sealed class ExactBytesScreenshotComparer : IScreenshotComparer
 
     public ScreenshotComparison Compare(byte[] recorded, byte[] current)
     {
+        if (recorded.Length != current.Length)
+            return new ScreenshotComparison(false);
+        return new ScreenshotComparison(recorded.AsSpan().SequenceEqual(current));
+    }
+}
+
+/// <summary>
+/// Default screenshot comparator: decoded-pixel equality for PNGs, falling back
+/// to byte equality for non-PNG buffers used by lightweight tests.
+/// </summary>
+public sealed class DecodedPixelsScreenshotComparer : IScreenshotComparer
+{
+    public static DecodedPixelsScreenshotComparer Instance { get; } = new();
+
+    public ScreenshotComparison Compare(byte[] recorded, byte[] current)
+    {
+        if (PngBitmap.TryDecode(recorded, out var recordedBitmap)
+            && PngBitmap.TryDecode(current, out var currentBitmap))
+        {
+            var matches = recordedBitmap.HasSamePixelsAs(currentBitmap);
+            return matches
+                ? new ScreenshotComparison(true)
+                : new ScreenshotComparison(false, "visual-match assertion: decoded pixels differ");
+        }
+
         if (recorded.Length != current.Length)
             return new ScreenshotComparison(false);
         return new ScreenshotComparison(recorded.AsSpan().SequenceEqual(current));
