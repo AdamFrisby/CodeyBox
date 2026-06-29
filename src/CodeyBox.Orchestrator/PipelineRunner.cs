@@ -10331,6 +10331,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         ISandbox sandbox,
         string phase,
         string auditorName,
+        WorkItemId workItemId,
+        int iteration,
         CancellationToken ct)
     {
         var timeout = _pipelineTuning.Current.AuditorIdleTimeout;
@@ -10358,8 +10360,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         probeTask,
                         sandbox,
                         "structured-stream probe",
-                        auditorName).ConfigureAwait(false);
-                    throw new AuditorIdleTimeoutException(auditorName, timedOutAfter.Value);
+                        auditorName,
+                        runner.Kind,
+                        workItemId,
+                        iteration).ConfigureAwait(false);
+                    throw new AuditorIdleTimeoutException(auditorName, runner.Kind, timedOutAfter.Value);
                 }
 
                 ct.ThrowIfCancellationRequested();
@@ -12587,7 +12592,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 async Task<ISandbox> CreatePreparedToolSandboxAsync(
                     SandboxRepositoryAccess repositoryAccess,
                     SandboxSpec sandboxSpec,
-                    string auditorName)
+                    string auditorName,
+                    AgentKind agentKind)
                 {
                     var prepared = await CreateAuditSandboxWithIdleTimeoutAsync(sandboxSpec, auditorName, ct);
                     try
@@ -12595,6 +12601,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         await RunAuditSandboxSetupWithIdleTimeoutAsync(
                             prepared,
                             auditorName,
+                            agentKind,
+                            item.Id,
+                            ctx.Iteration,
                             async (setupSandbox, setupCt) =>
                             {
                                 if (credential is not null && credential.Files.Count > 0)
@@ -12645,7 +12654,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                 await using var isolatedSandbox = await CreatePreparedToolSandboxAsync(
                                     isolatedAccess,
                                     isolatedSpec,
-                                    auditor.Name);
+                                    auditor.Name,
+                                    runner.Kind);
                                 run = await ExecAuditorAsync(
                                     isolatedSandbox,
                                     auditor,
@@ -12677,7 +12687,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         }
                         else
                         {
-                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync(access, spec, auditor.Name);
+                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync(access, spec, auditor.Name, runner.Kind);
                             run = await ExecAuditorAsync(
                                 sharedToolSandbox,
                                 auditor,
@@ -12726,8 +12736,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     _log.LogWarning(
                         ex,
-                        "Auditor {Auditor} timed out during iteration {Iteration}; returning incomplete audit verdict with {FindingCount} completed finding(s)",
+                        "Auditor {Auditor} (agent: {Agent}) timed out during iteration {Iteration}; returning incomplete audit verdict with {FindingCount} completed finding(s)",
                         ex.AuditorName,
+                        ex.AgentKind.Value,
                         ctx.Iteration,
                         findings.Count);
                     return new AuditorBatchResult(
@@ -12736,7 +12747,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         declaredShortCircuitBlocking,
                         IncompleteVerdict: true,
                         CompletedAuditors: completedAuditors.ToList(),
-                        IncompleteAuditors: [ex.AuditorName],
+                        IncompleteAuditors: [$"{ex.AuditorName} ({ex.AgentKind.Value})"],
                         PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
                         BuildTestGateFailed: buildTestGateFailed);
                 }
@@ -12812,6 +12823,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     await RunAuditSandboxSetupWithIdleTimeoutAsync(
                         sandbox,
                         pair.Auditor.Name,
+                        candidateRunner.Kind,
+                        trialItem.Id,
+                        ctx.Iteration,
                         async (setupSandbox, setupCt) =>
                         {
                             await dotnetShim.InstallAsync(setupSandbox, setupCt);
@@ -13099,7 +13113,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         if (firstExhaustion is null && inner is AgentClassExhaustedException exhaustion)
                             firstExhaustion = exhaustion;
                         else if (inner is AuditorIdleTimeoutException timeout)
-                            incompleteAuditors.Add(timeout.AuditorName);
+                            incompleteAuditors.Add($"{timeout.AuditorName} ({timeout.AgentKind.Value})");
                         else if (firstExhaustion is null && firstOtherException is null)
                             firstOtherException = ExceptionDispatchInfo.Capture(inner);
                     }
@@ -13263,7 +13277,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             : $"audit-llm-{auditor.Name}";
         var canCaptureStructuredStream = auditor.Kind == "llm"
             && !isPlanReview
-            && await CanCaptureAuditStructuredStreamAsync(runner, sandbox, auditPhase, auditor.Name, ct);
+            && await CanCaptureAuditStructuredStreamAsync(runner, sandbox, auditPhase, auditor.Name, ctx.WorkItemId, ctx.Iteration, ct);
         // Capture only for LLM-style auditors. Tool auditors don't run an
         // agent through this codepath (see IAuditor docs — tool auditors
         // ignore AuditContext.StdoutChunkCallback), so opening a capture
@@ -13363,6 +13377,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 result = await RunAuditorWithIdleTimeoutAsync(
                     auditor,
+                    runner.Kind,
                     sandbox,
                     SandboxConventions.WorkDir,
                     auditorCtx,
@@ -13481,6 +13496,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private async Task RunAuditSandboxSetupWithIdleTimeoutAsync(
         ISandbox sandbox,
         string auditorName,
+        AgentKind agent,
+        WorkItemId workItemId,
+        int iteration,
         Func<ISandbox, CancellationToken, Task> setup,
         CancellationToken ct)
     {
@@ -13514,8 +13532,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         setupTask,
                         sandbox,
                         "audit setup",
-                        auditorName).ConfigureAwait(false);
-                    throw new AuditorIdleTimeoutException(auditorName, timedOutAfter.Value);
+                        auditorName,
+                        agent,
+                        workItemId,
+                        iteration).ConfigureAwait(false);
+                    throw new AuditorIdleTimeoutException(auditorName, agent, timedOutAfter.Value);
                 }
 
                 ct.ThrowIfCancellationRequested();
@@ -13537,6 +13558,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private async Task<AuditResult> RunAuditorWithIdleTimeoutAsync(
         IAuditor auditor,
+        AgentKind agent,
         ISandbox sandbox,
         string workingDirectory,
         AuditContext context,
@@ -13580,8 +13602,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         auditorTask,
                         sandbox,
                         "auditor",
-                        auditor.Name).ConfigureAwait(false);
-                    throw new AuditorIdleTimeoutException(auditor.Name, timedOutAfter.Value);
+                        auditor.Name,
+                        agent,
+                        context.WorkItemId,
+                        context.Iteration).ConfigureAwait(false);
+                    throw new AuditorIdleTimeoutException(auditor.Name, agent, timedOutAfter.Value);
                 }
 
                 ct.ThrowIfCancellationRequested();
@@ -13667,8 +13692,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Task task,
         ISandbox sandbox,
         string operation,
-        string auditorName)
+        string auditorName,
+        AgentKind agent,
+        WorkItemId workItemId,
+        int iteration)
     {
+        AuditLog.AuditorTimedOut(
+            workItemId,
+            auditorName,
+            agent,
+            iteration,
+            sandbox.Id);
+
         try { await cts.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
 
@@ -13682,9 +13717,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         catch (TimeoutException)
         {
             _log.LogWarning(
-                "Timed-out {Operation} for auditor {Auditor} did not kill active execs in sandbox {SandboxId} within the teardown grace period",
+                "Timed-out {Operation} for auditor {Auditor} (agent: {Agent}) did not kill active execs in sandbox {SandboxId} within the teardown grace period",
                 operation,
                 auditorName,
+                agent.Value,
                 sandbox.Id);
         }
         catch (Exception ex)
@@ -13706,9 +13742,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         catch (TimeoutException)
         {
             _log.LogWarning(
-                "Timed-out {Operation} for auditor {Auditor} did not dispose sandbox {SandboxId} within the teardown grace period",
+                "Timed-out {Operation} for auditor {Auditor} (agent: {Agent}) did not dispose sandbox {SandboxId} within the teardown grace period",
                 operation,
                 auditorName,
+                agent.Value,
                 sandbox.Id);
         }
         catch (Exception ex)
@@ -21273,14 +21310,24 @@ internal sealed class AuditHistoryPersistenceFailedException : Exception
 
 internal sealed class AuditorIdleTimeoutException : TimeoutException
 {
+    public AuditorIdleTimeoutException(string auditorName, AgentKind agentKind, TimeSpan timeout)
+        : base($"auditor '{auditorName}' (agent: {agentKind.Value}) produced no output or verdict within {timeout}")
+    {
+        AuditorName = auditorName;
+        AgentKind = agentKind;
+        Timeout = timeout;
+    }
+
     public AuditorIdleTimeoutException(string auditorName, TimeSpan timeout)
         : base($"auditor '{auditorName}' produced no output or verdict within {timeout}")
     {
         AuditorName = auditorName;
+        AgentKind = new AgentKind("unknown");
         Timeout = timeout;
     }
 
     public string AuditorName { get; }
+    public AgentKind AgentKind { get; }
     public TimeSpan Timeout { get; }
 }
 

@@ -1145,6 +1145,58 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         Assert.Contains(expectedTestCommand, toolLog);
     }
 
+    [Fact]
+    public async Task TimedOutBuildTestGateEmitsStructuredEventAndAgentKind()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new HangingBuildTestGateAuditor("csharp:test-pass");
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        var webhooks = new CapturingWebhookDispatcher();
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            pipelineTuning: tuning,
+            webhookDispatcher: webhooks);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("incomplete auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("csharp:test-pass", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(tp.Agent.Kind.Value, final.LastError, StringComparison.OrdinalIgnoreCase);
+
+        var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
+        Assert.NotNull(timeoutEvent);
+        var details = timeoutEvent.Details;
+        Assert.NotNull(details);
+
+        var type = details.GetType();
+        var workItemIdProp = type.GetProperty("WorkItemId")?.GetValue(details)?.ToString();
+        var auditorProp = type.GetProperty("Auditor")?.GetValue(details)?.ToString();
+        var agentProp = type.GetProperty("Agent")?.GetValue(details)?.ToString();
+        var iterationProp = type.GetProperty("Iteration")?.GetValue(details);
+        var sandboxIdProp = type.GetProperty("SandboxId")?.GetValue(details)?.ToString();
+
+        Assert.Equal(item.Id.ToString(), workItemIdProp);
+        Assert.Equal("csharp:test-pass", auditorProp);
+        Assert.Equal(tp.Agent.Kind.Value, agentProp);
+        Assert.Equal(1, iterationProp);
+        Assert.NotNull(sandboxIdProp);
+        Assert.NotEmpty(sandboxIdProp);
+    }
+
     private async Task<FakeAuditTools> CreateFakeAuditToolsAsync()
     {
         var bin = Path.Combine(_workspace, "fake-audit-tools-" + Guid.NewGuid().ToString("N")[..8]);
