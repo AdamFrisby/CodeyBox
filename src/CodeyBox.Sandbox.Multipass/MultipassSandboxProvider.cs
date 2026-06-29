@@ -6017,7 +6017,11 @@ while True:
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
         sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, sys, urllib.error, urllib.parse, urllib.request");
+        sb.AppendLine("import os, signal, sys, urllib.error, urllib.parse, urllib.request");
+        sb.AppendLine("def codeybox_timeout(_signum, _frame):");
+        sb.AppendLine("    raise TimeoutError('ready probe timed out')");
+        sb.AppendLine("signal.signal(signal.SIGALRM, codeybox_timeout)");
+        sb.AppendLine("signal.alarm(2)");
         sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
         sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
         sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
@@ -6029,8 +6033,9 @@ while True:
         sb.AppendLine("    data=b'',");
         sb.AppendLine("    method='POST',");
         sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
+        sb.AppendLine("opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))");
         sb.AppendLine("try:");
-        sb.AppendLine("    with urllib.request.urlopen(req, timeout=1.0) as resp:");
+        sb.AppendLine("    with opener.open(req, timeout=1.0) as resp:");
         sb.AppendLine("        code = resp.getcode()");
         sb.AppendLine("        sys.exit(0 if 200 <= code < 300 else 1)");
         sb.AppendLine("except urllib.error.HTTPError:");
