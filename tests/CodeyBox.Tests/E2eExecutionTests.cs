@@ -479,6 +479,7 @@ public sealed class E2eExecutionTests : IDisposable
         await foreach (var r in _runs.ListByBatchAsync(batch)) results.Add(r);
         Assert.Equal(total, results.Count);
         Assert.All(results, r => Assert.Equal(E2eRunStatus.Passed, r.Status));
+        await WaitForDispatcherIdleAsync(dispatcher);
 
         // Parallelism proof: sequential = total * perStepDelay (~800ms). With max=4 the
         // ideal is two waves (~200ms); give it a generous ceiling so CI jitter doesn't
@@ -520,6 +521,7 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
 
         var terminal = await WaitForRunStatusAsync(runId, E2eRunStatus.Error);
+        await WaitForDispatcherIdleAsync(dispatcher);
         Assert.Contains("ReplayDriverUnavailable", terminal.Result);
     }
 
@@ -556,6 +558,7 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.True(await _runs.CancelAsync(runId));
 
         var terminal = await WaitForRunStatusAsync(runId, E2eRunStatus.Canceled);
+        await WaitForDispatcherIdleAsync(dispatcher);
         Assert.Equal(E2eRunStatus.Canceled, terminal.Status);
     }
 
@@ -595,6 +598,7 @@ public sealed class E2eExecutionTests : IDisposable
         }
         Assert.NotNull(terminal);
         Assert.Equal(E2eRunStatus.Error, terminal.Status);
+        await WaitForDispatcherIdleAsync(dispatcher);
         Assert.Contains("EmptyArtifact", terminal.Result);
     }
 
@@ -641,6 +645,11 @@ public sealed class E2eExecutionTests : IDisposable
         throw new TimeoutException($"Run {runId} did not reach {status}; current status={current?.Status}");
     }
 
+    private static async Task WaitForDispatcherIdleAsync(E2eRunDispatcher dispatcher)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await dispatcher.WaitForIdleAsync(cts.Token);
+    }
 
     private static string MakeTrivialPassArtifact()
         => JsonSerializer.Serialize(new E2eReplayArtifact

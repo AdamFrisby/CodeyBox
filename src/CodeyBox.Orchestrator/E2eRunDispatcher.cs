@@ -190,6 +190,18 @@ public sealed class E2eRunDispatcher : BackgroundService
         return true;
     }
 
+    internal async Task WaitForIdleAsync(CancellationToken ct = default)
+    {
+        while (true)
+        {
+            var tasks = _activeTasks.Values.ToArray();
+            if (tasks.Length == 0)
+                return;
+
+            await Task.WhenAll(tasks).WaitAsync(ct);
+        }
+    }
+
     private async Task RunOneAsync(IE2eExecutionSlot slot, E2eRun run, CancellationTokenSource runCancellation, CancellationToken stoppingToken)
     {
         var opts = _options.CurrentValue;
