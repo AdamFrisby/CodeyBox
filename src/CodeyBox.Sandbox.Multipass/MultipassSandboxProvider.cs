@@ -5114,6 +5114,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
     private const int DetachedPollFailureLimit = 5;
+    private static readonly TimeSpan DetachedAuthenticatedExitCleanupTimeout = TimeSpan.FromSeconds(5);
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
 
     // Test seam: override the WaitForDetachedCompletionAsync poll interval.
@@ -5492,7 +5493,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
                 var detachedExit = await WaitForDetachedCompletionAsync(detachedProcessGroupMarker!, agentOutputIngest, ct)
                     .ConfigureAwait(false);
-                var detachedOutput = await ReadDetachedOutputSidecarsAsync(detachedProcessGroupMarker!, ct)
+                var detachedOutput = await ReadDetachedOutputSidecarsAfterAuthenticatedExitAsync(detachedProcessGroupMarker!)
                     .ConfigureAwait(false);
                 await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
                 var detachedIngested = agentOutputIngest;
@@ -6305,7 +6306,7 @@ while True:
             {
                 if (ingest.TryGetExitCode(out var authenticatedExitCode))
                 {
-                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    var reapError = await EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(processGroupMarker).ConfigureAwait(false);
                     return new DetachedExitResult(authenticatedExitCode, reapError);
                 }
 
@@ -6315,7 +6316,7 @@ while True:
             {
                 if (ingest.TryGetExitCode(out var exitCode))
                 {
-                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    var reapError = await EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(processGroupMarker).ConfigureAwait(false);
                     return new DetachedExitResult(exitCode, reapError);
                 }
 
@@ -6329,6 +6330,20 @@ while True:
                     1,
                     $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
             }
+        }
+    }
+
+    private async Task<string?> EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(string processGroupMarker)
+    {
+        using var reapCts = new CancellationTokenSource(DetachedAuthenticatedExitCleanupTimeout);
+        try
+        {
+            return await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, reapCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (reapCts.IsCancellationRequested)
+        {
+            await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
+            return $"detached exec process group cleanup timed out after authenticated exit ({DetachedAuthenticatedExitCleanupTimeout.TotalSeconds:0.#}s)\n";
         }
     }
 
@@ -6351,6 +6366,22 @@ while True:
             stdout.Output,
             stderr.Output,
             stdout.Error + stderr.Error);
+    }
+
+    private async Task<DetachedOutputSidecars> ReadDetachedOutputSidecarsAfterAuthenticatedExitAsync(string processGroupMarker)
+    {
+        using var readCts = new CancellationTokenSource(DetachedAuthenticatedExitCleanupTimeout);
+        try
+        {
+            return await ReadDetachedOutputSidecarsAsync(processGroupMarker, readCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (readCts.IsCancellationRequested)
+        {
+            return new DetachedOutputSidecars(
+                "",
+                "",
+                $"detached exec output sidecar read timed out after authenticated exit ({DetachedAuthenticatedExitCleanupTimeout.TotalSeconds:0.#}s)\n");
+        }
     }
 
     private async Task<DetachedOutputSidecar> ReadDetachedOutputSidecarAsync(

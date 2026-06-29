@@ -2114,6 +2114,69 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_DetachedAuthenticatedExitIgnoresCallerCancellationDuringPostExitReap()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var exitPoster = new CapturingDetachedExitPoster();
+        using var callerCts = new CancellationTokenSource();
+        var pollCalls = 0;
+        var killCalls = 0;
+        var runner = new RecordingMultipassRunner(async (argv, stdin, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "transfer", _, _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                AssertDetachedLaunchStdin(stdin);
+                return new ProcessRunResult(0, "", "");
+            }
+            if (IsDetachedProcessGroupPoll(argv))
+            {
+                pollCalls++;
+                if (pollCalls == 1)
+                {
+                    await exitPoster.PostExitAsync(0);
+                    await callerCts.CancelAsync();
+                    return new ProcessRunResult(0, "alive 12345\n", "");
+                }
+
+                return new ProcessRunResult(0, "exited 12345 0 gone\n", "");
+            }
+            if (IsDetachedOutputSidecarRead(argv))
+                return new ProcessRunResult(0, "", "");
+            if (IsDetachedProcessGroupKill(argv))
+            {
+                killCalls++;
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return new ProcessRunResult(0, "", "");
+
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner, exitPoster.StartAsync);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            LaunchMode = SandboxExecLaunchMode.DetachedBatch,
+        }, callerCts.Token);
+
+        Assert.True(result.Success);
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal(2, pollCalls);
+        Assert.Equal(0, killCalls);
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedOutputSidecarReadFailureAppendsDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
