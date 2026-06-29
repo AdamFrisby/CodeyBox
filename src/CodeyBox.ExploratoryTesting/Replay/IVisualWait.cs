@@ -18,10 +18,10 @@ public interface IVisualWait
 {
     /// <summary>
     /// Wait for the screen to settle. When <paramref name="predicate"/> is
-    /// supplied, a matching screenshot may return early, but implementations
-    /// may still return a stable non-matching frame so the caller can run a
-    /// richer assertion verifier and report a precise mismatch. Returns the
-    /// selected screenshot on success, or null when the wait timed out.
+    /// supplied, it is the expected-state gate: implementations should return
+    /// only a matching screenshot, or null when the expected state never
+    /// appears before timeout. Without a predicate, a stable screenshot is a
+    /// successful wait result.
     /// </summary>
     Task<byte[]?> WaitAsync(
         ISandbox sandbox,

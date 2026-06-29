@@ -73,6 +73,8 @@ public sealed class SessionTraceTests
                             Visual = new TraceVisualDescriptor
                             {
                                 Region = new TraceBoundingRegion { X = 50, Y = 150, Width = 101, Height = 101 },
+                                ClickOffsetX = 50,
+                                ClickOffsetY = 50,
                                 SourceScreenshotPng = SamplePng,
                             },
                         },
@@ -123,6 +125,8 @@ public sealed class SessionTraceTests
         Assert.Equal(50, entry.Action.TargetDescriptor.Visual.Region.X);
         Assert.Equal(150, entry.Action.TargetDescriptor.Visual.Region.Y);
         Assert.Equal(101, entry.Action.TargetDescriptor.Visual.Region.Width);
+        Assert.Equal(50, entry.Action.TargetDescriptor.Visual.ClickOffsetX);
+        Assert.Equal(50, entry.Action.TargetDescriptor.Visual.ClickOffsetY);
         Assert.NotNull(entry.Observation.ScreenshotPng);
         Assert.Equal(SamplePng, entry.Observation.ScreenshotPng);
         Assert.Equal("{\"tree\":[]}", entry.Observation.AccessibilitySnapshotJson);
@@ -245,6 +249,8 @@ public sealed class SessionTraceTests
         Assert.Equal(30, visual.Region.Y); // 80 - 50
         Assert.Equal(101, visual.Region.Width);  // 2*50 + 1
         Assert.Equal(101, visual.Region.Height);
+        Assert.Equal(50, visual.ClickOffsetX);
+        Assert.Equal(50, visual.ClickOffsetY);
         Assert.NotNull(visual.SourceScreenshotPng);
         Assert.Equal(SamplePng, visual.SourceScreenshotPng);
 
@@ -335,7 +341,28 @@ public sealed class SessionTraceTests
         var clickVisual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
         var typeVisual = recorder.Trace.Entries[1].Action.TargetDescriptor.Visual;
         Assert.Equal(clickVisual.Region, typeVisual.Region);
+        Assert.Equal(clickVisual.ClickOffsetX, typeVisual.ClickOffsetX);
+        Assert.Equal(clickVisual.ClickOffsetY, typeVisual.ClickOffsetY);
         Assert.NotNull(typeVisual.SourceScreenshotPng);
+    }
+
+    [Fact]
+    public async Task RecordingBridge_KeyActionInheritsPreviousTargetDescriptor()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new RecordingGraphicalSandbox(SamplePng);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "key", Key = "Enter" });
+
+        var clickVisual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
+        var keyVisual = recorder.Trace.Entries[1].Action.TargetDescriptor.Visual;
+        Assert.Equal(clickVisual.Region, keyVisual.Region);
+        Assert.Equal(clickVisual.ClickOffsetX, keyVisual.ClickOffsetX);
+        Assert.Equal(clickVisual.ClickOffsetY, keyVisual.ClickOffsetY);
+        Assert.NotNull(keyVisual.SourceScreenshotPng);
     }
 
     [Fact]
@@ -372,6 +399,32 @@ public sealed class SessionTraceTests
         Assert.Single(entry.Action.InputEvents);
         Assert.Equal(SandboxInputEventType.Scroll, entry.Action.InputEvents[0].Type);
         Assert.Equal(3, entry.Action.InputEvents[0].Y);
+
+        var visual = entry.Action.TargetDescriptor.Visual;
+        Assert.Equal(0, visual.Region.Width);
+        Assert.Equal(0, visual.Region.Height);
+        Assert.Null(visual.ClickOffsetX);
+        Assert.Null(visual.ClickOffsetY);
+    }
+
+    [Fact]
+    public async Task RecordingBridge_ScrollActionDoesNotInheritPreviousTargetDescriptor()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new RecordingGraphicalSandbox(SamplePng);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "scroll", ScrollY = 3 });
+
+        var clickVisual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
+        var scrollVisual = recorder.Trace.Entries[1].Action.TargetDescriptor.Visual;
+        Assert.NotEqual(clickVisual.Region, scrollVisual.Region);
+        Assert.Equal(0, scrollVisual.Region.Width);
+        Assert.Equal(0, scrollVisual.Region.Height);
+        Assert.Null(scrollVisual.ClickOffsetX);
+        Assert.Null(scrollVisual.ClickOffsetY);
     }
 
     [Fact]
@@ -513,6 +566,8 @@ public sealed class SessionTraceTests
         var visual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
         Assert.Equal(0, visual.Region.X); // clamped
         Assert.Equal(0, visual.Region.Y); // clamped
+        Assert.Equal(10, visual.ClickOffsetX);
+        Assert.Equal(5, visual.ClickOffsetY);
     }
 
     [Fact]

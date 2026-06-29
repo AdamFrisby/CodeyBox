@@ -75,10 +75,11 @@ public sealed record ReplayStepResult
 /// The bounds + provenance of a re-located target on the current screen.
 /// Returned by <see cref="IElementLocator.LocateAsync"/> and consumed by the
 /// engine to drive real input. The <see cref="CenterX"/> / <see cref="CenterY"/>
-/// pair is the engine's click target; <see cref="Region"/> is the recorded
-/// descriptor's region — locators that snap to a nearby point preserve the
-/// recorded region rather than synthesising a fresh one, so consumers should
-/// treat it as the recorded shape, not as live geometry of the located hit.
+/// pair is the engine's click target; <see cref="Region"/> is the best-known
+/// live bounds of the matched target. Point-probe locators that do not receive
+/// live bounds may preserve the recorded shape anchored around the located
+/// point, so consumers should treat it as locator provenance rather than a
+/// guarantee of platform-reported geometry.
 /// </summary>
 public sealed record LocatedTarget
 {

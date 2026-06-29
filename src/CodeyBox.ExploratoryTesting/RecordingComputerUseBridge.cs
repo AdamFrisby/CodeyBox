@@ -248,23 +248,36 @@ public sealed class RecordingComputerUseBridge
         var (cx, cy) = ResolveActionCentre(action, events);
 
         TraceBoundingRegion region;
+        int? clickOffsetX = null;
+        int? clickOffsetY = null;
         if (cx.HasValue && cy.HasValue)
         {
             var r = _options.TargetCropRadius;
             var clampedX = Math.Max(0, cx.Value - r);
             var clampedY = Math.Max(0, cy.Value - r);
+            var width = 2 * r + 1;
+            var height = 2 * r + 1;
+            if (TryReadPngDimensions(preScreenshot, out var screenWidth, out var screenHeight))
+            {
+                var right = Math.Min(screenWidth - 1, cx.Value + r);
+                var bottom = Math.Min(screenHeight - 1, cy.Value + r);
+                width = Math.Max(1, right - clampedX + 1);
+                height = Math.Max(1, bottom - clampedY + 1);
+            }
+            clickOffsetX = cx.Value - clampedX;
+            clickOffsetY = cy.Value - clampedY;
             region = new TraceBoundingRegion
             {
                 X = clampedX,
                 Y = clampedY,
-                Width = 2 * r + 1,
-                Height = 2 * r + 1,
+                Width = width,
+                Height = height,
             };
         }
         else
         {
             if (_lastTargetDescriptor is { } last
-                && action is "key" or "type" or "scroll"
+                && action is "key" or "type"
                 && HasUsableTargetDescriptor(last))
             {
                 return last with
@@ -285,6 +298,8 @@ public sealed class RecordingComputerUseBridge
             Visual = new TraceVisualDescriptor
             {
                 Region = region,
+                ClickOffsetX = clickOffsetX,
+                ClickOffsetY = clickOffsetY,
                 SourceScreenshotPng = preScreenshot,
             },
         };
@@ -309,6 +324,24 @@ public sealed class RecordingComputerUseBridge
         }
         return (null, null);
     }
+
+    private static bool TryReadPngDimensions(byte[]? png, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+        if (png is null || png.Length < 24) return false;
+        ReadOnlySpan<byte> signature = [137, 80, 78, 71, 13, 10, 26, 10];
+        if (!png.AsSpan(0, signature.Length).SequenceEqual(signature)) return false;
+        if (png[12] != (byte)'I' || png[13] != (byte)'H' || png[14] != (byte)'D' || png[15] != (byte)'R')
+            return false;
+
+        width = ReadBigEndianInt32(png.AsSpan(16, 4));
+        height = ReadBigEndianInt32(png.AsSpan(20, 4));
+        return width > 0 && height > 0;
+    }
+
+    private static int ReadBigEndianInt32(ReadOnlySpan<byte> bytes)
+        => (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
 
     private static bool HasUsableTargetDescriptor(TraceTargetDescriptor descriptor)
     {

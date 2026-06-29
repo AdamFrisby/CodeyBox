@@ -48,8 +48,8 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         IAccessibilityMatcher? matcher = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
-        _locator = locator ?? new AccessibilityElementLocator();
         _matcher = matcher ?? DefaultAccessibilityMatcher.Instance;
+        _locator = locator ?? new AccessibilityElementLocator(_matcher);
     }
 
     public async Task<ReachabilityOutcome> EnsureReachableAsync(
@@ -188,6 +188,20 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                         Diagnostic = $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
                     };
                 }
+
+                var visualStatus = await VerifyVisualOnlyTargetAsync(sandbox, current, descriptor, ct)
+                    .ConfigureAwait(false);
+                if (visualStatus != VisualTargetVerificationStatus.Verified)
+                {
+                    return new ReachabilityOutcome
+                    {
+                        Status = ReachabilityStatus.Occluded,
+                        Target = current,
+                        Diagnostic = visualStatus == VisualTargetVerificationStatus.Mismatch
+                            ? $"visual-only target pixels no longer match the recorded descriptor at ({current.CenterX},{current.CenterY}); cannot verify it is visible and unobstructed"
+                            : $"visual-only target at ({current.CenterX},{current.CenterY}) has no verifiable current visual signature; cannot prove it is visible and unobstructed",
+                    };
+                }
             }
             catch (OperationCanceledException)
             {
@@ -205,6 +219,33 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         }
 
         return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
+    }
+
+    private static async Task<VisualTargetVerificationStatus> VerifyVisualOnlyTargetAsync(
+        ISandbox sandbox,
+        LocatedTarget current,
+        TraceTargetDescriptor descriptor,
+        CancellationToken ct)
+    {
+        if (current.Source == "visual-ocr-tree")
+            return VisualTargetVerificationStatus.Verified;
+
+        byte[] screenshot;
+        try
+        {
+            screenshot = await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return VisualTargetVerificationStatus.Unverifiable;
+        }
+
+        if (screenshot.Length == 0) return VisualTargetVerificationStatus.Unverifiable;
+        return VisualSignatureElementLocator.VerifyVisualTargetAt(screenshot, descriptor.Visual, current);
     }
 
     private static bool InViewport(LocatedTarget t, ReplayOptions o) =>

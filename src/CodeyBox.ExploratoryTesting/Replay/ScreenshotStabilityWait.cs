@@ -11,17 +11,10 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// byte-identical, mirroring how a human says "ok the spinner stopped, now
 /// I can read it."
 ///
-/// <para>When a <c>predicate</c> is supplied it is an <b>early-stop hint</b>,
-/// not a hard gate: a matching frame returns immediately (the engine can
-/// stop waiting once the expected state appears), but the stability fallback
-/// still applies, so a frame that never matches the predicate still returns
-/// once the screen settles — that lets a downstream assertion verifier run
-/// against the stable frame and produce a precise
-/// <see cref="ReplayFailureKind.AssertionMismatch"/> diagnostic instead of a
-/// misleading <see cref="ReplayFailureKind.WaitTimeout"/>. Treating the
-/// predicate as a hard gate would also defeat any verifier wired with a
-/// non-byte-equality <see cref="IScreenshotComparer"/>, since the engine's
-/// byte-equality predicate would never agree with a perceptual comparator.</para>
+/// <para>When a <c>predicate</c> is supplied it is the expected-state gate:
+/// a matching frame returns immediately, while stable non-matching frames keep
+/// polling until the expected state appears or the deadline expires. Without a
+/// predicate, stability alone is sufficient.</para>
 ///
 /// <para>Byte-equality is intentionally conservative: a single pixel of
 /// noise restarts the stable count. That's what we want — the cursor blink
@@ -87,11 +80,10 @@ public sealed class ScreenshotStabilityWait : IVisualWait
                     // Account for both the current frame and the prior frame —
                     // a "2 consecutive identical screenshots" requirement is
                     // satisfied the first time we observe one match, not after
-                    // two matches. Stability returns the frame regardless of
-                    // whether a predicate was supplied: the predicate is an
-                    // early-stop hint, not a hard gate (see type docs).
+                    // two matches. When a predicate is supplied, stability
+                    // alone is not enough; keep waiting for the expected state.
                     stable++;
-                    if (stable + 1 >= options.StableFrameCount)
+                    if (predicate is null && stable + 1 >= options.StableFrameCount)
                         return current;
                 }
                 else

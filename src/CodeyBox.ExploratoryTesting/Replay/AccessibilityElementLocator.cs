@@ -67,13 +67,14 @@ public sealed class AccessibilityElementLocator : IElementLocator
 
         var region = descriptor.Visual.Region;
         var hasPoint = region.Width > 0 && region.Height > 0;
-        var treeHit = await LocateFromAccessibilityTreeAsync(sandbox, expected, ct).ConfigureAwait(false);
-        if (treeHit is not null) return treeHit;
+        var treeHit = await LocateFromAccessibilityTreeAsync(sandbox, expected, descriptor.Visual, ct)
+            .ConfigureAwait(false);
+        if (treeHit.Status == TreeLocateStatus.Found) return treeHit.Target;
+        if (treeHit.Status == TreeLocateStatus.Ambiguous) return null;
 
         if (!hasPoint) return null;
 
-        var cx = region.X + region.Width / 2;
-        var cy = region.Y + region.Height / 2;
+        var (cx, cy) = RecordedClickPoint(descriptor.Visual);
 
         // Probe at the recorded centre even if it falls outside the viewport:
         // the reachability checker is the layer that distinguishes "off-screen
@@ -149,9 +150,10 @@ public sealed class AccessibilityElementLocator : IElementLocator
         return _matcher.Matches(snap, expected) ? snap : null;
     }
 
-    private async Task<LocatedTarget?> LocateFromAccessibilityTreeAsync(
+    private async Task<TreeLocateResult> LocateFromAccessibilityTreeAsync(
         ISandbox sandbox,
         TraceAccessibilityDescriptor expected,
+        TraceVisualDescriptor visual,
         CancellationToken ct)
     {
         string? json;
@@ -165,55 +167,110 @@ public sealed class AccessibilityElementLocator : IElementLocator
         }
         catch (Exception)
         {
-            return null;
+            return TreeLocateResult.None;
         }
 
-        if (string.IsNullOrWhiteSpace(json)) return null;
+        if (string.IsNullOrWhiteSpace(json)) return TreeLocateResult.None;
 
         try
         {
             using var doc = JsonDocument.Parse(json);
-            return SearchTree(doc.RootElement, expected);
+            var candidates = new List<LocatedTarget>();
+            SearchTree(doc.RootElement, expected, candidates, ct);
+            return SelectTreeCandidate(candidates, visual);
         }
         catch (JsonException)
         {
-            return null;
+            return TreeLocateResult.None;
         }
     }
 
-    private LocatedTarget? SearchTree(JsonElement element, TraceAccessibilityDescriptor expected)
+    private void SearchTree(
+        JsonElement element,
+        TraceAccessibilityDescriptor expected,
+        List<LocatedTarget> candidates,
+        CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         if (element.ValueKind == JsonValueKind.Object)
         {
             var snap = SnapshotFromObject(element);
             if (_matcher.Matches(snap, expected) && TryReadBounds(element, out var region))
             {
-                return new LocatedTarget
+                candidates.Add(new LocatedTarget
                 {
                     CenterX = region.X + region.Width / 2,
                     CenterY = region.Y + region.Height / 2,
                     Region = region,
                     Source = "accessibility-tree",
                     Confidence = 1.0,
-                };
+                });
             }
 
             foreach (var property in element.EnumerateObject())
             {
-                var hit = SearchTree(property.Value, expected);
-                if (hit is not null) return hit;
+                SearchTree(property.Value, expected, candidates, ct);
             }
         }
         else if (element.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in element.EnumerateArray())
             {
-                var hit = SearchTree(item, expected);
-                if (hit is not null) return hit;
+                SearchTree(item, expected, candidates, ct);
+            }
+        }
+    }
+
+    private static TreeLocateResult SelectTreeCandidate(
+        IReadOnlyList<LocatedTarget> candidates,
+        TraceVisualDescriptor visual)
+    {
+        if (candidates.Count == 0) return TreeLocateResult.None;
+        if (candidates.Count == 1) return TreeLocateResult.Found(candidates[0]);
+        if (visual.Region.Width <= 0 || visual.Region.Height <= 0)
+            return TreeLocateResult.Ambiguous;
+
+        var (targetX, targetY) = RecordedClickPoint(visual);
+        LocatedTarget? best = null;
+        var bestScore = long.MaxValue;
+        var ambiguous = false;
+        foreach (var candidate in candidates)
+        {
+            var score = DistanceSquared(candidate.CenterX, candidate.CenterY, targetX, targetY);
+            if (score < bestScore)
+            {
+                best = candidate;
+                bestScore = score;
+                ambiguous = false;
+            }
+            else if (score == bestScore)
+            {
+                ambiguous = true;
             }
         }
 
-        return null;
+        return best is not null && !ambiguous
+            ? TreeLocateResult.Found(best with { Source = "accessibility-tree-disambiguated" })
+            : TreeLocateResult.Ambiguous;
+    }
+
+    private static (int X, int Y) RecordedClickPoint(TraceVisualDescriptor visual)
+    {
+        var region = visual.Region;
+        var x = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < region.Width
+            ? region.X + offsetX
+            : region.X + region.Width / 2;
+        var y = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
+            ? region.Y + offsetY
+            : region.Y + region.Height / 2;
+        return (x, y);
+    }
+
+    private static long DistanceSquared(int x1, int y1, int x2, int y2)
+    {
+        var dx = (long)x1 - x2;
+        var dy = (long)y1 - y2;
+        return dx * dx + dy * dy;
     }
 
     private static SandboxAccessibilitySnapshot SnapshotFromObject(JsonElement obj) => new()
@@ -364,5 +421,19 @@ public sealed class AccessibilityElementLocator : IElementLocator
                 yield return (dx, dy);
             }
         }
+    }
+
+    private enum TreeLocateStatus
+    {
+        None,
+        Found,
+        Ambiguous,
+    }
+
+    private sealed record TreeLocateResult(TreeLocateStatus Status, LocatedTarget? Target)
+    {
+        public static TreeLocateResult None { get; } = new(TreeLocateStatus.None, null);
+        public static TreeLocateResult Ambiguous { get; } = new(TreeLocateStatus.Ambiguous, null);
+        public static TreeLocateResult Found(LocatedTarget target) => new(TreeLocateStatus.Found, target);
     }
 }

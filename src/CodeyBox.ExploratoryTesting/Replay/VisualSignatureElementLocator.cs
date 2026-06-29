@@ -4,6 +4,13 @@ using System.Text;
 
 namespace CodeyBox.ExploratoryTesting.Replay;
 
+internal enum VisualTargetVerificationStatus
+{
+    Verified,
+    Mismatch,
+    Unverifiable,
+}
+
 /// <summary>
 /// Non-accessibility recognition fallback. The locator consumes the recorded
 /// visual descriptor in this order:
@@ -15,9 +22,7 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 ///   <see cref="TraceVisualDescriptor.Region"/> and search for that crop on
 ///   the current screenshot.</item>
 ///   <item>Use <see cref="TraceVisualDescriptor.OcrText"/> against the
-///   current accessibility/OCR tree when the sandbox exposes text bounds,
-///   with a conservative payload-marker fallback for providers/tests that
-///   materialise recognised text into screenshot payloads.</item>
+///   current accessibility/OCR tree when the sandbox exposes text bounds.</item>
 ///   <item>As a final compatibility fallback, accept a full current/source
 ///   byte match.</item>
 /// </list>
@@ -28,6 +33,24 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// </summary>
 public sealed class VisualSignatureElementLocator : IElementLocator
 {
+    private readonly IElementLocator _accessibilityLocator;
+
+    public VisualSignatureElementLocator()
+        : this(DefaultAccessibilityMatcher.Instance)
+    {
+    }
+
+    public VisualSignatureElementLocator(IAccessibilityMatcher matcher)
+        : this(new AccessibilityElementLocator(matcher))
+    {
+    }
+
+    public VisualSignatureElementLocator(IElementLocator accessibilityLocator)
+    {
+        _accessibilityLocator = accessibilityLocator
+            ?? throw new ArgumentNullException(nameof(accessibilityLocator));
+    }
+
     public async Task<LocatedTarget?> LocateAsync(
         ISandbox sandbox,
         TraceTargetDescriptor descriptor,
@@ -42,33 +65,18 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         var region = visual.Region;
         if (region.Width <= 0 || region.Height <= 0) return null;
 
-        byte[] current;
-        try
-        {
-            current = await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
+        var current = await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
 
         if (current is null || current.Length == 0) return null;
 
-        if (TryLocateTemplate(current, visual.TemplatePng, "visual-template", out var templateHit))
+        if (TryLocateTemplate(current, visual, out var templateHit))
             return templateHit;
 
-        if (TryLocateSourceCrop(current, visual.SourceScreenshotPng, region, out var cropHit))
+        if (TryLocateSourceCrop(current, visual, out var cropHit))
             return cropHit;
 
         var ocrTreeHit = await LocateOcrTextAsync(sandbox, visual, options, ct).ConfigureAwait(false);
         if (ocrTreeHit is not null) return ocrTreeHit;
-
-        if (TryLocateOcrTextPayload(current, visual.OcrText, region, out var ocrHit))
-            return ocrHit;
 
         var source = visual.SourceScreenshotPng;
         if (source is not null
@@ -76,29 +84,62 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             && current.Length == source.Length
             && current.AsSpan().SequenceEqual(source))
         {
-            return FromRegion(region, "visual-signature", 0.85);
+            return FromRegion(visual, "visual-signature", 0.85);
         }
 
         return null;
     }
 
+    internal static VisualTargetVerificationStatus VerifyVisualTargetAt(
+        byte[] currentPng,
+        TraceVisualDescriptor visual,
+        LocatedTarget target)
+    {
+        if (visual.TemplatePng is { Length: > 0 }
+            && PngBitmap.TryDecode(currentPng, out var currentTemplateScreen)
+            && PngBitmap.TryDecode(visual.TemplatePng, out var template))
+        {
+            return currentTemplateScreen.MatchesAt(template, target.Region.X, target.Region.Y)
+                ? VisualTargetVerificationStatus.Verified
+                : VisualTargetVerificationStatus.Mismatch;
+        }
+
+        if (visual.SourceScreenshotPng is { Length: > 0 } sourcePng)
+        {
+            if (PngBitmap.TryDecode(sourcePng, out var source)
+                && PngBitmap.TryDecode(currentPng, out var current)
+                && source.TryCrop(visual.Region, out var crop))
+            {
+                return current.MatchesAt(crop, target.Region.X, target.Region.Y)
+                    ? VisualTargetVerificationStatus.Verified
+                    : VisualTargetVerificationStatus.Mismatch;
+            }
+
+            if (currentPng.Length == sourcePng.Length && currentPng.AsSpan().SequenceEqual(sourcePng))
+                return VisualTargetVerificationStatus.Verified;
+        }
+
+        return VisualTargetVerificationStatus.Unverifiable;
+    }
+
     private static bool TryLocateTemplate(
         byte[] currentPng,
-        byte[]? templatePng,
-        string source,
+        TraceVisualDescriptor visual,
         out LocatedTarget? hit)
     {
         hit = null;
+        var templatePng = visual.TemplatePng;
         if (templatePng is null || templatePng.Length == 0) return false;
 
         if (PngBitmap.TryDecode(currentPng, out var current)
             && PngBitmap.TryDecode(templatePng, out var template)
-            && current.FindExact(template) is { } point)
+            && current.TryFindBestExact(template, PreferredTopLeft(visual.Region), out var point))
         {
+            var (offsetX, offsetY) = ResolveClickOffset(visual, template.Width, template.Height);
             hit = new LocatedTarget
             {
-                CenterX = point.X + template.Width / 2,
-                CenterY = point.Y + template.Height / 2,
+                CenterX = point.X + offsetX,
+                CenterY = point.Y + offsetY,
                 Region = new TraceBoundingRegion
                 {
                     X = point.X,
@@ -106,7 +147,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
                     Width = template.Width,
                     Height = template.Height,
                 },
-                Source = source,
+                Source = "visual-template",
                 Confidence = 0.9,
             };
             return true;
@@ -126,22 +167,23 @@ public sealed class VisualSignatureElementLocator : IElementLocator
 
     private static bool TryLocateSourceCrop(
         byte[] currentPng,
-        byte[]? sourcePng,
-        TraceBoundingRegion region,
+        TraceVisualDescriptor visual,
         out LocatedTarget? hit)
     {
         hit = null;
+        var sourcePng = visual.SourceScreenshotPng;
         if (sourcePng is null || sourcePng.Length == 0) return false;
 
         if (PngBitmap.TryDecode(sourcePng, out var source)
             && PngBitmap.TryDecode(currentPng, out var current)
-            && source.TryCrop(region, out var crop)
-            && current.FindExact(crop) is { } point)
+            && source.TryCrop(visual.Region, out var crop)
+            && current.TryFindBestExact(crop, PreferredTopLeft(visual.Region), out var point))
         {
+            var (offsetX, offsetY) = ResolveClickOffset(visual, crop.Width, crop.Height);
             hit = new LocatedTarget
             {
-                CenterX = point.X + crop.Width / 2,
-                CenterY = point.Y + crop.Height / 2,
+                CenterX = point.X + offsetX,
+                CenterY = point.Y + offsetY,
                 Region = new TraceBoundingRegion
                 {
                     X = point.X,
@@ -158,7 +200,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         return false;
     }
 
-    private static async Task<LocatedTarget?> LocateOcrTextAsync(
+    private async Task<LocatedTarget?> LocateOcrTextAsync(
         ISandbox sandbox,
         TraceVisualDescriptor visual,
         ReplayOptions options,
@@ -166,45 +208,48 @@ public sealed class VisualSignatureElementLocator : IElementLocator
     {
         if (string.IsNullOrWhiteSpace(visual.OcrText)) return null;
 
-        var locator = new AccessibilityElementLocator();
         var descriptor = new TraceTargetDescriptor
         {
             Accessibility = new TraceAccessibilityDescriptor { Text = visual.OcrText },
             Visual = new TraceVisualDescriptor { Region = visual.Region },
         };
-        var hit = await locator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
+        var hit = await _accessibilityLocator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
         if (hit is not null) return hit with { Source = "visual-ocr-tree" };
 
         descriptor = descriptor with
         {
             Accessibility = new TraceAccessibilityDescriptor { Name = visual.OcrText },
         };
-        hit = await locator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
+        hit = await _accessibilityLocator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
         return hit is null ? null : hit with { Source = "visual-ocr-tree" };
     }
 
-    private static bool TryLocateOcrTextPayload(
-        byte[] current,
-        string? ocrText,
-        TraceBoundingRegion region,
-        out LocatedTarget? hit)
+    private static LocatedTarget FromRegion(TraceVisualDescriptor visual, string source, double confidence)
     {
-        hit = null;
-        if (string.IsNullOrWhiteSpace(ocrText)) return false;
-        var needle = Encoding.UTF8.GetBytes(ocrText);
-        if (needle.Length == 0 || IndexOf(current, needle) < 0) return false;
-        hit = FromRegion(region, "visual-ocr-payload", 0.7);
-        return true;
+        var region = visual.Region;
+        var (offsetX, offsetY) = ResolveClickOffset(visual, region.Width, region.Height);
+        return new LocatedTarget
+        {
+            CenterX = region.X + offsetX,
+            CenterY = region.Y + offsetY,
+            Region = region,
+            Source = source,
+            Confidence = confidence,
+        };
     }
 
-    private static LocatedTarget FromRegion(TraceBoundingRegion region, string source, double confidence) => new()
+    private static (int X, int Y)? PreferredTopLeft(TraceBoundingRegion region) =>
+        region.Width > 0 && region.Height > 0 ? (region.X, region.Y) : null;
+
+    private static (int X, int Y) ResolveClickOffset(
+        TraceVisualDescriptor visual,
+        int width,
+        int height)
     {
-        CenterX = region.X + region.Width / 2,
-        CenterY = region.Y + region.Height / 2,
-        Region = region,
-        Source = source,
-        Confidence = confidence,
-    };
+        var offsetX = visual.ClickOffsetX is int x && x >= 0 && x < width ? x : width / 2;
+        var offsetY = visual.ClickOffsetY is int y && y >= 0 && y < height ? y : height / 2;
+        return (offsetX, offsetY);
+    }
 
     private static int IndexOf(byte[] haystack, byte[] needle)
     {
@@ -244,7 +289,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
                 bitmap = Decode(png);
                 return true;
             }
-            catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or ArgumentException)
+            catch (Exception ex) when (ex is InvalidDataException or NotSupportedException or ArgumentException or OverflowException)
             {
                 bitmap = null!;
                 return false;
@@ -256,7 +301,9 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             crop = null!;
             if (region.Width <= 0 || region.Height <= 0) return false;
             if (region.X < 0 || region.Y < 0) return false;
-            if (region.X + region.Width > Width || region.Y + region.Height > Height) return false;
+            var right = (long)region.X + region.Width;
+            var bottom = (long)region.Y + region.Height;
+            if (right > Width || bottom > Height) return false;
 
             var pixels = new byte[checked(region.Width * region.Height * 3)];
             for (var y = 0; y < region.Height; y++)
@@ -270,24 +317,55 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             return true;
         }
 
-        public (int X, int Y)? FindExact(PngBitmap template)
+        public bool TryFindBestExact(
+            PngBitmap template,
+            (int X, int Y)? preferredTopLeft,
+            out (int X, int Y) point)
         {
-            if (template.Width <= 0 || template.Height <= 0) return null;
-            if (template.Width > Width || template.Height > Height) return null;
+            point = default;
+            if (template.Width <= 0 || template.Height <= 0) return false;
+            if (template.Width > Width || template.Height > Height) return false;
 
+            var found = false;
+            var ambiguous = false;
+            var bestScore = long.MaxValue;
             for (var y = 0; y <= Height - template.Height; y++)
             {
                 for (var x = 0; x <= Width - template.Width; x++)
                 {
-                    if (MatchesAt(template, x, y)) return (x, y);
+                    if (!MatchesAt(template, x, y)) continue;
+                    if (preferredTopLeft is not { } preferred)
+                    {
+                        if (found) return false;
+                        point = (x, y);
+                        found = true;
+                        continue;
+                    }
+
+                    var score = DistanceSquared(x, y, preferred.X, preferred.Y);
+                    if (score < bestScore)
+                    {
+                        point = (x, y);
+                        bestScore = score;
+                        ambiguous = false;
+                        found = true;
+                    }
+                    else if (score == bestScore)
+                    {
+                        ambiguous = true;
+                    }
                 }
             }
 
-            return null;
+            return found && !ambiguous;
         }
 
-        private bool MatchesAt(PngBitmap template, int x, int y)
+        public bool MatchesAt(PngBitmap template, int x, int y)
         {
+            if (x < 0 || y < 0) return false;
+            if (template.Width <= 0 || template.Height <= 0) return false;
+            if ((long)x + template.Width > Width || (long)y + template.Height > Height) return false;
+
             var rowBytes = template.Width * 3;
             for (var ty = 0; ty < template.Height; ty++)
             {
@@ -297,6 +375,13 @@ public sealed class VisualSignatureElementLocator : IElementLocator
                     return false;
             }
             return true;
+        }
+
+        private static long DistanceSquared(int x1, int y1, int x2, int y2)
+        {
+            var dx = (long)x1 - x2;
+            var dy = (long)y1 - y2;
+            return dx * dx + dy * dy;
         }
 
         private static PngBitmap Decode(byte[] png)

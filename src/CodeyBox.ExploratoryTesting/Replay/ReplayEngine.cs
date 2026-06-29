@@ -69,7 +69,7 @@ public sealed class ReplayEngine
         // locators plug into the same chain via CompositeElementLocator.
         _locator = locator ?? new CompositeElementLocator(
             new AccessibilityElementLocator(matcher),
-            new VisualSignatureElementLocator());
+            new VisualSignatureElementLocator(matcher));
         _reachability = reachability;
         _visualWait = visualWait ?? new ScreenshotStabilityWait(timeProvider);
         _assertions = assertions ?? new DefaultAssertionVerifier();
@@ -176,8 +176,29 @@ public sealed class ReplayEngine
         var effectiveDescriptor = action.TargetDescriptor;
         if (NeedsLocator(action.Kind))
         {
-            located = await _locator.LocateAsync(sandbox, effectiveDescriptor, options, ct)
-                .ConfigureAwait(false);
+            try
+            {
+                located = await _locator.LocateAsync(sandbox, effectiveDescriptor, options, ct)
+                    .ConfigureAwait(false);
+                if (located is null)
+                {
+                    located = await TryLocateAfterHumanScrollAsync(
+                            sandbox, bridge, effectiveDescriptor, options, ct)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return await FailAsync(
+                    sandbox, entry, ReplayFailureKind.ActionFailed,
+                    $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): locator failed: {DiagnosticText.Sanitize(ex.Message)}",
+                    locatedTarget: null,
+                    ct).ConfigureAwait(false);
+            }
 
             if (located is null && _healer is not null)
             {
@@ -261,16 +282,14 @@ public sealed class ReplayEngine
                 ct).ConfigureAwait(false);
         }
 
-        // Early-stop hint for the stability wait when the assertion is a
+        // Hard expected-state predicate for visual-match assertions when the
+        // recorded screenshot is directly available. A matching frame returns
+        // immediately; otherwise the wait continues until the expected state
+        // appears or times out.
         // visual-match and we have the expected screenshot in hand — the
         // brief's 'wait until expected element/state appears' leg. The wait
-        // treats this as a hint, not a hard gate: a matching frame returns
-        // immediately, but a non-matching frame still gets returned once the
-        // screen settles so the verifier (with its configured
-        // IScreenshotComparer) can produce a precise AssertionMismatch
-        // diagnostic instead of a misleading WaitTimeout. Other assertion
-        // kinds rely on the accessibility tree (re-fetched after the wait)
-        // so they do not gain a useful per-frame predicate.
+        // Other assertion kinds rely on the accessibility tree (re-fetched
+        // after the wait) so they do not gain a useful per-frame predicate.
         var predicate = BuildExpectedStatePredicate(entry);
         var settled = await _visualWait.WaitAsync(sandbox, predicate, options, ct).ConfigureAwait(false);
         if (settled is null)
@@ -439,9 +458,8 @@ public sealed class ReplayEngine
         if (expected is null || expected.Length == 0) return null;
         // Detail-named recordings are resolved by the verifier, not by the
         // wait — building a predicate would require duplicating the named-
-        // recording map here. The wait still stops on stability, the verifier
-        // still runs on the stable frame, so this only loses the short-
-        // circuit, not the verification.
+        // recording map here. The wait therefore uses stability for named
+        // recordings and leaves the final comparison to the verifier.
         if (!string.IsNullOrEmpty(assertion.Detail)) return null;
         return current => current.Length == expected.Length && current.AsSpan().SequenceEqual(expected);
     }
@@ -585,7 +603,7 @@ public sealed class ReplayEngine
         // translated by the delta from the recorded anchor to the located
         // anchor. If the action has no recorded coordinates to anchor on, the
         // first Click/Move position acts as the anchor.
-        var anchor = FindAnchor(events, action);
+        var anchor = FindAnchor(events);
         if (anchor is null)
         {
             return CollapseToCentre(events, located);
@@ -607,7 +625,63 @@ public sealed class ReplayEngine
         return result;
     }
 
-    private static (int X, int Y)? FindAnchor(IReadOnlyList<SandboxInputEvent> events, TraceAction action)
+    private async Task<LocatedTarget?> TryLocateAfterHumanScrollAsync(
+        ISandbox sandbox,
+        ComputerUseBridge bridge,
+        TraceTargetDescriptor descriptor,
+        ReplayOptions options,
+        CancellationToken ct)
+    {
+        if (!HasVisualSearchSignal(descriptor.Visual) || options.MaxScrollAttempts <= 0)
+            return null;
+
+        for (var attempt = 0; attempt < options.MaxScrollAttempts; attempt++)
+        {
+            var scroll = BuildVisualSearchScrollRequest(descriptor.Visual, options, attempt);
+            await bridge.ExecuteAsync(sandbox, scroll, ct).ConfigureAwait(false);
+            var relocated = await _locator.LocateAsync(sandbox, descriptor, options, ct)
+                .ConfigureAwait(false);
+            if (relocated is not null) return relocated;
+        }
+
+        return null;
+    }
+
+    private static bool HasVisualSearchSignal(TraceVisualDescriptor visual) =>
+        visual.TemplatePng is { Length: > 0 }
+        || visual.SourceScreenshotPng is { Length: > 0 }
+        || !string.IsNullOrWhiteSpace(visual.OcrText);
+
+    private static ComputerUseRequest BuildVisualSearchScrollRequest(
+        TraceVisualDescriptor visual,
+        ReplayOptions options,
+        int attempt)
+    {
+        var (x, y) = RecordedClickPoint(visual);
+        if (y < 0) return new ComputerUseRequest { Action = "scroll", ScrollY = -options.ScrollStep };
+        if (y >= options.ScreenHeight) return new ComputerUseRequest { Action = "scroll", ScrollY = options.ScrollStep };
+        if (x < 0) return new ComputerUseRequest { Action = "scroll", ScrollX = -options.ScrollStep };
+        if (x >= options.ScreenWidth) return new ComputerUseRequest { Action = "scroll", ScrollX = options.ScrollStep };
+        return new ComputerUseRequest
+        {
+            Action = "scroll",
+            ScrollY = attempt % 2 == 0 ? options.ScrollStep : -options.ScrollStep,
+        };
+    }
+
+    private static (int X, int Y) RecordedClickPoint(TraceVisualDescriptor visual)
+    {
+        var region = visual.Region;
+        var x = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < region.Width
+            ? region.X + offsetX
+            : region.X + region.Width / 2;
+        var y = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
+            ? region.Y + offsetY
+            : region.Y + region.Height / 2;
+        return (x, y);
+    }
+
+    private static (int X, int Y)? FindAnchor(IReadOnlyList<SandboxInputEvent> events)
     {
         foreach (var evt in events)
         {
