@@ -542,11 +542,11 @@ public sealed class HotReloadConfigTests
         // Smoke test for the framework wiring: a JSON file loaded with
         // reloadOnChange:true must surface its new contents through
         // IOptionsMonitor<T> after a file edit.
-        var path = Path.Combine(Path.GetTempPath(), $"codeybox-hotreload-{Guid.NewGuid():N}.json");
+        var tempDir = Directory.CreateTempSubdirectory("codeybox-hotreload-");
+        var path = Path.Combine(tempDir.FullName, "appsettings.extra.json");
         try
         {
-            await File.WriteAllTextAsync(path,
-                "{ \"CodeyBox\": { \"Projects\": [ { \"Id\": \"alpha\", \"RepositoryUrl\": \"https://example.com/alpha.git\" } ] } }");
+            await WriteHotReloadProjectsConfigAsync(path, includeBeta: false, generation: 0);
 
             using var trackedConfig = TestFileSystemWatcherLeakTracker.TrackReloadingConfiguration(
                 new ConfigurationBuilder()
@@ -572,21 +572,52 @@ public sealed class HotReloadConfigTests
                 if (opts.Projects.Count == 2) fired.TrySetResult(opts);
             });
 
-            await File.WriteAllTextAsync(path,
-                "{ \"CodeyBox\": { \"Projects\": [ " +
-                "{ \"Id\": \"alpha\", \"RepositoryUrl\": \"https://example.com/alpha.git\" }, " +
-                "{ \"Id\": \"beta\",  \"RepositoryUrl\": \"https://example.com/beta.git\"  } " +
-                "] } }");
+            // FileSystemWatcher can drop an individual event under CI load. Keep
+            // making real file edits inside the timeout; the assertion still
+            // requires the IOptionsMonitor.OnChange path to observe the reload.
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            var generation = 1;
+            while (!fired.Task.IsCompleted && DateTime.UtcNow < deadline)
+            {
+                await WriteHotReloadProjectsConfigAsync(path, includeBeta: true, generation++);
 
-            var changed = await Task.WhenAny(fired.Task, Task.Delay(TimeSpan.FromSeconds(10)));
-            Assert.Same(fired.Task, changed);
+                var remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                    break;
+
+                var delay = remaining < TimeSpan.FromMilliseconds(750)
+                    ? remaining
+                    : TimeSpan.FromMilliseconds(750);
+                await Task.WhenAny(fired.Task, Task.Delay(delay));
+            }
+
+            Assert.True(
+                fired.Task.IsCompletedSuccessfully,
+                "ProjectsOptions did not hot-reload from the edited JSON file. " +
+                $"Current project ids: {string.Join(", ", monitor.CurrentValue.Projects.Select(p => p.Id))}");
             var reloaded = await fired.Task;
             Assert.Equal(new[] { "alpha", "beta" }, reloaded.Projects.Select(p => p.Id));
         }
         finally
         {
-            try { File.Delete(path); } catch { }
+            try { Directory.Delete(tempDir.FullName, recursive: true); } catch { }
         }
+    }
+
+    private static async Task WriteHotReloadProjectsConfigAsync(string path, bool includeBeta, int generation)
+    {
+        var beta = includeBeta
+            ? ", { \"Id\": \"beta\", \"RepositoryUrl\": \"https://example.com/beta-" +
+              generation.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".git\" }"
+            : string.Empty;
+
+        await File.WriteAllTextAsync(path,
+            "{ \"CodeyBox\": { \"Projects\": [ " +
+            "{ \"Id\": \"alpha\", \"RepositoryUrl\": \"https://example.com/alpha.git\" }" +
+            beta +
+            " ] } }");
+
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMilliseconds(generation + 1));
     }
 
     private static MultipassSandboxOptions MultipassOptions(string defaultImage, string bridge) => new()
