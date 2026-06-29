@@ -13704,6 +13704,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
             iteration,
             sandbox.Id);
 
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "audit.auditor_timed_out",
+            Details = new
+            {
+                WorkItemId = workItemId.ToString(),
+                Auditor = auditorName,
+                Agent = agent.Value,
+                Iteration = iteration,
+                SandboxId = sandbox.Id
+            }
+        }, CancellationToken.None).ConfigureAwait(false);
+
         try { await cts.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
 
