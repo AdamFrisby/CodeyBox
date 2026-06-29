@@ -6,13 +6,6 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-/// <summary>
-/// Cold-tier extraction of PipelineRunner's auditor / tool-call telemetry cluster.
-/// Behavior-preserving move from <see cref="PipelineRunner"/> — owns the auditor
-/// sub-step parsers (build/format/test/gitleaks/semgrep) and agent tool-call /
-/// thinking-aggregate timing emission. The pipeline spine holds one instance
-/// and delegates at the work / audit / merge seams.
-/// </summary>
 internal sealed class AuditorTelemetryEmitter
 {
     private readonly ITimingStore? _timings;
@@ -63,7 +56,7 @@ internal sealed class AuditorTelemetryEmitter
         }
     }
 
-    internal static List<(string Step, long DurationMs, string MetadataJson)> ParseAuditorSubSteps(string auditorName, string stdout)
+    private static List<(string Step, long DurationMs, string MetadataJson)> ParseAuditorSubSteps(string auditorName, string stdout)
     {
         var result = new List<(string, long, string)>();
         var auditStepPrefix = AuditTimingPrefix(auditorName);
@@ -158,7 +151,7 @@ internal sealed class AuditorTelemetryEmitter
         return result;
     }
 
-    internal static string AuditTimingPrefix(string auditorName)
+    private static string AuditTimingPrefix(string auditorName)
     {
         var separator = auditorName.IndexOf(':', StringComparison.Ordinal);
         if (separator <= 0)
@@ -244,7 +237,7 @@ internal sealed class AuditorTelemetryEmitter
         }
     }
 
-    internal static string SanitizeToolName(string name)
+    private static string SanitizeToolName(string name)
     {
         const int maxLen = 256;
         var s = name.Length > maxLen ? name[..maxLen] : name;

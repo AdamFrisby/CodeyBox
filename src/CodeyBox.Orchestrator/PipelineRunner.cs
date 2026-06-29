@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
@@ -61,9 +60,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IWorkItemTerminalRevisionBuilder _terminalRevisionBuilder;
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
-    // Cold-tier extraction: owns auditor sub-step parsers and agent tool-call /
-    // thinking-aggregate timing emission. Holds _timings / _toolCallCounters /
-    // _log internally so the seam is a single delegating call.
     private readonly AuditorTelemetryEmitter _auditorTelemetry;
     private readonly CredentialSmokeGate? _smokeGate;
     private readonly ISuggestionStore? _suggestions;
@@ -79,7 +75,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // audit gate falls back to probe-only behaviour.
     private readonly IAgentBudgetProvider? _budgetProvider;
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? _costExtractors;
-    private readonly IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? _toolCallCounters;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
@@ -349,13 +344,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
         _inVmSmokeGate = inVmSmokeGate;
-        _toolCallCounters = toolCallCounters;
         _retryScheduler = retryScheduler;
         _classRouter = classRouter;
         _fallbackHistory = fallbackHistory;
         _involvement = involvement;
         _log = log;
-        _auditorTelemetry = new AuditorTelemetryEmitter(_timings, _toolCallCounters, _log);
+        _auditorTelemetry = new AuditorTelemetryEmitter(_timings, toolCallCounters, _log);
         _smokeGate = smokeGate;
         _suggestions = suggestions;
         _auditReports = auditReports;

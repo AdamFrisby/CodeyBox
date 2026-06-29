@@ -5,6 +5,7 @@ using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Upstream;
 using CodeyBox.Webhooks;
@@ -159,6 +160,43 @@ public sealed class PipelineRunnerTimingTests : IDisposable
             "expected a phase.merge span on the full Done pipeline");
         Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "merge")),
             "expected a codeybox.phase.duration_ms{phase=merge} measurement");
+    }
+
+    [Fact]
+    public async Task AuditRun_EmitsAuditorSubStepTimingFromRawOutput()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        var auditor = new RawOutputAuditor(
+            "csharp:build-WaE",
+            """
+            Build succeeded.
+            Time Elapsed 00:00:01.234
+            """);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            timingStore: timings,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-substep.txt", "audit\n"));
+
+        var item = NewItem("feature/audit-substep");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var subStep = Assert.Single(timings.CompletedRows, r => r.Step == "csharp.build");
+        Assert.Equal(item.Id, subStep.WorkItemId);
+        Assert.Equal("audit", subStep.Phase);
+        Assert.Equal(1, subStep.Iteration);
+        Assert.Equal(1_234, subStep.DurationMs);
+        Assert.Equal("{}", subStep.MetadataJson);
+        Assert.Equal(subStep.StartedAt.AddMilliseconds(1_234), subStep.EndedAt);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -331,6 +369,26 @@ public sealed class PipelineRunnerTimingTests : IDisposable
         {
             await using (var disposeScope = await TimingScope.BeginAsync(_timings, _itemId, _phase, "vm.dispose"))
                 await _inner.DisposeAsync();
+        }
+    }
+
+    private sealed class RawOutputAuditor(string name, string rawOutput) : IAuditor
+    {
+        public string Name => name;
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(new AuditResult(true, [], rawOutput));
         }
     }
 
