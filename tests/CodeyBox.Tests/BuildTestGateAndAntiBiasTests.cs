@@ -1258,7 +1258,6 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Fail("LOGS:\n" + string.Join("\n", captLogger.Entries.Select(e => $"{e.Level}: {e.Message}")));
 
         // Assert that the logs contain the agent attribution in the teardown warning lines
         var killWarning = captLogger.Entries.FirstOrDefault(entry => entry.Message.Contains("did not kill active execs") || entry.Message.Contains("failed while killing active execs"));
@@ -1852,7 +1851,6 @@ file sealed class TimeoutSandboxProvider : ISandboxProvider
     private readonly ISandboxProvider _inner;
     private readonly bool _forceKillTimeout;
     private readonly bool _forceDisposeTimeout;
-    private int _createCount;
 
     public TimeoutSandboxProvider(ISandboxProvider inner, bool forceKillTimeout, bool forceDisposeTimeout)
     {
@@ -1866,9 +1864,7 @@ file sealed class TimeoutSandboxProvider : ISandboxProvider
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct)
     {
         var sb = await _inner.CreateAsync(spec, ct);
-        var count = System.Threading.Interlocked.Increment(ref _createCount);
-        System.Console.WriteLine($"[CREATE SANDBOX] count={count}");
-        if (count > 1)
+        if (spec.TimingPhase == "audit" && spec.Environment.ContainsKey("ANTHROPIC_API_KEY"))
         {
             return new TimeoutSandbox(sb, _forceKillTimeout, _forceDisposeTimeout);
         }
@@ -1887,6 +1883,8 @@ file sealed class TimeoutSandbox : ISandbox
     private readonly ISandbox _inner;
     private readonly bool _forceKillTimeout;
     private readonly bool _forceDisposeTimeout;
+    private bool _killed;
+    private bool _disposed;
 
     public TimeoutSandbox(ISandbox inner, bool forceKillTimeout, bool forceDisposeTimeout)
     {
@@ -1902,6 +1900,8 @@ file sealed class TimeoutSandbox : ISandbox
 
     public async Task KillActiveExecsAsync(CancellationToken ct)
     {
+        if (_killed) return;
+        _killed = true;
         if (_forceKillTimeout)
         {
             await Task.Delay(TimeSpan.FromSeconds(10), ct);
@@ -1912,6 +1912,8 @@ file sealed class TimeoutSandbox : ISandbox
 
     public async ValueTask DisposeAsync()
     {
+        if (_disposed) return;
+        _disposed = true;
         if (_forceDisposeTimeout)
         {
             await Task.Delay(TimeSpan.FromSeconds(10));
