@@ -33,6 +33,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Directory.Delete(_workspace, recursive: true);
     }
 
+    public static IEnumerable<object[]> AccessibilityProbeNullResults()
+    {
+        yield return [new ProcessRunResult(1, "", "pyatspi failed")];
+        yield return [new ProcessRunResult(0, "{\"role\":\"button\"}", "", StdoutLimitExceeded: true)];
+        yield return [new ProcessRunResult(0, "{\"role\":\"button\"}", "stderr", StderrLimitExceeded: true)];
+        yield return [new ProcessRunResult(0, "", "")];
+        yield return [new ProcessRunResult(0, "not-json", "")];
+        yield return [new ProcessRunResult(0, "null", "")];
+    }
+
     [Fact]
     public void CloudInit_InstallsExecWrapperAndRouteServiceWithoutGuestFirewallRules()
     {
@@ -442,6 +452,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var command = string.Join("\n", call.Argv);
         Assert.Contains("python3", command);
         Assert.Contains("pyatspi", command);
+        Assert.Contains("MAX_NODES", command);
+        Assert.Contains("bounds is None or contains(bounds)", command);
+    }
+
+    [Theory]
+    [MemberData(nameof(AccessibilityProbeNullResults))]
+    public async Task GetAccessibilityAtPointAsync_ReturnsNullForProbeFailures(ProcessRunResult probeResult)
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) => Task.FromResult(probeResult));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var snapshot = await sandbox.GetAccessibilityAtPointAsync(12, 34);
+
+        Assert.Null(snapshot);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
     }
 
     [Fact]
@@ -462,6 +489,22 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var command = string.Join("\n", call.Argv);
         Assert.Contains("python3", command);
         Assert.Contains("pyatspi", command);
+        Assert.Contains("STATE_FOCUSED", command);
+    }
+
+    [Theory]
+    [MemberData(nameof(AccessibilityProbeNullResults))]
+    public async Task GetAccessibilityTreeJsonAsync_ReturnsNullForProbeFailures(ProcessRunResult probeResult)
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) => Task.FromResult(probeResult));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var tree = await sandbox.GetAccessibilityTreeJsonAsync();
+
+        Assert.Null(tree);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
     }
 
     [Fact]

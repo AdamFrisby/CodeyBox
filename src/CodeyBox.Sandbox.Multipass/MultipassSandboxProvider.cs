@@ -5753,11 +5753,19 @@ internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
             WorkingDirectory = _spec.WorkingDirectory,
         }, ct, maxStdoutBytes: MaxAccessibilityJsonStdoutBytes, maxStderrBytes: MaxAccessibilityStderrBytes);
 
-        if (!result.Success || result.StdoutLimitExceeded || result.StderrLimitExceeded)
+        if (!result.Success
+            || result.StdoutLimitExceeded
+            || result.StderrLimitExceeded
+            || string.IsNullOrWhiteSpace(result.Stdout))
+        {
             return null;
+        }
 
         try
         {
+            using var doc = JsonDocument.Parse(result.Stdout);
+            if (doc.RootElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                return null;
             return JsonSerializer.Deserialize<SandboxAccessibilitySnapshot?>(result.Stdout, AccessibilityJsonOptions);
         }
         catch (JsonException)
@@ -5877,6 +5885,10 @@ internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
 
         target_x = int(os.environ.get("CODEYBOX_AX_X", "0"))
         target_y = int(os.environ.get("CODEYBOX_AX_Y", "0"))
+        MAX_NODES = 2000
+        MAX_DEPTH = 64
+        count = 0
+        limit_hit = False
 
         def safe(call, default=None):
             try:
@@ -5923,15 +5935,28 @@ internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
                 "elementType": role,
             }
 
-        def walk(acc, best=None):
+        def walk(acc, best=None, depth=0):
+            global count, limit_hit
+            if acc is None or limit_hit:
+                return best
+            if depth > MAX_DEPTH:
+                limit_hit = True
+                return best
+            count += 1
+            if count > MAX_NODES:
+                limit_hit = True
+                return best
             bounds = bounds_of(acc)
             if contains(bounds):
                 best = acc
+            if bounds is None or contains(bounds):
                 child_count = safe(lambda: acc.childCount, 0) or 0
                 for index in range(child_count):
+                    if limit_hit:
+                        break
                     child = safe(lambda i=index: acc.getChildAtIndex(i))
                     if child is not None:
-                        best = walk(child, best)
+                        best = walk(child, best, depth + 1)
             return best
 
         desktop = safe(lambda: pyatspi.Registry.getDesktop(0))
@@ -5940,7 +5965,7 @@ internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
             sys.exit(0)
 
         hit = walk(desktop)
-        print(json.dumps(snapshot(hit) if hit is not None else None, separators=(",", ":")))
+        print(json.dumps(snapshot(hit) if hit is not None and not limit_hit else None, separators=(",", ":")))
         """;
 
     private const string MultipassAccessibilityTreePython =
@@ -5998,6 +6023,9 @@ internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
             bounds = bounds_of(acc)
             if bounds is not None:
                 item["bounds"] = bounds
+            state = safe(lambda: acc.getState())
+            if state is not None and safe(lambda: state.contains(pyatspi.STATE_FOCUSED), False):
+                item["focused"] = True
 
             children = []
             child_count = safe(lambda: acc.childCount, 0) or 0

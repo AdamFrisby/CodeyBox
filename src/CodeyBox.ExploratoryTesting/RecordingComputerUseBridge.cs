@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Sandbox.Graphical;
+using System.Text.Json;
 
 namespace CodeyBox.ExploratoryTesting;
 
@@ -20,6 +21,19 @@ public sealed record RecordingComputerUseBridgeOptions
     /// for the web pilot; CLI/API recorders should override.
     /// </summary>
     public string Modality { get; init; } = "web-graphical";
+}
+
+/// <summary>
+/// Recorder-only metadata for one computer-use request. Keep trace policy out of
+/// the shared <see cref="ComputerUseRequest"/> DTO, whose job is input synthesis.
+/// </summary>
+public sealed record RecordingComputerUseMetadata
+{
+    /// <summary>
+    /// True only for deliberate application-wide keyboard shortcuts that should
+    /// replay without a target descriptor, such as Escape closing a dialog.
+    /// </summary>
+    public bool IsGlobalInput { get; init; }
 }
 
 /// <summary>
@@ -119,6 +133,19 @@ public sealed class RecordingComputerUseBridge
         ISandbox sandbox,
         ComputerUseRequest request,
         CancellationToken ct = default)
+        => await ExecuteAsync(sandbox, request, metadata: null, ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// Executes <paramref name="request"/> and records it with optional
+    /// recorder-scoped metadata. The metadata does not affect the bridge input
+    /// dispatch; it only controls trace annotations such as deliberate global
+    /// shortcuts.
+    /// </summary>
+    public async Task<ComputerUseResult> ExecuteAsync(
+        ISandbox sandbox,
+        ComputerUseRequest request,
+        RecordingComputerUseMetadata? metadata,
+        CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(request);
@@ -164,8 +191,11 @@ public sealed class RecordingComputerUseBridge
 
         string? postAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
 
-        var targetDescriptor = BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility);
-        UpdateRememberedFocusTarget(canonicalAction, events, targetDescriptor);
+        var isGlobalInput = ShouldRecordGlobalInput(metadata, canonicalAction, events);
+        var targetDescriptor = isGlobalInput
+            ? BuildEmptyTargetDescriptor(preScreenshot)
+            : BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility);
+        UpdateRememberedFocusTarget(canonicalAction, events, targetDescriptor, postAccessibilityJson, postScreenshot);
 
         var entry = new TraceEntry
         {
@@ -176,7 +206,7 @@ public sealed class RecordingComputerUseBridge
                 InputEvents = events,
                 Kind = canonicalAction,
                 TargetDescriptor = targetDescriptor,
-                IsGlobalInput = ShouldRecordGlobalInput(request, canonicalAction, events, targetDescriptor),
+                IsGlobalInput = isGlobalInput,
             },
             Observation = new TraceObservation
             {
@@ -305,6 +335,15 @@ public sealed class RecordingComputerUseBridge
         };
     }
 
+    private static TraceTargetDescriptor BuildEmptyTargetDescriptor(byte[]? screenshot) => new()
+    {
+        Visual = new TraceVisualDescriptor
+        {
+            Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 },
+            SourceScreenshotPng = screenshot,
+        },
+    };
+
     private static (int? X, int? Y) ResolveActionCentre(string action, SandboxInputEvent[] events)
     {
         if (events.Length > 0 && action is "click" or "double_click" or "move")
@@ -328,7 +367,9 @@ public sealed class RecordingComputerUseBridge
     private void UpdateRememberedFocusTarget(
         string action,
         IReadOnlyList<SandboxInputEvent> events,
-        TraceTargetDescriptor targetDescriptor)
+        TraceTargetDescriptor targetDescriptor,
+        string? postAccessibilityJson,
+        byte[]? postScreenshot)
     {
         if (ActionSetsPointerFocus(action, events))
         {
@@ -340,7 +381,7 @@ public sealed class RecordingComputerUseBridge
 
         if (ActionMayMoveKeyboardFocus(action, events))
         {
-            _lastTargetDescriptor = null;
+            _lastTargetDescriptor = TryBuildFocusedTargetDescriptor(postAccessibilityJson, postScreenshot);
         }
     }
 
@@ -361,17 +402,233 @@ public sealed class RecordingComputerUseBridge
     }
 
     private static bool ShouldRecordGlobalInput(
-        ComputerUseRequest request,
+        RecordingComputerUseMetadata? metadata,
         string action,
-        IReadOnlyList<SandboxInputEvent> events,
-        TraceTargetDescriptor targetDescriptor)
+        IReadOnlyList<SandboxInputEvent> events)
     {
-        if (request.IsGlobalInput)
-            return action is "key" or "events" && events.Any(e => e.Type == SandboxInputEventType.Key);
+        if (metadata?.IsGlobalInput != true)
+            return false;
 
-        return action == "key"
-            && !HasUsableTargetDescriptor(targetDescriptor)
-            && events.Any(e => e.Type == SandboxInputEventType.Key && !string.IsNullOrWhiteSpace(e.Key));
+        if (action == "key")
+            return events.Any(e => e.Type == SandboxInputEventType.Key && !string.IsNullOrWhiteSpace(e.Key));
+
+        return action == "events"
+            && events.Count > 0
+            && events.All(e => e.Type == SandboxInputEventType.Key && !string.IsNullOrWhiteSpace(e.Key));
+    }
+
+    private static TraceTargetDescriptor? TryBuildFocusedTargetDescriptor(
+        string? accessibilityJson,
+        byte[]? screenshot)
+    {
+        if (string.IsNullOrWhiteSpace(accessibilityJson))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(accessibilityJson);
+            return TryFindFocusedTarget(doc.RootElement, screenshot);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static TraceTargetDescriptor? TryFindFocusedTarget(JsonElement element, byte[]? screenshot)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            if (IsFocusedNode(element))
+            {
+                return BuildDescriptorFromAccessibilityNode(element, screenshot);
+            }
+
+            foreach (var property in element.EnumerateObject())
+            {
+                var hit = TryFindFocusedTarget(property.Value, screenshot);
+                if (hit is not null) return hit;
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                var hit = TryFindFocusedTarget(item, screenshot);
+                if (hit is not null) return hit;
+            }
+        }
+
+        return null;
+    }
+
+    private static TraceTargetDescriptor BuildDescriptorFromAccessibilityNode(JsonElement node, byte[]? screenshot)
+    {
+        var accessibility = new TraceAccessibilityDescriptor
+        {
+            Role = ReadString(node, "role", "Role", "controlType", "type"),
+            Name = ReadString(node, "name", "Name", "label", "title", "accessibleName"),
+            Text = ReadString(node, "text", "Text", "value", "description"),
+            ElementType = ReadString(node, "elementType", "ElementType", "tagName", "className"),
+        };
+        if (!TryReadBounds(node, out var region))
+            region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+
+        return new TraceTargetDescriptor
+        {
+            Accessibility = accessibility,
+            Visual = new TraceVisualDescriptor
+            {
+                Region = region,
+                ClickOffsetX = region.Width > 0 ? region.Width / 2 : null,
+                ClickOffsetY = region.Height > 0 ? region.Height / 2 : null,
+                SourceScreenshotPng = screenshot,
+            },
+        };
+    }
+
+    private static bool IsFocusedNode(JsonElement node)
+    {
+        foreach (var name in new[] { "focused", "Focused", "hasFocus", "HasFocus", "has_focus", "isFocused", "is_focused" })
+        {
+            if (!TryGetProperty(node, name, out var property))
+                continue;
+
+            if (property.ValueKind == JsonValueKind.True) return true;
+            if (property.ValueKind == JsonValueKind.String
+                && bool.TryParse(property.GetString(), out var parsed)
+                && parsed)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryReadBounds(JsonElement obj, out TraceBoundingRegion region)
+    {
+        if (TryReadRectObject(obj, out region)) return true;
+
+        foreach (var name in new[] { "bounds", "Bounds", "rect", "Rect", "boundingBox", "BoundingBox" })
+        {
+            if (!TryGetProperty(obj, name, out var child)) continue;
+            if (child.ValueKind == JsonValueKind.Object && TryReadRectObject(child, out region)) return true;
+            if (child.ValueKind == JsonValueKind.Array && TryReadRectArray(child, out region)) return true;
+        }
+
+        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+        return false;
+    }
+
+    private static bool TryReadRectObject(JsonElement obj, out TraceBoundingRegion region)
+    {
+        if (TryReadInt(obj, "x", out var x)
+            && TryReadInt(obj, "y", out var y)
+            && TryReadInt(obj, "width", out var width)
+            && TryReadInt(obj, "height", out var height)
+            && width > 0
+            && height > 0)
+        {
+            region = new TraceBoundingRegion { X = x, Y = y, Width = width, Height = height };
+            return true;
+        }
+
+        if (TryReadInt(obj, "left", out var left)
+            && TryReadInt(obj, "top", out var top)
+            && TryReadInt(obj, "right", out var right)
+            && TryReadInt(obj, "bottom", out var bottom)
+            && right > left
+            && bottom > top)
+        {
+            region = new TraceBoundingRegion
+            {
+                X = left,
+                Y = top,
+                Width = right - left,
+                Height = bottom - top,
+            };
+            return true;
+        }
+
+        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+        return false;
+    }
+
+    private static bool TryReadRectArray(JsonElement array, out TraceBoundingRegion region)
+    {
+        if (array.GetArrayLength() < 4)
+        {
+            region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+            return false;
+        }
+
+        var values = new int[4];
+        var i = 0;
+        foreach (var item in array.EnumerateArray())
+        {
+            if (i >= 4) break;
+            if (!TryReadInt(item, out values[i]))
+            {
+                region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+                return false;
+            }
+            i++;
+        }
+
+        if (values[2] <= 0 || values[3] <= 0)
+        {
+            region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+            return false;
+        }
+
+        region = new TraceBoundingRegion { X = values[0], Y = values[1], Width = values[2], Height = values[3] };
+        return true;
+    }
+
+    private static bool TryReadInt(JsonElement obj, string name, out int value)
+    {
+        if (TryGetProperty(obj, name, out var property))
+            return TryReadInt(property, out value);
+
+        value = 0;
+        return false;
+    }
+
+    private static bool TryReadInt(JsonElement element, out int value)
+    {
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out value))
+            return true;
+        if (element.ValueKind == JsonValueKind.String
+            && int.TryParse(element.GetString(), out value))
+        {
+            return true;
+        }
+
+        value = 0;
+        return false;
+    }
+
+    private static string? ReadString(JsonElement obj, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (TryGetProperty(obj, name, out var prop) && prop.ValueKind == JsonValueKind.String)
+            {
+                var value = prop.GetString();
+                if (!string.IsNullOrEmpty(value)) return value;
+            }
+        }
+        return null;
+    }
+
+    private static bool TryGetProperty(JsonElement obj, string name, out JsonElement value)
+    {
+        if (obj.ValueKind == JsonValueKind.Object && obj.TryGetProperty(name, out value))
+            return true;
+
+        value = default;
+        return false;
     }
 
     private static bool KeyMayMoveFocus(string? key)

@@ -72,7 +72,7 @@ public sealed class ReplayEngine
             new AccessibilityElementLocator(matcher),
             new VisualSignatureElementLocator(
                 new AccessibilityElementLocator(matcher),
-                ocrTextLocator));
+                ocrTextLocator ?? TesseractOcrTextLocator.Instance));
         _reachability = reachability;
         _visualWait = visualWait ?? new ScreenshotStabilityWait(timeProvider);
         _assertions = assertions ?? new DefaultAssertionVerifier();
@@ -575,8 +575,8 @@ public sealed class ReplayEngine
                 Y = located.CenterY,
             },
             "scroll" => BuildScrollRequest(action, located),
-            "key" => BuildTargetedKeyRequest(action),
-            "type" => BuildTargetedTypeRequest(action),
+            "key" => BuildTargetedKeyRequest(action, located),
+            "type" => BuildTargetedTypeRequest(action, located),
             "events" => new ComputerUseRequest
             {
                 Action = "events",
@@ -586,20 +586,63 @@ public sealed class ReplayEngine
         };
     }
 
-    private static ComputerUseRequest BuildTargetedKeyRequest(TraceAction action)
+    private static ComputerUseRequest BuildTargetedKeyRequest(TraceAction action, LocatedTarget? located)
     {
         var key = FirstKey(action.InputEvents);
+        if (located is not null)
+        {
+            return new ComputerUseRequest
+            {
+                Action = "events",
+                Events =
+                [
+                    new SandboxInputEvent
+                    {
+                        Type = SandboxInputEventType.Click,
+                        X = located.CenterX,
+                        Y = located.CenterY,
+                    },
+                    new SandboxInputEvent
+                    {
+                        Type = SandboxInputEventType.Key,
+                        Key = key,
+                    },
+                ],
+            };
+        }
+
         return new ComputerUseRequest
         {
             Action = "key",
             Key = key,
-            IsGlobalInput = action.IsGlobalInput,
         };
     }
 
-    private static ComputerUseRequest BuildTargetedTypeRequest(TraceAction action)
+    private static ComputerUseRequest BuildTargetedTypeRequest(TraceAction action, LocatedTarget? located)
     {
         var text = FirstText(action.InputEvents);
+        if (located is not null)
+        {
+            return new ComputerUseRequest
+            {
+                Action = "events",
+                Events =
+                [
+                    new SandboxInputEvent
+                    {
+                        Type = SandboxInputEventType.Click,
+                        X = located.CenterX,
+                        Y = located.CenterY,
+                    },
+                    new SandboxInputEvent
+                    {
+                        Type = SandboxInputEventType.Type,
+                        Text = text,
+                    },
+                ],
+            };
+        }
+
         return new ComputerUseRequest
         {
             Action = "type",
@@ -762,8 +805,10 @@ public sealed class ReplayEngine
     private static bool NeedsLocator(TraceAction action) =>
         action.Kind switch
         {
-            "click" or "double_click" or "move" or "events" => true,
-            "scroll" or "key" or "type" => HasUsableTargetSignal(action.TargetDescriptor),
+            "click" or "double_click" or "move" => true,
+            "events" => !IsGlobalKeyboardEventsAction(action),
+            "key" => !action.IsGlobalInput && HasUsableTargetSignal(action.TargetDescriptor),
+            "scroll" or "type" => HasUsableTargetSignal(action.TargetDescriptor),
             _ => false,
         };
 
@@ -771,6 +816,14 @@ public sealed class ReplayEngine
         action.Kind is "key" or "type"
         && !action.IsGlobalInput
         && !HasUsableTargetSignal(action.TargetDescriptor);
+
+    private static bool IsGlobalKeyboardEventsAction(TraceAction action) =>
+        action.Kind == "events"
+        && action.IsGlobalInput
+        && action.InputEvents.Count > 0
+        && action.InputEvents.All(e =>
+            e.Type == SandboxInputEventType.Key
+            && !string.IsNullOrWhiteSpace(e.Key));
 
     private static bool IsTargetlessScrollAction(TraceAction action) =>
         action.Kind == "scroll"

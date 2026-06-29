@@ -49,9 +49,12 @@ public sealed class ReplayEngineTests
 
         // Drove real input via the bridge — not synthetic selector dispatch.
         var clickInputs = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Click).ToList();
-        Assert.Single(clickInputs);
-        Assert.Equal(170, clickInputs[0].X);
-        Assert.Equal(90, clickInputs[0].Y);
+        Assert.Equal(2, clickInputs.Count);
+        Assert.All(clickInputs, click =>
+        {
+            Assert.Equal(170, click.X);
+            Assert.Equal(90, click.Y);
+        });
         var typeInputs = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Type).ToList();
         Assert.Single(typeInputs);
         Assert.Equal("user", typeInputs[0].Text);
@@ -1045,7 +1048,7 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
-    public async Task Replay_DispatchesKey_AfterTargetRecognition()
+    public async Task Replay_FocusesRelocatedTargetBeforeDispatchingKey()
     {
         var sandbox = new ScriptedSandbox(StableScreenshotA)
         {
@@ -1077,10 +1080,19 @@ public sealed class ReplayEngineTests
         Assert.NotNull(locatedTarget);
         Assert.Equal(60, locatedTarget.CenterX);
         Assert.Equal(30, locatedTarget.CenterY);
-        Assert.DoesNotContain(sandbox.RecordedInputEvents, e => e.Type is SandboxInputEventType.Move or SandboxInputEventType.Click);
-        var keys = sandbox.RecordedInputEvents.Where(e => e.Type == SandboxInputEventType.Key).ToList();
-        Assert.Single(keys);
-        Assert.Equal("Enter", keys[0].Key);
+        Assert.Collection(
+            sandbox.RecordedInputEvents,
+            e =>
+            {
+                Assert.Equal(SandboxInputEventType.Click, e.Type);
+                Assert.Equal(60, e.X);
+                Assert.Equal(30, e.Y);
+            },
+            e =>
+            {
+                Assert.Equal(SandboxInputEventType.Key, e.Type);
+                Assert.Equal("Enter", e.Key);
+            });
     }
 
     [Fact]
@@ -2174,6 +2186,23 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
+    public async Task DefaultAssertionVerifier_VisualMatch_ReportsDecodedPngPixelMismatch()
+    {
+        var recorded = BuildRgbPng(1, 1, [12, 34, 56]);
+        var current = BuildRgbPng(1, 1, [56, 34, 12]);
+        var verifier = new DefaultAssertionVerifier();
+
+        var diag = await verifier.VerifyAsync(
+            assertion: new TraceAssertion { Kind = "visual-match" },
+            currentScreenshotPng: current,
+            recordedScreenshotPng: recorded,
+            accessibilitySnapshotJson: null,
+            ct: CancellationToken.None);
+
+        Assert.Equal("visual-match assertion: decoded pixels differ", diag);
+    }
+
+    [Fact]
     public async Task DefaultAssertionVerifier_TextContains_EmptyDetail_ReportsConfigError()
     {
         var verifier = new DefaultAssertionVerifier();
@@ -2815,9 +2844,12 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
-    public async Task Replay_DispatchesGlobalKeyWithoutTargetDescriptor_WhenMarkedGlobal()
+    public async Task Replay_DispatchesGlobalKeyWithoutRelocatingTarget_WhenMarkedGlobal()
     {
-        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => throw new InvalidOperationException("global input must not locate"),
+        };
         var trace = MakeTrace(new TraceEntry
         {
             Sequence = 1,
@@ -2826,6 +2858,37 @@ public sealed class ReplayEngineTests
             {
                 InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Escape" }],
                 Kind = "key",
+                IsGlobalInput = true,
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Accessibility = new TraceAccessibilityDescriptor { Role = "textbox", Name = "Search" },
+                    Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 20, Y = 30, Width = 100, Height = 20 } },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        });
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        var key = Assert.Single(sandbox.RecordedInputEvents);
+        Assert.Equal(SandboxInputEventType.Key, key.Type);
+        Assert.Equal("Escape", key.Key);
+    }
+
+    [Fact]
+    public async Task Replay_DispatchesGlobalKeyboardEventsWithoutTargetDescriptor_WhenMarkedGlobal()
+    {
+        var sandbox = new ScriptedSandbox(StableScreenshotA);
+        var trace = MakeTrace(new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Ctrl+K" }],
+                Kind = "events",
                 IsGlobalInput = true,
                 TargetDescriptor = new TraceTargetDescriptor
                 {
@@ -2839,7 +2902,7 @@ public sealed class ReplayEngineTests
         var result = await engine.ReplayAsync(sandbox, trace);
 
         Assert.True(result.Passed, result.FailedStep?.Diagnostic);
-        Assert.Contains(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Key && e.Key == "Escape");
+        Assert.Contains(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Key && e.Key == "Ctrl+K");
     }
 
     // ------------------------------------------------------------------
@@ -3428,6 +3491,31 @@ public sealed class ReplayEngineTests
         var status = DescriptorVisualTargetVerifier.Instance.Verify(current, visual, target);
 
         Assert.Equal(VisualTargetVerificationStatus.Verified, status);
+    }
+
+    [Fact]
+    public void DescriptorVisualTargetVerifier_ReportsMismatchForDifferentSourceCropPixels()
+    {
+        var source = BuildRgbPng(1, 1, [0, 255, 0]);
+        var current = BuildRgbPng(1, 1, [255, 0, 0]);
+        var visual = new TraceVisualDescriptor
+        {
+            Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 1, Height = 1 },
+            SourceScreenshotPng = source,
+        };
+        var target = new LocatedTarget
+        {
+            CenterX = 0,
+            CenterY = 0,
+            Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 1, Height = 1 },
+            Source = "accessibility-point",
+            Confidence = 1,
+            Evidence = LocatedTargetEvidence.Accessibility,
+        };
+
+        var status = DescriptorVisualTargetVerifier.Instance.Verify(current, visual, target);
+
+        Assert.Equal(VisualTargetVerificationStatus.Mismatch, status);
     }
 
     [Fact]
@@ -4505,6 +4593,62 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
+    public async Task Replay_DefaultEngineUsesTesseractOcrFallback()
+    {
+        SandboxExec? capturedExec = null;
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            GetAccessibilityTree = _ => Task.FromResult<string?>(null),
+            AccessibilityAtPoint = (_, _) => null,
+            Exec = (exec, _) =>
+            {
+                capturedExec = exec;
+                return Task.FromResult(new SandboxExecResult(
+                    0,
+                    """
+                    level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+                    5	1	1	1	1	1	180	90	120	30	96	Checkout
+                    """,
+                    ""));
+            },
+        };
+        var trace = MakeTrace(new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 240, Y = 105 }],
+                Kind = "click",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 20, Y = 30, Width = 100, Height = 20 },
+                        OcrText = "Checkout",
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        });
+        var clock = new FakeTimeProvider(FrozenNow);
+        var engine = new ReplayEngine(
+            bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            reachability: AlwaysReachable.Instance,
+            visualWait: new ImmediateWait(),
+            timeProvider: clock);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        Assert.NotNull(capturedExec);
+        Assert.Contains("tesseract", string.Join(" ", capturedExec!.Argv));
+        var click = Assert.Single(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Click);
+        Assert.Equal(240, click.X);
+        Assert.Equal(105, click.Y);
+    }
+
+    [Fact]
     public async Task VisualSignatureLocator_DefaultOcrFallbackDoesNotShellOutToTesseract()
     {
         var execCalls = 0;
@@ -5102,6 +5246,23 @@ public sealed class ReplayEngineTests
             ISandbox sandbox, LocatedTarget target, TraceTargetDescriptor descriptor,
             ReplayOptions options, CancellationToken ct)
             => throw _toThrow;
+    }
+
+    private sealed class AlwaysReachable : IReachabilityChecker
+    {
+        public static AlwaysReachable Instance { get; } = new();
+
+        public Task<ReachabilityOutcome> EnsureReachableAsync(
+            ISandbox sandbox,
+            LocatedTarget target,
+            TraceTargetDescriptor descriptor,
+            ReplayOptions options,
+            CancellationToken ct)
+            => Task.FromResult(new ReachabilityOutcome
+            {
+                Status = ReachabilityStatus.Reachable,
+                Target = target,
+            });
     }
 
     private sealed class AlwaysMatchScreenshotComparer : IScreenshotComparer

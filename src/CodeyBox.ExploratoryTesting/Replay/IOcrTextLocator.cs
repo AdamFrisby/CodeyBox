@@ -27,7 +27,7 @@ internal sealed class NullOcrTextLocator : IOcrTextLocator
         => Task.FromResult<LocatedTarget?>(null);
 }
 
-internal sealed class TesseractOcrTextLocator : IOcrTextLocator
+public sealed class TesseractOcrTextLocator : IOcrTextLocator
 {
     public static TesseractOcrTextLocator Instance { get; } = new();
 
@@ -76,10 +76,10 @@ internal sealed class TesseractOcrTextLocator : IOcrTextLocator
         return TryLocateFromTsv(result.Stdout, expected, visual);
     }
 
-    internal static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText)
+    public static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText)
         => TryLocateFromTsv(tsv, expectedText, visual: null);
 
-    internal static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText, TraceVisualDescriptor? visual)
+    public static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText, TraceVisualDescriptor? visual)
     {
         var rows = ParseRows(tsv);
         if (rows.Count == 0) return null;

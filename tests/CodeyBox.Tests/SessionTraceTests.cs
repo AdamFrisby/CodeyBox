@@ -417,7 +417,7 @@ public sealed class SessionTraceTests
     }
 
     [Fact]
-    public async Task RecordingBridge_FocusChangingKeyInvalidatesPreviousTargetDescriptor()
+    public async Task RecordingBridge_FocusChangingKeyClearsPreviousTargetDescriptorWhenNoFocusedNode()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
         var sandbox = new AccessibleGraphicalSandbox(SamplePng);
@@ -436,6 +436,31 @@ public sealed class SessionTraceTests
         Assert.Equal(0, typeDescriptor.Visual.Region.Width);
         Assert.Equal(0, typeDescriptor.Visual.Region.Height);
         Assert.Null(typeDescriptor.Accessibility);
+    }
+
+    [Fact]
+    public async Task RecordingBridge_FocusChangingKeyCapturesPostKeyFocusedDescriptor()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new FocusedAccessibilitySandbox(SamplePng);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "key", Key = "Tab" });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "type", Text = "after tab" });
+
+        var keyDescriptor = recorder.Trace.Entries[1].Action.TargetDescriptor;
+        var typeDescriptor = recorder.Trace.Entries[2].Action.TargetDescriptor;
+
+        Assert.Equal(recorder.Trace.Entries[0].Action.TargetDescriptor.Visual.Region, keyDescriptor.Visual.Region);
+        Assert.NotNull(typeDescriptor.Accessibility);
+        Assert.Equal("textbox", typeDescriptor.Accessibility.Role);
+        Assert.Equal("Search", typeDescriptor.Accessibility.Name);
+        Assert.Equal(new TraceBoundingRegion { X = 30, Y = 40, Width = 150, Height = 20 }, typeDescriptor.Visual.Region);
+        Assert.Equal(75, typeDescriptor.Visual.ClickOffsetX);
+        Assert.Equal(10, typeDescriptor.Visual.ClickOffsetY);
+        Assert.NotNull(typeDescriptor.Visual.SourceScreenshotPng);
     }
 
     [Fact]
@@ -533,7 +558,7 @@ public sealed class SessionTraceTests
     }
 
     [Fact]
-    public async Task RecordingBridge_TargetlessEscapeRecordsGlobalInput()
+    public async Task RecordingBridge_TargetlessEscapeDoesNotRecordGlobalInputWithoutMetadata()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
         var sandbox = new RecordingGraphicalSandbox(SamplePng);
@@ -544,12 +569,12 @@ public sealed class SessionTraceTests
 
         var entry = recorder.Trace.Entries[0];
         Assert.Equal("key", entry.Action.Kind);
-        Assert.True(entry.Action.IsGlobalInput);
+        Assert.False(entry.Action.IsGlobalInput);
         Assert.Equal(0, entry.Action.TargetDescriptor.Visual.Region.Width);
     }
 
     [Fact]
-    public async Task RecordingBridge_TargetlessShortcutRecordsGlobalInput()
+    public async Task RecordingBridge_TargetlessShortcutDoesNotRecordGlobalInputWithoutMetadata()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
         var sandbox = new RecordingGraphicalSandbox(SamplePng);
@@ -560,12 +585,33 @@ public sealed class SessionTraceTests
 
         var entry = recorder.Trace.Entries[0];
         Assert.Equal("key", entry.Action.Kind);
-        Assert.True(entry.Action.IsGlobalInput);
+        Assert.False(entry.Action.IsGlobalInput);
         Assert.Equal(0, entry.Action.TargetDescriptor.Visual.Region.Width);
     }
 
     [Fact]
     public async Task RecordingBridge_RequestCanExplicitlyMarkGlobalKeyInput()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new AccessibleGraphicalSandbox(SamplePng);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest
+        {
+            Action = "key",
+            Key = "F1",
+        }, new RecordingComputerUseMetadata { IsGlobalInput = true });
+
+        var entry = recorder.Trace.Entries[1];
+        Assert.True(entry.Action.IsGlobalInput);
+        Assert.Equal(0, entry.Action.TargetDescriptor.Visual.Region.Width);
+        Assert.Null(entry.Action.TargetDescriptor.Accessibility);
+    }
+
+    [Fact]
+    public async Task RecordingBridge_ExplicitGlobalEventsMetadataRecordsGlobalInput()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
         var sandbox = new RecordingGraphicalSandbox(SamplePng);
@@ -574,10 +620,9 @@ public sealed class SessionTraceTests
 
         await recorder.ExecuteAsync(sandbox, new ComputerUseRequest
         {
-            Action = "key",
-            Key = "F1",
-            IsGlobalInput = true,
-        });
+            Action = "events",
+            Events = [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Escape" }],
+        }, new RecordingComputerUseMetadata { IsGlobalInput = true });
 
         Assert.True(recorder.Trace.Entries[0].Action.IsGlobalInput);
     }
@@ -842,6 +887,49 @@ public sealed class SessionTraceTests
     }
 
     [Fact]
+    public async Task RecordingBridge_AccessibilityPointExceptionDefaultsToNull()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new AccessibilityFaultSandbox(SamplePng)
+        {
+            AtPoint = (_, _, _) => Task.FromException<SandboxAccessibilitySnapshot?>(
+                new InvalidOperationException("point IPC failed")),
+            Tree = _ => Task.FromResult<string?>("{\"tree\":[]}"),
+        };
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 50, Y = 50 });
+
+        var entry = recorder.Trace.Entries[0];
+        Assert.Null(entry.Action.TargetDescriptor.Accessibility);
+        Assert.Equal("{\"tree\":[]}", entry.Observation.AccessibilitySnapshotJson);
+    }
+
+    [Fact]
+    public async Task RecordingBridge_AccessibilityTreeExceptionDefaultsToNull()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new AccessibilityFaultSandbox(SamplePng)
+        {
+            AtPoint = (_, _, _) => Task.FromResult<SandboxAccessibilitySnapshot?>(new SandboxAccessibilitySnapshot
+            {
+                Role = "button",
+                Name = "Submit",
+            }),
+            Tree = _ => Task.FromException<string?>(new InvalidOperationException("tree IPC failed")),
+        };
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 50, Y = 50 });
+
+        var entry = recorder.Trace.Entries[0];
+        Assert.NotNull(entry.Action.TargetDescriptor.Accessibility);
+        Assert.Null(entry.Observation.AccessibilitySnapshotJson);
+    }
+
+    [Fact]
     public async Task RecordingBridge_TypeActionSkipsAccessibilityPointProbeButCapturesTree()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
@@ -939,6 +1027,71 @@ public sealed class SessionTraceTests
 
         public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
             => Task.FromResult<string?>("{\"tree\":[{\"role\":\"button\"}]}");
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class FocusedAccessibilitySandbox : ISandbox
+    {
+        private readonly byte[] _screenshot;
+
+        public FocusedAccessibilitySandbox(byte[] screenshot) => _screenshot = screenshot;
+
+        public string Id => "focused-accessibility-sandbox";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+            => Task.FromResult(_screenshot);
+
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+            => Task.CompletedTask;
+
+        public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+            => Task.FromResult<SandboxAccessibilitySnapshot?>(new SandboxAccessibilitySnapshot
+            {
+                Role = "button",
+                Name = "Submit",
+                Text = "Submit",
+                ElementType = "button",
+            });
+
+        public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+            => Task.FromResult<string?>(
+                """
+                {"children":[{"role":"textbox","name":"Search","elementType":"input","focused":true,"bounds":{"x":30,"y":40,"width":150,"height":20}}]}
+                """);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class AccessibilityFaultSandbox : ISandbox
+    {
+        private readonly byte[] _screenshot;
+
+        public AccessibilityFaultSandbox(byte[] screenshot) => _screenshot = screenshot;
+
+        public string Id => "accessibility-fault-sandbox";
+        public Func<int, int, CancellationToken, Task<SandboxAccessibilitySnapshot?>> AtPoint { get; init; }
+            = (_, _, _) => Task.FromResult<SandboxAccessibilitySnapshot?>(null);
+        public Func<CancellationToken, Task<string?>> Tree { get; init; }
+            = _ => Task.FromResult<string?>(null);
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+            => Task.FromResult(_screenshot);
+
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+            => Task.CompletedTask;
+
+        public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+            => AtPoint(x, y, ct);
+
+        public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+            => Tree(ct);
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
