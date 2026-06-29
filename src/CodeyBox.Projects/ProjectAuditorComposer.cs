@@ -32,6 +32,7 @@ public sealed class ProjectAuditorComposer
     private readonly Func<PlanAdherenceAuditorOptions>? _planAdherenceOptions;
     private readonly IReadOnlyDictionary<string, IAuditor> _registeredAuditorsByName;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
+    private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttributionOptions;
     private readonly ILogger<ProjectAuditorComposer> _logger;
 
     /// <summary>
@@ -62,12 +63,14 @@ public sealed class ProjectAuditorComposer
         ILogger<ProjectAuditorComposer> logger,
         PresetCatalogOptions? catalogOptions = null,
         Func<TestRunOptions>? testRunOptions = null,
-        Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null)
+        Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null,
+        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null)
     {
         _catalog = catalog;
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _testRunOptions = testRunOptions;
         _planAdherenceOptions = planAdherenceOptions;
+        _testFailureAttributionOptions = testFailureAttributionOptions;
         _logger = logger;
 
         var byName = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
@@ -254,11 +257,12 @@ public sealed class ProjectAuditorComposer
             return _catalog;
 
         ProjectRepository.ApplyPresetOverrideOptions(project, options);
-        // Thread the hot-reloadable run-options accessor into the per-project
-        // catalog so override / repo-preset-root projects still source
-        // blame-hang and the test-specific idle timeout through the type;
-        // dropping it here would silently fall back to TestRunOptions.Default.
-        return new PresetCatalog(options, _testRunOptions);
+        // Thread the hot-reloadable run-options accessor AND the test-failure
+        // attribution snapshot into the per-project catalog so override /
+        // repo-preset-root projects still source blame-hang, the test-specific
+        // idle timeout, and flake-attribution behaviour through the type;
+        // dropping either here would silently fall back to defaults.
+        return new PresetCatalog(options, _testRunOptions, _testFailureAttributionOptions);
     }
 
     private static bool HasProjectPresetOverrides(Project project)

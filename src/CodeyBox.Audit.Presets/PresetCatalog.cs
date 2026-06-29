@@ -14,12 +14,13 @@ public sealed class PresetCatalog : IPresetCatalog
     private readonly Dictionary<string, Func<PresetContext, IReadOnlyList<IAuditor>>> _auditTypes =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly IReadOnlyDictionary<string, AuditTypePresetDefinition> _auditTypeDefinitions;
+    private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttributionOptions;
 
     public PresetCatalog()
         : this(null) { }
 
     public PresetCatalog(PresetCatalogOptions? options)
-        : this(options, null) { }
+        : this(options, testRunOptions: null, testFailureAttributionOptions: null) { }
 
     /// <param name="testRunOptions">
     /// Live accessor for hot-reloadable <see cref="TestRunOptions"/> (blame-hang
@@ -27,8 +28,18 @@ public sealed class PresetCatalog : IPresetCatalog
     /// Null keeps the default (byte-identical) test-runner behaviour, which is
     /// what unit tests and the parameterless path use.
     /// </param>
-    public PresetCatalog(PresetCatalogOptions? options, Func<TestRunOptions>? testRunOptions)
+    /// <param name="testFailureAttributionOptions">
+    /// Hot-reloadable test-failure-attribution options. When set, a classified
+    /// dotnet-test failure triggers a base-checkout rerun that attributes each
+    /// failing test to the diff or to pre-existing state. Null disables the
+    /// feature (classification fails closed to diff-attributable).
+    /// </param>
+    public PresetCatalog(
+        PresetCatalogOptions? options,
+        Func<TestRunOptions>? testRunOptions,
+        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null)
     {
+        _testFailureAttributionOptions = testFailureAttributionOptions;
         var snapshot = new PresetConfigLoader().Load(options);
         LlmPromptFrameTemplate = snapshot.LlmPromptFrame;
         LlmPlanPromptFrameTemplate = snapshot.LlmPlanPromptFrame;
@@ -37,7 +48,10 @@ public sealed class PresetCatalog : IPresetCatalog
         foreach (var (name, definition) in snapshot.Languages)
         {
             var captured = definition;
-            RegisterLanguage(name, _ => PresetConfigLoader.MaterialiseLanguage(captured, testRunOptions));
+            RegisterLanguage(name, _ => PresetConfigLoader.MaterialiseLanguage(
+                captured,
+                testRunOptions,
+                _testFailureAttributionOptions));
         }
 
         AuditTypePresets.Register(this, snapshot.AuditTypes, snapshot.LlmPromptFrame, snapshot.LlmPlanPromptFrame);

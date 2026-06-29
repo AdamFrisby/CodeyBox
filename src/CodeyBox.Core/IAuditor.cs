@@ -264,6 +264,25 @@ public sealed record AuditResult
         string? AgentStderr = null,
         string? AgentSummary = null,
         string? AgentStdout = null)
+        : this(
+            Passed,
+            Findings,
+            RawOutput,
+            AgentStderr,
+            AgentSummary,
+            AgentStdout,
+            TestFailureAttributions: null)
+    {
+    }
+
+    public AuditResult(
+        bool Passed,
+        IReadOnlyList<AuditFinding> Findings,
+        string? RawOutput,
+        string? AgentStderr,
+        string? AgentSummary,
+        string? AgentStdout,
+        IReadOnlyList<TestFailureAttributionResult>? TestFailureAttributions = null)
     {
         this.Passed = Passed;
         this.Findings = Findings;
@@ -271,6 +290,7 @@ public sealed record AuditResult
         this.AgentStderr = AgentStderr;
         this.AgentSummary = AgentSummary;
         this.AgentStdout = AgentStdout;
+        this.TestFailureAttributions = TestFailureAttributions ?? [];
     }
 
     public bool Passed { get; init; }
@@ -279,6 +299,7 @@ public sealed record AuditResult
     public string? AgentStderr { get; init; }
     public string? AgentSummary { get; init; }
     public string? AgentStdout { get; init; }
+    public IReadOnlyList<TestFailureAttributionResult> TestFailureAttributions { get; init; }
 
     /// <summary>
     /// Mirrors <see cref="CodeyBox.Core.AgentResult.TerminalDiagnostic"/> for an

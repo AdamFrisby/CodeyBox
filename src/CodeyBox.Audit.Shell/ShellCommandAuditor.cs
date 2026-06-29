@@ -205,7 +205,26 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                 combinedOutput,
                 finding));
             if (classified is not null)
+            {
+                if (_opts.ResultClassifier is DotnetTestCommandResultClassifier
+                    && _opts.TestFailureAttributionOptions is not null)
+                {
+                    var parsed = DotnetTestOutputParser.Parse(Name, combinedOutput);
+                    var attributions = await DotnetTestFailureAttributionRunner.AttributeAsync(
+                        sandbox,
+                        workingDirectory,
+                        context,
+                        Name,
+                        _opts.Argv,
+                        parsed.FailedTestNames,
+                        parsed.HitFailureParseCap,
+                        _opts.TestFailureAttributionOptions,
+                        ct);
+                    return classified with { TestFailureAttributions = attributions };
+                }
+
                 return classified;
+            }
         }
 
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
@@ -340,6 +359,7 @@ public sealed record ShellCommandAuditorOptions
     /// the command on every exit path, and is absent for Code runs.
     /// </summary>
     public IReadOnlySet<AuditTarget> Targets { get; init; } = AuditTargets.CodeOnly;
+    public TestFailureAttributionOptionsSnapshot? TestFailureAttributionOptions { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
     public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;

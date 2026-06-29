@@ -368,7 +368,11 @@ internal sealed class RequiredBuildGate
         return new AuditResult(
             Passed: passed,
             Findings: findings,
-            RawOutput: string.IsNullOrEmpty(result.Output) ? null : result.Output);
+            RawOutput: string.IsNullOrEmpty(result.Output) ? null : result.Output,
+            AgentStderr: null,
+            AgentSummary: null,
+            AgentStdout: null,
+            TestFailureAttributions: result.TestFailureAttributions ?? []);
     }
 
     private static string BuildFailureSummary(RequiredBuildVerificationResult result)

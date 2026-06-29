@@ -98,6 +98,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             Role = _opts.Role,
             BuildTestGateEvidence = _opts.BuildTestGateEvidence,
             SelfHealNuGetHome = _opts.SelfHealNuGetHome,
+            TestFailureAttributionOptions = _opts.TestFailureAttributionOptions,
         });
         return inner.RunAsync(sandbox, workingDirectory, context, ct);
     }
@@ -156,4 +157,11 @@ public sealed record DotnetTestAuditorOptions
     /// emitted command byte-identical to the legacy path.
     /// </summary>
     public Func<TestRunOptions>? RunOptionsAccessor { get; init; }
+
+    /// <summary>
+    /// Optional hot-reloadable test-failure-attribution options. When set, a
+    /// classified test failure triggers a base-checkout rerun that attributes
+    /// each failing test to the diff or to pre-existing state.
+    /// </summary>
+    public TestFailureAttributionOptionsSnapshot? TestFailureAttributionOptions { get; init; }
 }

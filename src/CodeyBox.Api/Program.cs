@@ -2216,15 +2216,25 @@ static Func<TestRunOptions> DotnetTestRunOptionsAccessor(IServiceProvider sp)
 // same hot-reloadable PipelineTuningSnapshot.
 builder.Services.AddSingleton<Func<TestRunOptions>>(DotnetTestRunOptionsAccessor);
 
+// Hot-reloadable test-failure-attribution snapshot sourced from CodeyBoxOptions.
+// Rebuilt on IOptionsMonitor emissions by AgentConfigHotReload so a
+// configuration edit takes effect without a process restart.
+builder.Services.AddSingleton<TestFailureAttributionOptionsSnapshot>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new TestFailureAttributionOptionsSnapshot(cbOpts.TestFailureAttribution);
+});
+
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(
     sp.GetRequiredService<PresetCatalogOptions>(),
-    sp.GetRequiredService<Func<TestRunOptions>>()));
+    sp.GetRequiredService<Func<TestRunOptions>>(),
+    sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>()));
 
 // The canonical dotnet-test runner, registered so the ITestSelector seam
 // (a separate work item) can resolve ITestRunnerAuditor from DI and enumerate
 // its TestSuiteDescriptor. The preset catalog builds its own instance for the
 // audit run from the csharp language YAML; this registration mirrors that
-// command with the same hot-reloadable run options.
+// command with the same hot-reloadable run options and attribution snapshot.
 builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(new DotnetTestAuditorOptions
 {
     Name = "csharp:test-pass",
@@ -2233,6 +2243,7 @@ builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(ne
     Role = AuditorRole.BuildTestGate,
     BuildTestGateEvidence = BuildTestGateEvidence.Test,
     RunOptionsAccessor = sp.GetRequiredService<Func<TestRunOptions>>(),
+    TestFailureAttributionOptions = sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
 }));
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
@@ -3468,6 +3479,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
+        testFailureAttribution: sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
@@ -4945,6 +4957,17 @@ namespace CodeyBox.Api
         /// <see cref="PipelineOptions.EmitPlanTestCases"/>; edits require restart.
         /// </summary>
         public bool EmitPlanTestCases { get; set; } = true;
+
+        /// <summary>
+        /// Optional runtime flake attribution for parsed dotnet test failures.
+        /// When enabled, the failing test names are rerun against the
+        /// merge-base/base checkout in the same sandbox and classified as
+        /// diff-attributable only when they pass on base and fail on the diff.
+        /// When disabled, or when the base rerun cannot be performed,
+        /// classification fails closed to diff-attributable.
+        /// Hot-reloadable via <see cref="AgentConfigHotReload"/>.
+        /// </summary>
+        public TestFailureAttributionOptions TestFailureAttribution { get; set; } = new();
 
         /// <summary>
         /// Maximum concurrent release deep-audit phases across all releases.

@@ -38,13 +38,14 @@ internal static class DotnetTestOutputParser
     public static DotnetTestOutputParseResult Parse(string auditorName, string output)
     {
         if (string.IsNullOrWhiteSpace(output))
-            return new DotnetTestOutputParseResult([], 0, false);
+            return new DotnetTestOutputParseResult([], [], 0, false, false);
 
         var match = FailedTestHeaderRegex.Match(output);
         if (!match.Success)
-            return new DotnetTestOutputParseResult([], 0, false);
+            return new DotnetTestOutputParseResult([], [], 0, false, false);
 
         var findings = new List<AuditFinding>();
+        var failedTestNames = new List<string>();
         var failureBodyRanges = new List<(int Start, int End)>();
         var parsedFailureCount = 0;
         var omittedReportedFailureCount = 0;
@@ -71,6 +72,7 @@ internal static class DotnetTestOutputParser
                 continue;
             }
 
+            failedTestNames.Add(testName);
             if (findings.Count < MaxReportedFailureFindings)
             {
                 findings.Add(new AuditFinding(
@@ -95,8 +97,10 @@ internal static class DotnetTestOutputParser
 
         return new DotnetTestOutputParseResult(
             findings,
+            failedTestNames,
             parsedFailureCount,
-            HasCommandFailureSignalOutsideRanges(output, failureBodyRanges));
+            HasCommandFailureSignalOutsideRanges(output, failureBodyRanges),
+            match.Success);
     }
 
     private static int FindFailureBodyEnd(string output, int bodyStart, int defaultEnd)
@@ -241,5 +245,7 @@ internal static class DotnetTestOutputParser
 
 internal sealed record DotnetTestOutputParseResult(
     IReadOnlyList<AuditFinding> Findings,
+    IReadOnlyList<string> FailedTestNames,
     int ParsedFailureCount,
-    bool HasCommandFailureSignals);
+    bool HasCommandFailureSignals,
+    bool HitFailureParseCap);
