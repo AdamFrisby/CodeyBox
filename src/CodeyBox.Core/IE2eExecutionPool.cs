@@ -6,19 +6,12 @@ namespace CodeyBox.Core;
 
 /// <summary>
 /// The cheap CPU-only VM pool that runs committed e2e-replay artifacts. The pool
-/// is intentionally separate from the orchestrator's
-/// <see cref="CodeyBox.Orchestrator.WorkerPool"/> coding fleet — see the brief's
-/// hard rule: "many replays concurrently across the pool; nothing runs on the
-/// local coding fleet". The pool decides its own concurrency cap, leases
-/// (sandbox, working directory) slots clone-per-test from a pre-baked image,
-/// and tears them down after each run.
-///
-/// <para>Two near-term implementations:
-/// <see cref="CodeyBox.Orchestrator.LocalE2eExecutionPool"/> wraps an
-/// <see cref="ISandboxProvider"/> (Multipass in production) and clones from
-/// its baseline image. A remote SSH-fanout implementation is the natural
-/// follow-up: it speaks the same interface and the dispatcher does not care
-/// where the sandbox lives.</para>
+/// is intentionally separate from the coding-worker fleet. The pool decides
+/// its own concurrency cap, leases (sandbox, working directory) slots
+/// clone-per-test from a pre-baked image, and tears them down after each run.
+/// Implementations can run locally for development or fan out to remote
+/// cheap-CPU hosts; the dispatcher only depends on this provider-agnostic
+/// contract.
 /// </summary>
 public interface IE2eExecutionPool
 {

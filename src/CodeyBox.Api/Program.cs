@@ -430,7 +430,27 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         }
     }
 
-    var inner = kind switch
+    var inner = BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
+    startupLog.LogInformation(
+        "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
+        inner.Name,
+        orchestratorOptions.MaxConcurrentSandboxes);
+    return SandboxAdmissionControlledProvider.Wrap(
+        inner,
+        orchestratorOptions.MaxConcurrentSandboxes,
+        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+}
+
+static ISandboxProvider BuildSandboxProviderInner(
+    IServiceProvider sp,
+    CodeyBoxOptions opts,
+    IHostEnvironment environment,
+    ILogger startupLog,
+    ILoggerFactory loggerFactory,
+    string kind)
+{
+    return kind switch
     {
         "process" => BuildProcess(opts, environment, startupLog, loggerFactory),
         "bubblewrap" => new BubblewrapSandboxProvider(
@@ -449,15 +469,52 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         _ => throw new InvalidOperationException(
             $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, sprites, bubblewrap, process"),
     };
-    var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
-    startupLog.LogInformation(
-        "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
-        inner.Name,
-        orchestratorOptions.MaxConcurrentSandboxes);
-    return SandboxAdmissionControlledProvider.Wrap(
-        inner,
-        orchestratorOptions.MaxConcurrentSandboxes,
-        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+}
+
+static IE2eExecutionPool BuildE2eExecutionPool(IServiceProvider sp)
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var e2eOptions = sp.GetRequiredService<IOptionsMonitor<E2eExecutionOptions>>();
+    var poolKind = (e2eOptions.CurrentValue.PoolKind ?? "local").Trim().ToLowerInvariant();
+
+    ISandboxProvider provider = poolKind switch
+    {
+        "remote-ssh" => BuildMultipassRemote(sp, loggerFactory),
+        "local" => BuildE2eLocalSandboxProvider(sp, loggerFactory),
+        _ => throw new InvalidOperationException(
+            $"Unknown CodeyBox:E2eExecution:PoolKind '{e2eOptions.CurrentValue.PoolKind}'. Valid: local, remote-ssh"),
+    };
+
+    return new LocalE2eExecutionPool(
+        provider,
+        e2eOptions,
+        loggerFactory.CreateLogger<LocalE2eExecutionPool>(),
+        fallbackImageReference: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxImageReference,
+        name: poolKind);
+}
+
+static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILoggerFactory loggerFactory)
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var environment = sp.GetRequiredService<IHostEnvironment>();
+    var startupLog = loggerFactory.CreateLogger("CodeyBox.E2eSandbox");
+    var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
+    if (string.IsNullOrEmpty(kind))
+    {
+        if (environment.IsDevelopment())
+        {
+            startupLog.LogWarning(
+                "CodeyBox:E2eExecution:PoolKind=local with CodeyBox:SandboxProvider unset; defaulting E2E provider to 'process' because environment is Development.");
+            kind = "process";
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:SandboxProvider must be set when CodeyBox:E2eExecution:PoolKind=local in non-Development environments.");
+        }
+    }
+
+    return BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
 }
 
 static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
@@ -2144,11 +2201,12 @@ builder.Services.AddSingleton<IE2eRunStore>(sp =>
     return new SqliteE2eRunStore(opts.StateDatabasePath);
 });
 builder.Services.AddSingleton<IE2eReplayRuntime, E2eReplayRuntime>();
-// Local pool wraps the orchestrator's registered ISandboxProvider but exposes
-// its OWN concurrency gate. The pool is the single architectural seam that
-// keeps E2E load off the coding-worker WorkerPool — there is no DI path from
-// the pool back to WorkerPool, and the dispatcher only takes the pool.
-builder.Services.AddSingleton<IE2eExecutionPool, LocalE2eExecutionPool>();
+builder.Services.AddSingleton<E2eRunCancellationRegistry>();
+// E2E pool selection is deliberately independent of the coding pipeline's
+// admitted ISandboxProvider. PoolKind=remote-ssh builds the existing
+// multipass-over-SSH provider; PoolKind=local builds an unwrapped provider
+// for development only.
+builder.Services.AddSingleton<IE2eExecutionPool>(BuildE2eExecutionPool);
 builder.Services.AddHostedService<E2eRunDispatcher>();
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {

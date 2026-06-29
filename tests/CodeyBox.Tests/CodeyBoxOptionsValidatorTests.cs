@@ -213,6 +213,52 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.False(result.Failed, result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData(0, "CodeyBox:E2eExecution:MaxConcurrent")]
+    [InlineData(E2eExecutionOptions.MaximumMaxConcurrent + 1, "CodeyBox:E2eExecution:MaxConcurrent")]
+    public void Validate_RejectsInvalidE2eMaxConcurrent(int value, string expected)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.E2eExecution.MaxConcurrent = value;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expected, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsInvalidE2eTimingAndPoolKind()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.E2eExecution.PollInterval = TimeSpan.FromMilliseconds(-1);
+        options.E2eExecution.PerRunTimeout = TimeSpan.Zero;
+        options.E2eExecution.PoolKind = "bogus";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:E2eExecution:PollInterval", result.FailureMessage);
+        Assert.Contains("CodeyBox:E2eExecution:PerRunTimeout", result.FailureMessage);
+        Assert.Contains("CodeyBox:E2eExecution:PoolKind", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("local")]
+    [InlineData("remote-ssh")]
+    public void Validate_AcceptsValidE2ePoolKinds(string poolKind)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.E2eExecution.MaxConcurrent = E2eExecutionOptions.MaximumMaxConcurrent;
+        options.E2eExecution.PollInterval = TimeSpan.Zero;
+        options.E2eExecution.PerRunTimeout = TimeSpan.FromSeconds(1);
+        options.E2eExecution.PoolKind = poolKind;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_RejectsInvalidSandboxResumeMode()
     {

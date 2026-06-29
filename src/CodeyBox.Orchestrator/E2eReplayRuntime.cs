@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using CodeyBox.Core;
@@ -25,6 +26,9 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
 {
     private readonly ILogger<E2eReplayRuntime> _logger;
     private const int OutputTailBytes = 4096;
+    private const int OutputCaptureBytes = 16 * 1024;
+    private const string ReplayDriverBinary = "codeybox-e2e-replay";
+    private static readonly JsonSerializerOptions ArtifactJson = new(JsonSerializerDefaults.Web);
 
     public E2eReplayRuntime(ILogger<E2eReplayRuntime> logger)
     {
@@ -40,7 +44,13 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         var stepResults = new List<E2eStepResult>();
         var assertionResults = new List<E2eAssertionResult>();
 
-        if (artifact.Readiness is { } readiness && readiness.Argv.Count > 0)
+        if (!E2eReplayArtifactValidation.TryValidate(artifact, out var schemaKind, out var schemaDetail))
+        {
+            sw.Stop();
+            return Fail(schemaDetail, schemaKind, failedIndex: -1, stepResults, assertionResults, sw.ElapsedMilliseconds);
+        }
+
+        if (artifact.Readiness is { Url.Length: > 0 } readiness)
         {
             var ready = await RunReadinessAsync(readiness, sandbox, ct);
             if (!ready.passed)
@@ -59,152 +69,78 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             }
         }
 
-        for (var i = 0; i < artifact.Steps.Count; i++)
+        if (artifact.Steps.Count == 0 && artifact.Assertions.Count == 0)
         {
-            ct.ThrowIfCancellationRequested();
-            var step = artifact.Steps[i];
-            if (step.Argv.Count == 0)
+            sw.Stop();
+            return new E2eRunResult
             {
-                _logger.LogWarning("E2E step {Index} has empty argv; treating as failure.", i);
-                stepResults.Add(new E2eStepResult { Passed = false, ExitCode = -1, StdoutTail = string.Empty, StderrTail = "empty argv" });
-                sw.Stop();
-                return Fail("step had empty argv", "EmptyStep", i, stepResults, assertionResults, sw.ElapsedMilliseconds);
-            }
-
-            SandboxExecResult result;
-            try
-            {
-                result = await sandbox.ExecAsync(new SandboxExec
-                {
-                    Argv = step.Argv,
-                    Stdin = step.Stdin,
-                    WorkingDirectory = step.WorkingDirectory,
-                }, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "E2E step {Index} threw during exec.", i);
-                stepResults.Add(new E2eStepResult { Passed = false, ExitCode = -1, StdoutTail = string.Empty, StderrTail = ex.Message });
-                sw.Stop();
-                return Fail($"step {i} threw: {ex.Message}", "ExecException", i, stepResults, assertionResults, sw.ElapsedMilliseconds);
-            }
-
-            var passed = !step.FailOnNonZeroExit || result.ExitCode == 0;
-            stepResults.Add(new E2eStepResult
-            {
-                ExitCode = result.ExitCode,
-                StdoutTail = Tail(result.Stdout),
-                StderrTail = Tail(result.Stderr),
-                Passed = passed,
-            });
-
-            if (!passed)
-            {
-                sw.Stop();
-                return Fail($"step {i} exited {result.ExitCode}", "StepFailed", i, stepResults, assertionResults, sw.ElapsedMilliseconds);
-            }
-
-            if (step.DelayAfterMs is { } delay && delay > 0)
-            {
-                try
-                {
-                    await Task.Delay(delay, ct);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    throw;
-                }
-            }
+                Passed = true,
+                Summary = $"readiness succeeded, {sw.ElapsedMilliseconds} ms",
+                StepResults = stepResults,
+                AssertionResults = assertionResults,
+                DurationMs = sw.ElapsedMilliseconds,
+            };
         }
 
-        for (var i = 0; i < artifact.Assertions.Count; i++)
-        {
-            ct.ThrowIfCancellationRequested();
-            var assertion = artifact.Assertions[i];
-            if (assertion.Argv.Count == 0)
-            {
-                assertionResults.Add(new E2eAssertionResult
-                {
-                    Description = assertion.Description,
-                    Passed = false,
-                    Detail = "empty argv",
-                });
-                sw.Stop();
-                return Fail($"assertion {i} had empty argv", "EmptyAssertion", i, stepResults, assertionResults, sw.ElapsedMilliseconds);
-            }
-
-            SandboxExecResult result;
-            try
-            {
-                result = await sandbox.ExecAsync(new SandboxExec { Argv = assertion.Argv }, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "E2E assertion {Index} threw during exec.", i);
-                assertionResults.Add(new E2eAssertionResult
-                {
-                    Description = assertion.Description,
-                    Passed = false,
-                    Detail = $"exec exception: {ex.Message}",
-                });
-                sw.Stop();
-                return Fail($"assertion {i} threw: {ex.Message}", "AssertionException", i, stepResults, assertionResults, sw.ElapsedMilliseconds);
-            }
-
-            var (ok, detail) = EvaluateAssertion(assertion, result);
-            assertionResults.Add(new E2eAssertionResult
-            {
-                Description = assertion.Description,
-                Passed = ok,
-                Detail = detail,
-            });
-
-            if (!ok)
-            {
-                sw.Stop();
-                return Fail($"assertion {i} failed: {detail}", "AssertionFailed", i, stepResults, assertionResults, sw.ElapsedMilliseconds);
-            }
-        }
-
+        var replay = await RunReplayDriverAsync(artifact, sandbox, ct);
         sw.Stop();
-        return new E2eRunResult
+        return replay with
         {
-            Passed = true,
-            Summary = $"{artifact.Steps.Count} steps, {artifact.Assertions.Count} assertions, {sw.ElapsedMilliseconds} ms",
-            StepResults = stepResults,
-            AssertionResults = assertionResults,
+            Summary = replay.Passed
+                ? $"{artifact.Steps.Count} steps, {artifact.Assertions.Count} assertions, {sw.ElapsedMilliseconds} ms"
+                : replay.Summary,
             DurationMs = sw.ElapsedMilliseconds,
         };
     }
 
-    private static (bool ok, string detail) EvaluateAssertion(E2eReplayAssertion a, SandboxExecResult r)
+    private async Task<E2eRunResult> RunReplayDriverAsync(E2eReplayArtifact artifact, ISandbox sandbox, CancellationToken ct)
     {
-        if (r.ExitCode != a.ExpectExitCode)
+        SandboxExecResult result;
+        try
         {
-            return (false, $"exit {r.ExitCode} != expected {a.ExpectExitCode}");
+            result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = [ReplayDriverBinary, "--artifact-json-stdin"],
+                Stdin = JsonSerializer.Serialize(artifact, ArtifactJson),
+                WorkingDirectory = "/work",
+                MaxStdoutBytes = OutputCaptureBytes,
+                MaxStderrBytes = OutputCaptureBytes,
+            }, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "E2E replay driver threw during exec.");
+            return Fail($"replay driver threw: {ex.Message}", "ExecException", -1, [], [], 0);
         }
 
-        if (!string.IsNullOrEmpty(a.ExpectStdoutContains)
-            && r.Stdout.IndexOf(a.ExpectStdoutContains, StringComparison.Ordinal) < 0)
+        var stepResults = BuildSyntheticStepResults(artifact, result);
+        var assertionResults = BuildSyntheticAssertionResults(artifact, result);
+        if (result.OutputLimitExceeded)
         {
-            return (false, $"stdout missing substring '{Truncate(a.ExpectStdoutContains, 80)}'");
+            return Fail("replay driver exceeded output capture limit", "OutputLimitExceeded", -1, stepResults, assertionResults, 0);
         }
 
-        if (!string.IsNullOrEmpty(a.ExpectStdoutNotContains)
-            && r.Stdout.IndexOf(a.ExpectStdoutNotContains, StringComparison.Ordinal) >= 0)
+        if (result.ExitCode == 127)
         {
-            return (false, $"stdout contained forbidden substring '{Truncate(a.ExpectStdoutNotContains, 80)}'");
+            return Fail("replay driver is not installed in the E2E image", "ReplayDriverUnavailable", -1, stepResults, assertionResults, 0);
         }
 
-        return (true, "ok");
+        if (result.ExitCode != 0)
+        {
+            return Fail($"replay driver exited {result.ExitCode}: {Tail(result.Stderr)}", "ReplayDriverFailed", -1, stepResults, assertionResults, 0);
+        }
+
+        return new E2eRunResult
+        {
+            Passed = true,
+            Summary = "replay driver completed",
+            StepResults = stepResults,
+            AssertionResults = assertionResults,
+        };
     }
 
     private static async Task<(bool passed, string detail)> RunReadinessAsync(E2eReadinessProbe probe, ISandbox sandbox, CancellationToken ct)
@@ -217,7 +153,12 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             ct.ThrowIfCancellationRequested();
             try
             {
-                var result = await sandbox.ExecAsync(new SandboxExec { Argv = probe.Argv }, ct);
+                var result = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["curl", "-fsS", "--max-time", "5", probe.Url!],
+                    MaxStdoutBytes = OutputCaptureBytes,
+                    MaxStderrBytes = OutputCaptureBytes,
+                }, ct);
                 last = result;
                 if (result.ExitCode == 0)
                 {
@@ -245,8 +186,42 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
                 }
             }
         }
-        var tail = last is null ? "no attempts" : $"last exit {last.ExitCode}, stderr: {Truncate(last.Stderr, 200)}";
+        var tail = last is null ? "no attempts" : $"last exit {last.ExitCode}, stderr: {RawOutputRedactor.TruncateToBytes(Tail(last.Stderr), 200)}";
         return (false, tail);
+    }
+
+    private static IReadOnlyList<E2eStepResult> BuildSyntheticStepResults(E2eReplayArtifact artifact, SandboxExecResult result)
+    {
+        var passed = result.ExitCode == 0 && !result.OutputLimitExceeded;
+        var count = Math.Max(1, artifact.Steps.Count);
+        var rows = new List<E2eStepResult>(count);
+        for (var i = 0; i < count; i++)
+        {
+            rows.Add(new E2eStepResult
+            {
+                ExitCode = result.ExitCode,
+                StdoutTail = i == 0 ? Tail(result.Stdout) : string.Empty,
+                StderrTail = i == 0 ? Tail(result.Stderr) : string.Empty,
+                Passed = passed,
+            });
+        }
+        return rows;
+    }
+
+    private static IReadOnlyList<E2eAssertionResult> BuildSyntheticAssertionResults(E2eReplayArtifact artifact, SandboxExecResult result)
+    {
+        var passed = result.ExitCode == 0 && !result.OutputLimitExceeded;
+        var rows = new List<E2eAssertionResult>(artifact.Assertions.Count);
+        foreach (var assertion in artifact.Assertions)
+        {
+            rows.Add(new E2eAssertionResult
+            {
+                Description = assertion.Description,
+                Passed = passed,
+                Detail = passed ? "ok" : Tail(result.Stderr),
+            });
+        }
+        return rows;
     }
 
     private static E2eRunResult Fail(string summary, string kind, int failedIndex, IReadOnlyList<E2eStepResult> steps, IReadOnlyList<E2eAssertionResult> assertions, long durationMs)
@@ -264,10 +239,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
     private static string Tail(string s)
     {
         if (string.IsNullOrEmpty(s) || s.Length <= OutputTailBytes)
-            return s ?? string.Empty;
-        return s[^OutputTailBytes..];
+            return RawOutputRedactor.Redact(s ?? string.Empty);
+        return RawOutputRedactor.Redact(s[^OutputTailBytes..]);
     }
-
-    private static string Truncate(string s, int max)
-        => string.IsNullOrEmpty(s) || s.Length <= max ? s ?? string.Empty : s[..max];
 }

@@ -9,10 +9,10 @@ together.
 
 The brief's hard rule: **E2E load never runs on the local coding-worker
 fleet.** That separation is architectural — the dispatcher only depends on
-`IE2eExecutionPool`, the pool only depends on the configured
-`ISandboxProvider`, and there is no DI path from either back to
-`WorkerPool`. A unit test pins this contract via reflection so a future
-refactor can't reintroduce a hidden coupling.
+`IE2eExecutionPool`, and Program builds the E2E provider independently from
+the coding pipeline's admitted `ISandboxProvider`. `PoolKind=remote-ssh`
+selects the existing multipass-over-SSH cheap-CPU provider; `PoolKind=local`
+exists for development and still bypasses the coding fleet's admission gate.
 
 ## Shape at a glance
 
@@ -38,7 +38,7 @@ TestCase (E2eReplay) ──→ /e2eruns ──→ SqliteE2eRunStore
 |---|---|---|
 | `Enabled` | `false` | Master switch. The dispatcher does NOT drain the queue when off; the REST surface stays available so operators can enqueue ahead of enabling. |
 | `MaxConcurrent` | `4` | Hard upper bound on concurrent leases. Sized for the cheap-CPU cloud quota, NOT for the coding fleet. Hot-reloadable. Floor 1, ceiling 512. |
-| `PoolKind` | `local` | `local` wraps the orchestrator's `ISandboxProvider`. `remote-ssh` is the planned multi-host implementation; not implemented yet — operator config is accepted but the dispatcher will fail fast when selected. |
+| `PoolKind` | `local` | `local` builds an independent development provider from `CodeyBox:SandboxProvider`. `remote-ssh` uses the existing multipass-over-SSH provider for the cheap CPU cloud pool. |
 | `NetworkProfile` | `null` | Logical bridge profile cloned sandboxes attach to (passed through to `SandboxNetworkPolicy.ProfileName`). Use the app-under-test profile that allows only the HTTP service ports the runtime hits. |
 | `SandboxImageReference` | `null` | Falls back to the orchestrator-wide `SandboxImageReference`. Set when the E2E pool runs from a separate pre-baked image carrying the app stack. |
 | `BaselineImageRef` | `null` | Optional content-hashed baseline pin. Mirrors `SandboxSpec.BaselineImageRef`. |
@@ -51,7 +51,7 @@ The intended production shape: bake the app stack (DB / services / headless
 browser) into a baseline image once via the existing
 `MultipassUseBaselineImages` flow, point `E2eExecution:BaselineImageRef`
 (or `E2eExecution:SandboxImageReference`) at it, and the
-`LocalE2eExecutionPool` clones from it for every lease. Per-test startup is
+E2E execution pool clones from it for every lease. Per-test startup is
 fast (snapshot clone) and heavy setup is amortised once. Clone-per-test,
 run, discard — no slot reuse.
 
@@ -78,23 +78,23 @@ Queued → Running → Passed | Failed | Error | Canceled
 ```
 
 - **Passed** — every step + assertion succeeded.
-- **Failed** — a step exited non-zero (when `FailOnNonZeroExit` is true, the
-  default), an assertion's expected exit code / stdout substring didn't
-  match, or an empty step/assertion was encountered.
+- **Failed** — the replay driver reports a deterministic app/assertion
+  failure.
 - **Error** — readiness probe never came up, the artifact JSON failed to
-  parse, the test case vanished mid-claim, the per-run timeout fired, or
-  an exec call threw. Distinguishes infra failure from real assertion
-  failure on dashboards.
+  parse, the artifact schema is invalid, the fixed replay driver is missing,
+  the test case vanished mid-claim, the per-run timeout fired, output hit the
+  capture bound, or an exec call threw. Distinguishes infra failure from real
+  assertion failure on dashboards.
 - **Canceled** — operator hit `POST /e2eruns/{id}/cancel`, or the
   dispatcher's process is shutting down mid-run.
 
 The result column on a terminal row is a serialized
 `E2eRunResult` — `{ passed, summary, failureKind, failedStepIndex,
 stepResults[], assertionResults[], durationMs }`. Step + assertion
-sub-results carry the last 4 KiB of stdout/stderr; downstream dashboards
-get enough context to investigate without re-running.
+sub-results carry a redacted bounded tail of stdout/stderr; downstream
+dashboards get enough context to investigate without re-running.
 
-On Pass / Fail the dispatcher also stamps the owning test case's
+On Pass / Fail / Error the dispatcher also stamps the owning test case's
 `LastRunPassed`, `LastRunAt`, and `LastRunResult` so the test-case list
 reflects the most recent execution outcome.
 
@@ -107,47 +107,47 @@ Persisted as JSON in `TestCase.ExecutableArtifactJson` for cases whose
 {
   "name": "auth-login-happy-path",
   "readiness": {
-    "argv": ["curl", "-fsS", "http://localhost:8080/healthz"],
+    "url": "http://localhost:8080/healthz",
     "maxAttempts": 30,
     "delayMs": 1000
   },
   "steps": [
     {
-      "argv": ["curl", "-fsS", "-X", "POST", "http://localhost:8080/login", "-d", "{...}"],
-      "workingDirectory": "/work",
-      "failOnNonZeroExit": true,
+      "action": "navigate",
+      "target": "http://localhost:8080/login",
+      "delayAfterMs": 200
+    },
+    {
+      "action": "fill",
+      "selector": "#email",
+      "value": "alice@example.com"
+    },
+    {
+      "action": "click",
+      "selector": "button[type=submit]",
       "delayAfterMs": 200
     }
   ],
   "assertions": [
     {
-      "argv": ["curl", "-fsS", "http://localhost:8080/me"],
-      "expectExitCode": 0,
-      "expectStdoutContains": "\"email\":\"alice@example.com\"",
-      "description": "/me returns the freshly-authenticated session"
+      "kind": "selectorVisible",
+      "selector": "#account-menu",
+      "description": "account menu is visible after login"
     }
   ]
 }
 ```
 
-Steps execute sequentially inside the cloned sandbox via
-`ISandbox.ExecAsync`. The runtime does not reach outside the sandbox; any
-HTTP traffic is the artifact's own concern (typically `curl` against the
-pre-baked app's loopback port).
-
-Richer assertion kinds (DOM selectors, JSON-path matchers) layer on top of
-the same `argv + expectations` shape later without changing the runtime
-contract — they reduce to "run this command and check the output". The
-brief calls out a cheap-model selector-repair fallback as a future
-addition; this runtime exposes the seam by recording
-`failedStepIndex` on failure but does not act on it.
+The runtime never executes artifact-controlled argv. It validates the JSON
+schema, checks readiness with a fixed bounded `curl`, then invokes the
+pre-baked image's fixed `codeybox-e2e-replay --artifact-json-stdin` driver and
+passes the artifact on stdin. The driver is the trusted component that turns
+recorded actions/selectors/assertions into deterministic browser/app
+interaction. The brief calls out a cheap-model selector-repair fallback as a
+future addition; this runtime records failure detail but does not repair.
 
 ## Out of scope (deliberate)
 
-- **The remote-SSH multi-host pool** (`PoolKind=remote-ssh`). The
-  abstraction (`IE2eExecutionPool`) is the seam the future implementation
-  will plug into; the dispatcher does not need to know whether the sandbox
-  lives on the same host or a separate cheap-CPU box.
 - **Cheap-model selector-repair on failure.** The seam exists
   (`E2eRunResult.FailedStepIndex`); the hook is intentionally not built.
 - **Conformance gates / coverage scoring.** Lives in

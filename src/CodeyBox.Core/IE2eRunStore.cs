@@ -22,6 +22,9 @@ public interface IE2eRunStore
 
     IAsyncEnumerable<E2eRun> ListByBatchAsync(string batchId, CancellationToken ct = default);
 
+    /// <summary>Returns true when at least one queued run is available to claim.</summary>
+    Task<bool> HasQueuedAsync(CancellationToken ct = default);
+
     /// <summary>Atomically claims the oldest queued run; returns null when the queue is empty.</summary>
     Task<E2eRun?> ClaimNextQueuedAsync(string sandboxId, CancellationToken ct = default);
 

@@ -170,6 +170,22 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
         foreach (var row in rows) yield return row;
     }
 
+    public async Task<bool> HasQueuedAsync(CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM e2e_runs WHERE status = 'Queued' LIMIT 1;";
+            var value = await cmd.ExecuteScalarAsync(ct);
+            return value is not null && value is not DBNull;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<E2eRun?> ClaimNextQueuedAsync(string sandboxId, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
@@ -262,7 +278,8 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
                     started_at = COALESCE($sa, started_at),
                     finished_at = COALESCE($fa, finished_at),
                     result = COALESCE($res, result)
-                WHERE id = $id;
+                WHERE id = $id
+                  AND status NOT IN ('Passed', 'Failed', 'Error', 'Canceled');
                 """;
             cmd.Parameters.AddWithValue("$st", status.ToString());
             cmd.Parameters.AddWithValue("$sa", (object?)startedAt?.ToString("O") ?? DBNull.Value);

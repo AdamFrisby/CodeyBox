@@ -18,6 +18,7 @@ namespace CodeyBox.Core;
 public sealed record E2eReplayArtifact
 {
     /// <summary>Optional human-readable label echoed into the run result.</summary>
+    [JsonPropertyName("name")]
     public string? Name { get; init; }
 
     /// <summary>
@@ -26,34 +27,63 @@ public sealed record E2eReplayArtifact
     /// test never came up") rather than <see cref="E2eRunStatus.Failed"/> so the
     /// dashboard distinguishes flake-from-infra-issue vs. real assertion fail.
     /// </summary>
+    [JsonPropertyName("readiness")]
     public E2eReadinessProbe? Readiness { get; init; }
 
+    [JsonPropertyName("steps")]
     public IReadOnlyList<E2eReplayStep> Steps { get; init; } = [];
 
+    [JsonPropertyName("assertions")]
     public IReadOnlyList<E2eReplayAssertion> Assertions { get; init; } = [];
 }
 
 public sealed record E2eReadinessProbe
 {
-    /// <summary>Shell command (argv) the runtime invokes until it exits 0 or the deadline expires.</summary>
+    /// <summary>HTTP(S) URL the runtime probes with its built-in readiness command.</summary>
+    [JsonPropertyName("url")]
+    public string? Url { get; init; }
+
+    /// <summary>Legacy command shape. New artifacts must use <see cref="Url"/>.</summary>
+    [JsonPropertyName("argv")]
     public IReadOnlyList<string> Argv { get; init; } = [];
 
     /// <summary>Maximum number of probe attempts; defaults to 30.</summary>
+    [JsonPropertyName("maxAttempts")]
     public int MaxAttempts { get; init; } = 30;
 
     /// <summary>Delay (ms) between probe attempts; defaults to 1000.</summary>
+    [JsonPropertyName("delayMs")]
     public int DelayMs { get; init; } = 1000;
 }
 
 public sealed record E2eReplayStep
 {
-    /// <summary>Shell command (argv) executed inside the sandbox.</summary>
+    /// <summary>Recorded browser/app action, for example <c>navigate</c>, <c>click</c>, or <c>fill</c>.</summary>
+    [JsonPropertyName("action")]
+    public string? Action { get; init; }
+
+    /// <summary>Selector used by selector-targeted actions.</summary>
+    [JsonPropertyName("selector")]
+    public string? Selector { get; init; }
+
+    /// <summary>URL or other action target.</summary>
+    [JsonPropertyName("target")]
+    public string? Target { get; init; }
+
+    /// <summary>Value typed/selected by input-oriented actions.</summary>
+    [JsonPropertyName("value")]
+    public string? Value { get; init; }
+
+    /// <summary>Legacy command shape. New artifacts must use action/selector/target fields.</summary>
+    [JsonPropertyName("argv")]
     public IReadOnlyList<string> Argv { get; init; } = [];
 
     /// <summary>Optional stdin payload; null = no stdin.</summary>
+    [JsonPropertyName("stdin")]
     public string? Stdin { get; init; }
 
     /// <summary>Working directory inside the sandbox; null defers to the sandbox default (/work).</summary>
+    [JsonPropertyName("workingDirectory")]
     public string? WorkingDirectory { get; init; }
 
     /// <summary>
@@ -61,32 +91,53 @@ public sealed record E2eReplayStep
     /// runtime records the exit code but continues — useful for fire-and-forget
     /// setup steps. Defaults to true (strict).
     /// </summary>
+    [JsonPropertyName("failOnNonZeroExit")]
     public bool FailOnNonZeroExit { get; init; } = true;
 
     /// <summary>Optional fixed delay (ms) inserted after the step completes.</summary>
+    [JsonPropertyName("delayAfterMs")]
     public int? DelayAfterMs { get; init; }
 }
 
 /// <summary>
-/// Assertion shape. Inspects the stdout/exit-code of a shell command executed
-/// inside the sandbox. Richer assertion kinds (DOM selectors, HTTP body JSON
-/// paths) layer on top later without changing the runtime contract — they too
-/// reduce to "run this command and check the output".
+/// Assertion shape consumed by the deterministic replay driver. New artifacts
+/// use selector/target/value fields; legacy argv expectations are retained only
+/// so old data can be rejected with a clear validation error instead of being
+/// executed as artifact-controlled shell commands.
 /// </summary>
 public sealed record E2eReplayAssertion
 {
+    /// <summary>Assertion kind, for example <c>selectorVisible</c> or <c>urlContains</c>.</summary>
+    [JsonPropertyName("kind")]
+    public string? Kind { get; init; }
+
+    [JsonPropertyName("selector")]
+    public string? Selector { get; init; }
+
+    [JsonPropertyName("target")]
+    public string? Target { get; init; }
+
+    [JsonPropertyName("value")]
+    public string? Value { get; init; }
+
+    /// <summary>Legacy command shape. New artifacts must use kind/selector/target/value fields.</summary>
+    [JsonPropertyName("argv")]
     public IReadOnlyList<string> Argv { get; init; } = [];
 
     /// <summary>Expected exit code; defaults to 0.</summary>
+    [JsonPropertyName("expectExitCode")]
     public int ExpectExitCode { get; init; }
 
     /// <summary>Optional substring that must appear in stdout (case-sensitive).</summary>
+    [JsonPropertyName("expectStdoutContains")]
     public string? ExpectStdoutContains { get; init; }
 
     /// <summary>Optional substring that must NOT appear in stdout.</summary>
+    [JsonPropertyName("expectStdoutNotContains")]
     public string? ExpectStdoutNotContains { get; init; }
 
     /// <summary>Optional human-readable description for failure reporting.</summary>
+    [JsonPropertyName("description")]
     public string? Description { get; init; }
 }
 

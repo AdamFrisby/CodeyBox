@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using CodeyBox.Core;
@@ -28,8 +30,15 @@ public sealed class E2eRunDispatcher : BackgroundService
     private readonly IE2eReplayRuntime _runtime;
     private readonly ITestCaseStore _testCases;
     private readonly IOptionsMonitor<E2eExecutionOptions> _options;
+    private readonly E2eRunCancellationRegistry _cancellations;
     private readonly ILogger<E2eRunDispatcher> _logger;
+    private readonly ConcurrentDictionary<string, Task> _activeTasks = new(StringComparer.Ordinal);
     private static readonly JsonSerializerOptions ResultJson = new() { WriteIndented = false };
+    private static readonly JsonSerializerOptions ArtifactJson = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+    };
 
     public E2eRunDispatcher(
         IE2eRunStore store,
@@ -37,6 +46,7 @@ public sealed class E2eRunDispatcher : BackgroundService
         IE2eReplayRuntime runtime,
         ITestCaseStore testCases,
         IOptionsMonitor<E2eExecutionOptions> options,
+        E2eRunCancellationRegistry cancellations,
         ILogger<E2eRunDispatcher> logger)
     {
         _store = store;
@@ -44,6 +54,7 @@ public sealed class E2eRunDispatcher : BackgroundService
         _runtime = runtime;
         _testCases = testCases;
         _options = options;
+        _cancellations = cancellations;
         _logger = logger;
     }
 
@@ -80,6 +91,28 @@ public sealed class E2eRunDispatcher : BackgroundService
         }
     }
 
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await base.StopAsync(cancellationToken);
+
+        var tasks = _activeTasks.Values.ToArray();
+        if (tasks.Length == 0)
+            return;
+
+        try
+        {
+            await Task.WhenAll(tasks).WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning("E2eRunDispatcher shutdown timed out with {Count} active replay task(s).", _activeTasks.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "E2eRunDispatcher observed a replay task failure during shutdown drain.");
+        }
+    }
+
     /// <summary>
     /// Attempts to claim one queued run and start its execution on a pool slot.
     /// Returns true when a run was claimed (so the caller skips the idle delay)
@@ -88,7 +121,17 @@ public sealed class E2eRunDispatcher : BackgroundService
     /// </summary>
     internal async Task<bool> TryDispatchOneAsync(CancellationToken stoppingToken)
     {
+        if (!_options.CurrentValue.Enabled)
+        {
+            return false;
+        }
+
         if (_pool.InFlight >= _pool.MaxConcurrent)
+        {
+            return false;
+        }
+
+        if (!await _store.HasQueuedAsync(stoppingToken))
         {
             return false;
         }
@@ -131,15 +174,27 @@ public sealed class E2eRunDispatcher : BackgroundService
             return false;
         }
 
-        _ = Task.Run(() => RunOneAsync(slot, claimed, stoppingToken), stoppingToken);
+        var runCancellation = _cancellations.Register(claimed.Id);
+        var task = Task.Run(() => RunOneAsync(slot, claimed, runCancellation, stoppingToken));
+        _activeTasks[claimed.Id] = task;
+        _ = task.ContinueWith(
+            t =>
+            {
+                _activeTasks.TryRemove(claimed.Id, out _);
+                if (t.Exception is { } ex)
+                    _logger.LogError(ex, "E2E run {RunId} task faulted.", claimed.Id);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
         return true;
     }
 
-    private async Task RunOneAsync(IE2eExecutionSlot slot, E2eRun run, CancellationToken stoppingToken)
+    private async Task RunOneAsync(IE2eExecutionSlot slot, E2eRun run, CancellationTokenSource runCancellation, CancellationToken stoppingToken)
     {
         var opts = _options.CurrentValue;
         using var timeoutCts = new CancellationTokenSource(opts.PerRunTimeout);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, stoppingToken);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, stoppingToken, runCancellation.Token);
 
         try
         {
@@ -162,7 +217,7 @@ public sealed class E2eRunDispatcher : BackgroundService
             {
                 artifact = string.IsNullOrWhiteSpace(testCase.ExecutableArtifactJson)
                     ? null
-                    : JsonSerializer.Deserialize<E2eReplayArtifact>(testCase.ExecutableArtifactJson);
+                    : JsonSerializer.Deserialize<E2eReplayArtifact>(testCase.ExecutableArtifactJson, ArtifactJson);
             }
             catch (JsonException ex)
             {
@@ -176,20 +231,32 @@ public sealed class E2eRunDispatcher : BackgroundService
                 return;
             }
 
+            if (!E2eReplayArtifactValidation.TryValidate(artifact, out var failureKind, out var detail))
+            {
+                await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson(failureKind, detail), CancellationToken.None);
+                return;
+            }
+
             var result = await _runtime.ExecuteAsync(artifact, slot.Sandbox, linked.Token);
             var resultJson = JsonSerializer.Serialize(result, ResultJson);
-            var status = result.Passed ? E2eRunStatus.Passed : E2eRunStatus.Failed;
-            await PersistResultAsync(run.Id, status, resultJson, CancellationToken.None);
-            await UpdateTestCaseLastRunAsync(testCase, result, CancellationToken.None);
+            var status = result.Passed
+                ? E2eRunStatus.Passed
+                : IsInfrastructureFailure(result.FailureKind) ? E2eRunStatus.Error : E2eRunStatus.Failed;
+            var persisted = await PersistResultAsync(run.Id, status, resultJson, CancellationToken.None);
+            if (persisted && status is E2eRunStatus.Passed or E2eRunStatus.Failed or E2eRunStatus.Error)
+                await UpdateTestCaseLastRunAsync(testCase.Id, result, CancellationToken.None);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("PerRunTimeout", $"exceeded {opts.PerRunTimeout}"), CancellationToken.None);
         }
+        catch (OperationCanceledException) when (runCancellation.IsCancellationRequested)
+        {
+            await PersistResultAsync(run.Id, E2eRunStatus.Canceled, BuildErrorResultJson("Canceled", "run canceled by operator"), CancellationToken.None);
+        }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
             await PersistResultAsync(run.Id, E2eRunStatus.Canceled, BuildErrorResultJson("ShutdownCancel", "dispatcher canceled before run finished"), CancellationToken.None);
-            throw;
         }
         catch (Exception ex)
         {
@@ -198,40 +265,32 @@ public sealed class E2eRunDispatcher : BackgroundService
         }
         finally
         {
+            _activeTasks.TryRemove(run.Id, out _);
+            _cancellations.Unregister(run.Id, runCancellation);
             try { await slot.DisposeAsync(); }
             catch (Exception ex) { _logger.LogWarning(ex, "E2E pool slot disposal threw; continuing."); }
         }
     }
 
-    private async Task PersistResultAsync(string runId, E2eRunStatus status, string resultJson, CancellationToken ct)
+    private async Task<bool> PersistResultAsync(string runId, E2eRunStatus status, string resultJson, CancellationToken ct)
     {
-        try
-        {
-            await _store.UpdateStatusAsync(runId, status, startedAt: null, finishedAt: DateTimeOffset.UtcNow, result: resultJson, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Persisting result for run {RunId} failed.", runId);
-        }
+        var updated = await _store.UpdateStatusAsync(runId, status, startedAt: null, finishedAt: DateTimeOffset.UtcNow, result: resultJson, ct);
+        if (updated)
+            return true;
+
+        var current = await _store.GetAsync(runId, CancellationToken.None);
+        if (current?.Status == E2eRunStatus.Canceled)
+            return false;
+
+        throw new InvalidOperationException($"Persisting result for run '{runId}' affected no rows.");
     }
 
-    private async Task UpdateTestCaseLastRunAsync(TestCase testCase, E2eRunResult result, CancellationToken ct)
+    private async Task UpdateTestCaseLastRunAsync(string testCaseId, E2eRunResult result, CancellationToken ct)
     {
-        try
-        {
-            var updated = testCase with
-            {
-                UpdatedAt = DateTimeOffset.UtcNow,
-                LastRunPassed = result.Passed,
-                LastRunAt = DateTimeOffset.UtcNow,
-                LastRunResult = result.Summary,
-            };
-            await _testCases.UpdateAsync(updated, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Updating last-run for test case {TestCaseId} failed.", testCase.Id);
-        }
+        var now = DateTimeOffset.UtcNow;
+        var updated = await _testCases.UpdateLastRunAsync(testCaseId, result.Passed, now, result.Summary, ct);
+        if (!updated)
+            throw new InvalidOperationException($"Updating last-run for test case '{testCaseId}' affected no rows.");
     }
 
     private static string BuildErrorResultJson(string kind, string detail)
@@ -243,6 +302,13 @@ public sealed class E2eRunDispatcher : BackgroundService
             StepResults = Array.Empty<E2eStepResult>(),
             AssertionResults = Array.Empty<E2eAssertionResult>(),
         }, ResultJson);
+
+    private static bool IsInfrastructureFailure(string? failureKind) =>
+        string.Equals(failureKind, "ReadinessProbe", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ExecException", StringComparison.Ordinal)
+        || string.Equals(failureKind, "AssertionException", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ReplayDriverUnavailable", StringComparison.Ordinal)
+        || string.Equals(failureKind, "OutputLimitExceeded", StringComparison.Ordinal);
 
     private static async Task DelaySafely(TimeSpan delay, CancellationToken ct)
     {

@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
@@ -70,7 +71,7 @@ internal static class E2eRunEndpoints
             return Results.BadRequest(new { error = $"Bulk enqueue exceeds maximum of {maxBulk} items" });
 
         var batchId = string.IsNullOrWhiteSpace(req.BatchId) ? Guid.NewGuid().ToString("N") : req.BatchId;
-        var created = new List<E2eRunDto>(req.TestCaseIds.Count);
+        var validated = new List<TestCase>(req.TestCaseIds.Count);
         foreach (var tcId in req.TestCaseIds)
         {
             if (string.IsNullOrWhiteSpace(tcId))
@@ -82,7 +83,12 @@ internal static class E2eRunEndpoints
                 return Results.BadRequest(new { error = $"TestCase '{tcId}' AutomationKind is {testCase.AutomationKind}; expected E2eReplay" });
             if (string.IsNullOrWhiteSpace(testCase.ExecutableArtifactJson))
                 return Results.BadRequest(new { error = $"TestCase '{tcId}' has no ExecutableArtifactJson" });
+            validated.Add(testCase);
+        }
 
+        var created = new List<E2eRunDto>(validated.Count);
+        foreach (var testCase in validated)
+        {
             var run = new E2eRun
             {
                 Id = Guid.NewGuid().ToString("N"),
@@ -111,10 +117,16 @@ internal static class E2eRunEndpoints
         return run is null ? Results.NotFound() : Results.Ok(ToDto(run));
     }
 
-    private static async Task<IResult> CancelAsync(string id, IE2eRunStore runs, CancellationToken ct)
+    private static async Task<IResult> CancelAsync(
+        string id,
+        IE2eRunStore runs,
+        E2eRunCancellationRegistry cancellations,
+        CancellationToken ct)
     {
         var run = await runs.GetAsync(id, ct);
         if (run is null) return Results.NotFound();
+        if (run.Status == E2eRunStatus.Running)
+            cancellations.Cancel(id);
         var ok = await runs.CancelAsync(id, ct);
         if (!ok) return Results.Conflict(new { error = $"run '{id}' is already terminal (status={run.Status})" });
         var refreshed = await runs.GetAsync(id, ct);

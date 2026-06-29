@@ -26,12 +26,10 @@ public sealed class E2eExecutionOptions
     public int MaxConcurrent { get; set; } = 4;
 
     /// <summary>
-    /// Which pool implementation to load. <c>local</c> wraps the orchestrator's
-    /// configured <see cref="ISandboxProvider"/> (Multipass in production) and
-    /// clones from the pre-baked baseline image. <c>remote-ssh</c> is the
-    /// planned multi-host implementation that fans replays out to a separate
-    /// remote pool over SSH; not implemented in this commit (the dispatcher
-    /// fails fast when selected so operators see the gap immediately).
+    /// Which pool implementation to load. <c>local</c> builds an independent
+    /// provider from the development sandbox configuration and keeps it outside
+    /// the coding fleet's admission gate. <c>remote-ssh</c> fans replays out to
+    /// the existing multipass-over-SSH cheap-CPU pool.
     /// </summary>
     public string PoolKind { get; set; } = "local";
 

@@ -8,12 +8,12 @@ using Microsoft.Extensions.Options;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// The default E2E pool. Wraps the orchestrator's configured
-/// <see cref="ISandboxProvider"/> (Multipass in production) with its OWN
-/// concurrency gate so that E2E load never competes with the coding fleet for
-/// <see cref="WorkerPool"/> slots. Clone-per-test: each lease produces a fresh
-/// sandbox from the pre-baked baseline image (when the provider supports
-/// baseline images) and disposes it on release.
+/// E2E execution pool backed by a sandbox provider chosen specifically for
+/// replay work. Production composition should pass the remote cheap-CPU
+/// provider; local development can pass an independent unadmitted provider.
+/// Clone-per-test: each lease produces a fresh sandbox from the pre-baked
+/// baseline image (when the provider supports baseline images) and disposes it
+/// on release.
 ///
 /// <para>The pool itself does not contain a queue — the
 /// <see cref="E2eRunDispatcher"/> hosted service owns queue draining and calls
@@ -24,32 +24,49 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool
     private readonly ISandboxProvider _provider;
     private readonly IOptionsMonitor<E2eExecutionOptions>? _options;
     private readonly ILogger<LocalE2eExecutionPool> _logger;
-    private readonly SemaphoreSlim _gate;
+    private readonly ResizableConcurrencyGate _gate;
     private readonly int _initialMaxConcurrent;
-    private int _inFlight;
+    private readonly Func<string?> _fallbackImageReference;
+    private readonly string _name;
 
     public LocalE2eExecutionPool(
         ISandboxProvider provider,
         IOptionsMonitor<E2eExecutionOptions>? options,
-        ILogger<LocalE2eExecutionPool> logger)
+        ILogger<LocalE2eExecutionPool> logger,
+        Func<string?>? fallbackImageReference = null,
+        string? name = null)
     {
         _provider = provider ?? throw new ArgumentNullException(nameof(provider));
         _options = options;
         _logger = logger;
+        _fallbackImageReference = fallbackImageReference ?? (() => null);
+        _name = string.IsNullOrWhiteSpace(name) ? "local" : name;
         _initialMaxConcurrent = Clamp(options?.CurrentValue.MaxConcurrent ?? 4);
-        _gate = new SemaphoreSlim(_initialMaxConcurrent, E2eExecutionOptions.MaximumMaxConcurrent);
+        _gate = new ResizableConcurrencyGate(_initialMaxConcurrent);
+        _options?.OnChange(opts =>
+        {
+            var resized = _gate.Resize(Clamp(opts.MaxConcurrent));
+            if (resized.OldTarget != resized.NewTarget)
+            {
+                _logger.LogInformation(
+                    "E2E pool {Pool} resized from {Old} to {New}; in-flight={InFlight}",
+                    _name,
+                    resized.OldTarget,
+                    resized.NewTarget,
+                    resized.InFlight);
+            }
+        });
     }
 
-    public string Name => "local";
+    public string Name => _name;
 
-    public int MaxConcurrent => Clamp(_options?.CurrentValue.MaxConcurrent ?? _initialMaxConcurrent);
+    public int MaxConcurrent => _gate.CurrentTarget;
 
-    public int InFlight => Volatile.Read(ref _inFlight);
+    public int InFlight => _gate.CurrentInFlight;
 
     public async Task<IE2eExecutionSlot> LeaseAsync(CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct);
-        Interlocked.Increment(ref _inFlight);
         try
         {
             var spec = BuildSpec();
@@ -59,7 +76,6 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool
         }
         catch
         {
-            Interlocked.Decrement(ref _inFlight);
             _gate.Release();
             throw;
         }
@@ -70,7 +86,7 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool
         var opts = _options?.CurrentValue ?? new E2eExecutionOptions();
         return new SandboxSpec
         {
-            ImageReference = opts.SandboxImageReference ?? string.Empty,
+            ImageReference = opts.SandboxImageReference ?? _fallbackImageReference() ?? string.Empty,
             BaselineImageRef = opts.BaselineImageRef,
             Network = string.IsNullOrEmpty(opts.NetworkProfile)
                 ? SandboxNetworkPolicy.Denied
@@ -80,12 +96,11 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool
 
     private void ReleaseSlot()
     {
-        Interlocked.Decrement(ref _inFlight);
         try
         {
             _gate.Release();
         }
-        catch (SemaphoreFullException)
+        catch (InvalidOperationException)
         {
             // Defensive: a double-release would be a bug elsewhere, log rather than crash.
             _logger.LogWarning("E2E pool gate over-released; ignoring.");

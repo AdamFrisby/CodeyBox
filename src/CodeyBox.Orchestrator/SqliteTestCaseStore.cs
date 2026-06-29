@@ -167,6 +167,34 @@ public sealed class SqliteTestCaseStore : ITestCaseStore, IDisposable
         }
     }
 
+    public async Task<bool> UpdateLastRunAsync(string id, bool passed, DateTimeOffset ranAt, string result, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE test_cases SET
+                    updated_at = $ua,
+                    last_run_passed = $passed,
+                    last_run_at = $run_at,
+                    last_run_result = $result
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$ua", ranAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$passed", passed ? 1 : 0);
+            cmd.Parameters.AddWithValue("$run_at", ranAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$result", result);
+            cmd.Parameters.AddWithValue("$id", id);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<TestCase?> GetAsync(string id, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);

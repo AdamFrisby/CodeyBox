@@ -520,12 +520,14 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
         Path.GetTempPath(), $"codeybox-testcaseshttp-{Guid.NewGuid():N}.db");
 
     public SqliteTestCaseStore TestCaseStore { get; }
+    public SqliteE2eRunStore E2eRunStore { get; }
     public SqliteWorkItemStore WorkItemStore { get; }
 
     public TestCaseApiFactory()
     {
         WorkItemStore = new SqliteWorkItemStore(_dbPath);
         TestCaseStore = new SqliteTestCaseStore(_dbPath);
+        E2eRunStore = new SqliteE2eRunStore(_dbPath);
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -553,6 +555,9 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
             services.RemoveAll<ITestCaseStore>();
             services.AddSingleton<ITestCaseStore>(TestCaseStore);
 
+            services.RemoveAll<IE2eRunStore>();
+            services.AddSingleton<IE2eRunStore>(E2eRunStore);
+
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                 new Project
@@ -571,6 +576,7 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             TestCaseStore.Dispose();
+            E2eRunStore.Dispose();
             WorkItemStore.Dispose();
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
         }
