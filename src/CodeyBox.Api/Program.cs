@@ -28,6 +28,7 @@ using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.MultipassRemote;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.Sandbox.Sprites;
 using CodeyBox.HostProcess;
 using CodeyBox.Webhooks;
 using CodeyBox.Notifications;
@@ -352,6 +353,8 @@ ApiKeyAuth.Configure(builder);
 //   multipass   — Real Ubuntu VMs via Canonical's snap. Separate guest
 //                 kernel. Single 'snap install multipass' on Ubuntu, no
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
+//   sprites     — Fly.io hosted Firecracker microVMs via sprites.dev. Requires
+//                 SPRITES_TOKEN (or configured token env var).
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
 // B1: register the baseline-image resolver capability as a derived view of
@@ -416,7 +419,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         {
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: multipass, multipass-remote, bubblewrap, process " +
+                "Choose one of: multipass, multipass-remote, sprites, bubblewrap, process " +
                 "(see docs/sandbox-providers.md for trade-offs).");
         }
     }
@@ -436,8 +439,9 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             sp.GetService<ITimingStore>(),
             sp.GetService<ISandboxResourceUsageStore>()),
         "multipass-remote" => BuildMultipassRemote(sp, loggerFactory),
+        "sprites" => BuildSprites(sp, loggerFactory, startupLog),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, bubblewrap, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, sprites, bubblewrap, process"),
     };
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
@@ -598,6 +602,35 @@ static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, 
             VmNamePrefix = !string.IsNullOrWhiteSpace(cfg.VmNamePrefix) ? cfg.VmNamePrefix! : fromDefaults.VmNamePrefix,
         };
     }
+}
+
+static SpritesSandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory loggerFactory, ILogger startupLog)
+{
+    startupLog.LogInformation(
+        "Using sprites.dev sandbox provider; host mounts are staged through the Sprites API.");
+    return new SpritesSandboxProvider(
+        () =>
+        {
+            var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+            var cfg = live.Sprites ?? new SpritesSandboxConfig();
+            var defaults = new SpritesSandboxOptions();
+            return new SpritesSandboxOptions
+            {
+                ApiBaseUrl = !string.IsNullOrWhiteSpace(cfg.ApiBaseUrl) ? cfg.ApiBaseUrl : defaults.ApiBaseUrl,
+                TokenEnvironmentVariable = !string.IsNullOrWhiteSpace(cfg.TokenEnvironmentVariable)
+                    ? cfg.TokenEnvironmentVariable
+                    : defaults.TokenEnvironmentVariable,
+                NamePrefix = !string.IsNullOrWhiteSpace(cfg.NamePrefix) ? cfg.NamePrefix : defaults.NamePrefix,
+                WaitForCapacity = cfg.WaitForCapacity,
+                UrlAuth = !string.IsNullOrWhiteSpace(cfg.UrlAuth) ? cfg.UrlAuth : defaults.UrlAuth,
+                MaxListPages = cfg.MaxListPages > 0 ? cfg.MaxListPages : defaults.MaxListPages,
+                NetworkProfiles = cfg.NetworkProfiles ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+                DefaultCpuCount = cfg.DefaultCpuCount,
+                DefaultMemoryBytes = cfg.DefaultMemoryBytes,
+                Region = cfg.Region,
+            };
+        },
+        loggerFactory.CreateLogger<SpritesSandboxProvider>());
 }
 
 static void LogDiskGuardBanner(IDiskGuardedSandboxProvider provider, ILogger startupLog)
@@ -3608,6 +3641,44 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
+    /// Configuration for <c>CodeyBox:SandboxProvider=sprites</c>. The Sprites
+    /// rc30 create API accepts only name, capacity wait, and URL auth settings;
+    /// CPU/RAM/region values are retained as explicit no-op operator hints.
+    /// </summary>
+    public sealed class SpritesSandboxConfig
+    {
+        /// <summary>Sprites REST/WebSocket API base URL. Default <c>https://api.sprites.dev</c>.</summary>
+        public string ApiBaseUrl { get; set; } = "https://api.sprites.dev";
+
+        /// <summary>Environment variable read for the bearer token. Default <c>SPRITES_TOKEN</c>.</summary>
+        public string TokenEnvironmentVariable { get; set; } = "SPRITES_TOKEN";
+
+        /// <summary>Managed sprite name prefix. Must remain <c>codeybox-</c>-compatible for leak reaping.</summary>
+        public string NamePrefix { get; set; } = SpritesSandboxProvider.DefaultNamePrefix;
+
+        /// <summary>Whether create should wait for capacity before returning.</summary>
+        public bool WaitForCapacity { get; set; }
+
+        /// <summary>URL auth setting sent on create. Sprites supports <c>sprite</c> and <c>public</c>.</summary>
+        public string UrlAuth { get; set; } = "sprite";
+
+        /// <summary>Safety ceiling for paged list calls during leak reaping.</summary>
+        public int MaxListPages { get; set; } = 100;
+
+        /// <summary>Sprites egress allow-list domains keyed by CodeyBox network profile name.</summary>
+        public Dictionary<string, List<string>> NetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Operator hint only; Sprites rc30 has no create-time CPU field.</summary>
+        public int? DefaultCpuCount { get; set; }
+
+        /// <summary>Operator hint only; Sprites rc30 has no create-time RAM field.</summary>
+        public long? DefaultMemoryBytes { get; set; }
+
+        /// <summary>Operator hint only; Sprites rc30 has no create-time region field.</summary>
+        public string? Region { get; set; }
+    }
+
+    /// <summary>
     /// Top-level options bag bound from the <c>CodeyBox</c> configuration
     /// section. See <c>docs/configuration.md</c> for the full hot-reload
     /// contract per field. Summary of the rule of thumb consumers should
@@ -3835,6 +3906,12 @@ namespace CodeyBox.Api
         /// only consumed when that provider is selected.
         /// </summary>
         public MultipassRemoteSandboxConfig? MultipassRemoteSandbox { get; set; }
+
+        /// <summary>
+        /// Configuration for <c>SandboxProvider=sprites</c>. Optional; provider
+        /// defaults to the public sprites.dev API and <c>SPRITES_TOKEN</c>.
+        /// </summary>
+        public SpritesSandboxConfig? Sprites { get; set; }
 
         /// <summary>
         /// Maps logical network-profile names → host bridge names. Operators

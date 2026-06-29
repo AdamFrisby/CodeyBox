@@ -28,6 +28,7 @@
     <Project Path="src/CodeyBox.Sandbox.Multipass/CodeyBox.Sandbox.Multipass.csproj" />
     <Project Path="src/CodeyBox.Sandbox.MultipassRemote/CodeyBox.Sandbox.MultipassRemote.csproj" />
     <Project Path="src/CodeyBox.Sandbox.Process/CodeyBox.Sandbox.Process.csproj" />
+    <Project Path="src/CodeyBox.Sandbox.Sprites/CodeyBox.Sandbox.Sprites.csproj" />
     <Project Path="src/CodeyBox.Sandbox/CodeyBox.Sandbox.csproj" />
     <Project Path="src/CodeyBox.Upstream.GitHub/CodeyBox.Upstream.GitHub.csproj" />
     <Project Path="src/CodeyBox.Upstream/CodeyBox.Upstream.csproj" />
