@@ -1724,7 +1724,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var skipWork = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
             || resumingConflictRework
             || (resumingPreempt && entry is WorkItemState.Reworking);
-        var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged
+        var skipAudit = entry is WorkItemState.Merged
             || resumingConflictRework;
         var skipMerge = entry is WorkItemState.Merged;
         var planningEnabledAtEntry = ShouldUsePlanningPhase(item, project);
@@ -2025,6 +2025,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // findings (format, lint, build-WaE).
             var auditors = _auditorComposer.Compose(project, agentRunner);
             AuditLog.AuditProfileSelected(project.Audit.Profile, auditors.Select(a => a.Name).ToArray());
+            var currentRunAuditPass = skipMerge || resumingConflictRework;
 
             // Snapshot the self-review-checklist gate once per pickup so the
             // work prompt, the audit-iteration tag, and the audit-log event
@@ -2185,7 +2186,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // the loop exits at iteration 1 because empty scheduled auditors
             // produce zero findings and zero blocking findings.
             var mechanicalFixersConfigured = project.Audit.MechanicalFixers.Count > 0;
-            if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies || mechanicalFixersConfigured))
+            var auditGateConfigured = auditors.Count > 0 || requiredBuildApplies || mechanicalFixersConfigured;
+            if (!skipAudit && auditGateConfigured)
             {
                 var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, selfReviewChecklistEnabled, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
@@ -2195,15 +2197,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     item = item with { PreemptedAt = null, PreemptCheckpoint = null };
                 }
                 await Transition(item, WorkItemState.AuditPassed, ct, project);
+                currentRunAuditPass = true;
             }
             else if (resumingPreempt)
             {
                 await ClearPreemptAsync(item, ct);
                 item = item with { PreemptedAt = null, PreemptCheckpoint = null };
             }
+            else if (!skipAudit)
+            {
+                currentRunAuditPass = true;
+            }
 
             // -------- Phase 1.5b: AuditPassed-resume build gate --------
-            // skipAudit=true items entered from AuditPassed/Merged (retry or
+            // skipAudit=true items entered from Merged (retry or
             // resume past the audit phase). The audit loop is skipped, so the
             // required-build gate above never runs for them. Re-verify the
             // build here before any merge work: a branch that reached
@@ -2235,6 +2242,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // verdict. Refresh the in-memory snapshot so the downstream merge / PR
                 // open phases see the updated ReCheckVerdicts list.
                 item = await _store.GetAsync(item.Id, ct) ?? item;
+            }
+
+            if (!skipMerge)
+            {
+                await EnsureCurrentRealAuditPassBeforeMergeAsync(
+                    item,
+                    auditGateConfigured,
+                    currentRunAuditPass,
+                    ct);
             }
 
             // Open PR record (local metadata) AFTER the audit converges.
@@ -7176,6 +7192,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
         var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, currentWorkAttemptStartedAt, ct);
+        if (priorAuditHistory is [.., var latestPrior] && !AuditProgressRequiresRework(latestPrior))
+        {
+            _log.LogInformation(
+                "Ignoring persisted passing audit iteration {Iteration} for work item {Id}; merge requires a fresh audit pass in this pickup",
+                latestPrior.Iteration,
+                item.Id);
+            priorAuditHistory = [];
+        }
         var configuredMaxIterations = ResolveConfiguredAuditMaxIterations(item, project);
         var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
         var incompleteFinalReworkExtensionUsed = HasIncompleteFinalReworkExtension(
@@ -7864,6 +7888,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
             completedAuditors);
     }
 
+    private static AuditProgressSnapshot ToAuditProgressSnapshot(AuditProgressRecord record)
+        => new(
+            record.Iteration,
+            record.MaxIterations,
+            record.BlockingFindings,
+            record.NonBlockingFindings,
+            record.BlockingFindingIds,
+            record.BlockingFindingsDetails,
+            record.Findings,
+            record.WorkBranchTip,
+            record.Status,
+            record.ScheduledAuditors,
+            record.CompletedAuditors);
+
     private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
         => BuildAuditProgressSignals(history).Count > 0;
 
@@ -7897,20 +7935,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         var snapshots = records
-            .Where(r => r.Iteration > 0)
+            .Select((Record, Index) => (Record, Index))
+            .Where(r => r.Record.Iteration > 0)
+            .GroupBy(r => r.Record.Iteration)
+            .Select(g => g.OrderByDescending(r => r.Index).First().Record)
             .OrderBy(r => r.Iteration)
-            .Select(r => new AuditProgressSnapshot(
-                r.Iteration,
-                r.MaxIterations,
-                r.BlockingFindings,
-                r.NonBlockingFindings,
-                r.BlockingFindingIds,
-                r.BlockingFindingsDetails,
-                r.Findings,
-                r.WorkBranchTip,
-                r.Status,
-                r.ScheduledAuditors,
-                r.CompletedAuditors))
+            .Select(ToAuditProgressSnapshot)
             .ToList();
 
         if (snapshots is [.., { IsComplete: false, Findings.Count: 0 }])
@@ -7956,6 +7986,125 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 $"failed to persist durable audit progress for work item {item.Id}; retry cannot safely continue without prior audit trajectory",
                 ex);
         }
+    }
+
+    private async Task EnsureCurrentRealAuditPassBeforeMergeAsync(
+        WorkItem item,
+        bool auditGateConfigured,
+        bool currentRunAuditPass,
+        CancellationToken ct)
+    {
+        if (!auditGateConfigured)
+            return;
+
+        if (!currentRunAuditPass)
+        {
+            throw new AuditUnavailableException(
+                $"work item {item.Id} cannot merge because no audit pass was produced in this pipeline pickup");
+        }
+
+        if (_auditProgress is null)
+            return;
+
+        var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
+        IReadOnlyList<AuditProgressRecord> records;
+        try
+        {
+            records = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new AuditHistoryLoadFailedException(
+                $"failed to load latest audit progress for merge gate on work item {item.Id}",
+                ex);
+        }
+
+        var latest = records
+            .Select((Record, Index) => (Record, Index))
+            .Where(r => r.Record.Iteration > 0)
+            .OrderByDescending(r => r.Record.Iteration)
+            .ThenByDescending(r => r.Index)
+            .Select(r => r.Record)
+            .FirstOrDefault();
+        if (latest is null)
+        {
+            throw new AuditUnavailableException(
+                $"work item {item.Id} cannot merge because no completed audit progress record exists for this pickup");
+        }
+
+        if (!AuditProgressStatuses.IsComplete(latest.Status))
+        {
+            throw new AuditUnavailableException(
+                $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} is {latest.Status}");
+        }
+
+        if (latest.BlockingFindings > 0)
+        {
+            throw new AuditUnavailableException(
+                $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} still has {latest.BlockingFindings} blocking finding(s)");
+        }
+
+        var missingAuditors = MissingCompletedAuditors(latest.ScheduledAuditors, latest.CompletedAuditors);
+        if (missingAuditors.Count > 0)
+        {
+            throw new AuditUnavailableException(
+                $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} did not complete auditor(s): {string.Join(", ", missingAuditors)}");
+        }
+
+        if (HasLlmAgentExecutionFailureSentinel(latest.Findings, f => f.Title))
+        {
+            throw new AuditUnavailableException(
+                $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} contains review-agent infrastructure failure results");
+        }
+
+        if (await LatestAuditReportIterationHasLlmAgentExecutionFailureAsync(item.Id, latest.Iteration, ct))
+        {
+            throw new AuditUnavailableException(
+                $"work item {item.Id} cannot merge because latest audit report iteration {latest.Iteration} contains review-agent infrastructure failure results");
+        }
+    }
+
+    private static IReadOnlyList<string> MissingCompletedAuditors(
+        IReadOnlyList<string>? scheduledAuditors,
+        IReadOnlyList<string>? completedAuditors)
+    {
+        if (scheduledAuditors is null || scheduledAuditors.Count == 0)
+            return [];
+
+        var completed = new HashSet<string>(completedAuditors ?? [], StringComparer.Ordinal);
+        return scheduledAuditors
+            .Where(a => !completed.Contains(a))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private async Task<bool> LatestAuditReportIterationHasLlmAgentExecutionFailureAsync(
+        WorkItemId workItemId,
+        int iteration,
+        CancellationToken ct)
+    {
+        if (_auditReports is null)
+            return false;
+
+        IReadOnlyList<AuditReport> reports;
+        try
+        {
+            reports = await _auditReports.GetByWorkItemAsync(workItemId.ToString(), ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Failed to load diagnostic audit reports for merge gate on work item {WorkItemId}; relying on durable audit progress",
+                workItemId);
+            return false;
+        }
+
+        return reports
+            .Where(r => r.Iteration == iteration)
+            .GroupBy(r => r.AuditorName, StringComparer.Ordinal)
+            .Select(g => g.OrderByDescending(r => r.StartedAt).First())
+            .Any(r => HasLlmAgentExecutionFailureSentinel(r.Findings, f => f.Title));
     }
 
     private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(
@@ -10062,8 +10211,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private static bool IsLlmAgentExecutionFailure(AuditResult result) =>
         !result.Passed
         && result.AgentSummary is not null
-        && result.Findings.Any(f =>
-            string.Equals(f.Title, "review agent failed to run", StringComparison.OrdinalIgnoreCase));
+        && HasLlmAgentExecutionFailureSentinel(result.Findings, f => f.Title);
+
+    private static bool HasLlmAgentExecutionFailureSentinel<T>(
+        IEnumerable<T> findings,
+        Func<T, string> titleSelector) =>
+        findings.Any(f =>
+            string.Equals(titleSelector(f), "review agent failed to run", StringComparison.OrdinalIgnoreCase));
 
     private sealed record AuditorRunRecord(
         IAuditor Auditor,

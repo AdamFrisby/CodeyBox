@@ -1517,12 +1517,11 @@ public sealed class RequiredBuildGateTests : IDisposable
     [Fact]
     public async Task AuditPassedResume_CannotMerge_WhenRequiredBuildFails()
     {
-        // The retry-from-audit-passed path skips the audit loop. Without an
-        // explicit gate it would walk a non-compiling branch into merge.
-        // This test enters the pipeline at AuditPassed with a build-broken
-        // work branch and asserts the runner refuses to proceed: the item
-        // is demoted to AuditFailed citing the required build failure
-        // instead of advancing to Merging / Merged.
+        // A retry-from-audit-passed pickup must re-audit before merge. This
+        // test enters the pipeline at AuditPassed with a build-broken work
+        // branch and asserts the fresh audit gate refuses to proceed: the item
+        // is demoted to AuditFailed citing the required build failure instead
+        // of advancing to Merging / Merged.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddDotnetSolutionMarkerAsync(seed);
         var fakeDotnet = await CreateFakeDotnetAsync();
@@ -1543,7 +1542,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Contains("required build failed", final.LastError);
-        Assert.Contains("AuditPassed resume", final.LastError);
+        Assert.Contains("Audit did not pass", final.LastError);
         Assert.NotEqual(WorkItemState.Merging, final.State);
         Assert.NotEqual(WorkItemState.Merged, final.State);
         Assert.NotEqual(WorkItemState.Done, final.State);
