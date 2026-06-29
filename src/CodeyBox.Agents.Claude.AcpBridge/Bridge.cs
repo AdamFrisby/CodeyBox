@@ -892,6 +892,26 @@ internal sealed class Bridge : IAsyncDisposable
                 politeSent = NativeMethods.Kill(pid, SignalTerm) == 0;
             }
             catch { politeSent = false; }
+
+            if (!politeSent)
+            {
+                try
+                {
+                    using var killProc = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "kill",
+                        Arguments = $"-15 {pid}",
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    });
+                    if (killProc is not null)
+                    {
+                        killProc.WaitForExit();
+                        politeSent = killProc.ExitCode == 0;
+                    }
+                }
+                catch { }
+            }
         }
 
         if (politeSent)
