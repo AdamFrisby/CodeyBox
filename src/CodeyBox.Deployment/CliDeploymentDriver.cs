@@ -46,15 +46,17 @@ public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
                 ? c.Replace("{artifact}", quotedArtifact, StringComparison.Ordinal)
                 : $"{quotedArtifact} --version";
 
-        var result = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", invocation],
-            WorkingDirectory = context.WorkingDirectory,
-            ExtraEnvironment = recipe.Environment,
-        }, ct).ConfigureAwait(false);
+        var result = await RunDeploymentExecAsync(
+            sandbox,
+            recipe,
+            context,
+            "cli invocation",
+            ["sh", "-c", invocation],
+            recipe.Environment,
+            ct).ConfigureAwait(false);
         if (!result.Success)
             throw new InvalidOperationException(
-                $"cli invocation '{invocation}' exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
+                $"cli invocation '{Tail(invocation)}' exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
     }
 
     protected override DeploymentEndpoint BuildEndpoint(ISandbox sandbox, DeploymentRecipe recipe, DeploymentContext context)
@@ -65,6 +67,8 @@ public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["sandbox.id"] = sandbox.Id,
+                ["endpoint.scope"] = "sandbox-exec",
+                ["sandbox.path"] = recipe.ArtifactPath!,
             },
         };
 }

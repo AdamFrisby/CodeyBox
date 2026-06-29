@@ -17,11 +17,10 @@ namespace CodeyBox.Deployment;
 /// the normal path was interrupted before disposal could run.</para>
 ///
 /// <para>The provider's <see cref="ISandboxProvider.ListAllManagedAsync"/>
-/// surface lists EVERY codeybox-* sandbox — work-item phase VMs, suspended
-/// VMs, preempt-marked VMs, and deployment VMs alike — without a kind
-/// discriminator. To avoid destroying VMs the work pipeline intentionally
-/// preserved, this reaper honours the same skip-gates as
-/// <c>SandboxLeakReaper</c>:</para>
+/// surface lists every codeybox-* sandbox, so this reaper only considers
+/// records explicitly tagged <see cref="SandboxPurpose.Deployment"/>. Work,
+/// audit, merge, and session VMs are left to the general sandbox reaper. The
+/// deployment reaper still honours preserve skip-gates for deployment VMs:</para>
 /// <list type="bullet">
 ///   <item><b>HasPreemptMarker</b> — graceful-shutdown-preserved VMs are
 ///   exempt for <see cref="DeploymentLeakOptions.PreemptRetention"/>
@@ -33,10 +32,8 @@ namespace CodeyBox.Deployment;
 ///   wires this to the work-item store's SuspendedVmName index so the
 ///   startup resume handler can multipass-start them back to Running.</item>
 /// </list>
-/// <para>Running both reapers is safe because any sandbox this reaper
-/// disposes is also a SandboxLeakReaper orphan (same preserve gates, same
-/// LeakAgeThreshold floor). The two reapers converge on the same orphans;
-/// either one disposing is the correct outcome.</para>
+/// <para>Running both reapers is safe because each uses provider-reported
+/// ownership tags to operate on its own lifecycle class.</para>
 /// </summary>
 public sealed class DeploymentLeakReaper : BackgroundService
 {
@@ -95,6 +92,11 @@ public sealed class DeploymentLeakReaper : BackgroundService
     internal async Task RunSweepAsync(CancellationToken ct)
     {
         var opts = _optsAccessor();
+        if (!opts.Enabled)
+        {
+            _latestLeaks = [];
+            return;
+        }
         try
         {
             var managed = await _provider.ListAllManagedAsync(ct).ConfigureAwait(false);
@@ -110,6 +112,8 @@ public sealed class DeploymentLeakReaper : BackgroundService
             var leaks = new List<DeploymentLeakInfo>();
             foreach (var info in managed)
             {
+                if (info.Purpose != SandboxPurpose.Deployment) continue;
+
                 // Tracked-active: the current orchestrator process owns this
                 // sandbox via a live phase or active deployment handle. Never
                 // a leak.

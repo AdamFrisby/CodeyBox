@@ -282,6 +282,16 @@ public interface IDeploymentHandle : IAsyncDisposable
     /// so callers (auditors, periodic monitors) can re-verify mid-life.
     /// </summary>
     Task HealthCheckAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Executes a command inside the live deployment substrate. This is the
+    /// invocation channel for sandbox-scoped endpoints such as CLI binaries or
+    /// packaged library artifacts whose <see cref="DeploymentEndpoint.Path"/> is
+    /// meaningful inside the deployment sandbox rather than on the host file
+    /// system. Implementations that do not own an executable substrate should
+    /// throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
 }
 
 /// <summary>

@@ -19,6 +19,10 @@ public sealed class DeploymentManagerTests
             ImageReference = "ubuntu",
             BuildCommand = "dotnet pack",
             ArtifactPath = "/lib/out.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
         };
 
         var handle = await manager.StartAsync(
@@ -34,6 +38,25 @@ public sealed class DeploymentManagerTests
 
         await handle.DisposeAsync();
         Assert.Empty(manager.GetActive());
+    }
+
+    [Fact]
+    public async Task StartAsync_ValidatesRecipeBeforeDeploying()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var driver = new ValidationThrowingDriver();
+        var registry = new DeploymentDriverRegistry([driver]);
+        var manager = new DeploymentManager(registry);
+        var recipe = new DeploymentRecipe { Kind = driver.Kind, ImageReference = "x" };
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => manager.StartAsync(
+                recipe,
+                new DeploymentContext { SandboxProvider = provider },
+                CancellationToken.None));
+
+        Assert.True(driver.ValidateCalled);
+        Assert.False(driver.DeployCalled);
     }
 
     [Fact]
@@ -69,11 +92,50 @@ public sealed class DeploymentManagerTests
     }
 
     [Fact]
+    public void Registry_BlankKind_Throws()
+    {
+        Assert.Throws<InvalidOperationException>(() => new DeploymentDriverRegistry([new BlankKindDriver()]));
+    }
+
+    [Fact]
     public void Registry_TryGet_CaseInsensitiveLookup()
     {
         var driver = new WebAppDeploymentDriver();
         var registry = new DeploymentDriverRegistry([driver]);
         Assert.True(registry.TryGet("WEB-APP", out var resolved));
         Assert.Same(driver, resolved);
+    }
+
+    private sealed class ValidationThrowingDriver : IDeploymentDriver
+    {
+        public bool ValidateCalled { get; private set; }
+        public bool DeployCalled { get; private set; }
+        public string Kind => "validation-test";
+
+        public void ValidateRecipe(DeploymentRecipe recipe)
+        {
+            ValidateCalled = true;
+            throw new ArgumentException("invalid recipe", nameof(recipe));
+        }
+
+        public Task<IDeploymentHandle> DeployAsync(
+            DeploymentRecipe recipe,
+            DeploymentContext context,
+            CancellationToken ct = default)
+        {
+            DeployCalled = true;
+            throw new NotSupportedException();
+        }
+    }
+
+    private sealed class BlankKindDriver : IDeploymentDriver
+    {
+        public string Kind => " ";
+        public void ValidateRecipe(DeploymentRecipe recipe) { }
+        public Task<IDeploymentHandle> DeployAsync(
+            DeploymentRecipe recipe,
+            DeploymentContext context,
+            CancellationToken ct = default)
+            => throw new NotSupportedException();
     }
 }

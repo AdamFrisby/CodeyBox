@@ -1,0 +1,98 @@
+using CodeyBox.Api;
+using CodeyBox.Core;
+using CodeyBox.Deployment;
+using CodeyBox.Projects;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+
+namespace CodeyBox.Tests;
+
+public sealed class DeploymentProgramWiringTests
+{
+    [Fact]
+    public async Task ProgramRegistersDeploymentCompositionRoot()
+    {
+        using var factory = new DeploymentProgramWiringFactory();
+
+        var drivers = factory.Services.GetServices<IDeploymentDriver>()
+            .Select(d => d.Kind)
+            .OrderBy(k => k, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(
+            [DeploymentKinds.Cli, DeploymentKinds.Daemon, DeploymentKinds.Library, DeploymentKinds.WebApp],
+            drivers);
+
+        var registry = factory.Services.GetRequiredService<IDeploymentDriverRegistry>();
+        Assert.True(registry.TryGet(DeploymentKinds.WebApp, out _));
+        Assert.True(registry.TryGet(DeploymentKinds.Daemon, out _));
+        Assert.True(registry.TryGet(DeploymentKinds.Cli, out _));
+        Assert.True(registry.TryGet(DeploymentKinds.Library, out _));
+
+        Assert.IsType<DeploymentManager>(factory.Services.GetRequiredService<IDeploymentManager>());
+        Assert.IsType<DeploymentLeakReaper>(factory.Services.GetRequiredService<DeploymentLeakReaper>());
+        Assert.True(factory.HadDeploymentLeakReaperHostedRegistration);
+
+        var repo = factory.Services.GetRequiredService<IProjectRepository>();
+        Assert.IsType<ProjectRepository>(repo);
+        var project = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(project?.Deployment);
+        Assert.Equal(DeploymentKinds.WebApp, project!.Deployment!.Kind);
+    }
+
+    private sealed class DeploymentProgramWiringFactory : WebApplicationFactory<Program>
+    {
+        private readonly string _dbPath = Path.Combine(
+            Path.GetTempPath(), $"codeybox-deployment-wiring-{Guid.NewGuid():N}.db");
+
+        public bool HadDeploymentLeakReaperHostedRegistration { get; private set; }
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                var tmp = Path.GetTempPath();
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:StateDatabasePath"] = _dbPath,
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:Projects:0:Id"] = "alpha",
+                    ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/alpha.git",
+                    ["CodeyBox:Projects:0:Deployment:Kind"] = DeploymentKinds.WebApp,
+                    ["CodeyBox:Projects:0:Deployment:ImageReference"] = "ubuntu-22.04",
+                    ["CodeyBox:Projects:0:Deployment:RunCommand"] = "nohup ./server &",
+                    ["CodeyBox:Projects:0:Deployment:Ports:0"] = "8080",
+                    ["CodeyBox:Projects:0:Deployment:HealthEndpoint"] = "/healthz",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                HadDeploymentLeakReaperHostedRegistration =
+                    services.Any(sd => sd.ServiceType == typeof(DeploymentLeakReaper))
+                    && services.Any(sd => sd.ServiceType == typeof(IHostedService));
+
+                services.RemoveAll<IHostedService>();
+                services.RemoveAll<ISandboxProvider>();
+                services.AddSingleton<ISandboxProvider>(new FakeDeploymentSandboxProvider());
+            });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            base.Dispose(disposing);
+        }
+    }
+}

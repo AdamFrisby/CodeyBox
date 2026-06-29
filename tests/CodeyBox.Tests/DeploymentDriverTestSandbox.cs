@@ -35,8 +35,14 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
     /// <summary>Stable ordered list of every exec invocation across all created sandboxes.</summary>
     public List<string> ExecLog { get; } = new();
 
+    /// <summary>Stable ordered list of every full exec request across all created sandboxes.</summary>
+    public List<SandboxExec> ExecInvocations { get; } = new();
+
     /// <summary>Script of (commandPattern → result). First match wins.</summary>
     public List<ExecRule> ExecRules { get; } = new();
+
+    public string? HostAddress { get; set; } = "10.42.0.10";
+    public HashSet<string> DisposeThrowsFor { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Optional override for the synthetic <see cref="ManagedSandboxInfo"/>
@@ -53,7 +59,7 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
         if (_createThrows)
             throw new InvalidOperationException("Simulated provisioning failure.");
         lock (_specs) _specs.Add(spec);
-        var sb = new FakeDeploymentSandbox(this);
+        var sb = new FakeDeploymentSandbox(this, spec);
         lock (_created) _created.Add(sb);
         return Task.FromResult<ISandbox>(sb);
     }
@@ -70,7 +76,8 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
                         sb.Id,
                         sb.CreatedAt,
                         DiskBytes: null,
-                        IsTrackedActive: !sb.IsDisposed))
+                        IsTrackedActive: !sb.IsDisposed,
+                        Purpose: sb.Spec.Purpose))
                 .ToList();
         }
         return Task.FromResult(snapshot);
@@ -78,6 +85,8 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
 
     public Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
+        if (DisposeThrowsFor.Contains(name))
+            throw new InvalidOperationException($"Simulated dispose failure for {name}.");
         _disposedNames[name] = 0;
         lock (_created)
         {
@@ -87,13 +96,15 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
         return Task.CompletedTask;
     }
 
-    internal SandboxExecResult ResolveExec(string command)
+    internal async Task<SandboxExecResult> ResolveExecAsync(SandboxExec exec, CancellationToken ct)
     {
+        var command = string.Join(' ', exec.Argv);
         lock (ExecLog) ExecLog.Add(command);
+        lock (ExecInvocations) ExecInvocations.Add(exec);
         foreach (var rule in ExecRules)
         {
             if (rule.Matches(command))
-                return rule.Apply();
+                return await rule.ApplyAsync(ct).ConfigureAwait(false);
         }
         return new SandboxExecResult(0, string.Empty, string.Empty);
     }
@@ -110,50 +121,61 @@ internal sealed class ExecRule
     public string Substring { get; }
     private readonly Queue<SandboxExecResult> _results;
     private readonly SandboxExecResult? _finalLoop;
+    private readonly TimeSpan? _delay;
     public int InvocationCount { get; private set; }
 
-    public ExecRule(string substring, SandboxExecResult result)
+    public ExecRule(string substring, SandboxExecResult result, TimeSpan? delay = null)
     {
         Substring = substring;
         _results = new Queue<SandboxExecResult>();
         _finalLoop = result;
+        _delay = delay;
     }
 
-    public ExecRule(string substring, IEnumerable<SandboxExecResult> scripted, SandboxExecResult? finalLoop = null)
+    public ExecRule(
+        string substring,
+        IEnumerable<SandboxExecResult> scripted,
+        SandboxExecResult? finalLoop = null,
+        TimeSpan? delay = null)
     {
         Substring = substring;
         _results = new Queue<SandboxExecResult>(scripted);
         _finalLoop = finalLoop;
+        _delay = delay;
     }
 
     public bool Matches(string command) => command.Contains(Substring, StringComparison.Ordinal);
 
-    public SandboxExecResult Apply()
+    public async Task<SandboxExecResult> ApplyAsync(CancellationToken ct)
     {
         InvocationCount++;
+        if (_delay is { } delay)
+            await Task.Delay(delay, ct).ConfigureAwait(false);
         if (_results.Count > 0)
             return _results.Dequeue();
         return _finalLoop ?? new SandboxExecResult(0, string.Empty, string.Empty);
     }
 }
 
-internal sealed class FakeDeploymentSandbox : ISandbox
+internal sealed class FakeDeploymentSandbox : IRoutableSandbox
 {
     private readonly FakeDeploymentSandboxProvider _provider;
     public string Id { get; } = $"codeybox-{Guid.NewGuid():N}"[..23];
     public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
     public bool IsDisposed { get; private set; }
+    public SandboxSpec Spec { get; }
+    public string? HostAddress => _provider.HostAddress;
 
-    public FakeDeploymentSandbox(FakeDeploymentSandboxProvider provider)
+    public FakeDeploymentSandbox(FakeDeploymentSandboxProvider provider, SandboxSpec spec)
     {
         _provider = provider;
+        Spec = spec;
     }
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        var command = string.Join(' ', exec.Argv);
-        return Task.FromResult(_provider.ResolveExec(command));
+        return _provider.ResolveExecAsync(exec, ct);
     }
 
     public ValueTask DisposeAsync()

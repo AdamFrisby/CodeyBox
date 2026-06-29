@@ -48,15 +48,16 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         // server would block forever. The driver does NOT manage the daemonisation
         // itself; that is recipe-author territory (different stacks have different
         // conventions: systemd-via-spawn, nohup, npm pm2, …).
-        var result = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", recipe.RunCommand!],
-            WorkingDirectory = context.WorkingDirectory,
-            ExtraEnvironment = recipe.Environment,
-        }, ct).ConfigureAwait(false);
+        var result = await RunDeploymentExecAsync(
+            sandbox,
+            recipe,
+            context,
+            "web-app start",
+            ["sh", "-c", recipe.RunCommand!],
+            recipe.Environment,
+            ct).ConfigureAwait(false);
         if (!result.Success)
-            throw new InvalidOperationException(
-                $"web-app start command exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
+            throw DeploymentExecFailed("web-app start", result);
     }
 
     protected override async Task ProbeReadyAsync(
@@ -93,12 +94,14 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var result = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", probeCommand],
-                WorkingDirectory = context.WorkingDirectory,
-                ExtraEnvironment = recipe.Environment,
-            }, ct).ConfigureAwait(false);
+            var result = await RunDeploymentExecAsync(
+                sandbox,
+                recipe,
+                context,
+                "web-app readiness probe",
+                ["sh", "-c", probeCommand],
+                recipe.Environment,
+                ct).ConfigureAwait(false);
             if (result.Success)
                 return;
             await Task.Delay(interval, ct).ConfigureAwait(false);
@@ -111,22 +114,27 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         var scheme = recipe.Settings.TryGetValue(SettingsKeyScheme, out var s) && !string.IsNullOrWhiteSpace(s)
             ? s
             : "http";
-        var url = $"{scheme}://127.0.0.1:{port}";
+        var host = ResolveHostAddress(sandbox);
+        var url = host is null ? null : $"{scheme}://{host}:{port}";
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["sandbox.id"] = sandbox.Id,
+            ["endpoint.scope"] = host is null ? "sandbox-local" : "host-routable",
+            ["sandbox.local-url"] = $"{scheme}://127.0.0.1:{port}",
+            ["http.health-path"] = recipe.HealthEndpoint!,
+        };
+        AddServiceEndpointMetadata(metadata, sandbox, recipe, scheme);
         return new DeploymentEndpoint
         {
             Kind = DeploymentEndpointKind.Http,
             Url = url,
-            Host = "127.0.0.1",
+            Host = host,
             Port = port,
             // DeploymentEndpoint.Path is documented as a file-path slot for
             // artifact-bearing kinds. For HTTP deployments the health-probe
             // URL path is surfaced via Metadata instead so the file-path
             // semantic stays intact.
-            Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["sandbox.id"] = sandbox.Id,
-                ["http.health-path"] = recipe.HealthEndpoint!,
-            },
+            Metadata = metadata,
         };
     }
 }

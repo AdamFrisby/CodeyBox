@@ -198,7 +198,18 @@ public sealed record ManagedSandboxInfo(
     bool HasPreemptMarker = false,
     bool IsSuspendLifecycleOrFrozen = false,
     string? LifecycleProviderId = null,
-    string? HostId = null);
+    string? HostId = null,
+    SandboxPurpose Purpose = SandboxPurpose.WorkItem);
+
+/// <summary>
+/// Broad owner category for a sandbox. Providers persist this where possible
+/// so post-restart leak reapers only sweep sandboxes they own.
+/// </summary>
+public enum SandboxPurpose
+{
+    WorkItem = 0,
+    Deployment = 1,
+}
 
 public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>
 {
@@ -347,6 +358,17 @@ public interface IReleaseAdmissionOnHostLossSandbox : ISandbox
     /// </summary>
     bool ReleaseAdmissionAfterHostLoss { get; }
 }
+
+/// <summary>
+/// Optional capability for sandbox implementations that can expose an address
+/// reachable from the orchestrator host. Deployment drivers use this for
+/// caller-facing endpoints; sandbox-local loopback addresses stay internal.
+/// </summary>
+public interface IRoutableSandbox : ISandbox
+{
+    string? HostAddress { get; }
+}
+
 
 /// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider
@@ -1029,6 +1051,7 @@ public sealed class NullBaselineImageResolver : IBaselineImageResolver
 public sealed record SandboxSpec
 {
     public required string ImageReference { get; init; }
+    public SandboxPurpose Purpose { get; init; } = SandboxPurpose.WorkItem;
     public IReadOnlyList<SandboxMount> Mounts { get; init; } = [];
     public IReadOnlyDictionary<string, string> Environment { get; init; } = new Dictionary<string, string>();
     public SandboxResourceLimits Limits { get; init; } = SandboxResourceLimits.Default;

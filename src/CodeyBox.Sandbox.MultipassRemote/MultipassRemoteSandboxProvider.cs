@@ -80,6 +80,8 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// </summary>
 public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, ISandboxHostPoolSnapshot
 {
+    private const string PurposeMarkerFile = ".codeybox-purpose";
+
     private readonly Func<MultipassRemoteSandboxOptions> _optsAccessor;
     private readonly Func<MultipassRemoteSandboxOptions, IRemoteHostTransport> _transportFactory;
     private readonly ILogger<MultipassRemoteSandboxProvider> _log;
@@ -297,6 +299,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         // 1) Prepare the per-sandbox staging directory on the remote host.
         await EnsureRemoteStagingDirAsync(opts, transport, remoteSandboxRoot, ct).ConfigureAwait(false);
         await WriteRemoteCreatedAtAsync(opts, transport, remoteSandboxRoot, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
+        await WriteRemotePurposeMarkerAsync(opts, transport, remoteSandboxRoot, spec.Purpose, ct).ConfigureAwait(false);
 
         // 2) Stage each bind-mount source. Writable mounts get tracked so we
         //    can sync them back at dispose; tmpfs mounts get an empty remote
@@ -491,7 +494,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             try
             {
                 var createdAtByName = await ReadRemoteCreatedAtMetadataAsync(opts, transport, ct).ConfigureAwait(false);
-                AddManagedFromListJson(infos, opts, result.Stdout, createdAtByName);
+                var purposeByName = await ReadRemotePurposeMarkersAsync(opts, transport, ct).ConfigureAwait(false);
+                AddManagedFromListJson(infos, opts, result.Stdout, createdAtByName, purposeByName);
                 inventoriedHostIds.Add(opts.HostId);
             }
             catch (RemoteSshTransportException ex)
@@ -927,6 +931,70 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 "staging-metadata",
                 $"Failed to write remote sandbox metadata '{metadataPath}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
                 isHostRuntimeFailure: true);
+    }
+
+    private async Task WriteRemotePurposeMarkerAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string remoteSandboxRoot,
+        SandboxPurpose purpose,
+        CancellationToken ct)
+    {
+        var path = JoinRemote(remoteSandboxRoot, PurposeMarkerFile);
+        var cmd = $"printf %s {OpenSshCliTransport.QuoteShellWord(purpose.ToString())} > {OpenSshCliTransport.QuoteShellWord(path)}";
+        var r = await RunRemoteControlAsync(opts, transport, ["sh", "-c", cmd], ct).ConfigureAwait(false);
+        if (r.ExitCode != 0)
+            throw new RemoteHostProvisioningException(
+                opts.HostId,
+                "staging-purpose",
+                $"Failed to write remote sandbox purpose marker '{path}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
+    }
+
+    private async Task<IReadOnlyDictionary<string, SandboxPurpose>> ReadRemotePurposeMarkersAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        CancellationToken ct)
+    {
+        var root = OpenSshCliTransport.QuoteShellWord(opts.RemoteStagingRoot);
+        var script =
+            $"find {root} -mindepth 2 -maxdepth 2 -name {OpenSshCliTransport.QuoteShellWord(PurposeMarkerFile)} -type f -print 2>/dev/null " +
+            $"| while IFS= read -r f; do d=${{f%/{PurposeMarkerFile}}}; n=${{d##*/}}; printf '%s\\t' \"$n\"; head -n 1 \"$f\"; printf '\\n'; done || true";
+        ProcessRunResultLike result;
+        try
+        {
+            result = await RunRemoteInventoryAsync(opts, transport, ["sh", "-c", script], ct).ConfigureAwait(false);
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            MarkRuntimeUnhealthy(opts, ex);
+            throw;
+        }
+
+        if (result.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Remote sandbox purpose-marker scan on host {HostId} exited {ExitCode}: {Stderr}",
+                opts.HostId,
+                result.ExitCode,
+                TruncateForLog(result.Stderr));
+            return new Dictionary<string, SandboxPurpose>(StringComparer.Ordinal);
+        }
+
+        var purposes = new Dictionary<string, SandboxPurpose>(StringComparer.Ordinal);
+        using var reader = new StringReader(result.Stdout);
+        while (reader.ReadLine() is { } line)
+        {
+            var tab = line.IndexOf('\t');
+            if (tab <= 0 || tab == line.Length - 1)
+                continue;
+            var name = line[..tab];
+            var raw = line[(tab + 1)..].Trim();
+            if (Enum.TryParse<SandboxPurpose>(raw, ignoreCase: true, out var purpose))
+                purposes[name] = purpose;
+        }
+
+        return purposes;
     }
 
     private async Task ApplyVmEnvironmentAsync(
@@ -1458,7 +1526,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         List<ManagedSandboxInfo> infos,
         MultipassRemoteSandboxOptions opts,
         string json,
-        IReadOnlyDictionary<string, DateTimeOffset> createdAtByName)
+        IReadOnlyDictionary<string, DateTimeOffset> createdAtByName,
+        IReadOnlyDictionary<string, SandboxPurpose> purposeByName)
     {
         using var doc = JsonDocument.Parse(json);
         if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
@@ -1476,6 +1545,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             var state = entry.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null;
             var isSuspendOrFreezing = state is "Suspended" or "Suspending" or "Freezing";
             createdAtByName.TryGetValue(name, out var createdAt);
+            var purpose = purposeByName.TryGetValue(name, out var p) ? p : SandboxPurpose.WorkItem;
 
             infos.Add(new ManagedSandboxInfo(
                 Name: name,
@@ -1484,7 +1554,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 IsTrackedActive: isTrackedActive,
                 HasPreemptMarker: false,
                 IsSuspendLifecycleOrFrozen: isSuspendOrFreezing,
-                HostId: opts.HostId));
+                HostId: opts.HostId,
+                Purpose: purpose));
         }
     }
 

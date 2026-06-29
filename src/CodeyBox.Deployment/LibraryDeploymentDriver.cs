@@ -11,10 +11,9 @@ namespace CodeyBox.Deployment;
 /// inspect it.
 ///
 /// <para>The harness invocation comes from the recipe's
-/// <see cref="SettingsKeyHarnessCommand"/> setting. Without one the
-/// readiness check is a no-op: a successful build IS the deployment, and
-/// no consumer-side restore is exercised. Recipes that want to verify
-/// downstream restore must declare a harness command.</para>
+/// <see cref="SettingsKeyHarnessCommand"/> setting. It is mandatory: a
+/// build-only recipe does not prove package restore or downstream
+/// consumption and is rejected during validation.</para>
 /// </summary>
 public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
 {
@@ -30,6 +29,10 @@ public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
         base.ValidateRecipe(recipe);
         if (string.IsNullOrWhiteSpace(recipe.BuildCommand))
             throw new ArgumentException("DeploymentRecipe.BuildCommand is required for kind 'library' (it produces the package).", nameof(recipe));
+        if (string.IsNullOrWhiteSpace(recipe.ArtifactPath))
+            throw new ArgumentException("DeploymentRecipe.ArtifactPath is required for kind 'library'.", nameof(recipe));
+        if (!recipe.Settings.TryGetValue(SettingsKeyHarnessCommand, out var harness) || string.IsNullOrWhiteSpace(harness))
+            throw new ArgumentException("DeploymentRecipe.Settings['harness-command'] is required for kind 'library'.", nameof(recipe));
     }
 
     protected override async Task ProbeReadyAsync(
@@ -43,21 +46,20 @@ public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
         // in the produced package path. Recipes that need the unquoted form
         // can read ArtifactPath through Environment.
         var quotedArtifact = Shell.Quote(recipe.ArtifactPath);
-        var harness = recipe.Settings.TryGetValue(SettingsKeyHarnessCommand, out var h) && !string.IsNullOrWhiteSpace(h)
-            ? h.Replace("{artifact}", quotedArtifact, StringComparison.Ordinal)
-            : null;
-        if (harness is null)
-            return; // build succeeded; no harness configured.
+        var harness = recipe.Settings[SettingsKeyHarnessCommand]
+            .Replace("{artifact}", quotedArtifact, StringComparison.Ordinal);
 
-        var result = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", harness],
-            WorkingDirectory = context.WorkingDirectory,
-            ExtraEnvironment = recipe.Environment,
-        }, ct).ConfigureAwait(false);
+        var result = await RunDeploymentExecAsync(
+            sandbox,
+            recipe,
+            context,
+            "library harness",
+            ["sh", "-c", harness],
+            recipe.Environment,
+            ct).ConfigureAwait(false);
         if (!result.Success)
             throw new InvalidOperationException(
-                $"library harness '{harness}' exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
+                $"library harness '{Tail(harness)}' exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
     }
 
     protected override DeploymentEndpoint BuildEndpoint(ISandbox sandbox, DeploymentRecipe recipe, DeploymentContext context)
@@ -68,6 +70,8 @@ public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["sandbox.id"] = sandbox.Id,
+                ["endpoint.scope"] = "sandbox-artifact",
+                ["sandbox.path"] = recipe.ArtifactPath!,
             },
         };
 }

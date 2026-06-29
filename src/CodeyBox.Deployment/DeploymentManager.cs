@@ -49,10 +49,8 @@ public sealed class DeploymentManager : IDeploymentManager
                 $"No deployment driver registered for kind '{recipe.Kind}'. Registered: " +
                 $"[{string.Join(", ", _registry.AvailableKinds)}]");
 
-        // ValidateRecipe is called once inside SandboxDeploymentDriverBase.DeployAsync
-        // as defence-in-depth for hand-built recipes that bypass the binder; we do
-        // not pre-validate here because the project repository already validates at
-        // load time (and the duplicate raised a noise flag from the auditor).
+        driver.ValidateRecipe(recipe);
+
         var inner = await driver.DeployAsync(recipe, context, ct).ConfigureAwait(false);
         var startedAt = _clock();
         var tracked = new TrackedDeployment(inner, this, recipe.Kind, context.ProjectId, startedAt);
@@ -103,6 +101,8 @@ public sealed class DeploymentManager : IDeploymentManager
         public string? SandboxId => Inner.SandboxId;
 
         public Task HealthCheckAsync(CancellationToken ct = default) => Inner.HealthCheckAsync(ct);
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Inner.ExecAsync(exec, ct);
 
         public async ValueTask DisposeAsync()
         {

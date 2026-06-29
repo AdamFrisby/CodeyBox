@@ -6,6 +6,12 @@ namespace CodeyBox.Tests;
 
 public sealed class DeploymentLeakReaperTests
 {
+    private static SandboxSpec DeploymentSpec() => new()
+    {
+        ImageReference = "x",
+        Purpose = SandboxPurpose.Deployment,
+    };
+
     private static DeploymentLeakOptions Opts(
         TimeSpan? leakAgeThreshold = null,
         bool autoDispose = true) => new()
@@ -21,7 +27,7 @@ public sealed class DeploymentLeakReaperTests
     public async Task ManagedSandbox_NotInActiveSet_AndOldEnough_IsDisposed()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         // Disposing the sandbox flips the fake's IsTrackedActive listing to false
         // (mapping the production semantic "no live phase owns this VM" to the
         // fake's "disposed" state — close enough for the reaper's filter logic).
@@ -39,6 +45,49 @@ public sealed class DeploymentLeakReaperTests
         Assert.Contains(s.Id, provider.DisposedNames);
     }
 
+    [Fact]
+    public async Task NonDeploymentSandbox_IsIgnored()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        await s.DisposeAsync();
+
+        var manager = new StubManager(active: []);
+        var clock = () => s.CreatedAt + TimeSpan.FromHours(2);
+        var reaper = new DeploymentLeakReaper(
+            provider, manager, () => Opts(), NullLogger<DeploymentLeakReaper>.Instance, clock);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task DisabledOptions_DoNotSweep()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        await s.DisposeAsync();
+
+        var manager = new StubManager(active: []);
+        var clock = () => s.CreatedAt + TimeSpan.FromHours(2);
+        var reaper = new DeploymentLeakReaper(
+            provider,
+            manager,
+            () =>
+            {
+                var opts = Opts();
+                opts.Enabled = false;
+                return opts;
+            },
+            NullLogger<DeploymentLeakReaper>.Instance,
+            clock);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
     /// <summary>
     /// Genuine orphan-from-crash scenario: the sandbox is undisposed (the
     /// orchestrator crashed before reaching DisposeAsync) but no live phase
@@ -50,12 +99,13 @@ public sealed class DeploymentLeakReaperTests
     public async Task UndisposedOrphan_FromPriorProcess_IsDisposed()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         // Override the fake's listing to report the production semantic
         // directly: IsTrackedActive=false (no live phase owner) while the
         // sandbox itself remains undisposed.
         provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
-            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false);
+            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
+            Purpose: sb.Spec.Purpose);
 
         var manager = new StubManager(active: []);
         var clock = () => s.CreatedAt + TimeSpan.FromHours(2);
@@ -74,7 +124,7 @@ public sealed class DeploymentLeakReaperTests
     public async Task ManagedSandbox_InActiveSet_NotReportedAsLeak()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         await s.DisposeAsync();  // No longer IsTrackedActive
 
         var info = new ActiveDeploymentInfo(
@@ -96,7 +146,7 @@ public sealed class DeploymentLeakReaperTests
     public async Task ManagedSandbox_YoungerThanThreshold_NotReportedAsLeak()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         await s.DisposeAsync();
 
         var manager = new StubManager(active: []);
@@ -112,7 +162,7 @@ public sealed class DeploymentLeakReaperTests
     public async Task AutoDisposeFalse_LeaksReportedButNotDisposed()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         await s.DisposeAsync();
 
         var manager = new StubManager(active: []);
@@ -136,11 +186,12 @@ public sealed class DeploymentLeakReaperTests
     public async Task SuspendedVmName_IsSkipped_EvenWhenOldAndOrphan()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         // Simulate the VM "stopped" (not tracked-active) while the work item's
         // SuspendedVmName still names it — orchestrator restart in progress.
         provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
-            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false);
+            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
+            Purpose: sb.Spec.Purpose);
 
         var manager = new StubManager(active: []);
         var clock = () => s.CreatedAt + TimeSpan.FromHours(2);
@@ -166,10 +217,11 @@ public sealed class DeploymentLeakReaperTests
     public async Task PreemptMarkedSandbox_NotReaped_WithinPreemptRetention()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
             sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
-            HasPreemptMarker: true);
+            HasPreemptMarker: true,
+            Purpose: sb.Spec.Purpose);
 
         var manager = new StubManager(active: []);
         var clock = () => s.CreatedAt + TimeSpan.FromHours(2);  // Past leak threshold but within 24h preempt retention
@@ -179,6 +231,26 @@ public sealed class DeploymentLeakReaperTests
         await reaper.RunSweepAsync(CancellationToken.None);
         Assert.Empty(reaper.GetLatestLeaks());
         Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task PreemptMarkedSandbox_ReapedAfterPreemptRetention()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
+            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
+            HasPreemptMarker: true,
+            Purpose: sb.Spec.Purpose);
+
+        var manager = new StubManager(active: []);
+        var clock = () => s.CreatedAt + TimeSpan.FromHours(26);
+        var reaper = new DeploymentLeakReaper(
+            provider, manager, () => Opts(), NullLogger<DeploymentLeakReaper>.Instance, clock);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Single(reaper.GetLatestLeaks());
+        Assert.Contains(s.Id, provider.DisposedNames);
     }
 
     /// <summary>
@@ -191,10 +263,11 @@ public sealed class DeploymentLeakReaperTests
     public async Task SuspendLifecycleSandbox_IsSkipped()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
             sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
-            HasPreemptMarker: false, IsSuspendLifecycleOrFrozen: true);
+            HasPreemptMarker: false, IsSuspendLifecycleOrFrozen: true,
+            Purpose: sb.Spec.Purpose);
 
         var manager = new StubManager(active: []);
         var clock = () => s.CreatedAt + TimeSpan.FromHours(2);
@@ -215,9 +288,10 @@ public sealed class DeploymentLeakReaperTests
     public async Task UnknownCreatedAt_IsSkipped()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        var s = (FakeDeploymentSandbox)await provider.CreateAsync(new SandboxSpec { ImageReference = "x" });
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
         provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
-            sb.Id, CreatedAt: null, DiskBytes: null, IsTrackedActive: false);
+            sb.Id, CreatedAt: null, DiskBytes: null, IsTrackedActive: false,
+            Purpose: sb.Spec.Purpose);
 
         var manager = new StubManager(active: []);
         var clock = () => s.CreatedAt + TimeSpan.FromHours(2);
@@ -227,6 +301,28 @@ public sealed class DeploymentLeakReaperTests
         await reaper.RunSweepAsync(CancellationToken.None);
         Assert.Empty(reaper.GetLatestLeaks());
         Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task DisposeFailure_DoesNotAbortSweep()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var first = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        var second = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        await first.DisposeAsync();
+        await second.DisposeAsync();
+        provider.DisposeThrowsFor.Add(first.Id);
+
+        var manager = new StubManager(active: []);
+        var clock = () => first.CreatedAt + TimeSpan.FromHours(2);
+        var reaper = new DeploymentLeakReaper(
+            provider, manager, () => Opts(), NullLogger<DeploymentLeakReaper>.Instance, clock);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(2, reaper.GetLatestLeaks().Count);
+        Assert.DoesNotContain(first.Id, provider.DisposedNames);
+        Assert.Contains(second.Id, provider.DisposedNames);
     }
 
     private sealed class StubManager : IDeploymentManager

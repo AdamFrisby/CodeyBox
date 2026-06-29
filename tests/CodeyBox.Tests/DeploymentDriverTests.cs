@@ -53,9 +53,12 @@ public sealed class DeploymentDriverTests
 
         Assert.True(handle.IsAlive);
         Assert.Equal(DeploymentEndpointKind.Http, handle.Endpoint.Kind);
-        Assert.Equal("http://127.0.0.1:8080", handle.Endpoint.Url);
+        Assert.Equal("http://10.42.0.10:8080", handle.Endpoint.Url);
+        Assert.Equal("10.42.0.10", handle.Endpoint.Host);
         Assert.Equal(8080, handle.Endpoint.Port);
         Assert.Null(handle.Endpoint.Path);
+        Assert.Equal("host-routable", handle.Endpoint.Metadata["endpoint.scope"]);
+        Assert.Equal("http://127.0.0.1:8080", handle.Endpoint.Metadata["sandbox.local-url"]);
         Assert.Equal("/healthz", handle.Endpoint.Metadata["http.health-path"]);
         Assert.Equal(DeploymentKinds.WebApp, handle.Kind);
         Assert.Single(provider.Created);
@@ -82,6 +85,108 @@ public sealed class DeploymentDriverTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
 
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task DeploymentExecs_SetOutputCaps()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "echo build",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.NotEmpty(provider.ExecInvocations);
+        Assert.All(provider.ExecInvocations, exec =>
+        {
+            Assert.True(exec.MaxStdoutBytes > 0);
+            Assert.True(exec.MaxStderrBytes > 0);
+            Assert.True(exec.KillOnOutputLimit);
+        });
+    }
+
+    [Fact]
+    public async Task DeploymentFailure_RedactsCommandOutput()
+    {
+        const string Token = "ghp_XYZabc789012345678901234567890";
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("leak-secret", new SandboxExecResult(1, "", $"Authorization: {Token}")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "leak-secret",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        Assert.DoesNotContain(Token, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("***", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WebApp_StartFails_TearsDownSubstrate()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("start-fail", new SandboxExecResult(42, "", "boom")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "start-fail",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task WebApp_StartRuntimeTimeout_TearsDownAndThrowsTimeout()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule(
+            "foreground-server",
+            new SandboxExecResult(0, "", ""),
+            delay: TimeSpan.FromSeconds(5)));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "foreground-server",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            StartupTimeout = TimeSpan.FromMilliseconds(50),
+        };
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
         Assert.Single(provider.Created);
         Assert.True(provider.Created[0].IsDisposed);
     }
@@ -125,6 +230,75 @@ public sealed class DeploymentDriverTests
             Ports = [80],
         };
         Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+    }
+
+    [Fact]
+    public async Task WebApp_CustomHealthProbeAndHttpsScheme_AreUsed()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("custom-probe", new SandboxExecResult(0, "", "")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8443],
+            HealthEndpoint = "/ready",
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyScheme] = "https",
+                [WebAppDeploymentDriver.SettingsKeyHealthProbeCommand] = "custom-probe {url}",
+            },
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Equal("https://10.42.0.10:8443", handle.Endpoint.Url);
+        Assert.Contains(provider.ExecLog, c => c.Contains("custom-probe 'https://127.0.0.1:8443/ready'", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task WebApp_StartsAndProbesBackingServicesBeforePrimary()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("postgres-start", new SandboxExecResult(0, "", "")));
+        provider.ExecRules.Add(new ExecRule("127.0.0.1:5432", new SandboxExecResult(0, "ok", "")));
+        provider.ExecRules.Add(new ExecRule("127.0.0.1:8080", new SandboxExecResult(0, "ok", "")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "postgres:16",
+                    RunCommand = "postgres-start",
+                    Ports = [5432],
+                    HealthEndpoint = "/ready",
+                },
+            ],
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        var serviceStart = provider.ExecLog.FindIndex(c => c.Contains("postgres-start", StringComparison.Ordinal));
+        var serviceProbe = provider.ExecLog.FindIndex(c => c.Contains("127.0.0.1:5432", StringComparison.Ordinal));
+        var appStart = provider.ExecLog.FindIndex(c => c.Contains("./server", StringComparison.Ordinal));
+        var appProbe = provider.ExecLog.FindIndex(c => c.Contains("127.0.0.1:8080", StringComparison.Ordinal));
+        Assert.True(serviceStart >= 0, "service start did not run");
+        Assert.True(serviceProbe > serviceStart, "service readiness probe did not run after service start");
+        Assert.True(appStart > serviceProbe, "primary app started before backing service became ready");
+        Assert.True(appProbe > appStart, "primary readiness probe did not run after primary start");
+        Assert.Equal("http://10.42.0.10:5432/ready", handle.Endpoint.Metadata["service.db.url"]);
     }
 
     // ── Daemon ──────────────────────────────────────────────────────────────
@@ -172,7 +346,33 @@ public sealed class DeploymentDriverTests
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Equal(DeploymentEndpointKind.Tcp, handle.Endpoint.Kind);
         Assert.Equal(5432, handle.Endpoint.Port);
-        Assert.Equal("127.0.0.1", handle.Endpoint.Host);
+        Assert.Equal("10.42.0.10", handle.Endpoint.Host);
+        Assert.Equal("host-routable", handle.Endpoint.Metadata["endpoint.scope"]);
+    }
+
+    [Fact]
+    public async Task Daemon_StartFails_TearsDownSubstrate()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("daemon-fail", new SandboxExecResult(2, "", "cannot start")));
+
+        var driver = new DaemonDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Daemon,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "daemon-fail",
+            Settings = new Dictionary<string, string>
+            {
+                [DaemonDeploymentDriver.SettingsKeyLivenessCommand] = "pgrep -f daemon",
+            },
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
     }
 
     [Fact]
@@ -208,6 +408,11 @@ public sealed class DeploymentDriverTests
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Equal(DeploymentEndpointKind.Cli, handle.Endpoint.Kind);
         Assert.Equal("/usr/local/bin/mytool", handle.Endpoint.Path);
+        var result = await handle.ExecAsync(new SandboxExec
+        {
+            Argv = [handle.Endpoint.Path!, "--version"],
+        });
+        Assert.True(result.Success);
     }
 
     [Fact]
@@ -244,10 +449,10 @@ public sealed class DeploymentDriverTests
     // ── Library ─────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Library_BuildSucceeds_NoHarness_ExposesArtifact()
+    public async Task Library_HarnessSucceeds_ExposesArtifact()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        // No exec rules: build returns success by default; readiness is no-op when no harness configured.
+        provider.ExecRules.Add(new ExecRule("consumer-harness", new SandboxExecResult(0, "ok", "")));
 
         var driver = new LibraryDeploymentDriver();
         var recipe = new DeploymentRecipe
@@ -256,11 +461,49 @@ public sealed class DeploymentDriverTests
             ImageReference = "ubuntu-22.04",
             BuildCommand = "dotnet pack",
             ArtifactPath = "./bin/mylib.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "consumer-harness {artifact}",
+            },
         };
 
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Equal(DeploymentEndpointKind.Library, handle.Endpoint.Kind);
         Assert.Equal("./bin/mylib.nupkg", handle.Endpoint.Path);
+        Assert.Equal("sandbox-artifact", handle.Endpoint.Metadata["endpoint.scope"]);
+    }
+
+    [Fact]
+    public void Library_RecipeWithoutHarness_FailsValidation()
+    {
+        var driver = new LibraryDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Library,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "dotnet pack",
+            ArtifactPath = "./bin/mylib.nupkg",
+        };
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("harness-command", ex.Message);
+    }
+
+    [Fact]
+    public void Library_RecipeWithoutArtifactPath_FailsValidation()
+    {
+        var driver = new LibraryDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Library,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "dotnet pack",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "consumer-harness",
+            },
+        };
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("ArtifactPath", ex.Message);
     }
 
     [Fact]
@@ -312,6 +555,10 @@ public sealed class DeploymentDriverTests
             ImageReference = "ubuntu-22.04",
             BuildCommand = "echo built",
             ArtifactPath = "/lib/out.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
         };
         var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
 
@@ -336,6 +583,10 @@ public sealed class DeploymentDriverTests
             ImageReference = "ubuntu-22.04",
             BuildCommand = "echo build",
             ArtifactPath = "/lib/out.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
         };
 
         await Assert.ThrowsAsync<InvalidOperationException>(
@@ -403,6 +654,34 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
+    public async Task HealthCheck_DefaultToken_TimesOutWhenUnhealthy()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("curl",
+            new[] { new SandboxExecResult(0, "200", "") },
+            finalLoop: new SandboxExecResult(7, "", "Connection refused")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [9000],
+            HealthEndpoint = "/health",
+            StartupTimeout = TimeSpan.FromMilliseconds(75),
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.01",
+            },
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        await Assert.ThrowsAsync<TimeoutException>(() => handle.HealthCheckAsync());
+    }
+
+    [Fact]
     public async Task HealthCheck_AfterDispose_ThrowsObjectDisposed()
     {
         var provider = new FakeDeploymentSandboxProvider();
@@ -413,6 +692,10 @@ public sealed class DeploymentDriverTests
             ImageReference = "ubuntu-22.04",
             BuildCommand = "echo build",
             ArtifactPath = "/lib/x.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
         };
         var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         await handle.DisposeAsync();
@@ -432,10 +715,15 @@ public sealed class DeploymentDriverTests
             ImageReference = "ubuntu-22.04",
             BuildCommand = "echo built",
             ArtifactPath = "/lib/x.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
             // NetworkProfile is null → BuildSandboxSpec must default to Denied
         };
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Single(provider.Specs);
+        Assert.Equal(SandboxPurpose.Deployment, provider.Specs[0].Purpose);
         Assert.Same(SandboxNetworkPolicy.Denied, provider.Specs[0].Network);
         Assert.Null(provider.Specs[0].Network.ProfileName);
     }
@@ -452,6 +740,10 @@ public sealed class DeploymentDriverTests
             BuildCommand = "echo built",
             ArtifactPath = "/lib/x.nupkg",
             NetworkProfile = "egress-restricted",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
         };
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Equal("egress-restricted", provider.Specs[0].Network.ProfileName);
@@ -469,6 +761,10 @@ public sealed class DeploymentDriverTests
             BuildCommand = "echo built",
             ArtifactPath = "/lib/x.nupkg",
             Environment = new Dictionary<string, string> { ["DOTNET_NOLOGO"] = "1" },
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
         };
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Equal("1", provider.Specs[0].Environment["DOTNET_NOLOGO"]);

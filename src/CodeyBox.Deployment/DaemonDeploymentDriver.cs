@@ -53,15 +53,16 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         DeploymentContext context,
         CancellationToken ct)
     {
-        var result = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", recipe.RunCommand!],
-            WorkingDirectory = context.WorkingDirectory,
-            ExtraEnvironment = recipe.Environment,
-        }, ct).ConfigureAwait(false);
+        var result = await RunDeploymentExecAsync(
+            sandbox,
+            recipe,
+            context,
+            "daemon start",
+            ["sh", "-c", recipe.RunCommand!],
+            recipe.Environment,
+            ct).ConfigureAwait(false);
         if (!result.Success)
-            throw new InvalidOperationException(
-                $"daemon start command exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
+            throw DeploymentExecFailed("daemon start", result);
     }
 
     protected override async Task ProbeReadyAsync(
@@ -98,12 +99,14 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var result = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = probeArgv,
-                WorkingDirectory = context.WorkingDirectory,
-                ExtraEnvironment = recipe.Environment,
-            }, ct).ConfigureAwait(false);
+            var result = await RunDeploymentExecAsync(
+                sandbox,
+                recipe,
+                context,
+                "daemon readiness probe",
+                probeArgv,
+                recipe.Environment,
+                ct).ConfigureAwait(false);
             if (result.Success)
                 return;
             await Task.Delay(interval, ct).ConfigureAwait(false);
@@ -116,17 +119,22 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         {
             ["sandbox.id"] = sandbox.Id,
         };
+        AddServiceEndpointMetadata(metadata, sandbox, recipe);
         if (recipe.Ports.Count > 0)
         {
             var port = recipe.Ports[0];
+            var host = ResolveHostAddress(sandbox);
+            metadata["endpoint.scope"] = host is null ? "sandbox-local" : "host-routable";
+            metadata["sandbox.local-endpoint"] = $"127.0.0.1:{port}";
             return new DeploymentEndpoint
             {
                 Kind = DeploymentEndpointKind.Tcp,
-                Host = "127.0.0.1",
+                Host = host,
                 Port = port,
                 Metadata = metadata,
             };
         }
+        metadata["endpoint.scope"] = "sandbox-process";
         return new DeploymentEndpoint
         {
             Kind = DeploymentEndpointKind.Process,

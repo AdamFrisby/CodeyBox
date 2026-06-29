@@ -24,6 +24,19 @@ public sealed class ProjectRepositoryDeploymentTests
         HealthEndpoint = "/healthz",
     };
 
+    private static ProjectsOptions OptionsWithDeployment(DeploymentRecipeConfig deployment) => new()
+    {
+        Projects =
+        [
+            new ProjectConfig
+            {
+                Id = "alpha",
+                RepositoryUrl = "https://example.com/x.git",
+                Deployment = deployment,
+            },
+        ],
+    };
+
     [Fact]
     public async Task NoRegistry_BindsRecipeWithoutDriverValidation()
     {
@@ -176,6 +189,53 @@ public sealed class ProjectRepositoryDeploymentTests
         Assert.Contains("failed driver validation", ex.Message, StringComparison.Ordinal);
         Assert.Contains("recipe is not consistent", ex.Message, StringComparison.Ordinal);
         Assert.IsType<InvalidOperationException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task HotReload_ValidDeploymentEdit_UpdatesSnapshot()
+    {
+        var registry = new DeploymentDriverRegistry([new WebAppDeploymentDriver()]);
+        var monitor = new TestProjectsOptionsMonitor(OptionsWithDeployment(WebAppRecipeCfg()));
+        using var repo = new ProjectRepository(
+            monitor,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            knobRegistry: null,
+            deploymentDrivers: registry);
+
+        var updated = WebAppRecipeCfg();
+        updated.Ports = [9090];
+        updated.HealthEndpoint = "/ready";
+
+        monitor.Push(OptionsWithDeployment(updated));
+
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(p?.Deployment);
+        Assert.Equal(new[] { 9090 }, p!.Deployment!.Ports);
+        Assert.Equal("/ready", p.Deployment.HealthEndpoint);
+    }
+
+    [Fact]
+    public async Task HotReload_InvalidDeploymentEdit_PreservesPreviousSnapshot()
+    {
+        var registry = new DeploymentDriverRegistry([new WebAppDeploymentDriver()]);
+        var monitor = new TestProjectsOptionsMonitor(OptionsWithDeployment(WebAppRecipeCfg()));
+        using var repo = new ProjectRepository(
+            monitor,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProjectRepository>.Instance,
+            presetCatalogOptions: null,
+            knobRegistry: null,
+            deploymentDrivers: registry);
+
+        var invalid = WebAppRecipeCfg();
+        invalid.Ports = [];
+
+        monitor.Push(OptionsWithDeployment(invalid));
+
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(p?.Deployment);
+        Assert.Equal(new[] { 8080 }, p!.Deployment!.Ports);
+        Assert.Equal("/healthz", p.Deployment.HealthEndpoint);
     }
 
     /// <summary>

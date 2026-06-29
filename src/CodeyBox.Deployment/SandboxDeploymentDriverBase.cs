@@ -23,6 +23,9 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     /// lines and dashboards.
     /// </summary>
     private const int DeploymentIdHexChars = 16;
+    private const int DeploymentExecOutputCaptureBytes = 256 * 1024;
+    private const int ErrorOutputTailChars = 2048;
+    private const string Localhost = "127.0.0.1";
 
     protected ILogger Log { get; }
     protected Func<DateTimeOffset> Clock { get; }
@@ -48,6 +51,25 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         {
             if (port is < 1 or > 65535)
                 throw new ArgumentException($"DeploymentRecipe.Ports contains invalid port {port}; must be 1..65535.", nameof(recipe));
+        }
+
+        foreach (var service in recipe.Services)
+        {
+            if (service is null)
+                throw new ArgumentException("DeploymentRecipe.Services cannot contain null entries.", nameof(recipe));
+            if (string.IsNullOrWhiteSpace(service.Name))
+                throw new ArgumentException("DeploymentRecipe.Services[].Name is required.", nameof(recipe));
+            if (string.IsNullOrWhiteSpace(service.ImageReference))
+                throw new ArgumentException($"DeploymentRecipe.Services['{service.Name}'].ImageReference is required.", nameof(recipe));
+            if (string.IsNullOrWhiteSpace(service.RunCommand))
+                throw new ArgumentException($"DeploymentRecipe.Services['{service.Name}'].RunCommand is required.", nameof(recipe));
+            if (service.Ports.Count == 0)
+                throw new ArgumentException($"DeploymentRecipe.Services['{service.Name}'].Ports must contain at least one port.", nameof(recipe));
+            foreach (var port in service.Ports)
+            {
+                if (port is < 1 or > 65535)
+                    throw new ArgumentException($"DeploymentRecipe.Services['{service.Name}'].Ports contains invalid port {port}; must be 1..65535.", nameof(recipe));
+            }
         }
     }
 
@@ -88,12 +110,14 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                 startupCts.CancelAfter(recipe.StartupTimeout);
                 try
                 {
+                    await StartServicesAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
+                    await ProbeServicesReadyAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
                     await StartRuntimeAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                 {
                     throw new TimeoutException(
-                        $"Deployment kind '{Kind}' StartRuntime did not return within {recipe.StartupTimeout}. " +
+                        $"Deployment kind '{Kind}' startup did not return within {recipe.StartupTimeout}. " +
                         "RunCommand likely runs the server in the foreground — sandbox.ExecAsync waits for the " +
                         "child process to exit, so the recipe must background the server (e.g. nohup ... &, exec, " +
                         "or a process supervisor) for StartRuntime to return. Tearing down substrate.");
@@ -146,6 +170,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     protected virtual SandboxSpec BuildSandboxSpec(DeploymentRecipe recipe, DeploymentContext context) => new()
     {
         ImageReference = recipe.ImageReference,
+        Purpose = SandboxPurpose.Deployment,
         Mounts = context.Mounts,
         Environment = recipe.Environment,
         Network = recipe.NetworkProfile is null
@@ -153,6 +178,75 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             : new SandboxNetworkPolicy { ProfileName = recipe.NetworkProfile },
         WorkingDirectory = context.WorkingDirectory,
     };
+
+    protected virtual async Task StartServicesAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        CancellationToken ct)
+    {
+        foreach (var service in recipe.Services)
+        {
+            var result = await RunDeploymentExecAsync(
+                sandbox,
+                recipe,
+                context,
+                $"service '{service.Name}' start",
+                ["sh", "-c", service.RunCommand!],
+                MergeEnvironment(recipe.Environment, service.Environment),
+                ct).ConfigureAwait(false);
+            if (!result.Success)
+                throw DeploymentExecFailed($"service '{service.Name}' start", result);
+        }
+    }
+
+    protected virtual async Task ProbeServicesReadyAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        CancellationToken ct)
+    {
+        foreach (var service in recipe.Services)
+            await ProbeServiceReadyAsync(sandbox, recipe, context, service, ct).ConfigureAwait(false);
+    }
+
+    private async Task ProbeServiceReadyAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        DeploymentService service,
+        CancellationToken ct)
+    {
+        var port = service.Ports[0];
+        string[] probeArgv;
+        if (!string.IsNullOrWhiteSpace(service.HealthEndpoint))
+        {
+            var path = service.HealthEndpoint!.StartsWith('/') ? service.HealthEndpoint : "/" + service.HealthEndpoint;
+            var probeUrl = $"http://{Localhost}:{port}{path}";
+            probeArgv = ["sh", "-c", $"curl -fsS -o /dev/null --max-time 5 {Shell.Quote(probeUrl)}"];
+        }
+        else
+        {
+            probeArgv = ["bash", "-c", $"exec 3<>/dev/tcp/{Localhost}/{port}"];
+        }
+
+        var interval = ResolveProbeInterval(recipe);
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var result = await RunDeploymentExecAsync(
+                sandbox,
+                recipe,
+                context,
+                $"service '{service.Name}' readiness probe",
+                probeArgv,
+                MergeEnvironment(recipe.Environment, service.Environment),
+                ct).ConfigureAwait(false);
+            if (result.Success)
+                return;
+            await Task.Delay(interval, ct).ConfigureAwait(false);
+        }
+    }
 
     protected virtual async Task RunBuildAsync(
         ISandbox sandbox,
@@ -162,15 +256,17 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     {
         if (string.IsNullOrWhiteSpace(recipe.BuildCommand))
             return;
-        var result = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", recipe.BuildCommand],
-            WorkingDirectory = context.WorkingDirectory,
-            ExtraEnvironment = recipe.Environment,
-        }, ct).ConfigureAwait(false);
+        var result = await RunDeploymentExecAsync(
+            sandbox,
+            recipe,
+            context,
+            "build",
+            ["sh", "-c", recipe.BuildCommand],
+            recipe.Environment,
+            ct,
+            recipe.MaxLifetime).ConfigureAwait(false);
         if (!result.Success)
-            throw new InvalidOperationException(
-                $"Deployment kind '{Kind}' build step exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
+            throw DeploymentExecFailed("build", result);
     }
 
     /// <summary>
@@ -198,20 +294,128 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
 
     /// <summary>
     /// Hook for the runtime <see cref="IDeploymentHandle.HealthCheckAsync"/>.
-    /// Default re-runs the readiness probe with no startup deadline (callers
-    /// supply their own cancellation/timeout).
+    /// Default re-runs backing-service probes and the primary readiness probe
+    /// under the recipe's startup timeout, unless the caller cancels first.
     /// </summary>
-    protected virtual Task RunHealthCheckAsync(
+    protected virtual async Task RunHealthCheckAsync(
         ISandbox sandbox,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
-        => ProbeReadyAsync(sandbox, recipe, context, ct);
+    {
+        using var healthCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        healthCts.CancelAfter(recipe.StartupTimeout);
+        try
+        {
+            await ProbeServicesReadyAsync(sandbox, recipe, context, healthCts.Token).ConfigureAwait(false);
+            await ProbeReadyAsync(sandbox, recipe, context, healthCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"Deployment kind '{Kind}' health check did not complete within {recipe.StartupTimeout}.");
+        }
+    }
+
+    protected async Task<SandboxExecResult> RunDeploymentExecAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        string stage,
+        IReadOnlyList<string> argv,
+        IReadOnlyDictionary<string, string>? environment,
+        CancellationToken ct,
+        TimeSpan? timeout = null)
+    {
+        var effectiveTimeout = timeout ?? recipe.StartupTimeout;
+        using var execCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        execCts.CancelAfter(effectiveTimeout);
+        try
+        {
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = context.WorkingDirectory,
+                ExtraEnvironment = environment,
+                MaxStdoutBytes = DeploymentExecOutputCaptureBytes,
+                MaxStderrBytes = DeploymentExecOutputCaptureBytes,
+                KillOnOutputLimit = true,
+            }, execCts.Token).ConfigureAwait(false);
+            if (result.OutputLimitExceeded)
+            {
+                throw new InvalidOperationException(
+                    $"Deployment kind '{Kind}' {stage} exceeded the {DeploymentExecOutputCaptureBytes} byte output capture limit; " +
+                    $"stdout tail: {Tail(result.Stdout)}; stderr tail: {Tail(result.Stderr)}");
+            }
+            return result;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"Deployment kind '{Kind}' {stage} command did not finish within {effectiveTimeout}.");
+        }
+    }
+
+    protected InvalidOperationException DeploymentExecFailed(string stage, SandboxExecResult result)
+        => new(
+            $"Deployment kind '{Kind}' {stage} command exited {result.ExitCode}; " +
+            $"stdout tail: {Tail(result.Stdout)}; stderr tail: {Tail(result.Stderr)}");
+
+    protected static IReadOnlyDictionary<string, string> MergeEnvironment(
+        IReadOnlyDictionary<string, string> primary,
+        IReadOnlyDictionary<string, string> overlay)
+    {
+        if (overlay.Count == 0)
+            return primary;
+        var merged = new Dictionary<string, string>(primary, StringComparer.Ordinal);
+        foreach (var (key, value) in overlay)
+            merged[key] = value;
+        return merged;
+    }
+
+    protected static TimeSpan ResolveProbeInterval(DeploymentRecipe recipe)
+    {
+        if (recipe.Settings.TryGetValue("probe-interval-seconds", out var iv)
+            && double.TryParse(iv, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
+            && seconds > 0)
+        {
+            return TimeSpan.FromSeconds(Math.Min(seconds, 60));
+        }
+        return TimeSpan.FromSeconds(1);
+    }
+
+    protected static string? ResolveHostAddress(ISandbox sandbox)
+        => sandbox is IRoutableSandbox { HostAddress: { } host } && !string.IsNullOrWhiteSpace(host)
+            ? host
+            : null;
+
+    protected static void AddServiceEndpointMetadata(
+        IDictionary<string, string> metadata,
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        string scheme = "http")
+    {
+        var host = ResolveHostAddress(sandbox);
+        foreach (var service in recipe.Services)
+        {
+            if (service.Ports.Count == 0)
+                continue;
+            var port = service.Ports[0];
+            var path = string.IsNullOrWhiteSpace(service.HealthEndpoint)
+                ? string.Empty
+                : service.HealthEndpoint!.StartsWith('/') ? service.HealthEndpoint : "/" + service.HealthEndpoint;
+            metadata[$"service.{service.Name}.sandbox-local-url"] = $"{scheme}://{Localhost}:{port}{path}";
+            if (host is not null)
+                metadata[$"service.{service.Name}.url"] = $"{scheme}://{host}:{port}{path}";
+        }
+    }
 
     protected static string Tail(string? text, int maxChars = 256)
     {
         if (string.IsNullOrEmpty(text)) return string.Empty;
-        return text.Length <= maxChars ? text : text[^maxChars..];
+        var redacted = RawOutputRedactor.Redact(text);
+        maxChars = Math.Min(maxChars, ErrorOutputTailChars);
+        return redacted.Length <= maxChars ? redacted : redacted[^maxChars..];
     }
 }
 
@@ -252,6 +456,13 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
         if (!IsAlive)
             throw new ObjectDisposedException(nameof(SandboxDeploymentHandle));
         return _healthCheck(ct);
+    }
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+    {
+        if (!IsAlive)
+            throw new ObjectDisposedException(nameof(SandboxDeploymentHandle));
+        return Sandbox.ExecAsync(exec, ct);
     }
 
     public async ValueTask DisposeAsync()

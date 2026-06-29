@@ -67,7 +67,7 @@ public static class DeploymentRecipeBinder
     {
         if (!seconds.HasValue) return fallback;
         if (double.IsNaN(seconds.Value) || double.IsInfinity(seconds.Value) || seconds.Value <= 0)
-            return fallback;
+            throw new InvalidOperationException("DeploymentRecipe.StartupTimeoutSeconds must be a positive finite number.");
         return TimeSpan.FromSeconds(seconds.Value);
     }
 
@@ -75,7 +75,7 @@ public static class DeploymentRecipeBinder
     {
         if (!minutes.HasValue) return fallback;
         if (double.IsNaN(minutes.Value) || double.IsInfinity(minutes.Value) || minutes.Value <= 0)
-            return fallback;
+            throw new InvalidOperationException("DeploymentRecipe.MaxLifetimeMinutes must be a positive finite number.");
         return TimeSpan.FromMinutes(minutes.Value);
     }
 }

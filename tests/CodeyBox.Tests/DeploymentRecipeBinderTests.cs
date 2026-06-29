@@ -98,7 +98,7 @@ public sealed class DeploymentRecipeBinderTests
     [InlineData(double.PositiveInfinity)]
     [InlineData(0.0)]
     [InlineData(-1.0)]
-    public void ToRecipe_BadStartupTimeoutSeconds_FallsBackToDefault(double bad)
+    public void ToRecipe_BadStartupTimeoutSeconds_Throws(double bad)
     {
         var cfg = new DeploymentRecipeConfig
         {
@@ -107,15 +107,16 @@ public sealed class DeploymentRecipeBinderTests
             ArtifactPath = "/y",
             StartupTimeoutSeconds = bad,
         };
-        var recipe = DeploymentRecipeBinder.ToRecipe(cfg)!;
-        Assert.Equal(TimeSpan.FromMinutes(5), recipe.StartupTimeout);
+        var ex = Assert.Throws<InvalidOperationException>(() => DeploymentRecipeBinder.ToRecipe(cfg));
+        Assert.Contains("StartupTimeoutSeconds", ex.Message);
     }
 
     [Theory]
     [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
     [InlineData(0.0)]
     [InlineData(-1.0)]
-    public void ToRecipe_BadMaxLifetimeMinutes_FallsBackToDefault(double bad)
+    public void ToRecipe_BadMaxLifetimeMinutes_Throws(double bad)
     {
         var cfg = new DeploymentRecipeConfig
         {
@@ -124,8 +125,8 @@ public sealed class DeploymentRecipeBinderTests
             ArtifactPath = "/y",
             MaxLifetimeMinutes = bad,
         };
-        var recipe = DeploymentRecipeBinder.ToRecipe(cfg)!;
-        Assert.Equal(TimeSpan.FromMinutes(60), recipe.MaxLifetime);
+        var ex = Assert.Throws<InvalidOperationException>(() => DeploymentRecipeBinder.ToRecipe(cfg));
+        Assert.Contains("MaxLifetimeMinutes", ex.Message);
     }
 
     [Fact]

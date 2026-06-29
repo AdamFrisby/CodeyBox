@@ -17,11 +17,9 @@ public sealed class DeploymentDriverRegistry : IDeploymentDriverRegistry
     public DeploymentDriverRegistry(IEnumerable<IDeploymentDriver> drivers)
     {
         ArgumentNullException.ThrowIfNull(drivers);
-        // OrdinalIgnoreCase mirrors the case-insensitive JSON config binder so
-        // recipe authors who write "Kind": "Web-App" or "WebApp" still resolve
-        // to the canonical driver Kind. The driver's own Kind string is the
-        // dictionary key, so duplicate-Kind detection treats case-equivalent
-        // strings as duplicates.
+        // OrdinalIgnoreCase mirrors the case-insensitive JSON config binder.
+        // Punctuation is still significant: "WEB-APP" resolves to the
+        // canonical "web-app" driver, but "WebApp" does not.
         _byKind = new Dictionary<string, IDeploymentDriver>(StringComparer.OrdinalIgnoreCase);
         foreach (var driver in drivers)
         {

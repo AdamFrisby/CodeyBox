@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -50,6 +52,9 @@ namespace CodeyBox.Sandbox.Multipass;
 public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
 {
     public const string ProviderId = "multipass";
+
+    private const string PurposeMarkerFile = ".codeybox-purpose";
+
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
     // UseBaselineImages in appsettings.json and have the change land on the next
@@ -318,6 +323,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
         try
         {
+            await WriteSandboxPurposeMarkerAsync(sandboxRoot, spec.Purpose, ct).ConfigureAwait(false);
+
             // Track ownership before the VM becomes host-visible. A slow launch,
             // clone, cloud-init wait, mount, or environment transfer can overlap a
             // leak-reaper sweep; once multipass lists this name, it must already be
@@ -416,6 +423,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
+            var hostAddress = await ResolveSandboxHostAddressAsync(opts, name, workItemId, ct).ConfigureAwait(false);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
             // already baked into the source VM's filesystem, so the clone
@@ -434,7 +442,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 // multipass daemon.
                 opGateAcquirer: (argv, ct) => EnterMultipassOpGateAsync(ReadOptions(), argv, ct),
                 resourceUsageStore: _resourceUsageStore,
-                baselineRef: clonedFromBaselineRef);
+                baselineRef: clonedFromBaselineRef,
+                hostAddress: hostAddress);
             // Register in the owner index ONLY when a work-item ID is present.
             // Sandboxes created without one (some tests) have no orchestrator-side
             // owner to suspend back into, so skip them.
@@ -1128,13 +1137,41 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 createdAt = details.CreatedAt;
             var isActive = _activeSandboxNames.ContainsKey(name);
             var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
+            var purpose = ReadSandboxPurposeMarker(stagingDir);
             var diskBytes = detailsByName.TryGetValue(name, out details) ? details.DiskBytes : null;
             var state = detailsByName.TryGetValue(name, out details) ? details.State : null;
             infos.Add(new ManagedSandboxInfo(
                 name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker,
-                IsSuspendLifecycleState(state)));
+                IsSuspendLifecycleState(state),
+                purpose));
         }
         return infos;
+    }
+
+    private static async Task WriteSandboxPurposeMarkerAsync(string sandboxRoot, SandboxPurpose purpose, CancellationToken ct)
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(sandboxRoot, PurposeMarkerFile),
+            purpose.ToString(),
+            ct).ConfigureAwait(false);
+    }
+
+    private static SandboxPurpose ReadSandboxPurposeMarker(string stagingDir)
+    {
+        var path = Path.Combine(stagingDir, PurposeMarkerFile);
+        if (!File.Exists(path))
+            return SandboxPurpose.WorkItem;
+        try
+        {
+            var value = File.ReadAllText(path).Trim();
+            return Enum.TryParse<SandboxPurpose>(value, ignoreCase: true, out var purpose)
+                ? purpose
+                : SandboxPurpose.WorkItem;
+        }
+        catch
+        {
+            return SandboxPurpose.WorkItem;
+        }
     }
 
     /// <summary>
@@ -1157,12 +1194,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private async Task<Dictionary<string, MultipassSandboxDetails>> FetchSandboxDetailsAsync(
         MultipassSandboxOptions opts,
         List<string> names,
-        CancellationToken ct)
+        CancellationToken ct,
+        WorkItemId? workItemId = null)
     {
         var argv = new List<string> { opts.MultipassBinary, "info", "--format", "json" };
         argv.AddRange(names);
 
-        var run = await RunAsync(opts, argv, stdin: null, ct: ct);
+        var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
         if (run.ExitCode != 0)
         {
             _log.LogWarning("multipass info failed (exit {ExitCode}): {Stderr}", run.ExitCode, run.Stderr);
@@ -1201,7 +1239,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 result[vmEntry.Name] = new MultipassSandboxDetails(
                     diskBytes,
                     TryReadCreatedAt(vmEntry.Value),
-                    state);
+                    state,
+                    TryReadPrimaryIpv4(vmEntry.Value));
             }
         }
         catch (JsonException ex)
@@ -1209,6 +1248,18 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             _log.LogWarning(ex, "Failed to parse multipass info output; sandbox details will be omitted");
         }
         return result;
+    }
+
+    private async Task<string?> ResolveSandboxHostAddressAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        var detailsByName = await FetchSandboxDetailsAsync(opts, [name], ct, workItemId).ConfigureAwait(false);
+        return detailsByName.TryGetValue(name, out var details)
+            ? details.PrimaryIpv4
+            : null;
     }
 
     private static DateTimeOffset? TryReadCreatedAt(JsonElement vmInfo)
@@ -1225,6 +1276,39 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 return parsed;
         }
 
+        return null;
+    }
+
+    private static string? TryReadPrimaryIpv4(JsonElement vmInfo)
+    {
+        if (!vmInfo.TryGetProperty("ipv4", out var ipv4El))
+            return null;
+
+        if (ipv4El.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var value in ipv4El.EnumerateArray())
+            {
+                var parsed = TryParseIpv4(value.GetString());
+                if (parsed is not null)
+                    return parsed;
+            }
+            return null;
+        }
+
+        return ipv4El.ValueKind == JsonValueKind.String
+            ? TryParseIpv4(ipv4El.GetString())
+            : null;
+    }
+
+    private static string? TryParseIpv4(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        foreach (var token in value.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (IPAddress.TryParse(token, out var address) && address.AddressFamily == AddressFamily.InterNetwork)
+                return address.ToString();
+        }
         return null;
     }
 
@@ -4605,7 +4689,11 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 }
 
-internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt, string? State = null);
+internal readonly record struct MultipassSandboxDetails(
+    long? DiskBytes,
+    DateTimeOffset? CreatedAt,
+    string? State = null,
+    string? PrimaryIpv4 = null);
 
 internal sealed class MultipassDaemonRetryPolicy
 {
@@ -5252,7 +5340,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5312,6 +5400,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly Action<string>? _onNoLongerTrackedActive;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? _opGateAcquirer;
     private readonly AgentOutputHttpIngestSessionStarter _agentOutputIngestSessionStarter;
+    private readonly string? _hostAddress;
     private readonly int _maxScreenshotPngBytes;
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
@@ -5369,7 +5458,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? opGateAcquirer = null,
         AgentOutputHttpIngestSessionStarter? agentOutputIngestSessionStarter = null,
         ISandboxResourceUsageStore? resourceUsageStore = null,
-        string? baselineRef = null)
+        string? baselineRef = null,
+        string? hostAddress = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -5393,6 +5483,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         _opGateAcquirer = opGateAcquirer;
         _agentOutputIngestSessionStarter = agentOutputIngestSessionStarter
             ?? MultipassAgentOutputHttpIngestSession.TryStartAsync;
+        _hostAddress = hostAddress;
         _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
         _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
         if (_maxScreenshotPngBytes <= 0)
@@ -5406,6 +5497,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     public string Id { get; }
     public string ProviderId => MultipassSandboxProvider.ProviderId;
     public bool CapturesResourceMetrics => _opts.CaptureResourceMetrics;
+    public string? HostAddress => _hostAddress;
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
     {
