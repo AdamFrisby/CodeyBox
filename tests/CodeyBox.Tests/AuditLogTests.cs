@@ -753,6 +753,23 @@ public sealed class AuditLogTests : IDisposable
             e => GetScalar<string>(e, "Sandbox") is "vm-flow-a" or "vm-flow-b");
     }
 
+    [Fact]
+    public void AuditorTimedOut_emits_correct_properties()
+    {
+        var id = WorkItemId.New();
+        AuditLog.AuditorTimedOut(id, "my-auditor", new AgentKind("codex"), 2, "vm-01");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("audit.auditor_timed_out", GetScalar<string>(evt, "EventName"));
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal(id.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("my-auditor", GetScalar<string>(evt, "Auditor"));
+        Assert.Equal("codex", GetScalar<string>(evt, "Agent"));
+        Assert.Equal(2, GetScalar<int>(evt, "Iteration"));
+        Assert.Equal("vm-01", GetScalar<string>(evt, "SandboxId"));
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static T? GetScalar<T>(LogEvent evt, string key)

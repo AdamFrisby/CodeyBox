@@ -182,6 +182,18 @@ public sealed record AuditCompletedDetails
 }
 
 /// <summary>
+/// Details payload for the <c>audit.auditor_timed_out</c> event.
+/// </summary>
+public sealed record AuditAuditorTimedOutDetails
+{
+    public required string WorkItemId { get; init; }
+    public required string Auditor { get; init; }
+    public required string Agent { get; init; }
+    public required int Iteration { get; init; }
+    public string? SandboxId { get; init; }
+}
+
+/// <summary>
 /// Details payload for <c>work_item.needs_operator_input</c> when the audit
 /// loop parks with audit history that an operator should inspect, including
 /// iteration-ceiling-with-progress and genuine empty-rework parks.

@@ -150,6 +150,8 @@ public static class EventSchema
         "release.sync_conflict",
         // Upstream/forge state surfaced by background sweeps (not state transitions)
         "upstream.pr_stale_base",
+        // Audit-level
+        "audit.auditor_timed_out",
     ];
 
     /// <summary>

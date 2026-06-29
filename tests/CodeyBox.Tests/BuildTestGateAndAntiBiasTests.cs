@@ -1149,12 +1149,17 @@ public sealed class BuildTestGateOrderingTests : IDisposable
     public async Task TimedOutBuildTestGateEmitsStructuredEventAndAgentKind()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var gate = new HangingBuildTestGateAuditor("csharp:test-pass");
+        var gate = new HangingCredentialedAuditor("my-credentialed-auditor");
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
         var webhooks = new CapturingWebhookDispatcher();
+        var captLogger = new CapturingLogger<PipelineRunner>();
+
+        var workAgentKind = AgentKind.Claude;
+        var auditAgentKind = new AgentKind("codex");
+        var extraRunners = new[] { new ScriptedAgent(Array.Empty<MergeStrategy>()) { Kind = auditAgentKind } };
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -1164,7 +1169,15 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             credentials: AuditCredentials(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             pipelineTuning: tuning,
-            webhookDispatcher: webhooks);
+            webhookDispatcher: webhooks,
+            projectAudit: new ProjectAudit
+            {
+                AuditAgent = auditAgentKind,
+                AuditTypes = ["scripted"],
+                MaxIterations = 1
+            },
+            extraAgentRunners: extraRunners,
+            logger: captLogger);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
@@ -1172,10 +1185,11 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Contains("incomplete auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("csharp:test-pass", final.LastError, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains(tp.Agent.Kind.Value, final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("my-credentialed-auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("codex", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("claude", final.LastError, StringComparison.OrdinalIgnoreCase);
 
         var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
         Assert.NotNull(timeoutEvent);
@@ -1190,11 +1204,75 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var sandboxIdProp = type.GetProperty("SandboxId")?.GetValue(details)?.ToString();
 
         Assert.Equal(item.Id.ToString(), workItemIdProp);
-        Assert.Equal("csharp:test-pass", auditorProp);
-        Assert.Equal(tp.Agent.Kind.Value, agentProp);
+        Assert.Equal("my-credentialed-auditor", auditorProp);
+        Assert.Equal("codex", agentProp);
         Assert.Equal(1, iterationProp);
         Assert.NotNull(sandboxIdProp);
         Assert.NotEmpty(sandboxIdProp);
+
+        // Verify the normal timeout log contains (agent: {Agent})
+        Assert.Contains(captLogger.Entries, entry => entry.Message.Contains("(agent: codex)"));
+    }
+
+    [Fact]
+    public async Task TimedOutAuditorLogAttributionOnTeardownFailures()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new HangingCredentialedAuditor("my-credentialed-auditor");
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        var webhooks = new CapturingWebhookDispatcher();
+        var captLogger = new CapturingLogger<PipelineRunner>();
+
+        var workAgentKind = AgentKind.Claude;
+        var auditAgentKind = new AgentKind("codex");
+        var extraRunners = new[] { new ScriptedAgent(Array.Empty<MergeStrategy>()) { Kind = auditAgentKind } };
+
+        // Wrap the default sandbox provider to force kill/dispose timeouts
+        var defaultProvider = new ProcessSandboxProvider(Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance);
+        var timeoutProvider = new TimeoutSandboxProvider(defaultProvider, forceKillTimeout: true, forceDisposeTimeout: true);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [gate],
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            pipelineTuning: tuning,
+            webhookDispatcher: webhooks,
+            projectAudit: new ProjectAudit
+            {
+                AuditAgent = auditAgentKind,
+                AuditTypes = ["scripted"],
+                MaxIterations = 1
+            },
+            extraAgentRunners: extraRunners,
+            sandboxProvider: timeoutProvider,
+            logger: captLogger);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // Print all logs to help diagnose
+        foreach (var entry in captLogger.Entries)
+        {
+            System.Console.WriteLine($"[CAPTURED LOG] {entry.Level}: {entry.Message}");
+        }
+
+        // Assert that the logs contain the agent attribution in the teardown warning lines
+        var killWarning = captLogger.Entries.FirstOrDefault(entry => entry.Message.Contains("did not kill active execs") || entry.Message.Contains("failed while killing active execs"));
+        var disposeWarning = captLogger.Entries.FirstOrDefault(entry => entry.Message.Contains("did not dispose sandbox") || entry.Message.Contains("failed while disposing sandbox"));
+        
+        Assert.NotNull(killWarning);
+        Assert.Contains("(agent: codex)", killWarning.Message);
+
+        Assert.NotNull(disposeWarning);
+        Assert.Contains("(agent: codex)", disposeWarning.Message);
     }
 
     private async Task<FakeAuditTools> CreateFakeAuditToolsAsync()
@@ -1751,5 +1829,91 @@ file sealed class LowQualityPipelineLlmAuditor : IAuditor, IRequiresPassedBuildT
                         "src/FeatureFlags.cs:5"),
                 ])
             : new AuditResult(true, []);
+    }
+}
+
+file sealed class HangingCredentialedAuditor : IAuditor
+{
+    public HangingCredentialedAuditor(string name) => Name = name;
+
+    public string Name { get; }
+    public string Kind => "llm";
+    public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+
+    public async Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(30), ct);
+        return new AuditResult(true, []);
+    }
+}
+
+file sealed class TimeoutSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+    private readonly bool _forceKillTimeout;
+    private readonly bool _forceDisposeTimeout;
+
+    public TimeoutSandboxProvider(ISandboxProvider inner, bool forceKillTimeout, bool forceDisposeTimeout)
+    {
+        _inner = inner;
+        _forceKillTimeout = forceKillTimeout;
+        _forceDisposeTimeout = forceDisposeTimeout;
+    }
+
+    public string Name => _inner.Name;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct)
+    {
+        var sb = await _inner.CreateAsync(spec, ct);
+        return new TimeoutSandbox(sb, _forceKillTimeout, _forceDisposeTimeout);
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string sandboxId, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(sandboxId, ct);
+}
+
+file sealed class TimeoutSandbox : ISandbox
+{
+    private readonly ISandbox _inner;
+    private readonly bool _forceKillTimeout;
+    private readonly bool _forceDisposeTimeout;
+
+    public TimeoutSandbox(ISandbox inner, bool forceKillTimeout, bool forceDisposeTimeout)
+    {
+        _inner = inner;
+        _forceKillTimeout = forceKillTimeout;
+        _forceDisposeTimeout = forceDisposeTimeout;
+    }
+
+    public string Id => _inner.Id;
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct)
+        => _inner.ExecAsync(exec, ct);
+
+    public async Task KillActiveExecsAsync(CancellationToken ct)
+    {
+        if (_forceKillTimeout)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10), ct);
+            throw new TimeoutException("Forced kill timeout");
+        }
+        await _inner.KillActiveExecsAsync(ct);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_forceDisposeTimeout)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            throw new TimeoutException("Forced dispose timeout");
+        }
+        await _inner.DisposeAsync();
     }
 }
