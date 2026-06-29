@@ -1,5 +1,3 @@
-using CodeyBox.Core;
-
 namespace CodeyBox.ExploratoryTesting.Replay;
 
 /// <summary>
@@ -19,7 +17,6 @@ public interface IAssertionVerifier
     /// Return null on success; a diagnostic string when the assertion
     /// does not hold against the current observation.
     /// </summary>
-    /// <param name="sandbox">Sandbox the assertion is being evaluated against.</param>
     /// <param name="assertion">The recorded assertion to verify.</param>
     /// <param name="currentScreenshotPng">Screenshot captured AFTER the action — the "now" frame.</param>
     /// <param name="recordedScreenshotPng">
@@ -30,7 +27,6 @@ public interface IAssertionVerifier
     /// <param name="accessibilitySnapshotJson">Current accessibility-tree snapshot, when available.</param>
     /// <param name="ct">Cancellation token.</param>
     Task<string?> VerifyAsync(
-        ISandbox sandbox,
         TraceAssertion assertion,
         byte[]? currentScreenshotPng,
         byte[]? recordedScreenshotPng,

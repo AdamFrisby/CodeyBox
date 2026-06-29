@@ -374,6 +374,28 @@ public sealed class SessionTraceTests
     }
 
     [Fact]
+    public async Task RecordingBridge_FocusChangingKeyInvalidatesPreviousTargetDescriptor()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new AccessibleGraphicalSandbox(SamplePng);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "key", Key = "Tab" });
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "type", Text = "after tab" });
+
+        var clickVisual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
+        var keyVisual = recorder.Trace.Entries[1].Action.TargetDescriptor.Visual;
+        var typeDescriptor = recorder.Trace.Entries[2].Action.TargetDescriptor;
+
+        Assert.Equal(clickVisual.Region, keyVisual.Region);
+        Assert.Equal(0, typeDescriptor.Visual.Region.Width);
+        Assert.Equal(0, typeDescriptor.Visual.Region.Height);
+        Assert.Null(typeDescriptor.Accessibility);
+    }
+
+    [Fact]
     public async Task RecordingBridge_CapturesScreenshotAction()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);

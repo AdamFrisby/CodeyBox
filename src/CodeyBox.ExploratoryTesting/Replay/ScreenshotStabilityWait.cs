@@ -12,8 +12,9 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// I can read it."
 ///
 /// <para>When a <c>predicate</c> is supplied it is the expected-state gate:
-/// a matching frame returns immediately, while stable non-matching frames keep
-/// polling until the expected state appears or the deadline expires. Without a
+/// matching frames must still satisfy the same consecutive-stability window
+/// before the wait returns. Stable non-matching frames keep polling until the
+/// expected state appears and settles, or the deadline expires. Without a
 /// predicate, stability alone is sufficient.</para>
 ///
 /// <para>Pixel-equality is intentionally conservative: a single pixel of
@@ -46,6 +47,7 @@ public sealed class ScreenshotStabilityWait : IVisualWait
 
         var deadline = _timeProvider.GetUtcNow() + options.VisualWaitTimeout;
         byte[]? previous = null;
+        var previousMatchedPredicate = false;
         var stable = 0;
 
         while (true)
@@ -56,18 +58,20 @@ public sealed class ScreenshotStabilityWait : IVisualWait
 
             if (current is not null)
             {
-                if (predicate is not null && await predicate(current, ct).ConfigureAwait(false))
-                    return current;
+                var predicateMatched = predicate is null
+                    || await predicate(current, ct).ConfigureAwait(false);
 
-                if (previous is not null && ScreenshotsRepresentSamePixels(previous, current))
+                if (predicateMatched
+                    && previousMatchedPredicate
+                    && previous is not null
+                    && ScreenshotsRepresentSamePixels(previous, current))
                 {
                     // Account for both the current frame and the prior frame —
                     // a "2 consecutive identical screenshots" requirement is
                     // satisfied the first time we observe one match, not after
-                    // two matches. When a predicate is supplied, stability
-                    // alone is not enough; keep waiting for the expected state.
+                    // two matches.
                     stable++;
-                    if (predicate is null && stable + 1 >= options.StableFrameCount)
+                    if (stable + 1 >= options.StableFrameCount)
                         return current;
                 }
                 else
@@ -75,6 +79,7 @@ public sealed class ScreenshotStabilityWait : IVisualWait
                     stable = 0;
                 }
                 previous = current;
+                previousMatchedPredicate = predicateMatched;
             }
 
             if (_timeProvider.GetUtcNow() >= deadline)

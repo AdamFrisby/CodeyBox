@@ -3853,7 +3853,7 @@ test "$work" = present && test "$exec_wrapper" = present
         set -eux
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat
+        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat tesseract-ocr tesseract-ocr-eng
         systemctl daemon-reload
         systemctl enable codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
         systemctl restart codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service

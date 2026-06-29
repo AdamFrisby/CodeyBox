@@ -69,21 +69,18 @@ internal sealed class PngBitmap
 
     public bool TryFindBestExact(
         PngBitmap template,
-        (int X, int Y)? preferredTopLeft,
         CancellationToken ct,
         out (int X, int Y) point)
-        => TryFindBestMatch(template, preferredTopLeft, PngPixelMatchOptions.Exact, ct, out point);
+        => TryFindBestMatch(template, PngPixelMatchOptions.Exact, ct, out point);
 
     public bool TryFindBestTolerant(
         PngBitmap template,
-        (int X, int Y)? preferredTopLeft,
         CancellationToken ct,
         out (int X, int Y) point)
-        => TryFindBestMatch(template, preferredTopLeft, PngPixelMatchOptions.ReplayTolerance, ct, out point);
+        => TryFindBestMatch(template, PngPixelMatchOptions.ReplayTolerance, ct, out point);
 
     public bool TryFindBestMatch(
         PngBitmap template,
-        (int X, int Y)? preferredTopLeft,
         PngPixelMatchOptions options,
         CancellationToken ct,
         out (int X, int Y) point)
@@ -92,13 +89,6 @@ internal sealed class PngBitmap
         if (template.Width <= 0 || template.Height <= 0) return false;
         if (template.Width > Width || template.Height > Height) return false;
 
-        if (preferredTopLeft is { } preferred
-            && MatchesAt(template, preferred.X, preferred.Y, options, ct))
-        {
-            point = preferred;
-            return true;
-        }
-
         if (template.PixelCount > 512 * 512) return false;
         var candidatePositions = ((long)Width - template.Width + 1) * (Height - template.Height + 1);
         if (candidatePositions > 2_000_000) return false;
@@ -106,41 +96,20 @@ internal sealed class PngBitmap
             return false;
 
         var found = false;
-        var ambiguous = false;
-        var bestScore = long.MaxValue;
-        var bestDelta = long.MaxValue;
         for (var y = 0; y <= Height - template.Height; y++)
         {
             ct.ThrowIfCancellationRequested();
             for (var x = 0; x <= Width - template.Width; x++)
             {
                 if (!LikelyMatchAt(template, x, y, options)) continue;
-                if (!TryScoreMatchAt(template, x, y, options, ct, out var delta)) continue;
-                if (preferredTopLeft is not { } target)
-                {
-                    if (found) return false;
-                    point = (x, y);
-                    found = true;
-                    continue;
-                }
-
-                var distance = DistanceSquared(x, y, target.X, target.Y);
-                if (distance < bestScore || (distance == bestScore && delta < bestDelta))
-                {
-                    point = (x, y);
-                    bestScore = distance;
-                    bestDelta = delta;
-                    ambiguous = false;
-                    found = true;
-                }
-                else if (distance == bestScore && delta == bestDelta)
-                {
-                    ambiguous = true;
-                }
+                if (!TryScoreMatchAt(template, x, y, options, ct, out _)) continue;
+                if (found) return false;
+                point = (x, y);
+                found = true;
             }
         }
 
-        return found && !ambiguous;
+        return found;
     }
 
     public bool MatchesAt(PngBitmap template, int x, int y, CancellationToken ct = default)
@@ -230,13 +199,6 @@ internal sealed class PngBitmap
             if (distinct.Count > maxDistinctColors) return false;
         }
         return true;
-    }
-
-    private static long DistanceSquared(int x1, int y1, int x2, int y2)
-    {
-        var dx = (long)x1 - x2;
-        var dy = (long)y1 - y2;
-        return dx * dx + dy * dy;
     }
 
     private static PngBitmap Decode(byte[] png)

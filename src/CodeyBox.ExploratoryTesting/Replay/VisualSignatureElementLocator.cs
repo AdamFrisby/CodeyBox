@@ -103,8 +103,8 @@ public sealed class VisualSignatureElementLocator : IElementLocator
 
         if (SharedPngBitmap.TryDecode(currentPng, out var current)
             && SharedPngBitmap.TryDecode(templatePng, out var template)
-            && (current.TryFindBestExact(template, PreferredTopLeft(visual.Region), ct, out var point)
-                || current.TryFindBestTolerant(template, PreferredTopLeft(visual.Region), ct, out point)))
+            && (current.TryFindBestExact(template, ct, out var point)
+                || current.TryFindBestTolerant(template, ct, out point)))
         {
             var (offsetX, offsetY) = ResolveClickOffset(visual, template.Width, template.Height);
             hit = new LocatedTarget
@@ -141,8 +141,8 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         if (SharedPngBitmap.TryDecode(sourcePng, out var source)
             && SharedPngBitmap.TryDecode(currentPng, out var current)
             && source.TryCrop(visual.Region, out var crop)
-            && (current.TryFindBestExact(crop, PreferredTopLeft(visual.Region), ct, out var point)
-                || current.TryFindBestTolerant(crop, PreferredTopLeft(visual.Region), ct, out point)))
+            && (current.TryFindBestExact(crop, ct, out var point)
+                || current.TryFindBestTolerant(crop, ct, out point)))
         {
             var (offsetX, offsetY) = ResolveClickOffset(visual, crop.Width, crop.Height);
             hit = new LocatedTarget
@@ -226,9 +226,6 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             Evidence = LocatedTargetEvidence.Visual,
         };
     }
-
-    private static (int X, int Y)? PreferredTopLeft(TraceBoundingRegion region) =>
-        region.Width > 0 && region.Height > 0 ? (region.X, region.Y) : null;
 
     private static (int X, int Y) ResolveClickOffset(
         TraceVisualDescriptor visual,

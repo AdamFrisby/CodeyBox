@@ -441,7 +441,7 @@ public sealed class ReplayEngine
         {
             var accessibility = await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false);
             var diag = await _assertions
-                .VerifyAsync(sandbox, assertion, current, entry.Observation.ScreenshotPng, accessibility, ct)
+                .VerifyAsync(assertion, current, entry.Observation.ScreenshotPng, accessibility, ct)
                 .ConfigureAwait(false);
             state.Record(current, diag);
         }
@@ -517,9 +517,9 @@ public sealed class ReplayEngine
         public void Record(byte[] screenshot, string? diagnostic)
         {
             LastScreenshot = screenshot;
+            Matched = diagnostic is null;
             if (diagnostic is null)
             {
-                Matched = true;
                 LastDiagnostic = null;
                 return;
             }
@@ -530,6 +530,7 @@ public sealed class ReplayEngine
         public void RecordException(byte[] screenshot, Exception exception)
         {
             LastScreenshot = screenshot;
+            Matched = false;
             VerifierException = exception;
         }
     }
@@ -568,22 +569,90 @@ public sealed class ReplayEngine
                 Y = located.CenterY,
             },
             "scroll" => BuildScrollRequest(action, located),
-            "key" => new ComputerUseRequest
-            {
-                Action = "key",
-                Key = FirstKey(action.InputEvents),
-            },
-            "type" => new ComputerUseRequest
-            {
-                Action = "type",
-                Text = FirstText(action.InputEvents),
-            },
+            "key" => BuildTargetedKeyRequest(action, located),
+            "type" => BuildTargetedTypeRequest(action, located),
             "events" => new ComputerUseRequest
             {
                 Action = "events",
                 Events = RelocateEvents(action.InputEvents, located, action),
             },
             _ => throw new NotSupportedException($"Unsupported replay action kind '{action.Kind}'."),
+        };
+    }
+
+    private static ComputerUseRequest BuildTargetedKeyRequest(TraceAction action, LocatedTarget? located)
+    {
+        var key = FirstKey(action.InputEvents);
+        if (located is null)
+        {
+            return new ComputerUseRequest
+            {
+                Action = "key",
+                Key = key,
+            };
+        }
+
+        return new ComputerUseRequest
+        {
+            Action = "events",
+            Events =
+            [
+                new SandboxInputEvent
+                {
+                    Type = SandboxInputEventType.Move,
+                    X = located.CenterX,
+                    Y = located.CenterY,
+                },
+                new SandboxInputEvent
+                {
+                    Type = SandboxInputEventType.Click,
+                    X = located.CenterX,
+                    Y = located.CenterY,
+                },
+                new SandboxInputEvent
+                {
+                    Type = SandboxInputEventType.Key,
+                    Key = key,
+                },
+            ],
+        };
+    }
+
+    private static ComputerUseRequest BuildTargetedTypeRequest(TraceAction action, LocatedTarget? located)
+    {
+        var text = FirstText(action.InputEvents);
+        if (located is null)
+        {
+            return new ComputerUseRequest
+            {
+                Action = "type",
+                Text = text,
+            };
+        }
+
+        return new ComputerUseRequest
+        {
+            Action = "events",
+            Events =
+            [
+                new SandboxInputEvent
+                {
+                    Type = SandboxInputEventType.Move,
+                    X = located.CenterX,
+                    Y = located.CenterY,
+                },
+                new SandboxInputEvent
+                {
+                    Type = SandboxInputEventType.Click,
+                    X = located.CenterX,
+                    Y = located.CenterY,
+                },
+                new SandboxInputEvent
+                {
+                    Type = SandboxInputEventType.Type,
+                    Text = text,
+                },
+            ],
         };
     }
 
@@ -707,7 +776,7 @@ public sealed class ReplayEngine
 
         for (var attempt = 0; attempt < options.MaxScrollAttempts; attempt++)
         {
-            var scroll = BuildVisualSearchScrollRequest(descriptor.Visual, options, attempt);
+            var scroll = BuildVisualSearchScrollRequest(descriptor.Visual, options);
             await bridge.ExecuteAsync(sandbox, scroll, ct).ConfigureAwait(false);
             var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct)
                 .ConfigureAwait(false);
@@ -728,8 +797,7 @@ public sealed class ReplayEngine
 
     private static ComputerUseRequest BuildVisualSearchScrollRequest(
         TraceVisualDescriptor visual,
-        ReplayOptions options,
-        int attempt)
+        ReplayOptions options)
     {
         var (x, y) = RecordedClickPoint(visual);
         if (y < 0) return new ComputerUseRequest { Action = "scroll", ScrollY = -options.ScrollStep };
@@ -739,7 +807,7 @@ public sealed class ReplayEngine
         return new ComputerUseRequest
         {
             Action = "scroll",
-            ScrollY = attempt % 2 == 0 ? options.ScrollStep : -options.ScrollStep,
+            ScrollY = options.ScrollStep,
         };
     }
 

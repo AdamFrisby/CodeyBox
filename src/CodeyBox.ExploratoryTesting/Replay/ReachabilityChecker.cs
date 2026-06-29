@@ -187,6 +187,23 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                     Diagnostic = $"another element ({Describe(snap)}) is on top of the expected target ({Describe(expectedAccessibility)}) at ({current.CenterX},{current.CenterY})",
                 };
             }
+
+            if (HasPixelVisualSignal(descriptor.Visual))
+            {
+                var visualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct)
+                    .ConfigureAwait(false);
+                if (visualStatus != VisualTargetVerificationStatus.Verified)
+                {
+                    return new ReachabilityOutcome
+                    {
+                        Status = ReachabilityStatus.Occluded,
+                        Target = current,
+                        Diagnostic = visualStatus == VisualTargetVerificationStatus.Mismatch
+                            ? $"expected element ({Describe(expectedAccessibility)}) is accessibility-top-most at ({current.CenterX},{current.CenterY}) but its visible pixels no longer match the recorded descriptor"
+                            : $"expected element ({Describe(expectedAccessibility)}) is accessibility-top-most at ({current.CenterX},{current.CenterY}) but its current visual descriptor could not be verified",
+                    };
+                }
+            }
         }
         else
         {
@@ -199,11 +216,18 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                     if (TopMostAccessibilityMatchesOcrTarget(snap, descriptor.Visual, current))
                         return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
 
+                    var topMostVisualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct)
+                        .ConfigureAwait(false);
+                    if (topMostVisualStatus == VisualTargetVerificationStatus.Verified)
+                        return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
+
                     return new ReachabilityOutcome
                     {
                         Status = ReachabilityStatus.Occluded,
                         Target = current,
-                        Diagnostic = $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
+                        Diagnostic = topMostVisualStatus == VisualTargetVerificationStatus.Mismatch
+                            ? $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}) and target pixels no longer match the recorded descriptor"
+                            : $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
                     };
                 }
 
@@ -238,6 +262,10 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 
         return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
     }
+
+    private static bool HasPixelVisualSignal(TraceVisualDescriptor visual) =>
+        visual.TemplatePng is { Length: > 0 }
+        || visual.SourceScreenshotPng is { Length: > 0 } && visual.Region is { Width: > 0, Height: > 0 };
 
     private async Task<VisualTargetVerificationStatus> GetCurrentVisualEvidenceStatusAsync(
         ISandbox sandbox,

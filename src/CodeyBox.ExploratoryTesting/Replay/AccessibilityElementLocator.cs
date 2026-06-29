@@ -179,7 +179,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
             using var doc = JsonDocument.Parse(json);
             var candidates = new List<LocatedTarget>();
             SearchTree(doc.RootElement, expected, visual, candidates, ct);
-            return SelectTreeCandidate(candidates, visual);
+            return SelectTreeCandidate(candidates);
         }
         catch (JsonException)
         {
@@ -226,37 +226,11 @@ public sealed class AccessibilityElementLocator : IElementLocator
         }
     }
 
-    private static TreeLocateResult SelectTreeCandidate(
-        IReadOnlyList<LocatedTarget> candidates,
-        TraceVisualDescriptor visual)
+    private static TreeLocateResult SelectTreeCandidate(IReadOnlyList<LocatedTarget> candidates)
     {
         if (candidates.Count == 0) return TreeLocateResult.None;
         if (candidates.Count == 1) return TreeLocateResult.Found(candidates[0]);
-        if (visual.Region.Width <= 0 || visual.Region.Height <= 0)
-            return TreeLocateResult.Ambiguous;
-
-        var (targetX, targetY) = RecordedClickPoint(visual);
-        LocatedTarget? best = null;
-        var bestScore = long.MaxValue;
-        var ambiguous = false;
-        foreach (var candidate in candidates)
-        {
-            var score = DistanceSquared(candidate.CenterX, candidate.CenterY, targetX, targetY);
-            if (score < bestScore)
-            {
-                best = candidate;
-                bestScore = score;
-                ambiguous = false;
-            }
-            else if (score == bestScore)
-            {
-                ambiguous = true;
-            }
-        }
-
-        return best is not null && !ambiguous
-            ? TreeLocateResult.Found(best with { Source = "accessibility-tree-disambiguated" })
-            : TreeLocateResult.Ambiguous;
+        return TreeLocateResult.Ambiguous;
     }
 
     private static (int X, int Y) RecordedClickPoint(TraceVisualDescriptor visual)
@@ -282,13 +256,6 @@ public sealed class AccessibilityElementLocator : IElementLocator
             ? currentBounds.Y + offsetY
             : currentBounds.Y + currentBounds.Height / 2;
         return (x, y);
-    }
-
-    private static long DistanceSquared(int x1, int y1, int x2, int y2)
-    {
-        var dx = (long)x1 - x2;
-        var dy = (long)y1 - y2;
-        return dx * dx + dy * dy;
     }
 
     private static SandboxAccessibilitySnapshot SnapshotFromObject(JsonElement obj) => new()

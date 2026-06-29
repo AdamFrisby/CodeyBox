@@ -1,5 +1,3 @@
-using CodeyBox.Core;
-
 namespace CodeyBox.ExploratoryTesting.Replay;
 
 /// <summary>
@@ -73,14 +71,12 @@ public sealed class DefaultAssertionVerifier : IAssertionVerifier
     }
 
     public Task<string?> VerifyAsync(
-        ISandbox sandbox,
         TraceAssertion assertion,
         byte[]? currentScreenshotPng,
         byte[]? recordedScreenshotPng,
         string? accessibilitySnapshotJson,
         CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(assertion);
         ct.ThrowIfCancellationRequested();
 

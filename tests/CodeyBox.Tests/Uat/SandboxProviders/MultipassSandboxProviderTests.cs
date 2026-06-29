@@ -290,6 +290,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
         Assert.Contains("x11-utils socat", cloudInit);
+        Assert.Contains("tesseract-ocr tesseract-ocr-eng", cloudInit);
         Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
         Assert.Contains("-listen \"$listen_addr\"", cloudInit);
         Assert.Contains("-allow \"$host_addr\"", cloudInit);
@@ -312,6 +313,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("xvfb x11vnc xfce4", headlessCloudInit);
         Assert.DoesNotContain("xdotool scrot ffmpeg", headlessCloudInit);
         Assert.DoesNotContain("x11-utils socat", headlessCloudInit);
+        Assert.DoesNotContain("tesseract-ocr", headlessCloudInit);
     }
 
     [Fact]
@@ -324,6 +326,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
+        Assert.Contains("tesseract-ocr tesseract-ocr-eng", cloudInit);
         Assert.True(
             cloudInit.IndexOf("systemctl enable --now codeybox-route.service", StringComparison.Ordinal)
             < cloudInit.IndexOf("apt-get update", StringComparison.Ordinal),
@@ -4675,7 +4678,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("apt-get install -y --no-install-recommends xvfb", baselineCloudInitText);
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("xvfb x11vnc xfce4", StringComparison.Ordinal)
-            && cmd.Contains("xdotool scrot ffmpeg", StringComparison.Ordinal));
+            && cmd.Contains("xdotool scrot ffmpeg", StringComparison.Ordinal)
+            && cmd.Contains("tesseract-ocr tesseract-ocr-eng", StringComparison.Ordinal));
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("touch /opt/codeybox-project-tools", StringComparison.Ordinal));
     }

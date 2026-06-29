@@ -165,8 +165,7 @@ public sealed class RecordingComputerUseBridge
         string? postAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
 
         var targetDescriptor = BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility);
-        if (HasUsableTargetDescriptor(targetDescriptor))
-            _lastTargetDescriptor = targetDescriptor;
+        UpdateRememberedFocusTarget(canonicalAction, events, targetDescriptor);
 
         var entry = new TraceEntry
         {
@@ -323,6 +322,62 @@ public sealed class RecordingComputerUseBridge
             }
         }
         return (null, null);
+    }
+
+    private void UpdateRememberedFocusTarget(
+        string action,
+        IReadOnlyList<SandboxInputEvent> events,
+        TraceTargetDescriptor targetDescriptor)
+    {
+        if (ActionSetsPointerFocus(action, events))
+        {
+            _lastTargetDescriptor = HasUsableTargetDescriptor(targetDescriptor)
+                ? targetDescriptor
+                : null;
+            return;
+        }
+
+        if (ActionMayMoveKeyboardFocus(action, events))
+        {
+            _lastTargetDescriptor = null;
+        }
+    }
+
+    private static bool ActionSetsPointerFocus(string action, IReadOnlyList<SandboxInputEvent> events)
+    {
+        if (action is "click" or "double_click") return true;
+        if (action is not "events") return false;
+        return events.Any(e =>
+            e.Type == SandboxInputEventType.Click
+            && e.X.HasValue
+            && e.Y.HasValue);
+    }
+
+    private static bool ActionMayMoveKeyboardFocus(string action, IReadOnlyList<SandboxInputEvent> events)
+    {
+        if (action is not ("key" or "events")) return false;
+        return events.Any(e => e.Type == SandboxInputEventType.Key && KeyMayMoveFocus(e.Key));
+    }
+
+    private static bool KeyMayMoveFocus(string? key)
+    {
+        if (string.IsNullOrWhiteSpace(key)) return false;
+        var normalized = key.Trim().ToLowerInvariant();
+        return normalized.Contains("tab", StringComparison.Ordinal)
+            || normalized.Contains("enter", StringComparison.Ordinal)
+            || normalized.Contains("return", StringComparison.Ordinal)
+            || normalized.Contains("escape", StringComparison.Ordinal)
+            || normalized == "esc"
+            || normalized.Contains("arrow", StringComparison.Ordinal)
+            || normalized is "up" or "down" or "left" or "right"
+            || normalized.Contains("pageup", StringComparison.Ordinal)
+            || normalized.Contains("pagedown", StringComparison.Ordinal)
+            || normalized.Contains("ctrl", StringComparison.Ordinal)
+            || normalized.Contains("control", StringComparison.Ordinal)
+            || normalized.Contains("alt", StringComparison.Ordinal)
+            || normalized.Contains("meta", StringComparison.Ordinal)
+            || normalized.Contains("cmd", StringComparison.Ordinal)
+            || normalized.Contains("super", StringComparison.Ordinal);
     }
 
     private static bool TryReadPngDimensions(byte[]? png, out int width, out int height)
