@@ -714,18 +714,10 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>
 // changes through the same OnChange handler that drives the worker options.
 builder.Services.AddSingleton<CodeyBox.Orchestrator.AgentSessionDispatchOptions>(sp =>
 {
-    var workerOptions = sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>();
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
-    var dispatch = new CodeyBox.Orchestrator.AgentSessionDispatchOptions
-    {
-        Enabled = workerOptions.Enabled,
-        PreemptiveSelfReviewEnabled = monitor.CurrentValue.ClaudeSession?.PreemptiveSelfReview?.Enabled ?? false,
-    };
-    monitor.OnChange(opts =>
-    {
-        dispatch.Enabled = opts.ClaudeSession?.Enabled ?? false;
-        dispatch.PreemptiveSelfReviewEnabled = opts.ClaudeSession?.PreemptiveSelfReview?.Enabled ?? false;
-    });
+    var dispatch = new CodeyBox.Orchestrator.AgentSessionDispatchOptions();
+    AgentSessionDispatchOptionsBinder.Apply(dispatch, monitor.CurrentValue.ClaudeSession);
+    monitor.OnChange(opts => AgentSessionDispatchOptionsBinder.Apply(dispatch, opts.ClaudeSession));
     return dispatch;
 });
 // Default metrics sink is the no-op; operators wire a logging/metrics-backed

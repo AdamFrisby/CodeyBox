@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Api;
+using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
@@ -181,6 +182,39 @@ public sealed class ClaudeSessionOptionsBinderTests
         Assert.Equal(ClaudeSessionTransport.Print, live.Transport);
         Assert.Empty(live.TransportOverridesByAgentClassMember);
         Assert.Empty(live.TransportOverridesByProject);
+    }
+
+    [Fact]
+    public void DispatchOptionsOnChangeWiring_MapsPreemptiveSelfReviewFlag()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            ClaudeSession = new ClaudeSessionOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReview = new PreemptiveSelfReviewConfig { Enabled = true },
+            },
+        };
+        var monitor = new FiringOptionsMonitor<CodeyBoxOptions>(initial);
+
+        var live = new AgentSessionDispatchOptions();
+        AgentSessionDispatchOptionsBinder.Apply(live, monitor.CurrentValue.ClaudeSession);
+        monitor.OnChange((opts, _) => AgentSessionDispatchOptionsBinder.Apply(live, opts.ClaudeSession));
+
+        Assert.True(live.Enabled);
+        Assert.True(live.PreemptiveSelfReviewEnabled);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            ClaudeSession = new ClaudeSessionOptions
+            {
+                Enabled = false,
+                PreemptiveSelfReview = new PreemptiveSelfReviewConfig { Enabled = false },
+            },
+        });
+
+        Assert.False(live.Enabled);
+        Assert.False(live.PreemptiveSelfReviewEnabled);
     }
 
     private sealed class FiringOptionsMonitor<T> : IOptionsMonitor<T>

@@ -122,6 +122,21 @@ public sealed class PipelineOptionsWiringTests
         Assert.Equal(1200, options.TimeoutSeconds);
     }
 
+    [Fact]
+    public void ProgramMapsPreemptiveSelfReviewConfigIntoSessionDispatchOptions()
+    {
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:ClaudeSession:Enabled"] = "true",
+            ["CodeyBox:ClaudeSession:PreemptiveSelfReview:Enabled"] = "true",
+        });
+
+        var options = factory.Services.GetRequiredService<AgentSessionDispatchOptions>();
+
+        Assert.True(options.Enabled);
+        Assert.True(options.PreemptiveSelfReviewEnabled);
+    }
+
     private sealed class PipelineOptionsWiringFactory : WebApplicationFactory<Program>
     {
         private readonly Dictionary<string, string?> _extraConfig;

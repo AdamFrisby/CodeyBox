@@ -171,6 +171,7 @@ public sealed class AgentPromptPreprocessorTests
         {
             AgentPromptPhase.Work,
             AgentPromptPhase.Rework,
+            AgentPromptPhase.SelfReview,
             AgentPromptPhase.Audit,
             AgentPromptPhase.Merge,
             AgentPromptPhase.CheckAndAct,
@@ -190,7 +191,9 @@ public sealed class AgentPromptPreprocessorTests
         }
 
         Assert.Equal(phases, recorder.Contexts.Select(ctx => ctx.Phase).ToArray());
-        Assert.Equal(["prompt-0|processed", "prompt-1|processed", "prompt-2|processed", "prompt-3|processed", "prompt-4|processed"], inner.RunPrompts);
+        Assert.Equal(
+            Enumerable.Range(0, phases.Length).Select(i => $"prompt-{i}|processed").ToArray(),
+            inner.RunPrompts);
     }
 
     [Fact]

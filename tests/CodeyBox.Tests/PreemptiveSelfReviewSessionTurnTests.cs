@@ -88,9 +88,10 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
             new RecordingFileWrite("a.txt", "v1"),
             new RecordingFileWrite("a.txt", "v1-self-review-fixed"),
         ]);
-        var auditor = new GuidanceContributingAuditor(
+        var auditor = new GuidanceContributingFileReadingAuditor(
             "ScriptedWithGuidance",
             guidance: "- guidance-marker-12345",
+            fileName: "a.txt",
             plan: [new AuditOutcome(true, [])]);
 
         using var tp = TestSupport.BuildPipeline(
@@ -132,10 +133,15 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
         Assert.DoesNotContain("maximise compliance", prompts[1], StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("maximize compliance", prompts[1], StringComparison.OrdinalIgnoreCase);
 
-        // The auditor (which runs in a fresh sandbox via the legacy audit
-        // path) saw the post-self-review committed code, but the auditor
-        // itself never ran on the worker's session — auditor isolation is
-        // verified by SessionMode_PreemptiveSelfReview_AuditorRunsInSeparateSandbox.
+        // The self-review fix was committed and pushed to the branch the formal
+        // auditor clones. This catches the clean-index/agent-self-commit class
+        // of regressions where the second turn ran but its changes never left
+        // the warm worker VM.
+        Assert.Equal("v1-self-review-fixed", (await ReadWorkBranchFileAsync(tp, item, "a.txt")).Trim());
+
+        // The first formal audit ran after that push and saw the fixed content.
+        var firstAuditContent = Assert.Single(auditor.FileContentsObserved);
+        Assert.Equal("v1-self-review-fixed", firstAuditContent.Trim());
     }
 
     [Fact]
@@ -283,6 +289,262 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
         // Two turns were attempted (work + self-review); the second one
         // threw so SendTurns increments to 2.
         Assert.Equal(2, sessionRunner.SendTurns);
+    }
+
+    [Fact]
+    public async Task FeatureOn_SelfReviewAgentCreatesCommit_CommitIsPushedToWorkBranch()
+    {
+        // The prompt asks the agent to commit any self-review fixes. If it obeys,
+        // the index is clean after the turn; the pipeline must still notice HEAD
+        // advanced, stamp/push as needed, and let the independent auditor grade
+        // the fixed branch.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+            new RecordingFileWrite(
+                "a.txt",
+                "v1-agent-self-committed",
+                Commit: true,
+                CommitMessage: $"agent self-review commit\n\n{CodeyBoxTrailers.PromptRevisionTrailerKey}: 1\n{CodeyBoxTrailers.CoAuthoredBy}"),
+        ]);
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- fix things",
+            plan: [new AuditOutcome(true, [])]);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal("v1-agent-self-committed", (await ReadWorkBranchFileAsync(tp, item, "a.txt")).Trim());
+
+        var subjects = await ReadWorkBranchLogSubjectsAsync(tp, item);
+        Assert.Contains("agent self-review commit", subjects);
+        Assert.DoesNotContain("codeybox: pre-emptive self-review fixes", subjects);
+    }
+
+    [Fact]
+    public async Task FeatureOn_NonSuccessSelfReviewRestoresWorktree_BeforeReworkReusesSession()
+    {
+        // A non-success self-review result can still leave dirty files behind.
+        // The formal audit reviews the already-pushed work commit; if it fails,
+        // the subsequent rework turn resumes the same worker VM, so the optional
+        // self-review dirt must be reset first.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+            new RecordingFileWrite("a.txt", "poison-from-failed-self-review", ReturnSuccess: false),
+            new RecordingFileWrite("a.txt", "v2-rework"),
+        ]);
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- force cleanup coverage",
+            plan:
+            [
+                new AuditOutcome(false, [new AuditFinding("quality:test", AuditSeverity.Error, "needs rework", "first pass fails")]),
+                new AuditOutcome(true, []),
+            ]);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(3, sessionRunner.SendTurns);
+        Assert.Equal("v2-rework", (await ReadWorkBranchFileAsync(tp, item, "a.txt")).Trim());
+    }
+
+    [Fact]
+    public async Task FeatureOn_PostTurnGitFailureIsSoft_AuditStillRunsAgainstWorkCommit()
+    {
+        // Staging/commit/trailer/push failures in the optional self-review
+        // integration must not fail the work phase. Break the worker clone's
+        // origin before the helper pushes; audit should still run against the
+        // previously pushed work commit.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+            new RecordingFileWrite("a.txt", "v1-self-review-unpushable", BreakOriginBeforeReturn: true),
+        ]);
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- fix things",
+            plan: [new AuditOutcome(true, [])]);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, sessionRunner.SendTurns);
+        Assert.Equal("v1", (await ReadWorkBranchFileAsync(tp, item, "a.txt")).Trim());
+    }
+
+    [Fact]
+    public async Task FeatureOn_RequiredBuildFailureStillRunsWarmSelfReviewBeforeGate()
+    {
+        // The cache-hot pass must run immediately after the initial work turn.
+        // A terminal required-build failure should happen after that optional
+        // second turn, not prevent it from running.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+            new RecordingFileWrite("a.txt", "v1-self-review-fixed"),
+        ]);
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- fix things",
+            plan: [new AuditOutcome(true, [])]);
+        var requiredBuild = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Failed(1, "compile failed"));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            requiredBuildVerifier: requiredBuild,
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(2, sessionRunner.SendTurns);
+        Assert.Equal("v1-self-review-fixed", (await ReadWorkBranchFileAsync(tp, item, "a.txt")).Trim());
+        Assert.Equal(1, requiredBuild.VerifyCalls);
+    }
+
+    [Fact]
+    public async Task FeatureOn_SelfReviewPromptRunsThroughPromptPreprocessors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+            new RecordingFileWrite("a.txt", "v1-self-review-fixed"),
+        ]);
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- fix things",
+            plan: [new AuditOutcome(true, [])]);
+        var preprocessor = new RecordingAppendingPreprocessor("preprocessed-self-review");
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            promptPreprocessors: new AgentPromptPreprocessorChain([preprocessor]),
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var prompts = sessionRunner.PromptsSent.ToArray();
+        Assert.Contains("preprocessed-self-review", prompts[1]);
+        Assert.Contains(preprocessor.PhasesObserved, p => p == AgentPromptPhase.SelfReview);
+    }
+
+    [Fact]
+    public async Task FeatureOn_CancellationFromSelfReviewPropagates()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        using var cts = new CancellationTokenSource();
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+        ])
+        {
+            BeforeSelfReviewFault = () => cts.Cancel(),
+            SelfReviewTurnFault = new OperationCanceledException(cts.Token),
+        };
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- fix things",
+            plan: [new AuditOutcome(true, [])]);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => tp.Pipeline.RunAsync(item, cts.Token));
     }
 
     [Fact]
@@ -458,7 +720,138 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task FeatureOn_AuditPasses_EmitsAuditIterationHistogram_TaggedSelfReviewOn()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+            new RecordingFileWrite("a.txt", "v1-after-self-review"),
+        ]);
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- always check",
+            plan: [new AuditOutcome(true, [])]);
+
+        var captured = new List<(long Value, IReadOnlyDictionary<string, object?> Tags)>();
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Name == "codeybox.session.audit_iterations")
+                    l.EnableMeasurementEvents(instrument);
+            },
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            var dict = new Dictionary<string, object?>(StringComparer.Ordinal);
+            for (var i = 0; i < tags.Length; i++)
+                dict[tags[i].Key] = tags[i].Value;
+            lock (captured)
+                captured.Add((value, dict));
+        });
+        listener.Start();
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        lock (captured)
+        {
+            var metric = Assert.Single(captured);
+            Assert.Equal(1, metric.Value);
+            Assert.Equal("on", metric.Tags["self_review"]);
+            Assert.Equal("passed", metric.Tags["outcome"]);
+        }
+    }
+
+    [Fact]
+    public async Task FeatureOn_SelfReviewSuggestionsFile_IsNotPushedToWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+            new RecordingFileWrite("a.txt", "v1-self-review-fixed", CreateSuggestions: true),
+        ]);
+        var auditor = new GuidanceContributingAuditor(
+            "ScriptedWithGuidance",
+            guidance: "- fix things",
+            plan: [new AuditOutcome(true, [])]);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            sessionDispatchOptions: new AgentSessionDispatchOptions
+            {
+                Enabled = true,
+                PreemptiveSelfReviewEnabled = true,
+            },
+            sessionAgentRunnerOverride: sessionRunner);
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal("v1-self-review-fixed", (await ReadWorkBranchFileAsync(tp, item, "a.txt")).Trim());
+        Assert.False(await WorkBranchPathExistsAsync(tp, item, ".codeybox/suggestions.json"));
+    }
+
     // ─── helpers / doubles ────────────────────────────────────────────────
+
+    private static async Task<string> ReadWorkBranchFileAsync(TestPipeline tp, WorkItem item, string fileName)
+    {
+        var bareRepo = tp.GitHost.GetRepoPath(item.Id.ToString());
+        var (_, stdout, _) = await TestSupport.RunGit(
+            bareRepo,
+            "show",
+            $"{item.WorkBranch}:{fileName}");
+        return stdout;
+    }
+
+    private static async Task<IReadOnlyList<string>> ReadWorkBranchLogSubjectsAsync(TestPipeline tp, WorkItem item)
+    {
+        var bareRepo = tp.GitHost.GetRepoPath(item.Id.ToString());
+        var (_, stdout, _) = await TestSupport.RunGit(
+            bareRepo,
+            "log",
+            "--pretty=format:%s",
+            item.WorkBranch!);
+        return stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static async Task<bool> WorkBranchPathExistsAsync(TestPipeline tp, WorkItem item, string path)
+    {
+        var bareRepo = tp.GitHost.GetRepoPath(item.Id.ToString());
+        var (code, _, _) = await TestSupport.RunGitNoThrow(
+            bareRepo,
+            "cat-file",
+            "-e",
+            $"{item.WorkBranch}:{path}");
+        return code == 0;
+    }
 
     private static Project ProjectWithSessionEnabled(
         string repoUrl,
@@ -511,6 +904,47 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
         }
     }
 
+    private sealed class GuidanceContributingFileReadingAuditor : IAuditor
+    {
+        private readonly Queue<AuditOutcome> _plan;
+        private readonly string? _guidance;
+        private readonly string _fileName;
+
+        public GuidanceContributingFileReadingAuditor(
+            string name,
+            string? guidance,
+            string fileName,
+            IEnumerable<AuditOutcome> plan)
+        {
+            Name = name;
+            _guidance = guidance;
+            _fileName = fileName;
+            _plan = new Queue<AuditOutcome>(plan);
+        }
+
+        public string Name { get; }
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public string? SelfReviewGuidance => _guidance;
+        public ConcurrentQueue<string> FileContentsObserved { get; } = new();
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", _fileName],
+                WorkingDirectory = workingDirectory,
+            }, ct);
+            FileContentsObserved.Enqueue(read.Success ? read.Stdout : $"<missing:{read.Stderr}>");
+            var outcome = _plan.Count > 0 ? _plan.Dequeue() : new AuditOutcome(true, []);
+            return new AuditResult(outcome.Passed, outcome.Findings);
+        }
+    }
+
     private sealed class NoGuidanceAuditor : IAuditor
     {
         private readonly Queue<AuditOutcome> _plan;
@@ -553,7 +987,31 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
         }
     }
 
-    private sealed record RecordingFileWrite(string FileName, string Contents);
+    private sealed record RecordingFileWrite(
+        string FileName,
+        string Contents,
+        bool Commit = false,
+        string? CommitMessage = null,
+        bool ReturnSuccess = true,
+        bool BreakOriginBeforeReturn = false,
+        bool CreateSuggestions = false);
+
+    private sealed class RecordingAppendingPreprocessor : IAgentPromptPreprocessor
+    {
+        private readonly string _marker;
+
+        public RecordingAppendingPreprocessor(string marker) => _marker = marker;
+
+        public int Order => AgentPromptPreprocessorOrder.Plugin;
+        public ConcurrentQueue<AgentPromptPhase> PhasesObserved { get; } = new();
+
+        public Task<string> ProcessAsync(PromptContext ctx, string prompt, CancellationToken ct = default)
+        {
+            _ = ct;
+            PhasesObserved.Enqueue(ctx.Phase);
+            return Task.FromResult($"{prompt}\n\n{_marker}");
+        }
+    }
 
     /// <summary>
     /// Mirrors the in-fixture RecordingSessionRunner from
@@ -578,6 +1036,8 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
         public string? OpenedHandleId;
         /// <summary>If set, the second SendTurnAsync call throws this exception.</summary>
         public Exception? SelfReviewTurnFault { get; set; }
+        public Action? BeforeSelfReviewFault { get; set; }
+        public bool FaultSelfReviewAfterApplyingAction { get; set; }
         public ConcurrentQueue<string> HandleIdsObserved { get; } = new();
         public ConcurrentQueue<string> SandboxIdsObservedOnTurns { get; } = new();
         public ConcurrentQueue<string> PromptsSent { get; } = new();
@@ -626,8 +1086,11 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
             if (_capturedSandbox is not null)
                 SandboxIdsObservedOnTurns.Enqueue(_capturedSandbox.Id);
 
-            if (turnIndex == 2 && SelfReviewTurnFault is not null)
+            if (turnIndex == 2 && SelfReviewTurnFault is not null && !FaultSelfReviewAfterApplyingAction)
+            {
+                BeforeSelfReviewFault?.Invoke();
                 throw SelfReviewTurnFault;
+            }
 
             if (_turnFiles.Count == 0)
                 return new AgentResult(true, "ok", null, null);
@@ -639,9 +1102,64 @@ public sealed class PreemptiveSelfReviewSessionTurnTests : IDisposable
                 Argv = ["sh", "-c", "cat > \"$0\"", path],
                 Stdin = file.Contents,
             }, ct);
-            return result.Success
+            if (!result.Success)
+                return new AgentResult(false, "fail", result.Stdout, result.Stderr);
+
+            if (file.CreateSuggestions)
+            {
+                var suggestions = await _capturedSandbox.ExecAsync(new SandboxExec
+                {
+                    Argv =
+                    [
+                        "sh", "-c",
+                        "mkdir -p .codeybox && cat > .codeybox/suggestions.json",
+                    ],
+                    WorkingDirectory = _workingDirectory,
+                    Stdin = """[{"title":"note","description":"operator triage"}]""",
+                }, ct);
+                if (!suggestions.Success)
+                    return new AgentResult(false, "suggestions failed", suggestions.Stdout, suggestions.Stderr);
+            }
+
+            if (file.Commit)
+            {
+                var add = await _capturedSandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", _workingDirectory!, "add", "-A"],
+                }, ct);
+                if (!add.Success)
+                    return new AgentResult(false, "add failed", add.Stdout, add.Stderr);
+                var commit = await _capturedSandbox.ExecAsync(new SandboxExec
+                {
+                    Argv =
+                    [
+                        "git", "-C", _workingDirectory!, "commit", "-m",
+                        file.CommitMessage ?? $"agent turn {turnIndex} commit",
+                    ],
+                }, ct);
+                if (!commit.Success)
+                    return new AgentResult(false, "commit failed", commit.Stdout, commit.Stderr);
+            }
+
+            if (file.BreakOriginBeforeReturn)
+            {
+                var breakOrigin = await _capturedSandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", _workingDirectory!, "remote", "set-url", "origin", "/definitely/missing/origin.git"],
+                }, ct);
+                if (!breakOrigin.Success)
+                    return new AgentResult(false, "break origin failed", breakOrigin.Stdout, breakOrigin.Stderr);
+            }
+
+            if (turnIndex == 2 && SelfReviewTurnFault is not null)
+            {
+                BeforeSelfReviewFault?.Invoke();
+                throw SelfReviewTurnFault;
+            }
+
+            return file.ReturnSuccess
                 ? new AgentResult(true, "ok", null, null)
-                : new AgentResult(false, "fail", result.Stdout, result.Stderr);
+                : new AgentResult(false, "scripted non-success", "self-review returned failure", null);
         }
 
         public Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)

@@ -4762,8 +4762,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (isInitial && suggestionsJson is not null)
                 await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
-            await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
-
             // Session-path enhancement (config-gated, default OFF): inject ONE
             // pre-emptive self-review turn in the SAME warm session right after
             // the initial work commit lands, BEFORE the formal audit fires in
@@ -4790,6 +4788,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     promptRevisionAtDispatch,
                     ct);
             }
+
+            await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
 
             phaseSucceeded = true;
             return agentResult.Stdout;
@@ -4939,11 +4939,34 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         var selfReviewPrompt = BuildPreemptiveSelfReviewPrompt(guidance, promptRevisionAtDispatch);
-
-        AgentResult turnResult;
+        string shaBefore;
         try
         {
-            turnResult = await sessionLifecycle.SendTurnAsync(selfReviewPrompt, ct, stdoutChunkCallback: null);
+            selfReviewPrompt = await ProcessAgentPromptAsync(
+                item.Id,
+                runner.Kind,
+                AgentPromptPhase.SelfReview,
+                AuditProgressIterationNumbers.WorkPhase,
+                project,
+                sandbox,
+                selfReviewPrompt,
+                ct);
+
+            var beforeHead = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+            }, ct);
+            if (!beforeHead.Success)
+            {
+                _log.LogWarning(
+                    "Pre-emptive self-review could not read HEAD before turn for work item {Id}; continuing to audit without it: {Stderr}",
+                    item.Id,
+                    beforeHead.Stderr);
+                CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "failed"));
+                return;
+            }
+            shaBefore = beforeHead.Stdout.Trim();
         }
         catch (OperationCanceledException)
         {
@@ -4952,73 +4975,167 @@ public sealed partial class PipelineRunner : IPipelineRunner
         catch (Exception ex)
         {
             _log.LogWarning(ex,
-                "Pre-emptive self-review turn faulted for work item {Id} session {SessionId}; continuing to audit without it",
-                item.Id, sessionLifecycle.Handle.SessionId);
-            CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
-                new KeyValuePair<string, object?>("outcome", "failed"));
-            sessionLifecycle.MarkPreemptiveSelfReviewRan();
-            return;
-        }
-
-        // Mark that the turn fired regardless of commit outcome so the
-        // audit-iteration metric tags this item with self_review=on.
-        sessionLifecycle.MarkPreemptiveSelfReviewRan();
-
-        if (!turnResult.Success)
-        {
-            _log.LogInformation(
-                "Pre-emptive self-review turn for work item {Id} returned non-success; skipping commit and continuing to audit.",
+                "Pre-emptive self-review setup failed for work item {Id}; continuing to audit without it",
                 item.Id);
             CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
                 new KeyValuePair<string, object?>("outcome", "failed"));
             return;
         }
 
-        // Stage anything the self-review turn left dirty, mirroring the
-        // work-phase staging policy: strip suggestions.json so the audit
-        // branch never carries it.
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
-        await sandbox.ExecAsync(new SandboxExec
+        var turnAttempted = false;
+        try
         {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
-                ".codeybox/suggestions.json"],
-        }, ct);
+            turnAttempted = true;
+            var turnResult = await sessionLifecycle.SendTurnAsync(selfReviewPrompt, ct, stdoutChunkCallback: null);
 
-        var staged = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
-        }, ct);
-        var hasStagedDiff = staged.ExitCode != 0;
+            // Mark that the turn fired regardless of commit outcome so the
+            // audit-iteration metric tags this item with self_review=on.
+            sessionLifecycle.MarkPreemptiveSelfReviewRan();
 
-        if (!hasStagedDiff)
-        {
-            // Self-review turn produced no edits — the work was already clean
-            // by the auditor's criteria. That's a successful outcome, not a
-            // failure: the formal audit still runs and judges independently.
+            if (!turnResult.Success)
+            {
+                _log.LogInformation(
+                    "Pre-emptive self-review turn for work item {Id} returned non-success; restoring worktree and continuing to audit.",
+                    item.Id);
+                CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "failed"));
+                await RestoreSelfReviewWorktreeOrCloseSessionAsync(
+                    sessionLifecycle,
+                    sandbox,
+                    item,
+                    project,
+                    branch,
+                    "self-review turn returned non-success",
+                    ct);
+                return;
+            }
+
+            // Stage anything the self-review turn left dirty, mirroring the
+            // work-phase staging policy: strip suggestions.json so the audit
+            // branch never carries it.
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
+                    ".codeybox/suggestions.json"],
+            }, ct);
+
+            var staged = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
+            }, ct);
+            var hasStagedDiff = staged.ExitCode != 0;
+
+            var observedModelId = ResolveObservedModelId(runner, item.ModelId);
+            if (hasStagedDiff)
+            {
+                var trailerBlock = await ComposeCommitTrailerBlockAsync(
+                    item.Id, runner.Kind, observedModelId, ct,
+                    promptRevisionAtDispatch: promptRevisionAtDispatch);
+                var commitMessage = $"codeybox: pre-emptive self-review fixes\n\n{trailerBlock}";
+                await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+            }
+
+            var afterHead = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+            }, ct);
+            if (!afterHead.Success)
+                throw new InvalidOperationException($"Failed to read HEAD after pre-emptive self-review: {afterHead.Stderr}");
+            var shaAfter = afterHead.Stdout.Trim();
+
+            if (string.Equals(shaBefore, shaAfter, StringComparison.Ordinal))
+            {
+                // Self-review turn produced no edits — the work was already clean
+                // by the auditor's criteria. That's a successful outcome, not a
+                // failure: the formal audit still runs and judges independently.
+                CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "no_changes"));
+                return;
+            }
+
+            // Stamp the prompt-revision trailer on HEAD if the agent forgot,
+            // mirroring the work-phase commit hygiene so the
+            // process:prompt-revision-trailer auditor doesn't fire on the extra
+            // commit. This also covers the path where the agent created its own
+            // clean commit and left no staged diff for the orchestrator to commit.
+            await EnsureHeadCarriesPromptRevisionTrailerAsync(
+                sandbox, item, runner.Kind, observedModelId,
+                promptRevisionAtDispatch, agentPhase: "self-review", ct);
+
+            await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
+
             CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
-                new KeyValuePair<string, object?>("outcome", "no_changes"));
-            return;
+                new KeyValuePair<string, object?>("outcome", "committed_changes"));
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Pre-emptive self-review integration failed for work item {Id} session {SessionId}; restoring worktree and continuing to audit without it",
+                item.Id, sessionLifecycle.Handle.SessionId);
+            if (turnAttempted)
+                sessionLifecycle.MarkPreemptiveSelfReviewRan();
+            CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
+                new KeyValuePair<string, object?>("outcome", "failed"));
+            if (turnAttempted)
+            {
+                await RestoreSelfReviewWorktreeOrCloseSessionAsync(
+                    sessionLifecycle,
+                    sandbox,
+                    item,
+                    project,
+                    branch,
+                    "self-review integration failed",
+                    ct);
+            }
+        }
+    }
 
-        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
-        var trailerBlock = await ComposeCommitTrailerBlockAsync(
-            item.Id, runner.Kind, observedModelId, ct,
-            promptRevisionAtDispatch: promptRevisionAtDispatch);
-        var commitMessage = $"codeybox: pre-emptive self-review fixes\n\n{trailerBlock}";
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
-
-        // Stamp the prompt-revision trailer on HEAD if the agent forgot,
-        // mirroring the work-phase commit hygiene so the
-        // process:prompt-revision-trailer auditor doesn't fire on the extra
-        // commit.
-        await EnsureHeadCarriesPromptRevisionTrailerAsync(
-            sandbox, item, runner.Kind, observedModelId,
-            promptRevisionAtDispatch, agentPhase: "self-review", ct);
-
-        await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
-
-        CodeyBoxMeters.SessionPreemptiveSelfReviewTurns.Add(1,
-            new KeyValuePair<string, object?>("outcome", "committed_changes"));
+    private async Task RestoreSelfReviewWorktreeOrCloseSessionAsync(
+        ClaudeSessionLifecycle sessionLifecycle,
+        ISandbox sandbox,
+        WorkItem item,
+        Project project,
+        string branch,
+        string reason,
+        CancellationToken ct)
+    {
+        try
+        {
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", branch);
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "reset", "--hard", $"origin/{branch}");
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "clean", "-fdx");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception cleanupEx)
+        {
+            _log.LogWarning(cleanupEx,
+                "Failed to restore worktree after pre-emptive self-review failure for work item {Id}; closing session and degrading future turns to fresh sandboxes",
+                item.Id);
+            try
+            {
+                await CloseAmbientClaudeSessionAsync(
+                    sessionLifecycle,
+                    item,
+                    project,
+                    $"{reason}; failed to restore self-review worktree");
+            }
+            catch (Exception closeEx) when (closeEx is not OperationCanceledException)
+            {
+                _log.LogWarning(closeEx,
+                    "Failed to close Claude session after pre-emptive self-review cleanup failure for work item {Id}; continuing to audit already-pushed work branch",
+                    item.Id);
+            }
+            _ambientSessionLifecycle.Value = null;
+        }
     }
 
     /// <summary>
