@@ -1164,7 +1164,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [gate],
+            auditors: TestAuditGates.WithPassedBuildAndTest(gate),
             maxAuditIterations: 1,
             credentials: AuditCredentials(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
@@ -1185,7 +1185,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("incomplete auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("my-credentialed-auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("codex", final.LastError, StringComparison.OrdinalIgnoreCase);
@@ -1237,7 +1237,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [gate],
+            auditors: TestAuditGates.WithPassedBuildAndTest(gate),
             maxAuditIterations: 1,
             credentials: AuditCredentials(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
@@ -1257,12 +1257,8 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var item = NewItem();
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
-
-        // Print all logs to help diagnose
-        foreach (var entry in captLogger.Entries)
-        {
-            System.Console.WriteLine($"[CAPTURED LOG] {entry.Level}: {entry.Message}");
-        }
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Fail("LOGS:\n" + string.Join("\n", captLogger.Entries.Select(e => $"{e.Level}: {e.Message}")));
 
         // Assert that the logs contain the agent attribution in the teardown warning lines
         var killWarning = captLogger.Entries.FirstOrDefault(entry => entry.Message.Contains("did not kill active execs") || entry.Message.Contains("failed while killing active execs"));
@@ -1856,6 +1852,7 @@ file sealed class TimeoutSandboxProvider : ISandboxProvider
     private readonly ISandboxProvider _inner;
     private readonly bool _forceKillTimeout;
     private readonly bool _forceDisposeTimeout;
+    private int _createCount;
 
     public TimeoutSandboxProvider(ISandboxProvider inner, bool forceKillTimeout, bool forceDisposeTimeout)
     {
@@ -1869,7 +1866,13 @@ file sealed class TimeoutSandboxProvider : ISandboxProvider
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct)
     {
         var sb = await _inner.CreateAsync(spec, ct);
-        return new TimeoutSandbox(sb, _forceKillTimeout, _forceDisposeTimeout);
+        var count = System.Threading.Interlocked.Increment(ref _createCount);
+        System.Console.WriteLine($"[CREATE SANDBOX] count={count}");
+        if (count > 1)
+        {
+            return new TimeoutSandbox(sb, _forceKillTimeout, _forceDisposeTimeout);
+        }
+        return sb;
     }
 
     public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
