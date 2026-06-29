@@ -174,7 +174,7 @@ public sealed class ReplayEngine
 
         LocatedTarget? located = null;
         var effectiveDescriptor = action.TargetDescriptor;
-        if (NeedsLocator(action.Kind))
+        if (NeedsLocator(action))
         {
             try
             {
@@ -282,16 +282,35 @@ public sealed class ReplayEngine
                 ct).ConfigureAwait(false);
         }
 
-        // Hard expected-state predicate for visual-match assertions when the
-        // recorded screenshot is directly available. A matching frame returns
-        // immediately; otherwise the wait continues until the expected state
-        // appears or times out.
-        // visual-match and we have the expected screenshot in hand — the
-        // brief's 'wait until expected element/state appears' leg. The wait
-        // Other assertion kinds rely on the accessibility tree (re-fetched
-        // after the wait) so they do not gain a useful per-frame predicate.
-        var predicate = BuildExpectedStatePredicate(entry);
-        var settled = await _visualWait.WaitAsync(sandbox, predicate, options, ct).ConfigureAwait(false);
+        ObservationWaitResult wait;
+        try
+        {
+            wait = await WaitForObservationAsync(sandbox, entry, options, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return await FailAsync(
+                sandbox, entry, ReplayFailureKind.ActionFailed,
+                $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): visual wait failed: {DiagnosticText.Sanitize(ex.Message)}",
+                locatedTarget: located,
+                ct).ConfigureAwait(false);
+        }
+
+        if (wait.AssertionException is not null)
+        {
+            return BuildAssertionExceptionResult(entry, wait.Assertion!, wait.AssertionException, wait.AssertionScreenshot ?? wait.Screenshot, located);
+        }
+
+        if (wait.AssertionDiagnostic is not null)
+        {
+            return BuildAssertionMismatchResult(entry, wait.Assertion!, wait.AssertionDiagnostic, wait.AssertionScreenshot ?? wait.Screenshot, located);
+        }
+
+        var settled = wait.Screenshot;
         if (settled is null)
         {
             return await FailAsync(
@@ -299,59 +318,6 @@ public sealed class ReplayEngine
                 $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): screen did not settle within {options.VisualWaitTimeout}",
                 locatedTarget: located,
                 ct).ConfigureAwait(false);
-        }
-
-        if (entry.Assertion is { } assertion)
-        {
-            // Fetch the accessibility tree only for assertion kinds that
-            // consume it. Visual-match looks at screenshots only — issuing
-            // an extra accessibility-tree IPC roundtrip per step burns cost
-            // for no diagnostic value.
-            var accessibility = AssertionConsumesAccessibilityTree(assertion)
-                ? await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
-                : null;
-            string? diag;
-            try
-            {
-                diag = await _assertions
-                    .VerifyAsync(sandbox, assertion, settled, entry.Observation.ScreenshotPng, accessibility, ct)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                // A throwing verifier must not leak out of ReplayAsync and
-                // abort the structured-step contract; coerce into an
-                // AssertionMismatch so the rest of the result envelope still
-                // surfaces, matching how reachability / dispatch errors are
-                // handled.
-                return new ReplayStepResult
-                {
-                    Sequence = entry.Sequence,
-                    ActionKind = action.Kind,
-                    Passed = false,
-                    FailureKind = ReplayFailureKind.AssertionMismatch,
-                    Diagnostic = $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' verifier threw: {DiagnosticText.Sanitize(ex.Message)}",
-                    DiagnosticScreenshotPng = settled,
-                    LocatedTarget = located,
-                };
-            }
-            if (diag is not null)
-            {
-                return new ReplayStepResult
-                {
-                    Sequence = entry.Sequence,
-                    ActionKind = action.Kind,
-                    Passed = false,
-                    FailureKind = ReplayFailureKind.AssertionMismatch,
-                    Diagnostic = $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' failed: {DiagnosticText.Sanitize(diag)}",
-                    DiagnosticScreenshotPng = settled,
-                    LocatedTarget = located,
-                };
-            }
         }
 
         return new ReplayStepResult
@@ -369,12 +335,10 @@ public sealed class ReplayEngine
         ReplayOptions options,
         CancellationToken ct)
     {
-        byte[]? current;
+        ObservationWaitResult wait;
         try
         {
-            current = await _visualWait
-                .WaitAsync(sandbox, BuildExpectedStatePredicate(entry), options, ct)
-                .ConfigureAwait(false);
+            wait = await WaitForObservationAsync(sandbox, entry, options, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -389,6 +353,17 @@ public sealed class ReplayEngine
                 ct).ConfigureAwait(false);
         }
 
+        if (wait.AssertionException is not null)
+        {
+            return BuildAssertionExceptionResult(entry, wait.Assertion!, wait.AssertionException, wait.AssertionScreenshot ?? wait.Screenshot, located: null);
+        }
+
+        if (wait.AssertionDiagnostic is not null)
+        {
+            return BuildAssertionMismatchResult(entry, wait.Assertion!, wait.AssertionDiagnostic, wait.AssertionScreenshot ?? wait.Screenshot, located: null);
+        }
+
+        var current = wait.Screenshot;
         if (current is null)
         {
             return await FailAsync(
@@ -396,48 +371,6 @@ public sealed class ReplayEngine
                 $"step {entry.Sequence} (screenshot): screen did not settle within {options.VisualWaitTimeout}",
                 locatedTarget: null,
                 ct).ConfigureAwait(false);
-        }
-
-        if (entry.Assertion is { } assertion)
-        {
-            var accessibility = AssertionConsumesAccessibilityTree(assertion)
-                ? await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
-                : null;
-            string? diag;
-            try
-            {
-                diag = await _assertions
-                    .VerifyAsync(sandbox, assertion, current, entry.Observation.ScreenshotPng, accessibility, ct)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                return new ReplayStepResult
-                {
-                    Sequence = entry.Sequence,
-                    ActionKind = entry.Action.Kind,
-                    Passed = false,
-                    FailureKind = ReplayFailureKind.AssertionMismatch,
-                    Diagnostic = $"step {entry.Sequence} (screenshot): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' verifier threw: {DiagnosticText.Sanitize(ex.Message)}",
-                    DiagnosticScreenshotPng = current,
-                };
-            }
-            if (diag is not null)
-            {
-                return new ReplayStepResult
-                {
-                    Sequence = entry.Sequence,
-                    ActionKind = entry.Action.Kind,
-                    Passed = false,
-                    FailureKind = ReplayFailureKind.AssertionMismatch,
-                    Diagnostic = $"step {entry.Sequence} (screenshot): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' failed: {DiagnosticText.Sanitize(diag)}",
-                    DiagnosticScreenshotPng = current,
-                };
-            }
         }
 
         return new ReplayStepResult
@@ -448,20 +381,144 @@ public sealed class ReplayEngine
         };
     }
 
-    private static bool AssertionConsumesAccessibilityTree(TraceAssertion assertion) =>
-        assertion.Kind is "text-contains" or "element-present";
-
-    private static Func<byte[], bool>? BuildExpectedStatePredicate(TraceEntry entry)
+    private async Task<ObservationWaitResult> WaitForObservationAsync(
+        ISandbox sandbox,
+        TraceEntry entry,
+        ReplayOptions options,
+        CancellationToken ct)
     {
-        if (entry.Assertion is not { Kind: "visual-match" } assertion) return null;
-        var expected = entry.Observation.ScreenshotPng;
-        if (expected is null || expected.Length == 0) return null;
-        // Detail-named recordings are resolved by the verifier, not by the
-        // wait — building a predicate would require duplicating the named-
-        // recording map here. The wait therefore uses stability for named
-        // recordings and leaves the final comparison to the verifier.
-        if (!string.IsNullOrEmpty(assertion.Detail)) return null;
-        return current => current.Length == expected.Length && current.AsSpan().SequenceEqual(expected);
+        var assertion = EffectiveAssertion(entry);
+        AssertionPollingState? assertionState = assertion is null ? null : new AssertionPollingState();
+        Func<byte[], CancellationToken, Task<bool>>? predicate = assertion is null
+            ? null
+            : async (current, token) =>
+            {
+                await VerifyAssertionForFrameAsync(sandbox, entry, assertion, current, assertionState!, token)
+                    .ConfigureAwait(false);
+                return assertionState!.Matched || assertionState.VerifierException is not null;
+            };
+
+        var screenshot = await _visualWait.WaitAsync(sandbox, predicate, options, ct).ConfigureAwait(false);
+        if (assertion is not null
+            && screenshot is not null
+            && assertionState is { Matched: false, VerifierException: null })
+        {
+            await VerifyAssertionForFrameAsync(sandbox, entry, assertion, screenshot, assertionState, ct)
+                .ConfigureAwait(false);
+        }
+
+        return new ObservationWaitResult(
+            screenshot,
+            assertion,
+            assertionState?.LastDiagnostic,
+            assertionState?.VerifierException,
+            assertionState?.LastScreenshot);
+    }
+
+    private async Task VerifyAssertionForFrameAsync(
+        ISandbox sandbox,
+        TraceEntry entry,
+        TraceAssertion assertion,
+        byte[] current,
+        AssertionPollingState state,
+        CancellationToken ct)
+    {
+        try
+        {
+            var accessibility = await TryGetAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false);
+            var diag = await _assertions
+                .VerifyAsync(sandbox, assertion, current, entry.Observation.ScreenshotPng, accessibility, ct)
+                .ConfigureAwait(false);
+            state.Record(current, diag);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            state.RecordException(current, ex);
+        }
+    }
+
+    private static TraceAssertion? EffectiveAssertion(TraceEntry entry)
+    {
+        if (entry.Assertion is not null) return entry.Assertion;
+        if (entry.Action.Kind == "screenshot"
+            && entry.Observation.ScreenshotPng is { Length: > 0 })
+        {
+            return new TraceAssertion { Kind = "visual-match" };
+        }
+
+        return null;
+    }
+
+    private static ReplayStepResult BuildAssertionExceptionResult(
+        TraceEntry entry,
+        TraceAssertion assertion,
+        Exception exception,
+        byte[]? screenshot,
+        LocatedTarget? located)
+        => new()
+        {
+            Sequence = entry.Sequence,
+            ActionKind = entry.Action.Kind,
+            Passed = false,
+            FailureKind = ReplayFailureKind.AssertionMismatch,
+            Diagnostic = $"step {entry.Sequence} ({DiagnosticText.Sanitize(entry.Action.Kind)}): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' verifier threw: {DiagnosticText.Sanitize(exception.Message)}",
+            DiagnosticScreenshotPng = screenshot,
+            LocatedTarget = located,
+        };
+
+    private static ReplayStepResult BuildAssertionMismatchResult(
+        TraceEntry entry,
+        TraceAssertion assertion,
+        string diagnostic,
+        byte[]? screenshot,
+        LocatedTarget? located)
+        => new()
+        {
+            Sequence = entry.Sequence,
+            ActionKind = entry.Action.Kind,
+            Passed = false,
+            FailureKind = ReplayFailureKind.AssertionMismatch,
+            Diagnostic = $"step {entry.Sequence} ({DiagnosticText.Sanitize(entry.Action.Kind)}): assertion '{DiagnosticText.Sanitize(assertion.Kind)}' failed: {DiagnosticText.Sanitize(diagnostic)}",
+            DiagnosticScreenshotPng = screenshot,
+            LocatedTarget = located,
+        };
+
+    private sealed record ObservationWaitResult(
+        byte[]? Screenshot,
+        TraceAssertion? Assertion,
+        string? AssertionDiagnostic,
+        Exception? AssertionException,
+        byte[]? AssertionScreenshot);
+
+    private sealed class AssertionPollingState
+    {
+        public bool Matched { get; private set; }
+        public string? LastDiagnostic { get; private set; }
+        public Exception? VerifierException { get; private set; }
+        public byte[]? LastScreenshot { get; private set; }
+
+        public void Record(byte[] screenshot, string? diagnostic)
+        {
+            LastScreenshot = screenshot;
+            if (diagnostic is null)
+            {
+                Matched = true;
+                LastDiagnostic = null;
+                return;
+            }
+
+            LastDiagnostic = diagnostic;
+        }
+
+        public void RecordException(byte[] screenshot, Exception exception)
+        {
+            LastScreenshot = screenshot;
+            VerifierException = exception;
+        }
     }
 
     private async Task DispatchActionAsync(
@@ -725,8 +782,33 @@ public sealed class ReplayEngine
         return null;
     }
 
-    private static bool NeedsLocator(string actionKind) =>
-        actionKind is "click" or "double_click" or "move" or "events" or "scroll" or "key" or "type";
+    private static bool NeedsLocator(TraceAction action) =>
+        action.Kind switch
+        {
+            "click" or "double_click" or "move" or "events" => true,
+            "scroll" or "key" or "type" => HasUsableTargetSignal(action.TargetDescriptor),
+            _ => false,
+        };
+
+    private static bool HasUsableTargetSignal(TraceTargetDescriptor descriptor)
+    {
+        var accessibility = descriptor.Accessibility;
+        if (accessibility is not null
+            && (!string.IsNullOrEmpty(accessibility.Role)
+                || !string.IsNullOrEmpty(accessibility.Name)
+                || !string.IsNullOrEmpty(accessibility.Text)
+                || !string.IsNullOrEmpty(accessibility.ElementType)))
+        {
+            return true;
+        }
+
+        var visual = descriptor.Visual;
+        var region = visual.Region;
+        return region.Width > 0 && region.Height > 0
+            || visual.TemplatePng is { Length: > 0 }
+            || visual.SourceScreenshotPng is { Length: > 0 } && region.Width > 0 && region.Height > 0
+            || !string.IsNullOrWhiteSpace(visual.OcrText);
+    }
 
     private async Task<ReplayStepResult> FailAsync(
         ISandbox sandbox,

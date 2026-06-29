@@ -33,7 +33,13 @@ internal enum VisualTargetVerificationStatus
 /// </summary>
 public sealed class VisualSignatureElementLocator : IElementLocator
 {
+    private const int MaxExactSearchPositions = 2_000_000;
+    private const int MaxExactTemplatePixels = 512 * 512;
+    private const int MaxLowEntropyTemplatePixels = 64 * 64;
+    private const int MaxLowEntropyDistinctColors = 2;
+
     private readonly IElementLocator _accessibilityLocator;
+    private readonly IOcrTextLocator _ocrLocator;
 
     public VisualSignatureElementLocator()
         : this(DefaultAccessibilityMatcher.Instance)
@@ -46,9 +52,15 @@ public sealed class VisualSignatureElementLocator : IElementLocator
     }
 
     public VisualSignatureElementLocator(IElementLocator accessibilityLocator)
+        : this(accessibilityLocator, null)
+    {
+    }
+
+    public VisualSignatureElementLocator(IElementLocator accessibilityLocator, IOcrTextLocator? ocrLocator)
     {
         _accessibilityLocator = accessibilityLocator
             ?? throw new ArgumentNullException(nameof(accessibilityLocator));
+        _ocrLocator = ocrLocator ?? TesseractOcrTextLocator.Instance;
     }
 
     public async Task<LocatedTarget?> LocateAsync(
@@ -63,24 +75,26 @@ public sealed class VisualSignatureElementLocator : IElementLocator
 
         var visual = descriptor.Visual;
         var region = visual.Region;
-        if (region.Width <= 0 || region.Height <= 0) return null;
+        if (!HasAnyVisualSignal(visual)) return null;
 
         var current = await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
 
         if (current is null || current.Length == 0) return null;
 
-        if (TryLocateTemplate(current, visual, out var templateHit))
+        if (TryLocateTemplate(current, visual, ct, out var templateHit))
             return templateHit;
 
-        if (TryLocateSourceCrop(current, visual, out var cropHit))
+        if (TryLocateSourceCrop(current, visual, ct, out var cropHit))
             return cropHit;
 
-        var ocrTreeHit = await LocateOcrTextAsync(sandbox, visual, options, ct).ConfigureAwait(false);
+        var ocrTreeHit = await LocateOcrTextAsync(sandbox, current, visual, options, ct).ConfigureAwait(false);
         if (ocrTreeHit is not null) return ocrTreeHit;
 
         var source = visual.SourceScreenshotPng;
         if (source is not null
             && source.Length > 0
+            && region.Width > 0
+            && region.Height > 0
             && current.Length == source.Length
             && current.AsSpan().SequenceEqual(source))
         {
@@ -125,6 +139,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
     private static bool TryLocateTemplate(
         byte[] currentPng,
         TraceVisualDescriptor visual,
+        CancellationToken ct,
         out LocatedTarget? hit)
     {
         hit = null;
@@ -133,7 +148,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
 
         if (PngBitmap.TryDecode(currentPng, out var current)
             && PngBitmap.TryDecode(templatePng, out var template)
-            && current.TryFindBestExact(template, PreferredTopLeft(visual.Region), out var point))
+            && current.TryFindBestExact(template, PreferredTopLeft(visual.Region), ct, out var point))
         {
             var (offsetX, offsetY) = ResolveClickOffset(visual, template.Width, template.Height);
             hit = new LocatedTarget
@@ -153,21 +168,13 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             return true;
         }
 
-        if (IndexOf(currentPng, templatePng) >= 0)
-        {
-            // Byte-contained templates are useful for tests and providers that
-            // embed OCR/template sidecars in the screenshot payload. There is
-            // no coordinate mapping in that shape, so leave the match to other
-            // descriptor fields by returning false here.
-            return false;
-        }
-
         return false;
     }
 
     private static bool TryLocateSourceCrop(
         byte[] currentPng,
         TraceVisualDescriptor visual,
+        CancellationToken ct,
         out LocatedTarget? hit)
     {
         hit = null;
@@ -177,7 +184,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         if (PngBitmap.TryDecode(sourcePng, out var source)
             && PngBitmap.TryDecode(currentPng, out var current)
             && source.TryCrop(visual.Region, out var crop)
-            && current.TryFindBestExact(crop, PreferredTopLeft(visual.Region), out var point))
+            && current.TryFindBestExact(crop, PreferredTopLeft(visual.Region), ct, out var point))
         {
             var (offsetX, offsetY) = ResolveClickOffset(visual, crop.Width, crop.Height);
             hit = new LocatedTarget
@@ -202,6 +209,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
 
     private async Task<LocatedTarget?> LocateOcrTextAsync(
         ISandbox sandbox,
+        byte[] currentPng,
         TraceVisualDescriptor visual,
         ReplayOptions options,
         CancellationToken ct)
@@ -221,7 +229,18 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             Accessibility = new TraceAccessibilityDescriptor { Name = visual.OcrText },
         };
         hit = await _accessibilityLocator.LocateAsync(sandbox, descriptor, options, ct).ConfigureAwait(false);
-        return hit is null ? null : hit with { Source = "visual-ocr-tree" };
+        if (hit is not null) return hit with { Source = "visual-ocr-tree" };
+
+        return await _ocrLocator.LocateTextAsync(sandbox, currentPng, visual, ct).ConfigureAwait(false);
+    }
+
+    private static bool HasAnyVisualSignal(TraceVisualDescriptor visual)
+    {
+        var region = visual.Region;
+        return region.Width > 0 && region.Height > 0
+            || visual.TemplatePng is { Length: > 0 }
+            || visual.SourceScreenshotPng is { Length: > 0 }
+            || !string.IsNullOrWhiteSpace(visual.OcrText);
     }
 
     private static LocatedTarget FromRegion(TraceVisualDescriptor visual, string source, double confidence)
@@ -251,19 +270,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         return (offsetX, offsetY);
     }
 
-    private static int IndexOf(byte[] haystack, byte[] needle)
-    {
-        if (needle.Length == 0) return 0;
-        if (needle.Length > haystack.Length) return -1;
-        for (var i = 0; i <= haystack.Length - needle.Length; i++)
-        {
-            if (haystack.AsSpan(i, needle.Length).SequenceEqual(needle))
-                return i;
-        }
-        return -1;
-    }
-
-    private sealed class PngBitmap
+    internal sealed class PngBitmap
     {
         private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
         private const int MaxCompressedPngBytes = 64 * 1024 * 1024;
@@ -281,6 +288,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
 
         public int Width { get; }
         public int Height { get; }
+        public int PixelCount => Width * Height;
 
         public static bool TryDecode(byte[] png, out PngBitmap bitmap)
         {
@@ -320,21 +328,40 @@ public sealed class VisualSignatureElementLocator : IElementLocator
         public bool TryFindBestExact(
             PngBitmap template,
             (int X, int Y)? preferredTopLeft,
+            CancellationToken ct,
             out (int X, int Y) point)
         {
             point = default;
             if (template.Width <= 0 || template.Height <= 0) return false;
             if (template.Width > Width || template.Height > Height) return false;
 
+            if (preferredTopLeft is { } preferred
+                && MatchesAt(template, preferred.X, preferred.Y, ct))
+            {
+                point = preferred;
+                return true;
+            }
+
+            if (template.PixelCount > MaxExactTemplatePixels) return false;
+            var candidatePositions = ((long)Width - template.Width + 1) * (Height - template.Height + 1);
+            if (candidatePositions > MaxExactSearchPositions) return false;
+            if (template.PixelCount > MaxLowEntropyTemplatePixels
+                && template.HasLowSampledColorDiversity(MaxLowEntropyDistinctColors))
+            {
+                return false;
+            }
+
             var found = false;
             var ambiguous = false;
             var bestScore = long.MaxValue;
             for (var y = 0; y <= Height - template.Height; y++)
             {
+                ct.ThrowIfCancellationRequested();
                 for (var x = 0; x <= Width - template.Width; x++)
                 {
-                    if (!MatchesAt(template, x, y)) continue;
-                    if (preferredTopLeft is not { } preferred)
+                    if (!LikelyMatchAt(template, x, y)) continue;
+                    if (!MatchesAt(template, x, y, ct)) continue;
+                    if (preferredTopLeft is not { } target)
                     {
                         if (found) return false;
                         point = (x, y);
@@ -342,7 +369,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
                         continue;
                     }
 
-                    var score = DistanceSquared(x, y, preferred.X, preferred.Y);
+                    var score = DistanceSquared(x, y, target.X, target.Y);
                     if (score < bestScore)
                     {
                         point = (x, y);
@@ -360,7 +387,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             return found && !ambiguous;
         }
 
-        public bool MatchesAt(PngBitmap template, int x, int y)
+        public bool MatchesAt(PngBitmap template, int x, int y, CancellationToken ct = default)
         {
             if (x < 0 || y < 0) return false;
             if (template.Width <= 0 || template.Height <= 0) return false;
@@ -369,10 +396,49 @@ public sealed class VisualSignatureElementLocator : IElementLocator
             var rowBytes = template.Width * 3;
             for (var ty = 0; ty < template.Height; ty++)
             {
+                if ((ty & 0x3F) == 0) ct.ThrowIfCancellationRequested();
                 var source = (((y + ty) * Width) + x) * 3;
                 var target = ty * rowBytes;
                 if (!_rgb.AsSpan(source, rowBytes).SequenceEqual(template._rgb.AsSpan(target, rowBytes)))
                     return false;
+            }
+            return true;
+        }
+
+        public bool HasSamePixelsAs(PngBitmap other)
+        {
+            if (other.Width != Width || other.Height != Height) return false;
+            return _rgb.AsSpan().SequenceEqual(other._rgb);
+        }
+
+        private bool LikelyMatchAt(PngBitmap template, int x, int y)
+        {
+            return PixelMatches(template, x, y, 0, 0)
+                && PixelMatches(template, x + template.Width - 1, y, template.Width - 1, 0)
+                && PixelMatches(template, x, y + template.Height - 1, 0, template.Height - 1)
+                && PixelMatches(template, x + template.Width - 1, y + template.Height - 1, template.Width - 1, template.Height - 1);
+        }
+
+        private bool PixelMatches(PngBitmap template, int x, int y, int tx, int ty)
+        {
+            var source = ((y * Width) + x) * 3;
+            var target = ((ty * template.Width) + tx) * 3;
+            return _rgb[source] == template._rgb[target]
+                && _rgb[source + 1] == template._rgb[target + 1]
+                && _rgb[source + 2] == template._rgb[target + 2];
+        }
+
+        private bool HasLowSampledColorDiversity(int maxDistinctColors)
+        {
+            var distinct = new HashSet<int>();
+            var pixelCount = PixelCount;
+            var step = Math.Max(1, pixelCount / 4096);
+            for (var pixel = 0; pixel < pixelCount; pixel += step)
+            {
+                var offset = pixel * 3;
+                var color = (_rgb[offset] << 16) | (_rgb[offset + 1] << 8) | _rgb[offset + 2];
+                distinct.Add(color);
+                if (distinct.Count > maxDistinctColors) return false;
             }
             return true;
         }

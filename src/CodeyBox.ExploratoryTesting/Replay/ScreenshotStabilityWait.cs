@@ -5,10 +5,10 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// <summary>
 /// Default <see cref="IVisualWait"/>: polls
 /// <see cref="ISandbox.GetScreenshotAsync"/> at
-/// <see cref="ReplayOptions.VisualWaitPollInterval"/>, comparing PNG bytes
-/// for pixel stability. The screen is "settled" when
+/// <see cref="ReplayOptions.VisualWaitPollInterval"/>, comparing decoded PNG
+/// pixels for stability when possible. The screen is "settled" when
 /// <see cref="ReplayOptions.StableFrameCount"/> consecutive screenshots are
-/// byte-identical, mirroring how a human says "ok the spinner stopped, now
+/// pixel-identical, mirroring how a human says "ok the spinner stopped, now
 /// I can read it."
 ///
 /// <para>When a <c>predicate</c> is supplied it is the expected-state gate:
@@ -16,10 +16,10 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 /// polling until the expected state appears or the deadline expires. Without a
 /// predicate, stability alone is sufficient.</para>
 ///
-/// <para>Byte-equality is intentionally conservative: a single pixel of
-/// noise restarts the stable count. That's what we want — the cursor blink
-/// is the canonical false positive a softer "near equal" metric would
-/// accept, and accepting it is how you build a flaky test suite.</para>
+/// <para>Pixel-equality is intentionally conservative: a single pixel of
+/// noise restarts the stable count. PNGs that cannot be decoded fall back to
+/// byte equality so non-PNG fakes used by tests still get deterministic wait
+/// behavior.</para>
 ///
 /// <para>On deadline expiry the wait returns <c>null</c>: a screen that
 /// never settles (a continuous animation / never-ending load) is a real
@@ -37,7 +37,7 @@ public sealed class ScreenshotStabilityWait : IVisualWait
 
     public async Task<byte[]?> WaitAsync(
         ISandbox sandbox,
-        Func<byte[], bool>? predicate,
+        Func<byte[], CancellationToken, Task<bool>>? predicate,
         ReplayOptions options,
         CancellationToken ct)
     {
@@ -52,30 +52,14 @@ public sealed class ScreenshotStabilityWait : IVisualWait
         {
             ct.ThrowIfCancellationRequested();
 
-            byte[]? current;
-            try
-            {
-                current = await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception)
-            {
-                // Screenshot acquisition can hiccup on graphical sandboxes (window
-                // not yet mapped, transient framebuffer error). The wait absorbs
-                // those by counting them as "no frame this poll" — the deadline
-                // path below will still surface a sustained failure as null.
-                current = null;
-            }
+            var current = await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
 
             if (current is not null)
             {
-                if (predicate is not null && predicate(current))
+                if (predicate is not null && await predicate(current, ct).ConfigureAwait(false))
                     return current;
 
-                if (previous is not null && ByteSpansEqual(previous, current))
+                if (previous is not null && ScreenshotsRepresentSamePixels(previous, current))
                 {
                     // Account for both the current frame and the prior frame —
                     // a "2 consecutive identical screenshots" requirement is
@@ -100,8 +84,14 @@ public sealed class ScreenshotStabilityWait : IVisualWait
         }
     }
 
-    private static bool ByteSpansEqual(byte[] a, byte[] b)
+    private static bool ScreenshotsRepresentSamePixels(byte[] a, byte[] b)
     {
+        if (VisualSignatureElementLocator.PngBitmap.TryDecode(a, out var left)
+            && VisualSignatureElementLocator.PngBitmap.TryDecode(b, out var right))
+        {
+            return left.HasSamePixelsAs(right);
+        }
+
         if (a.Length != b.Length) return false;
         return a.AsSpan().SequenceEqual(b);
     }

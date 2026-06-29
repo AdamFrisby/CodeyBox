@@ -25,7 +25,7 @@ public interface IVisualWait
     /// </summary>
     Task<byte[]?> WaitAsync(
         ISandbox sandbox,
-        Func<byte[], bool>? predicate,
+        Func<byte[], CancellationToken, Task<bool>>? predicate,
         ReplayOptions options,
         CancellationToken ct);
 }

@@ -177,6 +177,9 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         {
             try
             {
+                if (IsOcrLocatedTarget(current))
+                    return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
+
                 var snap = await sandbox.GetAccessibilityAtPointAsync(current.CenterX, current.CenterY, ct)
                     .ConfigureAwait(false);
                 if (snap is not null)
@@ -227,7 +230,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         TraceTargetDescriptor descriptor,
         CancellationToken ct)
     {
-        if (current.Source == "visual-ocr-tree")
+        if (IsOcrLocatedTarget(current))
             return VisualTargetVerificationStatus.Verified;
 
         byte[] screenshot;
@@ -250,6 +253,9 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 
     private static bool InViewport(LocatedTarget t, ReplayOptions o) =>
         t.CenterX >= 0 && t.CenterX < o.ScreenWidth && t.CenterY >= 0 && t.CenterY < o.ScreenHeight;
+
+    private static bool IsOcrLocatedTarget(LocatedTarget target) =>
+        target.Source is "visual-ocr-tree" or "visual-ocr";
 
     private static (int Dx, int Dy) ResolveScrollDelta(LocatedTarget t, ReplayOptions o)
     {

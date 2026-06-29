@@ -176,7 +176,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
         {
             using var doc = JsonDocument.Parse(json);
             var candidates = new List<LocatedTarget>();
-            SearchTree(doc.RootElement, expected, candidates, ct);
+            SearchTree(doc.RootElement, expected, visual, candidates, ct);
             return SelectTreeCandidate(candidates, visual);
         }
         catch (JsonException)
@@ -188,6 +188,7 @@ public sealed class AccessibilityElementLocator : IElementLocator
     private void SearchTree(
         JsonElement element,
         TraceAccessibilityDescriptor expected,
+        TraceVisualDescriptor visual,
         List<LocatedTarget> candidates,
         CancellationToken ct)
     {
@@ -197,10 +198,11 @@ public sealed class AccessibilityElementLocator : IElementLocator
             var snap = SnapshotFromObject(element);
             if (_matcher.Matches(snap, expected) && TryReadBounds(element, out var region))
             {
+                var (cx, cy) = RecordedClickPointForCurrentBounds(visual, region);
                 candidates.Add(new LocatedTarget
                 {
-                    CenterX = region.X + region.Width / 2,
-                    CenterY = region.Y + region.Height / 2,
+                    CenterX = cx,
+                    CenterY = cy,
                     Region = region,
                     Source = "accessibility-tree",
                     Confidence = 1.0,
@@ -209,14 +211,14 @@ public sealed class AccessibilityElementLocator : IElementLocator
 
             foreach (var property in element.EnumerateObject())
             {
-                SearchTree(property.Value, expected, candidates, ct);
+                SearchTree(property.Value, expected, visual, candidates, ct);
             }
         }
         else if (element.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in element.EnumerateArray())
             {
-                SearchTree(item, expected, candidates, ct);
+                SearchTree(item, expected, visual, candidates, ct);
             }
         }
     }
@@ -263,6 +265,19 @@ public sealed class AccessibilityElementLocator : IElementLocator
         var y = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
             ? region.Y + offsetY
             : region.Y + region.Height / 2;
+        return (x, y);
+    }
+
+    private static (int X, int Y) RecordedClickPointForCurrentBounds(
+        TraceVisualDescriptor visual,
+        TraceBoundingRegion currentBounds)
+    {
+        var x = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < currentBounds.Width
+            ? currentBounds.X + offsetX
+            : currentBounds.X + currentBounds.Width / 2;
+        var y = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < currentBounds.Height
+            ? currentBounds.Y + offsetY
+            : currentBounds.Y + currentBounds.Height / 2;
         return (x, y);
     }
 

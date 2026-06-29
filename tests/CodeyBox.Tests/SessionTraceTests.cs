@@ -571,6 +571,26 @@ public sealed class SessionTraceTests
     }
 
     [Fact]
+    public async Task RecordingBridge_ClampsRegionAtScreenshotRightAndBottomEdges()
+    {
+        var png = BuildPngHeader(width: 200, height: 100);
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new RecordingGraphicalSandbox(png);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 190, Y = 95 });
+
+        var visual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
+        Assert.Equal(140, visual.Region.X);
+        Assert.Equal(45, visual.Region.Y);
+        Assert.Equal(60, visual.Region.Width);
+        Assert.Equal(55, visual.Region.Height);
+        Assert.Equal(50, visual.ClickOffsetX);
+        Assert.Equal(50, visual.ClickOffsetY);
+    }
+
+    [Fact]
     public async Task RecordingBridge_HandlesScreenshotFailureGracefully()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
@@ -705,6 +725,28 @@ public sealed class SessionTraceTests
         public FrozenTimeProvider(DateTimeOffset now) => _now = now;
 
         public override DateTimeOffset GetUtcNow() => _now;
+    }
+
+    private static byte[] BuildPngHeader(int width, int height)
+    {
+        var png = new byte[24];
+        ReadOnlySpan<byte> signature = [137, 80, 78, 71, 13, 10, 26, 10];
+        signature.CopyTo(png);
+        png[12] = (byte)'I';
+        png[13] = (byte)'H';
+        png[14] = (byte)'D';
+        png[15] = (byte)'R';
+        WriteBigEndianInt32(png.AsSpan(16, 4), width);
+        WriteBigEndianInt32(png.AsSpan(20, 4), height);
+        return png;
+    }
+
+    private static void WriteBigEndianInt32(Span<byte> target, int value)
+    {
+        target[0] = (byte)(value >> 24);
+        target[1] = (byte)(value >> 16);
+        target[2] = (byte)(value >> 8);
+        target[3] = (byte)value;
     }
 
     private sealed class RecordingGraphicalSandbox : ISandbox
