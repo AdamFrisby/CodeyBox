@@ -58,7 +58,8 @@ public sealed class ReplayEngine
         IAssertionVerifier? assertions = null,
         ILocatorHealer? healer = null,
         IAccessibilityMatcher? accessibilityMatcher = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IOcrTextLocator? ocrTextLocator = null)
     {
         _bridgeFactory = bridgeFactory ?? (() => new ComputerUseBridge());
         var matcher = accessibilityMatcher ?? DefaultAccessibilityMatcher.Instance;
@@ -69,7 +70,9 @@ public sealed class ReplayEngine
         // locators plug into the same chain via CompositeElementLocator.
         _locator = locator ?? new CompositeElementLocator(
             new AccessibilityElementLocator(matcher),
-            new VisualSignatureElementLocator(matcher));
+            new VisualSignatureElementLocator(
+                new AccessibilityElementLocator(matcher),
+                ocrTextLocator));
         _reachability = reachability;
         _visualWait = visualWait ?? new ScreenshotStabilityWait(timeProvider);
         _assertions = assertions ?? new DefaultAssertionVerifier();
@@ -187,6 +190,15 @@ public sealed class ReplayEngine
                 locatedTarget: null,
                 ct).ConfigureAwait(false);
         }
+        if (IsTargetlessScrollAction(action))
+        {
+            return await FailAsync(
+                sandbox, entry,
+                ReplayFailureKind.NotFound,
+                $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): scroll input has no target descriptor; replay refuses to send a blind wheel event at the current pointer",
+                locatedTarget: null,
+                ct).ConfigureAwait(false);
+        }
 
         if (NeedsLocator(action))
         {
@@ -194,12 +206,6 @@ public sealed class ReplayEngine
             {
                 located = await _locator.LocateAsync(sandbox, effectiveDescriptor, options, ct)
                     .ConfigureAwait(false);
-                if (located is null)
-                {
-                    located = await TryLocateAfterHumanScrollAsync(
-                            sandbox, bridge, effectiveDescriptor, options, ct)
-                        .ConfigureAwait(false);
-                }
             }
             catch (OperationCanceledException)
             {
@@ -569,8 +575,8 @@ public sealed class ReplayEngine
                 Y = located.CenterY,
             },
             "scroll" => BuildScrollRequest(action, located),
-            "key" => BuildTargetedKeyRequest(action, located),
-            "type" => BuildTargetedTypeRequest(action, located),
+            "key" => BuildTargetedKeyRequest(action),
+            "type" => BuildTargetedTypeRequest(action),
             "events" => new ComputerUseRequest
             {
                 Action = "events",
@@ -580,79 +586,24 @@ public sealed class ReplayEngine
         };
     }
 
-    private static ComputerUseRequest BuildTargetedKeyRequest(TraceAction action, LocatedTarget? located)
+    private static ComputerUseRequest BuildTargetedKeyRequest(TraceAction action)
     {
         var key = FirstKey(action.InputEvents);
-        if (located is null)
-        {
-            return new ComputerUseRequest
-            {
-                Action = "key",
-                Key = key,
-            };
-        }
-
         return new ComputerUseRequest
         {
-            Action = "events",
-            Events =
-            [
-                new SandboxInputEvent
-                {
-                    Type = SandboxInputEventType.Move,
-                    X = located.CenterX,
-                    Y = located.CenterY,
-                },
-                new SandboxInputEvent
-                {
-                    Type = SandboxInputEventType.Click,
-                    X = located.CenterX,
-                    Y = located.CenterY,
-                },
-                new SandboxInputEvent
-                {
-                    Type = SandboxInputEventType.Key,
-                    Key = key,
-                },
-            ],
+            Action = "key",
+            Key = key,
+            IsGlobalInput = action.IsGlobalInput,
         };
     }
 
-    private static ComputerUseRequest BuildTargetedTypeRequest(TraceAction action, LocatedTarget? located)
+    private static ComputerUseRequest BuildTargetedTypeRequest(TraceAction action)
     {
         var text = FirstText(action.InputEvents);
-        if (located is null)
-        {
-            return new ComputerUseRequest
-            {
-                Action = "type",
-                Text = text,
-            };
-        }
-
         return new ComputerUseRequest
         {
-            Action = "events",
-            Events =
-            [
-                new SandboxInputEvent
-                {
-                    Type = SandboxInputEventType.Move,
-                    X = located.CenterX,
-                    Y = located.CenterY,
-                },
-                new SandboxInputEvent
-                {
-                    Type = SandboxInputEventType.Click,
-                    X = located.CenterX,
-                    Y = located.CenterY,
-                },
-                new SandboxInputEvent
-                {
-                    Type = SandboxInputEventType.Type,
-                    Text = text,
-                },
-            ],
+            Action = "type",
+            Text = text,
         };
     }
 
@@ -764,65 +715,6 @@ public sealed class ReplayEngine
         return result;
     }
 
-    private async Task<LocatedTarget?> TryLocateAfterHumanScrollAsync(
-        ISandbox sandbox,
-        ComputerUseBridge bridge,
-        TraceTargetDescriptor descriptor,
-        ReplayOptions options,
-        CancellationToken ct)
-    {
-        if (!HasVisualSearchSignal(descriptor.Visual) || options.MaxScrollAttempts <= 0)
-            return null;
-
-        for (var attempt = 0; attempt < options.MaxScrollAttempts; attempt++)
-        {
-            var scroll = BuildVisualSearchScrollRequest(descriptor.Visual, options);
-            await bridge.ExecuteAsync(sandbox, scroll, ct).ConfigureAwait(false);
-            var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct)
-                .ConfigureAwait(false);
-            if (settled is null) return null;
-
-            var relocated = await _locator.LocateAsync(sandbox, descriptor, options, ct)
-                .ConfigureAwait(false);
-            if (relocated is not null) return relocated;
-        }
-
-        return null;
-    }
-
-    private static bool HasVisualSearchSignal(TraceVisualDescriptor visual) =>
-        visual.TemplatePng is { Length: > 0 }
-        || visual.SourceScreenshotPng is { Length: > 0 }
-        || !string.IsNullOrWhiteSpace(visual.OcrText);
-
-    private static ComputerUseRequest BuildVisualSearchScrollRequest(
-        TraceVisualDescriptor visual,
-        ReplayOptions options)
-    {
-        var (x, y) = RecordedClickPoint(visual);
-        if (y < 0) return new ComputerUseRequest { Action = "scroll", ScrollY = -options.ScrollStep };
-        if (y >= options.ScreenHeight) return new ComputerUseRequest { Action = "scroll", ScrollY = options.ScrollStep };
-        if (x < 0) return new ComputerUseRequest { Action = "scroll", ScrollX = -options.ScrollStep };
-        if (x >= options.ScreenWidth) return new ComputerUseRequest { Action = "scroll", ScrollX = options.ScrollStep };
-        return new ComputerUseRequest
-        {
-            Action = "scroll",
-            ScrollY = options.ScrollStep,
-        };
-    }
-
-    private static (int X, int Y) RecordedClickPoint(TraceVisualDescriptor visual)
-    {
-        var region = visual.Region;
-        var x = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < region.Width
-            ? region.X + offsetX
-            : region.X + region.Width / 2;
-        var y = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
-            ? region.Y + offsetY
-            : region.Y + region.Height / 2;
-        return (x, y);
-    }
-
     private static (int X, int Y)? FindAnchor(IReadOnlyList<SandboxInputEvent> events)
     {
         foreach (var evt in events)
@@ -878,6 +770,10 @@ public sealed class ReplayEngine
     private static bool IsTargetlessKeyboardAction(TraceAction action) =>
         action.Kind is "key" or "type"
         && !action.IsGlobalInput
+        && !HasUsableTargetSignal(action.TargetDescriptor);
+
+    private static bool IsTargetlessScrollAction(TraceAction action) =>
+        action.Kind == "scroll"
         && !HasUsableTargetSignal(action.TargetDescriptor);
 
     private static bool HasUsableTargetSignal(TraceTargetDescriptor descriptor)

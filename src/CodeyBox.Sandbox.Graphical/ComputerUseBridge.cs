@@ -233,6 +233,7 @@ public sealed record ComputerUseRequest
     public int? ScrollY { get; init; }
     public string? Key { get; init; }
     public string? Text { get; init; }
+    public bool IsGlobalInput { get; init; }
     public IReadOnlyList<SandboxInputEvent>? Events { get; init; }
 }
 

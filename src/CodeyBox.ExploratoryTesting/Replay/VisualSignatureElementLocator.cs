@@ -47,7 +47,7 @@ public sealed class VisualSignatureElementLocator : IElementLocator
     {
         _accessibilityLocator = accessibilityLocator
             ?? throw new ArgumentNullException(nameof(accessibilityLocator));
-        _ocrLocator = ocrLocator ?? TesseractOcrTextLocator.Instance;
+        _ocrLocator = ocrLocator ?? NullOcrTextLocator.Instance;
     }
 
     public async Task<LocatedTarget?> LocateAsync(

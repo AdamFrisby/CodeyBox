@@ -165,7 +165,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
             if (snap is null)
             {
                 if (!await HasAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
-                    && await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct).ConfigureAwait(false) == VisualTargetVerificationStatus.Verified)
+                    && await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, allowLocatorEvidence: true, ct).ConfigureAwait(false) == VisualTargetVerificationStatus.Verified)
                 {
                     return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
                 }
@@ -190,7 +190,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 
             if (HasPixelVisualSignal(descriptor.Visual))
             {
-                var visualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct)
+                var visualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, allowLocatorEvidence: false, ct)
                     .ConfigureAwait(false);
                 if (visualStatus != VisualTargetVerificationStatus.Verified)
                 {
@@ -216,22 +216,22 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                     if (TopMostAccessibilityMatchesOcrTarget(snap, descriptor.Visual, current))
                         return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
 
-                    var topMostVisualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct)
+                    var topMostVisualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, allowLocatorEvidence: false, ct)
                         .ConfigureAwait(false);
-                    if (topMostVisualStatus == VisualTargetVerificationStatus.Verified)
-                        return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
 
                     return new ReachabilityOutcome
                     {
                         Status = ReachabilityStatus.Occluded,
                         Target = current,
-                        Diagnostic = topMostVisualStatus == VisualTargetVerificationStatus.Mismatch
-                            ? $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}) and target pixels no longer match the recorded descriptor"
-                            : $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
+                        Diagnostic = topMostVisualStatus == VisualTargetVerificationStatus.Verified
+                            ? $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); target pixels still match but the accessible surface would receive the input"
+                            : topMostVisualStatus == VisualTargetVerificationStatus.Mismatch
+                                ? $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}) and target pixels no longer match the recorded descriptor"
+                                : $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
                     };
                 }
 
-                var visualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, ct)
+                var visualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, allowLocatorEvidence: true, ct)
                     .ConfigureAwait(false);
                 if (visualStatus != VisualTargetVerificationStatus.Verified)
                 {
@@ -271,10 +271,14 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         ISandbox sandbox,
         LocatedTarget current,
         TraceTargetDescriptor descriptor,
+        bool allowLocatorEvidence,
         CancellationToken ct)
     {
-        if ((current.Evidence & (LocatedTargetEvidence.Visual | LocatedTargetEvidence.Ocr)) != 0)
+        if (allowLocatorEvidence
+            && (current.Evidence & (LocatedTargetEvidence.Visual | LocatedTargetEvidence.Ocr)) != 0)
+        {
             return VisualTargetVerificationStatus.Verified;
+        }
 
         byte[] screenshot;
         try

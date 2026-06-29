@@ -107,11 +107,12 @@ public sealed class AccessibilityElementLocator : IElementLocator
                 var match = await ProbeAccessibilityAsync(sandbox, px, py, expected, ct).ConfigureAwait(false);
                 if (match is not null)
                 {
+                    var shiftedRegion = ShiftRegionToPoint(region, cx, cy, px, py);
                     return new LocatedTarget
                     {
                         CenterX = px,
                         CenterY = py,
-                        Region = region,
+                        Region = shiftedRegion,
                         Source = "accessibility-ring",
                         Confidence = RingHitConfidence,
                         Evidence = LocatedTargetEvidence.Accessibility,
@@ -244,6 +245,20 @@ public sealed class AccessibilityElementLocator : IElementLocator
             : region.Y + region.Height / 2;
         return (x, y);
     }
+
+    private static TraceBoundingRegion ShiftRegionToPoint(
+        TraceBoundingRegion region,
+        int oldCenterX,
+        int oldCenterY,
+        int newCenterX,
+        int newCenterY)
+        => new()
+        {
+            X = region.X + newCenterX - oldCenterX,
+            Y = region.Y + newCenterY - oldCenterY,
+            Width = region.Width,
+            Height = region.Height,
+        };
 
     private static (int X, int Y) RecordedClickPointForCurrentBounds(
         TraceVisualDescriptor visual,

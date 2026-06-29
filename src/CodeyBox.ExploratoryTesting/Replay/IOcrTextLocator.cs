@@ -15,6 +15,18 @@ public interface IOcrTextLocator
         CancellationToken ct);
 }
 
+internal sealed class NullOcrTextLocator : IOcrTextLocator
+{
+    public static NullOcrTextLocator Instance { get; } = new();
+
+    public Task<LocatedTarget?> LocateTextAsync(
+        ISandbox sandbox,
+        byte[] currentScreenshotPng,
+        TraceVisualDescriptor visual,
+        CancellationToken ct)
+        => Task.FromResult<LocatedTarget?>(null);
+}
+
 internal sealed class TesseractOcrTextLocator : IOcrTextLocator
 {
     public static TesseractOcrTextLocator Instance { get; } = new();
@@ -61,18 +73,25 @@ internal sealed class TesseractOcrTextLocator : IOcrTextLocator
         if (!result.Success || string.IsNullOrWhiteSpace(result.Stdout))
             return null;
 
-        return TryLocateFromTsv(result.Stdout, expected);
+        return TryLocateFromTsv(result.Stdout, expected, visual);
     }
 
     internal static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText)
+        => TryLocateFromTsv(tsv, expectedText, visual: null);
+
+    internal static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText, TraceVisualDescriptor? visual)
     {
         var rows = ParseRows(tsv);
         if (rows.Count == 0) return null;
 
+        var matches = new List<TraceBoundingRegion>();
         for (var i = 0; i < rows.Count; i++)
         {
             if (TextMatches(rows[i].Text, expectedText))
-                return FromRow(rows[i]);
+            {
+                matches.Add(rows[i].Bounds);
+                continue;
+            }
 
             var union = rows[i].Bounds;
             var combined = rows[i].Text;
@@ -81,11 +100,15 @@ internal sealed class TesseractOcrTextLocator : IOcrTextLocator
                 combined += " " + rows[j].Text;
                 union = Union(union, rows[j].Bounds);
                 if (TextMatches(combined, expectedText))
-                    return FromBounds(union);
+                    matches.Add(union);
             }
         }
 
-        return null;
+        if (matches.Count == 0) return null;
+        if (matches.Count == 1) return FromBounds(matches[0]);
+
+        var disambiguated = DisambiguateByRecordedRegion(matches, visual);
+        return disambiguated is null ? null : FromBounds(disambiguated);
     }
 
     private static List<OcrRow> ParseRows(string tsv)
@@ -136,8 +159,6 @@ internal sealed class TesseractOcrTextLocator : IOcrTextLocator
     private static bool TextMatches(string actual, string expected)
         => actual.Contains(expected, StringComparison.OrdinalIgnoreCase);
 
-    private static LocatedTarget FromRow(OcrRow row) => FromBounds(row.Bounds);
-
     private static LocatedTarget FromBounds(TraceBoundingRegion region) => new()
     {
         CenterX = region.X + region.Width / 2,
@@ -161,6 +182,58 @@ internal sealed class TesseractOcrTextLocator : IOcrTextLocator
             Width = x2 - x1,
             Height = y2 - y1,
         };
+    }
+
+    private static TraceBoundingRegion? DisambiguateByRecordedRegion(
+        IReadOnlyList<TraceBoundingRegion> matches,
+        TraceVisualDescriptor? visual)
+    {
+        var recorded = visual?.Region;
+        if (recorded is not { Width: > 0, Height: > 0 }) return null;
+
+        TraceBoundingRegion? best = null;
+        long bestDistance = long.MaxValue;
+        var tied = false;
+        foreach (var match in matches)
+        {
+            if (!Intersects(Expand(recorded, recorded.Width, recorded.Height), match))
+                continue;
+
+            var distance = SquaredCenterDistance(recorded, match);
+            if (distance < bestDistance)
+            {
+                best = match;
+                bestDistance = distance;
+                tied = false;
+            }
+            else if (distance == bestDistance)
+            {
+                tied = true;
+            }
+        }
+
+        return tied ? null : best;
+    }
+
+    private static TraceBoundingRegion Expand(TraceBoundingRegion region, int xPadding, int yPadding) => new()
+    {
+        X = region.X - Math.Max(0, xPadding),
+        Y = region.Y - Math.Max(0, yPadding),
+        Width = region.Width + Math.Max(0, xPadding) * 2,
+        Height = region.Height + Math.Max(0, yPadding) * 2,
+    };
+
+    private static bool Intersects(TraceBoundingRegion left, TraceBoundingRegion right)
+        => left.X < right.X + right.Width
+            && right.X < left.X + left.Width
+            && left.Y < right.Y + right.Height
+            && right.Y < left.Y + left.Height;
+
+    private static long SquaredCenterDistance(TraceBoundingRegion left, TraceBoundingRegion right)
+    {
+        var dx = (long)(left.X + left.Width / 2) - (right.X + right.Width / 2);
+        var dy = (long)(left.Y + left.Height / 2) - (right.Y + right.Height / 2);
+        return dx * dx + dy * dy;
     }
 
     private sealed record OcrRow(string Text, TraceBoundingRegion Bounds);

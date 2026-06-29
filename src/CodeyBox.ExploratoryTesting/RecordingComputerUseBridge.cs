@@ -176,6 +176,7 @@ public sealed class RecordingComputerUseBridge
                 InputEvents = events,
                 Kind = canonicalAction,
                 TargetDescriptor = targetDescriptor,
+                IsGlobalInput = ShouldRecordGlobalInput(request, canonicalAction, events, targetDescriptor),
             },
             Observation = new TraceObservation
             {
@@ -276,7 +277,7 @@ public sealed class RecordingComputerUseBridge
         else
         {
             if (_lastTargetDescriptor is { } last
-                && action is "key" or "type"
+                && action is "key" or "type" or "scroll"
                 && HasUsableTargetDescriptor(last))
             {
                 return last with
@@ -359,6 +360,20 @@ public sealed class RecordingComputerUseBridge
         return events.Any(e => e.Type == SandboxInputEventType.Key && KeyMayMoveFocus(e.Key));
     }
 
+    private static bool ShouldRecordGlobalInput(
+        ComputerUseRequest request,
+        string action,
+        IReadOnlyList<SandboxInputEvent> events,
+        TraceTargetDescriptor targetDescriptor)
+    {
+        if (request.IsGlobalInput)
+            return action is "key" or "events" && events.Any(e => e.Type == SandboxInputEventType.Key);
+
+        return action == "key"
+            && !HasUsableTargetDescriptor(targetDescriptor)
+            && events.Any(e => e.Type == SandboxInputEventType.Key && !string.IsNullOrWhiteSpace(e.Key));
+    }
+
     private static bool KeyMayMoveFocus(string? key)
     {
         if (string.IsNullOrWhiteSpace(key)) return false;
@@ -371,13 +386,7 @@ public sealed class RecordingComputerUseBridge
             || normalized.Contains("arrow", StringComparison.Ordinal)
             || normalized is "up" or "down" or "left" or "right"
             || normalized.Contains("pageup", StringComparison.Ordinal)
-            || normalized.Contains("pagedown", StringComparison.Ordinal)
-            || normalized.Contains("ctrl", StringComparison.Ordinal)
-            || normalized.Contains("control", StringComparison.Ordinal)
-            || normalized.Contains("alt", StringComparison.Ordinal)
-            || normalized.Contains("meta", StringComparison.Ordinal)
-            || normalized.Contains("cmd", StringComparison.Ordinal)
-            || normalized.Contains("super", StringComparison.Ordinal);
+            || normalized.Contains("pagedown", StringComparison.Ordinal);
     }
 
     private static bool TryReadPngDimensions(byte[]? png, out int width, out int height)

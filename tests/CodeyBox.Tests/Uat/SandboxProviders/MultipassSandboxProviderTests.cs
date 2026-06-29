@@ -327,6 +327,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
         Assert.Contains("tesseract-ocr tesseract-ocr-eng", cloudInit);
+        Assert.Contains("at-spi2-core python3-pyatspi", cloudInit);
         Assert.True(
             cloudInit.IndexOf("systemctl enable --now codeybox-route.service", StringComparison.Ordinal)
             < cloudInit.IndexOf("apt-get update", StringComparison.Ordinal),
@@ -410,8 +411,57 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Task.FromResult(new ProcessRunResult(0, "", "")));
 
         await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetScreenshotAsync());
+        await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetAccessibilityAtPointAsync(10, 20));
+        await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetAccessibilityTreeJsonAsync());
         await Assert.ThrowsAsync<NotSupportedException>(() =>
             sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = SandboxInputEventType.Click }]));
+    }
+
+    [Fact]
+    public async Task GetAccessibilityAtPointAsync_GraphicalSandboxRunsPyAtSpiProbe()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(
+                0,
+                "{\"role\":\"push button\",\"name\":\"Save\",\"text\":\"Save\",\"elementType\":\"push button\"}",
+                "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var snapshot = await sandbox.GetAccessibilityAtPointAsync(12, 34);
+
+        Assert.NotNull(snapshot);
+        Assert.Equal("push button", snapshot.Role);
+        Assert.Equal("Save", snapshot.Name);
+        Assert.Equal("Save", snapshot.Text);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
+        Assert.Contains($"DISPLAY={SandboxConventions.GraphicalDisplay}", call.Argv);
+        Assert.Contains("CODEYBOX_AX_X=12", call.Argv);
+        Assert.Contains("CODEYBOX_AX_Y=34", call.Argv);
+        var command = string.Join("\n", call.Argv);
+        Assert.Contains("python3", command);
+        Assert.Contains("pyatspi", command);
+    }
+
+    [Fact]
+    public async Task GetAccessibilityTreeJsonAsync_GraphicalSandboxRunsPyAtSpiProbe()
+    {
+        const string treeJson = "{\"children\":[{\"role\":\"frame\",\"name\":\"JobTrack\",\"text\":null,\"elementType\":\"frame\"}]}";
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(0, treeJson, "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var tree = await sandbox.GetAccessibilityTreeJsonAsync();
+
+        Assert.Equal(treeJson, tree);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
+        Assert.Contains($"DISPLAY={SandboxConventions.GraphicalDisplay}", call.Argv);
+        var command = string.Join("\n", call.Argv);
+        Assert.Contains("python3", command);
+        Assert.Contains("pyatspi", command);
     }
 
     [Fact]

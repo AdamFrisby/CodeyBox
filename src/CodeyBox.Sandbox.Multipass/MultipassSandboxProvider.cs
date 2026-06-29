@@ -3853,7 +3853,7 @@ test "$work" = present && test "$exec_wrapper" = present
         set -eux
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat tesseract-ocr tesseract-ocr-eng
+        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat tesseract-ocr tesseract-ocr-eng at-spi2-core python3-pyatspi
         systemctl daemon-reload
         systemctl enable codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
         systemctl restart codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
@@ -5238,8 +5238,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
-    internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
+internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
     internal const int ResourceMetricsCaptureMaxStderrBytes = 4096;
+    internal const int MaxAccessibilityJsonStdoutBytes = 2 * 1024 * 1024;
+    internal const int MaxAccessibilityStderrBytes = 64 * 1024;
     internal const int AgentOutputHttpSetupFailedExitCode = 86;
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
@@ -5260,6 +5262,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+    private static readonly JsonSerializerOptions AccessibilityJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
 
     internal delegate Task<MultipassAgentOutputHttpIngestSession?> AgentOutputHttpIngestSessionStarter(
         System.Net.IPAddress bindAddress,
@@ -5729,6 +5735,71 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         => bytes.Length >= PngSignature.Length
             && bytes.AsSpan(0, PngSignature.Length).SequenceEqual(PngSignature);
 
+    public async Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        var result = await ExecRunAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "bash", "-lc",
+                "DISPLAY=:0 python3 - <<'PY'\n" + MultipassAccessibilityAtPointPython + "\nPY\n",
+            ],
+            ExtraEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["CODEYBOX_AX_X"] = x.ToString(CultureInfo.InvariantCulture),
+                ["CODEYBOX_AX_Y"] = y.ToString(CultureInfo.InvariantCulture),
+            },
+            WorkingDirectory = _spec.WorkingDirectory,
+        }, ct, maxStdoutBytes: MaxAccessibilityJsonStdoutBytes, maxStderrBytes: MaxAccessibilityStderrBytes);
+
+        if (!result.Success || result.StdoutLimitExceeded || result.StderrLimitExceeded)
+            return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<SandboxAccessibilitySnapshot?>(result.Stdout, AccessibilityJsonOptions);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    public async Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        var result = await ExecRunAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "bash", "-lc",
+                "DISPLAY=:0 python3 - <<'PY'\n" + MultipassAccessibilityTreePython + "\nPY\n",
+            ],
+            WorkingDirectory = _spec.WorkingDirectory,
+        }, ct, maxStdoutBytes: MaxAccessibilityJsonStdoutBytes, maxStderrBytes: MaxAccessibilityStderrBytes);
+
+        if (!result.Success
+            || result.StdoutLimitExceeded
+            || result.StderrLimitExceeded
+            || string.IsNullOrWhiteSpace(result.Stdout))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(result.Stdout);
+            if (doc.RootElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                return null;
+            return result.Stdout;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
     {
         EnsureGraphical();
@@ -5791,6 +5862,162 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 throw new ArgumentOutOfRangeException(nameof(inputEvent), inputEvent.Type, "Unknown input event type.");
         }
     }
+
+    private const string MultipassAccessibilityAtPointPython =
+        """
+        import os
+        import json
+        import sys
+
+        try:
+            import pyatspi
+        except Exception:
+            print("null")
+            sys.exit(0)
+
+        target_x = int(os.environ.get("CODEYBOX_AX_X", "0"))
+        target_y = int(os.environ.get("CODEYBOX_AX_Y", "0"))
+
+        def safe(call, default=None):
+            try:
+                return call()
+            except Exception:
+                return default
+
+        def text_of(acc):
+            text = safe(lambda: acc.queryText())
+            if text is None:
+                return None
+            count = safe(lambda: text.characterCount, 0) or 0
+            if count <= 0:
+                return None
+            value = safe(lambda: text.getText(0, min(count, 512)), None)
+            return value if value else None
+
+        def bounds_of(acc):
+            component = safe(lambda: acc.queryComponent())
+            if component is None:
+                return None
+            extents = safe(lambda: component.getExtents(pyatspi.DESKTOP_COORDS))
+            if extents is None:
+                return None
+            x, y, width, height = int(extents.x), int(extents.y), int(extents.width), int(extents.height)
+            if width <= 0 or height <= 0:
+                return None
+            return {"x": x, "y": y, "width": width, "height": height}
+
+        def contains(bounds):
+            return (bounds is not None
+                    and target_x >= bounds["x"]
+                    and target_y >= bounds["y"]
+                    and target_x < bounds["x"] + bounds["width"]
+                    and target_y < bounds["y"] + bounds["height"])
+
+        def snapshot(acc):
+            role = safe(lambda: acc.getRoleName())
+            name = safe(lambda: acc.name)
+            return {
+                "role": role,
+                "name": name,
+                "text": text_of(acc),
+                "elementType": role,
+            }
+
+        def walk(acc, best=None):
+            bounds = bounds_of(acc)
+            if contains(bounds):
+                best = acc
+                child_count = safe(lambda: acc.childCount, 0) or 0
+                for index in range(child_count):
+                    child = safe(lambda i=index: acc.getChildAtIndex(i))
+                    if child is not None:
+                        best = walk(child, best)
+            return best
+
+        desktop = safe(lambda: pyatspi.Registry.getDesktop(0))
+        if desktop is None:
+            print("null")
+            sys.exit(0)
+
+        hit = walk(desktop)
+        print(json.dumps(snapshot(hit) if hit is not None else None, separators=(",", ":")))
+        """;
+
+    private const string MultipassAccessibilityTreePython =
+        """
+        import json
+        import sys
+
+        try:
+            import pyatspi
+        except Exception:
+            print("null")
+            sys.exit(0)
+
+        MAX_NODES = 2000
+        count = 0
+
+        def safe(call, default=None):
+            try:
+                return call()
+            except Exception:
+                return default
+
+        def text_of(acc):
+            text = safe(lambda: acc.queryText())
+            if text is None:
+                return None
+            char_count = safe(lambda: text.characterCount, 0) or 0
+            if char_count <= 0:
+                return None
+            value = safe(lambda: text.getText(0, min(char_count, 512)), None)
+            return value if value else None
+
+        def bounds_of(acc):
+            component = safe(lambda: acc.queryComponent())
+            if component is None:
+                return None
+            extents = safe(lambda: component.getExtents(pyatspi.DESKTOP_COORDS))
+            if extents is None:
+                return None
+            x, y, width, height = int(extents.x), int(extents.y), int(extents.width), int(extents.height)
+            if width <= 0 or height <= 0:
+                return None
+            return {"x": x, "y": y, "width": width, "height": height}
+
+        def node(acc):
+            global count
+            count += 1
+            role = safe(lambda: acc.getRoleName())
+            item = {
+                "role": role,
+                "name": safe(lambda: acc.name),
+                "text": text_of(acc),
+                "elementType": role,
+            }
+            bounds = bounds_of(acc)
+            if bounds is not None:
+                item["bounds"] = bounds
+
+            children = []
+            child_count = safe(lambda: acc.childCount, 0) or 0
+            for index in range(child_count):
+                if count >= MAX_NODES:
+                    break
+                child = safe(lambda i=index: acc.getChildAtIndex(i))
+                if child is not None:
+                    children.append(node(child))
+            if children:
+                item["children"] = children
+            return item
+
+        desktop = safe(lambda: pyatspi.Registry.getDesktop(0))
+        if desktop is None:
+            print("null")
+            sys.exit(0)
+
+        print(json.dumps({"children": [node(desktop)]}, separators=(",", ":")))
+        """;
 
     private static IReadOnlyList<string> BuildScrollArgv(List<string> argv, SandboxInputEvent inputEvent)
     {
