@@ -1,13 +1,16 @@
 using System.Diagnostics;
+using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -701,6 +704,118 @@ public sealed class ConflictResolverPipelinePathTests : IDisposable
         var (_, readme, _) = await TestSupport.RunGit(barePath, "show", "main:README.md");
         Assert.Equal("main\nwork\n", readme);
         await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", "feature/conflict-resolver", "main");
+    }
+
+    [Fact]
+    public async Task CleanMergeRecordsProjectChangeScopeTimingMetadata()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace, "seed-clean-change-scope");
+        var timings = new PipelineRunnerTimingTests.RecordingTimingStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            timingStore: timings,
+            mergeScopeResolver: NewMergeScopeResolver(),
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            });
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("feature.txt", "work\n"));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "clean merge change scope",
+            Prompt = "add feature",
+            WorkBranch = "feature/clean-change-scope",
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        var cleanRow = Assert.Single(
+            timings.CompletedRows,
+            r => r.WorkItemId == item.Id && r.Phase == "merge" && r.Step == "git.merge_clean_host");
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, MetadataString(cleanRow, "change_scope"));
+        Assert.Equal("host-clean", MetadataString(cleanRow, "capability"));
+        Assert.DoesNotContain(
+            timings.CompletedRows,
+            r => r.WorkItemId == item.Id && r.Phase == "merge" && r.Step == "agent.exec");
+    }
+
+    [Fact]
+    public async Task ConflictedMergePassesItemChangeScopeToResolverAndTiming()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace, "seed-conflict-change-scope");
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main\n");
+        var timings = new PipelineRunnerTimingTests.RecordingTimingStore();
+        var resolverLog = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(log: resolverLog);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            timingStore: timings,
+            agenticConflictResolver: resolver,
+            mergeScopeResolver: NewMergeScopeResolver(),
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            });
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            Assert.Equal("README.md", file.Path);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main\nwork\n",
+            };
+        });
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "conflicted merge change scope",
+            Prompt = "change README",
+            WorkBranch = "feature/conflict-change-scope",
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+            },
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        var mergeAgentRow = Assert.Single(
+            timings.CompletedRows,
+            r => r.WorkItemId == item.Id && r.Phase == "merge" && r.Step == "agent.exec");
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, MetadataString(mergeAgentRow, "change_scope"));
+
+        var startLog = Assert.Single(
+            resolverLog.Entries,
+            e => e.Level == LogLevel.Information
+                 && e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, startLog.Properties["ChangeScope"]);
+        Assert.Equal(AgenticConflictResolverOperation.Merge, startLog.Properties["Operation"]);
+    }
+
+    private static ChangeScopeMergeScopeResolver NewMergeScopeResolver() =>
+        new(new KnobRegistry([new ChangeScopeKnob()]));
+
+    private static string MetadataString(TimingRecord record, string key)
+    {
+        using var doc = JsonDocument.Parse(record.MetadataJson);
+        return doc.RootElement.GetProperty(key).GetString()
+               ?? throw new InvalidOperationException($"metadata key '{key}' was not a string");
     }
 
     private sealed class MainAdvancingAuditor : IAuditor

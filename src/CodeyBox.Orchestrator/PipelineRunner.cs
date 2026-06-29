@@ -7,7 +7,6 @@ using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Git;
-using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 
@@ -172,6 +171,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // tests that don't exercise the emit path; when null, plan approval simply
     // skips test-case emission (the plan itself is still approved).
     private readonly ITestCaseStore? _testCaseStore;
+    private readonly IMergeScopeResolver _mergeScopeResolver;
     private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the
     // default for tests / minimal compositions). Composed with the global
@@ -300,17 +300,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IAgentAuthFailureClassifier? authFailureClassifier = null,
         IAgentAuthAvailabilityRegistry? authAvailability = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        // Composition-root path. When supplied, the registry plumbing is owned
-        // by the host's DI graph and not rebuilt here, removing the two-class
-        // duplication. Legacy embedders / tests that don't wire this still get
-        // the registry-built path below.
+        // Composition-root auth-required path. When supplied, the availability
+        // plumbing is owned by the host's DI graph and not rebuilt here.
+        // Legacy embedders / tests that don't wire this still get the
+        // handler-built path below.
         IAgentAuthRequiredHandler? authRequiredHandler = null,
         IAgentAuthRequiredAvailabilityReader? authRequiredReader = null,
         IPlanReviewGate? planReviewGate = null,
         // Optional store for plan-derived test cases. Null disables emission
         // entirely (plans still approve). Only planned items reach the emit path,
         // so unplanned items are never touched regardless of wiring.
-        ITestCaseStore? testCaseStore = null)
+        ITestCaseStore? testCaseStore = null,
+        IMergeScopeResolver? mergeScopeResolver = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -388,6 +389,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _knobRegistry = knobRegistry;
         _planReviewGate = planReviewGate ?? new AlwaysPassPlanReviewGate();
         _testCaseStore = testCaseStore;
+        _mergeScopeResolver = mergeScopeResolver ?? NullMergeScopeResolver.Instance;
         _availability = availability;
         // Prefer the DI-injected handler when supplied: keeps the registry
         // plumbing in one place (the composition root) rather than duplicated
@@ -3139,8 +3141,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             IReadOnlyList<string> rebaseConflictFiles;
             IAgentRunner? rebaseReviewRunner = null;
             AgentCredential? rebaseReviewCredential = null;
+            var rebaseMergeScope = _mergeScopeResolver.Resolve(item.Knobs, project.Knobs);
             await using (var rebaseScope = await TimingScope.BeginAsync(
                 _timings, item.Id, timingPhase, "git.rebase_work_branch_onto_base",
+                metadata: new Dictionary<string, object>
+                {
+                    ["change_scope"] = rebaseMergeScope.Value,
+                },
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 var rebaseResult = await RebaseCheckedOutBranchWithScopeFenceAsync(
@@ -3152,6 +3159,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     workBranch,
                     $"origin/{baseBranch}",
                     oldTip,
+                    rebaseMergeScope,
                     project,
                     ct);
                 rebaseConflictFiles = rebaseResult.ConflictFiles;
@@ -3455,6 +3463,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string workBranch,
         string upstreamRef,
         string oldTip,
+        MergeScopeHint mergeScope,
         Project project,
         CancellationToken ct)
     {
@@ -3511,7 +3520,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Rebase)
                     {
                         ProjectId = project.Id,
-                        ChangeScope = ChangeScopeKnob.ResolveEffectiveValue(item.Knobs, project.Knobs),
+                        MergeScope = mergeScope,
                     },
                     candidates,
                     ct);
@@ -12521,6 +12530,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var preMergeSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
         var workTipSha = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct);
         var hostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
+        var mergeScope = _mergeScopeResolver.Resolve(item.Knobs, project.Knobs);
 
         // Clean merge: pure git plumbing, done entirely host-side in the bare
         // repo — no sandbox/VM, no agent. The host already computed the exact
@@ -12539,22 +12549,41 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // content conflicts, where a model is actually needed.
         if (!hostMerge.HasConflicts)
         {
-            var (cleanGitName, cleanGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
-            var cleanTrailerBlock = await ComposeCommitTrailerBlockAsync(
-                item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct);
-            var cleanMessage = $"codeybox: merge {workBranch}\n\n{cleanTrailerBlock}\n";
-            var cleanMergeSha = await _gitHost.CreateMergeCommitAsync(
-                repoId, hostMerge.TreeSha, preMergeSha, workTipSha, cleanMessage,
-                cleanGitName, cleanGitEmail, ct);
-            // Defence-in-depth: confirm ancestry (both parents reachable) and
-            // that the committed tree matches the host merge-tree. By
-            // construction it does; this also re-checks the prediction didn't
-            // go stale between compute and commit. No sandbox needed — a clean
-            // merge has no conflict files to security-review.
-            await VerifyMergeResultAgainstHostAsync(
-                item.Id, repoId, preMergeSha, workTipSha, cleanMergeSha, hostMerge,
-                project.Audit.MergeScopeBufferLines, ct);
-            await UpdateHostBaseRefAsync(repoId, baseBranch, cleanMergeSha, preMergeSha, ct);
+            string cleanMergeSha;
+            var cleanMergeScope = await TimingScope.BeginAsync(
+                _timings, item.Id, "merge", "git.merge_clean_host",
+                metadata: new Dictionary<string, object>
+                {
+                    ["agent"] = runner.Kind.Value,
+                    ["capability"] = "host-clean",
+                    ["change_scope"] = mergeScope.Value,
+                },
+                log: _log,
+                activitySource: CodeyBoxActivities.Pipeline);
+            await using (cleanMergeScope)
+            {
+                var (cleanGitName, cleanGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+                var cleanTrailerBlock = await ComposeCommitTrailerBlockAsync(
+                    item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct);
+                var cleanMessage = $"codeybox: merge {workBranch}\n\n{cleanTrailerBlock}\n";
+                cleanMergeSha = await _gitHost.CreateMergeCommitAsync(
+                    repoId, hostMerge.TreeSha, preMergeSha, workTipSha, cleanMessage,
+                    cleanGitName, cleanGitEmail, ct);
+                // Defence-in-depth: confirm ancestry (both parents reachable) and
+                // that the committed tree matches the host merge-tree. By
+                // construction it does; this also re-checks the prediction didn't
+                // go stale between compute and commit. No sandbox needed — a clean
+                // merge has no conflict files to security-review.
+                await VerifyMergeResultAgainstHostAsync(
+                    item.Id, repoId, preMergeSha, workTipSha, cleanMergeSha, hostMerge,
+                    project.Audit.MergeScopeBufferLines, ct);
+                await UpdateHostBaseRefAsync(repoId, baseBranch, cleanMergeSha, preMergeSha, ct);
+            }
+            CodeyBoxMeters.AgentDuration.Record(cleanMergeScope.ElapsedMs,
+                new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+                new KeyValuePair<string, object?>("phase", "merge"),
+                new KeyValuePair<string, object?>("change_scope", mergeScope.Value),
+                new KeyValuePair<string, object?>("capability", "host-clean"));
             return (cleanMergeSha, null);
         }
 
@@ -12640,7 +12669,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // it. Mirrors the pickup-rebase pattern where chosenResolver swaps in.
             var chosenMergeRunner = runner;
             var chosenMergeCredential = credential;
-            var mergeChangeScope = ChangeScopeKnob.ResolveEffectiveValue(item.Knobs, project.Knobs);
             if (hostMerge.HasConflicts)
             {
                 var mergeExecScope = await TimingScope.BeginAsync(
@@ -12649,7 +12677,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     {
                         ["agent"] = runner.Kind.Value,
                         ["capability"] = "agentic-in-vm",
-                        ["change_scope"] = mergeChangeScope,
+                        ["change_scope"] = mergeScope.Value,
                     },
                     log: _log,
                     activitySource: CodeyBoxActivities.Pipeline);
@@ -12673,7 +12701,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Merge)
                         {
                             ProjectId = project.Id,
-                            ChangeScope = mergeChangeScope,
+                            MergeScope = mergeScope,
                         },
                         candidates,
                         ct);
@@ -12724,7 +12752,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
                 new KeyValuePair<string, object?>("agent.kind", chosenMergeRunner.Kind.Value),
                 new KeyValuePair<string, object?>("phase", "merge"),
-                new KeyValuePair<string, object?>("change_scope", mergeChangeScope));
+                new KeyValuePair<string, object?>("change_scope", mergeScope.Value));
 
             // When the cascade swapped to a cross-kind fallback, item.ModelId
             // belongs to the primary (e.g. "claude-opus-4-7") and is not valid

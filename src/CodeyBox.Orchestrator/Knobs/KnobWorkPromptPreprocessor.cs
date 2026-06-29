@@ -66,27 +66,25 @@ public sealed class KnobWorkPromptPreprocessor : IAgentPromptPreprocessor
             // (ReleaseService.RunDeepAuditIterationAsync). That id never has a
             // row in IWorkItemStore — releases are stored separately — so a
             // null return here is the expected shape for the deep-audit path,
-            // not a bug. Fall through without item-knob fragments: project
-            // knobs alone do not contribute (the Resolve call below needs an
-            // item knob map, and the audit fragment surface today is per-item
-            // only). Returning the prompt unchanged matches the
-            // "knob with nothing to say contributes nothing" framework rule.
+            // not a bug. Audit still resolves project-level knobs below, so a
+            // project default such as changeScope=surgical shapes release
+            // audits even without a per-item row.
             //
             // Work phase keeps the historical fail-closed behaviour: a missing
             // item there means the orchestrator handed us an id the store
             // can't see, which is a real defect we want surfaced rather than
             // silently dropping item knobs that the agent depends on.
-            if (ctx.Phase == AgentPromptPhase.Audit)
-                return prompt;
-
-            _log.LogError(
-                "Work item {WorkItemId} was not found while applying knob prompt directives",
-                ctx.ItemId);
-            throw new InvalidOperationException(
-                $"Work item '{ctx.ItemId}' was not found while applying knob prompt directives.");
+            if (ctx.Phase != AgentPromptPhase.Audit)
+            {
+                _log.LogError(
+                    "Work item {WorkItemId} was not found while applying knob prompt directives",
+                    ctx.ItemId);
+                throw new InvalidOperationException(
+                    $"Work item '{ctx.ItemId}' was not found while applying knob prompt directives.");
+            }
         }
 
-        var effective = _registry.Resolve(item.Knobs, ctx.Project.Knobs);
+        var effective = _registry.Resolve(item?.Knobs, ctx.Project.Knobs);
         var fragments = new List<(string Key, string Value, bool DisplayValue, string Fragment)>();
         foreach (var knob in _registry.All)
         {

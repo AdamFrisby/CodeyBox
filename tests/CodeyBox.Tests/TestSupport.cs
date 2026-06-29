@@ -116,6 +116,7 @@ internal static class TestSupport
         IRequiredBuildVerifier? requiredBuildVerifier = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
+        AgenticConflictResolver? agenticConflictResolver = null,
         ITaskQueue? taskQueue = null,
         Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         IAgentInvolvementStore? involvement = null,
@@ -147,7 +148,9 @@ internal static class TestSupport
         CancellationRegistry? cancellationRegistry = null,
         AgentAvailabilityRegistry? availabilityRegistry = null,
         ScriptedAgent? agentOverride = null,
-        IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null)
+        IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
+        IMergeScopeResolver? mergeScopeResolver = null,
+        IReadOnlyDictionary<string, string>? projectKnobs = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -201,6 +204,7 @@ internal static class TestSupport
             NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Upstream = upstream ?? ProjectUpstream.Noop,
             Audit = audit,
+            Knobs = projectKnobs ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
         };
         var projects = projectRepository ?? new InMemoryProjectRepository(defaultProject);
         var terminalWebhookDispatcher = webhookDispatcher ?? new NullWebhookDispatcher();
@@ -282,6 +286,7 @@ internal static class TestSupport
             preMergeVerifier: preMergeVerifier,
             incrementalRebase: incrementalRebase,
             pipelineTuning: pipelineTuning,
+            agenticConflictResolver: agenticConflictResolver,
             taskQueue: queue,
             availability: availabilityRegistry,
             authAvailability: authAvailability,
@@ -319,7 +324,8 @@ internal static class TestSupport
             mechanicalFixerComposer: mechanicalComposer,
             mechanicalFixerInputProviders: mechanicalFixerInputProviders,
             inVmSmokeGate: inVmSmokeGate,
-            toolCallCounters: toolCallCounters);
+            toolCallCounters: toolCallCounters,
+            mergeScopeResolver: mergeScopeResolver);
 
         return new TestPipeline(
             pipeline,

@@ -86,10 +86,11 @@ clears an inherited `Defaults.Knobs` entry for that known key.
 
 At every WORK and AUDIT agent invocation, the
 [`KnobWorkPromptPreprocessor`](../src/CodeyBox.Orchestrator/Knobs/KnobWorkPromptPreprocessor.cs)
-loads the work item, resolves each registered knob's effective value
-(item → project default → knob default), asks every knob for its phase-specific
-prompt fragment, and appends the non-empty fragments to the prompt as a single
-block:
+loads the work item when one exists, resolves each registered knob's effective
+value (item → project default → knob default), asks every knob for its
+phase-specific prompt fragment, and appends the non-empty fragments to the
+prompt as a single block. Audit calls with synthetic work-item ids still apply
+project defaults; they simply have no item-level override map.
 
 ```
 ## Per-item directives (knobs)
@@ -183,14 +184,16 @@ requested change.
   quality, completeness, security, tests, etc.), so a surgical item flags
   out-of-scope breadth that a refactor item does not.
 - **Merge**: the effective value is stamped on merge timing metadata (the
-  `merge.agent.exec` timing scope's `change_scope` tag and the `AgentDuration`
-  meter's `change_scope` dimension, matching the surrounding snake_case tag
-  convention) and threaded into `AgenticConflictResolverContext.ChangeScope`
-  so the agentic conflict resolver can tag refactor-scoped items as
-  conflict-prone in its logs. The merge-phase rebase path (when a rebase
-  hits conflicts) also carries the value through; work/rework/audit phases
-  intentionally do NOT tag this dimension on the meter — the lever is on
-  the merge surface today.
+  clean host-side `merge.git.merge_clean_host` timing scope and the conflicted
+  `merge.agent.exec` timing scope's `change_scope` tag, plus the
+  `AgentDuration` meter's `change_scope` dimension, matching the surrounding
+  snake_case tag convention). The value is resolved by the DI-provided
+  `IMergeScopeResolver`, which uses the registered `IKnobRegistry`; the
+  generic agentic conflict resolver receives only a neutral `MergeScopeHint`
+  containing the label and whether it should emit its start log. The
+  merge-phase rebase path (when a rebase hits conflicts) also carries the
+  value through; work/rework/audit phases intentionally do NOT tag this
+  dimension on the meter — the lever is on the merge surface today.
   Scheduling biases for refactor-vs-normal items remain provided by
   `JobType.Refactor`'s project-exclusive dispatcher gate (see
   [`OrchestratorService`](../src/CodeyBox.Orchestrator/OrchestratorService.cs)

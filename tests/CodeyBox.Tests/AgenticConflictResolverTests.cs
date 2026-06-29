@@ -1764,13 +1764,12 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
-    public async Task ResolveAsync_EmitsStartingLogWithChangeScope_WhenSet()
+    public async Task ResolveAsync_EmitsStartingLogWithMergeScopeHint_WhenHighlighted()
     {
         // The resolver tags its start-of-resolve log line with the effective
-        // changeScope so operators can correlate refactor-scoped items with
+        // merge scope so operators can correlate refactor-scoped items with
         // merge-conflict-prone behaviour. Pin the actual log emission, not
-        // just the record-field plumbing — a regression that drops the log
-        // or inverts the guard must fail this test.
+        // just the record-field plumbing.
         var sandbox = new ConflictSandbox();
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
         var logger = new CapturingLogger<AgenticConflictResolver>();
@@ -1790,7 +1789,7 @@ public sealed class AgenticConflictResolverTests
             workItemId,
             new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge)
             {
-                ChangeScope = "refactor",
+                MergeScope = new MergeScopeHint("refactor", HighlightInResolverLog: true),
             },
             [new AgenticConflictResolverCandidate(runner, Credential: null)],
             CancellationToken.None);
@@ -1809,11 +1808,11 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
-    public async Task ResolveAsync_DoesNotEmitStartingLog_WhenChangeScopeUnset()
+    public async Task ResolveAsync_DoesNotEmitStartingLog_WhenMergeScopeUnset()
     {
         // Guards against the inverted-condition bug class: when the context
-        // carries no changeScope (e.g. older callers that did not thread the
-        // knob through), the resolver must NOT emit the changeScope start
+        // carries no merge-scope hint (e.g. older callers that did not thread
+        // the metadata through), the resolver must NOT emit the start
         // log — otherwise the log would carry an empty/null tag every time.
         var sandbox = new ConflictSandbox();
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
@@ -1841,25 +1840,19 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Theory]
-    [InlineData("surgical", true)]
-    [InlineData("refactor", true)]
-    [InlineData("moderate", false)]
-    [InlineData("SURGICAL", true)]
-    [InlineData("  refactor  ", true)]
-    [InlineData("", false)]
-    public async Task ResolveAsync_StartingLogGatedOnNonDefaultChangeScope(
-        string changeScope,
+    [InlineData("surgical", true, true)]
+    [InlineData("refactor", true, true)]
+    [InlineData("moderate", false, false)]
+    [InlineData("moderate", true, true)]
+    [InlineData("refactor", false, false)]
+    public async Task ResolveAsync_StartingLogHonorsSuppliedMergeScopeHint(
+        string mergeScopeValue,
+        bool highlight,
         bool expectLogEmitted)
     {
-        // The orchestrator always supplies an effective changeScope via the
-        // knob registry, defaulting to "moderate" when neither the item nor
-        // the project sets the knob. If the resolver emitted the start log
-        // unconditionally, every conflict resolution would tag the line with
-        // changeScope=moderate — drowning out the surgical/refactor signal
-        // operators rely on for correlating conflict-prone behaviour. Pin
-        // the gating: only the non-default values (surgical, refactor) light
-        // the log. Mirrors the prompt-fragment contract — "moderate" is the
-        // existing default and contributes nothing.
+        // The resolver must not import concrete knob semantics. Pipeline code
+        // supplies both the label and the highlight bit; this test proves the
+        // resolver honors that neutral metadata instead of interpreting values.
         var sandbox = new ConflictSandbox();
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
         var logger = new CapturingLogger<AgenticConflictResolver>();
@@ -1878,7 +1871,7 @@ public sealed class AgenticConflictResolverTests
             WorkItemId.New(),
             new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge)
             {
-                ChangeScope = changeScope,
+                MergeScope = new MergeScopeHint(mergeScopeValue, highlight),
             },
             [new AgenticConflictResolverCandidate(runner, Credential: null)],
             CancellationToken.None);
@@ -1887,22 +1880,6 @@ public sealed class AgenticConflictResolverTests
             e => e.Level == LogLevel.Information &&
                  e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
         Assert.Equal(expectLogEmitted, emitted);
-    }
-
-    [Fact]
-    public void AgenticConflictResolverContext_ChangeScope_SurvivesRecordCopy()
-    {
-        // Smaller plumbing pin: the record's with-init syntax must preserve
-        // ChangeScope across copies so the pipeline can layer ProjectId on
-        // top of a base context without dropping the resolved changeScope.
-        var refactor = new AgenticConflictResolverContext(
-            "main", "feature", AgenticConflictResolverOperation.Merge)
-        {
-            ChangeScope = "refactor",
-        };
-        var withProject = refactor with { ProjectId = new ProjectId("p1") };
-        Assert.Equal("refactor", withProject.ChangeScope);
-        Assert.Equal(new ProjectId("p1"), withProject.ProjectId);
     }
 
     private sealed class NoopPreprocessor : IAgentPromptPreprocessor

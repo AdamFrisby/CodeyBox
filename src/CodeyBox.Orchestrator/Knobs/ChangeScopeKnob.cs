@@ -91,39 +91,4 @@ public sealed class ChangeScopeKnob : IKnob
         return null;
     }
 
-    /// <summary>
-    /// Telemetry-side helper for callers that already have an item's and a
-    /// project's knob maps but no <see cref="IKnobRegistry"/> on hand. Resolves
-    /// the effective <c>changeScope</c> value following the registry's
-    /// item → project → default precedence and returns <see cref="ValueModerate"/>
-    /// when neither map carries a value. Used by the merge path to stamp
-    /// <c>changeScope</c> on merge timing metadata and on the agentic conflict
-    /// resolver context without taking a registry dependency in
-    /// <c>PipelineRunner</c>.
-    ///
-    /// <para>
-    /// Implementation delegates to a private singleton <see cref="KnobRegistry"/>
-    /// scoped to this one descriptor, so precedence, case-insensitive lookup,
-    /// whitespace handling, and AllowedValues canonicalisation all flow through
-    /// the same code path that <see cref="IKnobRegistry.Resolve"/> uses on the
-    /// prompt-assembly side — the two surfaces cannot drift, and any future
-    /// addition to <see cref="AllowedValues"/> is picked up automatically here.
-    /// </para>
-    /// </summary>
-    public static string ResolveEffectiveValue(
-        IReadOnlyDictionary<string, string>? itemKnobs,
-        IReadOnlyDictionary<string, string>? projectKnobs)
-    {
-        var resolved = SingletonRegistry.Resolve(itemKnobs, projectKnobs);
-        return resolved.TryGetValue(KeyName, out var value) && !string.IsNullOrWhiteSpace(value)
-            ? value
-            : ValueModerate;
-    }
-
-    // Process-scoped registry seeded with a single ChangeScopeKnob descriptor.
-    // Reuses KnobRegistry's existing precedence / canonicalisation logic
-    // instead of duplicating it — single source of truth shared with the
-    // prompt-assembly path. The registry is immutable after construction so
-    // sharing it across calls is safe.
-    private static readonly KnobRegistry SingletonRegistry = new([new ChangeScopeKnob()]);
 }

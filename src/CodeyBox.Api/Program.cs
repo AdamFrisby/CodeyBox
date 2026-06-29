@@ -769,6 +769,7 @@ builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptP
 builder.Services.AddSingleton<IKnob, CodeyBox.Orchestrator.Knobs.ChangeScopeKnob>();
 builder.Services.AddSingleton<IKnob, CodeyBox.Orchestrator.Knobs.PlanKnob>();
 builder.Services.AddSingleton<IKnobRegistry, KnobRegistry>();
+builder.Services.AddSingleton<IMergeScopeResolver, CodeyBox.Orchestrator.Knobs.ChangeScopeMergeScopeResolver>();
 builder.Services.AddSingleton<IAgentPromptPreprocessor, CodeyBox.Orchestrator.Knobs.KnobWorkPromptPreprocessor>();
 
 builder.Services.AddSingleton<AgentPromptPreprocessorChain>();
@@ -2580,7 +2581,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
     planReviewGate: sp.GetRequiredService<IPlanReviewGate>(),
-    testCaseStore: sp.GetService<ITestCaseStore>()));
+    testCaseStore: sp.GetService<ITestCaseStore>(),
+    mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
