@@ -139,6 +139,67 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildSandboxSpec_AppendsRepositoryAllowedHostsToAgentAllowlist()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pipelineOptions = new PipelineOptions
+        {
+            SandboxImageReference = "ignored",
+            AgentAllowedHosts = [MarkerHost, "api.agent.example.invalid"],
+        };
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            pipelineOptions: pipelineOptions);
+        var access = new SandboxRepositoryAccess(
+            CloneUrlInsideSandbox: "/repo",
+            Mounts:
+            [
+                new SandboxMount
+                {
+                    SandboxPath = "/repo",
+                    HostPath = _workspace,
+                    ReadOnly = true,
+                },
+            ],
+            Network: new SandboxNetworkPolicy
+            {
+                AllowedHosts = ["git-host.example.invalid", MarkerHost.ToUpperInvariant()],
+            });
+        var credential = new AgentCredential(
+            AgentKind.Claude,
+            EnvironmentVariables: new Dictionary<string, string> { [MarkerEnvKey] = MarkerEnvValue },
+            Files: new Dictionary<string, string>());
+
+        var method = typeof(PipelineRunner).GetMethod(
+            "BuildSandboxSpec",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(nameof(PipelineRunner), "BuildSandboxSpec");
+        var spec = Assert.IsType<SandboxSpec>(method.Invoke(
+            tp.Pipeline,
+            [
+                access,
+                credential,
+                true,
+                null,
+                null,
+                null,
+                SandboxProfileFlavor.Headless,
+                null,
+                null,
+            ]));
+
+        Assert.Contains(MarkerHost, spec.Network.AllowedHosts);
+        Assert.Contains("api.agent.example.invalid", spec.Network.AllowedHosts);
+        Assert.Contains("git-host.example.invalid", spec.Network.AllowedHosts);
+        Assert.Equal(
+            1,
+            spec.Network.AllowedHosts.Count(host =>
+                string.Equals(host, MarkerHost, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
     public async Task WorkAgentSandbox_PreservesDetachedBatchLaunchModeThroughPipeline()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

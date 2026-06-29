@@ -188,7 +188,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
-    public async Task WorkCompleteContinuation_DoesNotResolveWorkAgentClassAtPickup()
+    public async Task WorkCompleteContinuation_ResolvesWorkAgentClassAtPickup()
     {
         var frontierClass = new AgentClass
         {
@@ -202,7 +202,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
         var router = new AgentClassRouter(
             [frontierClass],
             [new FakeProbe(AgentKind.Claude, 0.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromSeconds(60) },
             NullLogger<AgentClassRouter>.Instance);
         var tracking = new AgentTrackingPipeline(_store);
         var item = new WorkItem
@@ -231,13 +231,14 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
         await queue.EnqueueAsync(item.Id);
         using var _ = registry;
         await svc.StartAsync(CancellationToken.None);
-        var completed = await Task.WhenAny(tracking.Ran, Task.Delay(TimeSpan.FromSeconds(10)));
+        var completed = await Task.WhenAny(tracking.Ran, Task.Delay(TimeSpan.FromMilliseconds(300)));
         await svc.StopAsync(CancellationToken.None);
 
-        Assert.Same(tracking.Ran, completed);
-        Assert.True(tracking.ReceivedNullAgent);
+        Assert.NotSame(tracking.Ran, completed);
+        Assert.Null(tracking.LastAgent);
+        Assert.False(tracking.ReceivedNullAgent);
         var stored = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, stored?.State);
+        Assert.Equal(WorkItemState.WorkComplete, stored?.State);
     }
 
     [Fact]

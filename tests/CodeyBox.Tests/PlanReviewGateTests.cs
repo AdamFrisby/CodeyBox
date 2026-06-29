@@ -58,7 +58,7 @@ public sealed class PlanReviewGateTests
         var gate = new AlwaysPassPlanReviewGate();
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await gate.ReviewAsync(SampleItem(), artifact));
+            await gate.ReviewAsync(SampleRequest(artifact)));
 
         Assert.Contains(expectedMessage, ex.Message, StringComparison.Ordinal);
     }
@@ -80,7 +80,7 @@ public sealed class PlanReviewGateTests
 
         var normalized = PlanArtifactDocument.NormalizeRaw(raw, maxChars: 20_000);
         var gate = new AlwaysPassPlanReviewGate();
-        var decision = await gate.ReviewAsync(SampleItem(), normalized);
+        var decision = await gate.ReviewAsync(SampleRequest(normalized));
         var guidance = PlanArtifactDocument.ToImplementationGuidance(normalized);
 
         Assert.True(decision.Approved);
@@ -209,11 +209,15 @@ public sealed class PlanReviewGateTests
             $"Expected non-object root rejection, but got: {ex.Message}");
     }
 
-    private static WorkItem SampleItem() => new()
-    {
-        Id = WorkItemId.New(),
-        ProjectId = new ProjectId("test-project"),
-        Title = "plan review",
-        Prompt = "do work",
-    };
+    private static PlanReviewRequest SampleRequest(string artifact) => new(
+        WorkItemId.New(),
+        new ProjectId("test-project"),
+        "plan review",
+        "do work",
+        PromptRevision: 1,
+        artifact,
+        AgentKind.Claude,
+        AgentInstanceId: null,
+        ModelId: null,
+        ReasoningMode: null);
 }

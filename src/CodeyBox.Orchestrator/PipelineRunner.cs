@@ -935,7 +935,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         string repoId,
         string baseBranch,
-        ClaudeSessionLifecycle? planningSessionLifecycle,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -1028,7 +1027,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     project,
                                     repoId,
                                     baseBranch,
-                                    planningSessionLifecycle,
                                     phaseCt,
                                     hostShutdownToken);
                             },
@@ -1161,7 +1159,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return current;
         }
 
-        var decision = await _planReviewGate.ReviewAsync(current, current.PlanArtifact!, ct);
+        var decision = await _planReviewGate.ReviewAsync(
+            new PlanReviewRequest(
+                current.Id,
+                current.ProjectId,
+                current.Title,
+                current.Prompt,
+                current.PromptRevision,
+                current.PlanArtifact!,
+                current.Agent,
+                current.AgentInstanceId,
+                current.ModelId,
+                current.ReasoningMode),
+            ct);
         if (!decision.Approved)
         {
             throw new InvalidOperationException(
@@ -1273,29 +1283,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         string repoId,
         string baseBranch,
-        ClaudeSessionLifecycle? planningSessionLifecycle,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
         var credential = await ResolveAgentCredentialForInvocationAsync(runner, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
-        if (planningSessionLifecycle is not null
-            && !planningSessionLifecycle.IsClosed
-            && planningSessionLifecycle.CanRunTurn(runner, item)
-            && string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
-        {
-            return await RunSessionPlanningAgentTurnAsync(
-                item,
-                runner,
-                credential,
-                project,
-                repoId,
-                access,
-                baseBranch,
-                planningSessionLifecycle,
-                ct,
-                hostShutdownToken);
-        }
 
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
         var extraEnv = new Dictionary<string, string>
@@ -1363,7 +1355,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 log: _log,
                 activitySource: CodeyBoxActivities.Pipeline))
             {
-                var canCaptureStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "planning", ct);
+                var canCaptureStructuredStream = runner is IPlanArtifactExtractor
+                    && await CanCaptureStructuredStreamAsync(runner, sandbox, "planning", ct);
                 streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
                     ? await BeginAgentStreamCaptureAsync(item.Id, "planning", 1, ct)
                     : null;
@@ -1447,155 +1440,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task<string> RunSessionPlanningAgentTurnAsync(
-        WorkItem item,
-        IAgentRunner runner,
-        AgentCredential? credential,
-        Project project,
-        string repoId,
-        SandboxRepositoryAccess access,
-        string baseBranch,
-        ClaudeSessionLifecycle planningSessionLifecycle,
-        CancellationToken ct,
-        CancellationToken hostShutdownToken)
-    {
-        ISandbox sandbox;
-        try
-        {
-            sandbox = await planningSessionLifecycle.GetSandboxAsync(ct);
-        }
-        catch (AgentSessionDegradedException ex)
-        {
-            _log.LogWarning(ex,
-                "Claude session lifecycle degraded before planning for work item {Id}; using a fresh planning sandbox",
-                item.Id);
-            _ambientSessionLifecycle.Value = null;
-            return await RunPlanningAgentTurnAsync(
-                item,
-                runner,
-                project,
-                repoId,
-                baseBranch,
-                planningSessionLifecycle: null,
-                ct,
-                hostShutdownToken);
-        }
-
-        AgentStreamCapture? streamCapture = null;
-        try
-        {
-            if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
-            await planningSessionLifecycle.RefreshCredentialAsync(credential, ct);
-
-            if (!planningSessionLifecycle.FirstTurnComplete)
-                await RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            else
-                await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
-
-            await RunWithCancellation(
-                sandbox,
-                ct,
-                "git",
-                "-C",
-                SandboxConventions.WorkDir,
-                "checkout",
-                "-B",
-                "codeybox/planning",
-                $"origin/{baseBranch}");
-            await DisablePlanningPushesAsync(sandbox, ct);
-
-            var prompt = await ProcessAgentPromptAsync(
-                item.Id,
-                runner.Kind,
-                AgentPromptPhase.Planning,
-                1,
-                project,
-                sandbox,
-                BuildPlanningPrompt(item),
-                ct);
-
-            AuditLog.AgentStarted(runner.Kind, sandbox.Id, "planning");
-            var agentSw = Stopwatch.StartNew();
-            AgentResult result;
-            await using (var agentScope = await TimingScope.BeginAsync(
-                _timings,
-                item.Id,
-                "planning",
-                "agent.exec",
-                metadata: new Dictionary<string, object>
-                {
-                    ["agent"] = runner.Kind.Value,
-                    ["session"] = true,
-                },
-                log: _log,
-                activitySource: CodeyBoxActivities.Pipeline))
-            {
-                streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
-                    ? await BeginAgentStreamCaptureAsync(item.Id, "planning", 1, ct)
-                    : null;
-                var stdoutCallback = BuildStdoutCallback(item.Id, "planning", streamCapture);
-                using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                var runTask = planningSessionLifecycle.SendTurnAsync(prompt, runnerCts.Token, stdoutCallback);
-                var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
-                if (completed != runTask)
-                {
-                    await runnerCts.CancelAsync();
-                    throw new OperationCanceledException(hostShutdownToken);
-                }
-
-                result = await runTask;
-            }
-            agentSw.Stop();
-
-            var endedAt = DateTimeOffset.UtcNow;
-            var observedModelId = ResolveObservedModelId(runner, item.ModelId);
-            var startedAt = endedAt - agentSw.Elapsed;
-            await TryRecordCostAsync(
-                result.Stdout,
-                result.Stderr,
-                runner.Kind,
-                item.AgentInstanceId,
-                item.Id,
-                "planning",
-                iteration: null,
-                startedAt,
-                endedAt,
-                observedModelId);
-
-            AuditLog.AgentFinished(
-                runner.Kind,
-                sandbox.Id,
-                result.Success,
-                null,
-                agentSw.Elapsed,
-                stdoutTail: Tail(result.Stdout),
-                stderrTail: Tail(result.Stderr));
-            LogAgentOutput(_log, runner.Kind, result);
-
-            if (!result.Success)
-            {
-                await ThrowPlanningAgentFailureAsync(
-                    runner,
-                    item,
-                    project,
-                    result,
-                    observedModelId,
-                    endedAt,
-                    sandbox.Id,
-                    ct);
-            }
-
-            await ResetPlanningSandboxWorkTreeAsync(sandbox, throwOnFailure: false, ct);
-            return result.Stdout ?? string.Empty;
-        }
-        finally
-        {
-            if (streamCapture is not null)
-                await streamCapture.DisposeAsync();
-        }
-    }
-
     private async Task ThrowPlanningAgentFailureAsync(
         IAgentRunner runner,
         WorkItem item,
@@ -1645,11 +1489,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private static SandboxRepositoryAccess BuildReadOnlyPlanningRepositoryAccess(SandboxRepositoryAccess access)
     {
-        // SnapshotForIsolation pairs with ReadOnly so providers without a true
-        // kernel-level RO mount option (multipass) stage a snapshot copy. Only
-        // the planning phase requests this — other RO mounts (git alternates,
-        // mechanical-edit bare repo) stay shared to keep per-sandbox bring-up
-        // bounded.
+        // SnapshotForIsolation pairs with ReadOnly to request provider-enforced
+        // source isolation for pre-review planning. The provider decides whether
+        // a read-only bind, a staged copy, or an equivalent mechanism satisfies
+        // the hint.
         var mounts = access.Mounts
             .Select(m => m with { ReadOnly = true, SnapshotForIsolation = true })
             .ToArray();
@@ -1968,13 +1811,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             // Session-mode dispatch: when the work item, its project, and the
             // global flag all opt in for the Claude resumable worker, open one
-            // worker session+VM up-front. The lifecycle is published via the
-            // AsyncLocal so the work / rework agent-phase path picks it up
-            // without any explicit threading; the outer try/finally closes it
-            // (disposes the VM) on every exit path. Items that don't opt in
-            // see no behaviour change: claudeSessionLifecycle stays null and
-            // RunAgentPhaseAsync takes the legacy independent-phase branch.
-            if (!skipWork && !skipAudit)
+            // worker session+VM for implementation. Plan-off items open it
+            // up-front; plan-on items open it only after the PLAN is approved so
+            // the planning sandbox cannot mutate the implementation VM or host
+            // repo before review. The lifecycle is published via the AsyncLocal
+            // so the work / rework agent-phase path picks it up without any
+            // explicit threading; the outer try/finally closes it on every exit
+            // path. Items that don't opt in see no behaviour change:
+            // claudeSessionLifecycle stays null and RunAgentPhaseAsync takes the
+            // legacy independent-phase branch.
+            if (!skipWork && !skipAudit && !planningLifecycleRequiredAtEntry)
             {
                 claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
                     item,
@@ -2001,7 +1847,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     project,
                     repoId,
                     baseBranch,
-                    claudeSessionLifecycle,
                     ct,
                     hostShutdownToken);
                 claudeSessionLifecycle = _ambientSessionLifecycle.Value;
@@ -2030,6 +1875,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     AgentInstanceId = planningEntryAgentInstanceId,
                 };
 
+                if (!skipWork && !skipAudit && claudeSessionLifecycle is null)
+                {
+                    claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(
+                        item,
+                        project,
+                        agentRunner,
+                        repoId,
+                        ct);
+                    _ambientSessionLifecycle.Value = claudeSessionLifecycle;
+                }
             }
             if (!string.Equals(item.WorkBranch, workBranch, StringComparison.Ordinal))
             {

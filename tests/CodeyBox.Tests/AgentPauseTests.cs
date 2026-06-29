@@ -572,7 +572,7 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task Worker_AuditPassedDirectItemWithPausedWorkAgent_EntersPipeline()
+    public async Task Worker_AuditPassedDirectItemWithPausedWorkAgent_ParksBeforePipeline()
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
@@ -601,9 +601,10 @@ public sealed class AgentPauseTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
         await queue.EnqueueAsync(item.Id);
 
-        var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
-        Assert.NotNull(done);
-        Assert.True(pipeline.Entered);
+        var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
+        Assert.NotNull(parked);
+        Assert.False(pipeline.Entered);
+        Assert.Equal("merge", parked!.AgentPauseRetryFrom);
         await svc.StopAsync(CancellationToken.None);
     }
 

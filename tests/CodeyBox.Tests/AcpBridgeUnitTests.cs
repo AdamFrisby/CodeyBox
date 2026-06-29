@@ -40,6 +40,7 @@ namespace CodeyBox.Tests;
 /// other HOME-sensitive tests.
 /// </summary>
 [SupportedOSPlatform("linux")]
+[Collection("Process environment")]
 public sealed class AcpBridgeUnitTests
 {
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);

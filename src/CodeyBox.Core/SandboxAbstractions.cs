@@ -873,13 +873,10 @@ public sealed record SandboxMount
     public bool Tmpfs { get; init; }
     public long? SizeBytes { get; init; }
 
-    // Opt-in: providers that have no kernel-level read-only mount option
-    // (notably multipass, which can only flip RO after `multipass start`)
-    // stage a host-side snapshot copy of the source path so an agent that
-    // breaks out cannot mutate the shared source. Existing read-only host
-    // mounts (git alternates, mechanical-edit bare repo) keep ReadOnly=true
-    // without snapshotting; planning sets this flag to keep that defense-
-    // in-depth without forcing the same multi-GB copy on every audit/merge.
+    // Provider-neutral isolation hint for read-only host sources that must not
+    // be shared with the sandbox by reference. Providers can satisfy it with a
+    // kernel read-only bind, a staged copy, or another equivalent isolation
+    // strategy; callers should treat it as "do not expose the mutable source".
     public bool SnapshotForIsolation { get; init; }
 }
 

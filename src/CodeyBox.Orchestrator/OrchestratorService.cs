@@ -2561,13 +2561,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
-    private static bool ShouldResolveAgentClassAtPickup(WorkItem item) =>
-        item.State is WorkItemState.Queued
-            or WorkItemState.Planning
-            or WorkItemState.PlanReview
-            or WorkItemState.PlanApproved
-            or WorkItemState.Reworking
-            or WorkItemState.ReworkingForConflict;
+    private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
+    {
+        _ = item;
+        return true;
+    }
 
     private static bool IsOperatorPaused(AgentAvailability? availability) =>
         AgentDispatchAvailability.IsPausedVerdict(availability);

@@ -200,7 +200,39 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_ClaudeSessionMode_RunsPlanningAsFirstWarmSessionTurnThenImplementation()
+    public async Task ItemPlanOff_OverridesProjectDefaultPlanOn()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            });
+        var item = NewItem("feature/item-plan-off") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOff,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Null(final.PlanArtifact);
+        Assert.Equal(0, agent.PlanningCalls);
+        Assert.Equal(1, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanOn_ClaudeSessionMode_RunsPlanningColdThenImplementationInWarmSession()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
@@ -234,18 +266,16 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(1, sessionRunner.OpenCalls);
         Assert.True(
-            sessionRunner.SendTurns == 2,
-            "Expected planning and work to both use the warm session. Prompts: "
+            sessionRunner.SendTurns == 1,
+            "Expected only implementation to use the warm session after plan approval. Prompts: "
             + string.Join("\n---\n", sessionRunner.PromptsSent));
         Assert.Equal(1, sessionRunner.CloseCalls);
         Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
         Assert.Equal("max", sessionRunner.OpenedReasoningMode);
-        Assert.Contains("planning-only phase", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
-        Assert.DoesNotContain("Reviewed planning metadata", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
-        Assert.DoesNotContain("planning-only phase", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
-        Assert.Contains("Reviewed planning metadata", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
-        Assert.Contains("output.txt", sessionRunner.PromptsSent[1], StringComparison.Ordinal);
-        Assert.Equal(0, agent.PlanningCalls);
+        Assert.DoesNotContain("planning-only phase", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.Contains("Reviewed planning metadata", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.Contains("output.txt", sessionRunner.PromptsSent[0], StringComparison.Ordinal);
+        Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
 
         var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
@@ -508,6 +538,34 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(agent.ExtractorInvocations, agent.LastExtractorNullReturns);
     }
 
+    [Fact]
+    public async Task PlanOn_StructuredStreamRunnerWithoutPlanExtractor_DoesNotCaptureEnvelopeForPlanParsing()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new StructuredPlainPlanningAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/plain-structured-runner") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(1, agent.WorkCalls);
+        Assert.NotEmpty(agent.CaptureStructuredStreamCalls);
+        Assert.False(agent.CaptureStructuredStreamCalls[0]);
+        Assert.All(agent.CaptureStructuredStreamCalls, Assert.False);
+        Assert.Equal(0, agent.StructuredStreamSupportProbeCount);
+    }
     [Fact]
     public async Task PlanOn_NonStreamingPlanningStdoutFallbackPersistsPlan()
     {
@@ -934,6 +992,41 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PlanOn_StateRaceDuringPlanPersistence_FailsAmbiguousPlan()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/state-race-during-planning") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+        agent.OnPlanningBeforeReturnAsync = async ct =>
+        {
+            var current = await setup.Store.GetAsync(item.Id, ct)
+                ?? throw new InvalidOperationException("test item disappeared");
+            await setup.Store.UpdateAsync(current with
+            {
+                State = WorkItemState.WorkComplete,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            }, ct);
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Planning artifact persistence raced with state WorkComplete", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
     public async Task PlanOn_PromptEditDuringPlanReview_DoesNotApproveStalePlan()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -962,6 +1055,74 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal("edited during review", final.Prompt);
         Assert.Null(final.PlanArtifact);
         Assert.Null(final.PlanReviewedAt);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanOn_StateRaceDuringPlanReviewApproval_FailsAmbiguousPlan()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var gate = new MutatingPlanReviewGate();
+        using var setup = BuildPipeline(agent, _workspace, seed, planReviewGate: gate);
+        var item = NewItem("feature/state-race-during-review") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+        gate.OnReviewAsync = async ct =>
+        {
+            var current = await setup.Store.GetAsync(item.Id, ct)
+                ?? throw new InvalidOperationException("test item disappeared");
+            await setup.Store.UpdateAsync(current with
+            {
+                State = WorkItemState.WorkComplete,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            }, ct);
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Plan review approval raced with state WorkComplete", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanOn_StateRaceDuringPlanReviewTransition_FailsStaleContinuation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        PlanningTransitionRaceStore? raceStore = null;
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            workItemStoreDecorator: store => raceStore = new PlanningTransitionRaceStore(store));
+        var item = NewItem("feature/state-race-during-transition") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.True(raceStore!.Raced);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Planning transition for work item", final.LastError, StringComparison.Ordinal);
+        Assert.Contains("raced with state WorkComplete", final.LastError, StringComparison.Ordinal);
         Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
     }
@@ -1170,6 +1331,7 @@ public sealed class PlanningPipelineTests : IDisposable
         ICredentialProvider? credentials = null,
         ISandboxProvider? sandboxProvider = null,
         PipelineOptions? pipelineOptions = null,
+        Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         bool omitKnobRegistry = false,
         ILogger<PipelineRunner>? pipelineLogger = null)
     {
@@ -1177,6 +1339,7 @@ public sealed class PlanningPipelineTests : IDisposable
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
+        var pipelineStore = workItemStoreDecorator?.Invoke(store) ?? store;
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
@@ -1196,12 +1359,12 @@ public sealed class PlanningPipelineTests : IDisposable
             ClaudeSession = new ProjectClaudeSessionConfig { Enabled = enableClaudeSession },
         });
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
-        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
+        var terminalTransitions = TestSupport.CreateTerminalTransition(pipelineStore, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
-            store, webhooks,
+            pipelineStore, webhooks,
             pipelineOptions ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             pipelineLogger ?? NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
@@ -1532,6 +1695,59 @@ internal sealed partial class SandboxOnlyPlanningAgent : IAgentRunner
     private static partial Regex MergePromptShape();
 }
 
+internal sealed class StructuredPlainPlanningAgent : IAgentRunner, IStructuredStreamAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+    public int PlanningCalls { get; private set; }
+    public int WorkCalls { get; private set; }
+    public int StructuredStreamSupportProbeCount { get; private set; }
+    public List<bool> CaptureStructuredStreamCalls { get; } = [];
+
+    public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = ct;
+        StructuredStreamSupportProbeCount++;
+        return Task.FromResult(true);
+    }
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        CaptureStructuredStreamCalls.Add(captureStructuredStream);
+
+        if (prompt.Contains("planning-only phase", StringComparison.Ordinal))
+        {
+            PlanningCalls++;
+            var stdout = captureStructuredStream
+                ? """{"type":"assistant_delta","delta":{"text":"not a PLAN object"}}"""
+                : PlanningAwareAgentJson.DefaultPlan;
+            stdoutChunkCallback?.Invoke(stdout);
+            return new AgentResult(true, "planned", stdout, null);
+        }
+
+        WorkCalls++;
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo 'implemented by structured plain agent' > \"$0\"", $"{workingDirectory}/output.txt"],
+        }, ct);
+        return write.Success
+            ? new AgentResult(true, "worked", null, null)
+            : new AgentResult(false, "failed to write output.txt", write.Stdout, write.Stderr);
+    }
+}
+
 internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner, IPlanArtifactExtractor
 {
     private ISandbox? _sandbox;
@@ -1731,12 +1947,10 @@ internal sealed class PlanningRecordingSandboxProvider(ISandboxProvider inner) :
 internal sealed class RejectingPlanReviewGate : IPlanReviewGate
 {
     public ValueTask<PlanReviewDecision> ReviewAsync(
-        WorkItem item,
-        string planArtifact,
+        PlanReviewRequest request,
         CancellationToken ct = default)
     {
-        _ = item;
-        _ = planArtifact;
+        _ = request;
         ct.ThrowIfCancellationRequested();
         return ValueTask.FromResult(new PlanReviewDecision(
             Approved: false,
@@ -1750,16 +1964,106 @@ internal sealed class MutatingPlanReviewGate : IPlanReviewGate
     public Func<CancellationToken, Task>? OnReviewAsync { get; set; }
 
     public async ValueTask<PlanReviewDecision> ReviewAsync(
-        WorkItem item,
-        string planArtifact,
+        PlanReviewRequest request,
         CancellationToken ct = default)
     {
-        _ = item;
-        _ = PlanArtifactDocument.ParseCanonical(planArtifact);
+        _ = PlanArtifactDocument.ParseCanonical(request.PlanArtifact);
         if (OnReviewAsync is not null)
             await OnReviewAsync(ct);
         return new PlanReviewDecision(true, "mutating test review approved");
     }
+}
+
+internal sealed class PlanningTransitionRaceStore(SqliteWorkItemStore inner) : PlanningForwardingWorkItemStore(inner)
+{
+    public bool Raced { get; private set; }
+
+    public override async Task<bool> TryUpdateIfStateAndUpdatedAtAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+    {
+        if (!Raced
+            && onlyIfState == WorkItemState.Planning
+            && item.State == WorkItemState.PlanReview
+            && !string.IsNullOrWhiteSpace(item.PlanArtifact))
+        {
+            Raced = true;
+            var current = await Inner.GetAsync(item.Id, ct)
+                ?? throw new InvalidOperationException("test item disappeared");
+            await Inner.UpdateAsync(current with
+            {
+                State = WorkItemState.WorkComplete,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            }, ct);
+        }
+
+        return await Inner.TryUpdateIfStateAndUpdatedAtAsync(item, onlyIfState, onlyIfUpdatedAt, ct);
+    }
+}
+
+internal abstract class PlanningForwardingWorkItemStore(SqliteWorkItemStore inner) : IWorkItemStore
+{
+    protected SqliteWorkItemStore Inner { get; } = inner;
+
+    public virtual Task CreateAsync(WorkItem item, CancellationToken ct = default) => Inner.CreateAsync(item, ct);
+    public virtual Task UpdateAsync(WorkItem item, CancellationToken ct = default) => Inner.UpdateAsync(item, ct);
+    public virtual Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) =>
+        Inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+    public virtual Task<bool> TryUpdateIfStateAndUpdatedAtAsync(WorkItem item, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
+        Inner.TryUpdateIfStateAndUpdatedAtAsync(item, onlyIfState, onlyIfUpdatedAt, ct);
+    public virtual Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+        Inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
+    public virtual Task<PriorityUpdateResult> UpdatePriorityIfStateAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, WorkItemState onlyIfState, CancellationToken ct = default) =>
+        Inner.UpdatePriorityIfStateAsync(id, priority, updatedAt, onlyIfState, ct);
+    public virtual Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+        Inner.UpdateDependsOnAsync(id, dependsOn, updatedAt, ct);
+    public virtual Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+        Inner.UpdateAuditBudgetAsync(id, auditMaxIterations, auditComplexity, updatedAt, ct);
+    public virtual Task<bool> TryReplaceKnobsIfStateAndUpdatedAtAsync(WorkItemId id, IReadOnlyDictionary<string, string> knobs, DateTimeOffset updatedAt, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
+        Inner.TryReplaceKnobsIfStateAndUpdatedAtAsync(id, knobs, updatedAt, onlyIfState, onlyIfUpdatedAt, ct);
+    public virtual Task<bool> TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(WorkItem item, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
+        Inner.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(item, onlyIfState, onlyIfUpdatedAt, ct);
+    public virtual Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => Inner.GetAsync(id, ct);
+    public virtual IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => Inner.ListAsync(ct);
+    public virtual IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => Inner.ListByStateAsync(state, ct);
+    public virtual Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => Inner.CountByStateAsync(state, ct);
+    public virtual Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => Inner.ReorderAsync(orderedIds, ct);
+    public virtual IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) =>
+        Inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+    public virtual Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) =>
+        Inner.CountStartedInWindowAsync(projectId, since, ct);
+    public virtual Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => Inner.CountInFlightAsync(projectId, ct);
+    public virtual Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(ProjectId projectId, CancellationToken ct = default, WorkItemId? excludeId = null) =>
+        Inner.CountInFlightSplitByRefactorAsync(projectId, ct, excludeId);
+    public virtual Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) =>
+        Inner.GetByExternalIdAsync(projectId, externalId, ct);
+    public virtual Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) =>
+        Inner.GetByNamespacedExternalIdAsync(projectId, @namespace, externalId, ct);
+    public virtual Task<WorkItem?> ReplaceExternalIdsAsync(WorkItemId id, IReadOnlyDictionary<string, string> externalIds, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+        Inner.ReplaceExternalIdsAsync(id, externalIds, updatedAt, ct);
+    public virtual Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default) =>
+        Inner.GetFleetStateCountsAsync(ct);
+    public virtual Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default) =>
+        Inner.GetFleetRecentOutcomesAsync(perProject, ct);
+    public virtual Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) =>
+        Inner.GetFleetPauseStatesAsync(ct);
+    public virtual IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+        Inner.ListByReplaySourceAsync(sourceId, ct);
+    public virtual IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => Inner.ListSuspendedAsync(ct);
+    public virtual Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default) =>
+        Inner.GetActiveBaselineImageRefsAsync(ct);
+    public virtual Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(string baselineImageRef, CancellationToken ct = default) =>
+        Inner.ListWorkItemsForBaselineAsync(baselineImageRef, ct);
+    public virtual Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => Inner.OrphanReplaysAsync(sourceId, ct);
+    public virtual IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => Inner.ListByReleaseAsync(releaseId, ct);
+    public virtual Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+        Inner.TryReplacePromptAsync(id, newPrompt, updatedAt, ct);
+    public virtual Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) =>
+        Inner.RecordIterationDispatchAsync(workItemId, iteration, promptRevisionAtDispatch, dispatchedAt, ct);
+    public virtual Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) =>
+        Inner.GetIterationsAsync(workItemId, ct);
 }
 
 internal sealed class RecordingPlanningPreprocessor : IAgentPromptPreprocessor
