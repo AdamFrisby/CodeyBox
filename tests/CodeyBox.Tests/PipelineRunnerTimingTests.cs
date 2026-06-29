@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit.Presets;
@@ -199,6 +200,59 @@ public sealed class PipelineRunnerTimingTests : IDisposable
         Assert.Equal(subStep.StartedAt.AddMilliseconds(1_234), subStep.EndedAt);
     }
 
+    [Fact]
+    public async Task UnstructuredWorkAgent_EmitsFallbackToolCallTelemetryThroughRunAsync()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        var counter = new StaticToolCallCounter(
+            AgentKind.Claude,
+            "plain stream-json",
+            new AgentToolCallCounts(
+                new Dictionary<string, int> { ["Bash"] = 2 },
+                FinalText: "done"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            timingStore: timings,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            toolCallCounters: new Dictionary<AgentKind, IAgentToolCallCounter>
+            {
+                [AgentKind.Claude] = counter,
+            });
+
+        tp.Agent.ResultStdout = "plain stream-json";
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("tool-call-telemetry.txt", "telemetry\n"));
+
+        var item = NewItem("feature/tool-call-telemetry");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Contains("plain stream-json", counter.SeenStdouts);
+
+        var agentExec = Assert.Single(timings.CompletedRows, r => r.Phase == "work" && r.Step == "agent.exec");
+        var tool = Assert.Single(timings.CompletedRows, r => r.Step == "agent.tool_call.Bash");
+        Assert.Equal(item.Id, tool.WorkItemId);
+        Assert.Equal("work", tool.Phase);
+        Assert.Null(tool.Iteration);
+        Assert.Equal(0, tool.DurationMs);
+        Assert.Equal(tool.StartedAt, tool.EndedAt);
+        using (var metadata = JsonDocument.Parse(tool.MetadataJson))
+        {
+            Assert.Equal(2, metadata.RootElement.GetProperty("count").GetInt32());
+        }
+
+        var thinking = Assert.Single(timings.CompletedRows, r => r.Step == "agent.thinking_aggregate");
+        Assert.Equal(item.Id, thinking.WorkItemId);
+        Assert.Equal("work", thinking.Phase);
+        Assert.Null(thinking.Iteration);
+        Assert.Equal(agentExec.DurationMs, thinking.DurationMs);
+        Assert.Equal("{}", thinking.MetadataJson);
+        Assert.Equal(thinking.StartedAt.AddMilliseconds(thinking.DurationMs!.Value), thinking.EndedAt);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static WorkItem NewItem(string branch) => new()
@@ -389,6 +443,21 @@ public sealed class PipelineRunnerTimingTests : IDisposable
             _ = context;
             _ = ct;
             return Task.FromResult(new AuditResult(true, [], rawOutput));
+        }
+    }
+
+    private sealed class StaticToolCallCounter(
+        AgentKind kind,
+        string expectedStdout,
+        AgentToolCallCounts counts) : IAgentToolCallCounter
+    {
+        public AgentKind Kind => kind;
+        public List<string?> SeenStdouts { get; } = [];
+
+        public AgentToolCallCounts? TryCount(string? bufferedStdout)
+        {
+            SeenStdouts.Add(bufferedStdout);
+            return bufferedStdout == expectedStdout ? counts : null;
         }
     }
 

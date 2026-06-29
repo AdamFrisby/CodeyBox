@@ -144,7 +144,8 @@ internal static class TestSupport
         TimeProvider? retryTimeProvider = null,
         CancellationRegistry? cancellationRegistry = null,
         AgentAvailabilityRegistry? availabilityRegistry = null,
-        ScriptedAgent? agentOverride = null)
+        ScriptedAgent? agentOverride = null,
+        IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -313,7 +314,8 @@ internal static class TestSupport
             terminalRevisionBuilder: terminalTransitions,
             mechanicalFixerComposer: mechanicalComposer,
             mechanicalFixerInputProviders: mechanicalFixerInputProviders,
-            inVmSmokeGate: inVmSmokeGate);
+            inVmSmokeGate: inVmSmokeGate,
+            toolCallCounters: toolCallCounters);
 
         return new TestPipeline(
             pipeline,
