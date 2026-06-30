@@ -23,7 +23,7 @@ internal sealed class Bridge : IAsyncDisposable
     private const int SignalInterrupt = 2;
     private const int SignalKill = 9;
     private const int SignalTerm = 15;
-    private const int ClaudeSigtermGraceMilliseconds = 1500;
+    private const int ClaudeSigtermGraceMilliseconds = 5000;
     private const int ClaudeSigkillWaitMilliseconds = 500;
     // Starts after Shutdown has already run; this is only the final grace for
     // a signal-interrupted stdin read to unwind cooperatively.
@@ -869,10 +869,9 @@ internal sealed class Bridge : IAsyncDisposable
 
         if (politeSent)
         {
-            // Brief grace window so claude can flush ~/.claude/projects/<slug>/<session>.jsonl
-            // before exiting. 1.5s is well under any operator-visible
-            // teardown latency while comfortably covering the JSONL flush
-            // path; if claude is wedged we still SIGKILL below.
+            // Grace window so claude can flush ~/.claude/projects/<slug>/<session>.jsonl
+            // before exiting. Bounded so a wedged child can't pin shutdown — if
+            // the window elapses we still SIGKILL below.
             try { p.WaitForExit(milliseconds: ClaudeSigtermGraceMilliseconds); }
             catch { /* WaitForExit can throw if the handle is racing dispose */ }
         }
