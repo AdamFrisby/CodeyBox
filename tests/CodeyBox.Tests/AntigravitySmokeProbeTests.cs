@@ -58,7 +58,7 @@ public sealed class AntigravitySmokeProbeTests
     {
         Uri? captured = null;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req => captured = req.RequestUri);
-        await BuildProbe(handler).SmokeTestAsync(OAuthCred("oauth-token"), CancellationToken.None);
+        await BuildProbe(handler).SmokeTestAsync(FlatOAuthCred("oauth-token"), CancellationToken.None);
 
         Assert.NotNull(captured);
         Assert.Equal(new Uri(AntigravitySmokeProbe.LoadCodeAssistEndpoint), captured);
@@ -70,25 +70,41 @@ public sealed class AntigravitySmokeProbeTests
         string? authHeader = null;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req =>
             authHeader = req.Headers.Authorization?.ToString());
-        await BuildProbe(handler).SmokeTestAsync(OAuthCred("agy-oauth-token"), CancellationToken.None);
+        await BuildProbe(handler).SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.Equal("Bearer agy-oauth-token", authHeader);
     }
 
     [Fact]
-    public async Task OAuthProbe_SendsBearerHeader_FlatShape()
+    public async Task OAuthProbe_SendsJsonLoadCodeAssistBody()
     {
-        string? authHeader = null;
+        string? body = null;
+        string? contentType = null;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req =>
-            authHeader = req.Headers.Authorization?.ToString());
+        {
+            body = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            contentType = req.Content.Headers.ContentType?.MediaType;
+        });
         await BuildProbe(handler).SmokeTestAsync(FlatOAuthCred("flat-oauth-token"), CancellationToken.None);
-        Assert.Equal("Bearer flat-oauth-token", authHeader);
+        Assert.Equal("""{"metadata":{"pluginType":"GEMINI"}}""", body);
+        Assert.Equal("application/json", contentType);
+    }
+
+    [Fact]
+    public async Task RefreshableOAuthBundle_ReturnsOkWithoutHttpCall()
+    {
+        var calls = 0;
+        var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.Unauthorized, "", _ => calls++))
+            .SmokeTestAsync(OAuthCred("expired-access-token"), CancellationToken.None);
+
+        Assert.True(result.Ok);
+        Assert.Equal(0, calls);
     }
 
     [Fact]
     public async Task OAuthToken_Http200_ReturnsOk()
     {
         var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.OK, "{}", _ => { }))
-            .SmokeTestAsync(OAuthCred("agy-oauth-token"), CancellationToken.None);
+            .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.True(result.Ok);
     }
 
@@ -96,7 +112,7 @@ public sealed class AntigravitySmokeProbeTests
     public async Task OAuthToken_Http401_ReturnsFail_Auth()
     {
         var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.Unauthorized, "", _ => { }))
-            .SmokeTestAsync(OAuthCred("agy-oauth-token"), CancellationToken.None);
+            .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Equal("auth", result.FailureReason);
     }
@@ -105,7 +121,7 @@ public sealed class AntigravitySmokeProbeTests
     public async Task OAuthToken_Http403_ReturnsFail_Auth()
     {
         var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.Forbidden, "", _ => { }))
-            .SmokeTestAsync(OAuthCred("agy-oauth-token"), CancellationToken.None);
+            .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Equal("auth", result.FailureReason);
     }
@@ -114,16 +130,26 @@ public sealed class AntigravitySmokeProbeTests
     public async Task OAuthToken_Http500_ReturnsFail_Transient()
     {
         var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.InternalServerError, "", _ => { }))
-            .SmokeTestAsync(OAuthCred("agy-oauth-token"), CancellationToken.None);
+            .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("transient", result.FailureReason);
+    }
+
+    [Fact]
+    public async Task OAuthToken_Http400_ReturnsFail_Unknown()
+    {
+        var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.BadRequest, "", _ => { }))
+            .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
+        Assert.False(result.Ok);
+        Assert.Equal("HTTP 400", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Unknown, result.Category);
     }
 
     [Fact]
     public async Task OAuthNetworkException_ReturnsFail_Transient()
     {
         var result = await BuildProbe(new SmokeThrowingHandler(new HttpRequestException("timeout")))
-            .SmokeTestAsync(OAuthCred("agy-oauth-token"), CancellationToken.None);
+            .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("transient", result.FailureReason);
     }
@@ -133,7 +159,7 @@ public sealed class AntigravitySmokeProbeTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
         var result = await BuildProbe(new SmokeHangingHandler())
-            .SmokeTestAsync(OAuthCred("agy-oauth-token"), cts.Token);
+            .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), cts.Token);
         Assert.False(result.Ok);
         Assert.Equal("timeout", result.FailureReason);
     }
@@ -150,13 +176,12 @@ public sealed class AntigravitySmokeProbeTests
     }
 
     [Fact]
-    public async Task OAuthCredsJson_MissingAccessToken_FallsThroughToNoToken()
+    public async Task OAuthCredsJson_MissingAccessTokenWithRefreshToken_ReturnsOkWithoutHttpCall()
     {
         int calls = 0;
         var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.OK, "{}", _ => calls++))
             .SmokeTestAsync(OAuthCredMissingAccessToken(), CancellationToken.None);
-        Assert.False(result.Ok);
-        Assert.Contains("no token", result.FailureReason);
+        Assert.True(result.Ok);
         Assert.Equal(0, calls);
     }
 

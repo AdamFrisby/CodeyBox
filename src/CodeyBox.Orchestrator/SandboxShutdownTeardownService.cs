@@ -359,9 +359,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
             AuditLog.SandboxDisposedOnShutdown(
                 workItemId,
                 sandbox.Id,
-                metrics?.PeakRamBytes,
-                metrics?.AvgCpuPercent,
-                metrics?.TotalNetIoBytes);
+                metrics);
         }
         catch (OperationCanceledException)
         {

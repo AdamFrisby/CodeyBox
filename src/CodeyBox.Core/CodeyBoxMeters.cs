@@ -69,6 +69,22 @@ public static class CodeyBoxMeters
     public static readonly Histogram<long> SandboxLifecycle =
         SandboxMeter.CreateHistogram<long>("codeybox.sandbox.lifecycle.duration_ms");
 
+    /// <summary>Peak guest RAM captured at teardown. Tags: <c>phase</c>, <c>network_profile</c>.</summary>
+    public static readonly Histogram<double> SandboxPeakRamMb =
+        SandboxMeter.CreateHistogram<double>("codeybox.sandbox.resource.peak_ram_mb", unit: "MB");
+
+    /// <summary>Lifetime-average guest CPU utilization captured at teardown. Tags: <c>phase</c>, <c>network_profile</c>.</summary>
+    public static readonly Histogram<double> SandboxAvgCpuPercent =
+        SandboxMeter.CreateHistogram<double>("codeybox.sandbox.resource.avg_cpu_pct", unit: "%");
+
+    /// <summary>Cumulative guest network receive bytes captured at teardown, converted to MB. Tags: <c>phase</c>, <c>network_profile</c>.</summary>
+    public static readonly Histogram<double> SandboxNetRxMb =
+        SandboxMeter.CreateHistogram<double>("codeybox.sandbox.resource.net_rx_mb", unit: "MB");
+
+    /// <summary>Cumulative guest network transmit bytes captured at teardown, converted to MB. Tags: <c>phase</c>, <c>network_profile</c>.</summary>
+    public static readonly Histogram<double> SandboxNetTxMb =
+        SandboxMeter.CreateHistogram<double>("codeybox.sandbox.resource.net_tx_mb", unit: "MB");
+
     /// <summary>Upstream API call duration. Tags: <c>endpoint</c>, <c>status_code</c>.</summary>
     public static readonly Histogram<long> UpstreamApiCallDuration =
         UpstreamMeter.CreateHistogram<long>("codeybox.upstream.api_call.duration_ms");

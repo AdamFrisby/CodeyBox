@@ -62,6 +62,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private readonly MultipassDaemonRetryPolicy _daemonRetryPolicy;
     private readonly string _stagingRoot;
     private readonly ITimingStore? _timings;
+    private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly IDiskSpaceProbe _diskProbe;
     // Per-baseline-name semaphore: serialises bake operations so two
     // concurrent CreateAsync calls for the same profile don't both try to
@@ -117,34 +118,37 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private int _bootGateCapacity;
 
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
-        ITimingStore? timings = null)
-        : this(() => opts, log, timings, new DefaultProcessRunner())
+        ITimingStore? timings = null, ISandboxResourceUsageStore? resourceUsageStore = null)
+        : this(() => opts, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore)
     {
     }
 
     public MultipassSandboxProvider(Func<MultipassSandboxOptions> optionsAccessor,
-        ILogger<MultipassSandboxProvider> log, ITimingStore? timings = null)
-        : this(optionsAccessor, log, timings, new DefaultProcessRunner())
+        ILogger<MultipassSandboxProvider> log, ITimingStore? timings = null,
+        ISandboxResourceUsageStore? resourceUsageStore = null)
+        : this(optionsAccessor, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore)
     {
     }
 
     internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
-        IDiskSpaceProbe? diskProbe = null)
-        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe)
+        IDiskSpaceProbe? diskProbe = null, ISandboxResourceUsageStore? resourceUsageStore = null)
+        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe, resourceUsageStore)
     {
     }
 
     internal MultipassSandboxProvider(Func<MultipassSandboxOptions> optionsAccessor,
         ILogger<MultipassSandboxProvider> log, ITimingStore? timings, IProcessRunner runner,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
-        IDiskSpaceProbe? diskProbe = null)
+        IDiskSpaceProbe? diskProbe = null,
+        ISandboxResourceUsageStore? resourceUsageStore = null)
     {
         _optsAccessor = optionsAccessor;
         _log = log;
         _runner = runner;
         _daemonRetryPolicy = daemonRetryPolicy ?? MultipassDaemonRetryPolicy.Default;
         _timings = timings;
+        _resourceUsageStore = resourceUsageStore;
         _diskProbe = diskProbe ?? new DefaultDiskSpaceProbe();
         // StagingDirectory is captured once: the provider keeps the directory open
         // for the lifetime of the process. Re-binding it at runtime would orphan
@@ -328,6 +332,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             //     Slower per VM but works without prior baking.
             var useBaseline = opts.UseBaselineImages
                 && !string.IsNullOrWhiteSpace(spec.Network.ProfileName);
+            string? clonedFromBaselineRef = spec.BaselineImageRef;
 
             // After this block the VM is in Stopped state, ready for native
             // mounts. The launch path goes through a stop-mount-start cycle;
@@ -335,6 +340,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             if (useBaseline)
             {
                 var baselineName = await EnsureBaselineForProfileAsync(opts, spec.Network.ProfileName!, spec.Flavor, workItemId, spec.BaselineImageRef, ct);
+                clonedFromBaselineRef = baselineName;
                 await using var cloneScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.clone", log: _log);
                 await CloneFromBaselineAsync(opts, name, baselineName, workItemId, ct);
@@ -421,7 +427,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 // provisioning calls compete for the same semaphore slots
                 // rather than each opening its own unbounded path to the
                 // multipass daemon.
-                opGateAcquirer: (argv, ct) => EnterMultipassOpGateAsync(ReadOptions(), argv, ct));
+                opGateAcquirer: (argv, ct) => EnterMultipassOpGateAsync(ReadOptions(), argv, ct),
+                resourceUsageStore: _resourceUsageStore,
+                baselineRef: clonedFromBaselineRef);
             // Register in the owner index ONLY when a work-item ID is present.
             // Sandboxes created without one (some tests) have no orchestrator-side
             // owner to suspend back into, so skip them.
@@ -3690,6 +3698,50 @@ test "$work" = present && test "$exec_wrapper" = present
         echo "codeybox-route: default via $gw dev $iface"
         """;
 
+    internal const string PeakRamSamplerPath = "/run/codeybox-peak-ram-bytes";
+    internal const string ResourceDataInterface = "ens4";
+
+    private const string PeakRamSamplerScript = """
+        #!/bin/sh
+        out=/run/codeybox-peak-ram-bytes
+        peak=0
+        interval=10
+        while :; do
+            mem_total_kb=0
+            mem_available_kb=0
+            while read -r key value unit; do
+                case "$key" in
+                    MemTotal:) mem_total_kb=$value ;;
+                    MemAvailable:) mem_available_kb=$value ;;
+                esac
+            done < /proc/meminfo
+            if [ "$mem_total_kb" -gt 0 ] && [ "$mem_available_kb" -gt 0 ]; then
+                used_bytes=$(( (mem_total_kb - mem_available_kb) * 1024 ))
+                if [ "$used_bytes" -gt "$peak" ]; then
+                    peak=$used_bytes
+                    tmp="${out}.$$"
+                    printf '%s\n' "$peak" > "$tmp" && mv -f "$tmp" "$out"
+                fi
+            fi
+            sleep "$interval"
+        done
+        """;
+
+    private const string PeakRamSamplerService = """
+        [Unit]
+        Description=CodeyBox peak RAM sampler
+        After=multi-user.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/local/sbin/codeybox-peak-ram-sampler
+        Restart=always
+        RestartSec=1
+
+        [Install]
+        WantedBy=multi-user.target
+        """;
+
     private const string GraphicalXvfbService = """
         [Unit]
         Description=CodeyBox graphical X server
@@ -3796,6 +3848,8 @@ test "$work" = present && test "$exec_wrapper" = present
     ///     such as <c>runcmd:</c> or <c>write_files:</c> via
     ///     <paramref name="extraCloudInit"/> — duplicate top-level keys can
     ///     clobber generated user-data, so they are rejected before launch.
+    ///   - Installs a tiny peak-RAM sampler service that records the running
+    ///     max of MemTotal-MemAvailable to /run for teardown capture.
     ///
     /// Egress filtering is NOT installed in the guest. It lives entirely
     /// on the host (nftables on the profile bridge — see
@@ -3815,6 +3869,8 @@ test "$work" = present && test "$exec_wrapper" = present
         ValidateExtraCloudInitFragment(extraCloudInit);
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
+        var peakRamSamplerIndented = string.Join("\n      ", PeakRamSamplerScript.Split('\n'));
+        var peakRamSamplerServiceIndented = string.Join("\n      ", PeakRamSamplerService.Split('\n'));
         var graphicalXvfbIndented = string.Join("\n      ", GraphicalXvfbService.Split('\n'));
         var graphicalXfceIndented = string.Join("\n      ", GraphicalXfceService.Split('\n'));
         var graphicalVncIndented = string.Join("\n      ", GraphicalVncService.Split('\n'));
@@ -3846,6 +3902,10 @@ test "$work" = present && test "$exec_wrapper" = present
         sb.AppendLine("    permissions: '0o755'");
         sb.AppendLine("    content: |");
         sb.Append("      ").AppendLine(routeScriptIndented);
+        sb.AppendLine("  - path: /usr/local/sbin/codeybox-peak-ram-sampler");
+        sb.AppendLine("    permissions: '0o755'");
+        sb.AppendLine("    content: |");
+        sb.Append("      ").AppendLine(peakRamSamplerIndented);
         sb.AppendLine("  - path: /etc/systemd/system/codeybox-route.service");
         sb.AppendLine("    permissions: '0o644'");
         sb.AppendLine("    content: |");
@@ -3859,6 +3919,10 @@ test "$work" = present && test "$exec_wrapper" = present
         sb.AppendLine("      RemainAfterExit=yes");
         sb.AppendLine("      [Install]");
         sb.AppendLine("      WantedBy=multi-user.target");
+        sb.AppendLine("  - path: /etc/systemd/system/codeybox-peak-ram-sampler.service");
+        sb.AppendLine("    permissions: '0o644'");
+        sb.AppendLine("    content: |");
+        sb.Append("      ").AppendLine(peakRamSamplerServiceIndented);
         if (flavor == SandboxProfileFlavor.Graphical)
         {
             sb.AppendLine("  - path: /etc/systemd/system/codeybox-xvfb.service");
@@ -3898,6 +3962,7 @@ test "$work" = present && test "$exec_wrapper" = present
         sb.AppendLine(startRouteService
             ? "  - systemctl enable --now codeybox-route.service"
             : "  - systemctl enable codeybox-route.service");
+        sb.AppendLine("  - systemctl enable --now codeybox-peak-ram-sampler.service");
         if (flavor == SandboxProfileFlavor.Graphical && includeGraphicalInstall)
             AppendRuncmdCommand(sb, GraphicalInstallRuncmd);
         // Splice caller-supplied runcmd entries into the same block, after the
@@ -4770,6 +4835,7 @@ public sealed record MultipassSandboxOptions
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
     public const int DefaultMaxConcurrentBoots = 2;
     public static readonly TimeSpan DefaultBootLaunchDelay = TimeSpan.Zero;
+    public static readonly TimeSpan DefaultResourceMetricsCaptureTimeout = TimeSpan.FromSeconds(5);
 
     public string MultipassBinary { get; init; } = "multipass";
 
@@ -4848,6 +4914,13 @@ public sealed record MultipassSandboxOptions
     /// report the VM in the <c>Stopped</c> state. Defaults to 2 minutes.
     /// </summary>
     public TimeSpan VmStopTimeout { get; init; } = DefaultVmStopTimeout;
+
+    /// <summary>
+    /// Best-effort deadline for the in-VM teardown resource capture. Defaults
+    /// to 5 seconds and is intentionally short: capture must never block stop
+    /// or delete teardown.
+    /// </summary>
+    public TimeSpan ResourceMetricsCaptureTimeout { get; init; } = DefaultResourceMetricsCaptureTimeout;
 
     /// <summary>
     /// Maps logical network-profile names (selected via
@@ -5148,9 +5221,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly IProcessRunner _runner;
     private readonly MultipassDaemonRetryPolicy _daemonRetryPolicy;
     private readonly ITimingStore? _timings;
+    private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly WorkItemId _timingItemId;
     private readonly WorkItemId? _workItemId;
     private readonly string _timingPhase;
+    private readonly string? _baselineRef;
     private readonly Action<string>? _onDisposed;
     private readonly Action<string>? _onNoLongerTrackedActive;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? _opGateAcquirer;
@@ -5159,7 +5234,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
     private int _firstExecEmitted;
-    private bool _disposed;
+    private int _disposeStarted;
+    private int _disposed;
+    private int _resourceMetricsCaptureStarted;
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
@@ -5209,7 +5286,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null,
         Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? opGateAcquirer = null,
-        AgentOutputHttpIngestSessionStarter? agentOutputIngestSessionStarter = null)
+        AgentOutputHttpIngestSessionStarter? agentOutputIngestSessionStarter = null,
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        string? baselineRef = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -5219,9 +5298,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         _runner = runner ?? new DefaultProcessRunner();
         _daemonRetryPolicy = daemonRetryPolicy ?? MultipassDaemonRetryPolicy.Default;
         _timings = timings;
+        _resourceUsageStore = resourceUsageStore;
         _timingItemId = timingItemId;
         _workItemId = timingItemId.Value == Guid.Empty ? null : timingItemId;
         _timingPhase = timingPhase;
+        _baselineRef = baselineRef;
         _onDisposed = onDisposed;
         _onNoLongerTrackedActive = onNoLongerTrackedActive;
         // When the provider creates this sandbox it wires opGateAcquirer to
@@ -5286,7 +5367,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         int? maxStdoutBytes = null,
         int? maxStderrBytes = null)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if (exec.Argv.Count == 0) throw new ArgumentException("Argv must be non-empty", nameof(exec));
 
         var transferredVmPaths = new List<string>();
@@ -5614,7 +5695,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     private void EnsureGraphical()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if (_spec.Flavor != SandboxProfileFlavor.Graphical)
             throw new NotSupportedException("This Multipass sandbox was not created with the graphical flavor.");
     }
@@ -6721,26 +6802,12 @@ while True:
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed) return;
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0) return;
         if (_preserveOnDispose)
         {
-            _disposed = true;
+            Volatile.Write(ref _disposed, 1);
             return;
         }
-
-        long? peakRam = null;
-        double? avgCpu = null;
-        long? netIo = null;
-        if (_opts.CaptureResourceMetrics)
-        {
-            (peakRam, avgCpu, netIo) = await CaptureResourceMetricsAsync(CancellationToken.None).ConfigureAwait(false);
-            if (peakRam.HasValue || avgCpu.HasValue || netIo.HasValue)
-            {
-                _resourceMetrics = new SandboxResourceMetrics(peakRam, avgCpu, netIo);
-            }
-        }
-
-        _disposed = true;
 
         try
         {
@@ -6750,6 +6817,10 @@ while True:
         {
             _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
         }
+
+        var metrics = await EnsureResourceMetricsCapturedAsync(CancellationToken.None).ConfigureAwait(false);
+        Volatile.Write(ref _disposed, 1);
+
         await using var disposeScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "vm.dispose", log: _log);
         try
@@ -6770,75 +6841,232 @@ while True:
             return;
         }
         _onDisposed?.Invoke(_name);
-        AuditLog.SandboxDisposed(_name, peakRam, avgCpu, netIo);
+        AuditLog.SandboxDisposed(_name, metrics);
         try { Directory.Delete(_sandboxRoot, recursive: true); }
         catch (Exception ex) { _log.LogWarning(ex, "Failed to clean sandbox root {Root}", _sandboxRoot); }
     }
 
-    private async Task<(long? PeakRamBytes, double? AvgCpuPercent, long? TotalNetIoBytes)> CaptureResourceMetricsAsync(CancellationToken ct)
+    private async Task<SandboxResourceMetrics?> EnsureResourceMetricsCapturedAsync(CancellationToken ct)
+    {
+        if (!_opts.CaptureResourceMetrics)
+            return null;
+
+        if (Interlocked.Exchange(ref _resourceMetricsCaptureStarted, 1) != 0)
+            return _resourceMetrics;
+
+        try
+        {
+            await using var captureScope = await TimingScope.BeginAsync(
+                _timings, _timingItemId, _timingPhase, "vm.resource_capture", log: _log);
+            var metrics = await CaptureResourceMetricsAsync(ct).ConfigureAwait(false);
+            if (metrics is null)
+                return null;
+
+            _resourceMetrics = metrics;
+            await PersistResourceMetricsAsync(metrics, CancellationToken.None).ConfigureAwait(false);
+            RecordResourceMetricInstruments(metrics);
+            return metrics;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Failed to capture resource metrics for multipass VM {Name} before teardown", _name);
+            return null;
+        }
+    }
+
+    private async Task<SandboxResourceMetrics?> CaptureResourceMetricsAsync(CancellationToken ct)
     {
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(TimeSpan.FromSeconds(5));
-
-            var script = """
-            peak_ram=0
-            if [ -f /sys/fs/cgroup/memory.peak ]; then
-              peak_ram=$(cat /sys/fs/cgroup/memory.peak)
-            elif [ -f /sys/fs/cgroup/memory/memory.max_usage_in_bytes ]; then
-              peak_ram=$(cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes)
-            fi
-
-            read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
-            total=$((user + nice + system + idle + iowait + irq + softirq + steal))
-            active=$((user + nice + system + irq + softirq + steal))
-            avg_cpu=0
-            if [ $total -gt 0 ]; then
-              avg_cpu=$((active * 100 / total))
-            fi
-
-            net_io=0
-            for d in /sys/class/net/*; do
-              name=$(basename "$d")
-              if [ "$name" != "lo" ]; then
-                rx=$(cat "$d/statistics/rx_bytes" 2>/dev/null || echo 0)
-                tx=$(cat "$d/statistics/tx_bytes" 2>/dev/null || echo 0)
-                net_io=$((net_io + rx + tx))
-              fi
-            done
-
-            echo "$peak_ram $avg_cpu $net_io"
-            """;
+            cts.CancelAfter(ResolveResourceMetricsCaptureTimeout(_opts));
 
             var result = await ExecAsync(new SandboxExec
             {
-                Argv = ["sh", "-c", script]
-            }, cts.Token).ConfigureAwait(false);
+                Argv = ["sh", "-c", BuildResourceMetricsCaptureScript()]
+            }, cts.Token).WaitAsync(cts.Token).ConfigureAwait(false);
 
             if (result.ExitCode == 0)
-            {
-                var output = result.Stdout.Trim();
-                var parts = output.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length == 3)
-                {
-                    long? peakRam = long.TryParse(parts[0], out var r) && r > 0 ? r : null;
-                    double? avgCpu = double.TryParse(parts[1], out var c) && c >= 0 ? c : null;
-                    long? netIo = long.TryParse(parts[2], out var n) && n >= 0 ? n : null;
-                    return (peakRam, avgCpu, netIo);
-                }
-            }
+                return ParseResourceMetricsOutput(result.Stdout, DateTimeOffset.UtcNow);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning("Timed out capturing resource metrics for multipass VM {Name} before teardown", _name);
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to capture resource metrics for multipass VM {Name} before teardown", _name);
         }
-        return (null, null, null);
+        return null;
     }
+
+    internal static string BuildResourceMetricsCaptureScript() => $$"""
+        peak_ram_bytes=$(cat {{MultipassSandboxProvider.ShellSingleQuote(MultipassSandboxProvider.PeakRamSamplerPath)}} 2>/dev/null || true)
+
+        cpu_pct=$(awk '
+            /^cpu / {
+                idle=$5
+                iowait=$6
+                total=0
+                for (i=2; i<=NF; i++) total += $i
+                busy=total-idle-iowait
+                if (total > 0) printf "%.6f", busy * 100 / total
+            }
+        ' /proc/stat)
+
+        load1=
+        load5=
+        load15=
+        if read -r load1 load5 load15 _ < /proc/loadavg; then
+            :
+        fi
+
+        uptime_sec=$(awk '{print $1}' /proc/uptime 2>/dev/null || true)
+
+        net_rx_bytes=0
+        net_tx_bytes=0
+        net_line=$(awk -v iface={{MultipassSandboxProvider.ShellSingleQuote(MultipassSandboxProvider.ResourceDataInterface)}} -F'[: ]+' '
+            $2 == iface { print $3 " " $11; found=1 }
+            END { if (!found) print "0 0" }
+        ' /proc/net/dev)
+        set -- $net_line
+        net_rx_bytes=${1:-0}
+        net_tx_bytes=${2:-0}
+
+        printf 'peak_ram_bytes=%s\n' "$peak_ram_bytes"
+        printf 'avg_cpu_pct=%s\n' "$cpu_pct"
+        printf 'net_rx_bytes=%s\n' "$net_rx_bytes"
+        printf 'net_tx_bytes=%s\n' "$net_tx_bytes"
+        printf 'uptime_sec=%s\n' "$uptime_sec"
+        printf 'loadavg_1=%s\n' "$load1"
+        printf 'loadavg_5=%s\n' "$load5"
+        printf 'loadavg_15=%s\n' "$load15"
+        """;
+
+    internal SandboxResourceMetrics? ParseResourceMetricsOutput(string stdout, DateTimeOffset capturedAt)
+    {
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var rawLine in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var eq = rawLine.IndexOf('=');
+            if (eq <= 0) continue;
+            values[rawLine[..eq]] = rawLine[(eq + 1)..];
+        }
+
+        var metrics = new SandboxResourceMetrics(
+            PeakRamBytes: ParseNullableLong(values, "peak_ram_bytes", positiveOnly: true),
+            AvgCpuPercent: ParseNullableDouble(values, "avg_cpu_pct", min: 0, max: 100),
+            NetRxBytes: ParseNullableLong(values, "net_rx_bytes", positiveOnly: false),
+            NetTxBytes: ParseNullableLong(values, "net_tx_bytes", positiveOnly: false),
+            UptimeSeconds: ParseNullableDouble(values, "uptime_sec", min: 0, max: null),
+            LoadAvg1: ParseNullableDouble(values, "loadavg_1", min: 0, max: null),
+            LoadAvg5: ParseNullableDouble(values, "loadavg_5", min: 0, max: null),
+            LoadAvg15: ParseNullableDouble(values, "loadavg_15", min: 0, max: null),
+            BaselineRef: string.IsNullOrWhiteSpace(_baselineRef) ? null : _baselineRef,
+            NetworkProfile: string.IsNullOrWhiteSpace(_spec.Network.ProfileName) ? null : _spec.Network.ProfileName,
+            Phase: _timingPhase,
+            CapturedAt: capturedAt);
+
+        return HasAnyResourceMetric(metrics) ? metrics : null;
+    }
+
+    private async Task PersistResourceMetricsAsync(SandboxResourceMetrics metrics, CancellationToken ct)
+    {
+        if (_resourceUsageStore is null || _workItemId is not { } workItemId)
+            return;
+
+        try
+        {
+            await _resourceUsageStore.RecordAsync(new SandboxResourceUsageRecord
+            {
+                WorkItemId = workItemId,
+                Phase = _timingPhase,
+                VmName = _name,
+                DurationSeconds = metrics.UptimeSeconds,
+                AvgCpuPercent = metrics.AvgCpuPercent,
+                PeakRamMb = BytesToMb(metrics.PeakRamBytes),
+                NetRxMb = BytesToMb(metrics.NetRxBytes),
+                NetTxMb = BytesToMb(metrics.NetTxBytes),
+                BaselineRef = metrics.BaselineRef,
+                NetworkProfile = metrics.NetworkProfile,
+                LoadAvg1 = metrics.LoadAvg1,
+                LoadAvg5 = metrics.LoadAvg5,
+                LoadAvg15 = metrics.LoadAvg15,
+                CapturedAt = metrics.CapturedAt,
+            }, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Failed to persist resource metrics for multipass VM {Name}", _name);
+        }
+    }
+
+    private static void RecordResourceMetricInstruments(SandboxResourceMetrics metrics)
+    {
+        var phaseTag = new KeyValuePair<string, object?>("phase", metrics.Phase);
+        var networkTag = new KeyValuePair<string, object?>("network_profile", metrics.NetworkProfile ?? "");
+        if (BytesToMb(metrics.PeakRamBytes) is { } peak)
+            CodeyBoxMeters.SandboxPeakRamMb.Record(peak, phaseTag, networkTag);
+        if (metrics.AvgCpuPercent is { } cpu)
+            CodeyBoxMeters.SandboxAvgCpuPercent.Record(cpu, phaseTag, networkTag);
+        if (BytesToMb(metrics.NetRxBytes) is { } rx)
+            CodeyBoxMeters.SandboxNetRxMb.Record(rx, phaseTag, networkTag);
+        if (BytesToMb(metrics.NetTxBytes) is { } tx)
+            CodeyBoxMeters.SandboxNetTxMb.Record(tx, phaseTag, networkTag);
+    }
+
+    private static bool HasAnyResourceMetric(SandboxResourceMetrics metrics) =>
+        metrics.PeakRamBytes.HasValue
+        || metrics.AvgCpuPercent.HasValue
+        || metrics.NetRxBytes.HasValue
+        || metrics.NetTxBytes.HasValue
+        || metrics.UptimeSeconds.HasValue
+        || metrics.LoadAvg1.HasValue
+        || metrics.LoadAvg5.HasValue
+        || metrics.LoadAvg15.HasValue;
+
+    private static long? ParseNullableLong(
+        IReadOnlyDictionary<string, string> values,
+        string key,
+        bool positiveOnly)
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return null;
+        if (!long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+            return null;
+        if (positiveOnly)
+            return value > 0 ? value : null;
+        return value >= 0 ? value : null;
+    }
+
+    private static double? ParseNullableDouble(
+        IReadOnlyDictionary<string, string> values,
+        string key,
+        double min,
+        double? max)
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return null;
+        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            return null;
+        if (double.IsNaN(value) || double.IsInfinity(value) || value < min)
+            return null;
+        if (max.HasValue && value > max.Value)
+            return null;
+        return value;
+    }
+
+    private static double? BytesToMb(long? bytes) =>
+        bytes.HasValue ? bytes.Value / 1024d / 1024d : null;
+
+    private static TimeSpan ResolveResourceMetricsCaptureTimeout(MultipassSandboxOptions opts) =>
+        opts.ResourceMetricsCaptureTimeout > TimeSpan.Zero
+            ? opts.ResourceMetricsCaptureTimeout
+            : MultipassSandboxOptions.DefaultResourceMetricsCaptureTimeout;
 
     public async Task KillActiveExecsAsync(CancellationToken ct = default)
     {
-        if (_disposed) return;
+        if (Volatile.Read(ref _disposed) != 0) return;
         try
         {
             var stop = await RunMultipassAsync(
@@ -6866,7 +7094,7 @@ while True:
 
     public async Task StopAndPreserveAsync(CancellationToken ct = default)
     {
-        if (_disposed) return;
+        if (Volatile.Read(ref _disposed) != 0) return;
 
         // Stop/preserve is called only after the orchestrator has either
         // created a preempt checkpoint or decided the active state is
@@ -6874,6 +7102,7 @@ while True:
         // delete the VM even if multipass stop fails, times out, or shutdown
         // cancellation abandons the wait.
         _preserveOnDispose = true;
+        await EnsureResourceMetricsCapturedAsync(CancellationToken.None).ConfigureAwait(false);
         await TryWritePreemptMarkerAsync(CancellationToken.None);
 
         var stop = await RunMultipassAsync(
@@ -6933,7 +7162,7 @@ while True:
     /// </summary>
     public async Task SuspendAsync(CancellationToken ct = default)
     {
-        if (_disposed) return;
+        if (Volatile.Read(ref _disposed) != 0) return;
         await TryWritePreemptMarkerAsync(ct);
 
         ProcessRunResult result;

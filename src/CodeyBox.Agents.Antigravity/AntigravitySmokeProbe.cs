@@ -9,9 +9,9 @@ using CodeyBox.Core;
 namespace CodeyBox.Agents.Antigravity;
 
 /// <summary>
-/// Smoke-tests Antigravity credentials by sending a loadCodeAssist request
-/// directly to the daily-cloudcode-pa gateway (not via the CLI or sandbox).
-/// Validates the subscription OAuth token without spending quota.
+/// Smoke-tests Antigravity credentials. Refresh-token-bearing OAuth bundles
+/// pass by presence check because the in-VM agy CLI owns token refresh; access-
+/// token-only bundles are validated with a loadCodeAssist request.
 /// </summary>
 public sealed class AntigravitySmokeProbe : IAgentSmokeProbe
 {
@@ -40,15 +40,21 @@ public sealed class AntigravitySmokeProbe : IAgentSmokeProbe
                 return Fail("no token in credential bundle", sw, SmokeFailureCategory.Persistent);
             }
 
-            var accessToken = ExtractAccessToken(oauthJson, _log);
-            if (string.IsNullOrEmpty(accessToken))
+            var parsed = ExtractOAuthCredential(oauthJson, _log);
+            if (parsed.HasRefreshToken)
+            {
+                sw.Stop();
+                return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
+            }
+
+            if (string.IsNullOrEmpty(parsed.AccessToken))
             {
                 return Fail("no token in credential bundle", sw, SmokeFailureCategory.Persistent);
             }
 
             var client = _httpClientFactory.CreateClient("agent-smoke");
             using var request = new HttpRequestMessage(HttpMethod.Post, LoadCodeAssistEndpoint);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", parsed.AccessToken);
             request.Content = new StringContent(LoadCodeAssistBody, Encoding.UTF8, "application/json");
 
             using var response = await client.SendAsync(request, ct).ConfigureAwait(false);
@@ -77,34 +83,54 @@ public sealed class AntigravitySmokeProbe : IAgentSmokeProbe
         }
     }
 
-    internal static string? ExtractAccessToken(string oauthCredsJson, ILogger? log = null)
+    internal static string? ExtractAccessToken(string oauthCredsJson, ILogger? log = null) =>
+        ExtractOAuthCredential(oauthCredsJson, log).AccessToken;
+
+    internal static AntigravityOAuthCredential ExtractOAuthCredential(string oauthCredsJson, ILogger? log = null)
     {
         try
         {
             using var doc = JsonDocument.Parse(oauthCredsJson);
             var root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object) return null;
+            if (root.ValueKind != JsonValueKind.Object) return new(null, false);
 
+            string? accessToken = null;
+            var hasRefreshToken = false;
             if (root.TryGetProperty("token", out var tok)
-                && tok.ValueKind == JsonValueKind.Object
-                && tok.TryGetProperty("access_token", out var nested)
-                && nested.ValueKind == JsonValueKind.String)
+                && tok.ValueKind == JsonValueKind.Object)
             {
-                return nested.GetString();
+                if (tok.TryGetProperty("access_token", out var nested)
+                    && nested.ValueKind == JsonValueKind.String)
+                {
+                    accessToken = nested.GetString();
+                }
+
+                hasRefreshToken = tok.TryGetProperty("refresh_token", out var nestedRefresh)
+                    && nestedRefresh.ValueKind == JsonValueKind.String
+                    && !string.IsNullOrWhiteSpace(nestedRefresh.GetString());
             }
 
             if (root.TryGetProperty("access_token", out var flat)
                 && flat.ValueKind == JsonValueKind.String)
             {
-                return flat.GetString();
+                accessToken ??= flat.GetString();
             }
+
+            hasRefreshToken = hasRefreshToken
+                || (root.TryGetProperty("refresh_token", out var flatRefresh)
+                    && flatRefresh.ValueKind == JsonValueKind.String
+                    && !string.IsNullOrWhiteSpace(flatRefresh.GetString()));
+
+            return new(accessToken, hasRefreshToken);
         }
         catch (JsonException ex)
         {
             log?.LogDebug(ex, "Antigravity OAuth creds JSON is malformed; treating as no token");
         }
-        return null;
+        return new(null, false);
     }
+
+    internal readonly record struct AntigravityOAuthCredential(string? AccessToken, bool HasRefreshToken);
 
     private static AgentSmokeResult Fail(string reason, Stopwatch sw, SmokeFailureCategory category)
     {

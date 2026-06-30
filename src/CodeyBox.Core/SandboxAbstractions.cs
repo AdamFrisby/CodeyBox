@@ -164,12 +164,26 @@ public interface ISandbox : IAsyncDisposable
 }
 
 /// <summary>
-/// Resource metrics captured at sandbox teardown (peak RAM, avg CPU, total net I/O).
+/// Resource metrics captured at sandbox teardown for capacity planning.
 /// </summary>
 public sealed record SandboxResourceMetrics(
     long? PeakRamBytes,
     double? AvgCpuPercent,
-    long? TotalNetIoBytes);
+    long? NetRxBytes,
+    long? NetTxBytes,
+    double? UptimeSeconds,
+    double? LoadAvg1,
+    double? LoadAvg5,
+    double? LoadAvg15,
+    string? BaselineRef,
+    string? NetworkProfile,
+    string Phase,
+    DateTimeOffset CapturedAt)
+{
+    public long? TotalNetIoBytes => NetRxBytes.HasValue || NetTxBytes.HasValue
+        ? (NetRxBytes ?? 0) + (NetTxBytes ?? 0)
+        : null;
+}
 
 
 /// <summary>
