@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using CodeyBox.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -26,8 +27,9 @@ namespace CodeyBox.Deployment;
 ///   exempt for <see cref="DeploymentLeakOptions.PreemptRetention"/>
 ///   (default 24h).</item>
 ///   <item><b>IsSuspendLifecycleOrFrozen</b> — suspended VMs (multipass
-///   <c>Suspending</c>/<c>Suspended</c>) are exempt; they belong to the
-///   Claude session worker's stop/resume contract.</item>
+///   <c>Suspending</c>/<c>Suspended</c>) get a dedicated
+///   <see cref="DeploymentLeakOptions.SuspendOrphanGrace"/> measured from
+///   first observation in a suspend state before disposal.</item>
 ///   <item>Optional <c>suspendedNameProvider</c> — the composition root
 ///   wires this to the work-item store's SuspendedVmName index so the
 ///   startup resume handler can multipass-start them back to Running.</item>
@@ -43,6 +45,8 @@ public sealed class DeploymentLeakReaper : BackgroundService
     private readonly ILogger<DeploymentLeakReaper> _log;
     private readonly Func<DateTimeOffset> _clock;
     private readonly Func<CancellationToken, Task<IReadOnlySet<string>>>? _suspendedNameProvider;
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _suspendOrphanFirstSeen =
+        new(StringComparer.Ordinal);
     private volatile IReadOnlyList<DeploymentLeakInfo> _latestLeaks = [];
 
     public DeploymentLeakReaper(
@@ -69,7 +73,7 @@ public sealed class DeploymentLeakReaper : BackgroundService
         // be retuned without reconstruction), but Enabled is re-checked each tick
         // so an operator hot-flipping Enabled=false stops the sweep at the next
         // tick rather than the next process restart. Initial Enabled=false still
-        // short-circuits before allocating the timer.
+        // allocates the timer so a later Enabled=true can take effect.
         var initial = _optsAccessor();
         if (!initial.Enabled)
         {
@@ -108,6 +112,7 @@ public sealed class DeploymentLeakReaper : BackgroundService
                 ? (IReadOnlySet<string>)new HashSet<string>(StringComparer.Ordinal)
                 : await _suspendedNameProvider(ct).ConfigureAwait(false);
             var now = _clock();
+            var observedSuspendOrphans = new HashSet<string>(StringComparer.Ordinal);
 
             var leaks = new List<DeploymentLeakInfo>();
             foreach (var info in managed)
@@ -128,31 +133,47 @@ public sealed class DeploymentLeakReaper : BackgroundService
                 // purging them mid-restart strands the work item.
                 if (suspendedNames.Contains(info.Name)) continue;
 
-                // A VM in a suspend lifecycle state (freezing/frozen) without
-                // a live mapping belongs to the Claude session worker's
-                // stop/resume contract or is mid-snapshot. SandboxLeakReaper
-                // applies a dedicated SuspendOrphanGrace here; we conservatively
-                // skip them entirely so we never race the sibling reaper's
-                // grace window — if they're true suspend orphans, the sibling
-                // will dispose them under its dedicated gate.
-                if (info.IsSuspendLifecycleOrFrozen) continue;
+                DateTimeOffset createdAt;
+                TimeSpan age;
+                if (info.IsSuspendLifecycleOrFrozen)
+                {
+                    // The general SandboxLeakReaper no longer owns deployment
+                    // sandboxes, so deployment suspend/frozen states need their
+                    // own grace path here. Measure from first observation in
+                    // suspend state, not VM creation time, to avoid purging a
+                    // long-lived deployment that has only just begun freezing.
+                    observedSuspendOrphans.Add(info.Name);
+                    var firstSeen = _suspendOrphanFirstSeen.GetOrAdd(info.Name, now);
+                    if (now - firstSeen < opts.SuspendOrphanGrace) continue;
+                    createdAt = info.CreatedAt ?? firstSeen;
+                    age = now - createdAt;
+                }
+                else
+                {
+                    // Missing creation metadata is itself an orphan signal.
+                    // Remote providers cannot always recover CreatedAt, so
+                    // treat an unknown timestamp as old enough to report and
+                    // sweep, matching the general sandbox reaper's safety-net
+                    // behavior.
+                    createdAt = info.CreatedAt ?? now - opts.LeakAgeThreshold;
+                    age = now - createdAt;
 
-                // Missing creation metadata is itself an orphan signal. Remote
-                // providers cannot always recover CreatedAt, so treat an
-                // unknown timestamp as old enough to report and sweep, matching
-                // the general sandbox reaper's safety-net behavior.
-                var createdAt = info.CreatedAt ?? now - opts.LeakAgeThreshold;
-                var age = now - createdAt;
+                    // Preempt-marked (graceful-shutdown-preserved) VMs are
+                    // exempt for the longer PreemptRetention window. Once the
+                    // operator's retention window elapses they're treated like
+                    // any other leak.
+                    if (info.HasPreemptMarker && age < opts.PreemptRetention) continue;
 
-                // Preempt-marked (graceful-shutdown-preserved) VMs are exempt
-                // for the longer PreemptRetention window. Once the operator's
-                // retention window elapses they're treated like any other leak.
-                if (info.HasPreemptMarker && age < opts.PreemptRetention) continue;
-
-                if (age < opts.LeakAgeThreshold) continue;
+                    if (age < opts.LeakAgeThreshold) continue;
+                }
 
                 leaks.Add(new DeploymentLeakInfo(info.Name, createdAt, age, info.DiskBytes));
             }
+
+            foreach (var name in _suspendOrphanFirstSeen.Keys)
+                if (!observedSuspendOrphans.Contains(name))
+                    _suspendOrphanFirstSeen.TryRemove(name, out _);
+
             _latestLeaks = leaks;
 
             if (leaks.Count == 0) return;
@@ -193,7 +214,8 @@ public sealed class DeploymentLeakReaper : BackgroundService
         // exception. Narrowing here lets the inner rethrow propagate up to
         // ExecuteAsync (which expects OCE on shutdown) and still absorb any
         // transient per-leak timeout OCEs that escape the inner handler.
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "DeploymentLeakReaper: sweep failed");
@@ -229,6 +251,15 @@ public sealed class DeploymentLeakOptions
     /// disagree about when a preserved VM is fair game.
     /// </summary>
     public TimeSpan PreemptRetention { get; set; } = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// Dedicated grace before a deployment VM in a suspend lifecycle state is
+    /// treated as an orphan. Measured from first observation by this process,
+    /// not from VM creation time, so a deployment just entering Suspended is not
+    /// purged mid-snapshot. Default matches the general sandbox reaper.
+    /// </summary>
+    public TimeSpan SuspendOrphanGrace { get; set; } =
+        SuspendTimeoutPolicy.For(SandboxResourceLimits.Default.MemoryBytes);
 
     /// <summary>When true, automatically dispose detected orphans. Default true.</summary>
     public bool AutoDispose { get; set; } = true;

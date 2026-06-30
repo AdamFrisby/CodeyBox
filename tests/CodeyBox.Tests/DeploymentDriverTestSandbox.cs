@@ -164,6 +164,7 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox
     public string Id { get; } = $"codeybox-{Guid.NewGuid():N}"[..23];
     public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
     public bool IsDisposed { get; private set; }
+    public int DisposeCallCount { get; private set; }
     public SandboxSpec Spec { get; }
     public string? HostAddress => _provider.HostAddress;
 
@@ -183,6 +184,7 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox
     {
         if (_provider.SandboxDisposeThrowsFor.Contains(Id))
             throw new InvalidOperationException($"Simulated sandbox dispose failure for {Id}.");
+        DisposeCallCount++;
         MarkDisposed();
         return ValueTask.CompletedTask;
     }

@@ -1,14 +1,10 @@
-using CodeyBox.Core;
-
-namespace CodeyBox.Deployment;
+namespace CodeyBox.Core;
 
 /// <summary>
 /// Binds the flat, config-friendly <see cref="DeploymentRecipeConfig"/>
 /// shape into the strongly-typed <see cref="DeploymentRecipe"/> the drivers
-/// consume. Lives separate from the Projects assembly so a downstream
-/// consumer can call <see cref="ToRecipe"/> directly on hand-built recipes
-/// (for tests, ad-hoc invocations) without dragging in the full options
-/// pipeline.
+/// consume. Kept in Core so project configuration can bind deployment recipes
+/// without depending on a concrete deployment implementation assembly.
 /// </summary>
 public static class DeploymentRecipeBinder
 {
@@ -21,6 +17,11 @@ public static class DeploymentRecipeBinder
             throw new InvalidOperationException(
                 $"DeploymentRecipe (kind '{cfg.Kind}') is missing 'ImageReference'.");
 
+        var defaults = new DeploymentRecipe
+        {
+            Kind = cfg.Kind!,
+            ImageReference = cfg.ImageReference!,
+        };
         var ports = (cfg.Ports ?? []).ToList();
         var env = ToReadOnly(cfg.Environment);
         var settings = ToReadOnly(cfg.Settings);
@@ -38,10 +39,8 @@ public static class DeploymentRecipeBinder
             })
             .ToList();
 
-        return new DeploymentRecipe
+        return defaults with
         {
-            Kind = cfg.Kind!,
-            ImageReference = cfg.ImageReference!,
             BuildCommand = cfg.BuildCommand ?? string.Empty,
             RunCommand = cfg.RunCommand,
             ArtifactPath = cfg.ArtifactPath,
@@ -49,8 +48,8 @@ public static class DeploymentRecipeBinder
             Services = services,
             Ports = ports,
             HealthEndpoint = cfg.HealthEndpoint,
-            StartupTimeout = ResolveSecondsTimeout(cfg.StartupTimeoutSeconds, TimeSpan.FromMinutes(5)),
-            MaxLifetime = ResolveMinutesTimeout(cfg.MaxLifetimeMinutes, TimeSpan.FromMinutes(60)),
+            StartupTimeout = ResolveSecondsTimeout(cfg.StartupTimeoutSeconds, defaults.StartupTimeout),
+            MaxLifetime = ResolveMinutesTimeout(cfg.MaxLifetimeMinutes, defaults.MaxLifetime),
             NetworkProfile = cfg.NetworkProfile,
             Settings = settings,
         };

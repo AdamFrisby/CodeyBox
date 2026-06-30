@@ -14,13 +14,15 @@ public sealed class DeploymentLeakReaperTests
 
     private static DeploymentLeakOptions Opts(
         TimeSpan? leakAgeThreshold = null,
-        bool autoDispose = true) => new()
+        bool autoDispose = true,
+        TimeSpan? suspendOrphanGrace = null) => new()
         {
             Enabled = true,
             CheckInterval = TimeSpan.FromHours(1),   // never fires automatically
             LeakAgeThreshold = leakAgeThreshold ?? TimeSpan.FromMinutes(30),
             AutoDispose = autoDispose,
             DisposeTimeout = TimeSpan.FromSeconds(30),
+            SuspendOrphanGrace = suspendOrphanGrace ?? TimeSpan.FromMinutes(30),
         };
 
     [Fact]
@@ -250,10 +252,10 @@ public sealed class DeploymentLeakReaperTests
     }
 
     /// <summary>
-    /// Regression: a VM in the multipass Suspending/Suspended lifecycle (the
-    /// Claude session worker's stop/resume contract) must not be destroyed
-    /// by the deployment reaper. SandboxLeakReaper applies a dedicated
-    /// SuspendOrphanGrace here; this reaper conservatively skips them.
+    /// Regression: a deployment VM in the multipass Suspending/Suspended
+    /// lifecycle must not be destroyed immediately. Deployment sandboxes are
+    /// no longer owned by SandboxLeakReaper, so the deployment reaper applies
+    /// its own first-seen suspend grace.
     /// </summary>
     [Fact]
     public async Task SuspendLifecycleSandbox_IsSkipped()
@@ -272,6 +274,36 @@ public sealed class DeploymentLeakReaperTests
 
         await reaper.RunSweepAsync(CancellationToken.None);
         Assert.Empty(reaper.GetLatestLeaks());
+        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task SuspendLifecycleSandbox_IsReapedAfterSuspendOrphanGrace()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
+            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
+            HasPreemptMarker: false, IsSuspendLifecycleOrFrozen: true,
+            Purpose: sb.Spec.Purpose);
+
+        var manager = new StubManager(active: []);
+        var now = s.CreatedAt + TimeSpan.FromHours(2);
+        var reaper = new DeploymentLeakReaper(
+            provider,
+            manager,
+            () => Opts(suspendOrphanGrace: TimeSpan.FromMinutes(10)),
+            NullLogger<DeploymentLeakReaper>.Instance,
+            () => now);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+
+        now += TimeSpan.FromMinutes(11);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.Contains(s.Id, provider.DisposedNames);
     }
 
     [Fact]
@@ -316,12 +348,123 @@ public sealed class DeploymentLeakReaperTests
         Assert.Contains(second.Id, provider.DisposedNames);
     }
 
+    [Fact]
+    public async Task ProviderListFailure_IsSwallowed()
+    {
+        var reaper = new DeploymentLeakReaper(
+            new ThrowingListProvider(),
+            new StubManager(active: []),
+            () => Opts(),
+            NullLogger<DeploymentLeakReaper>.Instance);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
+    public async Task ManagerGetActiveFailure_IsSwallowedAndDoesNotDispose()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
+            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
+            Purpose: sb.Spec.Purpose);
+
+        var reaper = new DeploymentLeakReaper(
+            provider,
+            new StubManager(active: [], throwOnGetActive: true),
+            () => Opts(),
+            NullLogger<DeploymentLeakReaper>.Instance,
+            () => s.CreatedAt + TimeSpan.FromHours(2));
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task SuspendedNameProviderFailure_IsSwallowedAndDoesNotDispose()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
+            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: false,
+            Purpose: sb.Spec.Purpose);
+        Func<CancellationToken, Task<IReadOnlySet<string>>> suspendedNames =
+            _ => throw new InvalidOperationException("suspended index unavailable");
+
+        var reaper = new DeploymentLeakReaper(
+            provider,
+            new StubManager(active: []),
+            () => Opts(),
+            NullLogger<DeploymentLeakReaper>.Instance,
+            () => s.CreatedAt + TimeSpan.FromHours(2),
+            suspendedNameProvider: suspendedNames);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task RequestedCancellation_Propagates()
+    {
+        var reaper = new DeploymentLeakReaper(
+            new CancellationAwareListProvider(),
+            new StubManager(active: []),
+            () => Opts(),
+            NullLogger<DeploymentLeakReaper>.Instance);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => reaper.RunSweepAsync(cts.Token));
+    }
+
     private sealed class StubManager : IDeploymentManager
     {
         private readonly IReadOnlyList<ActiveDeploymentInfo> _active;
-        public StubManager(IReadOnlyList<ActiveDeploymentInfo> active) => _active = active;
+        private readonly bool _throwOnGetActive;
+
+        public StubManager(IReadOnlyList<ActiveDeploymentInfo> active, bool throwOnGetActive = false)
+        {
+            _active = active;
+            _throwOnGetActive = throwOnGetActive;
+        }
+
         public Task<IDeploymentHandle> StartAsync(DeploymentRecipe recipe, DeploymentContext context, CancellationToken ct = default)
             => throw new NotSupportedException();
-        public IReadOnlyList<ActiveDeploymentInfo> GetActive() => _active;
+
+        public IReadOnlyList<ActiveDeploymentInfo> GetActive()
+        {
+            if (_throwOnGetActive)
+                throw new InvalidOperationException("active set unavailable");
+            return _active;
+        }
+    }
+
+    private sealed class ThrowingListProvider : ISandboxProvider
+    {
+        public string Name => "throwing-list";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => throw new InvalidOperationException("list unavailable");
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => throw new NotSupportedException();
+    }
+
+    private sealed class CancellationAwareListProvider : ISandboxProvider
+    {
+        public string Name => "cancelling-list";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        }
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => throw new NotSupportedException();
     }
 }

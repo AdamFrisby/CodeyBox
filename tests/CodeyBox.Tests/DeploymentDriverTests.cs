@@ -749,9 +749,11 @@ public sealed class DeploymentDriverTests
         await handle.DisposeAsync();
         Assert.True(provider.Created[0].IsDisposed);
 
-        // Second dispose is a no-op (no exception). Tracking flips to !IsAlive.
+        // Second dispose is a no-op (no exception) and must not call through
+        // to the substrate a second time. Tracking flips to !IsAlive.
         await handle.DisposeAsync();
         Assert.False(handle.IsAlive);
+        Assert.Equal(1, provider.Created[0].DisposeCallCount);
     }
 
     [Fact]
@@ -784,7 +786,8 @@ public sealed class DeploymentDriverTests
     public async Task HealthCheck_RunsAgainstLiveDeployment()
     {
         var provider = new FakeDeploymentSandboxProvider();
-        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+        var readinessProbe = new ExecRule("curl", new SandboxExecResult(0, "200", ""));
+        provider.ExecRules.Add(readinessProbe);
 
         var driver = new WebAppDeploymentDriver();
         var recipe = new DeploymentRecipe
@@ -797,7 +800,10 @@ public sealed class DeploymentDriverTests
         };
 
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+        Assert.Equal(1, readinessProbe.InvocationCount);
+
         await handle.HealthCheckAsync();   // does not throw
+        Assert.Equal(2, readinessProbe.InvocationCount);
     }
 
     /// <summary>

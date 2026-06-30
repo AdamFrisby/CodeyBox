@@ -113,7 +113,7 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
-    public async Task CreateAsync_returns_routable_host_address_from_multipass_info()
+    public async Task CreateAsync_does_not_expose_remote_private_vm_ip_as_routable_host_address()
     {
         var opts = DefaultOptions();
         var transport = new FakeRemoteHostTransport();
@@ -135,7 +135,7 @@ public sealed class MultipassRemoteSandboxProviderTests
         });
 
         var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sb);
-        Assert.Equal("10.55.0.9", routable.HostAddress);
+        Assert.Null(routable.HostAddress);
 
         await sb.DisposeAsync();
     }
@@ -188,6 +188,41 @@ public sealed class MultipassRemoteSandboxProviderTests
 
         Assert.Contains("Network profile 'missing-profile' is not configured", ex.Message);
         Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
+    }
+
+    [Fact]
+    public async Task CreateAsync_marks_vm_active_before_remote_launch_returns()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        MultipassRemoteSandboxProvider? provider = null;
+        var observedActiveDuringLaunch = false;
+        var workItemId = new WorkItemId(Guid.NewGuid());
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch"))
+            {
+                observedActiveDuringLaunch = provider!
+                    .SnapshotActiveSandboxProgress()
+                    .Any(p => p.WorkItemId.Equals(workItemId));
+                return ProcessRunOk();
+            }
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            TimingWorkItemId = workItemId,
+        });
+
+        Assert.True(observedActiveDuringLaunch);
+        await sb.DisposeAsync();
     }
 
     [Fact]
@@ -1350,6 +1385,28 @@ public sealed class MultipassRemoteSandboxProviderTests
         Assert.False(host.RuntimeHealthy);
         Assert.Contains("metadata ssh dropped", host.RuntimeUnhealthyReason);
         Assert.False(inventory.IsComplete);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_throws_and_keeps_staging_when_remote_delete_fails()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "delete")) return new ProcessRunResult(1, "", "still busy");
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var vmName = opts.VmNamePrefix + "abc123";
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await provider.DisposeLeakedAsync(vmName, CancellationToken.None));
+
+        Assert.Contains("delete --purge", ex.Message);
+        Assert.DoesNotContain(transport.RecordedCalls, c =>
+            c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
     }
 
     [Fact]

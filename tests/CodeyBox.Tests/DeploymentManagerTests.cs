@@ -114,6 +114,27 @@ public sealed class DeploymentManagerTests
     }
 
     [Fact]
+    public async Task StartAsync_DeployFailure_DoesNotTrackDeployment()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var driver = new DeployThrowingDriver();
+        var registry = new DeploymentDriverRegistry([driver]);
+        var manager = new DeploymentManager(registry);
+        var recipe = new DeploymentRecipe { Kind = driver.Kind, ImageReference = "x" };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => manager.StartAsync(
+                recipe,
+                new DeploymentContext { SandboxProvider = provider },
+                CancellationToken.None));
+
+        Assert.Contains("deploy failed", ex.Message);
+        Assert.True(driver.ValidateCalled);
+        Assert.True(driver.DeployCalled);
+        Assert.Empty(manager.GetActive());
+    }
+
+    [Fact]
     public void Registry_DuplicateKind_Throws()
     {
         var d1 = new LibraryDeploymentDriver();
@@ -143,6 +164,24 @@ public sealed class DeploymentManagerTests
         var registry = new DeploymentDriverRegistry([driver]);
         Assert.True(registry.TryGet("WEB-APP", out var resolved));
         Assert.Same(driver, resolved);
+    }
+
+    private sealed class DeployThrowingDriver : IDeploymentDriver
+    {
+        public bool ValidateCalled { get; private set; }
+        public bool DeployCalled { get; private set; }
+        public string Kind => "deploy-failure-test";
+
+        public void ValidateRecipe(DeploymentRecipe recipe) => ValidateCalled = true;
+
+        public Task<IDeploymentHandle> DeployAsync(
+            DeploymentRecipe recipe,
+            DeploymentContext context,
+            CancellationToken ct = default)
+        {
+            DeployCalled = true;
+            throw new InvalidOperationException("deploy failed");
+        }
     }
 
     private sealed class ValidationThrowingDriver : IDeploymentDriver

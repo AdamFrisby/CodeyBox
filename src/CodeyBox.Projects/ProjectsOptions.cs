@@ -1,4 +1,4 @@
-using CodeyBox.Deployment;
+using CodeyBox.Core;
 using Microsoft.Extensions.Configuration;
 
 namespace CodeyBox.Projects;
