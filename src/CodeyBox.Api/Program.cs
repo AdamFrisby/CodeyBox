@@ -547,22 +547,11 @@ static IE2eExecutionPool BuildRemoteE2eExecutionPool(
 static CompositeManagedSandboxProvider BuildManagedSandboxLifecycleProvider(IServiceProvider sp)
 {
     var providers = new List<IManagedSandboxLifecycle> { sp.GetRequiredService<ISandboxProvider>() };
-    if (ShouldIncludeE2eManagedProviders(sp)
-        && sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
+    if (sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
     {
         providers.AddRange(source.ManagedSandboxProviders);
     }
     return new CompositeManagedSandboxProvider(providers);
-}
-
-static bool ShouldIncludeE2eManagedProviders(IServiceProvider sp)
-{
-    var e2e = sp.GetRequiredService<IOptionsMonitor<E2eExecutionOptions>>().CurrentValue;
-    if (!string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
-        return true;
-
-    var codeyBox = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
-    return GetE2eRemoteHostConfigs(codeyBox).Count > 0;
 }
 
 static bool IsValidE2eExecutionOptions(E2eExecutionOptions opts)
@@ -608,39 +597,12 @@ static void ValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxOpti
 
 static bool TryValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxOptions options, out string message)
 {
-    if (string.IsNullOrWhiteSpace(e2e.BaselineImageRef))
+    var failures = E2eRemotePoolConfigValidation.ValidateEnabledRemoteE2eConfig(e2e, options);
+    if (failures.Count > 0)
     {
-        message = "CodeyBox:E2eExecution:BaselineImageRef is required when E2E execution is enabled on PoolKind=remote-ssh; the remote pool clones this pre-baked image per run.";
+        message = string.Join("; ", failures);
         return false;
     }
-
-    if (!string.IsNullOrWhiteSpace(e2e.NetworkProfile))
-    {
-        message = "CodeyBox:E2eExecution:NetworkProfile is not supported by PoolKind=remote-ssh yet. Configure the remote E2E baseline networking directly or leave NetworkProfile unset.";
-        return false;
-    }
-
-    var e2eHosts = GetE2eRemoteHostConfigs(options);
-    if (e2eHosts.Count == 0 || e2eHosts.Any(static host => string.IsNullOrWhiteSpace(host.SshTarget)))
-    {
-        message = "CodeyBox:E2eMultipassRemoteSandbox:SshTarget or CodeyBox:E2eMultipassRemoteSandboxes[*]:SshTarget is required when E2E execution uses PoolKind=remote-ssh.";
-        return false;
-    }
-
-    if (e2eHosts.Any(static host => E2eRemoteHostValidation.IsLocalSshTarget(host)))
-    {
-        message = "CodeyBox:E2eMultipassRemoteSandbox must target a dedicated remote SSH host, not localhost, loopback, or the orchestrator host; E2E replay load must stay off the local coding fleet.";
-        return false;
-    }
-
-    var codingIdentity = RemotePoolIdentity(options.MultipassRemoteSandbox);
-    if (codingIdentity is not null
-        && e2eHosts.Any(host => string.Equals(RemotePoolIdentity(host), codingIdentity, StringComparison.OrdinalIgnoreCase)))
-    {
-        message = "CodeyBox:E2eMultipassRemoteSandbox must target a different SSH host than CodeyBox:MultipassRemoteSandbox; E2E replay load must stay off the coding fleet.";
-        return false;
-    }
-
     message = string.Empty;
     return true;
 }
@@ -652,15 +614,6 @@ static IReadOnlyList<MultipassRemoteSandboxConfig> GetE2eRemoteHostConfigs(Codey
     return options.E2eMultipassRemoteSandbox is null
         ? []
         : [options.E2eMultipassRemoteSandbox];
-}
-
-static string? RemotePoolIdentity(MultipassRemoteSandboxConfig? config)
-{
-    if (string.IsNullOrWhiteSpace(config?.SshTarget))
-        return null;
-    var host = E2eRemoteHostValidation.SshHostIdentity(config.SshTarget);
-    var port = config.SshPort ?? 22;
-    return $"{host}:{port}";
 }
 
 static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILoggerFactory loggerFactory)

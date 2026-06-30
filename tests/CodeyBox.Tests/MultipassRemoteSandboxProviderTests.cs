@@ -231,6 +231,161 @@ public sealed class MultipassRemoteSandboxProviderTests
             c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
     }
 
+    [Theory]
+    [InlineData("stop")]
+    [InlineData("clone")]
+    [InlineData("start")]
+    public async Task CreateAsync_with_baseline_ref_cleans_up_remote_state_when_clone_path_fails(string failingCommand)
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        const string baseline = "cb-e2e-baseline";
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, failingCommand))
+                return new ProcessRunResult(1, "", $"{failingCommand} failed");
+            if (Contains(argv, "info"))
+            {
+                var vm = VmNameFromInfo(argv);
+                return InfoJson(vm, vm == baseline ? "Stopped" : "Running");
+            }
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "ignored",
+                BaselineImageRef = baseline,
+                WorkingDirectory = "/work",
+            }));
+
+        Assert.Contains(transport.RecordedCalls, c =>
+            c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
+    }
+
+    [Fact]
+    public async Task CreateAsync_with_baseline_ref_cleans_up_remote_state_when_waiting_for_stopped_baseline_times_out()
+    {
+        var opts = DefaultOptions() with
+        {
+            VmStopTimeout = TimeSpan.FromMilliseconds(20),
+            VmStateCheckInterval = TimeSpan.FromMilliseconds(1),
+        };
+        var transport = new FakeRemoteHostTransport();
+        const string baseline = "cb-e2e-baseline";
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info"))
+            {
+                var vm = VmNameFromInfo(argv);
+                return InfoJson(vm, vm == baseline ? "Running" : "Running");
+            }
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "ignored",
+                BaselineImageRef = baseline,
+                WorkingDirectory = "/work",
+            }));
+
+        Assert.Contains(transport.RecordedCalls, c =>
+            c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
+    }
+
+    [Fact]
+    public async Task ListAllManagedAsync_marks_remote_clone_active_before_clone_completes()
+    {
+        var opts = DefaultOptions();
+        var cloneStarted = new ManualResetEventSlim(false);
+        var releaseClone = new ManualResetEventSlim(false);
+        var cloneVmName = "";
+        var transport = new FakeRemoteHostTransport();
+        const string baseline = "cb-e2e-baseline";
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "clone"))
+            {
+                cloneVmName = argv[^1];
+                cloneStarted.Set();
+                Assert.True(releaseClone.Wait(TimeSpan.FromSeconds(5)));
+                return ProcessRunOk();
+            }
+            if (Contains(argv, "list"))
+            {
+                return new ProcessRunResult(0, $$"""
+                    { "list": [ { "name": "{{cloneVmName}}", "state": "Running" } ] }
+                    """, "");
+            }
+            if (Contains(argv, "info"))
+            {
+                var vm = VmNameFromInfo(argv);
+                return InfoJson(vm, vm == baseline ? "Stopped" : "Running");
+            }
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var createTask = Task.Run(() => provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            BaselineImageRef = baseline,
+            WorkingDirectory = "/work",
+        }));
+        Assert.True(cloneStarted.Wait(TimeSpan.FromSeconds(5)));
+
+        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        var active = Assert.Single(managed);
+        Assert.Equal(cloneVmName, active.Name);
+        Assert.True(active.IsTrackedActive);
+        releaseClone.Set();
+        await using var sandbox = await createTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task CreateAsync_serializes_parallel_remote_heavy_multipass_operations()
+    {
+        var opts = DefaultOptions();
+        const string baseline = "cb-e2e-baseline";
+        var activeHeavy = 0;
+        var maxHeavy = 0;
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (IsRemoteHeavy(argv, opts.RemoteMultipassPath))
+            {
+                var current = Interlocked.Increment(ref activeHeavy);
+                UpdateMax(ref maxHeavy, current);
+                Thread.Sleep(25);
+                Interlocked.Decrement(ref activeHeavy);
+            }
+            if (Contains(argv, "info"))
+            {
+                var vm = VmNameFromInfo(argv);
+                return InfoJson(vm, vm == baseline ? "Stopped" : "Running");
+            }
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var first = Task.Run(() => provider.CreateAsync(new SandboxSpec { ImageReference = "ignored", BaselineImageRef = baseline }));
+        var second = Task.Run(() => provider.CreateAsync(new SandboxSpec { ImageReference = "ignored", BaselineImageRef = baseline }));
+        await using var firstSandbox = await first.WaitAsync(TimeSpan.FromSeconds(5));
+        await using var secondSandbox = await second.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(1, maxHeavy);
+    }
+
     [Fact]
     public async Task ListAllManagedAsync_filters_to_provider_prefix_and_returns_empty_on_transport_drop()
     {
@@ -383,6 +538,19 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     private static ProcessRunResult ProcessRunOk() => new(0, "", "");
+
+    private static bool IsRemoteHeavy(IReadOnlyList<string> argv, string multipassPath) =>
+        argv.Count >= 2
+        && argv[0] == multipassPath
+        && argv[1] is "launch" or "start" or "stop" or "clone" or "mount" or "delete";
+
+    private static void UpdateMax(ref int target, int value)
+    {
+        int existing;
+        do { existing = Volatile.Read(ref target); }
+        while (value > existing
+            && Interlocked.CompareExchange(ref target, value, existing) != existing);
+    }
 
     private static ProcessRunResult RunningInfoJson(string vm) => new(
         0,

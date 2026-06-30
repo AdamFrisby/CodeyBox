@@ -377,15 +377,17 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         [property: JsonPropertyName("assertions")] IReadOnlyList<E2eReplayAssertion> Assertions,
         [property: JsonPropertyName("__codeyboxAllowedOrigins")] IReadOnlyList<string> AllowedOrigins);
 
-    private const string ReplayDriverScript =
-        """
+    private static readonly string ReplayDriverScript =
+        $$"""
         const fs = require('fs');
         const dns = require('dns').promises;
         const net = require('net');
+        const OUTPUT_TAIL_CHARS = {{OutputTailBytes}};
+        const MAX_STEP_WAIT_MS = {{E2eReplayArtifactValidation.MaxStepDelayAfterMs}};
 
         function tail(value) {
           const s = String(value || '');
-          return s.length > 4096 ? s.slice(s.length - 4096) : s;
+          return s.length > OUTPUT_TAIL_CHARS ? s.slice(s.length - OUTPUT_TAIL_CHARS) : s;
         }
 
         function result(passed, summary, failureKind, failedStepIndex, stepResults, assertionResults, startedAt) {
@@ -467,8 +469,8 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             let records;
             try {
               records = await dns.lookup(host, { all: true });
-            } catch {
-              continue;
+            } catch (error) {
+              throw new Error(`DNS lookup failed for allowed origin host ${host}: ${error.message}`);
             }
 
             const usable = records.find(r => !isMetadataAddress(r.address));
@@ -496,12 +498,13 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           else if (action === 'waitforselector') await page.locator(step.selector).waitFor({ state: 'visible' });
           else if (action === 'wait') {
             const ms = Number(step.value || step.target || step.delayAfterMs || 1000);
-            await page.waitForTimeout(Number.isFinite(ms) && ms >= 0 ? ms : 1000);
+            const bounded = Number.isFinite(ms) && ms >= 0 ? Math.min(ms, MAX_STEP_WAIT_MS) : 1000;
+            await page.waitForTimeout(bounded);
             return;
           } else {
             throw new Error(`unsupported action: ${step.action}`);
           }
-          if (step.delayAfterMs) await page.waitForTimeout(Number(step.delayAfterMs));
+          if (step.delayAfterMs) await page.waitForTimeout(Math.min(Number(step.delayAfterMs), MAX_STEP_WAIT_MS));
         }
 
         async function performAssertion(page, assertion) {

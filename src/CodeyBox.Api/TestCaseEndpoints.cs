@@ -61,10 +61,7 @@ internal static class TestCaseEndpoints
             AutomationKind = req.AutomationKind,
             ExecutableArtifactJson = req.ExecutableArtifactJson,
             ConformanceJson = req.ConformanceJson,
-            Label = req.Label,
-            LastRunPassed = req.LastRunPassed,
-            LastRunAt = req.LastRunAt,
-            LastRunResult = req.LastRunResult
+            Label = req.Label
         };
 
         await store.CreateAsync(testCase, ct);
@@ -116,10 +113,7 @@ internal static class TestCaseEndpoints
                 AutomationKind = req.AutomationKind,
                 ExecutableArtifactJson = req.ExecutableArtifactJson,
                 ConformanceJson = req.ConformanceJson,
-                Label = req.Label,
-                LastRunPassed = req.LastRunPassed,
-                LastRunAt = req.LastRunAt,
-                LastRunResult = req.LastRunResult
+                Label = req.Label
             });
         }
 
@@ -211,10 +205,7 @@ internal static class TestCaseEndpoints
             AutomationKind = req.AutomationKind,
             ExecutableArtifactJson = req.ExecutableArtifactJson,
             ConformanceJson = req.ConformanceJson,
-            Label = req.Label,
-            LastRunPassed = req.LastRunPassed,
-            LastRunAt = req.LastRunAt,
-            LastRunResult = req.LastRunResult
+            Label = req.Label
         };
 
         // Single atomic UPDATE; if the row vanished after the existence check (concurrent
@@ -260,10 +251,7 @@ public record CreateTestCaseRequest(
     string? ExecutableArtifactJson = null,
     string? ConformanceJson = null,
     string? Label = null,
-    bool IsArchived = false,
-    bool? LastRunPassed = null,
-    DateTimeOffset? LastRunAt = null,
-    string? LastRunResult = null
+    bool IsArchived = false
 );
 
 public record UpdateTestCaseRequest(
@@ -274,10 +262,7 @@ public record UpdateTestCaseRequest(
     string? ExecutableArtifactJson = null,
     string? ConformanceJson = null,
     string? Label = null,
-    bool IsArchived = false,
-    bool? LastRunPassed = null,
-    DateTimeOffset? LastRunAt = null,
-    string? LastRunResult = null
+    bool IsArchived = false
 );
 
 public record TestCaseDto(

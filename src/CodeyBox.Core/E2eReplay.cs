@@ -78,18 +78,17 @@ public sealed record E2eReplayStep
     [JsonPropertyName("argv")]
     public IReadOnlyList<string> Argv { get; init; } = [];
 
-    /// <summary>Optional stdin payload; null = no stdin.</summary>
+    /// <summary>Legacy command stdin payload. New artifacts must omit this field; the replay validator rejects it.</summary>
     [JsonPropertyName("stdin")]
     public string? Stdin { get; init; }
 
-    /// <summary>Working directory inside the sandbox; null defers to the sandbox default (/work).</summary>
+    /// <summary>Legacy command working directory. New artifacts must omit this field; the replay validator rejects it.</summary>
     [JsonPropertyName("workingDirectory")]
     public string? WorkingDirectory { get; init; }
 
     /// <summary>
-    /// When true, a non-zero exit fails the step (and the run). When false the
-    /// runtime records the exit code but continues — useful for fire-and-forget
-    /// setup steps. Defaults to true (strict).
+    /// Legacy command-exit control. The Playwright replay runtime is always
+    /// strict and rejects artifacts that set this to false.
     /// </summary>
     [JsonPropertyName("failOnNonZeroExit")]
     public bool FailOnNonZeroExit { get; init; } = true;

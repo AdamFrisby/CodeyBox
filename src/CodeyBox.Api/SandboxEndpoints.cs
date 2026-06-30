@@ -77,7 +77,7 @@ internal static class SandboxEndpoints
             await provider.DisposeLeakedAsync(ToManagedSandboxInfo(leak), cts.Token);
             // Remove from the in-memory list immediately so a repeated call returns 404
             // instead of attempting a redundant multipass delete and returning 500.
-            reaper.RemoveFromLatestLeaks(name);
+            reaper.RemoveFromLatestLeaks(leak);
             var disposedAt = DateTimeOffset.UtcNow;
             AuditLog.SandboxLeakDisposed(name,
                 ageMinutes: leak.Age.TotalMinutes,

@@ -110,6 +110,13 @@ public sealed class SandboxLeakReaper : BackgroundService
         _latestLeaks = _latestLeaks.Where(l => l.Name != name).ToList();
     }
 
+    public void RemoveFromLatestLeaks(LeakedSandboxInfo leak)
+    {
+        _latestLeaks = _latestLeaks
+            .Where(candidate => !SameLeak(candidate, leak))
+            .ToList();
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!_opts.Enabled)
@@ -264,19 +271,19 @@ public sealed class SandboxLeakReaper : BackgroundService
 
             // Dispose leaks with bounded host-side pressure; each sandbox still
             // gets its independent timeout and one failure never blocks the batch.
-            var failedNames = new ConcurrentBag<string>();
+            var failedLeaks = new ConcurrentBag<LeakedSandboxInfo>();
             await Parallel.ForEachAsync(leaks, new ParallelOptions
             {
                 CancellationToken = ct,
                 MaxDegreeOfParallelism = maxConcurrentDisposes,
             }, async (leak, token) =>
             {
-                var failedName = await DisposeSingleAsync(leak, token);
-                if (failedName is not null)
-                    failedNames.Add(failedName);
+                var failedLeak = await DisposeSingleAsync(leak, token);
+                if (failedLeak is not null)
+                    failedLeaks.Add(failedLeak);
             });
-            var failedNameSet = failedNames.ToHashSet(StringComparer.Ordinal);
-            _latestLeaks = leaks.Where(leak => failedNameSet.Contains(leak.Name)).ToList();
+            var failed = failedLeaks.ToArray();
+            _latestLeaks = leaks.Where(leak => failed.Any(candidate => SameLeak(candidate, leak))).ToList();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -313,7 +320,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         return set;
     }
 
-    private async Task<string?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
+    private async Task<LeakedSandboxInfo?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
     {
         using var timeoutCts = new CancellationTokenSource(_opts.DisposeTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
@@ -367,7 +374,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                 },
             }, stoppingToken);
             _log.LogWarning("SandboxLeakReaper: timed out disposing leaked sandbox {Name}", leak.Name);
-            return leak.Name;
+            return leak;
         }
         catch (Exception ex)
         {
@@ -385,9 +392,13 @@ public sealed class SandboxLeakReaper : BackgroundService
                 },
             }, stoppingToken);
             _log.LogWarning(ex, "SandboxLeakReaper: failed to dispose leaked sandbox {Name}", leak.Name);
-            return leak.Name;
+            return leak;
         }
     }
+
+    private static bool SameLeak(LeakedSandboxInfo left, LeakedSandboxInfo right) =>
+        string.Equals(left.Name, right.Name, StringComparison.Ordinal)
+        && string.Equals(left.LifecycleProviderId, right.LifecycleProviderId, StringComparison.Ordinal);
 
     private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
         => new(

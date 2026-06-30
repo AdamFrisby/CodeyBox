@@ -76,6 +76,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     private readonly Func<MultipassRemoteSandboxOptions> _optsAccessor;
     private readonly IRemoteHostTransport _transport;
     private readonly ILogger<MultipassRemoteSandboxProvider> _log;
+    private readonly SemaphoreSlim _heavyMultipassGate = new(1, 1);
 
     // Tracks sandboxes still owned by a currently-running phase in this process.
     // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
@@ -150,6 +151,16 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             }
         }
 
+        var sandbox = new MultipassRemoteSandbox(
+            vmName,
+            spec,
+            stagedMounts,
+            remoteSandboxRoot,
+            _transport,
+            _optsAccessor,
+            _log,
+            onDispose: name => _active.TryRemove(name, out _));
+
         // 3) Create the VM on the remote host. E2E replays pass
         //    BaselineImageRef and take the clone path so expensive setup is
         //    amortized into the remote image once. Legacy remote coding
@@ -165,6 +176,11 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
         try
         {
+            // Track before clone/launch makes the VM visible to multipass list.
+            // Otherwise a concurrent leak sweep can mistake an in-progress remote
+            // clone with no CreatedAt metadata for an old orphan and purge it.
+            _active[vmName] = sandbox;
+
             if (!string.IsNullOrWhiteSpace(spec.BaselineImageRef))
             {
                 await CloneRemoteBaselineAsync(opts, spec.BaselineImageRef!, vmName, ct).ConfigureAwait(false);
@@ -195,17 +211,6 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 await RunRemoteOrThrowAsync(mountArgv, ct).ConfigureAwait(false);
             }
 
-            var sandbox = new MultipassRemoteSandbox(
-                vmName,
-                spec,
-                stagedMounts,
-                remoteSandboxRoot,
-                _transport,
-                _optsAccessor,
-                _log,
-                onDispose: name => _active.TryRemove(name, out _));
-            _active[vmName] = sandbox;
-
             SandboxLiveCounter.Increment();
             _log.LogInformation("Remote multipass sandbox {Vm} created on {Target} via {Transport}",
                 vmName, opts.SshTarget, _transport.DiagnosticId);
@@ -216,6 +221,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             // Best-effort cleanup of any partial remote state. We DO NOT log
             // here at error level — the original exception is the real story
             // and is about to be rethrown by the caller's try.
+            _active.TryRemove(vmName, out _);
             await BestEffortRemoteDeleteAsync(vmName, remoteSandboxRoot).ConfigureAwait(false);
             throw;
         }
@@ -224,6 +230,9 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
         var opts = _optsAccessor();
+        if (string.IsNullOrWhiteSpace(opts.SshTarget))
+            return [];
+
         // multipass list --format json is the documented machine-readable
         // shape. We parse only the fields we need.
         var argv = new[] { opts.RemoteMultipassPath, "list", "--format", "json" };
@@ -325,7 +334,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
     internal async Task RunRemoteOrThrowAsync(IReadOnlyList<string> argv, CancellationToken ct)
     {
-        var r = await RunRemoteAsync(argv, ct).ConfigureAwait(false);
+        var r = await RunRemoteMaybeGatedAsync(argv, ct).ConfigureAwait(false);
         if (r.ExitCode != 0)
             throw new InvalidOperationException(
                 $"Remote multipass command failed (exit {r.ExitCode}): " +
@@ -334,6 +343,22 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
     internal Task<ProcessRunResultLike> RunRemoteAsync(IReadOnlyList<string> argv, CancellationToken ct) =>
         RunRemoteAsync(argv, stdin: null, stdoutChunkCallback: null, stderrChunkCallback: null, ct);
+
+    private async Task<ProcessRunResultLike> RunRemoteMaybeGatedAsync(IReadOnlyList<string> argv, CancellationToken ct)
+    {
+        if (!IsHeavyRemoteMultipassOperation(argv))
+            return await RunRemoteAsync(argv, ct).ConfigureAwait(false);
+
+        await _heavyMultipassGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await RunRemoteAsync(argv, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _heavyMultipassGate.Release();
+        }
+    }
 
     internal async Task<ProcessRunResultLike> RunRemoteAsync(
         IReadOnlyList<string> argv,
@@ -448,10 +473,9 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         try
         {
             var opts = _optsAccessor();
-            await _transport.RunAsync(
+            await RunRemoteMaybeGatedAsync(
                 [opts.RemoteMultipassPath, "delete", "--purge", vmName],
-                stdin: null,
-                ct: ct).ConfigureAwait(false);
+                ct).ConfigureAwait(false);
             await _transport.RunAsync(
                 ["rm", "-rf", remoteSandboxRoot],
                 stdin: null,
@@ -511,6 +535,17 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
     private static string JoinRemote(string a, string b) =>
         a.TrimEnd('/') + "/" + b.TrimStart('/');
+
+    private bool IsHeavyRemoteMultipassOperation(IReadOnlyList<string> argv)
+    {
+        if (argv.Count < 2)
+            return false;
+        var opts = _optsAccessor();
+        if (!string.Equals(argv[0], opts.RemoteMultipassPath, StringComparison.Ordinal))
+            return false;
+
+        return argv[1] is "launch" or "start" or "stop" or "clone" or "mount" or "delete";
+    }
 
     private static string ParentOf(string remotePath)
     {

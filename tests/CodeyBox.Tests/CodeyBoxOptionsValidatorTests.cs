@@ -360,6 +360,50 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Fact]
+    public void Validate_RejectsEnabledRemoteE2eWhenAliasHostNameResolvesLocal()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = null;
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = "e2e-local-alias",
+            ExtraSshOptions = ["HostName=127.0.0.1"],
+        };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("dedicated", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEnabledRemoteE2eWhenAliasHostNameMatchesCodingFleetAddress()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = "coding-alias",
+            ExtraSshOptions = ["HostName=198.51.100.10"],
+        };
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = "e2e-alias",
+            ExtraSshOptions = ["HostName=198.51.100.10"],
+        };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("different SSH host", result.FailureMessage);
+    }
+
+    [Fact]
     public void Validate_RejectsInvalidE2eRemoteHostCapacity()
     {
         var options = ValidCodeyBoxOptions();

@@ -174,6 +174,63 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     [Fact]
+    public async Task Replay_embedded_driver_fails_closed_when_allowed_origin_dns_lookup_fails()
+    {
+        await using var sandbox = new LocalNodeSandbox();
+        var options = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+        {
+            AllowedReadinessOrigins = ["http://lookup-fails.invalid"],
+        });
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = [new E2eReplayStep { Action = "wait", Value = "0" }],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance, options);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReplayDriverFailed", result.FailureKind);
+        Assert.Contains("DNS lookup failed", result.Summary);
+    }
+
+    [Theory]
+    [InlineData("http://app.local/blocked-subresource", "request blocked")]
+    [InlineData("http://app.local/redirect-off-origin", "final navigation URL origin")]
+    public async Task Replay_embedded_driver_enforces_request_firewall_and_final_url(
+        string target,
+        string expectedDetail)
+    {
+        await using var sandbox = new LocalNodeSandbox();
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = [new E2eReplayStep { Action = "navigate", Target = target }],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("StepFailed", result.FailureKind);
+        Assert.Contains(expectedDetail, result.Summary);
+    }
+
+    [Fact]
+    public async Task Replay_embedded_driver_caps_wait_action_duration()
+    {
+        await using var sandbox = new LocalNodeSandbox();
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = [new E2eReplayStep { Action = "wait", Value = (E2eReplayArtifactValidation.MaxStepDelayAfterMs + 1).ToString() }],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.True(result.Passed, result.Summary);
+    }
+
+    [Fact]
     public async Task Replay_fails_when_step_exits_nonzero()
     {
         var sandbox = new FakeSandbox();
@@ -1683,6 +1740,99 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     [Fact]
+    public async Task Dispatcher_startup_requeues_running_runs_before_poll_loop()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        var runId = Guid.NewGuid().ToString("N");
+        await _runs.CreateAsync(new E2eRun
+        {
+            Id = runId,
+            TestCaseId = tcId,
+            Status = E2eRunStatus.Running,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            SandboxId = "orphaned-sandbox",
+        });
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+        {
+            Enabled = false,
+            PollInterval = TimeSpan.FromHours(1),
+        });
+        var pool = new LocalE2eExecutionPool(new CountingSandboxProvider(), monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var dispatcher = new E2eRunDispatcher(
+            _runs,
+            pool,
+            new CountingReplayRuntime(),
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            Admission(monitor),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        await dispatcher.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            E2eRun? recovered;
+            do
+            {
+                recovered = await _runs.GetAsync(runId);
+                if (recovered?.Status == E2eRunStatus.Queued)
+                    break;
+                await Task.Delay(20);
+            } while (DateTimeOffset.UtcNow < deadline);
+
+            Assert.NotNull(recovered);
+            Assert.Equal(E2eRunStatus.Queued, recovered.Status);
+            Assert.Null(recovered.StartedAt);
+            Assert.Null(recovered.SandboxId);
+        }
+        finally
+        {
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await dispatcher.StopAsync(stopCts.Token);
+        }
+    }
+
+    [Fact]
+    public async Task Dispatcher_records_error_releases_slot_and_updates_last_run_when_runtime_throws()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        var runId = Guid.NewGuid().ToString("N");
+        await _runs.CreateAsync(new E2eRun { Id = runId, TestCaseId = tcId, Status = E2eRunStatus.Queued });
+        var provider = new CountingSandboxProvider();
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+        {
+            Enabled = true,
+            MaxConcurrent = 1,
+            PollInterval = TimeSpan.FromMilliseconds(5),
+            PerRunTimeout = TimeSpan.FromSeconds(10),
+        });
+        var pool = new LocalE2eExecutionPool(provider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var runtime = new CountingReplayRuntime { ThrowOnExecute = true };
+        var dispatcher = new E2eRunDispatcher(
+            _runs,
+            pool,
+            runtime,
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            Admission(monitor),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
+
+        var terminal = await WaitForRunStatusAsync(runId, E2eRunStatus.Error);
+        await WaitForDispatcherIdleAsync(dispatcher);
+        Assert.Contains("Exception", terminal.Result);
+        Assert.Equal(0, pool.InFlight);
+        Assert.True(provider.AllSandboxesDisposed);
+        var testCase = await _testCases.GetAsync(tcId);
+        Assert.NotNull(testCase);
+        Assert.False(testCase.LastRunPassed);
+        Assert.Contains("runtime exploded", testCase.LastRunResult);
+    }
+
+    [Fact]
     public async Task Dispatcher_does_not_dispatch_when_pool_is_full()
     {
         var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
@@ -1953,6 +2103,7 @@ public sealed class E2eExecutionTests : IDisposable
             _root = Path.Combine(Path.GetTempPath(), $"codeybox-node-driver-{Guid.NewGuid():N}");
             Directory.CreateDirectory(Path.Combine(_root, "node_modules", "playwright"));
             File.WriteAllText(Path.Combine(_root, "node_modules", "playwright", "index.js"), PlaywrightStub);
+            File.WriteAllText(Path.Combine(_root, "dns-hook.js"), DnsHook);
         }
 
         public string Id { get; } = "local-node-" + Guid.NewGuid().ToString("N")[..8];
@@ -1969,6 +2120,7 @@ public sealed class E2eExecutionTests : IDisposable
             foreach (var arg in exec.Argv.Skip(1))
                 psi.ArgumentList.Add(arg);
             psi.Environment["NODE_PATH"] = Path.Combine(_root, "node_modules");
+            psi.Environment["NODE_OPTIONS"] = $"--require {Path.Combine(_root, "dns-hook.js")}";
 
             using var process = Process.Start(psi) ?? throw new InvalidOperationException("failed to start node");
             if (exec.Stdin is not null)
@@ -2041,12 +2193,23 @@ public sealed class E2eExecutionTests : IDisposable
                       abort: async () => { aborted = true; }
                     });
                     if (aborted) throw new Error('request blocked');
+                    if (url.includes('/blocked-subresource')) {
+                      aborted = false;
+                      await handler({
+                        request: () => ({ url: () => 'http://evil.local/pixel.png' }),
+                        continue: async () => {},
+                        abort: async () => { aborted = true; }
+                      });
+                      if (aborted) throw new Error('request blocked');
+                    }
                   }
-                  this.currentUrl = url;
+                  this.currentUrl = url.includes('/redirect-off-origin') ? 'http://evil.local/' : url;
                 },
                 url() { return this.currentUrl; },
                 async title() { return 'Dashboard'; },
-                async waitForTimeout() {}
+                async waitForTimeout(ms) {
+                  if (ms > 60000) throw new Error('uncapped wait');
+                }
               };
             }
 
@@ -2063,6 +2226,19 @@ public sealed class E2eExecutionTests : IDisposable
                   async close() {}
                 };
               }
+            };
+            """;
+
+        private const string DnsHook =
+            """
+            const dns = require('dns');
+            const originalLookup = dns.promises.lookup.bind(dns.promises);
+            dns.promises.lookup = async function(host, options) {
+              if (host === 'app.local') {
+                if (options && options.all) return [{ address: '127.0.0.1', family: 4 }];
+                return { address: '127.0.0.1', family: 4 };
+              }
+              return originalLookup(host, options);
             };
             """;
     }
@@ -2155,10 +2331,13 @@ public sealed class E2eExecutionTests : IDisposable
     private sealed class CountingReplayRuntime : IE2eReplayRuntime
     {
         public int ExecuteCount { get; private set; }
+        public bool ThrowOnExecute { get; init; }
 
         public Task<E2eRunResult> ExecuteAsync(E2eReplayArtifact artifact, ISandbox sandbox, CancellationToken ct = default)
         {
             ExecuteCount++;
+            if (ThrowOnExecute)
+                throw new InvalidOperationException("runtime exploded");
             return Task.FromResult(new E2eRunResult
             {
                 Passed = true,

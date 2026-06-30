@@ -109,6 +109,21 @@ public sealed class E2eRunApiTests : IDisposable
     }
 
     [Fact]
+    public void Program_registers_e2e_lifecycle_provider_even_when_remote_hosts_are_initially_unconfigured()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            e2eRemoteTarget: null,
+            e2eEnabled: false);
+
+        var pool = factory.Services.GetRequiredService<IE2eExecutionPool>();
+        var e2eProvider = GetInnerProvider(pool);
+        var composite = factory.Services.GetRequiredService<CompositeManagedSandboxProvider>();
+
+        Assert.Contains(e2eProvider, composite.Providers);
+    }
+
+    [Fact]
     public void Program_rejects_enabled_remote_e2e_without_baseline_ref()
     {
         using var factory = new E2ePoolWiringFactory("remote-ssh", e2eEnabled: true, baselineImageRef: null);
@@ -188,6 +203,36 @@ public sealed class E2eRunApiTests : IDisposable
             "remote-ssh",
             globalRemoteTarget: "coding@remote.example",
             e2eRemoteTarget: "e2e@remote.example",
+            e2eEnabled: true);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("different SSH host", ex.Message);
+    }
+
+    [Fact]
+    public void Program_rejects_enabled_remote_e2e_when_target_alias_resolves_to_loopback()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            e2eRemoteTarget: "e2e-local-alias",
+            e2eRemoteExtraSshOptions: ["HostName=127.0.0.1"],
+            e2eEnabled: true);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("dedicated", ex.Message);
+    }
+
+    [Fact]
+    public void Program_rejects_enabled_remote_e2e_when_alias_resolves_to_coding_fleet_address()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            globalRemoteTarget: "coding-alias",
+            globalRemoteExtraSshOptions: ["HostName=198.51.100.10"],
+            e2eRemoteTarget: "e2e-alias",
+            e2eRemoteExtraSshOptions: ["HostName=198.51.100.10"],
             e2eEnabled: true);
 
         var ex = Assert.Throws<OptionsValidationException>(() =>
@@ -522,7 +567,9 @@ public sealed class E2eRunApiTests : IDisposable
 internal sealed class E2ePoolWiringFactory(
     string poolKind,
     string? globalRemoteTarget = null,
+    IReadOnlyList<string>? globalRemoteExtraSshOptions = null,
     string? e2eRemoteTarget = "codeybox@e2e.example",
+    IReadOnlyList<string>? e2eRemoteExtraSshOptions = null,
     int? e2eRemoteMaxConcurrent = null,
     bool e2eEnabled = false,
     string? baselineImageRef = "cb-e2e-baseline",
@@ -533,6 +580,8 @@ internal sealed class E2ePoolWiringFactory(
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-e2epool-{Guid.NewGuid():N}.db");
     private readonly IReadOnlyList<string>? _e2eRemoteTargets = e2eRemoteTargets;
+    private readonly IReadOnlyList<string>? _globalRemoteExtraSshOptions = globalRemoteExtraSshOptions;
+    private readonly IReadOnlyList<string>? _e2eRemoteExtraSshOptions = e2eRemoteExtraSshOptions;
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -557,6 +606,11 @@ internal sealed class E2ePoolWiringFactory(
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
             };
+            if (_globalRemoteExtraSshOptions is { Count: > 0 })
+            {
+                for (var i = 0; i < _globalRemoteExtraSshOptions.Count; i++)
+                    values[$"CodeyBox:MultipassRemoteSandbox:ExtraSshOptions:{i}"] = _globalRemoteExtraSshOptions[i];
+            }
             if (_e2eRemoteTargets is { Count: > 0 })
             {
                 for (var i = 0; i < _e2eRemoteTargets.Count; i++)
@@ -569,6 +623,11 @@ internal sealed class E2ePoolWiringFactory(
             {
                 values["CodeyBox:E2eMultipassRemoteSandbox:SshTarget"] = e2eRemoteTarget;
                 values["CodeyBox:E2eMultipassRemoteSandbox:MaxConcurrent"] = e2eRemoteMaxConcurrent?.ToString();
+                if (_e2eRemoteExtraSshOptions is { Count: > 0 })
+                {
+                    for (var i = 0; i < _e2eRemoteExtraSshOptions.Count; i++)
+                        values[$"CodeyBox:E2eMultipassRemoteSandbox:ExtraSshOptions:{i}"] = _e2eRemoteExtraSshOptions[i];
+                }
             }
 
             cfg.AddInMemoryCollection(values);

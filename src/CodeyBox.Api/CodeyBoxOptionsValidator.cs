@@ -52,37 +52,9 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 failures.Add("CodeyBox:E2eExecution:PoolKind must be 'local' or 'remote-ssh'");
             }
             if (e2e.Enabled
-                && string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase)
-                && string.IsNullOrWhiteSpace(e2e.BaselineImageRef))
-            {
-                failures.Add("CodeyBox:E2eExecution:BaselineImageRef is required when E2E execution is enabled with PoolKind=remote-ssh");
-            }
-            if (e2e.Enabled
-                && string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrWhiteSpace(e2e.NetworkProfile))
-            {
-                failures.Add("CodeyBox:E2eExecution:NetworkProfile is not supported when E2E execution uses PoolKind=remote-ssh");
-            }
-            if (e2e.Enabled
                 && string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
             {
-                var e2eHosts = GetE2eRemoteHostConfigs(options);
-                if (e2eHosts.Count == 0 || e2eHosts.Any(static h => string.IsNullOrWhiteSpace(h.SshTarget)))
-                {
-                    failures.Add("CodeyBox:E2eMultipassRemoteSandbox:SshTarget or CodeyBox:E2eMultipassRemoteSandboxes[*]:SshTarget is required when E2E execution uses PoolKind=remote-ssh");
-                }
-
-                if (e2eHosts.Any(static host => E2eRemoteHostValidation.IsLocalSshTarget(host)))
-                {
-                    failures.Add("CodeyBox:E2eMultipassRemoteSandbox must target a dedicated remote SSH host, not localhost, loopback, or the orchestrator host");
-                }
-
-                var codingIdentity = RemotePoolIdentity(options.MultipassRemoteSandbox);
-                if (codingIdentity is not null
-                    && e2eHosts.Any(host => string.Equals(RemotePoolIdentity(host), codingIdentity, StringComparison.OrdinalIgnoreCase)))
-                {
-                    failures.Add("CodeyBox:E2eMultipassRemoteSandbox must target a different SSH host than CodeyBox:MultipassRemoteSandbox");
-                }
+                failures.AddRange(E2eRemotePoolConfigValidation.ValidateEnabledRemoteE2eConfig(e2e, options));
             }
             foreach (var (host, index) in GetE2eRemoteHostConfigs(options).Select((host, index) => (host, index)))
             {
@@ -264,14 +236,5 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         return options.E2eMultipassRemoteSandbox is null
             ? []
             : [options.E2eMultipassRemoteSandbox];
-    }
-
-    private static string? RemotePoolIdentity(MultipassRemoteSandboxConfig? config)
-    {
-        if (string.IsNullOrWhiteSpace(config?.SshTarget))
-            return null;
-        var host = E2eRemoteHostValidation.SshHostIdentity(config.SshTarget);
-        var port = config.SshPort ?? 22;
-        return $"{host}:{port}";
     }
 }

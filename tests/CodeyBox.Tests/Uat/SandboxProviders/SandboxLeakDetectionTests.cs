@@ -117,6 +117,48 @@ public sealed class SandboxLeakDetectionTests
     }
 
     [Fact]
+    public async Task LeakedSandboxEndpoint_DisposesDuplicateNamesOneProviderSnapshotAtATime()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var first = new UatSandboxProvider();
+        var second = new UatSandboxProvider();
+        first.Add(new ManagedSandboxInfo("codeybox-duplicate", OldEnough(threshold), null, false));
+        second.Add(new ManagedSandboxInfo("codeybox-duplicate", OldEnough(threshold), null, false));
+        var composite = new CompositeManagedSandboxProvider([first, second]);
+        var webhooks = new CapturingWebhookDispatcher();
+        var reaper = new SandboxLeakReaper(
+            composite,
+            webhooks,
+            new SandboxLeakOptions
+            {
+                Enabled = true,
+                CheckInterval = TimeSpan.FromHours(1),
+                LeakAgeThreshold = threshold,
+                AutoDispose = false,
+            },
+            NullLogger<SandboxLeakReaper>.Instance);
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Equal(2, reaper.GetLatestLeaks().Count);
+
+        using var factory = new SandboxProviderApiFactory(
+            managedLifecycle: composite,
+            reaper: reaper,
+            webhooks: webhooks);
+        using var client = factory.CreateClient();
+
+        var firstDispose = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose", content: null);
+        var secondDispose = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose", content: null);
+        var thirdDispose = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose", content: null);
+
+        firstDispose.EnsureSuccessStatusCode();
+        secondDispose.EnsureSuccessStatusCode();
+        Assert.Equal(HttpStatusCode.NotFound, thirdDispose.StatusCode);
+        Assert.Equal(["codeybox-duplicate"], first.DisposedNames);
+        Assert.Equal(["codeybox-duplicate"], second.DisposedNames);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
     public async Task SandboxLeakAdminEndpoint_ReturnsPendingCountAndAges()
     {
         var threshold = TimeSpan.FromMinutes(30);
