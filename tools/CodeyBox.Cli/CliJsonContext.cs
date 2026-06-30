@@ -13,6 +13,8 @@ namespace CodeyBox.Cli;
 [JsonSerializable(typeof(PauseQueueRequest))]
 [JsonSerializable(typeof(PauseAgentRequest))]
 [JsonSerializable(typeof(ReorderRequest))]
+[JsonSerializable(typeof(PutPromptRequest))]
+[JsonSerializable(typeof(PatchPriorityRequest))]
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
