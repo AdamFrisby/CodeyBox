@@ -133,11 +133,10 @@ public sealed class PipelineTuningOptions
     /// active auditors' <see cref="CodeyBox.Core.IAuditor.SelfReviewGuidance"/>
     /// and asks the agent to fix genuine issues it spots before committing;
     /// the formal audit (separate, fresh sandbox) still owns pass/fail.
-    /// Default <c>true</c> to preserve the always-on stopgap that the runtime
-    /// composer replaced. Hot-reloadable; set to <c>false</c> to dispatch
-    /// without the checklist for measurement / A-B comparison.
+    /// Default <c>false</c>; opt in to dispatch with the checklist for
+    /// measurement / A-B comparison.
     /// </summary>
-    public bool SelfReviewChecklistEnabled { get; set; } = true;
+    public bool SelfReviewChecklistEnabled { get; set; }
 
     public void Validate()
     {

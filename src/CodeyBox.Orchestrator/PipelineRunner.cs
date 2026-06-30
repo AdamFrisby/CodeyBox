@@ -3919,7 +3919,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string userPrompt,
         bool allowAgentQuestions = false,
         IReadOnlyList<IAuditor>? auditors = null,
-        bool selfReviewChecklistEnabled = true,
+        bool selfReviewChecklistEnabled = false,
         string? approvedPlan = null)
     {
         var sb = new System.Text.StringBuilder();

@@ -293,7 +293,10 @@ public sealed class PipelineRunnerTests
             new GuidanceAuditor("custom:review", "Verify custom API contract rules.")
         ];
 
-        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
+        var prompt = PipelineRunner.BuildInitialWorkPrompt(
+            "do work",
+            auditors: activeAuditors,
+            selfReviewChecklistEnabled: true);
 
         // Checklist should contain architecture guidance
         Assert.Contains("Loose-coupling violations", prompt);
@@ -318,7 +321,10 @@ public sealed class PipelineRunnerTests
         Assert.Null(cheatingLlm.SelfReviewGuidance);
 
         IReadOnlyList<IAuditor> activeAuditors = [cheatingLlm];
-        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
+        var prompt = PipelineRunner.BuildInitialWorkPrompt(
+            "do work",
+            auditors: activeAuditors,
+            selfReviewChecklistEnabled: true);
 
         // Checklist should be empty because cheating opted out
         Assert.DoesNotContain("scan your changes against the checklist", prompt);
@@ -330,7 +336,10 @@ public sealed class PipelineRunnerTests
         var newAuditor = new GuidanceAuditor("new-style:auditor", "- **New Auditor Standard**: Ensure dynamic checks work.");
         IReadOnlyList<IAuditor> activeAuditors = [newAuditor];
 
-        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
+        var prompt = PipelineRunner.BuildInitialWorkPrompt(
+            "do work",
+            auditors: activeAuditors,
+            selfReviewChecklistEnabled: true);
 
         Assert.Contains("scan your changes against the checklist below and fix any GENUINE issues you spot", prompt);
         Assert.Contains("the formal audit runs separately and owns pass/fail", prompt);
@@ -338,13 +347,18 @@ public sealed class PipelineRunnerTests
     }
 
     [Fact]
-    public void BuildInitialWorkPrompt_SelfReviewChecklist_DefaultIsOn()
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_DefaultIsOff()
     {
-        var auditor = new GuidanceAuditor("style:auditor", "- **Default-on marker**: dummy guidance.");
+        var auditor = new GuidanceAuditor("style:auditor", "- **Default-off marker**: should NOT appear.");
         var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: [auditor]);
-        // Default preserved: with the gate omitted, the checklist is injected.
-        Assert.Contains("Default-on marker", prompt);
-        Assert.Contains("scan your changes against the checklist", prompt);
+        Assert.DoesNotContain("Default-off marker", prompt);
+        Assert.DoesNotContain("scan your changes against the checklist", prompt);
+    }
+
+    [Fact]
+    public void PipelineTuningOptions_SelfReviewChecklist_DefaultIsOptIn()
+    {
+        Assert.False(new PipelineTuningOptions().SelfReviewChecklistEnabled);
     }
 
     [Fact]
