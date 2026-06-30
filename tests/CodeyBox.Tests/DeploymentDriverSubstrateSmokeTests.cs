@@ -1,7 +1,8 @@
-using System.Net;
-using System.Net.Sockets;
 using CodeyBox.Core;
 using CodeyBox.Deployment;
+using CodeyBox.ExploratoryTesting;
+using CodeyBox.ExploratoryTesting.Recipes;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -17,47 +18,22 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class DeploymentDriverSubstrateSmokeTests
 {
-    [Fact]
-    public async Task WebApp_JobTrackPilotShape_Deploys_HealthChecks_Exposes_AndTearsDown_OnProcessSubstrate()
+    [SkippableFact]
+    public async Task WebApp_JobTrackPilot_Deploys_HealthChecks_Exposes_AndTearsDown_OnProcessSubstrate()
     {
-        var port = ReserveLoopbackPort();
+        var source = Environment.GetEnvironmentVariable("JOBTRACK_SOURCE");
+        Skip.If(
+            string.IsNullOrWhiteSpace(source) || !Directory.Exists(source),
+            "Set JOBTRACK_SOURCE to a real JobTrack checkout to run the deployment-driver JobTrack pilot.");
+
+        var jobTrack = JobTrackRecipe.Default(Path.GetFullPath(source!));
         var provider = new RoutableProcessSandboxProvider();
         var driver = new WebAppDeploymentDriver();
-        var recipe = new DeploymentRecipe
-        {
-            Kind = DeploymentKinds.WebApp,
-            ImageReference = "ignored",
-            RunCommand = $$"""
-                python3 - <<'PY' >/dev/null 2>&1 &
-                import socket
-                port = {{port}}
-                body = b"jobtrack pilot ok"
-                with socket.socket() as server:
-                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    server.bind(("127.0.0.1", port))
-                    server.listen(5)
-                    for _ in range(2):
-                        conn, _ = server.accept()
-                        with conn:
-                            conn.recv(4096)
-                            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
-                PY
-                """,
-            Ports = [port],
-            HealthEndpoint = "/health",
-            Environment = new Dictionary<string, string>
-            {
-                ["JOBTRACK_DB_PATH"] = "./jobtrack-smoke.db",
-            },
-            Settings = new Dictionary<string, string>
-            {
-                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.05",
-            },
-        };
+        var recipe = ToDeploymentRecipe(jobTrack);
 
-        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider, jobTrack.Mounts), CancellationToken.None);
         Assert.Equal(DeploymentEndpointKind.Http, handle.Endpoint.Kind);
-        Assert.Equal($"http://127.0.0.1:{port}", handle.Endpoint.Url);
+        Assert.Equal(JobTrackRecipe.DefaultEntryUrl.Replace("localhost", "127.0.0.1", StringComparison.Ordinal), handle.Endpoint.Url);
         await handle.HealthCheckAsync();
     }
 
@@ -153,18 +129,43 @@ public sealed class DeploymentDriverSubstrateSmokeTests
         await handle.HealthCheckAsync();
     }
 
-    private static DeploymentContext Ctx(ISandboxProvider provider) => new()
+    private static DeploymentContext Ctx(ISandboxProvider provider, IReadOnlyList<SandboxMount>? mounts = null) => new()
     {
         SandboxProvider = provider,
+        Mounts = mounts ?? [],
         WorkingDirectory = "/work",
     };
 
-    private static int ReserveLoopbackPort()
+    private static DeploymentRecipe ToDeploymentRecipe(WebAppRecipe recipe)
     {
-        using var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        return ((IPEndPoint)listener.LocalEndpoint).Port;
+        var entry = new Uri(recipe.EntryUrl);
+        var buildCommands = recipe.BuildSteps
+            .Where(step => !string.Equals(step.Label, "install-firefox", StringComparison.Ordinal))
+            .Concat(recipe.SeedSteps)
+            .Where(step => step.Command.Count > 0)
+            .Select(step => string.Join(' ', step.Command.Select(QuoteShellWord)));
+        var runCommand = string.Join(' ', recipe.RunCommand.Command.Select(QuoteShellWord));
+        return new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = string.IsNullOrWhiteSpace(recipe.ImageReference) ? "ignored" : recipe.ImageReference,
+            BuildCommand = string.Join(" && ", buildCommands),
+            RunCommand = $"nohup {runCommand} >/tmp/jobtrack-deployment.log 2>&1 &",
+            Ports = [entry.Port],
+            HealthEndpoint = string.IsNullOrWhiteSpace(entry.AbsolutePath) ? "/" : entry.AbsolutePath,
+            StartupTimeout = recipe.ReadinessTimeout,
+            Environment = recipe.Environment,
+            NetworkProfile = recipe.NetworkProfile,
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] =
+                    Math.Max(0.05, recipe.ReadinessPollInterval.TotalSeconds).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            },
+        };
     }
+
+    private static string QuoteShellWord(string value)
+        => "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
 
     private sealed class RoutableProcessSandboxProvider : ISandboxProvider
     {
@@ -183,7 +184,7 @@ public sealed class DeploymentDriverSubstrateSmokeTests
             => _inner.DisposeLeakedAsync(name, ct);
     }
 
-    private sealed class RoutableProcessSandbox(ISandbox inner) : IRoutableSandbox
+    private sealed class RoutableProcessSandbox(ISandbox inner) : IRoutableSandbox, IDeploymentEndpointPublisher
     {
         public string Id => inner.Id;
         public string? HostAddress => "127.0.0.1";
@@ -193,6 +194,13 @@ public sealed class DeploymentDriverSubstrateSmokeTests
 
         public Task KillActiveExecsAsync(CancellationToken ct = default)
             => inner.KillActiveExecsAsync(ct);
+
+        public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+            => request.Port is >= 1 and <= 65535
+                && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+
+        public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+            => DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
 
         public ValueTask DisposeAsync()
             => inner.DisposeAsync();

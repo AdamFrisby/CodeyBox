@@ -20,9 +20,20 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     public const string SettingsKeyHealthProbeCommand = "health-probe-command";
     public const string SettingsKeyScheme = "scheme";
     public const string SettingsKeyProbeIntervalSeconds = "probe-interval-seconds";
+    private static readonly HttpClient HostProbeHttp = new()
+    {
+        Timeout = TimeSpan.FromSeconds(5),
+    };
+    private readonly Func<Uri, CancellationToken, Task<bool>> _hostHttpProbe;
 
-    public WebAppDeploymentDriver(ILogger<WebAppDeploymentDriver>? log = null, Func<DateTimeOffset>? clock = null)
-        : base(log, clock) { }
+    public WebAppDeploymentDriver(
+        ILogger<WebAppDeploymentDriver>? log = null,
+        Func<DateTimeOffset>? clock = null,
+        Func<Uri, CancellationToken, Task<bool>>? hostHttpProbe = null)
+        : base(log, clock)
+    {
+        _hostHttpProbe = hostHttpProbe ?? DefaultHostHttpProbeAsync;
+    }
 
     public override string Kind => DeploymentKinds.WebApp;
 
@@ -102,36 +113,105 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         }
     }
 
+    protected override Task ValidateProvisionedSubstrateAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        CancellationToken ct)
+    {
+        var request = new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Scheme = ResolveScheme(recipe),
+            Port = recipe.Ports[0],
+        };
+        if (!CanPublishEndpoint(sandbox, request))
+            throw new NotSupportedException(
+                $"Deployment kind '{Kind}' requires a substrate that can publish HTTP endpoint port {recipe.Ports[0]} before the app is started.");
+        return Task.CompletedTask;
+    }
+
     protected override DeploymentEndpoint BuildEndpoint(ISandbox sandbox, DeploymentRecipe recipe, DeploymentContext context)
     {
         var port = recipe.Ports[0];
-        var scheme = recipe.Settings.TryGetValue(SettingsKeyScheme, out var s) && !string.IsNullOrWhiteSpace(s)
-            ? s
-            : "http";
-        var host = ResolveHostAddress(sandbox);
-        if (host is null)
-            throw new InvalidOperationException(
-                $"Deployment kind '{Kind}' requires a routable sandbox host address to expose HTTP port {port}.");
-        var url = $"{scheme}://{host}:{port}";
+        var scheme = ResolveScheme(recipe);
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["sandbox.id"] = sandbox.Id,
-            ["endpoint.scope"] = "host-routable",
             ["sandbox.local-url"] = $"{scheme}://127.0.0.1:{port}",
             ["http.health-path"] = recipe.HealthEndpoint!,
         };
         AddServiceEndpointMetadata(metadata, sandbox, recipe, scheme);
-        return new DeploymentEndpoint
+        return PublishEndpoint(sandbox, new DeploymentEndpointRequest
         {
             Kind = DeploymentEndpointKind.Http,
-            Url = url,
-            Host = host,
             Port = port,
-            // DeploymentEndpoint.Path is documented as a file-path slot for
-            // artifact-bearing kinds. For HTTP deployments the health-probe
-            // URL path is surfaced via Metadata instead so the file-path
-            // semantic stays intact.
             Metadata = metadata,
-        };
+            Scheme = scheme,
+        });
+    }
+
+    protected override async Task VerifyExposedEndpointAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        DeploymentEndpoint endpoint,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint.Url))
+            throw new InvalidOperationException($"Deployment kind '{Kind}' published an HTTP endpoint without a URL.");
+
+        var probeUri = BuildProbeUri(endpoint.Url!, recipe.HealthEndpoint!);
+        var interval = ResolveProbeInterval(recipe);
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (await _hostHttpProbe(probeUri, ct).ConfigureAwait(false))
+                return;
+            await Task.Delay(interval, ct).ConfigureAwait(false);
+        }
+    }
+
+    protected override async Task RunHealthCheckAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        CancellationToken ct)
+    {
+        await base.RunHealthCheckAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
+        var endpoint = BuildEndpoint(sandbox, recipe, context);
+        await VerifyExposedEndpointAsync(sandbox, recipe, context, endpoint, ct).ConfigureAwait(false);
+    }
+
+    private static string ResolveScheme(DeploymentRecipe recipe)
+        => recipe.Settings.TryGetValue(SettingsKeyScheme, out var s) && !string.IsNullOrWhiteSpace(s)
+            ? s
+            : "http";
+
+    private static Uri BuildProbeUri(string baseUrl, string healthEndpoint)
+    {
+        var normalized = healthEndpoint.StartsWith("/", StringComparison.Ordinal)
+            ? healthEndpoint
+            : "/" + healthEndpoint;
+        return new Uri(baseUrl.TrimEnd('/') + normalized, UriKind.Absolute);
+    }
+
+    private static async Task<bool> DefaultHostHttpProbeAsync(Uri uri, CancellationToken ct)
+    {
+        try
+        {
+            using var response = await HostProbeHttp
+                .GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (HttpRequestException)
+        {
+            return false;
+        }
     }
 }

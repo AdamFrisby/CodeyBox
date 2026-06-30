@@ -96,6 +96,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         try
         {
             sandbox = await context.SandboxProvider.CreateAsync(spec, ct).ConfigureAwait(false);
+            await ValidateProvisionedSubstrateAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
 
             await RunBuildAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
 
@@ -143,6 +144,22 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             }
 
             var endpoint = BuildEndpoint(sandbox, recipe, context);
+            using (var exposeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                exposeCts.CancelAfter(recipe.StartupTimeout);
+                try
+                {
+                    await VerifyExposedEndpointAsync(sandbox, recipe, context, endpoint, exposeCts.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new TimeoutException(
+                        $"Deployment kind '{Kind}' exposed endpoint did not become reachable within {recipe.StartupTimeout}. " +
+                        "Tearing down substrate.");
+                }
+            }
+
             var id = Guid.NewGuid().ToString("N")[..DeploymentIdHexChars];
             // Capture the sandbox reference in a separate local so nulling the
             // outer one (to skip the catch's cleanup-on-failure path) does not
@@ -186,6 +203,12 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             : new SandboxNetworkPolicy { ProfileName = recipe.NetworkProfile },
         WorkingDirectory = context.WorkingDirectory,
     };
+
+    protected virtual Task ValidateProvisionedSubstrateAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        CancellationToken ct) => Task.CompletedTask;
 
     protected virtual async Task StartServicesAsync(
         ISandbox sandbox,
@@ -304,6 +327,18 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         DeploymentContext context);
 
     /// <summary>
+    /// Optional post-expose verification hook. Driver implementations whose
+    /// endpoint must be reachable from the host should probe the published
+    /// endpoint here before the handle is returned to callers.
+    /// </summary>
+    protected virtual Task VerifyExposedEndpointAsync(
+        ISandbox sandbox,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        DeploymentEndpoint endpoint,
+        CancellationToken ct) => Task.CompletedTask;
+
+    /// <summary>
     /// Hook for the runtime <see cref="IDeploymentHandle.HealthCheckAsync"/>.
     /// Default re-runs backing-service probes and the primary readiness probe
     /// under the recipe's startup timeout, unless the caller cancels first.
@@ -395,10 +430,22 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         return TimeSpan.FromSeconds(1);
     }
 
-    protected static string? ResolveHostAddress(ISandbox sandbox)
-        => sandbox is IRoutableSandbox { HostAddress: { } host } && !string.IsNullOrWhiteSpace(host)
-            ? host
-            : null;
+    protected bool CanPublishEndpoint(ISandbox sandbox, DeploymentEndpointRequest request)
+        => sandbox is IDeploymentEndpointPublisher publisher
+            && publisher.CanPublishEndpoint(request);
+
+    protected DeploymentEndpoint PublishEndpoint(ISandbox sandbox, DeploymentEndpointRequest request)
+    {
+        if (sandbox is not IDeploymentEndpointPublisher publisher)
+            throw new NotSupportedException(
+                $"Deployment kind '{Kind}' requires substrate endpoint publishing for {request.Kind} endpoints. " +
+                $"Sandbox provider '{sandbox.GetType().Name}' does not implement {nameof(IDeploymentEndpointPublisher)}.");
+        if (!publisher.CanPublishEndpoint(request))
+            throw new NotSupportedException(
+                $"Deployment kind '{Kind}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"} " +
+                $"from sandbox '{sandbox.Id}'.");
+        return publisher.PublishEndpoint(request);
+    }
 
     protected static void AddServiceEndpointMetadata(
         IDictionary<string, string> metadata,
@@ -406,7 +453,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         DeploymentRecipe recipe,
         string scheme = "http")
     {
-        var host = ResolveHostAddress(sandbox);
+        var publisher = sandbox as IDeploymentEndpointPublisher;
         foreach (var service in recipe.Services)
         {
             if (service.Ports.Count == 0)
@@ -416,9 +463,38 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                 ? string.Empty
                 : service.HealthEndpoint!.StartsWith('/') ? service.HealthEndpoint : "/" + service.HealthEndpoint;
             metadata[$"service.{service.Name}.image"] = service.ImageReference;
-            metadata[$"service.{service.Name}.sandbox-local-url"] = $"{scheme}://{Localhost}:{port}{path}";
-            if (host is not null)
-                metadata[$"service.{service.Name}.url"] = $"{scheme}://{host}:{port}{path}";
+            if (!string.IsNullOrWhiteSpace(service.HealthEndpoint))
+            {
+                metadata[$"service.{service.Name}.sandbox-local-url"] = $"{scheme}://{Localhost}:{port}{path}";
+                var request = new DeploymentEndpointRequest
+                {
+                    Kind = DeploymentEndpointKind.Http,
+                    Scheme = scheme,
+                    Port = port,
+                    Path = path,
+                };
+                if (publisher is not null && publisher.CanPublishEndpoint(request))
+                {
+                    var endpoint = publisher.PublishEndpoint(request);
+                    if (!string.IsNullOrWhiteSpace(endpoint.Url))
+                        metadata[$"service.{service.Name}.url"] = endpoint.Url!;
+                }
+            }
+            else
+            {
+                metadata[$"service.{service.Name}.sandbox-local-endpoint"] = $"{Localhost}:{port}";
+                var request = new DeploymentEndpointRequest
+                {
+                    Kind = DeploymentEndpointKind.Tcp,
+                    Port = port,
+                };
+                if (publisher is not null && publisher.CanPublishEndpoint(request))
+                {
+                    var endpoint = publisher.PublishEndpoint(request);
+                    if (!string.IsNullOrWhiteSpace(endpoint.Host) && endpoint.Port is { } publishedPort)
+                        metadata[$"service.{service.Name}.endpoint"] = $"{endpoint.Host}:{publishedPort}";
+                }
+            }
         }
     }
 

@@ -5340,7 +5340,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox, IDeploymentEndpointPublisher
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5498,6 +5498,19 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     public string ProviderId => MultipassSandboxProvider.ProviderId;
     public bool CapturesResourceMetrics => _opts.CaptureResourceMetrics;
     public string? HostAddress => _hostAddress;
+
+    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+        => !string.IsNullOrWhiteSpace(_hostAddress)
+            && request.Port is >= 1 and <= 65535
+            && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+
+    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+    {
+        if (!CanPublishEndpoint(request))
+            throw new NotSupportedException(
+                $"Multipass sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
+        return DeploymentEndpointPublisher.ForHostPort(request, _hostAddress!);
+    }
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
     {

@@ -1126,10 +1126,11 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, ISandboxDecorator
+internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, IDeploymentEndpointPublisher, ISandboxDecorator
 {
     private readonly ISandbox _inner;
     private readonly IRoutableSandbox? _routable;
+    private readonly IDeploymentEndpointPublisher? _endpointPublisher;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
     private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> _onDisposed;
     private readonly Action<AdmissionControlledSandbox> _onPreserved;
@@ -1153,6 +1154,7 @@ internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDispose
         ArgumentNullException.ThrowIfNull(log);
         _inner = inner;
         _routable = inner as IRoutableSandbox;
+        _endpointPublisher = inner as IDeploymentEndpointPublisher;
         _preserveOnDispose = inner as IPreserveOnDisposeSandbox;
         _lease = lease;
         _onDisposed = onDisposed;
@@ -1189,6 +1191,15 @@ internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDispose
 
     public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
         _inner.GetAccessibilityTreeJsonAsync(ct);
+
+    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+        => _endpointPublisher?.CanPublishEndpoint(request) == true;
+
+    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+        => _endpointPublisher is not null && _endpointPublisher.CanPublishEndpoint(request)
+            ? _endpointPublisher.PublishEndpoint(request)
+            : throw new NotSupportedException(
+                $"Sandbox '{Id}' does not support publishing {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
 
     public async ValueTask DisposeAsync()
     {

@@ -158,7 +158,7 @@ internal sealed class ExecRule
     }
 }
 
-internal sealed class FakeDeploymentSandbox : IRoutableSandbox
+internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpointPublisher
 {
     private readonly FakeDeploymentSandboxProvider _provider;
     public string Id { get; } = $"codeybox-{Guid.NewGuid():N}"[..23];
@@ -178,6 +178,19 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox
     {
         ct.ThrowIfCancellationRequested();
         return _provider.ResolveExecAsync(exec, ct);
+    }
+
+    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+        => !string.IsNullOrWhiteSpace(HostAddress)
+            && request.Port is >= 1 and <= 65535
+            && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+
+    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+    {
+        if (!CanPublishEndpoint(request))
+            throw new NotSupportedException(
+                $"Fake deployment sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
+        return DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
     }
 
     public ValueTask DisposeAsync()

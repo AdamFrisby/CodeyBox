@@ -25,19 +25,22 @@ public static class DeploymentRecipeBinder
         var ports = (cfg.Ports ?? []).ToList();
         var env = ToReadOnly(cfg.Environment);
         var settings = ToReadOnly(cfg.Settings);
-        var services = (cfg.Services ?? [])
-            .Where(s => s is not null)
-            .Select(s => new DeploymentService
+        var services = new List<DeploymentService>();
+        foreach (var s in cfg.Services ?? [])
+        {
+            if (s is null)
+                throw new InvalidOperationException("DeploymentRecipe.Services cannot contain null entries.");
+            services.Add(new DeploymentService
             {
-                Name = s!.Name ?? throw new InvalidOperationException("DeploymentService is missing 'Name'."),
+                Name = s.Name ?? throw new InvalidOperationException("DeploymentService is missing 'Name'."),
                 ImageReference = s.ImageReference ?? throw new InvalidOperationException(
                     $"DeploymentService '{s.Name}' is missing 'ImageReference'."),
                 RunCommand = s.RunCommand,
                 Environment = ToReadOnly(s.Environment),
                 Ports = (s.Ports ?? []).ToList(),
                 HealthEndpoint = s.HealthEndpoint,
-            })
-            .ToList();
+            });
+        }
 
         return defaults with
         {

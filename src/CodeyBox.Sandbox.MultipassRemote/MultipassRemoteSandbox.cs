@@ -29,8 +29,7 @@ internal sealed class MultipassRemoteSandbox :
     IShutdownTeardownSandbox,
     IPrivilegedGuestFileHardeningSandbox,
     IHostQualifiedSandbox,
-    IReleaseAdmissionOnHostLossSandbox,
-    IRoutableSandbox
+    IReleaseAdmissionOnHostLossSandbox
 {
     private readonly SandboxSpec _spec;
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;
@@ -60,12 +59,10 @@ internal sealed class MultipassRemoteSandbox :
         MultipassRemoteSandboxOptions opts,
         ILogger log,
         Action<RemoteSshTransportException> onTransportFailure,
-        Action<string, string> onDispose,
-        string? hostAddress = null)
+        Action<string, string> onDispose)
     {
         Id = vmName;
         HostId = hostId;
-        HostAddress = hostAddress;
         _spec = spec;
         _stagedMounts = stagedMounts;
         _remoteSandboxRoot = remoteSandboxRoot;
@@ -85,7 +82,6 @@ internal sealed class MultipassRemoteSandbox :
 
     public string Id { get; }
     public string HostId { get; }
-    public string? HostAddress { get; internal set; }
 
     // Reaper-exemption gate. DisposeAsync sets _disposed=1 up front to reject
     // new ExecAsync calls, then performs fallible sync-back. While sync-back

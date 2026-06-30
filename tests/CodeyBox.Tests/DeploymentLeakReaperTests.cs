@@ -141,6 +141,25 @@ public sealed class DeploymentLeakReaperTests
     }
 
     [Fact]
+    public async Task ManagedSandbox_TrackedActiveByProvider_NotReportedAsLeak()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
+        provider.ManagedInfoOverride = sb => new ManagedSandboxInfo(
+            sb.Id, sb.CreatedAt, DiskBytes: null, IsTrackedActive: true,
+            Purpose: sb.Spec.Purpose);
+
+        var manager = new StubManager(active: []);
+        var clock = () => s.CreatedAt + TimeSpan.FromHours(2);
+        var reaper = new DeploymentLeakReaper(
+            provider, manager, () => Opts(), NullLogger<DeploymentLeakReaper>.Instance, clock);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+    }
+
+    [Fact]
     public async Task ManagedSandbox_YoungerThanThreshold_NotReportedAsLeak()
     {
         var provider = new FakeDeploymentSandboxProvider();

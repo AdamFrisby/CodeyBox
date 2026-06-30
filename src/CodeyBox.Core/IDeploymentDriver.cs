@@ -341,6 +341,73 @@ public enum DeploymentEndpointKind
 }
 
 /// <summary>
+/// Request handed from a deployment driver to the substrate when a network
+/// endpoint must be published outside the sandbox. Drivers describe the
+/// desired endpoint; the substrate decides how that maps to caller-reachable
+/// connection info (same host/port, NAT mapping, tunnel URL, cloud load
+/// balancer, ...).
+/// </summary>
+public sealed record DeploymentEndpointRequest
+{
+    public required DeploymentEndpointKind Kind { get; init; }
+    public string Scheme { get; init; } = "http";
+    public int? Port { get; init; }
+    public string? Path { get; init; }
+    public IReadOnlyDictionary<string, string> Metadata { get; init; }
+        = new Dictionary<string, string>(StringComparer.Ordinal);
+}
+
+/// <summary>
+/// Optional sandbox capability for publishing a deployment endpoint reachable
+/// by the orchestrator host / deployment caller. Sandbox drivers depend on
+/// this deployment-level capability rather than assuming the VM's internal
+/// port is directly reachable from the host.
+/// </summary>
+public interface IDeploymentEndpointPublisher
+{
+    bool CanPublishEndpoint(DeploymentEndpointRequest request);
+    DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request);
+}
+
+public static class DeploymentEndpointPublisher
+{
+    public static DeploymentEndpoint ForHostPort(DeploymentEndpointRequest request, string host)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (string.IsNullOrWhiteSpace(host))
+            throw new ArgumentException("Host is required when publishing a host/port endpoint.", nameof(host));
+        if (request.Port is not { } port)
+            throw new ArgumentException("Port is required when publishing a host/port endpoint.", nameof(request));
+        if (port is < 1 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(request), port, "Port must be 1..65535.");
+
+        var metadata = new Dictionary<string, string>(request.Metadata, StringComparer.Ordinal)
+        {
+            ["endpoint.scope"] = "host-routable",
+        };
+
+        var path = NormalizeUrlPath(request.Path);
+        return new DeploymentEndpoint
+        {
+            Kind = request.Kind,
+            Url = request.Kind == DeploymentEndpointKind.Http
+                ? $"{request.Scheme}://{host}:{port}{path}"
+                : null,
+            Host = host,
+            Port = port,
+            Metadata = metadata,
+        };
+    }
+
+    private static string NormalizeUrlPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+        return path.StartsWith("/", StringComparison.Ordinal) ? path : "/" + path;
+    }
+}
+
+/// <summary>
 /// Resolves an <see cref="IDeploymentDriver"/> for a given recipe Kind. Loose
 /// coupling: new drivers are added via DI without changing the orchestrator.
 /// </summary>

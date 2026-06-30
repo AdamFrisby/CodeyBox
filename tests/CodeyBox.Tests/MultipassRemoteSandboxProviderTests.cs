@@ -134,8 +134,8 @@ public sealed class MultipassRemoteSandboxProviderTests
             WorkingDirectory = "/work",
         });
 
-        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sb);
-        Assert.Null(routable.HostAddress);
+        Assert.False(sb is IRoutableSandbox);
+        Assert.False(sb is IDeploymentEndpointPublisher);
 
         await sb.DisposeAsync();
     }
@@ -483,14 +483,21 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
+        var workItemId = new WorkItemId(Guid.NewGuid());
         var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
-            await provider.CreateAsync(new SandboxSpec { ImageReference = "bogus" }));
+            await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "bogus",
+                TimingWorkItemId = workItemId,
+            }));
         Assert.Equal("placement", ex.Operation);
         Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
 
         // Cleanup must have tried to delete the would-be VM.
         Assert.Contains(transport.RecordedCalls, c =>
             c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
+        Assert.Empty(provider.SnapshotActiveSandboxProgress());
+        Assert.Empty(provider.SnapshotActiveSandboxes());
     }
 
     [Theory]
@@ -836,8 +843,9 @@ public sealed class MultipassRemoteSandboxProviderTests
             {
                 if (script.StartsWith("printf %s ", StringComparison.Ordinal))
                 {
+                    var markerValue = ExtractFirstQuotedPath(script[..script.IndexOf(" > ", StringComparison.Ordinal)]);
                     var markerPath = ExtractQuotedPathAfterRedirect(script);
-                    markerByPath[markerPath] = "Deployment";
+                    markerByPath[markerPath] = markerValue;
                     return ProcessRunOk();
                 }
                 if (script.StartsWith("test -f ", StringComparison.Ordinal))

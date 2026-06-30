@@ -117,13 +117,20 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         if (recipe.Ports.Count > 0)
         {
             var port = recipe.Ports[0];
-            var host = ResolveHostAddress(sandbox);
-            metadata["endpoint.scope"] = host is null ? "sandbox-local" : "host-routable";
             metadata["sandbox.local-endpoint"] = $"127.0.0.1:{port}";
+            var request = new DeploymentEndpointRequest
+            {
+                Kind = DeploymentEndpointKind.Tcp,
+                Port = port,
+                Metadata = metadata,
+            };
+            if (CanPublishEndpoint(sandbox, request))
+                return PublishEndpoint(sandbox, request);
+
+            metadata["endpoint.scope"] = "sandbox-local";
             return new DeploymentEndpoint
             {
                 Kind = DeploymentEndpointKind.Tcp,
-                Host = host,
                 Port = port,
                 Metadata = metadata,
             };

@@ -16,6 +16,10 @@ public sealed class DeploymentDriverTests
         SandboxProvider = provider,
     };
 
+    private static WebAppDeploymentDriver NewWebAppDriver(
+        Func<Uri, CancellationToken, Task<bool>>? hostHttpProbe = null)
+        => new(hostHttpProbe: hostHttpProbe ?? ((_, _) => Task.FromResult(true)));
+
     // ── WebApp ───────────────────────────────────────────────────────────────
 
     [Fact]
@@ -33,7 +37,7 @@ public sealed class DeploymentDriverTests
             },
             finalLoop: new SandboxExecResult(0, "200", "")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -71,7 +75,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("build-fail", new SandboxExecResult(2, "", "compile error")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -95,7 +99,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -125,7 +129,7 @@ public sealed class DeploymentDriverTests
             "too-chatty",
             new SandboxExecResult(0, new string('x', 1024), "", StdoutLimitExceeded: true)));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -151,7 +155,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("leak-secret", new SandboxExecResult(1, "", $"Authorization: {Token}")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -175,7 +179,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("start-fail", new SandboxExecResult(42, "", "boom")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -198,7 +202,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider { HostAddress = null };
         provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -208,10 +212,38 @@ public sealed class DeploymentDriverTests
             HealthEndpoint = "/healthz",
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(
             () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
 
-        Assert.Contains("routable sandbox host address", ex.Message);
+        Assert.Contains("publish HTTP endpoint", ex.Message);
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task WebApp_ExposedUrlProbeNeverReady_TearsDownAndThrowsTimeout()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+
+        var driver = NewWebAppDriver((_, _) => Task.FromResult(false));
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            StartupTimeout = TimeSpan.FromMilliseconds(100),
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.01",
+            },
+        };
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
         Assert.Single(provider.Created);
         Assert.True(provider.Created[0].IsDisposed);
     }
@@ -225,7 +257,7 @@ public sealed class DeploymentDriverTests
             new SandboxExecResult(0, "", ""),
             delay: TimeSpan.FromSeconds(5)));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -252,7 +284,7 @@ public sealed class DeploymentDriverTests
             new SandboxExecResult(0, "", ""),
             delay: TimeSpan.FromSeconds(5)));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -275,7 +307,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(7, "", "Connection refused")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -299,7 +331,7 @@ public sealed class DeploymentDriverTests
     [Fact]
     public void WebApp_RecipeWithoutHealthEndpoint_FailsValidation()
     {
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -316,7 +348,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("custom-probe", new SandboxExecResult(0, "", "")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -345,7 +377,7 @@ public sealed class DeploymentDriverTests
         provider.ExecRules.Add(new ExecRule("127.0.0.1:5432", new SandboxExecResult(0, "ok", "")));
         provider.ExecRules.Add(new ExecRule("127.0.0.1:8080", new SandboxExecResult(0, "ok", "")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -387,7 +419,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("service-start-fail", new SandboxExecResult(2, "", "service boom")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -419,7 +451,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("127.0.0.1:5432", new SandboxExecResult(7, "", "refused")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -458,7 +490,7 @@ public sealed class DeploymentDriverTests
         provider.ExecRules.Add(new ExecRule("/dev/tcp/127.0.0.1/5432", new SandboxExecResult(0, "", "")));
         provider.ExecRules.Add(new ExecRule("127.0.0.1:8080", new SandboxExecResult(0, "ok", "")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -789,7 +821,7 @@ public sealed class DeploymentDriverTests
         var readinessProbe = new ExecRule("curl", new SandboxExecResult(0, "200", ""));
         provider.ExecRules.Add(readinessProbe);
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -821,7 +853,7 @@ public sealed class DeploymentDriverTests
             new[] { new SandboxExecResult(0, "200", "") },
             finalLoop: new SandboxExecResult(7, "", "Connection refused")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -851,7 +883,7 @@ public sealed class DeploymentDriverTests
             new[] { new SandboxExecResult(0, "200", "") },
             finalLoop: new SandboxExecResult(7, "", "Connection refused")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -1078,7 +1110,7 @@ public sealed class DeploymentDriverTests
     [Fact]
     public void Base_ValidateRecipe_RejectsServiceWithoutRunCommand()
     {
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -1102,9 +1134,85 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
+    public void Base_ValidateRecipe_RejectsNullServiceEntry()
+    {
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services = [null!],
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("null entries", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Base_ValidateRecipe_RejectsServiceWithBlankName(string name)
+    {
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = name,
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start",
+                    Ports = [5432],
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("Name is required", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Base_ValidateRecipe_RejectsServiceWithBlankImageReference(string imageReference)
+    {
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = imageReference,
+                    RunCommand = "service-start",
+                    Ports = [5432],
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("ImageReference", ex.Message);
+    }
+
+    [Fact]
     public void Base_ValidateRecipe_RejectsServiceWithoutPorts()
     {
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -1130,7 +1238,7 @@ public sealed class DeploymentDriverTests
     [Fact]
     public void Base_ValidateRecipe_RejectsServiceWithInvalidPort()
     {
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -1157,7 +1265,7 @@ public sealed class DeploymentDriverTests
     [Fact]
     public void Base_ValidateRecipe_RejectsDistinctServiceImageWithoutPlaceholder()
     {
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -1186,7 +1294,7 @@ public sealed class DeploymentDriverTests
     [Fact]
     public void WebApp_RecipeWithoutRunCommand_FailsValidation()
     {
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -1200,7 +1308,7 @@ public sealed class DeploymentDriverTests
     [Fact]
     public void WebApp_RecipeWithoutPorts_FailsValidation()
     {
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -1361,7 +1469,7 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
 
-        var driver = new WebAppDeploymentDriver();
+        var driver = NewWebAppDriver();
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,

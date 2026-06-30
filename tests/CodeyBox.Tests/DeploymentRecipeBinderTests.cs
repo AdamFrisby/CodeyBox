@@ -74,8 +74,10 @@ public sealed class DeploymentRecipeBinderTests
         var svc = recipe.Services[0];
         Assert.Equal("db", svc.Name);
         Assert.Equal("postgres:16", svc.ImageReference);
+        Assert.Equal("postgres", svc.RunCommand);
         Assert.Equal(new[] { 5432 }, svc.Ports);
         Assert.Equal("x", svc.Environment["POSTGRES_PASSWORD"]);
+        Assert.Equal("/ready", svc.HealthEndpoint);
     }
 
     [Fact]
@@ -142,6 +144,22 @@ public sealed class DeploymentRecipeBinderTests
             },
         };
         Assert.Throws<InvalidOperationException>(() => DeploymentRecipeBinder.ToRecipe(cfg));
+    }
+
+    [Fact]
+    public void ToRecipe_NullServiceEntry_Throws()
+    {
+        var cfg = new DeploymentRecipeConfig
+        {
+            Kind = "web-app",
+            ImageReference = "x",
+            Services = new List<DeploymentServiceConfig>
+            {
+                null!,
+            },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => DeploymentRecipeBinder.ToRecipe(cfg));
+        Assert.Contains("null entries", ex.Message);
     }
 
     [Fact]

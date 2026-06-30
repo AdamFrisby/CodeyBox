@@ -38,6 +38,15 @@ public sealed class SandboxAdmissionControlledProviderTests
 
         var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
         Assert.Equal("10.10.0.42", routable.HostAddress);
+        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
+        var request = new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        };
+        Assert.True(publisher.CanPublishEndpoint(request));
+        var endpoint = publisher.PublishEndpoint(request);
+        Assert.Equal("http://10.10.0.42:8080", endpoint.Url);
     }
 
     [Fact]
@@ -1860,13 +1869,20 @@ public sealed class SandboxAdmissionControlledProviderTests
             Task.CompletedTask;
     }
 
-    private sealed class RoutableSandbox : IRoutableSandbox
+    private sealed class RoutableSandbox : IRoutableSandbox, IDeploymentEndpointPublisher
     {
         public string Id { get; } = "routable-1";
         public string? HostAddress => "10.10.0.42";
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
             Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+            => request.Port is >= 1 and <= 65535
+                && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+
+        public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+            => DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }

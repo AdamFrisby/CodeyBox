@@ -2,6 +2,7 @@ using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Deployment;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox.MultipassRemote;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -43,6 +44,27 @@ public sealed class DeploymentProgramWiringTests
         var project = await repo.GetAsync(new ProjectId("alpha"));
         Assert.NotNull(project?.Deployment);
         Assert.Equal(DeploymentKinds.WebApp, project!.Deployment!.Kind);
+    }
+
+    [Fact]
+    public void ProgramBuildMultipassRemoteOptions_CopiesGlobalSandboxNetworkProfiles()
+    {
+        var options = new CodeyBoxOptions
+        {
+            MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+            {
+                SshTarget = "codeybox@remote.example",
+            },
+            SandboxNetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["deploy-isolated"] = "cb-deploy",
+            },
+        };
+
+        var remote = Program.BuildMultipassRemoteSandboxOptions(options);
+
+        Assert.Equal("cb-deploy", remote.NetworkProfiles["deploy-isolated"]);
+        Assert.Equal("cb-deploy", remote.NetworkProfiles["DEPLOY-ISOLATED"]);
     }
 
     private sealed class DeploymentProgramWiringFactory : WebApplicationFactory<Program>
