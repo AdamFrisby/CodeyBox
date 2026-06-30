@@ -565,6 +565,28 @@ public sealed class NullActiveSandboxProgressProvider : IActiveSandboxProgressPr
 }
 
 /// <summary>
+/// Provider capability exposing the executor-host placement pool behind a
+/// sandbox provider. Local providers return no pool; distributed providers can
+/// surface per-host capacity, cordon, and health so dashboards show fan-out
+/// limits instead of hiding them behind the global sandbox admission count.
+/// </summary>
+public interface ISandboxHostPoolSnapshot
+{
+    IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool();
+}
+
+public sealed record SandboxHostPoolEntry(
+    string HostId,
+    int Capacity,
+    int Reserved,
+    bool Cordoned,
+    bool ConfiguredHealthy,
+    bool RuntimeHealthy,
+    string? RuntimeUnhealthyReason,
+    DateTimeOffset? RuntimeUnhealthyUntil,
+    IReadOnlyList<string> AllowedNetworkProfiles);
+
+/// <summary>
 /// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
 /// The startup resume handler uses <see cref="ResumeSandboxAsync"/> to start
 /// each persisted VM by name and adopt its still-running agent process.

@@ -361,7 +361,7 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         argv.Add("-o"); argv.Add($"ConnectTimeout={opts.ConnectTimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
         // Multiplexed control sockets would reduce per-exec connection cost,
         // but they're host-disk artifacts that need cleanup and are tricky
-        // for our test fakes. Skip them for step 1.
+        // for our test fakes. Keep the transport stateless for now.
         argv.Add("-o"); argv.Add("ControlMaster=no");
         argv.Add("-o"); argv.Add("ControlPath=none");
         if (!string.IsNullOrWhiteSpace(opts.SshKeyPath))

@@ -175,7 +175,7 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
-    public async Task ExecAsync_propagates_transport_drop_as_RemoteSshTransportException()
+    public async Task ExecAsync_wraps_transport_drop_as_infrastructure_deferral()
     {
         // An SSH transport drop must NOT silently become a "command exited
         // non-zero" — the orchestrator needs to classify it as recoverable
@@ -200,8 +200,11 @@ public sealed class MultipassRemoteSandboxProviderTests
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
         var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
 
-        var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
             await sb.ExecAsync(new SandboxExec { Argv = ["echo", "x"] }));
+        Assert.Equal("exec", ex.Operation);
+        Assert.Equal("remote-host-unreachable", ex.ErrorClass);
+        Assert.IsType<RemoteSshTransportException>(ex.InnerException);
         Assert.Contains("connection refused", ex.Message);
         Assert.Equal(1, execCalls);
         await sb.DisposeAsync();

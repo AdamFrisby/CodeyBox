@@ -124,6 +124,10 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.audit.first_audit.outcome` | `{audit}` | `outcome` (`passed` \| `failed`), `planned` (`on` \| `off`) | One per work item at its first code-audit iteration. Slices first-audit pass-rate by the planned cohort (proves whether planning reduces cycles). |
 | `codeybox.audit.rework_empty.events` | `{event}` | `outcome` (`detected` \| `escalation_succeeded` \| `parked` \| `failed`) | Empty audit-rework handling sub-events. |
 | `codeybox.webhook.deliveries` | `{delivery}` | `endpoint`, `event`, `outcome` (`delivered` \| `failed`) | One per terminal webhook delivery outcome. |
+| `codeybox.sandbox.remote_placement.count` | `{placement}` | `host_id`, `outcome` (`reserved` \| `created`) | Remote multipass host-pool placement reservations and successful VM creations. |
+| `codeybox.sandbox.remote_placement.deferrals` | `{deferral}` | `reason`, `network_profile` | Placement deferrals when no remote executor host currently has eligible capacity. |
+| `codeybox.sandbox.remote_host.health_transitions` | `{transition}` | `host_id`, `state` (`healthy` \| `unhealthy`) | Runtime SSH health backoff transitions for remote executor hosts. |
+| `codeybox.coordinator.agent_stream.dropped_bytes` | `By` | `phase`, `reason` | Bytes dropped by agent stream capture caps before they can become a coordinator I/O bottleneck. |
 
 ### Histograms
 
@@ -139,6 +143,9 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.sandbox.resource.net_rx_mb` | `MB` | `phase`, `network_profile` | Cumulative guest receive traffic on the data interface captured at Multipass teardown. |
 | `codeybox.sandbox.resource.net_tx_mb` | `MB` | `phase`, `network_profile` | Cumulative guest transmit traffic on the data interface captured at Multipass teardown. |
 | `codeybox.upstream.api_call.duration_ms` | `ms` | `endpoint`, `status_code` | Upstream forge API call durations. |
+| `codeybox.coordinator.sqlite.write_gate.wait_ms` | `ms` | `outcome` (`acquired` \| `canceled`) | Time spent waiting for the shared SQLite single-writer gate. |
+| `codeybox.coordinator.git.command.duration_ms` | `ms` | `operation`, `outcome` (`success` \| `exit_nonzero` \| `canceled` \| `error`) | Host-side git command duration inside the orchestrator process. |
+| `codeybox.coordinator.agent_stream.capture.duration_ms` | `ms` | `phase`, `outcome` (`completed` \| `truncated` \| `error`) | Agent stream capture writer duration on the orchestrator host. |
 
 ### Observable gauges
 
@@ -151,6 +158,8 @@ Polled at collection time; registered only when OTel is enabled.
 | `codeybox.workers.max` | `{worker}` | — | Configured `MaxConcurrentWorkers` ceiling. |
 | `codeybox.sandbox.active` | `{sandbox}` | `provider` | Currently admitted sandbox leases when the provider is wrapped by the global admission gate, including create/provisioning and startup-resume leases; otherwise lifecycle-aware providers report `IActiveSandboxProvider.SnapshotActiveSandboxes()` and ephemeral providers report `SandboxLiveCounter.Active`. |
 | `codeybox.sandbox.max` | `{sandbox}` | — | Configured `MaxConcurrentSandboxes` admission ceiling. |
+| `codeybox.sandbox.remote_host.reserved` | `{sandbox}` | `host_id`, `cordoned`, `configured_healthy`, `runtime_healthy` | Per-host remote multipass reservations held by active or provisioning VMs. |
+| `codeybox.sandbox.remote_host.capacity` | `{sandbox}` | `host_id`, `cordoned`, `configured_healthy`, `runtime_healthy` | Per-host remote multipass capacity cap (`long.MaxValue` means unbounded at the host level). |
 | `codeybox.agent.quota.available_pct` | `%` | `agent.kind`, `model` | Most-recent subscription quota headroom observed per agent/model during routing (`-1` = unknown). |
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.

@@ -12,13 +12,13 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// disposal that stops + deletes the remote VM and rsync's writable mounts
 /// back to the orchestrator host so the merge phase can see them.
 ///
-/// <para>The implementation deliberately stays narrow for step 1. It does
-/// NOT implement <see cref="IPreemptibleSandbox"/>, <see cref="ISuspendableSandbox"/>,
-/// or <see cref="IShutdownTeardownSandbox"/>'s teardown-ownership flag —
-/// those would require shutdown-handler integration we want to add in a
-/// follow-up. It DOES report itself as an <see cref="IShutdownTeardownSandbox"/>
-/// so the active-sandbox snapshot is correctly typed and a future suspend
-/// implementation slots in without changing the provider surface.</para>
+/// <para>The implementation deliberately stays narrow. It does NOT implement
+/// <see cref="IPreemptibleSandbox"/> or <see cref="ISuspendableSandbox"/>;
+/// those would require durable remote VM identity and shutdown-handler
+/// integration beyond the pooled-executor placement layer. It DOES report
+/// itself as an <see cref="IShutdownTeardownSandbox"/> so the active-sandbox
+/// snapshot is correctly typed and a future suspend implementation slots in
+/// without changing the provider surface.</para>
 /// </summary>
 internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
 {
@@ -27,35 +27,43 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
     private readonly string _remoteSandboxRoot;
     private readonly IRemoteHostTransport _transport;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<ProcessRunResultLike>> _runRemoteMaybeGated;
-    private readonly Func<MultipassRemoteSandboxOptions> _opts;
+    private readonly MultipassRemoteSandboxOptions _opts;
     private readonly ILogger _log;
+    private readonly Action<RemoteSshTransportException> _onTransportFailure;
     private readonly Action<string> _onDispose;
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> _activeExecCts = new();
     private int _disposed; // 0/1 via Interlocked
 
     public MultipassRemoteSandbox(
         string vmName,
+        string hostId,
         SandboxSpec spec,
         IReadOnlyList<StagedBindMount> stagedMounts,
         string remoteSandboxRoot,
         IRemoteHostTransport transport,
         Func<IReadOnlyList<string>, CancellationToken, Task<ProcessRunResultLike>> runRemoteMaybeGated,
-        Func<MultipassRemoteSandboxOptions> optsAccessor,
+        MultipassRemoteSandboxOptions opts,
         ILogger log,
+        Action<RemoteSshTransportException> onTransportFailure,
         Action<string> onDispose)
     {
         Id = vmName;
+        HostId = hostId;
         _spec = spec;
         _stagedMounts = stagedMounts;
         _remoteSandboxRoot = remoteSandboxRoot;
         _transport = transport;
         _runRemoteMaybeGated = runRemoteMaybeGated;
-        _opts = optsAccessor;
+        _opts = opts;
         _log = log;
+        _onTransportFailure = onTransportFailure;
         _onDispose = onDispose;
     }
 
     public string Id { get; }
+    public string HostId { get; }
+    internal MultipassRemoteSandboxOptions HostOptions => _opts;
+    internal IRemoteHostTransport Transport => _transport;
 
     public WorkItemId? OwningWorkItemId => _spec.TimingWorkItemId;
 
@@ -66,7 +74,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         if (exec.Argv.Count == 0)
             throw new ArgumentException("Argv must be non-empty.", nameof(exec));
 
-        var opts = _opts();
+        var opts = _opts;
         var workdir = exec.WorkingDirectory ?? _spec.WorkingDirectory ?? SandboxConventions.WorkDir;
 
         // Build the in-VM command: `cd <wd> && <argv...>` so subsequent execs
@@ -153,6 +161,17 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
                     StdoutLimitExceeded: stdoutLimitHit,
                     StderrLimitExceeded: stderrLimitHit);
             }
+            catch (RemoteSshTransportException ex)
+            {
+                _onTransportFailure(ex);
+                throw new SandboxProvisioningDeferredException(
+                    provider: "multipass-remote",
+                    operation: "exec",
+                    errorClass: "remote-host-unreachable",
+                    detail: $"host={HostId}; vm={Id}; {ex.Message}",
+                    recheckIn: opts.PlacementRecheckIn,
+                    innerException: ex);
+            }
             catch (OperationCanceledException) when ((stdoutLimitHit || stderrLimitHit) && !ct.IsCancellationRequested)
             {
                 // The output-limit watchdog cancelled the linked token to
@@ -193,7 +212,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
-        var opts = _opts();
+        var opts = _opts;
         var vmName = Id;
 
         // 1) Try to cleanly stop the VM so background processes flush.
@@ -213,6 +232,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         }
         catch (RemoteSshTransportException ex)
         {
+            _onTransportFailure(ex);
             _log.LogWarning(ex, "Remote VM {Vm} stop failed during dispose (transport)", vmName);
         }
         catch (Exception ex)
@@ -234,6 +254,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
             }
             catch (RemoteSshTransportException ex)
             {
+                _onTransportFailure(ex);
                 _log.LogWarning(ex,
                     "Sync-back from remote {Remote} to host {Host} failed (transport)",
                     mount.RemoteStagedPath, hostPath);
@@ -263,6 +284,8 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         }
         catch (Exception ex)
         {
+            if (ex is RemoteSshTransportException transportEx)
+                _onTransportFailure(transportEx);
             _log.LogWarning(ex, "Remote VM {Vm} delete failed during dispose", vmName);
         }
         try
@@ -274,6 +297,8 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         }
         catch (Exception ex)
         {
+            if (ex is RemoteSshTransportException transportEx)
+                _onTransportFailure(transportEx);
             _log.LogWarning(ex, "Remote staging dir {Dir} cleanup failed during dispose", _remoteSandboxRoot);
         }
 

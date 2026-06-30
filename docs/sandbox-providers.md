@@ -1,6 +1,6 @@
 # Sandbox providers
 
-CodeyBox ships three providers. Pick one with `CodeyBox.SandboxProvider`
+CodeyBox ships four providers. Pick one with `CodeyBox.SandboxProvider`
 in `appsettings.json` (or `CodeyBox__SandboxProvider` env). Setup ranges
 from "single package" to nothing — pick the one whose security and
 operational trade-off matches your deployment.
@@ -12,6 +12,7 @@ operational trade-off matches your deployment.
 | `process`         | None (UNSAFE)                                | nothing                                                          | Working — dev only              |
 | `bubblewrap`      | Linux namespaces + seccomp; shared kernel    | `apt install bubblewrap` — no daemon, no /etc edits              | **Working, integration-tested** |
 | **`multipass`**   | **Real Ubuntu VM (separate guest kernel)**   | **`snap install multipass` — single command, no /etc edits**     | **Working, integration-tested** |
+| `multipass-remote` | Real Ubuntu VM on remote executor hosts     | `ssh` from orchestrator + `snap install multipass` per executor  | Working — distributed executor pool |
 
 CodeyBox previously shipped Kata, gVisor, and crun-vm provider scaffolds.
 Those were code-reviewed but never runtime-validated, so they were
@@ -228,14 +229,35 @@ Three ways to install what your project needs:
 
 ## `multipass-remote` — same kernel isolation, VM execution off-box
 
-Drives `multipass` on a REMOTE host over SSH while the orchestrator
-brain — work-item DB, dispatch loop, agent stream capture — stays local.
-This is "CHEAP-PATH distributed VMs, step 1 of 2": one orchestrator
-process, one SQLite database, sandboxes elsewhere. Lets you scale VM
-throughput by adding a beefy remote host without re-architecting the
-orchestrator into a multi-process service.
+Drives `multipass` on one or more REMOTE executor hosts over SSH while
+the orchestrator brain — work-item DB, dispatch loop, agent stream
+capture — stays local. This is the cheap distributed-VM path: one
+orchestrator process, one SQLite database, sandboxes elsewhere. It lets
+you scale VM throughput by adding executor hosts without re-architecting
+the service into multiple orchestrators or an external database.
 
 **Provider name:** `multipass-remote`.
+
+**Placement.** Configure `ExecutorHosts` to turn the legacy single remote
+into a host pool. Each host has its own SSH target, capacity cap,
+cordon/drain flag, configured health flag, and optional network-profile
+allowlist. New VMs are placed only on hosts that are healthy, not
+cordoned, allowed for the requested network profile, and below their
+`MaxConcurrentSandboxes` cap. Placement picks the lowest load ratio so
+VMs spread across hosts without oversubscribing any host. The normal
+global gates still apply: effective fan-out is bounded by
+`min(MaxConcurrentWorkers, MaxConcurrentSandboxes, sum(host caps))`. When
+configured host capacity exceeds the global cap, startup logs a warning
+instead of silently hiding the bottleneck.
+
+**Cordon/drain and health.** Set `Cordoned=true` on a host to stop new VM
+placements there while existing VMs finish and release their reservations.
+Set `Healthy=false` to route around a known-bad host without deleting it
+from config. If SSH transport to a host drops at runtime, the provider
+marks that host runtime-unhealthy for `RuntimeUnhealthyBackoff` and
+retries placement on another eligible host. A transport drop during
+`exec` is surfaced as infrastructure deferral, so the existing wedge /
+preempt-checkpoint recovery path can reschedule the work item.
 
 **Architecture.** Every `multipass` command (launch / exec / mount /
 stop / delete / info / list) is issued through an `IRemoteHostTransport`
@@ -274,9 +296,8 @@ multipass.
 **Setup.**
 1. Install OpenSSH on the orchestrator host (almost always already
    there).
-2. On the remote host: `snap install multipass`. Same install command as
-   for local multipass, same `MultipassExtraRuncmd` baseline-bake
-   workflow when you switch in step 2.
+2. On each remote executor host: `snap install multipass`. Same install
+   command as for local multipass.
 3. Provision an SSH key for the orchestrator that authorizes a
    non-interactive user on the remote host. Use a key dedicated to
    CodeyBox so revocation has clean blast radius.
@@ -289,29 +310,53 @@ multipass.
      "CodeyBox": {
        "SandboxProvider": "multipass-remote",
        "MultipassRemoteSandbox": {
-         "SshTarget": "codeybox@remote.example.com",
          "SshKeyPath": "/etc/codeybox/ssh/id_ed25519",
          "RemoteMultipassPath": "/snap/bin/multipass",
          "RemoteStagingRoot": "/home/codeybox/snap/multipass/common/codeybox-remote-staging",
-         "DefaultImage": "24.04"
+         "DefaultImage": "24.04",
+         "PlacementRecheckIn": "00:00:15",
+         "RuntimeUnhealthyBackoff": "00:01:00",
+         "ExecutorHosts": [
+           {
+             "Id": "exec-a",
+             "SshTarget": "codeybox@exec-a.example.com",
+             "MaxConcurrentSandboxes": 40,
+             "AllowedNetworkProfiles": [ "claude", "multi-llm", "(default)" ]
+           },
+           {
+             "Id": "exec-b",
+             "SshTarget": "codeybox@exec-b.example.com",
+             "MaxConcurrentSandboxes": 40,
+             "AllowedNetworkProfiles": [ "*" ]
+           }
+         ]
        }
      }
    }
    ```
 
-**Hot reload.** Every field on `MultipassRemoteSandbox` is read fresh on
-each `CreateAsync` via `IOptionsMonitor`, so rotating an SSH key or
-re-pointing at a different remote host takes effect on the next sandbox
-launch without an orchestrator restart.
+   For a legacy single-host setup, omit `ExecutorHosts` and put
+   `SshTarget` / `MaxConcurrentSandboxes` directly under
+   `MultipassRemoteSandbox`; the provider treats that as one host named
+   `default`.
 
-**Scope (step 1 of 2).** This provider deliberately does NOT implement:
-baseline image bake/clone, suspend/resume, host-shutdown teardown,
-disk-guard preflight, package-cache seeding. Those host-side concerns
-either don't translate cleanly to a remote host without further design
-(suspend/resume needs network-stable VM identity across orchestrator
-restarts; baselines need a per-remote-host cache) or are operator-tuning
-concerns deferred until the basic distributed-VM path is working
-end-to-end. Step 2 picks those up.
+**Hot reload.** Every field on `MultipassRemoteSandbox` is read fresh on
+each `CreateAsync` via `IOptionsMonitor`, so rotating an SSH key,
+cordoning a host, changing per-host caps, or adding/removing executors
+takes effect on the next sandbox launch without an orchestrator restart.
+
+**Observability.** Host-pool gauges expose per-host reserved slots and
+capacity; placement counters show reservations, created VMs, deferrals,
+and runtime health transitions. Coordinator pinch-points are also timed:
+SQLite write-gate wait, host-side git commands, and agent-stream capture
+I/O. See [`observability.md`](observability.md).
+
+**Scope.** This provider deliberately does NOT implement baseline image
+bake/clone, suspend/resume, host-shutdown teardown, disk-guard preflight,
+or package-cache seeding. Those host-side concerns either don't translate
+cleanly to a remote host without further design (suspend/resume needs
+network-stable VM identity across orchestrator restarts; baselines need a
+per-remote-host cache) or remain operator-tuning concerns.
 
 ## Choosing
 

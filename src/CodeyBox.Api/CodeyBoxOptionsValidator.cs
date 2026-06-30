@@ -301,6 +301,8 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             }
         }
 
+        ValidateMultipassRemote(options, failures);
+
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
         return failures.Count == 0
@@ -315,5 +317,53 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         return options.E2eMultipassRemoteSandbox is null
             ? []
             : [options.E2eMultipassRemoteSandbox];
+    }
+
+    private static void ValidateMultipassRemote(CodeyBoxOptions options, List<string> failures)
+    {
+        var cfg = options.MultipassRemoteSandbox;
+        if (cfg is null)
+            return;
+
+        if (cfg.MaxConcurrentSandboxes is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:MaxConcurrentSandboxes must be > 0 when set");
+        if (cfg.PlacementRecheckIn is { } placement && placement <= TimeSpan.Zero)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:PlacementRecheckIn must be positive when set");
+        if (cfg.RuntimeUnhealthyBackoff is { } backoff && backoff <= TimeSpan.Zero)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:RuntimeUnhealthyBackoff must be positive when set");
+
+        var providerIsRemote = string.Equals(
+            options.SandboxProvider?.Trim(),
+            "multipass-remote",
+            StringComparison.OrdinalIgnoreCase);
+        var hasTopLevelTarget = !string.IsNullOrWhiteSpace(cfg.SshTarget);
+        var hosts = cfg.ExecutorHosts ?? [];
+        if (providerIsRemote && hosts.Count == 0 && !hasTopLevelTarget)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:SshTarget is required when SandboxProvider=multipass-remote and ExecutorHosts is empty");
+
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < hosts.Count; i++)
+        {
+            var host = hosts[i];
+            var prefix = $"CodeyBox:MultipassRemoteSandbox:ExecutorHosts:{i}";
+            if (!string.IsNullOrWhiteSpace(host.Id) && !ids.Add(host.Id.Trim()))
+                failures.Add($"{prefix}:Id duplicates another executor host id ('{host.Id.Trim()}')");
+            if (providerIsRemote && !hasTopLevelTarget && string.IsNullOrWhiteSpace(host.SshTarget))
+                failures.Add($"{prefix}:SshTarget is required when no top-level SshTarget default is configured");
+            if (host.MaxConcurrentSandboxes is <= 0)
+                failures.Add($"{prefix}:MaxConcurrentSandboxes must be > 0 when set");
+            if (host.ServerAliveIntervalSeconds is <= 0)
+                failures.Add($"{prefix}:ServerAliveIntervalSeconds must be > 0 when set");
+            if (host.ServerAliveCountMax is <= 0)
+                failures.Add($"{prefix}:ServerAliveCountMax must be > 0 when set");
+            if (host.ConnectTimeoutSeconds is <= 0)
+                failures.Add($"{prefix}:ConnectTimeoutSeconds must be > 0 when set");
+            if (host.VmStartTimeout is { } start && start <= TimeSpan.Zero)
+                failures.Add($"{prefix}:VmStartTimeout must be positive when set");
+            if (host.VmStopTimeout is { } stop && stop <= TimeSpan.Zero)
+                failures.Add($"{prefix}:VmStopTimeout must be positive when set");
+            if (host.VmStateCheckInterval is { } poll && poll <= TimeSpan.Zero)
+                failures.Add($"{prefix}:VmStateCheckInterval must be positive when set");
+        }
     }
 }

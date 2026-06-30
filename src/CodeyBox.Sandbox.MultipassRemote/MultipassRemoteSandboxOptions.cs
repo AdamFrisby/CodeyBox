@@ -14,6 +14,57 @@ public sealed record MultipassRemoteSandboxOptions
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
 
     /// <summary>
+    /// Stable host id used in placement logs and metrics. Empty means this
+    /// options instance is the top-level legacy single-host config; resolved
+    /// host snapshots always have a non-empty id.
+    /// </summary>
+    public string HostId { get; init; } = "";
+
+    /// <summary>
+    /// Host-local sandbox capacity. Null means "uncapped here" and the global
+    /// worker/sandbox admission gates remain the only ceiling.
+    /// </summary>
+    public int? MaxConcurrentSandboxes { get; init; }
+
+    /// <summary>
+    /// When true, the host is draining: no new VMs are placed here, while
+    /// existing active VMs are allowed to finish and release their slots.
+    /// </summary>
+    public bool Cordoned { get; init; }
+
+    /// <summary>
+    /// Operator-configured health gate. Set false to route new VMs away from a
+    /// host without removing it from config; existing active VMs keep running.
+    /// </summary>
+    public bool Healthy { get; init; } = true;
+
+    /// <summary>
+    /// Logical network profiles this host may accept. Empty means all profiles;
+    /// "*" also means all profiles. Use "(default)" for sandboxes with no
+    /// explicit <see cref="CodeyBox.Core.SandboxNetworkPolicy.ProfileName"/>.
+    /// </summary>
+    public IReadOnlyList<string> AllowedNetworkProfiles { get; init; } = [];
+
+    /// <summary>
+    /// Multi-host pool. When empty, the legacy top-level SSH fields are treated
+    /// as a single host named "default".
+    /// </summary>
+    public IReadOnlyList<MultipassRemoteExecutorHostOptions> ExecutorHosts { get; init; } = [];
+
+    /// <summary>
+    /// Requeue delay surfaced when no executor host can currently accept a
+    /// sandbox because every eligible host is full, cordoned, or unhealthy.
+    /// </summary>
+    public TimeSpan PlacementRecheckIn { get; init; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Runtime backoff applied after an SSH transport drop. The host is skipped
+    /// for new placements until the deadline, then probed opportunistically by
+    /// the next placement/list operation.
+    /// </summary>
+    public TimeSpan RuntimeUnhealthyBackoff { get; init; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>
     /// OpenSSH client binary. Resolved via $PATH when bare ("ssh"). Override
     /// with an absolute path on hosts where $PATH-based resolution is
     /// unreliable (e.g. systemd unit with a stripped PATH).
@@ -131,4 +182,113 @@ public sealed record MultipassRemoteSandboxOptions
     /// recognise its own VMs in <c>multipass list</c>.
     /// </summary>
     public string VmNamePrefix { get; init; } = "codeybox-r-";
+
+    public static IReadOnlyList<MultipassRemoteSandboxOptions> ResolveExecutorHosts(MultipassRemoteSandboxOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        IReadOnlyList<MultipassRemoteExecutorHostOptions> hosts = options.ExecutorHosts.Count == 0
+            ? new MultipassRemoteExecutorHostOptions[]
+            {
+                new MultipassRemoteExecutorHostOptions
+                {
+                    Id = string.IsNullOrWhiteSpace(options.HostId) ? "default" : options.HostId,
+                    SshTarget = options.SshTarget,
+                    SshBinary = options.SshBinary,
+                    SshPort = options.SshPort,
+                    SshKeyPath = options.SshKeyPath,
+                    ExtraSshOptions = options.ExtraSshOptions,
+                    AcceptUnknownHostKeys = options.AcceptUnknownHostKeys,
+                    ServerAliveIntervalSeconds = options.ServerAliveIntervalSeconds,
+                    ServerAliveCountMax = options.ServerAliveCountMax,
+                    ConnectTimeoutSeconds = options.ConnectTimeoutSeconds,
+                    LocalTarBinary = options.LocalTarBinary,
+                    RemoteMultipassPath = options.RemoteMultipassPath,
+                    RemoteStagingRoot = options.RemoteStagingRoot,
+                    DefaultImage = options.DefaultImage,
+                    VmStartTimeout = options.VmStartTimeout,
+                    VmStopTimeout = options.VmStopTimeout,
+                    VmStateCheckInterval = options.VmStateCheckInterval,
+                    VmNamePrefix = options.VmNamePrefix,
+                    MaxConcurrentSandboxes = options.MaxConcurrentSandboxes,
+                    Cordoned = options.Cordoned,
+                    Healthy = options.Healthy,
+                    AllowedNetworkProfiles = options.AllowedNetworkProfiles,
+                },
+            }
+            : options.ExecutorHosts;
+
+        var resolved = new List<MultipassRemoteSandboxOptions>(hosts.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < hosts.Count; i++)
+        {
+            var host = hosts[i];
+            var hostId = string.IsNullOrWhiteSpace(host.Id)
+                ? $"host-{i + 1}"
+                : host.Id.Trim();
+            if (!seen.Add(hostId))
+                throw new InvalidOperationException($"Duplicate MultipassRemoteSandbox executor host id '{hostId}'.");
+
+            resolved.Add(options with
+            {
+                HostId = hostId,
+                SshTarget = host.SshTarget ?? options.SshTarget,
+                SshBinary = FirstNonWhiteSpace(host.SshBinary, options.SshBinary),
+                SshPort = host.SshPort ?? options.SshPort,
+                SshKeyPath = host.SshKeyPath ?? options.SshKeyPath,
+                ExtraSshOptions = host.ExtraSshOptions ?? options.ExtraSshOptions,
+                AcceptUnknownHostKeys = host.AcceptUnknownHostKeys ?? options.AcceptUnknownHostKeys,
+                ServerAliveIntervalSeconds = host.ServerAliveIntervalSeconds ?? options.ServerAliveIntervalSeconds,
+                ServerAliveCountMax = host.ServerAliveCountMax ?? options.ServerAliveCountMax,
+                ConnectTimeoutSeconds = host.ConnectTimeoutSeconds ?? options.ConnectTimeoutSeconds,
+                LocalTarBinary = FirstNonWhiteSpace(host.LocalTarBinary, options.LocalTarBinary),
+                RemoteMultipassPath = FirstNonWhiteSpace(host.RemoteMultipassPath, options.RemoteMultipassPath),
+                RemoteStagingRoot = FirstNonWhiteSpace(host.RemoteStagingRoot, options.RemoteStagingRoot),
+                DefaultImage = host.DefaultImage ?? options.DefaultImage,
+                VmStartTimeout = host.VmStartTimeout ?? options.VmStartTimeout,
+                VmStopTimeout = host.VmStopTimeout ?? options.VmStopTimeout,
+                VmStateCheckInterval = host.VmStateCheckInterval ?? options.VmStateCheckInterval,
+                VmNamePrefix = FirstNonWhiteSpace(host.VmNamePrefix, options.VmNamePrefix),
+                MaxConcurrentSandboxes = host.MaxConcurrentSandboxes ?? options.MaxConcurrentSandboxes,
+                Cordoned = host.Cordoned ?? options.Cordoned,
+                Healthy = host.Healthy ?? options.Healthy,
+                AllowedNetworkProfiles = host.AllowedNetworkProfiles ?? options.AllowedNetworkProfiles,
+                ExecutorHosts = [],
+            });
+        }
+
+        return resolved;
+    }
+
+    internal static int EffectiveCapacity(MultipassRemoteSandboxOptions hostOptions) =>
+        hostOptions.MaxConcurrentSandboxes is { } cap ? cap : int.MaxValue;
+
+    private static string FirstNonWhiteSpace(string? first, string fallback) =>
+        !string.IsNullOrWhiteSpace(first) ? first! : fallback;
+}
+
+public sealed record MultipassRemoteExecutorHostOptions
+{
+    public string? Id { get; init; }
+    public string? SshTarget { get; init; }
+    public string? SshBinary { get; init; }
+    public int? SshPort { get; init; }
+    public string? SshKeyPath { get; init; }
+    public IReadOnlyList<string>? ExtraSshOptions { get; init; }
+    public bool? AcceptUnknownHostKeys { get; init; }
+    public int? ServerAliveIntervalSeconds { get; init; }
+    public int? ServerAliveCountMax { get; init; }
+    public int? ConnectTimeoutSeconds { get; init; }
+    public string? LocalTarBinary { get; init; }
+    public string? RemoteMultipassPath { get; init; }
+    public string? RemoteStagingRoot { get; init; }
+    public string? DefaultImage { get; init; }
+    public TimeSpan? VmStartTimeout { get; init; }
+    public TimeSpan? VmStopTimeout { get; init; }
+    public TimeSpan? VmStateCheckInterval { get; init; }
+    public string? VmNamePrefix { get; init; }
+    public int? MaxConcurrentSandboxes { get; init; }
+    public bool? Cordoned { get; init; }
+    public bool? Healthy { get; init; }
+    public IReadOnlyList<string>? AllowedNetworkProfiles { get; init; }
 }

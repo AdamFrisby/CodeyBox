@@ -17,7 +17,7 @@ internal interface ISandboxAdmissionSnapshot
 /// disposed, so worker, audit, merge, smoke, and verifier call sites all share
 /// the same VM budget without each call site knowing about the policy.
 /// </summary>
-public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider
+public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider, ISandboxHostPoolSnapshot
 {
     private readonly ISandboxProvider _inner;
     private readonly SandboxAdmissionGate _gate;
@@ -32,6 +32,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     private readonly IBaselineImageResolver? _baselineResolver;
     private readonly IBaselineImageProvisioner? _baselineProvisioner;
     private readonly IActiveSandboxProgressProvider? _progressProvider;
+    private readonly ISandboxHostPoolSnapshot? _hostPoolSnapshot;
 
     private SandboxAdmissionControlledProvider(
         ISandboxProvider inner,
@@ -52,6 +53,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         _baselineResolver = inner as IBaselineImageResolver;
         _baselineProvisioner = inner as IBaselineImageProvisioner;
         _progressProvider = inner as IActiveSandboxProgressProvider;
+        _hostPoolSnapshot = inner as ISandboxHostPoolSnapshot;
     }
 
     public static ISandboxProvider Wrap(ISandboxProvider inner, int maxConcurrentSandboxes, ILogger log)
@@ -169,6 +171,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() =>
         _progressProvider?.SnapshotActiveSandboxProgress() ?? [];
+
+    public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() =>
+        _hostPoolSnapshot?.SnapshotHostPool() ?? [];
 
     public async Task ResumeSandboxAsync(string name, CancellationToken ct)
     {

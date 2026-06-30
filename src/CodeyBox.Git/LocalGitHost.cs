@@ -1393,6 +1393,8 @@ public sealed class LocalGitHost : IGitHost
         IReadOnlyDictionary<string, string>? extraEnv,
         params string[] args)
     {
+        var operation = args.Length == 0 ? "(none)" : args[0];
+        var sw = Stopwatch.StartNew();
         SanitizeAlternates(workdir);
         var psi = new ProcessStartInfo
         {
@@ -1422,12 +1424,33 @@ public sealed class LocalGitHost : IGitHost
                 continue;
             }
 
-            var stdout = await p.StandardOutput.ReadToEndAsync(ct);
-            var stderr = await p.StandardError.ReadToEndAsync(ct);
-            await p.WaitForExitAsync(ct);
-            return (p.ExitCode, stdout, stderr);
+            try
+            {
+                var stdout = await p.StandardOutput.ReadToEndAsync(ct);
+                var stderr = await p.StandardError.ReadToEndAsync(ct);
+                await p.WaitForExitAsync(ct);
+                var result = (p.ExitCode, stdout, stderr);
+                RecordGitCommandDuration(operation, sw, result.ExitCode == 0 ? "success" : "exit_nonzero");
+                return result;
+            }
+            catch (OperationCanceledException)
+            {
+                RecordGitCommandDuration(operation, sw, "canceled");
+                throw;
+            }
+            catch
+            {
+                RecordGitCommandDuration(operation, sw, "error");
+                throw;
+            }
         }
     }
+
+    private static void RecordGitCommandDuration(string operation, Stopwatch sw, string outcome) =>
+        CodeyBoxMeters.CoordinatorGitCommandDuration.Record(
+            sw.ElapsedMilliseconds,
+            new KeyValuePair<string, object?>("operation", operation),
+            new KeyValuePair<string, object?>("outcome", outcome));
 
     private static bool IsTextFileBusy(Win32Exception ex)
         => ex.NativeErrorCode == PosixTextFileBusyErrno

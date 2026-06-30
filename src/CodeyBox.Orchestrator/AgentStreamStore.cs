@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
+using System.Diagnostics;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
 
@@ -71,7 +72,7 @@ public sealed class AgentStreamStore : IAgentStreamStore
             Directory.CreateDirectory(dir);
             var path = ReserveUniqueCapturePath(dir, safePhase, iteration);
             var maxBytes = Options.MaxFileSizeMb * 1024L * 1024L;
-            return Task.FromResult<AgentStreamCapture?>(new AgentStreamCapture(path, maxBytes, _log));
+            return Task.FromResult<AgentStreamCapture?>(new AgentStreamCapture(path, maxBytes, safePhase, _log));
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
@@ -378,18 +379,21 @@ public sealed class AgentStreamCapture : IAsyncDisposable
     private readonly string _path;
     private readonly long _maxBytes;
     private readonly long _directWriteLimitBytes;
+    private readonly string _phase;
     private readonly ILogger _log;
     private readonly Channel<string> _chunks;
     private readonly Task _worker;
+    private readonly Stopwatch _duration = Stopwatch.StartNew();
     private long _enqueueDroppedBytes;
     private int _enqueueTruncated;
     private int _writerFailed;
 
-    public AgentStreamCapture(string path, long maxBytes, ILogger log)
+    public AgentStreamCapture(string path, long maxBytes, string phase, ILogger log)
     {
         _path = path;
         _maxBytes = maxBytes;
         _directWriteLimitBytes = Math.Max(0, maxBytes - TruncationMarkerReserveBytes);
+        _phase = phase;
         _log = log;
         _chunks = Channel.CreateBounded<string>(
             new BoundedChannelOptions(MaxQueuedChunks)
@@ -492,7 +496,20 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            Volatile.Write(ref _writerFailed, 1);
             _log.LogWarning(ex, "Agent stream writer failed for {Path}", _path);
+        }
+        finally
+        {
+            var outcome = Volatile.Read(ref _writerFailed) != 0
+                ? "error"
+                : Volatile.Read(ref _enqueueTruncated) != 0
+                    ? "truncated"
+                    : "completed";
+            CodeyBoxMeters.CoordinatorAgentStreamCaptureDuration.Record(
+                _duration.ElapsedMilliseconds,
+                new KeyValuePair<string, object?>("phase", _phase),
+                new KeyValuePair<string, object?>("outcome", outcome));
         }
     }
 
@@ -572,6 +589,10 @@ public sealed class AgentStreamCapture : IAsyncDisposable
             pendingTail.Clear();
             pendingTailBytes = 0;
             pendingTailRawBytes = 0;
+            CodeyBoxMeters.CoordinatorAgentStreamDroppedBytes.Add(
+                droppedBytes,
+                new KeyValuePair<string, object?>("phase", _phase),
+                new KeyValuePair<string, object?>("reason", "size_cap"));
             WriteTruncationMarker(writer, droppedBytes, ref bytesWritten);
         }
         else if (pendingTail.Length > 0)
