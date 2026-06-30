@@ -19,19 +19,21 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     };
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
+    private readonly Serilog.ILogger _auditLogger;
     // Also guards buffered reads on this store instance: Microsoft.Data.Sqlite
     // connections are not safe for overlapping commands from dispatcher and
     // worker tasks, even when WAL permits file-level read/write concurrency.
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
-    public SqliteWorkItemStore(string path)
+    public SqliteWorkItemStore(string path, Serilog.ILogger? auditLogger = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _connectionString = $"Data Source={path}";
         _conn = new SqliteConnection(_connectionString);
+        _auditLogger = auditLogger ?? Serilog.Log.Logger;
         _writeLock = SqliteDatabaseWriteGate.ForPath(path);
         _writeLock.Wait();
         try
@@ -824,9 +826,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     /// further. Returned (not thrown) so the call site retains the
     /// <c>throw</c> for analysis flow.
     /// </summary>
-    private static WorkItemStoreDiskFullException HandleDiskFull(string operation, SqliteException sqlex)
+    private WorkItemStoreDiskFullException HandleDiskFull(string operation, SqliteException sqlex)
     {
-        AuditLog.StoreDiskFull(operation);
+        AuditLog.StoreDiskFull(_auditLogger, operation);
         return new WorkItemStoreDiskFullException(operation, sqlex);
     }
 

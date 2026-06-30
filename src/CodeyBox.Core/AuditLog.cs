@@ -1130,7 +1130,10 @@ public static class AuditLog
                 id.ToString(), freeBytes, mountPath, thresholdBytes);
 
     public static void StoreDiskFull(string operation) =>
-        Audit("store.disk_full")
+        StoreDiskFull(Log.Logger, operation);
+
+    public static void StoreDiskFull(Serilog.ILogger logger, string operation) =>
+        Audit(logger, "store.disk_full")
             .Fatal(
                 "SQLite reported SQLITE_FULL during '{Operation}'; host disk is exhausted and no further state transitions can be persisted",
                 operation);
@@ -1465,7 +1468,10 @@ public static class AuditLog
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
-        Log.Logger
+        Audit(Log.Logger, eventName);
+
+    private static Serilog.ILogger Audit(Serilog.ILogger logger, string eventName) =>
+        logger
             .ForContext("Audit", true)
             .ForContext("EventName", eventName);
 }

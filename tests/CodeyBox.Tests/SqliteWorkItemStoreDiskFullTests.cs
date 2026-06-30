@@ -24,29 +24,20 @@ namespace CodeyBox.Tests;
 /// would silently break the operator's only "host out of state-store disk"
 /// alarm while leaving the exception type assertion green.
 /// </summary>
-[Collection("GlobalSerilog")]
 public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
 {
     private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-diskfull-{Guid.NewGuid():N}.db");
     private readonly TestSink _sink = new();
 
-    public SqliteWorkItemStoreDiskFullTests()
-    {
-        ConfigureLogger();
-    }
-
-    private void ConfigureLogger()
-    {
-        Log.Logger = new LoggerConfiguration()
+    private Serilog.ILogger ConfigureLogger()
+        => new LoggerConfiguration()
             .MinimumLevel.Verbose()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
-    }
 
     public void Dispose()
     {
-        Log.CloseAndFlush();
         try { File.Delete(_dbPath); } catch { }
         try { File.Delete(_dbPath + "-wal"); } catch { }
         try { File.Delete(_dbPath + "-shm"); } catch { }
@@ -55,9 +46,9 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task CreateAsync_TranslatesSqliteFull_ToTypedException()
     {
-        ConfigureLogger();
+        var logger = ConfigureLogger();
         _sink.Clear();
-        using var store = new SqliteWorkItemStore(_dbPath);
+        using var store = new SqliteWorkItemStore(_dbPath, logger);
 
         store.ForceMaxPageCountForTesting(1);
 
@@ -79,9 +70,9 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task UpdateAsync_TranslatesSqliteFull_ToTypedException()
     {
-        ConfigureLogger();
+        var logger = ConfigureLogger();
         _sink.Clear();
-        using var store = new SqliteWorkItemStore(_dbPath);
+        using var store = new SqliteWorkItemStore(_dbPath, logger);
 
         var item = new WorkItem
         {
@@ -116,9 +107,9 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task TryUpdateIfStateAsync_TranslatesSqliteFull_ToTypedException()
     {
-        ConfigureLogger();
+        var logger = ConfigureLogger();
         _sink.Clear();
-        using var store = new SqliteWorkItemStore(_dbPath);
+        using var store = new SqliteWorkItemStore(_dbPath, logger);
 
         var item = new WorkItem
         {
@@ -147,9 +138,9 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task TryReplaceKnobsIfStateAndUpdatedAtAsync_TranslatesSqliteFull_ToTypedException()
     {
-        ConfigureLogger();
+        var logger = ConfigureLogger();
         _sink.Clear();
-        using var store = new SqliteWorkItemStore(_dbPath);
+        using var store = new SqliteWorkItemStore(_dbPath, logger);
 
         var item = new WorkItem
         {
@@ -182,9 +173,9 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync_TranslatesSqliteFull_ToTypedException()
     {
-        ConfigureLogger();
+        var logger = ConfigureLogger();
         _sink.Clear();
-        using var store = new SqliteWorkItemStore(_dbPath);
+        using var store = new SqliteWorkItemStore(_dbPath, logger);
 
         var item = new WorkItem
         {
