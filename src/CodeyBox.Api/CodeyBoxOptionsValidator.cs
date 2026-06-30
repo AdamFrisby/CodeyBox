@@ -265,7 +265,18 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
     {
         if (string.IsNullOrWhiteSpace(config?.SshTarget))
             return null;
+        var host = SshHostIdentity(config.SshTarget);
         var port = config.SshPort ?? 22;
-        return $"{config.SshTarget.Trim()}:{port}";
+        return $"{host}:{port}";
+    }
+
+    private static string SshHostIdentity(string sshTarget)
+    {
+        var target = sshTarget.Trim();
+        var at = target.LastIndexOf('@');
+        var host = at >= 0 && at + 1 < target.Length ? target[(at + 1)..] : target;
+        if (host.Length >= 2 && host[0] == '[' && host[^1] == ']')
+            host = host[1..^1];
+        return host.Trim().TrimEnd('.').ToLowerInvariant();
     }
 }

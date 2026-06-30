@@ -251,7 +251,7 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
         }
     }
 
-    public async Task<E2eRun?> ClaimNextQueuedAsync(string sandboxId, CancellationToken ct = default)
+    public async Task<E2eRun?> ClaimNextQueuedAsync(string? sandboxId, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
         try
@@ -292,7 +292,7 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
                         WHERE id = $id AND status = 'Queued';
                         """;
                     upd.Parameters.AddWithValue("$sa", startedAt.ToString("O"));
-                    upd.Parameters.AddWithValue("$sb", sandboxId);
+                    upd.Parameters.AddWithValue("$sb", (object?)sandboxId ?? DBNull.Value);
                     upd.Parameters.AddWithValue("$id", claimedId);
                     var rows = await upd.ExecuteNonQueryAsync(ct);
                     if (rows == 0)
@@ -324,6 +324,51 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
                 await tx.RollbackAsync(ct);
                 throw;
             }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> AssignSandboxAsync(string id, string sandboxId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE e2e_runs
+                SET sandbox_id = $sb
+                WHERE id = $id AND status = 'Running';
+                """;
+            cmd.Parameters.AddWithValue("$sb", sandboxId);
+            cmd.Parameters.AddWithValue("$id", id);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> RequeueRunningAsync(DateTimeOffset startedBefore, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE e2e_runs
+                SET status = 'Queued',
+                    started_at = NULL,
+                    sandbox_id = NULL
+                WHERE status = 'Running'
+                  AND (started_at IS NULL OR started_at <= $cutoff);
+                """;
+            cmd.Parameters.AddWithValue("$cutoff", startedBefore.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct);
         }
         finally
         {

@@ -29,26 +29,27 @@ internal static class E2eRunEndpoints
     }
 
     private static async Task<IResult> EnqueueAsync(
-        [FromBody] EnqueueE2eRunRequest req,
+        [FromBody] EnqueueE2eRunRequest? req,
         ITestCaseStore testCases,
         IE2eRunStore runs,
+        E2eReplayArtifactAdmissionValidator artifactValidator,
         CancellationToken ct)
     {
+        if (req is null)
+            return Results.BadRequest(new { error = "Request body is required" });
         if (string.IsNullOrWhiteSpace(req.TestCaseId))
             return Results.BadRequest(new { error = "TestCaseId is required" });
 
         var testCase = await testCases.GetAsync(req.TestCaseId, ct);
-        if (testCase is null)
-            return Results.NotFound(new { error = $"TestCase '{req.TestCaseId}' not found" });
-        if (testCase.AutomationKind != AutomationKind.E2eReplay)
-            return Results.BadRequest(new { error = $"TestCase '{req.TestCaseId}' AutomationKind is {testCase.AutomationKind}; expected E2eReplay" });
-        if (string.IsNullOrWhiteSpace(testCase.ExecutableArtifactJson))
-            return Results.BadRequest(new { error = $"TestCase '{req.TestCaseId}' has no ExecutableArtifactJson" });
+        var validationError = ValidateRunnableTestCase(req.TestCaseId, testCase, artifactValidator);
+        if (validationError is not null)
+            return validationError;
+        var runnableTestCase = testCase!;
 
         var run = new E2eRun
         {
             Id = Guid.NewGuid().ToString("N"),
-            TestCaseId = testCase.Id,
+            TestCaseId = runnableTestCase.Id,
             Status = E2eRunStatus.Queued,
             CreatedAt = DateTimeOffset.UtcNow,
             BatchId = string.IsNullOrWhiteSpace(req.BatchId) ? null : req.BatchId,
@@ -59,9 +60,10 @@ internal static class E2eRunEndpoints
     }
 
     private static async Task<IResult> EnqueueBulkAsync(
-        [FromBody] EnqueueBulkE2eRunsRequest req,
+        [FromBody] EnqueueBulkE2eRunsRequest? req,
         ITestCaseStore testCases,
         IE2eRunStore runs,
+        E2eReplayArtifactAdmissionValidator artifactValidator,
         IOptions<CodeyBoxOptions> options,
         CancellationToken ct)
     {
@@ -79,13 +81,10 @@ internal static class E2eRunEndpoints
             if (string.IsNullOrWhiteSpace(tcId))
                 return Results.BadRequest(new { error = "TestCaseIds entries must not be empty" });
             var testCase = await testCases.GetAsync(tcId, ct);
-            if (testCase is null)
-                return Results.NotFound(new { error = $"TestCase '{tcId}' not found" });
-            if (testCase.AutomationKind != AutomationKind.E2eReplay)
-                return Results.BadRequest(new { error = $"TestCase '{tcId}' AutomationKind is {testCase.AutomationKind}; expected E2eReplay" });
-            if (string.IsNullOrWhiteSpace(testCase.ExecutableArtifactJson))
-                return Results.BadRequest(new { error = $"TestCase '{tcId}' has no ExecutableArtifactJson" });
-            validated.Add(testCase);
+            var validationError = ValidateRunnableTestCase(tcId, testCase, artifactValidator);
+            if (validationError is not null)
+                return validationError;
+            validated.Add(testCase!);
         }
 
         var created = new List<E2eRunDto>(validated.Count);
@@ -209,6 +208,20 @@ internal static class E2eRunEndpoints
         DeserializeResult(run.Result),
         run.SandboxId,
         run.BatchId);
+
+    private static IResult? ValidateRunnableTestCase(
+        string testCaseId,
+        TestCase? testCase,
+        E2eReplayArtifactAdmissionValidator artifactValidator)
+    {
+        if (testCase is null)
+            return Results.NotFound(new { error = $"TestCase '{testCaseId}' not found" });
+        if (testCase.AutomationKind != AutomationKind.E2eReplay)
+            return Results.BadRequest(new { error = $"TestCase '{testCaseId}' AutomationKind is {testCase.AutomationKind}; expected E2eReplay" });
+        if (!artifactValidator.TryValidateJson(testCase.ExecutableArtifactJson, out _, out var failureKind, out var detail))
+            return Results.BadRequest(new { error = $"TestCase '{testCaseId}' replay artifact is invalid ({failureKind}): {detail}" });
+        return null;
+    }
 
     private static E2eRunResult? DeserializeResult(string? result)
     {

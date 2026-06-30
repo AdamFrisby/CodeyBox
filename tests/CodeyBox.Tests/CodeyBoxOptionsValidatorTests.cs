@@ -308,6 +308,22 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Fact]
+    public void Validate_RejectsEnabledRemoteE2eWhenSameHostUsesDifferentSshUser()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "coding@remote.example" };
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "e2e@remote.example" };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("different SSH host", result.FailureMessage);
+    }
+
+    [Fact]
     public void Validate_RejectsInvalidE2eRemoteHostCapacity()
     {
         var options = ValidCodeyBoxOptions();

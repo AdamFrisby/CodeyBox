@@ -6,7 +6,7 @@ namespace CodeyBox.Orchestrator;
 /// Read/dispose-only provider used by lifecycle services that need to sweep
 /// sandboxes owned by more than one execution fleet.
 /// </summary>
-public sealed class CompositeManagedSandboxProvider : ISandboxProvider
+public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 {
     private readonly IReadOnlyList<ISandboxProvider> _providers;
 
@@ -22,27 +22,47 @@ public sealed class CompositeManagedSandboxProvider : ISandboxProvider
 
     public IReadOnlyList<ISandboxProvider> Providers => _providers;
 
-    public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
-        throw new NotSupportedException("CompositeManagedSandboxProvider is lifecycle-only and cannot create sandboxes.");
-
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
         var result = new List<ManagedSandboxInfo>();
+        var failures = new List<Exception>();
         foreach (var provider in _providers)
         {
             ct.ThrowIfCancellationRequested();
-            result.AddRange(await provider.ListAllManagedAsync(ct).ConfigureAwait(false));
+            try
+            {
+                result.AddRange(await provider.ListAllManagedAsync(ct).ConfigureAwait(false));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failures.Add(ex);
+            }
         }
+
+        if (result.Count == 0 && failures.Count == _providers.Count && failures.Count > 0)
+            throw new AggregateException("Every managed sandbox provider failed to list sandboxes.", failures);
+
         return result;
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
+        var failures = new List<Exception>();
         foreach (var provider in _providers)
         {
             ct.ThrowIfCancellationRequested();
-            await provider.DisposeLeakedAsync(name, ct).ConfigureAwait(false);
+            try
+            {
+                await provider.DisposeLeakedAsync(name, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failures.Add(ex);
+            }
         }
+
+        if (failures.Count == _providers.Count && failures.Count > 0)
+            throw new AggregateException($"Every managed sandbox provider failed to dispose leaked sandbox '{name}'.", failures);
     }
 
     private sealed class ReferenceEqualityComparer : IEqualityComparer<ISandboxProvider>

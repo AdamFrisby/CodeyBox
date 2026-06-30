@@ -32,7 +32,7 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SandboxLeakReaper : BackgroundService
 {
-    private readonly ISandboxProvider _provider;
+    private readonly IManagedSandboxLifecycle _provider;
     private readonly IWebhookDispatcher _webhooks;
     private readonly Func<SandboxLeakOptions> _optsAccessor;
     private readonly ILogger<SandboxLeakReaper> _log;
@@ -63,21 +63,21 @@ public sealed class SandboxLeakReaper : BackgroundService
     private SandboxLeakOptions _opts => _optsAccessor();
 
     public SandboxLeakReaper(
-        ISandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         IWebhookDispatcher webhooks,
         SandboxLeakOptions opts,
         ILogger<SandboxLeakReaper> log)
         : this(provider, webhooks, () => opts, log, store: null) { }
 
     public SandboxLeakReaper(
-        ISandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         IWebhookDispatcher webhooks,
         Func<SandboxLeakOptions> optionsAccessor,
         ILogger<SandboxLeakReaper> log)
         : this(provider, webhooks, optionsAccessor, log, store: null) { }
 
     public SandboxLeakReaper(
-        ISandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         IWebhookDispatcher webhooks,
         Func<SandboxLeakOptions> optionsAccessor,
         ILogger<SandboxLeakReaper> log,

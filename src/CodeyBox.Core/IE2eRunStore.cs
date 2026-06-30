@@ -27,8 +27,18 @@ public interface IE2eRunStore
     /// <summary>Returns true when at least one queued run is available to claim.</summary>
     Task<bool> HasQueuedAsync(CancellationToken ct = default);
 
-    /// <summary>Atomically claims the oldest queued run; returns null when the queue is empty.</summary>
-    Task<E2eRun?> ClaimNextQueuedAsync(string sandboxId, CancellationToken ct = default);
+    /// <summary>
+    /// Atomically claims the oldest queued run; returns null when the queue is
+    /// empty. <paramref name="sandboxId"/> may be null when the dispatcher needs
+    /// to validate the artifact before leasing a VM.
+    /// </summary>
+    Task<E2eRun?> ClaimNextQueuedAsync(string? sandboxId, CancellationToken ct = default);
+
+    /// <summary>Attaches the leased sandbox id to a claimed running run.</summary>
+    Task<bool> AssignSandboxAsync(string id, string sandboxId, CancellationToken ct = default);
+
+    /// <summary>Moves running rows older than the cutoff back to queued after a process restart.</summary>
+    Task<int> RequeueRunningAsync(DateTimeOffset startedBefore, CancellationToken ct = default);
 
     /// <summary>Updates the status and terminal fields of a run.</summary>
     Task<bool> UpdateStatusAsync(string id, E2eRunStatus status, DateTimeOffset? startedAt, DateTimeOffset? finishedAt, string? result, CancellationToken ct = default);

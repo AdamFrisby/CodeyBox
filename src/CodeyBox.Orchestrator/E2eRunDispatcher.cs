@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Concurrent;
-using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using CodeyBox.Core;
@@ -35,11 +33,7 @@ public sealed class E2eRunDispatcher : BackgroundService
     private readonly ILogger<E2eRunDispatcher> _logger;
     private readonly ConcurrentDictionary<string, Task> _activeTasks = new(StringComparer.Ordinal);
     private static readonly JsonSerializerOptions ResultJson = new() { WriteIndented = false };
-    private static readonly JsonSerializerOptions ArtifactJson = new(JsonSerializerDefaults.Web)
-    {
-        PropertyNameCaseInsensitive = true,
-        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
-    };
+    private readonly E2eReplayArtifactAdmissionValidator _artifactValidator;
 
     public E2eRunDispatcher(
         IE2eRunStore store,
@@ -57,11 +51,13 @@ public sealed class E2eRunDispatcher : BackgroundService
         _options = options;
         _cancellations = cancellations;
         _logger = logger;
+        _artifactValidator = new E2eReplayArtifactAdmissionValidator(options);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("E2eRunDispatcher started; pool={Pool}, max-concurrent={Max}", _pool.Name, _pool.MaxConcurrent);
+        await RecoverRunningRunsAsync(stoppingToken);
         while (!stoppingToken.IsCancellationRequested)
         {
             var opts = _options.CurrentValue;
@@ -115,10 +111,10 @@ public sealed class E2eRunDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Attempts to claim one queued run and start its execution on a pool slot.
-    /// Returns true when a run was claimed (so the caller skips the idle delay)
-    /// and false otherwise. Exposed internal for tests so they can drive a
-    /// single dispatch step without spinning up the BackgroundService loop.
+    /// Attempts to schedule one queued run for execution. Returns true when a
+    /// dispatch task was started (so the caller skips the idle delay) and false
+    /// otherwise. Exposed internal for tests so they can drive a single dispatch
+    /// step without spinning up the BackgroundService loop.
     /// </summary>
     internal async Task<bool> TryDispatchOneAsync(CancellationToken stoppingToken)
     {
@@ -127,7 +123,7 @@ public sealed class E2eRunDispatcher : BackgroundService
             return false;
         }
 
-        if (_pool.InFlight >= _pool.MaxConcurrent)
+        if (_activeTasks.Count >= _pool.MaxConcurrent || _pool.InFlight >= _pool.MaxConcurrent)
         {
             return false;
         }
@@ -137,53 +133,15 @@ public sealed class E2eRunDispatcher : BackgroundService
             return false;
         }
 
-        IE2eExecutionSlot? slot;
-        try
-        {
-            slot = await _pool.LeaseAsync(stoppingToken);
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "E2eRunDispatcher failed to lease a pool slot; backing off.");
-            return false;
-        }
-
-        E2eRun? claimed = null;
-        try
-        {
-            claimed = await _store.ClaimNextQueuedAsync(slot.SandboxId, stoppingToken);
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-            await slot.DisposeAsync();
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "E2eRunDispatcher claim failed; releasing slot.");
-            await slot.DisposeAsync();
-            return false;
-        }
-
-        if (claimed is null)
-        {
-            await slot.DisposeAsync();
-            return false;
-        }
-
-        var runCancellation = _cancellations.Register(claimed.Id);
-        var task = Task.Run(() => RunOneAsync(slot, claimed, runCancellation, stoppingToken));
-        _activeTasks[claimed.Id] = task;
+        var dispatchId = Guid.NewGuid().ToString("N");
+        var task = Task.Run(() => DispatchOneAsync(stoppingToken), CancellationToken.None);
+        _activeTasks[dispatchId] = task;
         _ = task.ContinueWith(
             t =>
             {
-                _activeTasks.TryRemove(claimed.Id, out _);
+                _activeTasks.TryRemove(dispatchId, out _);
                 if (t.Exception is { } ex)
-                    _logger.LogError(ex, "E2E run {RunId} task faulted.", claimed.Id);
+                    _logger.LogError(ex, "E2E dispatch task {DispatchId} faulted.", dispatchId);
             },
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
@@ -203,95 +161,90 @@ public sealed class E2eRunDispatcher : BackgroundService
         }
     }
 
-    private async Task RunOneAsync(IE2eExecutionSlot slot, E2eRun run, CancellationTokenSource runCancellation, CancellationToken stoppingToken)
+    private async Task DispatchOneAsync(CancellationToken stoppingToken)
     {
-        var opts = _options.CurrentValue;
-        var perRunTimeout = NormalizePerRunTimeout(opts.PerRunTimeout);
+        E2eRun? run = null;
+        IE2eExecutionSlot? slot = null;
+        CancellationTokenSource? runCancellation = null;
         CancellationTokenSource? timeoutCts = null;
         CancellationTokenSource? linked = null;
         TestCase? testCaseForLastRun = null;
+        var perRunTimeout = NormalizePerRunTimeout(_options.CurrentValue.PerRunTimeout);
         try
         {
+            try
+            {
+                run = await _store.ClaimNextQueuedAsync(sandboxId: null, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "E2eRunDispatcher claim failed; backing off.");
+                return;
+            }
+
+            if (run is null)
+                return;
+
+            runCancellation = _cancellations.Register(run.Id);
             timeoutCts = new CancellationTokenSource(perRunTimeout);
             linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, stoppingToken, runCancellation.Token);
 
-            var testCase = await _testCases.GetAsync(run.TestCaseId, linked.Token);
-            if (testCase is null)
+            var load = await LoadRunnableArtifactAsync(run, linked.Token);
+            testCaseForLastRun = load.TestCase;
+            if (load.FailureKind is not null)
             {
-                _logger.LogWarning("E2E run {RunId} references missing test case {TestCaseId}.", run.Id, run.TestCaseId);
-                await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("MissingTestCase", $"test case {run.TestCaseId} not found"), CancellationToken.None);
-                return;
-            }
-            testCaseForLastRun = testCase;
-
-            if (testCase.AutomationKind != AutomationKind.E2eReplay)
-            {
-                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, "WrongAutomationKind", $"automation_kind={testCase.AutomationKind} is not E2eReplay", CancellationToken.None);
+                if (load.FailureKind == "MissingTestCase")
+                    _logger.LogWarning("E2E run {RunId} references missing test case {TestCaseId}.", run.Id, run.TestCaseId);
+                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, load.TestCase, load.FailureKind, load.Detail ?? string.Empty, CancellationToken.None);
                 return;
             }
 
-            E2eReplayArtifact? artifact;
             try
             {
-                if (string.IsNullOrWhiteSpace(testCase.ExecutableArtifactJson))
-                {
-                    artifact = null;
-                }
-                else if (Encoding.UTF8.GetByteCount(testCase.ExecutableArtifactJson) > E2eReplayArtifactValidation.MaxArtifactJsonBytes)
-                {
-                    await PersistErrorAndMaybeStampTestCaseAsync(
-                        run.Id,
-                        testCase,
-                        "ArtifactTooLarge",
-                        $"artifact JSON exceeds {E2eReplayArtifactValidation.MaxArtifactJsonBytes} bytes",
-                        CancellationToken.None);
-                    return;
-                }
-                else
-                {
-                    artifact = JsonSerializer.Deserialize<E2eReplayArtifact>(testCase.ExecutableArtifactJson, ArtifactJson);
-                }
+                slot = await _pool.LeaseAsync(linked.Token);
             }
-            catch (JsonException ex)
+            catch (OperationCanceledException)
             {
-                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, "ArtifactParseError", ex.Message, CancellationToken.None);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "E2eRunDispatcher failed to lease a pool slot for run {RunId}.", run.Id);
+                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCaseForLastRun, "PoolLeaseFailed", ex.Message, CancellationToken.None);
                 return;
             }
 
-            if (artifact is null)
+            var assigned = await _store.AssignSandboxAsync(run.Id, slot.SandboxId, CancellationToken.None);
+            if (!assigned)
             {
-                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, "MissingArtifact", "test case has no executable artifact", CancellationToken.None);
+                _logger.LogInformation("E2E run {RunId} was terminal before sandbox assignment; releasing leased sandbox {SandboxId}.", run.Id, slot.SandboxId);
                 return;
             }
 
-            if (!E2eReplayArtifactValidation.TryValidate(artifact, out var failureKind, out var detail))
-            {
-                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, failureKind, detail, CancellationToken.None);
-                return;
-            }
-
-            var result = await _runtime.ExecuteAsync(artifact, slot.Sandbox, linked.Token);
-            var resultJson = JsonSerializer.Serialize(result, ResultJson);
-            var status = result.Passed
-                ? E2eRunStatus.Passed
-                : IsInfrastructureFailure(result.FailureKind) ? E2eRunStatus.Error : E2eRunStatus.Failed;
-            var persisted = await PersistResultAsync(run.Id, status, resultJson, CancellationToken.None);
-            if (persisted && status is E2eRunStatus.Passed or E2eRunStatus.Failed or E2eRunStatus.Error)
-                await UpdateTestCaseLastRunAsync(testCase.Id, result, CancellationToken.None);
+            run = run with { SandboxId = slot.SandboxId };
+            await ExecuteClaimedRunAsync(slot, run, load.TestCase!, load.Artifact!, linked.Token);
         }
-        catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested == true)
+        catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested == true && run is not null)
         {
             await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCaseForLastRun, "PerRunTimeout", $"exceeded {perRunTimeout}", CancellationToken.None);
         }
-        catch (OperationCanceledException) when (runCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (runCancellation?.IsCancellationRequested == true && run is not null)
         {
             await PersistResultAsync(run.Id, E2eRunStatus.Canceled, BuildErrorResultJson("Canceled", "run canceled by operator"), CancellationToken.None);
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested && run is not null)
         {
             await PersistResultAsync(run.Id, E2eRunStatus.Canceled, BuildErrorResultJson("ShutdownCancel", "dispatcher canceled before run finished"), CancellationToken.None);
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (run is not null)
         {
             _logger.LogWarning(ex, "E2E run {RunId} crashed; recording Error.", run.Id);
             await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCaseForLastRun, "Exception", ex.Message, CancellationToken.None);
@@ -300,10 +253,72 @@ public sealed class E2eRunDispatcher : BackgroundService
         {
             linked?.Dispose();
             timeoutCts?.Dispose();
-            _activeTasks.TryRemove(run.Id, out _);
-            _cancellations.Unregister(run.Id, runCancellation);
-            try { await slot.DisposeAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "E2E pool slot disposal threw; continuing."); }
+            if (run is not null && runCancellation is not null)
+                _cancellations.Unregister(run.Id, runCancellation);
+            try
+            {
+                if (slot is not null)
+                    await slot.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "E2E pool slot disposal threw; continuing.");
+            }
+        }
+    }
+
+    private async Task<(TestCase? TestCase, E2eReplayArtifact? Artifact, string? FailureKind, string? Detail)> LoadRunnableArtifactAsync(
+        E2eRun run,
+        CancellationToken ct)
+    {
+        var testCase = await _testCases.GetAsync(run.TestCaseId, ct);
+        if (testCase is null)
+        {
+            return (null, null, "MissingTestCase", $"test case {run.TestCaseId} not found");
+        }
+
+        if (testCase.AutomationKind != AutomationKind.E2eReplay)
+        {
+            return (testCase, null, "WrongAutomationKind", $"automation_kind={testCase.AutomationKind} is not E2eReplay");
+        }
+
+        return _artifactValidator.TryValidateJson(testCase.ExecutableArtifactJson, out var artifact, out var failureKind, out var detail)
+            ? (testCase, artifact, null, null)
+            : (testCase, null, failureKind, detail);
+    }
+
+    private async Task ExecuteClaimedRunAsync(
+        IE2eExecutionSlot slot,
+        E2eRun run,
+        TestCase testCase,
+        E2eReplayArtifact artifact,
+        CancellationToken ct)
+    {
+        var result = await _runtime.ExecuteAsync(artifact, slot.Sandbox, ct);
+        var resultJson = JsonSerializer.Serialize(result, ResultJson);
+        var status = result.Passed
+            ? E2eRunStatus.Passed
+            : IsInfrastructureFailure(result.FailureKind) ? E2eRunStatus.Error : E2eRunStatus.Failed;
+        var persisted = await PersistResultAsync(run.Id, status, resultJson, CancellationToken.None);
+        if (persisted && status is E2eRunStatus.Passed or E2eRunStatus.Failed or E2eRunStatus.Error)
+            await UpdateTestCaseLastRunAsync(testCase.Id, result, CancellationToken.None);
+    }
+
+    private async Task RecoverRunningRunsAsync(CancellationToken ct)
+    {
+        try
+        {
+            var recovered = await _store.RequeueRunningAsync(DateTimeOffset.UtcNow, ct);
+            if (recovered > 0)
+                _logger.LogWarning("E2eRunDispatcher requeued {Count} run(s) left Running by a prior process.", recovered);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "E2eRunDispatcher failed to recover running E2E runs; continuing startup.");
         }
     }
 
@@ -357,6 +372,7 @@ public sealed class E2eRunDispatcher : BackgroundService
     private static bool IsInfrastructureFailure(string? failureKind) =>
         string.Equals(failureKind, "ReadinessProbe", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReadinessUrlRejected", StringComparison.Ordinal)
+        || string.Equals(failureKind, "NavigationUrlRejected", StringComparison.Ordinal)
         || string.Equals(failureKind, "ExecException", StringComparison.Ordinal)
         || string.Equals(failureKind, "AssertionException", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReplayDriverFailed", StringComparison.Ordinal)

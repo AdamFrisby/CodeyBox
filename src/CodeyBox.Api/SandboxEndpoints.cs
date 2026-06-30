@@ -49,7 +49,7 @@ internal static class SandboxEndpoints
     /// </summary>
     private static async Task<IResult> DisposeLeakedAsync(
         string name,
-        CompositeManagedSandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         SandboxLeakReaper reaper,
         IWebhookDispatcher webhooks,
         ILogger<Program> log,

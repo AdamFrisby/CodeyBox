@@ -519,7 +519,7 @@ static IE2eExecutionPool BuildRemoteE2eExecutionPool(
 {
     var currentOptions = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
     var hostConfigs = GetE2eRemoteHostConfigs(currentOptions);
-    if (hostConfigs.Count <= 1)
+    if (hostConfigs.Count == 0)
     {
         var provider = BuildE2eMultipassRemote(sp, loggerFactory, hostIndex: 0);
         return new LocalE2eExecutionPool(
@@ -652,8 +652,19 @@ static string? RemotePoolIdentity(MultipassRemoteSandboxConfig? config)
 {
     if (string.IsNullOrWhiteSpace(config?.SshTarget))
         return null;
+    var host = SshHostIdentity(config.SshTarget);
     var port = config.SshPort ?? 22;
-    return $"{config.SshTarget.Trim()}:{port}";
+    return $"{host}:{port}";
+}
+
+static string SshHostIdentity(string sshTarget)
+{
+    var target = sshTarget.Trim();
+    var at = target.LastIndexOf('@');
+    var host = at >= 0 && at + 1 < target.Length ? target[(at + 1)..] : target;
+    if (host.Length >= 2 && host[0] == '[' && host[^1] == ']')
+        host = host[1..^1];
+    return host.Trim().TrimEnd('.').ToLowerInvariant();
 }
 
 static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILoggerFactory loggerFactory)
@@ -2391,6 +2402,7 @@ builder.Services.AddSingleton<IE2eRunStore>(sp =>
     return new SqliteE2eRunStore(opts.StateDatabasePath);
 });
 builder.Services.AddSingleton<IE2eReplayRuntime, E2eReplayRuntime>();
+builder.Services.AddSingleton<E2eReplayArtifactAdmissionValidator>();
 builder.Services.AddSingleton<E2eRunCancellationRegistry>();
 // E2E pool selection is deliberately independent of the coding pipeline's
 // admitted ISandboxProvider. PoolKind=remote-ssh builds the existing
@@ -3239,6 +3251,7 @@ builder.Services.AddHostedService(sp => new BudgetAlertService(
     sp.GetRequiredService<ILogger<BudgetAlertService>>()));
 
 builder.Services.AddSingleton<CompositeManagedSandboxProvider>(BuildManagedSandboxLifecycleProvider);
+builder.Services.AddSingleton<IManagedSandboxLifecycle>(sp => sp.GetRequiredService<CompositeManagedSandboxProvider>());
 builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 {
     // Live accessor: thresholds and policy fields (LeakAgeThreshold, AutoDispose,
@@ -3248,7 +3261,7 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
     // fields themselves.
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     return new SandboxLeakReaper(
-        sp.GetRequiredService<CompositeManagedSandboxProvider>(),
+        sp.GetRequiredService<IManagedSandboxLifecycle>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
         () => monitor.CurrentValue.SandboxLeak,
         sp.GetRequiredService<ILogger<SandboxLeakReaper>>(),

@@ -25,7 +25,6 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool, IManagedSandboxPr
     private readonly IOptionsMonitor<E2eExecutionOptions>? _options;
     private readonly ILogger<LocalE2eExecutionPool> _logger;
     private readonly ResizableConcurrencyGate _gate;
-    private readonly int _initialMaxConcurrent;
     private readonly Func<string?> _fallbackImageReference;
     private readonly string _name;
 
@@ -41,8 +40,7 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool, IManagedSandboxPr
         _logger = logger;
         _fallbackImageReference = fallbackImageReference ?? (() => null);
         _name = string.IsNullOrWhiteSpace(name) ? "local" : name;
-        _initialMaxConcurrent = Clamp(options?.CurrentValue.MaxConcurrent ?? 4);
-        _gate = new ResizableConcurrencyGate(_initialMaxConcurrent);
+        _gate = new ResizableConcurrencyGate(Clamp(options?.CurrentValue.MaxConcurrent ?? 4));
         _options?.OnChange(opts =>
         {
             var resized = _gate.Resize(Clamp(opts.MaxConcurrent));

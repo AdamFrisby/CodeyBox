@@ -61,7 +61,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             return Fail(schemaDetail, schemaKind, failedIndex: -1, stepResults, assertionResults, sw.ElapsedMilliseconds);
         }
 
-        if (!TryValidateReplayNavigationTargets(artifact, out var navigationDetail))
+        if (!E2eReplayOriginPolicy.TryValidateReplayNavigationTargets(artifact, CurrentAllowedOrigins(), out var navigationDetail))
         {
             sw.Stop();
             return Fail(navigationDetail, "NavigationUrlRejected", failedIndex: -1, stepResults, assertionResults, sw.ElapsedMilliseconds);
@@ -171,7 +171,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
 
     private async Task<(bool passed, string failureKind, string detail)> RunReadinessAsync(E2eReadinessProbe probe, ISandbox sandbox, CancellationToken ct)
     {
-        if (!TryValidateReadinessUrl(probe.Url, out var uri, out var rejectedDetail))
+        if (!E2eReplayOriginPolicy.TryValidateReadinessUrl(probe.Url, CurrentAllowedOrigins(), out var uri, out var rejectedDetail))
         {
             return (false, "ReadinessUrlRejected", rejectedDetail);
         }
@@ -199,7 +199,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
                         "--max-time",
                         "5",
                         "--resolve",
-                        $"{uri!.IdnHost}:{EffectivePort(uri)}:{resolved.ip}",
+                        $"{uri!.IdnHost}:{E2eReplayOriginPolicy.EffectivePort(uri)}:{resolved.ip}",
                         uri.ToString(),
                     ],
                     MaxStdoutBytes = OutputCaptureBytes,
@@ -243,7 +243,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
     {
         if (IPAddress.TryParse(uri.IdnHost, out var literal))
         {
-            return IsBlockedMetadataIp(literal)
+            return E2eReplayOriginPolicy.IsBlockedMetadataIp(literal)
                 ? (false, "ReadinessUrlRejected", $"readiness.url resolves to disallowed metadata address {literal}", null)
                 : (true, string.Empty, string.Empty, literal.ToString());
         }
@@ -278,7 +278,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             var token = line.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
             if (token is null || !IPAddress.TryParse(token, out var ip))
                 continue;
-            if (IsBlockedMetadataIp(ip))
+            if (E2eReplayOriginPolicy.IsBlockedMetadataIp(ip))
                 return (false, "ReadinessUrlRejected", $"readiness.url resolves to disallowed metadata address {ip}", null);
             first ??= ip;
         }
@@ -288,101 +288,9 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             : (true, string.Empty, string.Empty, first.ToString());
     }
 
-    private bool TryValidateReadinessUrl(string? url, out Uri? uri, out string detail)
-    {
-        uri = null;
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed)
-            || (parsed.Scheme != Uri.UriSchemeHttp && parsed.Scheme != Uri.UriSchemeHttps))
-        {
-            detail = "readiness.url must be an absolute http(s) URL";
-            return false;
-        }
-
-        if (!string.IsNullOrEmpty(parsed.UserInfo))
-        {
-            detail = "readiness.url must not contain userinfo";
-            return false;
-        }
-
-        var normalized = NormalizeOrigin(parsed);
-        var allowed = _options?.CurrentValue.AllowedReadinessOrigins
-            ?? new E2eExecutionOptions().AllowedReadinessOrigins;
-        foreach (var allowedOrigin in allowed)
-        {
-            if (!Uri.TryCreate(allowedOrigin, UriKind.Absolute, out var allowedUri))
-                continue;
-            if (string.Equals(normalized, NormalizeOrigin(allowedUri), StringComparison.OrdinalIgnoreCase))
-            {
-                uri = parsed;
-                detail = string.Empty;
-                return true;
-            }
-        }
-
-        detail = $"readiness.url origin '{normalized}' is not in CodeyBox:E2eExecution:AllowedReadinessOrigins";
-        return false;
-    }
-
-    private bool TryValidateReplayNavigationTargets(E2eReplayArtifact artifact, out string detail)
-    {
-        foreach (var (step, index) in artifact.Steps.Select((step, index) => (step, index)))
-        {
-            if (!string.Equals(step.Action, "navigate", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (!TryValidateAllowedAppUrl(step.Target, "steps[" + index + "].target", out detail))
-                return false;
-        }
-
-        detail = string.Empty;
-        return true;
-    }
-
-    private bool TryValidateAllowedAppUrl(string? url, string fieldName, out string detail)
-    {
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed)
-            || (parsed.Scheme != Uri.UriSchemeHttp && parsed.Scheme != Uri.UriSchemeHttps))
-        {
-            detail = $"{fieldName} must be an absolute http(s) URL";
-            return false;
-        }
-
-        if (!string.IsNullOrEmpty(parsed.UserInfo))
-        {
-            detail = $"{fieldName} must not contain userinfo";
-            return false;
-        }
-
-        if (!IsAllowedOrigin(parsed, out var normalized))
-        {
-            detail = $"{fieldName} origin '{normalized}' is not in CodeyBox:E2eExecution:AllowedReadinessOrigins";
-            return false;
-        }
-
-        detail = string.Empty;
-        return true;
-    }
-
-    private bool IsAllowedOrigin(Uri parsed, out string normalized)
-    {
-        normalized = NormalizeOrigin(parsed);
-        var allowed = _options?.CurrentValue.AllowedReadinessOrigins
-            ?? new E2eExecutionOptions().AllowedReadinessOrigins;
-        foreach (var allowedOrigin in allowed)
-        {
-            if (!Uri.TryCreate(allowedOrigin, UriKind.Absolute, out var allowedUri))
-                continue;
-            if (string.Equals(normalized, NormalizeOrigin(allowedUri), StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
-    }
-
     private ReplayDriverInput ToReplayDriverInput(E2eReplayArtifact artifact)
     {
-        var allowed = _options?.CurrentValue.AllowedReadinessOrigins
-            ?? new E2eExecutionOptions().AllowedReadinessOrigins;
+        var allowed = CurrentAllowedOrigins();
         return new ReplayDriverInput(
             artifact.Name,
             artifact.Readiness,
@@ -390,7 +298,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             artifact.Assertions,
             allowed
                 .Where(static origin => Uri.TryCreate(origin, UriKind.Absolute, out _))
-                .Select(static origin => NormalizeOrigin(new Uri(origin)))
+                .Select(static origin => E2eReplayOriginPolicy.NormalizeOrigin(new Uri(origin)))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray());
     }
@@ -450,31 +358,9 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         return false;
     }
 
-    private static int EffectivePort(Uri uri) =>
-        uri.IsDefaultPort ? (uri.Scheme == Uri.UriSchemeHttps ? 443 : 80) : uri.Port;
-
-    private static string NormalizeOrigin(Uri uri)
-    {
-        var port = EffectivePort(uri);
-        var defaultPort = uri.Scheme == Uri.UriSchemeHttps ? 443 : 80;
-        return port == defaultPort
-            ? $"{uri.Scheme}://{uri.IdnHost}"
-            : $"{uri.Scheme}://{uri.IdnHost}:{port}";
-    }
-
-    private static bool IsBlockedMetadataIp(IPAddress ip)
-    {
-        if (ip.IsIPv4MappedToIPv6)
-            ip = ip.MapToIPv4();
-
-        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-        {
-            var b = ip.GetAddressBytes();
-            return b[0] == 169 && b[1] == 254 && b[2] == 169 && b[3] == 254;
-        }
-
-        return false;
-    }
+    private IReadOnlyList<string> CurrentAllowedOrigins() =>
+        _options?.CurrentValue.AllowedReadinessOrigins
+        ?? new E2eExecutionOptions().AllowedReadinessOrigins;
 
     private sealed record ReplayDriverInput(
         [property: JsonPropertyName("name")] string? Name,
@@ -540,29 +426,46 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           return origin;
         }
 
+        function normalizeAddress(address) {
+          let value = String(address || '').trim().toLowerCase();
+          if (value.startsWith('[') && value.endsWith(']')) value = value.slice(1, -1);
+          return value;
+        }
+
         function isMetadataAddress(address) {
-          return address === '169.254.169.254';
+          const value = normalizeAddress(address);
+          return value === '169.254.169.254'
+            || value === '::ffff:169.254.169.254'
+            || value === '::169.254.169.254'
+            || value === '::ffff:a9fe:a9fe'
+            || value === '0:0:0:0:0:ffff:a9fe:a9fe'
+            || value === '::a9fe:a9fe'
+            || value === 'fd00:ec2::254'
+            || value === 'fd00:ec2:0:0:0:0:0:254'
+            || value === 'fe80::a9fe:a9fe'
+            || value === 'fe80:0:0:0:0:0:a9fe:a9fe';
         }
 
         async function buildHostResolverRules(allowedOrigins) {
           const rules = [];
           for (const origin of allowedOrigins) {
             const u = new URL(origin);
-            if (net.isIP(u.hostname)) {
-              if (isMetadataAddress(u.hostname)) throw new Error(`allowed origin resolves to blocked metadata address ${u.hostname}`);
+            const host = normalizeAddress(u.hostname);
+            if (net.isIP(host)) {
+              if (isMetadataAddress(host)) throw new Error(`allowed origin resolves to blocked metadata address ${host}`);
               continue;
             }
 
             let records;
             try {
-              records = await dns.lookup(u.hostname, { all: true });
+              records = await dns.lookup(host, { all: true });
             } catch {
               continue;
             }
 
             const usable = records.find(r => !isMetadataAddress(r.address));
-            if (!usable && records.length > 0) throw new Error(`allowed origin resolves only to blocked metadata addresses: ${u.hostname}`);
-            if (usable) rules.push(`MAP ${u.hostname} ${usable.address}`);
+            if (!usable && records.length > 0) throw new Error(`allowed origin resolves only to blocked metadata addresses: ${host}`);
+            if (usable) rules.push(`MAP ${host} ${usable.address}`);
           }
           return rules.length > 0 ? rules.join(',') : null;
         }

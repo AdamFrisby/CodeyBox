@@ -41,9 +41,9 @@ public sealed class E2eRunApiTests : IDisposable
     {
         using var factory = new E2ePoolWiringFactory("remote-ssh");
 
-        var pool = factory.Services.GetRequiredService<IE2eExecutionPool>();
+        var pool = Assert.IsType<MultiHostE2eExecutionPool>(factory.Services.GetRequiredService<IE2eExecutionPool>());
 
-        Assert.Equal("remote-ssh", pool.Name);
+        Assert.Equal("remote-ssh[1]", pool.Name);
         Assert.IsType<MultipassRemoteSandboxProvider>(GetInnerProvider(pool));
     }
 
@@ -56,13 +56,27 @@ public sealed class E2eRunApiTests : IDisposable
     [Fact]
     public void Program_remote_e2e_pool_reads_e2e_specific_remote_config()
     {
-        using var factory = new E2ePoolWiringFactory("remote-ssh", globalRemoteTarget: "coding@remote.example", e2eRemoteTarget: "e2e@remote.example");
+        using var factory = new E2ePoolWiringFactory("remote-ssh", globalRemoteTarget: "coding@coding.example", e2eRemoteTarget: "e2e@remote.example");
 
         var pool = factory.Services.GetRequiredService<IE2eExecutionPool>();
         var provider = Assert.IsType<MultipassRemoteSandboxProvider>(GetInnerProvider(pool));
         var opts = ReadRemoteOptions(provider);
 
         Assert.Equal("e2e@remote.example", opts.SshTarget);
+    }
+
+    [Fact]
+    public void Program_single_host_remote_e2e_pool_applies_per_host_capacity()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            e2eRemoteTarget: "e2e@remote.example",
+            e2eRemoteMaxConcurrent: 2);
+
+        var pool = Assert.IsType<MultiHostE2eExecutionPool>(factory.Services.GetRequiredService<IE2eExecutionPool>());
+
+        Assert.Equal("remote-ssh[1]", pool.Name);
+        Assert.Equal(2, pool.MaxConcurrent);
     }
 
     [Fact]
@@ -139,6 +153,20 @@ public sealed class E2eRunApiTests : IDisposable
     }
 
     [Fact]
+    public void Program_rejects_enabled_remote_e2e_when_target_matches_coding_host_with_different_user()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            globalRemoteTarget: "coding@remote.example",
+            e2eRemoteTarget: "e2e@remote.example",
+            e2eEnabled: true);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("different SSH host", ex.Message);
+    }
+
+    [Fact]
     public void Program_registers_e2e_dispatcher_as_hosted_service()
     {
         using var factory = new E2eHostedServiceWiringFactory();
@@ -161,6 +189,39 @@ public sealed class E2eRunApiTests : IDisposable
         Assert.IsType<ProcessSandboxProvider>(e2eProvider);
         Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(codingProvider);
         Assert.NotSame(codingProvider, e2eProvider);
+    }
+
+    [Fact]
+    public void Program_rejects_local_e2e_pool_outside_development()
+    {
+        using var env = ConfigureRequiredProductionChangelogSecret();
+        using var factory = new E2ePoolWiringFactory("local", environment: "Production");
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+
+        Assert.Contains("PoolKind=local", ex.Message);
+        Assert.Contains("development-only", ex.Message);
+    }
+
+    private static IDisposable ConfigureRequiredProductionChangelogSecret()
+    {
+        const string configKey = "CodeyBox__Changelog__GitHubWebhookSecretEnvVar";
+        const string secretKey = "CODEYBOX_CHANGELOG_SECRET_TEST";
+        var oldConfig = Environment.GetEnvironmentVariable(configKey);
+        var oldSecret = Environment.GetEnvironmentVariable(secretKey);
+        Environment.SetEnvironmentVariable(configKey, secretKey);
+        Environment.SetEnvironmentVariable(secretKey, "test-secret");
+        return new EnvScope(() =>
+        {
+            Environment.SetEnvironmentVariable(configKey, oldConfig);
+            Environment.SetEnvironmentVariable(secretKey, oldSecret);
+        });
+    }
+
+    private sealed class EnvScope(Action restore) : IDisposable
+    {
+        public void Dispose() => restore();
     }
 
     [Fact]
@@ -243,6 +304,19 @@ public sealed class E2eRunApiTests : IDisposable
         var missingArtifact = await SeedCaseAsync("api-missing-artifact", AutomationKind.E2eReplay, null);
         var missingArtifactResponse = await _client.PostAsJsonAsync("/e2eruns", new EnqueueE2eRunRequest(missingArtifact));
         Assert.Equal(HttpStatusCode.BadRequest, missingArtifactResponse.StatusCode);
+
+        var nullBody = await _client.PostAsJsonAsync<EnqueueE2eRunRequest?>("/e2eruns", null);
+        Assert.Equal(HttpStatusCode.BadRequest, nullBody.StatusCode);
+
+        var rejectedTarget = await SeedCaseAsync(
+            "api-rejected-target",
+            AutomationKind.E2eReplay,
+            JsonSerializer.Serialize(new E2eReplayArtifact
+            {
+                Steps = [new E2eReplayStep { Action = "navigate", Target = "http://169.254.169.254/latest/meta-data" }],
+            }));
+        var rejectedTargetResponse = await _client.PostAsJsonAsync("/e2eruns", new EnqueueE2eRunRequest(rejectedTarget));
+        Assert.Equal(HttpStatusCode.BadRequest, rejectedTargetResponse.StatusCode);
     }
 
     [Fact]
@@ -399,6 +473,9 @@ public sealed class E2eRunApiTests : IDisposable
 
     private static ISandboxProvider GetInnerProvider(IE2eExecutionPool pool)
     {
+        if (pool is IManagedSandboxProviderSource { ManagedSandboxProviders.Count: > 0 } source)
+            return source.ManagedSandboxProviders[0];
+
         var field = typeof(LocalE2eExecutionPool).GetField("_provider", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(field);
         return Assert.IsAssignableFrom<ISandboxProvider>(field.GetValue(pool));
@@ -417,10 +494,12 @@ internal sealed class E2ePoolWiringFactory(
     string poolKind,
     string? globalRemoteTarget = null,
     string? e2eRemoteTarget = "codeybox@e2e.example",
+    int? e2eRemoteMaxConcurrent = null,
     bool e2eEnabled = false,
     string? baselineImageRef = "cb-e2e-baseline",
     string? networkProfile = null,
-    IReadOnlyList<string>? e2eRemoteTargets = null) : WebApplicationFactory<Program>
+    IReadOnlyList<string>? e2eRemoteTargets = null,
+    string environment = "Development") : WebApplicationFactory<Program>
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-e2epool-{Guid.NewGuid():N}.db");
@@ -428,7 +507,7 @@ internal sealed class E2ePoolWiringFactory(
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.UseEnvironment("Development");
+        builder.UseEnvironment(environment);
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             var tmp = Path.GetTempPath();
@@ -441,6 +520,8 @@ internal sealed class E2ePoolWiringFactory(
                 ["CodeyBox:E2eExecution:Enabled"] = e2eEnabled.ToString(),
                 ["CodeyBox:E2eExecution:BaselineImageRef"] = baselineImageRef,
                 ["CodeyBox:E2eExecution:NetworkProfile"] = networkProfile,
+                ["CodeyBox:Changelog:Enabled"] = "false",
+                ["CodeyBox:Changelog:GitHubWebhookSecretEnvVar"] = "TEST_CHANGELOG_SECRET",
                 ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = globalRemoteTarget,
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
@@ -458,6 +539,7 @@ internal sealed class E2ePoolWiringFactory(
             else
             {
                 values["CodeyBox:E2eMultipassRemoteSandbox:SshTarget"] = e2eRemoteTarget;
+                values["CodeyBox:E2eMultipassRemoteSandbox:MaxConcurrent"] = e2eRemoteMaxConcurrent?.ToString();
             }
 
             cfg.AddInMemoryCollection(values);

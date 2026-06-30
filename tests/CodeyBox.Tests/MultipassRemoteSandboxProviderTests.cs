@@ -87,8 +87,20 @@ public sealed class MultipassRemoteSandboxProviderTests
             WorkingDirectory = "/work",
         });
 
-        Assert.Contains(transport.RecordedCalls, c =>
-            c.Argv.SequenceEqual([opts.RemoteMultipassPath, "clone", baseline, "--name", sb.Id]));
+        var calls = transport.RecordedCalls.Select(c => c.Argv).ToList();
+        var stopBaselineIndex = calls.FindIndex(argv =>
+            argv.SequenceEqual([opts.RemoteMultipassPath, "stop", baseline]));
+        var cloneIndex = calls.FindIndex(argv =>
+            argv.SequenceEqual([opts.RemoteMultipassPath, "clone", baseline, "--name", sb.Id]));
+        var startCloneIndex = calls.FindIndex(argv =>
+            argv.SequenceEqual([opts.RemoteMultipassPath, "start", sb.Id]));
+        var infoCloneIndex = calls.FindIndex(argv =>
+            argv.SequenceEqual([opts.RemoteMultipassPath, "info", sb.Id, "--format", "json"]));
+
+        Assert.True(stopBaselineIndex >= 0, "baseline VM must be stopped before clone");
+        Assert.True(cloneIndex > stopBaselineIndex, "clone must happen after stopping the baseline");
+        Assert.True(startCloneIndex > cloneIndex, "cloned VM must be started after clone");
+        Assert.True(infoCloneIndex > startCloneIndex, "running-state check must happen after starting the clone");
         Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
 
         await sb.DisposeAsync();
