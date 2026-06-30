@@ -113,6 +113,68 @@ public sealed class QueuePromptTests
     }
 
     [Fact]
+    public async Task Prompt_PositionalTextAndPromptFile_WritesErrorAndDoesNotCreateClient()
+    {
+        var tempFile = Path.GetTempFileName();
+        await File.WriteAllTextAsync(tempFile, "prompt from file");
+
+        try
+        {
+            var factoryCalled = false;
+            var result = await InvokeWithApiKeyAsync(
+                ["queue", "prompt", WorkItemId, "inline prompt", "--prompt-file", tempFile],
+                MakeTrackingFactory(() => factoryCalled = true));
+
+            Assert.Equal(1, result.Code);
+            Assert.False(factoryCalled);
+            Assert.Contains("provide either prompt text or --prompt-file", result.Stderr);
+            Assert.Empty(result.Stdout);
+        }
+        finally
+        {
+            File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public async Task Prompt_EmptyStdin_WritesErrorAndDoesNotCreateClient()
+    {
+        var factoryCalled = false;
+        var result = await InvokeWithApiKeyAsync(
+            ["queue", "prompt", WorkItemId],
+            MakeTrackingFactory(() => factoryCalled = true),
+            stdin: "");
+
+        Assert.Equal(1, result.Code);
+        Assert.False(factoryCalled);
+        Assert.Contains("prompt is required", result.Stderr);
+        Assert.Empty(result.Stdout);
+    }
+
+    [Fact]
+    public async Task Prompt_EmptyPromptFile_WritesErrorAndDoesNotCreateClient()
+    {
+        var tempFile = Path.GetTempFileName();
+
+        try
+        {
+            var factoryCalled = false;
+            var result = await InvokeWithApiKeyAsync(
+                ["queue", "prompt", WorkItemId, "--prompt-file", tempFile],
+                MakeTrackingFactory(() => factoryCalled = true));
+
+            Assert.Equal(1, result.Code);
+            Assert.False(factoryCalled);
+            Assert.Contains("prompt is required", result.Stderr);
+            Assert.Empty(result.Stdout);
+        }
+        finally
+        {
+            File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
     public async Task Prompt_Quiet_PrintsOnlyServerRevision()
     {
         var factory = MakeFactory(_ => PromptResponse(42));
@@ -145,6 +207,28 @@ public sealed class QueuePromptTests
     }
 
     [Fact]
+    public async Task Prompt_ExactLimitStdin_PutsPrompt()
+    {
+        var prompt = new string('x', 64 * 1024);
+        string? capturedBody = null;
+        var factory = MakeFactory(req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return PromptResponse(13);
+        });
+
+        var result = await InvokeWithApiKeyAsync(
+            ["queue", "prompt", WorkItemId],
+            factory,
+            stdin: prompt);
+
+        Assert.Equal(0, result.Code);
+        AssertPromptBody(capturedBody, prompt);
+        Assert.Contains("new prompt revision: 13", result.Stdout);
+        Assert.Empty(result.Stderr);
+    }
+
+    [Fact]
     public async Task Prompt_OversizedStdin_WritesErrorAndDoesNotCallApi()
     {
         var factoryCalled = false;
@@ -164,6 +248,46 @@ public sealed class QueuePromptTests
         Assert.NotEqual(0, result.Code);
         Assert.False(factoryCalled);
         Assert.Contains("prompt exceeds 64 KB limit", result.Stderr);
+        Assert.Empty(result.Stdout);
+    }
+
+    [Fact]
+    public async Task Prompt_OversizedPromptFile_WritesErrorAndDoesNotCreateClient()
+    {
+        var tempFile = Path.GetTempFileName();
+        await File.WriteAllTextAsync(tempFile, new string('x', 64 * 1024 + 1));
+
+        try
+        {
+            var factoryCalled = false;
+            var result = await InvokeWithApiKeyAsync(
+                ["queue", "prompt", WorkItemId, "--prompt-file", tempFile],
+                MakeTrackingFactory(() => factoryCalled = true));
+
+            Assert.Equal(1, result.Code);
+            Assert.False(factoryCalled);
+            Assert.Contains("prompt exceeds 64 KB limit", result.Stderr);
+            Assert.Empty(result.Stdout);
+        }
+        finally
+        {
+            File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public async Task Prompt_MissingPromptFile_WritesErrorAndDoesNotCreateClient()
+    {
+        var missingFile = Path.Combine(Path.GetTempPath(), $"codeybox-missing-{Guid.NewGuid():N}.txt");
+        var factoryCalled = false;
+
+        var result = await InvokeWithApiKeyAsync(
+            ["queue", "prompt", WorkItemId, "--prompt-file", missingFile],
+            MakeTrackingFactory(() => factoryCalled = true));
+
+        Assert.Equal(1, result.Code);
+        Assert.False(factoryCalled);
+        Assert.NotEmpty(result.Stderr);
         Assert.Empty(result.Stdout);
     }
 
@@ -244,6 +368,17 @@ public sealed class QueuePromptTests
         Content = new StringContent(
             $"{{\"id\":\"aabbccdd-0000-0000-0000-000000000000\",\"promptRevision\":{revision}}}"),
     };
+
+    private static Func<ResolvedConfig, CodeyBoxClient> MakeTrackingFactory(Action onCreate)
+    {
+        return config =>
+        {
+            onCreate();
+            return new CodeyBoxClient(
+                new HttpClient(new FakeHttpMessageHandler(_ => PromptResponse(1)))
+                { BaseAddress = new Uri(config.ApiBaseUrl) });
+        };
+    }
 
     private static Task<(int Code, string Stdout, string Stderr)> InvokeWithApiKeyAsync(
         string[] args,
