@@ -29,3 +29,7 @@ obj/
 # ACP bridge native binary is intentionally tracked. It is produced by
 # scripts/publish-acp-bridge.sh as a static linux-musl-x64 artifact and embedded
 # by CodeyBox.Agents.Claude so ACP is usable without an out-of-band publish job.
+
+# Runtime console/audit log output written by CodeyBox.Api when run from source
+# (local-only dev artifact; can grow to GBs; never commit).
+src/CodeyBox.Api/logs/
