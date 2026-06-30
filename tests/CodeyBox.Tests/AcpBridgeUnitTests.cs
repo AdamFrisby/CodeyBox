@@ -2578,6 +2578,7 @@ public sealed class AcpBridgeUnitTests
             Directory.CreateDirectory(workDir);
 
             var markerPath = Path.Combine(tmpDir, "sigterm-trapped.marker");
+            var armedPath = Path.Combine(tmpDir, "trap-armed.marker");
             var stubPath = Path.Combine(tmpDir, "claude-sigterm-stub.sh");
 
             // Bash stub: trap SIGTERM → write marker → exit 0. The `sleep &
@@ -2585,11 +2586,25 @@ public sealed class AcpBridgeUnitTests
             // BETWEEN commands by default; backgrounding the sleep and
             // wait-ing on it lets the trap deliver mid-sleep. argv[1] ==
             // "--ide" (the flag Bridge always prepends), argv[2] == the
-            // marker path the trap writes.
+            // marker path the trap writes, argv[3] == the "armed" path the
+            // stub touches AFTER installing the trap.
+            //
+            // The armed-file handshake closes a test-only race: Bridge emits
+            // `ready` from WriteLockfile() BEFORE SpawnClaude() starts this
+            // stub, so observing `ready` does not imply the stub has even
+            // begun executing — let alone reached its `trap` line. Under the
+            // 6-core capped full-suite load, SIGTERM (fired by the shutdown
+            // envelope below) could otherwise arrive before the trap is
+            // installed, so bash takes the default-terminate action, the trap
+            // never runs, and the marker is never written — a spurious failure
+            // unrelated to the product's SIGTERM-first contract. Waiting for
+            // the armed file guarantees the trap is live before we signal.
             File.WriteAllText(stubPath,
                 "#!/bin/bash\n" +
                 "MARKER=\"$2\"\n" +
+                "ARMED=\"$3\"\n" +
                 "trap 'echo \"got-sigterm\" > \"$MARKER\"; exit 0' SIGTERM\n" +
+                "echo armed > \"$ARMED\"\n" +
                 "sleep 60 &\n" +
                 "wait $!\n");
             File.SetUnixFileMode(stubPath,
@@ -2597,13 +2612,23 @@ public sealed class AcpBridgeUnitTests
 
             await using var ctx = new BridgeRunHandle();
             var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
-                + "\",\"claudeArgs\":[\"" + markerPath
+                + "\",\"claudeArgs\":[\"" + markerPath + "\",\"" + armedPath
                 + "\"],\"workingDirectory\":\"" + workDir
                 + "\",\"lockDir\":\"" + lockDir
                 + "\",\"turnTimeoutSeconds\":30}";
             await ctx.WriteStdinLineAsync(hello);
 
             await ctx.WaitForEnvelopeAsync("ready");
+
+            // Wait until the stub has installed its SIGTERM trap (it touches
+            // the armed file immediately after `trap`). Only then is it safe
+            // to trigger shutdown — otherwise SIGTERM could race ahead of the
+            // trap install (see the comment on the stub above).
+            for (int i = 0; i < 200 && !File.Exists(armedPath); i++)
+                await Task.Delay(25);
+            Assert.True(File.Exists(armedPath),
+                "Stub never armed its SIGTERM trap within 5s — cannot meaningfully " +
+                "exercise the SIGTERM-first path.");
 
             // Trigger shutdown via the host envelope — drives Bridge.Shutdown,
             // which sees the stub still running (HasExited=false) and calls
@@ -2652,12 +2677,19 @@ public sealed class AcpBridgeUnitTests
             var markerPath = Path.Combine(tmpDir, "sigterm-observed.marker");
             var stubPath = Path.Combine(tmpDir, "claude-ignore-sigterm-stub.sh");
 
+            // Install the SIGTERM trap BEFORE writing the pidfile, so that
+            // observing the pidfile (which the test waits on before triggering
+            // shutdown) guarantees the trap is already armed. The reverse order
+            // leaves a window where SIGTERM could land after the pidfile write
+            // but before the trap install, default-terminating the child and
+            // spuriously failing the marker assertion under capped full-suite
+            // load (same race class as the SIGTERM-first fixture above).
             File.WriteAllText(stubPath,
                 "#!/bin/bash\n" +
                 "PIDFILE=\"$2\"\n" +
                 "MARKER=\"$3\"\n" +
-                "echo $$ > \"$PIDFILE\"\n" +
                 "trap 'echo \"got-sigterm-but-staying-alive\" > \"$MARKER\"' SIGTERM\n" +
+                "echo $$ > \"$PIDFILE\"\n" +
                 "while true; do sleep 60 & wait $!; done\n");
             File.SetUnixFileMode(stubPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
