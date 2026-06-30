@@ -70,10 +70,20 @@ public sealed class DeploymentDriverSubstrateSmokeTests
         {
             Kind = DeploymentKinds.Daemon,
             ImageReference = "ignored",
-            RunCommand = "sleep 5 >/dev/null 2>&1 < /dev/null & echo $! > daemon.pid",
+            RunCommand = """
+                touch daemon.keepalive
+                (
+                  deadline=$(( $(date +%s) + 120 ))
+                  while [ -f daemon.keepalive ] && [ "$(date +%s)" -lt "$deadline" ]; do
+                    sleep 1
+                  done
+                ) >/dev/null 2>&1 < /dev/null &
+                echo $! > daemon.pid
+                """,
+            StartupTimeout = TimeSpan.FromSeconds(15),
             Settings = new Dictionary<string, string>
             {
-                [DaemonDeploymentDriver.SettingsKeyLivenessCommand] = "kill -0 $(cat daemon.pid)",
+                [DaemonDeploymentDriver.SettingsKeyLivenessCommand] = "test -r daemon.pid && kill -0 $(cat daemon.pid)",
                 [DaemonDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.05",
             },
         };
