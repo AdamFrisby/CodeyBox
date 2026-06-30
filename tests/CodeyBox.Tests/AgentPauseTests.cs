@@ -1280,12 +1280,23 @@ public sealed class AgentPauseTests : IDisposable
             DefaultAgentClass = "frontier",
         });
 
+    // The state/queue transitions these helpers wait on are driven by the
+    // background dispatch loop, whose scheduling latency balloons to ~8-10s
+    // when the capped (6-core) full-suite suite starves the ThreadPool — the
+    // target state is reached deterministically, just slowly. The previous 5s
+    // budget was below that observed latency, so the wait abandoned early and
+    // returned a not-yet-transitioned item, intermittently failing the callers'
+    // state assertions. The 30s budget is a starvation backstop consistent with
+    // this suite's other background-service waits (e.g. WaitForEnteredAsync),
+    // not the mechanism that makes the wait succeed.
+    private static readonly TimeSpan StateWaitBudget = TimeSpan.FromSeconds(30);
+
     private static async Task<WorkItem?> WaitForStateAsync(
         IWorkItemStore store,
         WorkItemId id,
         WorkItemState state)
     {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(StateWaitBudget);
         while (!cts.IsCancellationRequested)
         {
             var item = await store.GetAsync(id);
@@ -1298,7 +1309,7 @@ public sealed class AgentPauseTests : IDisposable
 
     private static async Task<bool> WaitForQueueCountAsync(InMemoryTaskQueue queue, int count)
     {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(StateWaitBudget);
         while (!cts.IsCancellationRequested)
         {
             if (queue.Count == count)

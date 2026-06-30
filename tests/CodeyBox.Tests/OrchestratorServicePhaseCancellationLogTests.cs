@@ -127,20 +127,14 @@ public sealed class OrchestratorServicePhaseCancellationLogTests : IDisposable
         Assert.Contains(CancellationSources.StuckProbe, entry.Message, StringComparison.Ordinal);
     }
 
-    private static async Task<CapturedLogEntry> WaitForLogAsync(
+    private static Task<CapturedLogEntry> WaitForLogAsync(
         CapturingLogger<OrchestratorService> logger,
         Func<CapturedLogEntry, bool> predicate)
     {
-        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(15);
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            var match = logger.Entries.FirstOrDefault(predicate);
-            if (match is not null) return match;
-            await Task.Delay(25);
-        }
-        var dump = string.Join("\n", logger.Entries.Select(e => $"[{e.Level}] {e.Message}"));
-        throw new TimeoutException(
-            $"Expected log entry not observed within 15s. Captured entries:\n{dump}");
+        // Push-based wait: wakes on each new log call rather than polling a
+        // wall-clock deadline that races ThreadPool starvation under the capped
+        // full-suite load. The 15s timeout is only a no-log-regression backstop.
+        return logger.WaitForEntryAsync(predicate, TimeSpan.FromSeconds(15));
     }
 
     /// <summary>

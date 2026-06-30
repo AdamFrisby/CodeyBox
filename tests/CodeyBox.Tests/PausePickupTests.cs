@@ -38,8 +38,7 @@ public sealed class PausePickupTests : IDisposable
         using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
         await controller.PauseAsync("hold-for-test");
 
-        var pickupCount = 0;
-        var pipeline = new CountingPipelineRunner(_store, onRun: () => Interlocked.Increment(ref pickupCount));
+        var pipeline = new CountingPipelineRunner(_store, signalAtCount: 1);
         var queue = new InMemoryTaskQueue();
         var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
         var reg = new CancellationRegistry(CancellationToken.None);
@@ -52,26 +51,27 @@ public sealed class PausePickupTests : IDisposable
         await _store.CreateAsync(item);
         await queue.EnqueueAsync(item.Id);
 
-        using var cts = new CancellationTokenSource();
         await svc.StartAsync(CancellationToken.None);
 
-        // Give the dispatch loop a generous window; it should spin on the pause gate.
+        // Give the dispatch loop a generous window; it should spin on the pause
+        // gate. (A negative assertion — the pause gate blocks pickup regardless
+        // of scheduling latency, so a slow loop only reinforces this, never
+        // breaks it.)
         await Task.Delay(300);
 
-        Assert.Equal(0, pickupCount);
+        Assert.Equal(0, pipeline.RunCount);
         var stored = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, stored!.State);
 
-        // Now resume and allow pickup.
+        // Now resume and allow pickup — await the pickup via the event signal
+        // rather than polling a wall-clock deadline that races ThreadPool
+        // starvation under the capped full-suite load.
         await controller.ResumeAsync();
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (DateTimeOffset.UtcNow < deadline && pickupCount == 0)
-            await Task.Delay(50);
+        await pipeline.ReachedTargetCount.WaitAsync(TimeSpan.FromSeconds(30));
 
-        cts.Cancel();
         await svc.StopAsync(CancellationToken.None);
 
-        Assert.Equal(1, pickupCount);
+        Assert.Equal(1, pipeline.RunCount);
     }
 
     [Fact]
@@ -80,8 +80,7 @@ public sealed class PausePickupTests : IDisposable
         // Sanity: with a Running controller, items are processed.
         using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
 
-        var pickupCount = 0;
-        var pipeline = new CountingPipelineRunner(_store, onRun: () => Interlocked.Increment(ref pickupCount));
+        var pipeline = new CountingPipelineRunner(_store, signalAtCount: 3);
         var queue = new InMemoryTaskQueue();
         var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
         var reg = new CancellationRegistry(CancellationToken.None);
@@ -98,12 +97,13 @@ public sealed class PausePickupTests : IDisposable
         }
 
         await svc.StartAsync(CancellationToken.None);
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref pickupCount) < 3)
-            await Task.Delay(50);
+        // Await all three pickups via the event signal rather than polling a
+        // wall-clock deadline that races ThreadPool starvation under the capped
+        // full-suite load.
+        await pipeline.ReachedTargetCount.WaitAsync(TimeSpan.FromSeconds(30));
 
         await svc.StopAsync(CancellationToken.None);
-        Assert.Equal(3, pickupCount);
+        Assert.Equal(3, pipeline.RunCount);
     }
 
     [Fact]
@@ -113,13 +113,13 @@ public sealed class PausePickupTests : IDisposable
 
         var itemStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var itemCanProceed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var itemCompleted = 0;
+        var itemCompletedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var pipeline = new BlockingPipelineRunner(
             _store,
             onStart: () => itemStarted.TrySetResult(),
             proceedGate: itemCanProceed.Task,
-            onComplete: () => Interlocked.Increment(ref itemCompleted));
+            onComplete: () => itemCompletedTcs.TrySetResult());
 
         var queue = new InMemoryTaskQueue();
         var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
@@ -145,13 +145,17 @@ public sealed class PausePickupTests : IDisposable
         // Allow the in-flight item to finish.
         itemCanProceed.TrySetResult();
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref itemCompleted) == 0)
-            await Task.Delay(50);
+        // Await the completion signal rather than polling a wall-clock
+        // deadline: the dispatcher/worker run on the ThreadPool, which the
+        // capped full-suite suite can starve, so a polling deadline races the
+        // very starvation it is waiting out. The completion signal fires only
+        // after the worker has committed the Done state (see
+        // BlockingPipelineRunner), so observing it guarantees Done is durable.
+        await itemCompletedTcs.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         await svc.StopAsync(CancellationToken.None);
 
-        Assert.Equal(1, itemCompleted);
+        Assert.True(itemCompletedTcs.Task.IsCompletedSuccessfully);
         var stored = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, stored!.State);
     }
@@ -165,17 +169,35 @@ internal sealed class CountingPipelineRunner : IPipelineRunner
 {
     private readonly IWorkItemStore _store;
     private readonly Action _onRun;
+    private int _runCount;
+    private readonly int _signalAtCount;
+    private readonly TaskCompletionSource _reachedTarget =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public CountingPipelineRunner(IWorkItemStore store, Action onRun)
+    public CountingPipelineRunner(IWorkItemStore store, Action? onRun = null, int signalAtCount = int.MaxValue)
     {
         _store = store;
-        _onRun = onRun;
+        _onRun = onRun ?? (static () => { });
+        _signalAtCount = signalAtCount;
     }
+
+    public int RunCount => Volatile.Read(ref _runCount);
+
+    /// <summary>
+    /// Completes once RunAsync has been invoked <c>signalAtCount</c> times.
+    /// Event-driven so the waiting test does not poll a wall-clock deadline
+    /// that competes for CPU with the very dispatcher it is waiting on.
+    /// </summary>
+    public Task ReachedTargetCount => _reachedTarget.Task;
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _onRun();
+        // Commit Done before signalling so the count is observed only after the
+        // store transition is durable.
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+        if (Interlocked.Increment(ref _runCount) >= _signalAtCount)
+            _reachedTarget.TrySetResult();
     }
 }
 
@@ -202,7 +224,14 @@ internal sealed class BlockingPipelineRunner : IPipelineRunner
     {
         _onStart();
         await _proceedGate;
-        _onComplete();
+        // Commit the Done state BEFORE signalling completion. The test awaits
+        // the completion signal and then asserts the item reached Done;
+        // signalling first leaves a window where the test reads the store
+        // before the Done write has committed (and StopAsync may begin
+        // draining), so under capped full-suite load the Done assertion could
+        // observe a not-yet-persisted state. Ordering the write first makes
+        // "completion observed" a true happens-after of the durable Done state.
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+        _onComplete();
     }
 }
