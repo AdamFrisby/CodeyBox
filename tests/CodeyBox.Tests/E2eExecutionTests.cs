@@ -89,12 +89,40 @@ public sealed class E2eExecutionTests : IDisposable
         var exec = Assert.Single(sandbox.ExecRequests);
         Assert.Equal("node", exec.Argv[0]);
         Assert.Equal("-e", exec.Argv[1]);
-        Assert.Equal(16 * 1024, exec.MaxStdoutBytes);
-        Assert.Equal(16 * 1024, exec.MaxStderrBytes);
+        Assert.Equal(1024 * 1024, exec.MaxStdoutBytes);
+        Assert.Equal(1024 * 1024, exec.MaxStderrBytes);
         var sent = JsonSerializer.Deserialize<E2eReplayArtifact>(exec.Stdin!, new JsonSerializerOptions(JsonSerializerDefaults.Web));
         Assert.NotNull(sent);
         Assert.Equal("#login", sent.Steps[1].Selector);
         Assert.Equal("#account", sent.Assertions[0].Selector);
+    }
+
+    [Fact]
+    public async Task Replay_executes_embedded_playwright_driver_script()
+    {
+        await using var sandbox = new LocalNodeSandbox();
+        var artifact = new E2eReplayArtifact
+        {
+            Steps =
+            [
+                new E2eReplayStep { Action = "navigate", Target = "http://app.local/" },
+                new E2eReplayStep { Action = "fill", Selector = "#name", Value = "Ada" },
+                new E2eReplayStep { Action = "click", Selector = "#submit" },
+            ],
+            Assertions =
+            [
+                new E2eReplayAssertion { Kind = "selectorTextContains", Selector = "#message", Value = "Welcome Ada" },
+                new E2eReplayAssertion { Kind = "urlContains", Value = "app.local" },
+                new E2eReplayAssertion { Kind = "titleContains", Value = "Dashboard" },
+            ],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.True(result.Passed, result.Summary);
+        Assert.Equal(3, result.StepResults.Count);
+        Assert.Equal(3, result.AssertionResults.Count);
     }
 
     [Fact]
@@ -145,7 +173,7 @@ public sealed class E2eExecutionTests : IDisposable
         var artifact = new E2eReplayArtifact
         {
             Readiness = new E2eReadinessProbe { Url = "http://app.local/healthz", MaxAttempts = 2, DelayMs = 0 },
-            Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app/items" }],
+            Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/items" }],
         };
         var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
 
@@ -181,7 +209,27 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     [Fact]
-    public async Task Replay_rejects_readiness_url_that_resolves_private_address()
+    public async Task Replay_allows_readiness_url_that_resolves_loopback_for_configured_app_origin()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "127.0.0.1 STREAM app.local\n", string.Empty);
+        sandbox.Programs["curl"] = _ => new SandboxExecResult(0, "ok\n", string.Empty);
+        var artifact = new E2eReplayArtifact
+        {
+            Readiness = new E2eReadinessProbe { Url = "http://app.local/healthz", MaxAttempts = 1, DelayMs = 0 },
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.True(result.Passed);
+        Assert.Contains(sandbox.ExecLog, argv => argv[0] == "curl");
+        var curl = sandbox.ExecRequests.Single(exec => exec.Argv[0] == "curl");
+        Assert.Contains("app.local:80:127.0.0.1", curl.Argv);
+    }
+
+    [Fact]
+    public async Task Replay_rejects_readiness_url_that_resolves_metadata_address()
     {
         var sandbox = new FakeSandbox();
         sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "169.254.169.254 STREAM app.local\n", string.Empty);
@@ -197,6 +245,58 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.False(result.Passed);
         Assert.Equal("ReadinessUrlRejected", result.FailureKind);
         Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "curl");
+    }
+
+    [Fact]
+    public async Task Replay_rejects_navigation_outside_configured_app_origins_before_driver_runs()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(1, 0));
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = [new E2eReplayStep { Action = "navigate", Target = "http://evil.local/" }],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("NavigationUrlRejected", result.FailureKind);
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "node");
+    }
+
+    [Fact]
+    public async Task Replay_custom_readiness_allowlist_allows_matching_origin_and_rejects_others_before_dns()
+    {
+        var options = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+        {
+            AllowedReadinessOrigins = ["http://custom.local:8080"],
+        });
+        var allowedSandbox = new FakeSandbox();
+        allowedSandbox.Programs["getent"] = _ => new SandboxExecResult(0, "10.42.0.5 STREAM custom.local\n", string.Empty);
+        allowedSandbox.Programs["curl"] = _ => new SandboxExecResult(0, "ok\n", string.Empty);
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance, options);
+
+        var allowed = await runtime.ExecuteAsync(new E2eReplayArtifact
+        {
+            Readiness = new E2eReadinessProbe { Url = "http://custom.local:8080/healthz", MaxAttempts = 1, DelayMs = 0 },
+        }, allowedSandbox);
+
+        Assert.True(allowed.Passed);
+        Assert.Contains(allowedSandbox.ExecLog, argv => argv[0] == "curl");
+
+        var rejectedSandbox = new FakeSandbox();
+        rejectedSandbox.Programs["getent"] = _ => new SandboxExecResult(0, "10.42.0.6 STREAM other.local\n", string.Empty);
+        rejectedSandbox.Programs["curl"] = _ => new SandboxExecResult(0, "should not run\n", string.Empty);
+
+        var rejected = await runtime.ExecuteAsync(new E2eReplayArtifact
+        {
+            Readiness = new E2eReadinessProbe { Url = "http://other.local:8080/healthz", MaxAttempts = 1, DelayMs = 0 },
+        }, rejectedSandbox);
+
+        Assert.False(rejected.Passed);
+        Assert.Equal("ReadinessUrlRejected", rejected.FailureKind);
+        Assert.Empty(rejectedSandbox.ExecLog);
     }
 
     [Fact]
@@ -227,23 +327,55 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.Equal("OutputLimitExceeded", result.FailureKind);
     }
 
+    [Fact]
+    public async Task Replay_accepts_maximum_valid_step_and_assertion_result_without_small_stdout_cap()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(E2eReplayArtifactValidation.MaxSteps, E2eReplayArtifactValidation.MaxAssertions));
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = Enumerable.Range(0, E2eReplayArtifactValidation.MaxSteps)
+                .Select(_ => new E2eReplayStep { Action = "wait", Value = "0" })
+                .ToArray(),
+            Assertions = Enumerable.Range(0, E2eReplayArtifactValidation.MaxAssertions)
+                .Select(_ => new E2eReplayAssertion { Kind = "titleContains", Value = "Dashboard" })
+                .ToArray(),
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.True(result.Passed);
+        var exec = Assert.Single(sandbox.ExecRequests);
+        Assert.Equal(1024 * 1024, exec.MaxStdoutBytes);
+    }
+
     public static IEnumerable<object[]> InvalidArtifactCases()
     {
         yield return [new E2eReplayArtifact { Readiness = new E2eReadinessProbe { Argv = ["curl"], Url = "http://app.local/" } }, "UnsupportedLegacyArgv"];
         yield return [new E2eReplayArtifact { Readiness = new E2eReadinessProbe { Url = "" } }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Readiness = new E2eReadinessProbe { Url = "ftp://app.local/" } }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Readiness = new E2eReadinessProbe { Url = "http://app.local/", MaxAttempts = 0 } }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Readiness = new E2eReadinessProbe { Url = "http://app.local/", DelayMs = E2eReplayArtifactValidation.MaxReadinessDelayMs + 1 } }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Steps = null! }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Assertions = null! }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Steps = Enumerable.Range(0, E2eReplayArtifactValidation.MaxSteps + 1).Select(_ => new E2eReplayStep { Action = "click", Selector = "#x" }).ToArray() }, "ArtifactTooLarge"];
+        yield return [new E2eReplayArtifact { Assertions = Enumerable.Range(0, E2eReplayArtifactValidation.MaxAssertions + 1).Select(_ => new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#x" }).ToArray() }, "ArtifactTooLarge"];
+        yield return [new E2eReplayArtifact { Name = new string('x', E2eReplayArtifactValidation.MaxStringLength + 1), Steps = [new E2eReplayStep { Action = "click", Selector = "#x" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x", WorkingDirectory = "/work2" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "bogus" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "navigate" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "fill", Selector = "#x" }] }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "wait", DelayAfterMs = E2eReplayArtifactValidation.MaxStepDelayAfterMs + 1 }] }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = new string('x', E2eReplayArtifactValidation.MaxStringLength + 1) }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Argv = ["sh"], Kind = "selectorVisible", Selector = "#x" }] }, "UnsupportedLegacyArgv"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "bogus" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "selectorVisible" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "urlContains" }] }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "titleContains", Value = new string('x', E2eReplayArtifactValidation.MaxStringLength + 1) }] }, "ArtifactSchemaError"];
     }
 
     [Theory]
@@ -252,6 +384,39 @@ public sealed class E2eExecutionTests : IDisposable
     {
         Assert.False(E2eReplayArtifactValidation.TryValidate(artifact, out var failureKind, out _));
         Assert.Equal(expectedKind, failureKind);
+    }
+
+    [Fact]
+    public void Artifact_validation_accepts_supported_action_and_assertion_variants()
+    {
+        var artifact = new E2eReplayArtifact
+        {
+            Steps =
+            [
+                new E2eReplayStep { Action = "navigate", Target = "http://app.local/" },
+                new E2eReplayStep { Action = "click", Selector = "#click" },
+                new E2eReplayStep { Action = "doubleClick", Selector = "#double" },
+                new E2eReplayStep { Action = "fill", Selector = "#fill", Value = "abc" },
+                new E2eReplayStep { Action = "press", Selector = "#press", Value = "Enter" },
+                new E2eReplayStep { Action = "select", Selector = "#select", Value = "one" },
+                new E2eReplayStep { Action = "check", Selector = "#check" },
+                new E2eReplayStep { Action = "uncheck", Selector = "#uncheck" },
+                new E2eReplayStep { Action = "hover", Selector = "#hover" },
+                new E2eReplayStep { Action = "waitForSelector", Selector = "#ready" },
+                new E2eReplayStep { Action = "wait", Value = "10", DelayAfterMs = 0 },
+            ],
+            Assertions =
+            [
+                new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#ready" },
+                new E2eReplayAssertion { Kind = "selectorHidden", Selector = "#hidden" },
+                new E2eReplayAssertion { Kind = "selectorTextContains", Selector = "#message", Value = "ok" },
+                new E2eReplayAssertion { Kind = "urlContains", Value = "app.local" },
+                new E2eReplayAssertion { Kind = "titleContains", Value = "Dashboard" },
+            ],
+        };
+
+        Assert.True(E2eReplayArtifactValidation.TryValidate(artifact, out var failureKind, out var detail),
+            $"{failureKind}: {detail}");
     }
 
     [Fact]
@@ -824,6 +989,25 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.Equal(E2eRunStatus.Canceled, terminal.Status);
     }
 
+    [Fact]
+    public void CancellationRegistry_duplicate_register_and_unregister_paths_are_deterministic()
+    {
+        var registry = new E2eRunCancellationRegistry();
+        using var cts = registry.Register("run-1");
+
+        var duplicate = Assert.Throws<InvalidOperationException>(() => registry.Register("run-1"));
+        Assert.Contains("already registered", duplicate.Message);
+
+        Assert.True(registry.Cancel("run-1"));
+        Assert.True(cts.IsCancellationRequested);
+        registry.Unregister("run-1", cts);
+
+        Assert.False(registry.Cancel("run-1"));
+
+        using var stale = new CancellationTokenSource();
+        registry.Unregister("run-1", stale);
+        Assert.True(stale.IsCancellationRequested is false);
+    }
 
     [Fact]
     public async Task Dispatcher_records_error_for_artifact_with_no_steps_and_no_assertions()
@@ -864,11 +1048,153 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.Contains("EmptyArtifact", terminal.Result);
     }
 
+    public static IEnumerable<object?[]> DispatcherArtifactLoadFailures()
+    {
+        yield return [AutomationKind.Unit, MakeTrivialPassArtifact(), "WrongAutomationKind"];
+        yield return [AutomationKind.E2eReplay, (string?)null, "MissingArtifact"];
+        yield return [AutomationKind.E2eReplay, new string('x', E2eReplayArtifactValidation.MaxArtifactJsonBytes + 1), "ArtifactTooLarge"];
+        yield return [AutomationKind.E2eReplay, "{ not-json", "ArtifactParseError"];
+    }
+
+    [Theory]
+    [MemberData(nameof(DispatcherArtifactLoadFailures))]
+    public async Task Dispatcher_records_terminal_errors_for_already_queued_artifact_load_failures(
+        AutomationKind kind,
+        string? artifactJson,
+        string expectedFailureKind)
+    {
+        var testCaseId = await SeedTestCaseAsync(kind, artifactJson);
+        var runId = Guid.NewGuid().ToString("N");
+        await _runs.CreateAsync(new E2eRun { Id = runId, TestCaseId = testCaseId, Status = E2eRunStatus.Queued });
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+        {
+            Enabled = true,
+            MaxConcurrent = 1,
+            PollInterval = TimeSpan.FromMilliseconds(5),
+            PerRunTimeout = TimeSpan.FromSeconds(10),
+        });
+        var pool = new LocalE2eExecutionPool(new CountingSandboxProvider(), monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var dispatcher = new E2eRunDispatcher(
+            _runs,
+            pool,
+            new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance),
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
+
+        var terminal = await WaitForRunStatusAsync(runId, E2eRunStatus.Error);
+        await WaitForDispatcherIdleAsync(dispatcher);
+        Assert.Contains(expectedFailureKind, terminal.Result);
+    }
+
+    [Fact]
+    public async Task Dispatcher_records_error_for_claimed_run_with_missing_test_case()
+    {
+        var runId = Guid.NewGuid().ToString("N");
+        var store = new ClaimFailureRunStore
+        {
+            Queued = true,
+            ClaimedRun = new E2eRun
+            {
+                Id = runId,
+                TestCaseId = "missing-test-case",
+                Status = E2eRunStatus.Running,
+            },
+        };
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { Enabled = true, MaxConcurrent = 1 });
+        var pool = new LocalE2eExecutionPool(new CountingSandboxProvider(), monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var dispatcher = new E2eRunDispatcher(
+            store,
+            pool,
+            new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance),
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
+        await WaitForDispatcherIdleAsync(dispatcher);
+
+        Assert.Equal(E2eRunStatus.Error, store.UpdatedStatus);
+        Assert.Contains("MissingTestCase", store.UpdatedResult);
+    }
+
+    [Fact]
+    public async Task Dispatcher_does_not_dispatch_when_pool_is_full()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        await _runs.CreateAsync(new E2eRun { Id = Guid.NewGuid().ToString("N"), TestCaseId = tcId, Status = E2eRunStatus.Queued });
+        var provider = new CountingSandboxProvider();
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { Enabled = true, MaxConcurrent = 1 });
+        var pool = new LocalE2eExecutionPool(provider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        await using var held = await pool.LeaseAsync();
+        var dispatcher = new E2eRunDispatcher(
+            _runs,
+            pool,
+            new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance),
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.False(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
+        Assert.Equal(1, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task Dispatcher_releases_backoff_paths_for_lease_and_claim_failures()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        await _runs.CreateAsync(new E2eRun { Id = Guid.NewGuid().ToString("N"), TestCaseId = tcId, Status = E2eRunStatus.Queued });
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { Enabled = true, MaxConcurrent = 1 });
+        var throwingProvider = new CountingSandboxProvider { ThrowOnCreate = true };
+        var throwingPool = new LocalE2eExecutionPool(throwingProvider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var leaseDispatcher = new E2eRunDispatcher(
+            _runs,
+            throwingPool,
+            new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance),
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.False(await leaseDispatcher.TryDispatchOneAsync(CancellationToken.None));
+        Assert.Equal(0, throwingPool.InFlight);
+
+        var claimStore = new ClaimFailureRunStore { Queued = true, ThrowOnClaim = true };
+        var claimProvider = new CountingSandboxProvider();
+        var claimPool = new LocalE2eExecutionPool(claimProvider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var claimDispatcher = new E2eRunDispatcher(
+            claimStore,
+            claimPool,
+            new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance),
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.False(await claimDispatcher.TryDispatchOneAsync(CancellationToken.None));
+        Assert.Equal(0, claimPool.InFlight);
+        Assert.True(claimProvider.AllSandboxesDisposed);
+
+        claimStore.ThrowOnClaim = false;
+        claimStore.ReturnNullClaim = true;
+        Assert.False(await claimDispatcher.TryDispatchOneAsync(CancellationToken.None));
+        Assert.Equal(0, claimPool.InFlight);
+        Assert.True(claimProvider.AllSandboxesDisposed);
+    }
+
     // --------------------------------------------------------------------
     // Helpers
     // --------------------------------------------------------------------
 
     private async Task<string> SeedE2eTestCaseAsync(string artifactJson)
+        => await SeedTestCaseAsync(AutomationKind.E2eReplay, artifactJson);
+
+    private async Task<string> SeedTestCaseAsync(AutomationKind automationKind, string? artifactJson)
     {
         var item = new WorkItem
         {
@@ -886,7 +1212,7 @@ public sealed class E2eExecutionTests : IDisposable
             Name = "fixture",
             Description = "fixture",
             SourceWorkItemId = item.Id.ToString(),
-            AutomationKind = AutomationKind.E2eReplay,
+            AutomationKind = automationKind,
             ExecutableArtifactJson = artifactJson,
         };
         await _testCases.CreateAsync(tc);
@@ -998,6 +1324,127 @@ public sealed class E2eExecutionTests : IDisposable
         public ValueTask DisposeAsync() => default;
     }
 
+    private sealed class LocalNodeSandbox : ISandbox
+    {
+        private readonly string _root;
+
+        public LocalNodeSandbox()
+        {
+            _root = Path.Combine(Path.GetTempPath(), $"codeybox-node-driver-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(Path.Combine(_root, "node_modules", "playwright"));
+            File.WriteAllText(Path.Combine(_root, "node_modules", "playwright", "index.js"), PlaywrightStub);
+        }
+
+        public string Id { get; } = "local-node-" + Guid.NewGuid().ToString("N")[..8];
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var psi = new ProcessStartInfo(exec.Argv[0])
+            {
+                WorkingDirectory = _root,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (var arg in exec.Argv.Skip(1))
+                psi.ArgumentList.Add(arg);
+            psi.Environment["NODE_PATH"] = Path.Combine(_root, "node_modules");
+
+            using var process = Process.Start(psi) ?? throw new InvalidOperationException("failed to start node");
+            if (exec.Stdin is not null)
+            {
+                await process.StandardInput.WriteAsync(exec.Stdin.AsMemory(), ct);
+            }
+            process.StandardInput.Close();
+
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = process.StandardError.ReadToEndAsync(ct);
+            try
+            {
+                await process.WaitForExitAsync(ct);
+            }
+            catch
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                throw;
+            }
+
+            return new SandboxExecResult(
+                process.ExitCode,
+                await stdoutTask,
+                await stderrTask);
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            try { Directory.Delete(_root, recursive: true); } catch { }
+            return default;
+        }
+
+        private const string PlaywrightStub =
+            """
+            let pageInstance;
+
+            function makeLocator(selector) {
+              return {
+                first() { return this; },
+                async isVisible() { return selector !== '#hidden'; },
+                async textContent() {
+                  if (selector === '#message') return 'Welcome Ada';
+                  return '';
+                },
+                async click() {},
+                async dblclick() {},
+                async fill(value) { pageInstance.values[selector] = value; },
+                async press() {},
+                async selectOption() {},
+                async check() {},
+                async uncheck() {},
+                async hover() {},
+                async waitFor() {}
+              };
+            }
+
+            function makePage(routes) {
+              return pageInstance = {
+                currentUrl: 'about:blank',
+                values: {},
+                locator: makeLocator,
+                async goto(url) {
+                  for (const handler of routes) {
+                    let aborted = false;
+                    await handler({
+                      request: () => ({ url: () => url }),
+                      continue: async () => {},
+                      abort: async () => { aborted = true; }
+                    });
+                    if (aborted) throw new Error('request blocked');
+                  }
+                  this.currentUrl = url;
+                },
+                url() { return this.currentUrl; },
+                async title() { return 'Dashboard'; },
+                async waitForTimeout() {}
+              };
+            }
+
+            exports.chromium = {
+              async launch() {
+                const routes = [];
+                return {
+                  async newContext() {
+                    return {
+                      async route(_pattern, handler) { routes.push(handler); },
+                      async newPage() { return makePage(routes); }
+                    };
+                  },
+                  async close() {}
+                };
+              }
+            };
+            """;
+    }
+
     private sealed class CountingSandboxProvider : ISandboxProvider
     {
         private readonly TimeSpan _execDelay;
@@ -1043,6 +1490,63 @@ public sealed class E2eExecutionTests : IDisposable
             do { existing = Volatile.Read(ref MaxConcurrentSeen); }
             while (current > existing
                 && Interlocked.CompareExchange(ref MaxConcurrentSeen, current, existing) != existing);
+        }
+    }
+
+    private sealed class ClaimFailureRunStore : IE2eRunStore
+    {
+        public bool Queued { get; set; }
+        public bool ThrowOnClaim { get; set; }
+        public bool ReturnNullClaim { get; set; }
+        public E2eRun? ClaimedRun { get; set; }
+        public E2eRunStatus? UpdatedStatus { get; private set; }
+        public string? UpdatedResult { get; private set; }
+
+        public Task CreateAsync(E2eRun run, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<E2eRun?> GetAsync(string id, CancellationToken ct = default) => Task.FromResult<E2eRun?>(null);
+
+        public IAsyncEnumerable<E2eRun> ListAsync(int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default) => Empty();
+
+        public IAsyncEnumerable<E2eRun> ListByTestCaseAsync(string testCaseId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default) => Empty();
+
+        public IAsyncEnumerable<E2eRun> ListByBatchAsync(string batchId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default) => Empty();
+
+        public Task<E2eRunBatchCounts?> GetBatchCountsAsync(string batchId, CancellationToken ct = default) => Task.FromResult<E2eRunBatchCounts?>(null);
+
+        public Task<bool> HasQueuedAsync(CancellationToken ct = default) => Task.FromResult(Queued);
+
+        public Task<E2eRun?> ClaimNextQueuedAsync(string sandboxId, CancellationToken ct = default)
+        {
+            if (ThrowOnClaim)
+                throw new InvalidOperationException("claim failed");
+            if (ReturnNullClaim)
+                return Task.FromResult<E2eRun?>(null);
+            if (ClaimedRun is not null)
+                return Task.FromResult<E2eRun?>(ClaimedRun with { SandboxId = sandboxId, Status = E2eRunStatus.Running });
+            return Task.FromResult<E2eRun?>(new E2eRun
+            {
+                Id = "claimed",
+                TestCaseId = "tc",
+                Status = E2eRunStatus.Running,
+                SandboxId = sandboxId,
+                StartedAt = DateTimeOffset.UtcNow,
+            });
+        }
+
+        public Task<bool> UpdateStatusAsync(string id, E2eRunStatus status, DateTimeOffset? startedAt, DateTimeOffset? finishedAt, string? result, CancellationToken ct = default)
+        {
+            UpdatedStatus = status;
+            UpdatedResult = result;
+            return Task.FromResult(true);
+        }
+
+        public Task<bool> CancelAsync(string id, CancellationToken ct = default) => Task.FromResult(true);
+
+        private static async IAsyncEnumerable<E2eRun> Empty()
+        {
+            await Task.CompletedTask;
+            yield break;
         }
     }
 

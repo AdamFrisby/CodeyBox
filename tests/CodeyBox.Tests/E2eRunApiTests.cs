@@ -66,6 +66,35 @@ public sealed class E2eRunApiTests : IDisposable
     }
 
     [Fact]
+    public void Program_wires_multi_host_remote_e2e_pool_from_plural_config()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            globalRemoteTarget: "coding@remote.example",
+            e2eRemoteTargets: ["e2e-a@remote.example", "e2e-b@remote.example"]);
+
+        var pool = Assert.IsType<MultiHostE2eExecutionPool>(factory.Services.GetRequiredService<IE2eExecutionPool>());
+        var source = Assert.IsAssignableFrom<IManagedSandboxProviderSource>(pool);
+
+        Assert.Equal("remote-ssh[2]", pool.Name);
+        Assert.Equal(2, source.ManagedSandboxProviders.Count);
+        Assert.All(source.ManagedSandboxProviders, provider => Assert.IsType<MultipassRemoteSandboxProvider>(provider));
+    }
+
+    [Fact]
+    public void Program_registers_e2e_provider_with_lifecycle_composite()
+    {
+        using var factory = new E2ePoolWiringFactory("remote-ssh");
+
+        var pool = factory.Services.GetRequiredService<IE2eExecutionPool>();
+        var e2eProvider = GetInnerProvider(pool);
+        var composite = factory.Services.GetRequiredService<CompositeManagedSandboxProvider>();
+
+        Assert.Contains(factory.Services.GetRequiredService<ISandboxProvider>(), composite.Providers);
+        Assert.Contains(e2eProvider, composite.Providers);
+    }
+
+    [Fact]
     public void Program_rejects_enabled_remote_e2e_without_baseline_ref()
     {
         using var factory = new E2ePoolWiringFactory("remote-ssh", e2eEnabled: true, baselineImageRef: null);
@@ -73,6 +102,40 @@ public sealed class E2eRunApiTests : IDisposable
         var ex = Assert.Throws<OptionsValidationException>(() =>
             factory.Services.GetRequiredService<IE2eExecutionPool>());
         Assert.Contains("BaselineImageRef", ex.Message);
+    }
+
+    [Fact]
+    public void Program_rejects_enabled_remote_e2e_without_dedicated_target()
+    {
+        using var factory = new E2ePoolWiringFactory("remote-ssh", e2eEnabled: true, e2eRemoteTarget: null);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("SshTarget", ex.Message);
+    }
+
+    [Fact]
+    public void Program_rejects_enabled_remote_e2e_when_network_profile_is_set()
+    {
+        using var factory = new E2ePoolWiringFactory("remote-ssh", e2eEnabled: true, networkProfile: "coding-net");
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("NetworkProfile", ex.Message);
+    }
+
+    [Fact]
+    public void Program_rejects_enabled_remote_e2e_when_target_matches_coding_fleet()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            globalRemoteTarget: "same@remote.example",
+            e2eRemoteTarget: "same@remote.example",
+            e2eEnabled: true);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("different SSH host", ex.Message);
     }
 
     [Fact]
@@ -207,6 +270,54 @@ public sealed class E2eRunApiTests : IDisposable
     }
 
     [Fact]
+    public async Task E2eRun_bulk_enqueue_rejects_wrong_kind_and_missing_artifact()
+    {
+        var wrongKind = await SeedCaseAsync("api-bulk-wrong-kind", AutomationKind.Unit, "{}");
+        var wrongKindResponse = await _client.PostAsJsonAsync(
+            "/e2eruns/bulk",
+            new EnqueueBulkE2eRunsRequest([wrongKind]));
+        Assert.Equal(HttpStatusCode.BadRequest, wrongKindResponse.StatusCode);
+
+        var missingArtifact = await SeedCaseAsync("api-bulk-missing-artifact", AutomationKind.E2eReplay, null);
+        var missingArtifactResponse = await _client.PostAsJsonAsync(
+            "/e2eruns/bulk",
+            new EnqueueBulkE2eRunsRequest([missingArtifact]));
+        Assert.Equal(HttpStatusCode.BadRequest, missingArtifactResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task E2eRun_endpoints_return_not_found_for_missing_resources()
+    {
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync("/e2eruns/missing-run")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.PostAsync("/e2eruns/missing-run/cancel", content: null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync("/testcases/missing-case/runs")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync("/e2eruns/batches/missing-batch")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync("/e2eruns/batches/missing-batch/runs")).StatusCode);
+    }
+
+    [Fact]
+    public async Task E2eRun_list_normalizes_page_bounds_and_ignores_invalid_result_json()
+    {
+        var testCaseId = await SeedE2eCaseAsync("api-invalid-result-case");
+        var run = new E2eRun
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            TestCaseId = testCaseId,
+            Status = E2eRunStatus.Error,
+            Result = "{ not-json",
+        };
+        await _factory.E2eRunStore.CreateAsync(run);
+
+        var page = await _client.GetFromJsonAsync<E2eRunPageDto>("/e2eruns?offset=-5&limit=999999");
+
+        Assert.NotNull(page);
+        Assert.Equal(0, page.Offset);
+        Assert.Equal(E2eExecutionOptions.MaximumListPageSize, page.Limit);
+        var dto = Assert.Single(page.Runs, r => r.Id == run.Id);
+        Assert.Null(dto.Result);
+    }
+
+    [Fact]
     public async Task E2eRun_cancel_running_run_signals_registry()
     {
         var testCaseId = await SeedE2eCaseAsync("api-running-cancel");
@@ -307,10 +418,13 @@ internal sealed class E2ePoolWiringFactory(
     string? globalRemoteTarget = null,
     string? e2eRemoteTarget = "codeybox@e2e.example",
     bool e2eEnabled = false,
-    string? baselineImageRef = "cb-e2e-baseline") : WebApplicationFactory<Program>
+    string? baselineImageRef = "cb-e2e-baseline",
+    string? networkProfile = null,
+    IReadOnlyList<string>? e2eRemoteTargets = null) : WebApplicationFactory<Program>
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-e2epool-{Guid.NewGuid():N}.db");
+    private readonly IReadOnlyList<string>? _e2eRemoteTargets = e2eRemoteTargets;
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -318,7 +432,7 @@ internal sealed class E2ePoolWiringFactory(
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             var tmp = Path.GetTempPath();
-            cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            var values = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
@@ -326,13 +440,27 @@ internal sealed class E2ePoolWiringFactory(
                 ["CodeyBox:E2eExecution:PoolKind"] = poolKind,
                 ["CodeyBox:E2eExecution:Enabled"] = e2eEnabled.ToString(),
                 ["CodeyBox:E2eExecution:BaselineImageRef"] = baselineImageRef,
+                ["CodeyBox:E2eExecution:NetworkProfile"] = networkProfile,
                 ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = globalRemoteTarget,
-                ["CodeyBox:E2eMultipassRemoteSandbox:SshTarget"] = e2eRemoteTarget,
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-            });
+            };
+            if (_e2eRemoteTargets is { Count: > 0 })
+            {
+                for (var i = 0; i < _e2eRemoteTargets.Count; i++)
+                {
+                    values[$"CodeyBox:E2eMultipassRemoteSandboxes:{i}:SshTarget"] = _e2eRemoteTargets[i];
+                    values[$"CodeyBox:E2eMultipassRemoteSandboxes:{i}:MaxConcurrent"] = "1";
+                }
+            }
+            else
+            {
+                values["CodeyBox:E2eMultipassRemoteSandbox:SshTarget"] = e2eRemoteTarget;
+            }
+
+            cfg.AddInMemoryCollection(values);
         });
         builder.ConfigureTestServices(services =>
         {

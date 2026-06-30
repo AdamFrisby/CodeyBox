@@ -259,6 +259,73 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.False(result.Failed, result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("ftp://app.local")]
+    [InlineData("http://app.local/path")]
+    [InlineData("http://app.local?x=1")]
+    [InlineData("http://app.local#frag")]
+    [InlineData("http://user@app.local")]
+    public void Validate_RejectsInvalidE2eAllowedReadinessOrigins(string origin)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.E2eExecution.AllowedReadinessOrigins = [origin];
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("AllowedReadinessOrigins", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEmptyE2eAllowedReadinessOrigins()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.E2eExecution.AllowedReadinessOrigins = [];
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("AllowedReadinessOrigins", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEnabledRemoteE2ePrerequisiteFailures()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "coding@example" };
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "coding@example" };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+        options.E2eExecution.NetworkProfile = "unsupported";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("NetworkProfile", result.FailureMessage);
+        Assert.Contains("different SSH host", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsInvalidE2eRemoteHostCapacity()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.E2eMultipassRemoteSandboxes =
+        [
+            new MultipassRemoteSandboxConfig
+            {
+                SshTarget = "e2e@example",
+                MaxConcurrent = E2eExecutionOptions.MaximumMaxConcurrent + 1,
+            },
+        ];
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("E2eMultipassRemoteSandboxes:0:MaxConcurrent", result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_RejectsInvalidSandboxResumeMode()
     {

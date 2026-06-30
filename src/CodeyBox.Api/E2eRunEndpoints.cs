@@ -132,17 +132,19 @@ internal static class E2eRunEndpoints
     {
         var run = await runs.GetAsync(id, ct);
         if (run is null) return Results.NotFound();
-        var signaledRunningRun = run.Status == E2eRunStatus.Running;
-        if (run.Status == E2eRunStatus.Running)
-            cancellations.Cancel(id);
+        var wasCancelable = run.Status is E2eRunStatus.Queued or E2eRunStatus.Running;
         var ok = await runs.CancelAsync(id, ct);
         if (!ok)
         {
             var current = await runs.GetAsync(id, ct);
-            if (signaledRunningRun && current?.Status == E2eRunStatus.Canceled)
+            if (wasCancelable && current?.Status == E2eRunStatus.Canceled)
+            {
+                cancellations.Cancel(id);
                 return Results.Ok(ToDto(current));
+            }
             return Results.Conflict(new { error = $"run '{id}' is already terminal (status={current?.Status ?? run.Status})" });
         }
+        cancellations.Cancel(id);
         var refreshed = await runs.GetAsync(id, ct);
         return refreshed is null ? Results.NoContent() : Results.Ok(ToDto(refreshed));
     }

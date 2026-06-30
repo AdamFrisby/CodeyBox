@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using CodeyBox.Core;
@@ -29,7 +30,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
     private readonly ILogger<E2eReplayRuntime> _logger;
     private readonly IOptionsMonitor<E2eExecutionOptions>? _options;
     private const int OutputTailBytes = 4096;
-    private const int OutputCaptureBytes = 16 * 1024;
+    private const int OutputCaptureBytes = 1024 * 1024;
     private const string ReplayDriverBinary = "node";
     private static readonly JsonSerializerOptions ArtifactJson = new(JsonSerializerDefaults.Web);
     private static readonly JsonSerializerOptions ResultJson = new(JsonSerializerDefaults.Web)
@@ -58,6 +59,12 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         {
             sw.Stop();
             return Fail(schemaDetail, schemaKind, failedIndex: -1, stepResults, assertionResults, sw.ElapsedMilliseconds);
+        }
+
+        if (!TryValidateReplayNavigationTargets(artifact, out var navigationDetail))
+        {
+            sw.Stop();
+            return Fail(navigationDetail, "NavigationUrlRejected", failedIndex: -1, stepResults, assertionResults, sw.ElapsedMilliseconds);
         }
 
         if (artifact.Readiness is { Url.Length: > 0 } readiness)
@@ -111,7 +118,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             result = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = [ReplayDriverBinary, "-e", ReplayDriverScript],
-                Stdin = JsonSerializer.Serialize(artifact, ArtifactJson),
+                Stdin = JsonSerializer.Serialize(ToReplayDriverInput(artifact), ArtifactJson),
                 WorkingDirectory = "/work",
                 MaxStdoutBytes = OutputCaptureBytes,
                 MaxStderrBytes = OutputCaptureBytes,
@@ -236,9 +243,9 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
     {
         if (IPAddress.TryParse(uri.IdnHost, out var literal))
         {
-            return IsSafeReadinessIp(literal)
-                ? (true, string.Empty, string.Empty, literal.ToString())
-                : (false, "ReadinessUrlRejected", $"readiness.url resolves to disallowed address {literal}", null);
+            return IsBlockedMetadataIp(literal)
+                ? (false, "ReadinessUrlRejected", $"readiness.url resolves to disallowed metadata address {literal}", null)
+                : (true, string.Empty, string.Empty, literal.ToString());
         }
 
         SandboxExecResult result;
@@ -271,8 +278,8 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             var token = line.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
             if (token is null || !IPAddress.TryParse(token, out var ip))
                 continue;
-            if (!IsSafeReadinessIp(ip))
-                return (false, "ReadinessUrlRejected", $"readiness.url resolves to disallowed address {ip}", null);
+            if (IsBlockedMetadataIp(ip))
+                return (false, "ReadinessUrlRejected", $"readiness.url resolves to disallowed metadata address {ip}", null);
             first ??= ip;
         }
 
@@ -314,6 +321,78 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
 
         detail = $"readiness.url origin '{normalized}' is not in CodeyBox:E2eExecution:AllowedReadinessOrigins";
         return false;
+    }
+
+    private bool TryValidateReplayNavigationTargets(E2eReplayArtifact artifact, out string detail)
+    {
+        foreach (var (step, index) in artifact.Steps.Select((step, index) => (step, index)))
+        {
+            if (!string.Equals(step.Action, "navigate", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!TryValidateAllowedAppUrl(step.Target, "steps[" + index + "].target", out detail))
+                return false;
+        }
+
+        detail = string.Empty;
+        return true;
+    }
+
+    private bool TryValidateAllowedAppUrl(string? url, string fieldName, out string detail)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed)
+            || (parsed.Scheme != Uri.UriSchemeHttp && parsed.Scheme != Uri.UriSchemeHttps))
+        {
+            detail = $"{fieldName} must be an absolute http(s) URL";
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(parsed.UserInfo))
+        {
+            detail = $"{fieldName} must not contain userinfo";
+            return false;
+        }
+
+        if (!IsAllowedOrigin(parsed, out var normalized))
+        {
+            detail = $"{fieldName} origin '{normalized}' is not in CodeyBox:E2eExecution:AllowedReadinessOrigins";
+            return false;
+        }
+
+        detail = string.Empty;
+        return true;
+    }
+
+    private bool IsAllowedOrigin(Uri parsed, out string normalized)
+    {
+        normalized = NormalizeOrigin(parsed);
+        var allowed = _options?.CurrentValue.AllowedReadinessOrigins
+            ?? new E2eExecutionOptions().AllowedReadinessOrigins;
+        foreach (var allowedOrigin in allowed)
+        {
+            if (!Uri.TryCreate(allowedOrigin, UriKind.Absolute, out var allowedUri))
+                continue;
+            if (string.Equals(normalized, NormalizeOrigin(allowedUri), StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private ReplayDriverInput ToReplayDriverInput(E2eReplayArtifact artifact)
+    {
+        var allowed = _options?.CurrentValue.AllowedReadinessOrigins
+            ?? new E2eExecutionOptions().AllowedReadinessOrigins;
+        return new ReplayDriverInput(
+            artifact.Name,
+            artifact.Readiness,
+            artifact.Steps,
+            artifact.Assertions,
+            allowed
+                .Where(static origin => Uri.TryCreate(origin, UriKind.Absolute, out _))
+                .Select(static origin => NormalizeOrigin(new Uri(origin)))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray());
     }
 
     private static E2eRunResult Fail(string summary, string kind, int failedIndex, IReadOnlyList<E2eStepResult> steps, IReadOnlyList<E2eAssertionResult> assertions, long durationMs)
@@ -383,43 +462,32 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             : $"{uri.Scheme}://{uri.IdnHost}:{port}";
     }
 
-    private static bool IsSafeReadinessIp(IPAddress ip)
+    private static bool IsBlockedMetadataIp(IPAddress ip)
     {
         if (ip.IsIPv4MappedToIPv6)
             ip = ip.MapToIPv4();
 
-        if (IPAddress.IsLoopback(ip))
-            return false;
-
         if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
         {
             var b = ip.GetAddressBytes();
-            if (b[0] == 0) return false;
-            if (b[0] == 10) return false;
-            if (b[0] == 100 && b[1] is >= 64 and <= 127) return false;
-            if (b[0] == 127) return false;
-            if (b[0] == 169 && b[1] == 254) return false;
-            if (b[0] == 172 && b[1] is >= 16 and <= 31) return false;
-            if (b[0] == 192 && b[1] == 168) return false;
-            if (b[0] >= 224) return false;
-            return true;
+            return b[0] == 169 && b[1] == 254 && b[2] == 169 && b[3] == 254;
         }
 
-        return !ip.IsIPv6LinkLocal
-            && !ip.IsIPv6Multicast
-            && !ip.IsIPv6SiteLocal
-            && !IsUniqueLocalIPv6(ip);
+        return false;
     }
 
-    private static bool IsUniqueLocalIPv6(IPAddress ip)
-    {
-        var b = ip.GetAddressBytes();
-        return (b[0] & 0xfe) == 0xfc;
-    }
+    private sealed record ReplayDriverInput(
+        [property: JsonPropertyName("name")] string? Name,
+        [property: JsonPropertyName("readiness")] E2eReadinessProbe? Readiness,
+        [property: JsonPropertyName("steps")] IReadOnlyList<E2eReplayStep> Steps,
+        [property: JsonPropertyName("assertions")] IReadOnlyList<E2eReplayAssertion> Assertions,
+        [property: JsonPropertyName("__codeyboxAllowedOrigins")] IReadOnlyList<string> AllowedOrigins);
 
     private const string ReplayDriverScript =
         """
         const fs = require('fs');
+        const dns = require('dns').promises;
+        const net = require('net');
 
         function tail(value) {
           const s = String(value || '');
@@ -454,9 +522,58 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           return { description: assertion.description || null, passed: false, detail: tail(error && error.stack ? error.stack : error) };
         }
 
-        async function performStep(page, step) {
+        function normalizeOrigin(raw) {
+          const u = new URL(String(raw));
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`non-http URL is not allowed: ${raw}`);
+          if (u.username || u.password) throw new Error(`userinfo is not allowed in URL: ${raw}`);
+          return u.origin;
+        }
+
+        function buildAllowedOriginSet(artifact) {
+          const origins = Array.isArray(artifact.__codeyboxAllowedOrigins) ? artifact.__codeyboxAllowedOrigins : [];
+          return new Set(origins.map(normalizeOrigin));
+        }
+
+        function ensureAllowedUrl(raw, allowedOrigins, label) {
+          const origin = normalizeOrigin(raw);
+          if (!allowedOrigins.has(origin)) throw new Error(`${label} origin ${origin} is not allowed`);
+          return origin;
+        }
+
+        function isMetadataAddress(address) {
+          return address === '169.254.169.254';
+        }
+
+        async function buildHostResolverRules(allowedOrigins) {
+          const rules = [];
+          for (const origin of allowedOrigins) {
+            const u = new URL(origin);
+            if (net.isIP(u.hostname)) {
+              if (isMetadataAddress(u.hostname)) throw new Error(`allowed origin resolves to blocked metadata address ${u.hostname}`);
+              continue;
+            }
+
+            let records;
+            try {
+              records = await dns.lookup(u.hostname, { all: true });
+            } catch {
+              continue;
+            }
+
+            const usable = records.find(r => !isMetadataAddress(r.address));
+            if (!usable && records.length > 0) throw new Error(`allowed origin resolves only to blocked metadata addresses: ${u.hostname}`);
+            if (usable) rules.push(`MAP ${u.hostname} ${usable.address}`);
+          }
+          return rules.length > 0 ? rules.join(',') : null;
+        }
+
+        async function performStep(page, step, allowedOrigins) {
           const action = String(step.action || '').toLowerCase();
-          if (action === 'navigate') await page.goto(step.target, { waitUntil: 'domcontentloaded' });
+          if (action === 'navigate') {
+            ensureAllowedUrl(step.target, allowedOrigins, 'navigate target');
+            await page.goto(step.target, { waitUntil: 'domcontentloaded' });
+            ensureAllowedUrl(page.url(), allowedOrigins, 'final navigation URL');
+          }
           else if (action === 'click') await page.locator(step.selector).click();
           else if (action === 'doubleclick') await page.locator(step.selector).dblclick();
           else if (action === 'fill') await page.locator(step.selector).fill(step.value || '');
@@ -505,6 +622,8 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           let artifact;
           try {
             artifact = JSON.parse(fs.readFileSync(0, 'utf8'));
+            const allowedOrigins = buildAllowedOriginSet(artifact);
+            if (allowedOrigins.size === 0) throw new Error('no allowed replay origins configured');
             let chromium;
             try {
               chromium = require('playwright').chromium;
@@ -514,12 +633,24 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
               return;
             }
 
-            browser = await chromium.launch({ headless: true });
+            const resolverRules = await buildHostResolverRules(allowedOrigins);
+            const launchOptions = { headless: true };
+            if (resolverRules) launchOptions.args = [`--host-resolver-rules=${resolverRules}`];
+            browser = await chromium.launch(launchOptions);
             const context = await browser.newContext();
+            await context.route('**/*', route => {
+              const url = route.request().url();
+              try {
+                ensureAllowedUrl(url, allowedOrigins, 'request');
+                return route.continue();
+              } catch {
+                return route.abort('blockedbyclient');
+              }
+            });
             const page = await context.newPage();
             for (let i = 0; i < (artifact.steps || []).length; i++) {
               try {
-                await performStep(page, artifact.steps[i]);
+                await performStep(page, artifact.steps[i], allowedOrigins);
                 stepResults.push(okStep());
               } catch (error) {
                 stepResults.push(failStep(error));

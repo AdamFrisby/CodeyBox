@@ -19,7 +19,7 @@ namespace CodeyBox.Orchestrator;
 /// <see cref="E2eRunDispatcher"/> hosted service owns queue draining and calls
 /// <see cref="LeaseAsync"/> once a slot is free.</para>
 /// </summary>
-public sealed class LocalE2eExecutionPool : IE2eExecutionPool
+public sealed class LocalE2eExecutionPool : IE2eExecutionPool, IManagedSandboxProviderSource
 {
     private readonly ISandboxProvider _provider;
     private readonly IOptionsMonitor<E2eExecutionOptions>? _options;
@@ -63,6 +63,8 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool
     public int MaxConcurrent => _gate.CurrentTarget;
 
     public int InFlight => _gate.CurrentInFlight;
+
+    public IReadOnlyList<ISandboxProvider> ManagedSandboxProviders => [_provider];
 
     public async Task<IE2eExecutionSlot> LeaseAsync(CancellationToken ct = default)
     {

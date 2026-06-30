@@ -57,11 +57,41 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             {
                 failures.Add("CodeyBox:E2eExecution:BaselineImageRef is required when E2E execution is enabled with PoolKind=remote-ssh");
             }
-            if (e2e.AllowedReadinessOrigins.Count == 0)
+            if (e2e.Enabled
+                && string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(e2e.NetworkProfile))
+            {
+                failures.Add("CodeyBox:E2eExecution:NetworkProfile is not supported when E2E execution uses PoolKind=remote-ssh");
+            }
+            if (e2e.Enabled
+                && string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
+            {
+                var e2eHosts = GetE2eRemoteHostConfigs(options);
+                if (e2eHosts.Count == 0 || e2eHosts.Any(static h => string.IsNullOrWhiteSpace(h.SshTarget)))
+                {
+                    failures.Add("CodeyBox:E2eMultipassRemoteSandbox:SshTarget or CodeyBox:E2eMultipassRemoteSandboxes[*]:SshTarget is required when E2E execution uses PoolKind=remote-ssh");
+                }
+
+                var codingIdentity = RemotePoolIdentity(options.MultipassRemoteSandbox);
+                if (codingIdentity is not null
+                    && e2eHosts.Any(host => string.Equals(RemotePoolIdentity(host), codingIdentity, StringComparison.OrdinalIgnoreCase)))
+                {
+                    failures.Add("CodeyBox:E2eMultipassRemoteSandbox must target a different SSH host than CodeyBox:MultipassRemoteSandbox");
+                }
+            }
+            foreach (var (host, index) in GetE2eRemoteHostConfigs(options).Select((host, index) => (host, index)))
+            {
+                if (host.MaxConcurrent is < E2eExecutionOptions.MinimumMaxConcurrent or > E2eExecutionOptions.MaximumMaxConcurrent)
+                {
+                    failures.Add(
+                        $"CodeyBox:E2eMultipassRemoteSandboxes:{index}:MaxConcurrent must be between {E2eExecutionOptions.MinimumMaxConcurrent} and {E2eExecutionOptions.MaximumMaxConcurrent}");
+                }
+            }
+            if (e2e.AllowedReadinessOrigins is null || e2e.AllowedReadinessOrigins.Count == 0)
             {
                 failures.Add("CodeyBox:E2eExecution:AllowedReadinessOrigins must contain at least one origin");
             }
-            foreach (var origin in e2e.AllowedReadinessOrigins)
+            foreach (var origin in e2e.AllowedReadinessOrigins ?? [])
             {
                 if (string.IsNullOrWhiteSpace(origin)
                     || !Uri.TryCreate(origin, UriKind.Absolute, out var uri)
@@ -220,5 +250,22 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
+    }
+
+    private static IReadOnlyList<MultipassRemoteSandboxConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
+    {
+        if (options.E2eMultipassRemoteSandboxes is { Count: > 0 } hosts)
+            return hosts;
+        return options.E2eMultipassRemoteSandbox is null
+            ? []
+            : [options.E2eMultipassRemoteSandbox];
+    }
+
+    private static string? RemotePoolIdentity(MultipassRemoteSandboxConfig? config)
+    {
+        if (string.IsNullOrWhiteSpace(config?.SshTarget))
+            return null;
+        var port = config.SshPort ?? 22;
+        return $"{config.SshTarget.Trim()}:{port}";
     }
 }

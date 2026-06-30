@@ -38,6 +38,20 @@ internal static class E2eReplayArtifactValidation
 
     public static bool TryValidate(E2eReplayArtifact artifact, out string failureKind, out string detail)
     {
+        if (artifact.Steps is null)
+        {
+            failureKind = "ArtifactSchemaError";
+            detail = "steps must be an array";
+            return false;
+        }
+
+        if (artifact.Assertions is null)
+        {
+            failureKind = "ArtifactSchemaError";
+            detail = "assertions must be an array";
+            return false;
+        }
+
         if (!IsBoundedString(artifact.Name))
         {
             failureKind = "ArtifactSchemaError";
@@ -91,6 +105,13 @@ internal static class E2eReplayArtifactValidation
 
     private static bool TryValidateReadiness(E2eReadinessProbe readiness, out string failureKind, out string detail)
     {
+        if (readiness.Argv is null)
+        {
+            failureKind = "ArtifactSchemaError";
+            detail = "readiness.argv must be an array when present";
+            return false;
+        }
+
         if (readiness.Argv.Count > 0)
         {
             failureKind = "UnsupportedLegacyArgv";
@@ -141,6 +162,13 @@ internal static class E2eReplayArtifactValidation
 
     private static bool TryValidateStep(E2eReplayStep step, int index, out string failureKind, out string detail)
     {
+        if (step.Argv is null)
+        {
+            failureKind = "ArtifactSchemaError";
+            detail = $"steps[{index}].argv must be an array when present";
+            return false;
+        }
+
         if (step.Argv.Count > 0)
         {
             failureKind = "UnsupportedLegacyArgv";
@@ -220,6 +248,13 @@ internal static class E2eReplayArtifactValidation
 
     private static bool TryValidateAssertion(E2eReplayAssertion assertion, int index, out string failureKind, out string detail)
     {
+        if (assertion.Argv is null)
+        {
+            failureKind = "ArtifactSchemaError";
+            detail = $"assertions[{index}].argv must be an array when present";
+            return false;
+        }
+
         if (assertion.Argv.Count > 0)
         {
             failureKind = "UnsupportedLegacyArgv";
