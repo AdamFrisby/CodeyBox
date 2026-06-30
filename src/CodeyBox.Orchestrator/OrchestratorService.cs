@@ -206,6 +206,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // any of them has committed StartedAt to the database.
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _budgetLocks = new();
 
+    // Clock for the deferral-requeue timer, the heartbeat PeriodicTimer, the
+    // dispatch-wake retry backoff, the rolling budget-window cutoff, and the
+    // worker-lifecycle UtcNow stamps (StartedAt / progress-clock / recovery /
+    // webhook suggestedRetryAt). Defaults to TimeProvider.System so production
+    // behavior is byte-for-byte unchanged and DI/Program.cs need not be touched;
+    // tests inject a FakeTimeProvider and drive these waits with Advance()
+    // instead of starving on a real Task.Delay under CPU load.
+    //
+    // Deliberately NOT used by the spawn-pacing wait (WaitForSpawnPacingAsync)
+    // or the queue-pause poll (WaitIfPausedAsync): those are real-time polling
+    // loops whose whole contract is prompt wall-clock pause-detection latency
+    // (asserted by SpawnPacingDelay_BreaksPromptlyOnQueuePauseDuringWait). To
+    // avoid a mixed-clock trap the spawn-pacing UtcNow reads that feed that
+    // loop also stay on the system clock.
+    private readonly TimeProvider _time;
+
     public OrchestratorService(
         ITaskQueue queue,
         IWorkItemStore store,
@@ -229,7 +245,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
         IStartupRecoveryInputBarrier? startupRecoveryBarrier = null,
         IStartupInitialRecoverySink? startupRecoveryCompletion = null,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        TimeProvider? timeProvider = null)
     {
         _queue = queue;
         _store = store;
@@ -253,6 +270,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _reaper?.AttachWorkerPoolSlotReleaser(this);
         _quotaRouterOptions = quotaRouterOptions;
         _budgetDeferralRecheck = budgetDeferralRecheck;
+        _time = timeProvider ?? TimeProvider.System;
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy
@@ -979,7 +997,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     "Worker pool: required slot-release wake-up kick failed for work item {WorkItemId} on attempt {Attempt}; retrying",
                     lease.WorkItemId,
                     attempt);
-                await Task.Delay(SlotReleasedDispatchWakeRetryDelay, ct);
+                await Task.Delay(SlotReleasedDispatchWakeRetryDelay, _time, ct);
             }
         }
     }
@@ -1014,7 +1032,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             await _reaper.RunOnceAsync(stoppingToken);
             await _reaper.SweepStrandedItemsAsync(stoppingToken);
-            _progressClock.Stamp(DateTimeOffset.UtcNow);
+            _progressClock.Stamp(_time.GetUtcNow());
         }
 
         _startupRecoveryCompletion?.MarkInitialRecoveryCompleted();
@@ -1374,7 +1392,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         string recoveryReason = "graceful shutdown drain timed out")
         => WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
             item,
-            DateTimeOffset.UtcNow,
+            _time.GetUtcNow(),
             _opts.MaxRecoveryAttempts,
             recoveryReason);
 
@@ -1768,7 +1786,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private async Task HeartbeatLoopAsync(string workerId, string currentWorkItemId, TimeSpan interval, CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(interval);
+        using var timer = new PeriodicTimer(interval, _time);
         while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
         {
             try
@@ -1817,7 +1835,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 item,
                 WorkItemRecoveryPolicy.NextRecoveryAttempt(item),
                 _opts.MaxRecoveryAttempts,
-                DateTimeOffset.UtcNow,
+                _time.GetUtcNow(),
                 $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}");
         }
 
@@ -1833,7 +1851,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
-                    UpdatedAt = DateTimeOffset.UtcNow,
+                    UpdatedAt = _time.GetUtcNow(),
                 }, checkAttempts, item.State);
             }
 
@@ -1852,7 +1870,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
-                    UpdatedAt = DateTimeOffset.UtcNow,
+                    UpdatedAt = _time.GetUtcNow(),
                 }, controlAttempts, item.State);
             }
 
@@ -1868,7 +1886,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _time.GetUtcNow(),
             }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
 
@@ -1902,7 +1920,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _time.GetUtcNow(),
             }, newAttempts, item.State);
         }
 
@@ -1969,8 +1987,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 WorkerId = registeredWorkerId,
                 HostName = Environment.MachineName,
                 ProcessId = Environment.ProcessId,
-                StartedAt = DateTimeOffset.UtcNow,
-                LastHeartbeatAt = DateTimeOffset.UtcNow,
+                StartedAt = _time.GetUtcNow(),
+                LastHeartbeatAt = _time.GetUtcNow(),
                 CurrentWorkItemId = id.ToString(),
             };
             try
@@ -2314,7 +2332,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 Event = "budget.deferred",
                                 WorkItem = item,
                                 Project = project,
-                                Details = new { deferReason.Reason, suggestedRetryAt = DateTimeOffset.UtcNow + deferReason.RecheckIn },
+                                Details = new { deferReason.Reason, suggestedRetryAt = _time.GetUtcNow() + deferReason.RecheckIn },
                             }, CancellationToken.None);
                         }
                         ClearPreStartRefactorDrainClaim(item);
@@ -2331,7 +2349,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     var baselineRef = ResolveBaselineRefForPickup(item, project);
                     item = item with
                     {
-                        StartedAt = DateTimeOffset.UtcNow,
+                        StartedAt = _time.GetUtcNow(),
                         BaselineImageRef = item.BaselineImageRef ?? baselineRef,
                     };
                     await _store.UpdateAsync(item, ct);
@@ -2397,7 +2415,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             mountPath = dskEx.MountPath,
                             freeBytes = dskEx.FreeBytes,
                             thresholdBytes = dskEx.ThresholdBytes,
-                            suggestedRetryAt = DateTimeOffset.UtcNow + dskEx.RecheckIn,
+                            suggestedRetryAt = _time.GetUtcNow() + dskEx.RecheckIn,
                         },
                     }, CancellationToken.None);
                 }
@@ -2428,7 +2446,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             operation = provEx.Operation,
                             errorClass = provEx.ErrorClass,
                             resumeState = deferredItem.State.ToString(),
-                            suggestedRetryAt = DateTimeOffset.UtcNow + provEx.RecheckIn,
+                            suggestedRetryAt = _time.GetUtcNow() + provEx.RecheckIn,
                         },
                     }, CancellationToken.None);
                 }
@@ -2447,7 +2465,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         finally
         {
             _activeItems.TryRemove(id, out _);
-            _progressClock.Stamp(DateTimeOffset.UtcNow);
+            _progressClock.Stamp(_time.GetUtcNow());
 
             // Release the per-agent slot if we reserved one (the only state in
             // which it was incremented). Doing this here — rather than at the
@@ -2609,7 +2627,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     private async Task<BudgetDeferral?> CheckBudgetAsync(WorkItem item, ProjectBudget budget, CancellationToken ct)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = _time.GetUtcNow();
 
         if (budget.MaxItemsPerHour > 0)
         {
@@ -2681,7 +2699,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
         var reset = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
             current,
-            DateTimeOffset.UtcNow);
+            _time.GetUtcNow());
         if (reset is null)
             return current;
 
@@ -3097,7 +3115,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             try
             {
                 if (hookedDelayTask is null)
-                    await Task.Delay(delay, stoppingToken);
+                    await Task.Delay(delay, _time, stoppingToken);
                 else
                     await hookedDelayTask;
 

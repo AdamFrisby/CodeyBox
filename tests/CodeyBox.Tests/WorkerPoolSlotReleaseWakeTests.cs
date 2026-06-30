@@ -5,6 +5,11 @@ using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
+// Framework FakeTimeProvider (CreateTimer fires on Advance); aliased to avoid
+// the namespace-local FakeTimeProvider in AgentClassRouterScoreTests.cs whose
+// CreateTimer would stay on the system clock. See SandboxSuspendResumeTests.
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
+
 namespace CodeyBox.Tests;
 
 [Collection("Background service timing")]
@@ -209,15 +214,15 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
         using var registry = new CancellationRegistry(CancellationToken.None);
-        // Use a long cap-retry window so the deferral timer cannot fire during
-        // the quiet-window assertion below even when the CI host is heavily
-        // loaded. A short window (e.g. 750ms) races against test setup +
-        // polling overhead: ScheduleDeferredRequeue removes the id from
-        // _deferredItems BEFORE the re-enqueue, so a timer that fires within
-        // the assertion window can make IsDeferredForTest read false while
-        // EnqueueCount is briefly still 1 (audit observed this exact race at
-        // ~806ms, right at the prior 750ms boundary).
+        // The cap-retry deferral timer now runs on the injected clock, so the
+        // quiet-window assertion below is deterministic: the timer cannot fire
+        // until the test advances the fake clock. The previous revision relied
+        // on a 5s real-wall-clock window to keep the timer from firing during
+        // the assertion (and documented a race observed at ~806ms under load) —
+        // routing ScheduleDeferredRequeue's Task.Delay through _time removes
+        // that wall-clock dependency entirely.
         var capRetryDelay = TimeSpan.FromSeconds(5);
+        var fakeTime = new ControllableTimeProvider();
         var concurrency = new AgentConcurrencyOptions
         {
             Members = { ["codex"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } },
@@ -227,14 +232,15 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             agentConcurrency: concurrency,
-            quotaRouterOptions: new QuotaRouterOptions { CapRetryRecheckInterval = capRetryDelay });
+            quotaRouterOptions: new QuotaRouterOptions { CapRetryRecheckInterval = capRetryDelay },
+            timeProvider: fakeTime);
 
         Assert.True(svc.TryReserveAgentSlotForTest(AgentKind.Codex));
 
         await svc.StartAsync(CancellationToken.None);
         await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
 
-        var item = MakeItem(DateTimeOffset.UtcNow) with { Agent = AgentKind.Codex };
+        var item = MakeItem(fakeTime.GetUtcNow()) with { Agent = AgentKind.Codex };
         await _store.CreateAsync(item);
         await queue.EnqueueAsync(item.Id);
 
@@ -248,13 +254,21 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         Assert.Equal(1, queue.EnqueueCount(item.Id));
         Assert.False(pipeline.HasEntered(item.Id));
 
+        // Without advancing the clock the deferral timer cannot fire, so the
+        // generic slot-release wake must not produce a retry. This is now a
+        // deterministic invariant rather than a real-time quiet-window race.
         Assert.False(
             await WaitUntilAsync(() => queue.EnqueueCount(item.Id) > 1, TimeSpan.FromMilliseconds(300)),
             "The generic slot-release wake must not clear the completed item's deferral or enqueue an immediate retry.");
         Assert.True(svc.IsDeferredForTest(item.Id));
 
+        // Drive the configured cap deferral interval on the injected clock: the
+        // item-specific retry must occur only when that timer fires.
         Assert.True(
-            await WaitUntilAsync(() => queue.EnqueueCount(item.Id) > 1, capRetryDelay + TimeSpan.FromSeconds(2)),
+            await AdvanceUntilAsync(
+                fakeTime,
+                capRetryDelay,
+                () => queue.EnqueueCount(item.Id) > 1),
             "The item-specific retry should occur only when the configured cap deferral interval fires.");
 
         svc.ReleaseAgentSlotForTest(AgentKind.Codex);
@@ -267,10 +281,12 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
         using var registry = new CancellationRegistry(CancellationToken.None);
+        var fakeTime = new ControllableTimeProvider();
         using var svc = new OrchestratorService(
             queue, _store, pipeline, registry,
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
-            NullLogger<OrchestratorService>.Instance);
+            NullLogger<OrchestratorService>.Instance,
+            timeProvider: fakeTime);
 
         var id = WorkItemId.New();
         var delay = TimeSpan.FromMilliseconds(75);
@@ -279,11 +295,20 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         svc.ScheduleInfrastructureDeferredRequeue(id, delay);
 
         Assert.True(svc.IsDeferredForTest(id));
+        // Both deferral timers run on the injected clock, so the single-owner
+        // contract is exercised deterministically: advancing past the delay
+        // fires exactly the owning timer's retry wake.
         Assert.True(
-            await WaitUntilAsync(() => queue.EnqueueCount(id) == 1, TimeSpan.FromSeconds(2)),
+            await AdvanceUntilAsync(fakeTime, delay, () => queue.EnqueueCount(id) == 1),
             "The first deferral owner should emit the retry wake.");
         Assert.False(svc.IsDeferredForTest(id));
 
+        // The duplicate schedule was rejected at registration (TryAdd failed),
+        // so it never armed a second timer. Advancing the clock far past the
+        // delay must still produce no second retry wake — deterministic now
+        // that the timers no longer depend on the wall clock.
+        fakeTime.Advance(delay + delay);
+        await Task.Delay(50);
         Assert.False(
             await WaitUntilAsync(() => queue.EnqueueCount(id) > 1, TimeSpan.FromMilliseconds(250)),
             "A duplicate deferral schedule must not create a second retry wake for the same item.");
@@ -857,6 +882,38 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             await Task.Delay(25);
         }
         return predicate();
+    }
+
+    /// <summary>
+    /// Advances the injected fake clock by <paramref name="step"/> in a loop,
+    /// yielding between advances so the deferral-timer continuation and the
+    /// subsequent SQLite enqueue can run, until <paramref name="predicate"/>
+    /// trips. The fake clock — not the wall clock — is what fires the deferral
+    /// timer; there is an unavoidable scheduling gap between the moment
+    /// ScheduleDeferredRequeue registers its timer and the moment we advance,
+    /// so the loop re-advances (each Advance fires any already-registered timer)
+    /// and yields. The 30s wall-clock backstop only guards against a genuine
+    /// non-firing regression and is never the mechanism that fires the timer,
+    /// so it does not reintroduce wall-clock flakiness.
+    /// </summary>
+    private static async Task<bool> AdvanceUntilAsync(
+        ControllableTimeProvider fakeTime,
+        TimeSpan step,
+        Func<bool> predicate)
+    {
+        var backstop = DateTime.UtcNow.AddSeconds(30);
+        while (!predicate())
+        {
+            fakeTime.Advance(step);
+            await Task.Yield();
+            if (predicate())
+                return true;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(2));
+            if (DateTime.UtcNow > backstop)
+                return predicate();
+        }
+        return true;
     }
 
     private static async Task<WorkerRegistration?> WaitForWorkerRegistrationAsync(

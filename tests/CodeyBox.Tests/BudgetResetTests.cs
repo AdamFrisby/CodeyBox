@@ -2,6 +2,10 @@ using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
+// Framework FakeTimeProvider (CreateTimer fires on Advance); aliased to avoid
+// the namespace-local FakeTimeProvider in AgentClassRouterScoreTests.cs.
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
+
 namespace CodeyBox.Tests;
 
 /// <summary>
@@ -123,18 +127,25 @@ public sealed class BudgetResetTests : IDisposable
         var queue = new InMemoryTaskQueue();
         var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
         var reg = new CancellationRegistry(CancellationToken.None);
+        var hourlyRecheck = TimeSpan.FromSeconds(3);
         var budgetRecheck = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
-            HourlyLimitRecheck = TimeSpan.FromSeconds(3),
+            HourlyLimitRecheck = hourlyRecheck,
         });
+        // Inject a controllable clock: both the rolling budget-window cutoff
+        // (CheckBudgetAsync) and the deferral re-pickup timer (ScheduleDeferredRequeue)
+        // now read it, so the window-clears → re-pickup sequence is driven by
+        // Advance() instead of a real 3s wall-clock wait that starves under load.
+        var fakeTime = new ControllableTimeProvider();
         var svc = new OrchestratorService(
             queue, _store, pipeline, reg, opts,
             NullLogger<OrchestratorService>.Instance,
             projects: projectRepo,
-            budgetDeferralRecheck: budgetRecheck);
+            budgetDeferralRecheck: budgetRecheck,
+            timeProvider: fakeTime);
 
         // Pre-seed 1 item whose StartedAt is inside the 1-hour window → cap is reached.
-        var blocking = Started("defer-retry", DateTimeOffset.UtcNow.AddMinutes(-30));
+        var blocking = Started("defer-retry", fakeTime.GetUtcNow().AddMinutes(-30));
         await _store.CreateAsync(blocking);
 
         // Enqueue 1 new item — the orchestrator should defer it (cap=1, already 1 started).
@@ -162,15 +173,20 @@ public sealed class BudgetResetTests : IDisposable
         Assert.Equal(0, pickupCount);
 
         // Simulate the rolling window advancing: age the blocking item out of the window.
-        await _store.UpdateAsync(blocking with { StartedAt = DateTimeOffset.UtcNow.AddHours(-2) });
+        await _store.UpdateAsync(blocking with { StartedAt = fakeTime.GetUtcNow().AddHours(-2) });
 
-        // Now the cap is not reached — the item should be picked up.
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref pickupCount) < 1)
-            await Task.Delay(50);
+        // Now the cap is not reached. Drive the deferral re-pickup timer on the
+        // injected clock (HourlyLimitRecheck) until the item is picked up. The
+        // fake clock — not the wall clock — fires the deferral; the 30s backstop
+        // only guards against a genuine non-firing regression.
+        var pickedUp = await AdvanceUntilAsync(
+            fakeTime,
+            hourlyRecheck,
+            () => Volatile.Read(ref pickupCount) >= 1);
 
         await svc.StopAsync(CancellationToken.None);
 
+        Assert.True(pickedUp, "deferred item should be picked up after the window clears and the recheck timer fires");
         Assert.Equal(1, Volatile.Read(ref pickupCount));
     }
 
@@ -183,5 +199,33 @@ public sealed class BudgetResetTests : IDisposable
             await Task.Delay(25);
         }
         return predicate();
+    }
+
+    /// <summary>
+    /// Advances the injected fake clock by <paramref name="step"/> in a loop,
+    /// yielding between advances so the deferral-timer continuation and the
+    /// re-pickup dispatch can run, until <paramref name="predicate"/> trips. The
+    /// fake clock fires the deferral timer; the 30s wall-clock backstop only
+    /// guards against a genuine non-firing regression and never fires the timer
+    /// itself, so it does not reintroduce wall-clock flakiness.
+    /// </summary>
+    private static async Task<bool> AdvanceUntilAsync(
+        ControllableTimeProvider fakeTime,
+        TimeSpan step,
+        Func<bool> predicate)
+    {
+        var backstop = DateTime.UtcNow.AddSeconds(30);
+        while (!predicate())
+        {
+            fakeTime.Advance(step);
+            await Task.Yield();
+            if (predicate())
+                return true;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(2));
+            if (DateTime.UtcNow > backstop)
+                return predicate();
+        }
+        return true;
     }
 }
