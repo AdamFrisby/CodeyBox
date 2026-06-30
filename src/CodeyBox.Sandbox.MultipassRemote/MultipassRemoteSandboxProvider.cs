@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -395,6 +397,11 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             }
 
             await WaitForVmStateAsync(opts, transport, vmName, "Running", opts.VmStartTimeout, ct).ConfigureAwait(false);
+
+            // Publish the VM's routable host address so deployment drivers can
+            // reach services running inside the sandbox. Resolved after the VM
+            // is Running because multipass populates the IPv4 field lazily.
+            sandbox.HostAddress = await ResolveRemoteHostAddressAsync(opts, transport, vmName, ct).ConfigureAwait(false);
 
             // 4) Apply environment via a stamped /etc/environment fragment.
             //    multipass exec is per-call by default; environment from the
@@ -1060,6 +1067,66 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             try { await Task.Delay(opts.VmStateCheckInterval, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { throw; }
         }
+    }
+
+    private async Task<string?> ResolveRemoteHostAddressAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        CancellationToken ct)
+    {
+        var result = await RunRemoteInventoryAsync(
+            opts,
+            transport,
+            [opts.RemoteMultipassPath, "info", vmName, "--format", "json"],
+            ct).ConfigureAwait(false);
+        if (result.ExitCode != 0)
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(result.Stdout);
+            if (!doc.RootElement.TryGetProperty("info", out var info)) return null;
+            if (!info.TryGetProperty(vmName, out var entry)) return null;
+            return TryReadPrimaryIpv4(entry);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string? TryReadPrimaryIpv4(JsonElement vmInfo)
+    {
+        if (!vmInfo.TryGetProperty("ipv4", out var ipv4El))
+            return null;
+
+        if (ipv4El.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var value in ipv4El.EnumerateArray())
+            {
+                var parsed = TryParseIpv4(value.GetString());
+                if (parsed is not null)
+                    return parsed;
+            }
+            return null;
+        }
+
+        return ipv4El.ValueKind == JsonValueKind.String
+            ? TryParseIpv4(ipv4El.GetString())
+            : null;
+    }
+
+    private static string? TryParseIpv4(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        foreach (var token in value.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (IPAddress.TryParse(token, out var address) && address.AddressFamily == AddressFamily.InterNetwork)
+                return address.ToString();
+        }
+        return null;
     }
 
     private static bool TryParseVmState(string json, string vmName, out string state)

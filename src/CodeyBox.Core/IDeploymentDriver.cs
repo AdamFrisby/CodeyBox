@@ -204,6 +204,10 @@ public sealed record DeploymentRecipe
 /// A supporting service deployed alongside the primary artifact (database,
 /// message broker, fixture, …). Drivers may render services as separate
 /// sandboxes or as colocated processes inside the primary substrate.
+/// Built-in sandbox drivers colocate services; when a service names a
+/// different <see cref="ImageReference"/> than the primary recipe, its
+/// <see cref="RunCommand"/> must consume that value via the driver's
+/// <c>{image}</c> placeholder rather than leaving the image reference idle.
 /// </summary>
 public sealed record DeploymentService
 {

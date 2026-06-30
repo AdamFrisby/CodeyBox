@@ -26,6 +26,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     private const int DeploymentExecOutputCaptureBytes = 256 * 1024;
     private const int ErrorOutputTailChars = 2048;
     private const string Localhost = "127.0.0.1";
+    private const string ServiceImagePlaceholder = "{image}";
 
     protected ILogger Log { get; }
     protected Func<DateTimeOffset> Clock { get; }
@@ -63,6 +64,13 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                 throw new ArgumentException($"DeploymentRecipe.Services['{service.Name}'].ImageReference is required.", nameof(recipe));
             if (string.IsNullOrWhiteSpace(service.RunCommand))
                 throw new ArgumentException($"DeploymentRecipe.Services['{service.Name}'].RunCommand is required.", nameof(recipe));
+            if (!string.Equals(service.ImageReference, recipe.ImageReference, StringComparison.Ordinal)
+                && !service.RunCommand!.Contains(ServiceImagePlaceholder, StringComparison.Ordinal))
+            {
+                throw new ArgumentException(
+                    $"DeploymentRecipe.Services['{service.Name}'].RunCommand must include {ServiceImagePlaceholder} when its ImageReference differs from the primary deployment image.",
+                    nameof(recipe));
+            }
             if (service.Ports.Count == 0)
                 throw new ArgumentException($"DeploymentRecipe.Services['{service.Name}'].Ports must contain at least one port.", nameof(recipe));
             foreach (var port in service.Ports)
@@ -93,7 +101,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
 
             // StartupTimeout bounds StartRuntimeAsync AND ProbeReadyAsync.
             // RunCommand is "fire and forget" by convention (recipe authors
-            // background the server via nohup/&/exec), but a misconfigured
+            // background the server via nohup/&), but a misconfigured
             // recipe that forgets to background can otherwise hang the deploy
             // indefinitely — neither the startup timeout nor the readiness
             // probe would fire. Wrapping start under the same bound surfaces
@@ -119,8 +127,8 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                     throw new TimeoutException(
                         $"Deployment kind '{Kind}' startup did not return within {recipe.StartupTimeout}. " +
                         "RunCommand likely runs the server in the foreground — sandbox.ExecAsync waits for the " +
-                        "child process to exit, so the recipe must background the server (e.g. nohup ... &, exec, " +
-                        "or a process supervisor) for StartRuntime to return. Tearing down substrate.");
+                        "child process to exit, so the recipe must background the server (e.g. nohup ... &, " +
+                        "setsid ... &, or a process supervisor) for StartRuntime to return. Tearing down substrate.");
                 }
                 try
                 {
@@ -187,12 +195,16 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     {
         foreach (var service in recipe.Services)
         {
+            var command = service.RunCommand!.Replace(
+                ServiceImagePlaceholder,
+                Shell.Quote(service.ImageReference),
+                StringComparison.Ordinal);
             var result = await RunDeploymentExecAsync(
                 sandbox,
                 recipe,
                 context,
                 $"service '{service.Name}' start",
-                ["sh", "-c", service.RunCommand!],
+                ["sh", "-c", command],
                 MergeEnvironment(recipe.Environment, service.Environment),
                 ct).ConfigureAwait(false);
             if (!result.Success)
@@ -263,8 +275,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             "build",
             ["sh", "-c", recipe.BuildCommand],
             recipe.Environment,
-            ct,
-            recipe.MaxLifetime).ConfigureAwait(false);
+            ct).ConfigureAwait(false);
         if (!result.Success)
             throw DeploymentExecFailed("build", result);
     }
@@ -404,6 +415,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             var path = string.IsNullOrWhiteSpace(service.HealthEndpoint)
                 ? string.Empty
                 : service.HealthEndpoint!.StartsWith('/') ? service.HealthEndpoint : "/" + service.HealthEndpoint;
+            metadata[$"service.{service.Name}.image"] = service.ImageReference;
             metadata[$"service.{service.Name}.sandbox-local-url"] = $"{scheme}://{Localhost}:{port}{path}";
             if (host is not null)
                 metadata[$"service.{service.Name}.url"] = $"{scheme}://{host}:{port}{path}";
@@ -428,6 +440,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
 internal sealed class SandboxDeploymentHandle : IDeploymentHandle
 {
     private readonly Func<CancellationToken, Task> _healthCheck;
+    private readonly SemaphoreSlim _disposeGate = new(1, 1);
     private int _disposed;
 
     public SandboxDeploymentHandle(
@@ -467,8 +480,19 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
 
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        if (Volatile.Read(ref _disposed) != 0)
             return;
-        await Sandbox.DisposeAsync().ConfigureAwait(false);
+        await _disposeGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return;
+            await Sandbox.DisposeAsync().ConfigureAwait(false);
+            Volatile.Write(ref _disposed, 1);
+        }
+        finally
+        {
+            _disposeGate.Release();
+        }
     }
 }

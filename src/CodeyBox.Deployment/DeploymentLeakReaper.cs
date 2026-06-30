@@ -137,10 +137,11 @@ public sealed class DeploymentLeakReaper : BackgroundService
                 // will dispose them under its dedicated gate.
                 if (info.IsSuspendLifecycleOrFrozen) continue;
 
-                // Unknown CreatedAt is conservative: we treat it as "too young
-                // to know" and skip rather than risk reaping a sandbox whose
-                // staging metadata is just temporarily missing.
-                if (info.CreatedAt is not { } createdAt) continue;
+                // Missing creation metadata is itself an orphan signal. Remote
+                // providers cannot always recover CreatedAt, so treat an
+                // unknown timestamp as old enough to report and sweep, matching
+                // the general sandbox reaper's safety-net behavior.
+                var createdAt = info.CreatedAt ?? now - opts.LeakAgeThreshold;
                 var age = now - createdAt;
 
                 // Preempt-marked (graceful-shutdown-preserved) VMs are exempt
@@ -159,6 +160,7 @@ public sealed class DeploymentLeakReaper : BackgroundService
 
             if (!opts.AutoDispose) return;
 
+            var failedNames = new HashSet<string>(StringComparer.Ordinal);
             foreach (var leak in leaks)
             {
                 ct.ThrowIfCancellationRequested();
@@ -177,11 +179,13 @@ public sealed class DeploymentLeakReaper : BackgroundService
                 }
                 catch (Exception ex)
                 {
+                    failedNames.Add(leak.Name);
                     _log.LogWarning(ex,
                         "DeploymentLeakReaper: failed to dispose orphan sandbox {Name}",
                         leak.Name);
                 }
             }
+            _latestLeaks = leaks.Where(leak => failedNames.Contains(leak.Name)).ToList();
         }
         // Only swallow OCEs that are NOT the outer shutdown-cancellation. Without
         // the `when` clause, the inner `catch (...) when (ct.IsCancellationRequested) { throw; }`

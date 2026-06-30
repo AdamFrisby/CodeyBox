@@ -78,14 +78,43 @@ public sealed class DeploymentProgramWiringTests
             });
             builder.ConfigureTestServices(services =>
             {
-                HadDeploymentLeakReaperHostedRegistration =
-                    services.Any(sd => sd.ServiceType == typeof(DeploymentLeakReaper))
-                    && services.Any(sd => sd.ServiceType == typeof(IHostedService));
+                HadDeploymentLeakReaperHostedRegistration = HasDeploymentLeakReaperHostedRegistration(services);
 
                 services.RemoveAll<IHostedService>();
                 services.RemoveAll<ISandboxProvider>();
                 services.AddSingleton<ISandboxProvider>(new FakeDeploymentSandboxProvider());
             });
+        }
+
+        private static bool HasDeploymentLeakReaperHostedRegistration(IServiceCollection services)
+        {
+            var provider = services.BuildServiceProvider(new ServiceProviderOptions
+            {
+                ValidateScopes = false,
+            });
+            try
+            {
+                foreach (var descriptor in services.Where(sd => sd.ServiceType == typeof(IHostedService)))
+                {
+                    if (descriptor.ImplementationFactory is null)
+                        continue;
+                    try
+                    {
+                        if (descriptor.ImplementationFactory(provider) is DeploymentLeakReaper)
+                            return true;
+                    }
+                    catch
+                    {
+                        // Other hosted-service factories can depend on test-removed
+                        // services. They are irrelevant to this assertion.
+                    }
+                }
+                return false;
+            }
+            finally
+            {
+                provider.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
         }
 
         protected override void Dispose(bool disposing)

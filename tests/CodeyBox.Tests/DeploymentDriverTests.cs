@@ -118,6 +118,33 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
+    public async Task DeploymentExec_OutputLimitExceeded_TearsDownAndThrows()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule(
+            "too-chatty",
+            new SandboxExecResult(0, new string('x', 1024), "", StdoutLimitExceeded: true)));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "too-chatty",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        Assert.Contains("output capture limit", ex.Message);
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
     public async Task DeploymentFailure_RedactsCommandOutput()
     {
         const string Token = "ghp_XYZabc789012345678901234567890";
@@ -161,6 +188,57 @@ public sealed class DeploymentDriverTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
 
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task WebApp_WithoutRoutableHost_TearsDownAndThrows()
+    {
+        var provider = new FakeDeploymentSandboxProvider { HostAddress = null };
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        Assert.Contains("routable sandbox host address", ex.Message);
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task WebApp_BuildTimeout_TearsDownAndThrowsTimeout()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule(
+            "slow-build",
+            new SandboxExecResult(0, "", ""),
+            delay: TimeSpan.FromSeconds(5)));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "slow-build",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            StartupTimeout = TimeSpan.FromMilliseconds(50),
+        };
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
         Assert.Single(provider.Created);
         Assert.True(provider.Created[0].IsDisposed);
     }
@@ -281,7 +359,7 @@ public sealed class DeploymentDriverTests
                 {
                     Name = "db",
                     ImageReference = "postgres:16",
-                    RunCommand = "postgres-start",
+                    RunCommand = "docker run --rm {image} postgres-start",
                     Ports = [5432],
                     HealthEndpoint = "/ready",
                 },
@@ -298,7 +376,113 @@ public sealed class DeploymentDriverTests
         Assert.True(serviceProbe > serviceStart, "service readiness probe did not run after service start");
         Assert.True(appStart > serviceProbe, "primary app started before backing service became ready");
         Assert.True(appProbe > appStart, "primary readiness probe did not run after primary start");
+        Assert.Contains(provider.ExecLog, c => c.Contains("'postgres:16'", StringComparison.Ordinal));
+        Assert.Equal("postgres:16", handle.Endpoint.Metadata["service.db.image"]);
         Assert.Equal("http://10.42.0.10:5432/ready", handle.Endpoint.Metadata["service.db.url"]);
+    }
+
+    [Fact]
+    public async Task WebApp_ServiceStartFails_TearsDownSubstrate()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("service-start-fail", new SandboxExecResult(2, "", "service boom")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start-fail",
+                    Ports = [5432],
+                },
+            ],
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task WebApp_ServiceReadinessTimeout_TearsDownSubstrate()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("127.0.0.1:5432", new SandboxExecResult(7, "", "refused")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            StartupTimeout = TimeSpan.FromMilliseconds(120),
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.01",
+            },
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start",
+                    Ports = [5432],
+                    HealthEndpoint = "/ready",
+                },
+            ],
+        };
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task WebApp_ServiceWithoutHealthEndpoint_UsesTcpFallback()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("/dev/tcp/127.0.0.1/5432", new SandboxExecResult(0, "", "")));
+        provider.ExecRules.Add(new ExecRule("127.0.0.1:8080", new SandboxExecResult(0, "ok", "")));
+
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start",
+                    Ports = [5432],
+                },
+            ],
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Contains(provider.ExecLog, c =>
+            c.StartsWith("bash -c", StringComparison.Ordinal)
+            && c.Contains("/dev/tcp/127.0.0.1/5432", StringComparison.Ordinal));
     }
 
     // ── Daemon ──────────────────────────────────────────────────────────────
@@ -702,6 +886,60 @@ public sealed class DeploymentDriverTests
         await Assert.ThrowsAsync<ObjectDisposedException>(() => handle.HealthCheckAsync());
     }
 
+    [Fact]
+    public async Task Exec_AfterDispose_ThrowsObjectDisposed()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var driver = new LibraryDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Library,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "echo build",
+            ArtifactPath = "/lib/x.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
+        };
+        var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+        await handle.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            handle.ExecAsync(new SandboxExec { Argv = ["true"] }));
+    }
+
+    [Fact]
+    public async Task DisposeFailure_KeepsHandleAliveAndRetryable()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var driver = new LibraryDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Library,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "echo build",
+            ArtifactPath = "/lib/x.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
+        };
+        var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+        provider.SandboxDisposeThrowsFor.Add(handle.SandboxId!);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await handle.DisposeAsync());
+
+        Assert.True(handle.IsAlive);
+        Assert.False(provider.Created[0].IsDisposed);
+
+        provider.SandboxDisposeThrowsFor.Remove(handle.SandboxId!);
+        await handle.DisposeAsync();
+
+        Assert.False(handle.IsAlive);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
     // ── SandboxSpec plumbing ────────────────────────────────────────────────
 
     [Fact]
@@ -829,6 +1067,112 @@ public sealed class DeploymentDriverTests
         };
         var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
         Assert.Contains("invalid port", ex.Message);
+    }
+
+    [Fact]
+    public void Base_ValidateRecipe_RejectsServiceWithoutRunCommand()
+    {
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    Ports = [5432],
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("RunCommand", ex.Message);
+    }
+
+    [Fact]
+    public void Base_ValidateRecipe_RejectsServiceWithoutPorts()
+    {
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start",
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("Ports", ex.Message);
+    }
+
+    [Fact]
+    public void Base_ValidateRecipe_RejectsServiceWithInvalidPort()
+    {
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start",
+                    Ports = [70000],
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("invalid port", ex.Message);
+    }
+
+    [Fact]
+    public void Base_ValidateRecipe_RejectsDistinctServiceImageWithoutPlaceholder()
+    {
+        var driver = new WebAppDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "nohup ./server &",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "postgres:16",
+                    RunCommand = "postgres-start",
+                    Ports = [5432],
+                },
+            ],
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("{image}", ex.Message);
     }
 
     // ── Driver-specific validation gaps ─────────────────────────────────────

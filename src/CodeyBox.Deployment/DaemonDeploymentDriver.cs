@@ -88,13 +88,7 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
             probeArgv = ["bash", "-c", $"exec 3<>/dev/tcp/127.0.0.1/{port}"];
         }
 
-        var interval = TimeSpan.FromSeconds(1);
-        if (recipe.Settings.TryGetValue(SettingsKeyProbeIntervalSeconds, out var iv)
-            && double.TryParse(iv, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
-            && seconds > 0)
-        {
-            interval = TimeSpan.FromSeconds(Math.Min(seconds, 60));
-        }
+        var interval = ResolveProbeInterval(recipe);
 
         while (true)
         {

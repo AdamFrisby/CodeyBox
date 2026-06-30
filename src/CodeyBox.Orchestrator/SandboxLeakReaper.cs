@@ -174,6 +174,9 @@ public sealed class SandboxLeakReaper : BackgroundService
             var leaks = new List<LeakedSandboxInfo>();
             foreach (var info in allManaged)
             {
+                if (info.Purpose == SandboxPurpose.Deployment)
+                    continue;
+
                 if (info.IsTrackedActive)
                     continue;
 

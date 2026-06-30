@@ -93,6 +93,7 @@ public sealed class DeploymentManager : IDeploymentManager
         public string Kind { get; } = kind;
         public ProjectId? ProjectId { get; } = projectId;
         public DateTimeOffset StartedAt { get; } = startedAt;
+        private readonly SemaphoreSlim _disposeGate = new(1, 1);
         private int _disposed;
 
         public string Id => Inner.Id;
@@ -106,15 +107,20 @@ public sealed class DeploymentManager : IDeploymentManager
 
         public async ValueTask DisposeAsync()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            if (Volatile.Read(ref _disposed) != 0)
                 return;
+            await _disposeGate.WaitAsync().ConfigureAwait(false);
             try
             {
+                if (Volatile.Read(ref _disposed) != 0)
+                    return;
                 await Inner.DisposeAsync().ConfigureAwait(false);
+                Volatile.Write(ref _disposed, 1);
+                owner.Untrack(Id);
             }
             finally
             {
-                owner.Untrack(Id);
+                _disposeGate.Release();
             }
         }
     }

@@ -4427,6 +4427,46 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_WritesPurposeMarker_AndListAllManagedReadsIt()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var staging = Path.Combine(_workspace, "staging-purpose-marker");
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: BuildSuccessfulCreateRunner(states));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Purpose = SandboxPurpose.Deployment,
+        });
+
+        var markerPath = Path.Combine(staging, sandbox.Id, ".codeybox-purpose");
+        Assert.Equal("Deployment", File.ReadAllText(markerPath).Trim());
+
+        var managed = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.Equal(sandbox.Id, managed.Name);
+        Assert.Equal(SandboxPurpose.Deployment, managed.Purpose);
+    }
+
+    [Fact]
+    public async Task CreateAsync_PassesMultipassInfoIpv4ToRoutableSandbox()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-host-address"),
+            runner: BuildSuccessfulCreateRunner(states));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+        });
+
+        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
+        Assert.Equal("10.42.0.88", routable.HostAddress);
+    }
+
+    [Fact]
     public async Task BaselineImages_BakeOncePerProfileUnderConcurrentCreatesThenCloneSandboxes()
     {
         var launchEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -8170,6 +8210,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             ct.ThrowIfCancellationRequested();
             if (argv is [_, "version"])
                 return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+            if (argv is [_, "list", "--format=json"] || argv is [_, "list", "--format", "json"])
+            {
+                var list = states.Keys
+                    .Select(name => new Dictionary<string, object> { ["name"] = name })
+                    .ToArray();
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { list }), ""));
+            }
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 states[argv[3]] = "Running";
@@ -8178,6 +8225,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var csvName, "--format=csv"])
                 return Task.FromResult(new ProcessRunResult(
                     0, states.TryGetValue(csvName, out var current) ? current : "Running", ""));
+            if (argv.Count >= 5 && argv[1] == "info" && argv[2] == "--format" && argv[3] == "json")
+            {
+                var info = argv.Skip(4).ToDictionary(
+                    name => name,
+                    name => (object)new
+                    {
+                        state = states.TryGetValue(name, out var current) ? current : "Running",
+                        memory = new { total = 17179869184L },
+                        disks = new Dictionary<string, object>(),
+                        ipv4 = new[] { "10.42.0.88" },
+                    },
+                    StringComparer.Ordinal);
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    JsonSerializer.Serialize(new { info }),
+                    ""));
+            }
             if (argv is [_, "info", var jsonName, "--format=json"])
             {
                 var state = states.TryGetValue(jsonName, out var current) ? current : "Running";
@@ -8190,6 +8254,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                             state,
                             memory = new { total = 17179869184L },
                             disks = new Dictionary<string, object>(),
+                            ipv4 = new[] { "10.42.0.88" },
                         },
                     },
                 });

@@ -113,6 +113,34 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_returns_routable_host_address_from_multipass_info()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport), "10.55.0.9");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+        });
+
+        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sb);
+        Assert.Equal("10.55.0.9", routable.HostAddress);
+
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
     public async Task CreateAsync_attaches_configured_network_profile_bridge()
     {
         var opts = DefaultOptions() with
@@ -746,6 +774,63 @@ public sealed class MultipassRemoteSandboxProviderTests
         var info = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
 
         Assert.Equal(createdAt, info.CreatedAt);
+    }
+
+    [Fact]
+    public async Task DeploymentPurposeMarker_IsWrittenAndReadBack()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        var markerByPath = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "list"))
+            {
+                var vm = VmNameFromLastLaunch(transport);
+                return new ProcessRunResult(0, $$"""
+                    {
+                      "list": [
+                        { "name": "{{vm}}", "state": "Running" }
+                      ]
+                    }
+                    """, "");
+            }
+            if (argv is ["sh", "-c", var script] && script.Contains(".codeybox-purpose", StringComparison.Ordinal))
+            {
+                if (script.StartsWith("printf %s ", StringComparison.Ordinal))
+                {
+                    var markerPath = ExtractQuotedPathAfterRedirect(script);
+                    markerByPath[markerPath] = "Deployment";
+                    return ProcessRunOk();
+                }
+                if (script.StartsWith("test -f ", StringComparison.Ordinal))
+                {
+                    var markerPath = ExtractFirstQuotedPath(script);
+                    return markerByPath.TryGetValue(markerPath, out var marker)
+                        ? new ProcessRunResult(0, marker, "")
+                        : new ProcessRunResult(0, "", "");
+                }
+            }
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Purpose = SandboxPurpose.Deployment,
+        });
+
+        var managed = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.Equal(sb.Id, managed.Name);
+        Assert.Equal(SandboxPurpose.Deployment, managed.Purpose);
+
+        await sb.DisposeAsync();
     }
 
     [Fact]
@@ -1924,9 +2009,11 @@ public sealed class MultipassRemoteSandboxProviderTests
             && Interlocked.CompareExchange(ref target, value, existing) != existing);
     }
 
-    private static ProcessRunResult RunningInfoJson(string vm) => new(
+    private static ProcessRunResult RunningInfoJson(string vm, string? ipv4 = null) => new(
         0,
-        $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}",
+        ipv4 is null
+            ? $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}"
+            : $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\",\"ipv4\":[\"{ipv4}\"]}}}}}}",
         "");
 
     private static ProcessRunResult InfoJson(string vm, string state) => new(
@@ -1938,6 +2025,22 @@ public sealed class MultipassRemoteSandboxProviderTests
     {
         var idx = argv.ToList().IndexOf("info");
         return idx >= 0 && idx + 1 < argv.Count ? argv[idx + 1] : "unknown";
+    }
+
+    private static string ExtractQuotedPathAfterRedirect(string script)
+    {
+        var redirect = script.IndexOf(" > ", StringComparison.Ordinal);
+        Assert.True(redirect >= 0, $"expected redirect in script: {script}");
+        return ExtractFirstQuotedPath(script[(redirect + 3)..]);
+    }
+
+    private static string ExtractFirstQuotedPath(string script)
+    {
+        var start = script.IndexOf('\'');
+        Assert.True(start >= 0, $"expected quoted path in script: {script}");
+        var end = script.IndexOf('\'', start + 1);
+        Assert.True(end > start, $"expected closing quote in script: {script}");
+        return script[(start + 1)..end];
     }
 
     private static string VmNameFromLastLaunch(FakeRemoteHostTransport transport)

@@ -4,8 +4,8 @@ using Microsoft.Extensions.Logging;
 namespace CodeyBox.Deployment;
 
 /// <summary>
-/// Drives a CLI-tool deployment: build the binary, stage it on PATH inside
-/// the substrate, then verify the tool runs by invoking the recipe's
+/// Drives a CLI-tool deployment: build or stage the binary as directed by the
+/// recipe, then verify the tool runs by invoking the recipe's
 /// readiness command (defaults to <c>&lt;artifact-path&gt; --version</c>).
 /// "Expose" returns the in-substrate binary path so callers can invoke the
 /// tool through the same sandbox handle.

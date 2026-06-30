@@ -41,6 +41,45 @@ public sealed class DeploymentManagerTests
     }
 
     [Fact]
+    public async Task DisposeFailure_KeepsDeploymentTrackedUntilRetrySucceeds()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        var driver = new LibraryDeploymentDriver();
+        var registry = new DeploymentDriverRegistry([driver]);
+        var manager = new DeploymentManager(registry);
+
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Library,
+            ImageReference = "ubuntu",
+            BuildCommand = "dotnet pack",
+            ArtifactPath = "/lib/out.nupkg",
+            Settings = new Dictionary<string, string>
+            {
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "harness {artifact}",
+            },
+        };
+
+        var handle = await manager.StartAsync(
+            recipe,
+            new DeploymentContext { SandboxProvider = provider },
+            CancellationToken.None);
+        provider.SandboxDisposeThrowsFor.Add(handle.SandboxId!);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await handle.DisposeAsync());
+
+        var activeAfterFailure = Assert.Single(manager.GetActive());
+        Assert.Equal(handle.Id, activeAfterFailure.Id);
+        Assert.True(handle.IsAlive);
+
+        provider.SandboxDisposeThrowsFor.Remove(handle.SandboxId!);
+        await handle.DisposeAsync();
+
+        Assert.Empty(manager.GetActive());
+        Assert.False(handle.IsAlive);
+    }
+
+    [Fact]
     public async Task StartAsync_ValidatesRecipeBeforeDeploying()
     {
         var provider = new FakeDeploymentSandboxProvider();

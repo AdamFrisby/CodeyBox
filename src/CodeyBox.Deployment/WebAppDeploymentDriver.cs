@@ -9,7 +9,7 @@ namespace CodeyBox.Deployment;
 /// <see cref="DeploymentRecipe.HealthEndpoint"/> against the primary port.
 ///
 /// <para>The driver starts the app via <see cref="DeploymentRecipe.RunCommand"/>
-/// in a background sandbox exec, then polls the configured health endpoint
+/// in an attached sandbox exec that must return quickly, then polls the configured health endpoint
 /// inside the sandbox using <c>curl</c> (or a busybox equivalent if the
 /// recipe overrides it via <see cref="DeploymentRecipe.Settings"/> key
 /// <c>health-probe-command</c>). Polling stays inside the substrate so we
@@ -83,13 +83,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
             ? p.Replace("{url}", quotedProbeUrl, StringComparison.Ordinal)
             : $"curl -fsS -o /dev/null --max-time 5 {quotedProbeUrl}";
 
-        var interval = TimeSpan.FromSeconds(1);
-        if (recipe.Settings.TryGetValue(SettingsKeyProbeIntervalSeconds, out var iv)
-            && double.TryParse(iv, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
-            && seconds > 0)
-        {
-            interval = TimeSpan.FromSeconds(Math.Min(seconds, 60));
-        }
+        var interval = ResolveProbeInterval(recipe);
 
         while (true)
         {
@@ -115,11 +109,14 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
             ? s
             : "http";
         var host = ResolveHostAddress(sandbox);
-        var url = host is null ? null : $"{scheme}://{host}:{port}";
+        if (host is null)
+            throw new InvalidOperationException(
+                $"Deployment kind '{Kind}' requires a routable sandbox host address to expose HTTP port {port}.");
+        var url = $"{scheme}://{host}:{port}";
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["sandbox.id"] = sandbox.Id,
-            ["endpoint.scope"] = host is null ? "sandbox-local" : "host-routable",
+            ["endpoint.scope"] = "host-routable",
             ["sandbox.local-url"] = $"{scheme}://127.0.0.1:{port}",
             ["http.health-path"] = recipe.HealthEndpoint!,
         };

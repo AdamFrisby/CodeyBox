@@ -29,6 +29,18 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_ForwardsRoutableSandboxHostAddress()
+    {
+        var inner = new RoutableProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+
+        await using var sandbox = await provider.CreateAsync(Spec());
+
+        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
+        Assert.Equal("10.10.0.42", routable.HostAddress);
+    }
+
+    [Fact]
     public async Task Stress_MultipleItemsFanOutAuditors_DrainsBelowFanoutBudget()
     {
         const int itemCount = 5;
@@ -1832,6 +1844,31 @@ public sealed class SandboxAdmissionControlledProviderTests
                 throw new InvalidOperationException("ensure baseline failed");
             return "baseline";
         }
+    }
+
+    private sealed class RoutableProvider : ISandboxProvider
+    {
+        public string Name => "routable";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            Task.FromResult<ISandbox>(new RoutableSandbox());
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class RoutableSandbox : IRoutableSandbox
+    {
+        public string Id { get; } = "routable-1";
+        public string? HostAddress => "10.10.0.42";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class CountingSandbox(

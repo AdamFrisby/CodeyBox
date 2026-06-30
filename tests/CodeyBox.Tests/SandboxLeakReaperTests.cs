@@ -137,6 +137,26 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
+    public async Task DeploymentSandbox_IsIgnoredByWorkItemReaper()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-deploy0011223",
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: false,
+            Purpose: SandboxPurpose.Deployment));
+
+        var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.Empty(provider.DisposedNames);
+    }
+
+    [Fact]
     public async Task AutoDispose_DoesNotDisposeTrackedActiveSandbox()
     {
         var threshold = TimeSpan.FromMinutes(30);

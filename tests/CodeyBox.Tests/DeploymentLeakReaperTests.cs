@@ -39,9 +39,7 @@ public sealed class DeploymentLeakReaperTests
             provider, manager, () => Opts(), NullLogger<DeploymentLeakReaper>.Instance, clock);
 
         await reaper.RunSweepAsync(CancellationToken.None);
-        var leaks = reaper.GetLatestLeaks();
-        Assert.Single(leaks);
-        Assert.Equal(s.Id, leaks[0].Name);
+        Assert.Empty(reaper.GetLatestLeaks());
         Assert.Contains(s.Id, provider.DisposedNames);
     }
 
@@ -113,9 +111,7 @@ public sealed class DeploymentLeakReaperTests
             provider, manager, () => Opts(), NullLogger<DeploymentLeakReaper>.Instance, clock);
 
         await reaper.RunSweepAsync(CancellationToken.None);
-        var leaks = reaper.GetLatestLeaks();
-        Assert.Single(leaks);
-        Assert.Equal(s.Id, leaks[0].Name);
+        Assert.Empty(reaper.GetLatestLeaks());
         Assert.Contains(s.Id, provider.DisposedNames);
         Assert.True(s.IsDisposed); // DisposeLeakedAsync flips the fake's flag too
     }
@@ -249,7 +245,7 @@ public sealed class DeploymentLeakReaperTests
             provider, manager, () => Opts(), NullLogger<DeploymentLeakReaper>.Instance, clock);
 
         await reaper.RunSweepAsync(CancellationToken.None);
-        Assert.Single(reaper.GetLatestLeaks());
+        Assert.Empty(reaper.GetLatestLeaks());
         Assert.Contains(s.Id, provider.DisposedNames);
     }
 
@@ -278,14 +274,8 @@ public sealed class DeploymentLeakReaperTests
         Assert.Empty(reaper.GetLatestLeaks());
     }
 
-    /// <summary>
-    /// Regression: unknown CreatedAt is conservative (skip), not aggressive.
-    /// Previously the code defaulted to (now - LeakAgeThreshold), producing
-    /// `age == LeakAgeThreshold` and failing the `age &lt; threshold` skip
-    /// check — every metadata-less sandbox got reaped on first sight.
-    /// </summary>
     [Fact]
-    public async Task UnknownCreatedAt_IsSkipped()
+    public async Task UnknownCreatedAt_IsReportedAndDisposed()
     {
         var provider = new FakeDeploymentSandboxProvider();
         var s = (FakeDeploymentSandbox)await provider.CreateAsync(DeploymentSpec());
@@ -300,7 +290,7 @@ public sealed class DeploymentLeakReaperTests
 
         await reaper.RunSweepAsync(CancellationToken.None);
         Assert.Empty(reaper.GetLatestLeaks());
-        Assert.DoesNotContain(s.Id, provider.DisposedNames);
+        Assert.Contains(s.Id, provider.DisposedNames);
     }
 
     [Fact]
@@ -320,7 +310,8 @@ public sealed class DeploymentLeakReaperTests
 
         await reaper.RunSweepAsync(CancellationToken.None);
 
-        Assert.Equal(2, reaper.GetLatestLeaks().Count);
+        var remaining = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal(first.Id, remaining.Name);
         Assert.DoesNotContain(first.Id, provider.DisposedNames);
         Assert.Contains(second.Id, provider.DisposedNames);
     }

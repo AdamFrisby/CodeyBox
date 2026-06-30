@@ -43,6 +43,7 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
 
     public string? HostAddress { get; set; } = "10.42.0.10";
     public HashSet<string> DisposeThrowsFor { get; } = new(StringComparer.Ordinal);
+    public HashSet<string> SandboxDisposeThrowsFor { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Optional override for the synthetic <see cref="ManagedSandboxInfo"/>
@@ -180,6 +181,8 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox
 
     public ValueTask DisposeAsync()
     {
+        if (_provider.SandboxDisposeThrowsFor.Contains(Id))
+            throw new InvalidOperationException($"Simulated sandbox dispose failure for {Id}.");
         MarkDisposed();
         return ValueTask.CompletedTask;
     }

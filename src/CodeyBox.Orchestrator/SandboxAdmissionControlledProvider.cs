@@ -1126,9 +1126,10 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, ISandboxDecorator
+internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, ISandboxDecorator
 {
     private readonly ISandbox _inner;
+    private readonly IRoutableSandbox? _routable;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
     private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> _onDisposed;
     private readonly Action<AdmissionControlledSandbox> _onPreserved;
@@ -1151,6 +1152,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
         ArgumentNullException.ThrowIfNull(onPreserved);
         ArgumentNullException.ThrowIfNull(log);
         _inner = inner;
+        _routable = inner as IRoutableSandbox;
         _preserveOnDispose = inner as IPreserveOnDisposeSandbox;
         _lease = lease;
         _onDisposed = onDisposed;
@@ -1162,6 +1164,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
     public string Id => _inner.Id;
     public string HostId { get; }
     public ISandbox InnerSandbox => _inner;
+    public string? HostAddress => _routable?.HostAddress;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
     public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
