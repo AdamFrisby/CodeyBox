@@ -87,35 +87,67 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
         await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
 
+        // Fill the whole 4-slot pool so the "backlog is held out" assertion is a
+        // DETERMINISTIC consequence of zero free slots, not a race against the
+        // refill loop. The dispatcher's contract is to refill EVERY open slot
+        // from one wake (see DispatchWake_RefillsAllOpenSlotsFromReadyBacklog...),
+        // so a single occupied slot in a 4-slot pool leaves three free slots that
+        // the very first wake legitimately fills — checking HasEntered==false at
+        // that instant only ever observed "not yet" by luck on a loaded host and
+        // was guaranteed to fail when the dispatcher won the race. Occupying all
+        // four slots makes the hold-out real: backlog cannot enter until a slot
+        // is released.
         var now = DateTimeOffset.UtcNow;
-        var running = MakeItem(createdAt: now);
-        var readyBacklog = new[]
+        var occupants = new[]
         {
+            MakeItem(createdAt: now),
             MakeItem(createdAt: now.AddMilliseconds(1)),
             MakeItem(createdAt: now.AddMilliseconds(2)),
             MakeItem(createdAt: now.AddMilliseconds(3)),
         };
+        var readyBacklog = new[]
+        {
+            MakeItem(createdAt: now.AddMilliseconds(4)),
+            MakeItem(createdAt: now.AddMilliseconds(5)),
+            MakeItem(createdAt: now.AddMilliseconds(6)),
+        };
 
-        await _store.CreateAsync(running);
+        foreach (var item in occupants)
+            await _store.CreateAsync(item);
         foreach (var item in readyBacklog)
             await _store.CreateAsync(item);
 
-        await queue.EnqueueAsync(running.Id);
-        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+        // One kick is enough: the refill loop fills all four slots from the
+        // store-backed pickup query without a per-item enqueue.
+        await queue.EnqueueAsync(occupants[0].Id);
+        foreach (var item in occupants)
+            Assert.True(
+                await pipeline.WaitForEnteredAsync(item.Id, DispatchWaitTimeout),
+                "All four slots should fill from a single kick via the store-backed refill loop.");
 
+        // Pool is now full (four entered occupants == four slots), so the ready
+        // backlog is genuinely blocked. This is a real invariant, not a timing
+        // snapshot.
         foreach (var item in readyBacklog)
             Assert.False(pipeline.HasEntered(item.Id));
 
-        pipeline.Release(running.Id);
-
-        foreach (var item in readyBacklog)
+        // Release the occupants one at a time. Each completion's slot-release
+        // wake must refill exactly one open slot from the independent ready
+        // backlog WITHOUT any per-item kick (EnqueueCount stays 0 for each
+        // backlog id), proving the slot-release wake keeps refilling while free
+        // slots and ready backlog remain.
+        for (var i = 0; i < readyBacklog.Length; i++)
         {
+            pipeline.Release(occupants[i].Id);
+            Assert.True(await pipeline.WaitForDoneAsync(occupants[i].Id, DispatchWaitTimeout));
+
             Assert.True(
-                await pipeline.WaitForEnteredAsync(item.Id, DispatchWaitTimeout),
-                "One slot-release wake should keep refilling while free slots and ready backlog remain.");
-            Assert.Equal(0, queue.EnqueueCount(item.Id));
+                await pipeline.WaitForEnteredAsync(readyBacklog[i].Id, DispatchWaitTimeout),
+                "A slot-release wake should refill the freed slot from independent ready backlog without an external kick.");
+            Assert.Equal(0, queue.EnqueueCount(readyBacklog[i].Id));
         }
 
+        pipeline.Release(occupants[^1].Id);
         foreach (var item in readyBacklog)
             pipeline.Release(item.Id);
         await svc.StopAsync(CancellationToken.None);
