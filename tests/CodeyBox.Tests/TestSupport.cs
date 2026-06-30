@@ -544,6 +544,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// the next candidate.
     /// </summary>
     public Queue<AgentResult> AgenticConflictResults { get; } = new();
+    public string? AgenticConflictResultStdout { get; set; }
 
     /// <summary>
     /// Hunk-scoped resolution handler queue. Each handler receives the
@@ -785,7 +786,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
                 return new AgentResult(false, $"ScriptedAgent: failed to git add '{path}': {add.Stderr}", null, null);
         }
 
-        return new AgentResult(true, "agentic resolved", null, null);
+        return new AgentResult(true, "agentic resolved", AgenticConflictResultStdout, null);
     }
 
     private static IReadOnlyList<string> ParseAgenticConflictFiles(string prompt)
