@@ -6277,7 +6277,22 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         {
             var probe = await RunLocalProcessAsync(
                 "/bin/sh",
-                ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-gone", pgid]);
+                ["-c", """
+                    codeybox_pgid=$1
+                    if [ -d /proc ]; then
+                        awk -v pgid="$codeybox_pgid" '
+                            {
+                                line = $0
+                                sub(/^[^)]*\) /, "", line)
+                                split(line, fields, " ")
+                                if (fields[3] == pgid && fields[1] != "Z") found = 1
+                            }
+                            END { exit found ? 0 : 1 }
+                        ' /proc/[0-9]*/stat 2>/dev/null
+                        exit $?
+                    fi
+                    kill -0 "-$codeybox_pgid" 2>/dev/null
+                    """, "codeybox-pgid-gone", pgid]);
             if (probe.Exit != 0)
                 return;
             if (DateTimeOffset.UtcNow >= deadline)

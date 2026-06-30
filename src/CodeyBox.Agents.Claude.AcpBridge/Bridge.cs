@@ -524,6 +524,11 @@ internal sealed class Bridge : IAsyncDisposable
         // any peer so the WebSocket handshake guard cannot see an empty
         // value during a connect/auth race.
         _lockPath = Path.Combine(baseDir, _port + ".lock");
+        if (ShutdownStarted)
+        {
+            DeleteLockfile();
+            return;
+        }
 
         var bytes = BridgePayloads.BuildLockfileBytes(
             Environment.ProcessId, _config.WorkingDirectory, _authToken ?? string.Empty, _port);
@@ -536,6 +541,9 @@ internal sealed class Bridge : IAsyncDisposable
             Fatal("lockfile_write_failed", ex.Message);
             return;
         }
+
+        if (ShutdownStarted)
+            DeleteLockfile();
     }
 
     private void EmitReady()
@@ -777,22 +785,7 @@ internal sealed class Bridge : IAsyncDisposable
         try { _turnDeadline?.Dispose(); } catch { }
 
         // CRITICAL: Delete the lockfile first to prevent any leak if we get terminated early.
-        if (_lockPath is not null)
-        {
-            try
-            {
-                File.Delete(_lockPath);
-            }
-            catch (Exception ex)
-            {
-                Emitter.Emit("lockfile_delete_failed", w =>
-                {
-                    w.WriteString("path", _lockPath);
-                    w.WriteString("exception", ex.GetType().FullName);
-                    w.WriteString("message", ex.Message);
-                });
-            }
-        }
+        DeleteLockfile();
 
         // Clean up connections and streams to immediately unblock the main thread's stdin read
         WebSocketConnection? peerToClose;
@@ -816,6 +809,25 @@ internal sealed class Bridge : IAsyncDisposable
         catch { }
 
         try { _cts.Cancel(); } catch { }
+    }
+
+    private void DeleteLockfile()
+    {
+        var lockPath = Volatile.Read(ref _lockPath);
+        if (string.IsNullOrEmpty(lockPath)) return;
+        try
+        {
+            File.Delete(lockPath);
+        }
+        catch (Exception ex)
+        {
+            Emitter.Emit("lockfile_delete_failed", w =>
+            {
+                w.WriteString("path", lockPath);
+                w.WriteString("exception", ex.GetType().FullName);
+                w.WriteString("message", ex.Message);
+            });
+        }
     }
 
     private static bool HasProcessExited(Process proc)

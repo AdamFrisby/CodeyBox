@@ -7225,6 +7225,22 @@ while True:
         // additional host-side multipass spin.
         const string pollCommand = """
             codeybox_pgid_marker=$1
+            codeybox_process_group_alive() {
+                codeybox_probe_pgid=$1
+                if [ -d /proc ]; then
+                    awk -v pgid="$codeybox_probe_pgid" '
+                        {
+                            line = $0
+                            sub(/^[^)]*\) /, "", line)
+                            split(line, fields, " ")
+                            if (fields[3] == pgid && fields[1] != "Z") found = 1
+                        }
+                        END { exit found ? 0 : 1 }
+                    ' /proc/[0-9]*/stat 2>/dev/null
+                    return $?
+                fi
+                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
+            }
             if ! test -f "$codeybox_pgid_marker"; then
                 printf 'missing\n'
                 exit 0
@@ -7237,7 +7253,7 @@ while True:
                     ;;
             esac
             codeybox_alive=gone
-            if kill -0 "-$codeybox_pgid" 2>/dev/null; then
+            if codeybox_process_group_alive "$codeybox_pgid"; then
                 codeybox_alive=alive
             fi
             codeybox_exit_file="${codeybox_pgid_marker}.exit"
@@ -7323,6 +7339,22 @@ while True:
     {
         const string killCommand = """
             codeybox_pgid_marker=$1
+            codeybox_process_group_alive() {
+                codeybox_probe_pgid=$1
+                if [ -d /proc ]; then
+                    awk -v pgid="$codeybox_probe_pgid" '
+                        {
+                            line = $0
+                            sub(/^[^)]*\) /, "", line)
+                            split(line, fields, " ")
+                            if (fields[3] == pgid && fields[1] != "Z") found = 1
+                        }
+                        END { exit found ? 0 : 1 }
+                    ' /proc/[0-9]*/stat 2>/dev/null
+                    return $?
+                fi
+                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
+            }
             codeybox_wait_i=0
             while ! test -f "$codeybox_pgid_marker"; do
                 if [ "$codeybox_wait_i" -ge 50 ]; then
@@ -7338,7 +7370,7 @@ while True:
             kill -TERM "-$codeybox_pgid" 2>/dev/null || true
             codeybox_i=0
             while [ "$codeybox_i" -lt 20 ]; do
-                if ! kill -0 "-$codeybox_pgid" 2>/dev/null; then
+                if ! codeybox_process_group_alive "$codeybox_pgid"; then
                     exit 0
                 fi
                 sleep 0.1
