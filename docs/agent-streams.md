@@ -91,9 +91,12 @@ Not locally verifiable here:
   and the plaintext-fallback summariser still produces a row.
 - Antigravity: the `agy` binary is shape-compatible with Claude (Anthropic
   stream-json for claude-* gateway models, Gemini stream-json for gemini-*).
-  CodeyBox probes `agy --help` for `--output-format stream-json` and adds the
-  flag when advertised. If absent, the runner falls back to agy's plaintext
-  output and the plaintext-fallback summariser still produces a row.
+  CodeyBox first uses `agy --help` as a cheap prefilter, then runs a trivial
+  `agy --print --output-format stream-json` functional probe and only adds the
+  flag to real work when that probe exits successfully with parseable NDJSON.
+  Results are cached per agy version. If the probe is ambiguous, prints usage,
+  or fails, the runner falls back to agy's plaintext output and the
+  plaintext-fallback summariser still produces a row.
 
 Unsupported (plaintext-fallback only):
 
@@ -126,7 +129,7 @@ The stream-capture system supports two paths per agent:
 | `codex`     | Yes (`codex exec --json`) | Yes             | Codex stream-json shape.                                           |
 | `cursor`    | Yes (Claude-shape)     | Yes                | `--output-format stream-json --stream-partial-output`              |
 | `gemini`    | Conditional            | Yes                | `gemini --help` probed for `--output-format stream-json`.          |
-| `antigravity` | Conditional          | Yes                | `agy --help` probed for `--output-format stream-json`.             |
+| `antigravity` | Conditional          | Yes                | Functional `agy --print --output-format stream-json` probe.        |
 | `opencode`  | No                     | Yes                | Plaintext stdout only.                                             |
 | `copilot`   | No                     | Yes                | Plaintext stdout only.                                             |
 

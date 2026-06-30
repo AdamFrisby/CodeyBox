@@ -205,24 +205,87 @@ public sealed class AgentRunnerStructuredStreamFlagTests
     }
 
     [Fact]
-    public async Task Antigravity_WhenHelpAdvertisesStreamJson_ReportsSupport()
+    public async Task Antigravity_WhenFunctionalProbeEmitsStructuredNdjson_ReportsSupport()
     {
-        var sandbox = new CapturingSandbox(stderr: "Usage: agy --output-format stream-json");
+        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
+        var sandbox = new CapturingSandbox
+        {
+            VersionOutput = "agy version structured-supported",
+            HelpOutput = "Usage: agy --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
         var runner = new AntigravityAgentRunner { Binary = "/opt/agy" };
 
         var supported = await runner.SupportsStructuredStreamAsync(sandbox);
 
         Assert.True(supported);
-        Assert.Equal(["/opt/agy", "--help"], sandbox.CapturedExec!.Argv);
+        Assert.Equal(["/opt/agy", "--version"], sandbox.Execs[0].Argv);
+        Assert.Equal(["/opt/agy", "--help"], sandbox.Execs[1].Argv);
+        Assert.Equal("bash", sandbox.Execs[2].Argv[0]);
+        Assert.Contains("--output-format", sandbox.Execs[3].Argv);
+        Assert.Contains("stream-json", sandbox.Execs[3].Argv);
+        Assert.Equal("/tmp", sandbox.Execs[3].WorkingDirectory);
+    }
+
+    [Fact]
+    public async Task Antigravity_WhenHelpMentionsStreamJsonButPrintModeBreaks_ReturnsFalse()
+    {
+        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
+        var sandbox = new CapturingSandbox
+        {
+            VersionOutput = "agy version structured-broken",
+            HelpOutput = "Usage: agy --output-format stream-json",
+            StructuredProbeOutput = """
+                Available subcommands:
+                  install   Configure environment paths and shell settings
+                  models    List available models
+                """,
+        };
+        var runner = new AntigravityAgentRunner();
+
+        var supported = await runner.SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
+        Assert.Contains("--output-format", sandbox.Execs[3].Argv);
+        Assert.Contains("stream-json", sandbox.Execs[3].Argv);
+    }
+
+    [Fact]
+    public async Task Antigravity_SupportProbe_CachesFunctionalOutcomeByVersion()
+    {
+        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
+        var runner = new AntigravityAgentRunner();
+        var firstSandbox = new CapturingSandbox
+        {
+            VersionOutput = "agy version cached-supported",
+            HelpOutput = "Usage: agy --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
+
+        Assert.True(await runner.SupportsStructuredStreamAsync(firstSandbox));
+
+        var secondSandbox = new CapturingSandbox
+        {
+            VersionOutput = "agy version cached-supported",
+            HelpOutput = "Usage: agy",
+        };
+
+        Assert.True(await runner.SupportsStructuredStreamAsync(secondSandbox));
+        Assert.Single(secondSandbox.Execs);
+        Assert.Equal(["agy", "--version"], secondSandbox.Execs[0].Argv);
     }
 
     [Fact]
     public async Task Antigravity_WhenHelpCommandFails_ReturnsFalse()
     {
+        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
         var sandbox = new CapturingSandbox(
             exitCode: 1,
             stdout: "--output-format stream-json",
-            stderr: "agy: auth failed");
+            stderr: "agy: auth failed")
+        {
+            VersionOutput = "agy version help-fails",
+        };
 
         var supported = await new AntigravityAgentRunner().SupportsStructuredStreamAsync(sandbox);
 
@@ -233,22 +296,30 @@ public sealed class AgentRunnerStructuredStreamFlagTests
     [Fact]
     public async Task Antigravity_WhenHelpOnlyAdvertisesOutputFormatWithoutStreamJson_ReturnsFalse()
     {
-        // Same regression target as the Cursor partial-marker test: BOTH
-        // `--output-format` AND `stream-json` must be present, not either.
-        var sandbox = new CapturingSandbox(
-            stdout: "  --output-format <text|json>   Output format");
+        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
+        var sandbox = new CapturingSandbox
+        {
+            VersionOutput = "agy version output-format-only",
+            HelpOutput = "  --output-format <text|json>   Output format",
+        };
         var supported = await new AntigravityAgentRunner().SupportsStructuredStreamAsync(sandbox);
 
         Assert.False(supported);
+        Assert.Equal(["agy", "--help"], sandbox.CapturedExec!.Argv);
     }
 
     [Fact]
     public async Task Antigravity_WhenHelpOnlyMentionsStreamJsonWithoutFlag_ReturnsFalse()
     {
-        var sandbox = new CapturingSandbox(
-            stdout: "agy ships stream-json in a future preview channel.");
+        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
+        var sandbox = new CapturingSandbox
+        {
+            VersionOutput = "agy version stream-json-only",
+            HelpOutput = "agy ships stream-json in a future preview channel.",
+        };
         var supported = await new AntigravityAgentRunner().SupportsStructuredStreamAsync(sandbox);
 
         Assert.False(supported);
+        Assert.Equal(["agy", "--help"], sandbox.CapturedExec!.Argv);
     }
 }

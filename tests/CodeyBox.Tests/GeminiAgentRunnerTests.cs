@@ -808,12 +808,29 @@ internal sealed class CapturingSandbox : ISandbox
     /// stream detection). When null, falls back to the regular stdout/stderr.
     /// </summary>
     public string? HelpOutput { get; init; }
+    public string? VersionOutput { get; init; }
+    public string? StructuredProbeOutput { get; init; }
+    public string? StructuredProbeStderr { get; init; }
+    public int StructuredProbeExitCode { get; init; }
+    public List<SandboxExec> Execs { get; } = [];
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
+        Execs.Add(exec);
         CapturedExec = exec;
+        if (VersionOutput is not null && exec.Argv.Contains("--version"))
+            return Task.FromResult(new SandboxExecResult(0, VersionOutput, string.Empty));
         if (HelpOutput is not null && exec.Argv.Contains("--help"))
             return Task.FromResult(new SandboxExecResult(0, HelpOutput, string.Empty));
+        if (StructuredProbeOutput is not null
+            && exec.Argv.Contains("--output-format")
+            && string.Equals(exec.Stdin, "Reply with exactly CODEYBOX_STRUCTURED_STREAM_PROBE. Do not inspect or modify files.", StringComparison.Ordinal))
+        {
+            return Task.FromResult(new SandboxExecResult(
+                StructuredProbeExitCode,
+                StructuredProbeOutput,
+                StructuredProbeStderr ?? string.Empty));
+        }
         if (_stdoutChunk is not null)
             exec.StdoutChunkCallback?.Invoke(_stdoutChunk);
         return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
