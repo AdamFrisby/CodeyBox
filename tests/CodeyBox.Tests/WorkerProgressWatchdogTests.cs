@@ -294,48 +294,49 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         var workerId = Guid.NewGuid().ToString();
         await PlantHeartbeatingWorkerAsync(workerId, item.Id);
 
-        using var process = StartBusyProcess(item.Id);
-        try
+        // Deterministic CPU signal: an actively-scheduled (R-state) tagged
+        // process. Injecting the sample reader exercises the same
+        // ObserveAsync -> TryObserveProcessCpu -> watchdog decision path as a
+        // real busy process, but without depending on a real `yes` process
+        // winning a /proc CPU tick on a contended host (the previous source of
+        // flakiness — under suite-wide saturation the burner was starved and
+        // the "process-cpu" signal never primed within the deadline).
+        var cpuReader = ActiveProcessSample("active-cpu-process");
+        var activitySource = new DefaultWorkerProgressActivitySource(
+            activeSandboxProvider: null,
+            processCpuSampleReader: cpuReader);
+        var activityProbe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: true,
+            ActiveSandboxProgressSignalEnabled: false);
+        var primed = await activitySource.ObserveAsync(
+            WorkerForItem(workerId, item.Id),
+            item.Id,
+            activityProbe,
+            CancellationToken.None);
+        Assert.NotNull(primed);
+        Assert.Equal("process-cpu", primed!.Reason);
+
+        var opts = new WorkerProgressWatchdogOptions
         {
-            var activitySource = new DefaultWorkerProgressActivitySource();
-            var activityProbe = new WorkerProgressActivityProbe(
-                ProcessCpuProgressSignalEnabled: true,
-                ActiveSandboxProgressSignalEnabled: false);
-            var primed = await WaitForActivityAsync(
-                activitySource,
-                WorkerForItem(workerId, item.Id),
-                item.Id,
-                activityProbe,
-                requiredReason: "process-cpu");
-            Assert.NotNull(primed);
-            await Task.Delay(TimeSpan.FromMilliseconds(150));
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            ProcessCpuProgressSignalEnabled = true,
+            ActiveSandboxProgressSignalEnabled = false,
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            activitySource: activitySource);
 
-            var opts = new WorkerProgressWatchdogOptions
-            {
-                ProgressTimeout = TimeSpan.FromMinutes(30),
-                CheckInterval = TimeSpan.FromMinutes(1),
-                ProcessCpuProgressSignalEnabled = true,
-                ActiveSandboxProgressSignalEnabled = false,
-            };
-            var watchdog = new WorkerProgressWatchdog(
-                _registry, _store, _queue, opts,
-                NullLogger<WorkerProgressWatchdog>.Instance,
-                _streams, _webhooks, _slotReleaser,
-                activitySource: activitySource);
+        await watchdog.RunOnceAsync(CancellationToken.None);
 
-            await watchdog.RunOnceAsync(CancellationToken.None);
-
-            var after = await _store.GetAsync(item.Id);
-            Assert.Equal(WorkItemState.Working, after!.State);
-            Assert.Equal(0, after.RecoveryAttempts);
-            Assert.Empty(_slotReleaser.Releases);
-            Assert.Single(await _registry.ListAsync());
-            Assert.Equal(0, _queue.Count);
-        }
-        finally
-        {
-            StopProcess(process);
-        }
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
     }
 
     [Fact]
@@ -977,35 +978,38 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             return;
 
         var itemId = WorkItemId.New();
-        var source = new DefaultWorkerProgressActivitySource();
+        // Two distinct, actively-scheduled process sets observed in sequence:
+        // the first primes a confirmed-progress baseline; the second has a
+        // different signature, exercising the "process replacement counts as
+        // progress" branch. Scripting the samples removes the dependency on two
+        // real `yes` processes each winning a /proc CPU tick under host load
+        // (the previous source of flakiness).
+        var cpuReader = ScriptedCpuSamples(
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                CpuTicks: 100,
+                ProcessSetSignature: "first-process-set",
+                HasActiveProcessState: true,
+                HasConfirmedProgress: false),
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                CpuTicks: 200,
+                ProcessSetSignature: "replacement-process-set",
+                HasActiveProcessState: true,
+                HasConfirmedProgress: false));
+        var source = new DefaultWorkerProgressActivitySource(
+            activeSandboxProvider: null,
+            processCpuSampleReader: cpuReader);
         var probe = new WorkerProgressActivityProbe(
             ProcessCpuProgressSignalEnabled: true,
             ActiveSandboxProgressSignalEnabled: false);
         var worker = WorkerForItem("replacement-process-test", itemId);
 
-        using (var firstProcess = StartBusyProcess(itemId))
-        {
-            try
-            {
-                var first = await WaitForActivityAsync(source, worker, itemId, probe, requiredReason: "process-cpu");
-                Assert.NotNull(first);
-            }
-            finally
-            {
-                StopProcess(firstProcess);
-            }
-        }
+        var first = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        Assert.NotNull(first);
+        Assert.Equal("process-cpu", first!.Reason);
 
-        using var replacement = StartBusyProcess(itemId);
-        try
-        {
-            var observed = await WaitForActivityAsync(source, worker, itemId, probe, requiredReason: "process-cpu");
-            Assert.NotNull(observed);
-        }
-        finally
-        {
-            StopProcess(replacement);
-        }
+        var observed = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        Assert.NotNull(observed);
+        Assert.Equal("process-cpu", observed!.Reason);
     }
 
     // ── State recovery mapping (mirrors DeadWorkerReaper) ────────────────────
@@ -1578,6 +1582,25 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         LastHeartbeatAt = DateTimeOffset.UtcNow,
         CurrentWorkItemId = itemId.ToString(),
     };
+
+    // Deterministic CPU sample reader: reports a single actively-scheduled
+    // (R-state) tagged process on every probe. This drives the
+    // HasActiveProcessState "process-cpu" branch without a real OS process, so
+    // the watchdog's "active process leaves the worker alone" contract is
+    // tested independently of host scheduler luck.
+    private static DefaultWorkerProgressActivitySource.ProcessCpuSampleReader ActiveProcessSample(
+        string processSignature, long cpuTicks = 100)
+    {
+        return (WorkItemId _, out DefaultWorkerProgressActivitySource.ProcessCpuSample sample) =>
+        {
+            sample = new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                CpuTicks: cpuTicks,
+                ProcessSetSignature: processSignature,
+                HasActiveProcessState: true,
+                HasConfirmedProgress: false);
+            return true;
+        };
+    }
 
     private static DefaultWorkerProgressActivitySource.ProcessCpuSampleReader ScriptedCpuSamples(
         params DefaultWorkerProgressActivitySource.ProcessCpuSample[] samples)
