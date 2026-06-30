@@ -9,11 +9,9 @@ namespace CodeyBox.Deployment;
 /// <see cref="WebAppDeploymentDriver"/> only by the readiness check shape —
 /// daemons may not host an HTTP probe.
 ///
-/// <para>The default readiness check tails a recipe-declared liveness
-/// command (<see cref="SettingsKeyLivenessCommand"/>) such as
-/// <c>pgrep -f my-daemon</c>. When the command exits 0, the process is
-/// considered alive. Recipes that listen on a TCP socket can override with
-/// a netcat-style probe; nothing is hardcoded to a single style.</para>
+/// <para>The default readiness check uses a recipe-declared liveness command,
+/// a declared TCP port, or the driver's managed process sidecar. When the
+/// selected probe exits 0, the process is considered alive.</para>
 ///
 /// <para>The exposed endpoint is TCP when the recipe declares at least one
 /// port (host/port surfaced); otherwise Process (the metadata bag is the
@@ -34,31 +32,21 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         base.ValidateRecipe(recipe);
         if (string.IsNullOrWhiteSpace(recipe.RunCommand))
             throw new ArgumentException("DeploymentRecipe.RunCommand is required for kind 'daemon'.", nameof(recipe));
-        // Validate with the same predicate the probe uses (IsNullOrWhiteSpace
-        // rather than ContainsKey) so a recipe with Settings['liveness-command']=''
-        // is caught here instead of throwing IndexOutOfRangeException from
-        // recipe.Ports[0] inside the probe.
-        var hasLivenessCommand =
-            recipe.Settings.TryGetValue(SettingsKeyLivenessCommand, out var explicitCmd)
-            && !string.IsNullOrWhiteSpace(explicitCmd);
-        if (!hasLivenessCommand && recipe.Ports.Count == 0)
-            throw new ArgumentException(
-                "DeploymentRecipe needs either a non-empty Settings['liveness-command'] or at least one Port for kind 'daemon'.",
-                nameof(recipe));
     }
 
     protected override async Task StartRuntimeAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
     {
-        var result = await RunDeploymentExecAsync(
-            sandbox,
+        var result = await StartManagedProcessAsync(
+            substrate,
             recipe,
             context,
             "daemon start",
-            ["sh", "-c", recipe.RunCommand!],
+            "primary",
+            recipe.RunCommand!,
             recipe.Environment,
             ct).ConfigureAwait(false);
         if (!result.Success)
@@ -66,7 +54,7 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override async Task ProbeReadyAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -79,13 +67,20 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         }
         else
         {
-            // /dev/tcp is a BASH builtin — it is not in POSIX, dash (Ubuntu's
-            // default /bin/sh) and busybox sh do NOT implement it. Invoke
-            // bash explicitly so the redirection actually works on minimal
-            // sandbox images; recipes that want a different probe shape can
-            // override via SettingsKeyLivenessCommand.
-            var port = recipe.Ports[0];
-            probeArgv = ["bash", "-c", $"exec 3<>/dev/tcp/127.0.0.1/{port}"];
+            if (recipe.Ports.Count > 0)
+            {
+                // /dev/tcp is a BASH builtin — it is not in POSIX, dash (Ubuntu's
+                // default /bin/sh) and busybox sh do NOT implement it. Invoke
+                // bash explicitly so the redirection actually works on minimal
+                // sandbox images; recipes that want a different probe shape can
+                // override via SettingsKeyLivenessCommand.
+                var port = recipe.Ports[0];
+                probeArgv = ["bash", "-c", $"exec 3<>/dev/tcp/127.0.0.1/{port}"];
+            }
+            else
+            {
+                probeArgv = ["sh", "-c", BuildManagedProcessLivenessCommand("primary")];
+            }
         }
 
         var interval = ResolveProbeInterval(recipe);
@@ -94,7 +89,7 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         {
             ct.ThrowIfCancellationRequested();
             var result = await RunDeploymentExecAsync(
-                sandbox,
+                substrate,
                 recipe,
                 context,
                 "daemon readiness probe",
@@ -107,13 +102,13 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         }
     }
 
-    protected override DeploymentEndpoint BuildEndpoint(ISandbox sandbox, DeploymentRecipe recipe, DeploymentContext context)
+    protected override DeploymentEndpoint BuildEndpoint(IDeploymentSubstrate substrate, DeploymentRecipe recipe, DeploymentContext context)
     {
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["sandbox.id"] = sandbox.Id,
+            ["substrate.id"] = substrate.Id,
         };
-        AddServiceEndpointMetadata(metadata, sandbox, recipe);
+        AddServiceEndpointMetadata(metadata, substrate, recipe);
         if (recipe.Ports.Count > 0)
         {
             var port = recipe.Ports[0];
@@ -124,13 +119,14 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
                 Port = port,
                 Metadata = metadata,
             };
-            if (CanPublishEndpoint(sandbox, request))
-                return PublishEndpoint(sandbox, request);
+            if (CanPublishEndpoint(substrate, request))
+                return PublishEndpoint(substrate, request);
 
             metadata["endpoint.scope"] = "sandbox-local";
             return new DeploymentEndpoint
             {
                 Kind = DeploymentEndpointKind.Tcp,
+                Host = "127.0.0.1",
                 Port = port,
                 Metadata = metadata,
             };

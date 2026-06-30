@@ -56,8 +56,8 @@ public sealed class DeploymentManager : IDeploymentManager
         var tracked = new TrackedDeployment(inner, this, recipe.Kind, context.ProjectId, startedAt);
         _active[inner.Id] = tracked;
         _log.LogInformation(
-            "Deployment {Id} of kind {Kind} started; endpoint={EndpointKind} sandbox={SandboxId}",
-            inner.Id, recipe.Kind, inner.Endpoint.Kind, inner.SandboxId ?? "<none>");
+            "Deployment {Id} of kind {Kind} started; endpoint={EndpointKind} substrate={SubstrateId}",
+            inner.Id, recipe.Kind, inner.Endpoint.Kind, inner.SubstrateId ?? "<none>");
         return tracked;
     }
 
@@ -73,7 +73,7 @@ public sealed class DeploymentManager : IDeploymentManager
                 t.Inner.Id,
                 t.Kind,
                 t.ProjectId,
-                t.Inner.SandboxId,
+                t.Inner.SubstrateId,
                 t.StartedAt,
                 t.Inner.Endpoint));
         }
@@ -99,11 +99,11 @@ public sealed class DeploymentManager : IDeploymentManager
         public string Id => Inner.Id;
         public DeploymentEndpoint Endpoint => Inner.Endpoint;
         public bool IsAlive => Volatile.Read(ref _disposed) == 0 && Inner.IsAlive;
-        public string? SandboxId => Inner.SandboxId;
+        public string? SubstrateId => Inner.SubstrateId;
 
         public Task HealthCheckAsync(CancellationToken ct = default) => Inner.HealthCheckAsync(ct);
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
-            Inner.ExecAsync(exec, ct);
+        public Task<DeploymentCommandResult> ExecAsync(DeploymentCommand command, CancellationToken ct = default) =>
+            Inner.ExecAsync(command, ct);
 
         public async ValueTask DisposeAsync()
         {

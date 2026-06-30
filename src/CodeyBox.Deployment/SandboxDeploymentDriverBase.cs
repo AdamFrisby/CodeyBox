@@ -91,49 +91,51 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
 
         ValidateRecipe(recipe);
 
-        var spec = BuildSandboxSpec(recipe, context);
-        ISandbox? sandbox = null;
+        var spec = BuildSubstrateSpec(recipe, context);
+        IDeploymentSubstrate? substrate = null;
         try
         {
-            sandbox = await context.SandboxProvider.CreateAsync(spec, ct).ConfigureAwait(false);
-            await ValidateProvisionedSubstrateAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
+            substrate = await context.SubstrateProvider.CreateAsync(spec, ct).ConfigureAwait(false);
+            await ValidateProvisionedSubstrateAsync(substrate, recipe, context, ct).ConfigureAwait(false);
 
-            await RunBuildAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
+            await RunBuildAsync(substrate, recipe, context, ct).ConfigureAwait(false);
 
-            // StartupTimeout bounds StartRuntimeAsync AND ProbeReadyAsync.
-            // RunCommand is "fire and forget" by convention (recipe authors
-            // background the server via nohup/&), but a misconfigured
-            // recipe that forgets to background can otherwise hang the deploy
-            // indefinitely — neither the startup timeout nor the readiness
-            // probe would fire. Wrapping start under the same bound surfaces
-            // the failure as TimeoutException after StartupTimeout.
-            //
-            // The two stages share the deadline but are caught separately so
-            // the operator-facing message tells them which stage hit it. A
-            // start-stage timeout almost always means the recipe forgot to
-            // background the run command (sandbox.ExecAsync is one-shot and
-            // blocks until the child exits); a probe-stage timeout means the
-            // server started but readiness never converged.
             using (var startupCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 startupCts.CancelAfter(recipe.StartupTimeout);
                 try
                 {
-                    await StartServicesAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
-                    await ProbeServicesReadyAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
-                    await StartRuntimeAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
+                    await StartServicesAsync(substrate, recipe, context, startupCts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                 {
                     throw new TimeoutException(
-                        $"Deployment kind '{Kind}' startup did not return within {recipe.StartupTimeout}. " +
-                        "RunCommand likely runs the server in the foreground — sandbox.ExecAsync waits for the " +
-                        "child process to exit, so the recipe must background the server (e.g. nohup ... &, " +
-                        "setsid ... &, or a process supervisor) for StartRuntime to return. Tearing down substrate.");
+                        $"Deployment kind '{Kind}' backing services did not start within {recipe.StartupTimeout}. " +
+                        "Tearing down substrate.");
                 }
                 try
                 {
-                    await ProbeReadyAsync(sandbox, recipe, context, startupCts.Token).ConfigureAwait(false);
+                    await ProbeServicesReadyAsync(substrate, recipe, context, startupCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new TimeoutException(
+                        $"Deployment kind '{Kind}' backing services did not become ready within {recipe.StartupTimeout}. " +
+                        "Tearing down substrate.");
+                }
+                try
+                {
+                    await StartRuntimeAsync(substrate, recipe, context, startupCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new TimeoutException(
+                        $"Deployment kind '{Kind}' runtime did not start within {recipe.StartupTimeout}. " +
+                        "Tearing down substrate.");
+                }
+                try
+                {
+                    await ProbeReadyAsync(substrate, recipe, context, startupCts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                 {
@@ -143,13 +145,13 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                 }
             }
 
-            var endpoint = BuildEndpoint(sandbox, recipe, context);
+            var endpoint = BuildEndpoint(substrate, recipe, context);
             using (var exposeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 exposeCts.CancelAfter(recipe.StartupTimeout);
                 try
                 {
-                    await VerifyExposedEndpointAsync(sandbox, recipe, context, endpoint, exposeCts.Token)
+                    await VerifyExposedEndpointAsync(substrate, recipe, context, endpoint, exposeCts.Token)
                         .ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -161,24 +163,24 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             }
 
             var id = Guid.NewGuid().ToString("N")[..DeploymentIdHexChars];
-            // Capture the sandbox reference in a separate local so nulling the
+            // Capture the substrate reference in a separate local so nulling the
             // outer one (to skip the catch's cleanup-on-failure path) does not
             // also nil out the closure used by the runtime health check.
-            var owned = sandbox;
+            var owned = substrate;
             var handle = new SandboxDeploymentHandle(
                 id,
                 Kind,
                 owned,
                 endpoint,
                 runtimeCt => RunHealthCheckAsync(owned, recipe, context, runtimeCt));
-            sandbox = null; // ownership transferred
+            substrate = null; // ownership transferred
             return handle;
         }
         catch
         {
-            if (sandbox is not null)
+            if (substrate is not null)
             {
-                try { await sandbox.DisposeAsync().ConfigureAwait(false); }
+                try { await substrate.DisposeAsync().ConfigureAwait(false); }
                 catch (Exception ex) { Log.LogWarning(ex, "Driver {Kind} teardown after failed deploy threw", Kind); }
             }
             throw;
@@ -186,32 +188,28 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     }
 
     /// <summary>
-    /// Builds the substrate SandboxSpec from the recipe. Default merges the
-    /// recipe's environment into a sandbox spec keyed off ImageReference and
-    /// NetworkProfile. <see cref="SandboxNetworkPolicy.Denied"/> is the safe
-    /// default when no profile is configured — deployment substrates are
-    /// network-isolated unless the recipe declares otherwise.
+    /// Builds the substrate spec from the recipe. Default merges the recipe's
+    /// environment into a spec keyed off ImageReference and NetworkProfile.
+    /// When no network profile is configured, the sandbox adapter maps that to
+    /// the provider's denied-network policy.
     /// </summary>
-    protected virtual SandboxSpec BuildSandboxSpec(DeploymentRecipe recipe, DeploymentContext context) => new()
+    protected virtual DeploymentSubstrateSpec BuildSubstrateSpec(DeploymentRecipe recipe, DeploymentContext context) => new()
     {
         ImageReference = recipe.ImageReference,
-        Purpose = SandboxPurpose.Deployment,
         Mounts = context.Mounts,
         Environment = recipe.Environment,
-        Network = recipe.NetworkProfile is null
-            ? SandboxNetworkPolicy.Denied
-            : new SandboxNetworkPolicy { ProfileName = recipe.NetworkProfile },
+        NetworkProfile = recipe.NetworkProfile,
         WorkingDirectory = context.WorkingDirectory,
     };
 
     protected virtual Task ValidateProvisionedSubstrateAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct) => Task.CompletedTask;
 
     protected virtual async Task StartServicesAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -222,12 +220,13 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                 ServiceImagePlaceholder,
                 Shell.Quote(service.ImageReference),
                 StringComparison.Ordinal);
-            var result = await RunDeploymentExecAsync(
-                sandbox,
+            var result = await StartManagedProcessAsync(
+                substrate,
                 recipe,
                 context,
                 $"service '{service.Name}' start",
-                ["sh", "-c", command],
+                $"service-{service.Name}",
+                command,
                 MergeEnvironment(recipe.Environment, service.Environment),
                 ct).ConfigureAwait(false);
             if (!result.Success)
@@ -236,17 +235,17 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     }
 
     protected virtual async Task ProbeServicesReadyAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
     {
         foreach (var service in recipe.Services)
-            await ProbeServiceReadyAsync(sandbox, recipe, context, service, ct).ConfigureAwait(false);
+            await ProbeServiceReadyAsync(substrate, recipe, context, service, ct).ConfigureAwait(false);
     }
 
     private async Task ProbeServiceReadyAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         DeploymentService service,
@@ -270,7 +269,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         {
             ct.ThrowIfCancellationRequested();
             var result = await RunDeploymentExecAsync(
-                sandbox,
+                substrate,
                 recipe,
                 context,
                 $"service '{service.Name}' readiness probe",
@@ -284,7 +283,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     }
 
     protected virtual async Task RunBuildAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -292,7 +291,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         if (string.IsNullOrWhiteSpace(recipe.BuildCommand))
             return;
         var result = await RunDeploymentExecAsync(
-            sandbox,
+            substrate,
             recipe,
             context,
             "build",
@@ -308,21 +307,21 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     /// for kinds that do not start a long-running process (CLI, Library).
     /// </summary>
     protected virtual Task StartRuntimeAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct) => Task.CompletedTask;
 
     /// <summary>Driver-specific readiness probe. Throws on persistent failure; returns on success.</summary>
     protected abstract Task ProbeReadyAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct);
 
     /// <summary>Builds the public-facing endpoint surfaced on the handle.</summary>
     protected abstract DeploymentEndpoint BuildEndpoint(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context);
 
@@ -332,7 +331,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     /// endpoint here before the handle is returned to callers.
     /// </summary>
     protected virtual Task VerifyExposedEndpointAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         DeploymentEndpoint endpoint,
@@ -344,7 +343,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
     /// under the recipe's startup timeout, unless the caller cancels first.
     /// </summary>
     protected virtual async Task RunHealthCheckAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -353,8 +352,8 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         healthCts.CancelAfter(recipe.StartupTimeout);
         try
         {
-            await ProbeServicesReadyAsync(sandbox, recipe, context, healthCts.Token).ConfigureAwait(false);
-            await ProbeReadyAsync(sandbox, recipe, context, healthCts.Token).ConfigureAwait(false);
+            await ProbeServicesReadyAsync(substrate, recipe, context, healthCts.Token).ConfigureAwait(false);
+            await ProbeReadyAsync(substrate, recipe, context, healthCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -363,8 +362,8 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         }
     }
 
-    protected async Task<SandboxExecResult> RunDeploymentExecAsync(
-        ISandbox sandbox,
+    protected async Task<DeploymentCommandResult> RunDeploymentExecAsync(
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         string stage,
@@ -378,7 +377,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         execCts.CancelAfter(effectiveTimeout);
         try
         {
-            var result = await sandbox.ExecAsync(new SandboxExec
+            var result = await substrate.ExecAsync(new DeploymentCommand
             {
                 Argv = argv,
                 WorkingDirectory = context.WorkingDirectory,
@@ -402,7 +401,62 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         }
     }
 
-    protected InvalidOperationException DeploymentExecFailed(string stage, SandboxExecResult result)
+    protected async Task<DeploymentCommandResult> StartManagedProcessAsync(
+        IDeploymentSubstrate substrate,
+        DeploymentRecipe recipe,
+        DeploymentContext context,
+        string stage,
+        string processName,
+        string command,
+        IReadOnlyDictionary<string, string>? environment,
+        CancellationToken ct)
+    {
+        var supervisor = """
+            set -eu
+            codeybox_name=$1
+            codeybox_command=$2
+            codeybox_dir="${CODEYBOX_DEPLOYMENT_RUNTIME_DIR:-/tmp/codeybox-deployment}"
+            mkdir -p "$codeybox_dir"
+            codeybox_base="$codeybox_dir/$codeybox_name"
+            rm -f "$codeybox_base.pid" "$codeybox_base.exit" "$codeybox_base.stdout" "$codeybox_base.stderr"
+            (
+                set +e
+                sh -c "$codeybox_command"
+                codeybox_rc=$?
+                printf '%s\n' "$codeybox_rc" > "$codeybox_base.exit"
+            ) > "$codeybox_base.stdout" 2> "$codeybox_base.stderr" < /dev/null &
+            codeybox_pid=$!
+            printf '%s\n' "$codeybox_pid" > "$codeybox_base.pid"
+            exit 0
+            """;
+
+        return await RunDeploymentExecAsync(
+            substrate,
+            recipe,
+            context,
+            stage,
+            ["sh", "-c", supervisor, "codeybox-deployment-start", SanitizeProcessName(processName), command],
+            environment,
+            ct).ConfigureAwait(false);
+    }
+
+    protected static string BuildManagedProcessLivenessCommand(string processName)
+    {
+        var quotedName = Shell.Quote(SanitizeProcessName(processName));
+        return $$"""
+            codeybox_dir="${CODEYBOX_DEPLOYMENT_RUNTIME_DIR:-/tmp/codeybox-deployment}"
+            codeybox_base="$codeybox_dir"/{{quotedName}}
+            test -r "$codeybox_base.pid" || exit 1
+            codeybox_pid=$(cat -- "$codeybox_base.pid") || exit 1
+            case "$codeybox_pid" in ''|*[!0-9]*|0) exit 1 ;; esac
+            if test -f "$codeybox_base.exit"; then
+              exit 1
+            fi
+            kill -0 "$codeybox_pid" 2>/dev/null
+            """;
+    }
+
+    protected InvalidOperationException DeploymentExecFailed(string stage, DeploymentCommandResult result)
         => new(
             $"Deployment kind '{Kind}' {stage} command exited {result.ExitCode}; " +
             $"stdout tail: {Tail(result.Stdout)}; stderr tail: {Tail(result.Stderr)}");
@@ -430,30 +484,24 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         return TimeSpan.FromSeconds(1);
     }
 
-    protected bool CanPublishEndpoint(ISandbox sandbox, DeploymentEndpointRequest request)
-        => sandbox is IDeploymentEndpointPublisher publisher
-            && publisher.CanPublishEndpoint(request);
+    protected bool CanPublishEndpoint(IDeploymentSubstrate substrate, DeploymentEndpointRequest request)
+        => substrate.CanPublishEndpoint(request);
 
-    protected DeploymentEndpoint PublishEndpoint(ISandbox sandbox, DeploymentEndpointRequest request)
+    protected DeploymentEndpoint PublishEndpoint(IDeploymentSubstrate substrate, DeploymentEndpointRequest request)
     {
-        if (sandbox is not IDeploymentEndpointPublisher publisher)
-            throw new NotSupportedException(
-                $"Deployment kind '{Kind}' requires substrate endpoint publishing for {request.Kind} endpoints. " +
-                $"Sandbox provider '{sandbox.GetType().Name}' does not implement {nameof(IDeploymentEndpointPublisher)}.");
-        if (!publisher.CanPublishEndpoint(request))
+        if (!substrate.CanPublishEndpoint(request))
             throw new NotSupportedException(
                 $"Deployment kind '{Kind}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"} " +
-                $"from sandbox '{sandbox.Id}'.");
-        return publisher.PublishEndpoint(request);
+                $"from substrate '{substrate.Id}'.");
+        return substrate.PublishEndpoint(request);
     }
 
     protected static void AddServiceEndpointMetadata(
         IDictionary<string, string> metadata,
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         string scheme = "http")
     {
-        var publisher = sandbox as IDeploymentEndpointPublisher;
         foreach (var service in recipe.Services)
         {
             if (service.Ports.Count == 0)
@@ -473,9 +521,9 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                     Port = port,
                     Path = path,
                 };
-                if (publisher is not null && publisher.CanPublishEndpoint(request))
+                if (substrate.CanPublishEndpoint(request))
                 {
-                    var endpoint = publisher.PublishEndpoint(request);
+                    var endpoint = substrate.PublishEndpoint(request);
                     if (!string.IsNullOrWhiteSpace(endpoint.Url))
                         metadata[$"service.{service.Name}.url"] = endpoint.Url!;
                 }
@@ -488,9 +536,9 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                     Kind = DeploymentEndpointKind.Tcp,
                     Port = port,
                 };
-                if (publisher is not null && publisher.CanPublishEndpoint(request))
+                if (substrate.CanPublishEndpoint(request))
                 {
-                    var endpoint = publisher.PublishEndpoint(request);
+                    var endpoint = substrate.PublishEndpoint(request);
                     if (!string.IsNullOrWhiteSpace(endpoint.Host) && endpoint.Port is { } publishedPort)
                         metadata[$"service.{service.Name}.endpoint"] = $"{endpoint.Host}:{publishedPort}";
                 }
@@ -505,11 +553,18 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         maxChars = Math.Min(maxChars, ErrorOutputTailChars);
         return redacted.Length <= maxChars ? redacted : redacted[^maxChars..];
     }
+
+    private static string SanitizeProcessName(string name)
+    {
+        var chars = name.Select(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_' ? ch : '-').ToArray();
+        var sanitized = new string(chars).Trim('-');
+        return string.IsNullOrWhiteSpace(sanitized) ? "process" : sanitized;
+    }
 }
 
 /// <summary>
 /// Default <see cref="IDeploymentHandle"/> implementation backed by a single
-/// sandbox. DisposeAsync is idempotent — the second call is a no-op so the
+/// substrate. DisposeAsync is idempotent — the second call is a no-op so the
 /// leak reaper, graceful shutdown, and the normal teardown path can all call
 /// it without coordinating.
 /// </summary>
@@ -522,23 +577,23 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
     public SandboxDeploymentHandle(
         string id,
         string kind,
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentEndpoint endpoint,
         Func<CancellationToken, Task> healthCheck)
     {
         Id = id;
         Kind = kind;
-        Sandbox = sandbox;
+        Substrate = substrate;
         Endpoint = endpoint;
         _healthCheck = healthCheck;
     }
 
     public string Id { get; }
     public string Kind { get; }
-    internal ISandbox Sandbox { get; }
+    internal IDeploymentSubstrate Substrate { get; }
     public DeploymentEndpoint Endpoint { get; }
     public bool IsAlive => Volatile.Read(ref _disposed) == 0;
-    public string? SandboxId => Sandbox.Id;
+    public string? SubstrateId => Substrate.Id;
 
     public Task HealthCheckAsync(CancellationToken ct = default)
     {
@@ -547,11 +602,11 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
         return _healthCheck(ct);
     }
 
-    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+    public Task<DeploymentCommandResult> ExecAsync(DeploymentCommand command, CancellationToken ct = default)
     {
         if (!IsAlive)
             throw new ObjectDisposedException(nameof(SandboxDeploymentHandle));
-        return Sandbox.ExecAsync(exec, ct);
+        return Substrate.ExecAsync(command, ct);
     }
 
     public async ValueTask DisposeAsync()
@@ -563,7 +618,7 @@ internal sealed class SandboxDeploymentHandle : IDeploymentHandle
         {
             if (Volatile.Read(ref _disposed) != 0)
                 return;
-            await Sandbox.DisposeAsync().ConfigureAwait(false);
+            await Substrate.DisposeAsync().ConfigureAwait(false);
             Volatile.Write(ref _disposed, 1);
         }
         finally

@@ -5,6 +5,11 @@ namespace CodeyBox.Tests;
 
 public sealed class DeploymentManagerTests
 {
+    private static DeploymentContext Ctx(FakeDeploymentSandboxProvider provider) => new()
+    {
+        SubstrateProvider = new SandboxDeploymentSubstrateProvider(provider),
+    };
+
     [Fact]
     public async Task StartAsync_TracksDeployment_AndUntracksOnDispose()
     {
@@ -27,14 +32,14 @@ public sealed class DeploymentManagerTests
 
         var handle = await manager.StartAsync(
             recipe,
-            new DeploymentContext { SandboxProvider = provider },
+            Ctx(provider),
             CancellationToken.None);
 
         var active = manager.GetActive();
         Assert.Single(active);
         Assert.Equal(handle.Id, active[0].Id);
         Assert.Equal(DeploymentKinds.Library, active[0].Kind);
-        Assert.Equal(handle.SandboxId, active[0].SandboxId);
+        Assert.Equal(handle.SubstrateId, active[0].SubstrateId);
 
         await handle.DisposeAsync();
         Assert.Empty(manager.GetActive());
@@ -62,9 +67,9 @@ public sealed class DeploymentManagerTests
 
         var handle = await manager.StartAsync(
             recipe,
-            new DeploymentContext { SandboxProvider = provider },
+            Ctx(provider),
             CancellationToken.None);
-        provider.SandboxDisposeThrowsFor.Add(handle.SandboxId!);
+        provider.SandboxDisposeThrowsFor.Add(handle.SubstrateId!);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await handle.DisposeAsync());
 
@@ -72,7 +77,7 @@ public sealed class DeploymentManagerTests
         Assert.Equal(handle.Id, activeAfterFailure.Id);
         Assert.True(handle.IsAlive);
 
-        provider.SandboxDisposeThrowsFor.Remove(handle.SandboxId!);
+        provider.SandboxDisposeThrowsFor.Remove(handle.SubstrateId!);
         await handle.DisposeAsync();
 
         Assert.Empty(manager.GetActive());
@@ -91,7 +96,7 @@ public sealed class DeploymentManagerTests
         await Assert.ThrowsAsync<ArgumentException>(
             () => manager.StartAsync(
                 recipe,
-                new DeploymentContext { SandboxProvider = provider },
+                Ctx(provider),
                 CancellationToken.None));
 
         Assert.True(driver.ValidateCalled);
@@ -109,7 +114,7 @@ public sealed class DeploymentManagerTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => manager.StartAsync(
                 recipe,
-                new DeploymentContext { SandboxProvider = provider },
+                Ctx(provider),
                 CancellationToken.None));
     }
 
@@ -125,7 +130,7 @@ public sealed class DeploymentManagerTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => manager.StartAsync(
                 recipe,
-                new DeploymentContext { SandboxProvider = provider },
+                Ctx(provider),
                 CancellationToken.None));
 
         Assert.Contains("deploy failed", ex.Message);

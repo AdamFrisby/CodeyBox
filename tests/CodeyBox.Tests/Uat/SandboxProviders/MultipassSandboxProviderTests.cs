@@ -989,6 +989,73 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task DetachedProcessGroupPoll_IgnoresZombieProcesses()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var marker = Path.Combine(_workspace, "zombie-only.pgid");
+        var ready = Path.Combine(_workspace, "zombie-only.ready");
+        var script = Path.Combine(_workspace, "zombie-only.py");
+        await File.WriteAllTextAsync(script, """
+            import os
+            import sys
+            import time
+
+            marker = sys.argv[1]
+            ready = sys.argv[2]
+            pid = os.fork()
+            if pid == 0:
+                os.setsid()
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(str(os.getpgrp()) + "\n")
+                with open(ready, "w", encoding="utf-8") as f:
+                    f.write("ready\n")
+                os._exit(0)
+
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                time.sleep(0.25)
+            """);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "python3",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add(script);
+        psi.ArgumentList.Add(marker);
+        psi.ArgumentList.Add(ready);
+
+        using var parent = Process.Start(psi)!;
+        try
+        {
+            await WaitForFileAsync(ready, TimeSpan.FromSeconds(5));
+            await Task.Delay(100);
+
+            var (exit, stdout, stderr) = await RunLocalProcessAsync(
+                "/bin/sh",
+                ["-c", MultipassSandbox.DetachedProcessGroupPollCommand, "codeybox-zombie-poll", marker],
+                CancellationToken.None);
+
+            Assert.Equal(0, exit);
+            Assert.StartsWith("exited ", stdout, StringComparison.Ordinal);
+            Assert.DoesNotContain("alive", stdout, StringComparison.Ordinal);
+            Assert.Equal("", stderr);
+        }
+        finally
+        {
+            try { parent.Kill(entireProcessTree: true); }
+            catch { }
+
+            try { await parent.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch { }
+        }
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedBatchPreservesWrapperDiagnosticsBeforeHttpStreaming()
     {
         if (OperatingSystem.IsWindows())
@@ -4000,7 +4067,61 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task DisposeAsync_DeleteFailureUntracksActiveSandboxWithoutMaskingCompletedPhase()
+    public void MultipassSandbox_PublishesDeploymentEndpointFromHostAddress()
+    {
+        var sandbox = new MultipassSandbox(
+            "codeybox-publish",
+            Path.Combine(_workspace, "publish-root"),
+            new SandboxSpec { ImageReference = "ignored" },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: new RecordingMultipassRunner((_, _, _) =>
+                Task.FromResult(new ProcessRunResult(0, "", ""))),
+            daemonRetryPolicy: InstantDaemonRetryPolicy(),
+            hostAddress: "10.55.0.7");
+        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
+        var request = new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Scheme = "http",
+            Port = 8080,
+            Path = "/health",
+        };
+
+        Assert.True(publisher.CanPublishEndpoint(request));
+        var endpoint = publisher.PublishEndpoint(request);
+
+        Assert.Equal("http://10.55.0.7:8080/health", endpoint.Url);
+        Assert.Equal("10.55.0.7", endpoint.Host);
+        Assert.Equal(8080, endpoint.Port);
+        Assert.Equal("host-routable", endpoint.Metadata["endpoint.scope"]);
+    }
+
+    [Fact]
+    public void MultipassSandbox_PublishEndpointRejectsMissingHostAddress()
+    {
+        var sandbox = new MultipassSandbox(
+            "codeybox-no-publish",
+            Path.Combine(_workspace, "no-publish-root"),
+            new SandboxSpec { ImageReference = "ignored" },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: new RecordingMultipassRunner((_, _, _) =>
+                Task.FromResult(new ProcessRunResult(0, "", ""))),
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
+        var request = new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Tcp,
+            Port = 5432,
+        };
+
+        Assert.False(publisher.CanPublishEndpoint(request));
+        Assert.Throws<NotSupportedException>(() => publisher.PublishEndpoint(request));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_DeleteFailureThrowsAndKeepsSandboxRetryable()
     {
         var disposedNames = new List<string>();
         var noLongerActiveNames = new List<string>();
@@ -4028,16 +4149,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             runner: runner,
             daemonRetryPolicy: InstantDaemonRetryPolicy());
 
-        await sandbox.DisposeAsync();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
 
+        Assert.Contains("multipass delete --purge codeybox-deletefail failed", ex.Message);
         Assert.Equal(1, deleteCalls);
         Assert.Empty(disposedNames);
+        Assert.Empty(noLongerActiveNames);
+
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(2, deleteCalls);
+        Assert.Equal(["codeybox-deletefail"], disposedNames);
         Assert.Equal(["codeybox-deletefail"], noLongerActiveNames);
-
-        await sandbox.DisposeAsync();
-
-        Assert.Equal(1, deleteCalls);
-        Assert.Empty(disposedNames);
     }
 
     [Fact]
@@ -4071,11 +4194,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.Contains("multipass delete --purge codeybox-shutdown-deletefail failed", ex.Message);
         Assert.Equal(1, deleteCalls);
-        Assert.Equal(["codeybox-shutdown-deletefail"], noLongerActiveNames);
+        Assert.Empty(noLongerActiveNames);
     }
 
     [Fact]
-    public async Task ProviderCreatedSandbox_DeleteFailureUntracksActiveCacheAndReaperDisposes()
+    public async Task ProviderCreatedSandbox_DeleteFailureThrowsAndKeepsActiveUntilRetrySucceeds()
     {
         var staging = Path.Combine(_workspace, "provider-delete-fail-staging");
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -4166,13 +4289,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var active = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
         Assert.True(active.IsTrackedActive);
 
-        await sandbox.DisposeAsync();
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await sandbox.DisposeAsync());
+        Assert.Contains("transient delete failure", failure.Message, StringComparison.Ordinal);
 
         Assert.Equal(1, deleteCalls);
-        var untracked = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
-        Assert.Equal(name, untracked.Name);
-        Assert.False(untracked.IsTrackedActive);
-        Assert.Equal(2, listCalls);
+        var stillActive = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.Equal(name, stillActive.Name);
+        Assert.True(stillActive.IsTrackedActive);
 
         var reaper = new SandboxLeakReaper(
             provider,
@@ -4188,9 +4312,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             NullLogger<SandboxLeakReaper>.Instance);
         await reaper.RunSweepAsync(CancellationToken.None);
 
+        Assert.Equal(1, deleteCalls);
+        Assert.NotEmpty(states);
+        Assert.Empty(reaper.GetLatestLeaks());
+
+        await sandbox.DisposeAsync();
+
         Assert.Equal(2, deleteCalls);
         Assert.Empty(states);
-        Assert.Empty(reaper.GetLatestLeaks());
+        Assert.Empty(await provider.ListAllManagedAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -6505,7 +6635,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     private sealed class LocalDetachedVm
     {
-        private const int DetachedProcessGroupMalformedExitCode = 73;
         private const string VmExecDir = "/home/ubuntu/.codeybox-exec/";
         private const string VmExecEnvDir = "/home/ubuntu/.codeybox-exec-env/";
         private const string VmExecStdinDir = "/home/ubuntu/.codeybox-exec-stdin/";
@@ -6593,37 +6722,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         public async Task<ProcessRunResult> PollProcessGroupAsync(string vmProcessGroupMarker, CancellationToken ct)
         {
             var marker = MapVmPath(vmProcessGroupMarker);
-            if (!File.Exists(marker))
-                return new ProcessRunResult(0, "missing\n", "");
-
-            var text = (await File.ReadAllTextAsync(marker, ct)).Trim();
-            if (!int.TryParse(text, out var pgid) || pgid <= 0)
-            {
-                return new ProcessRunResult(
-                    DetachedProcessGroupMalformedExitCode,
-                    "",
-                    $"detached exec process group marker {vmProcessGroupMarker} was malformed: {text}\n");
-            }
-
-            var (exit, _, _) = await RunLocalProcessAsync(
+            var (exit, stdout, stderr) = await RunLocalProcessAsync(
                 "/bin/sh",
-                ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-local-poll", text],
+                ["-c", MultipassSandbox.DetachedProcessGroupPollCommand, "codeybox-local-poll", marker],
                 ct);
-            if (exit == 0)
-                return new ProcessRunResult(0, $"alive {pgid}\n", "");
-
-            // Process group is gone. Mirror the real poll script: if the
-            // diagnostic exit-code sidecar exists, include it in the poll
-            // shape. The host still requires authenticated HTTP completion.
-            var exitFile = MapVmPath(vmProcessGroupMarker + ".exit");
-            if (File.Exists(exitFile))
-            {
-                var exitCodeText = (await File.ReadAllTextAsync(exitFile, ct)).Trim();
-                if (int.TryParse(exitCodeText, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
-                    return new ProcessRunResult(0, $"exited {pgid} {exitCodeText} gone\n", "");
-            }
-
-            return new ProcessRunResult(0, $"exited {pgid}\n", "");
+            return new ProcessRunResult(exit, stdout, stderr);
         }
 
         public async Task<ProcessRunResult> ReadOutputSidecarAsync(string vmPath, CancellationToken ct)

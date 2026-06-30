@@ -3565,6 +3565,8 @@ builder.Services.AddSingleton<IDeploymentDriver, WebAppDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, DaemonDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, CliDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, LibraryDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentSubstrateProvider>(sp =>
+    new SandboxDeploymentSubstrateProvider(sp.GetRequiredService<ISandboxProvider>()));
 builder.Services.AddSingleton<IDeploymentDriverRegistry, DeploymentDriverRegistry>();
 builder.Services.AddSingleton<IDeploymentManager>(sp => new DeploymentManager(
     sp.GetRequiredService<IDeploymentDriverRegistry>(),

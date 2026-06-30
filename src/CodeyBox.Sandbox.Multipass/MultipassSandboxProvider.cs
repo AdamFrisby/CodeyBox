@@ -5356,6 +5356,57 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedPollFailureLimit = 5;
     private static readonly TimeSpan DetachedAuthenticatedExitCleanupTimeout = TimeSpan.FromSeconds(5);
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
+    internal const string DetachedProcessGroupPollCommand = """
+            codeybox_pgid_marker=$1
+            codeybox_process_group_alive() {
+                codeybox_probe_pgid=$1
+                if [ -d /proc ]; then
+                    awk -v pgid="$codeybox_probe_pgid" '
+                        {
+                            line = $0
+                            sub(/^[^)]*\) /, "", line)
+                            split(line, fields, " ")
+                            if (fields[3] == pgid && fields[1] != "Z") found = 1
+                        }
+                        END { exit found ? 0 : 1 }
+                    ' /proc/[0-9]*/stat 2>/dev/null
+                    return $?
+                fi
+                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
+            }
+            if ! test -f "$codeybox_pgid_marker"; then
+                printf 'missing\n'
+                exit 0
+            fi
+            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
+            case "$codeybox_pgid" in
+                ''|*[!0-9]*|0)
+                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
+                    exit 73
+                    ;;
+            esac
+            codeybox_alive=gone
+            if codeybox_process_group_alive "$codeybox_pgid"; then
+                codeybox_alive=alive
+            fi
+            codeybox_exit_file="${codeybox_pgid_marker}.exit"
+            if test -f "$codeybox_exit_file"; then
+                codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
+                case "$codeybox_exit_code" in
+                    ''|*[!0-9-]*)
+                        printf 'exited %s\n' "$codeybox_pgid"
+                        ;;
+                    *)
+                        printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
+                        ;;
+                esac
+            elif [ "$codeybox_alive" = "alive" ]; then
+                printf 'alive %s\n' "$codeybox_pgid"
+            else
+                printf 'exited %s\n' "$codeybox_pgid"
+            fi
+            exit 0
+            """;
 
     // Test seam: override the WaitForDetachedCompletionAsync poll interval.
     // Production polls every 2s; tests set a small value so the loop is not
@@ -7236,59 +7287,8 @@ while True:
         // single multipass exec yields both liveness and (when available)
         // the wrapper-written exit code — no separate `cat` round-trip and no
         // additional host-side multipass spin.
-        const string pollCommand = """
-            codeybox_pgid_marker=$1
-            codeybox_process_group_alive() {
-                codeybox_probe_pgid=$1
-                if [ -d /proc ]; then
-                    awk -v pgid="$codeybox_probe_pgid" '
-                        {
-                            line = $0
-                            sub(/^[^)]*\) /, "", line)
-                            split(line, fields, " ")
-                            if (fields[3] == pgid && fields[1] != "Z") found = 1
-                        }
-                        END { exit found ? 0 : 1 }
-                    ' /proc/[0-9]*/stat 2>/dev/null
-                    return $?
-                fi
-                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
-            }
-            if ! test -f "$codeybox_pgid_marker"; then
-                printf 'missing\n'
-                exit 0
-            fi
-            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
-            case "$codeybox_pgid" in
-                ''|*[!0-9]*|0)
-                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
-                    exit 73
-                    ;;
-            esac
-            codeybox_alive=gone
-            if codeybox_process_group_alive "$codeybox_pgid"; then
-                codeybox_alive=alive
-            fi
-            codeybox_exit_file="${codeybox_pgid_marker}.exit"
-            if test -f "$codeybox_exit_file"; then
-                codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
-                case "$codeybox_exit_code" in
-                    ''|*[!0-9-]*)
-                        printf 'exited %s\n' "$codeybox_pgid"
-                        ;;
-                    *)
-                        printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
-                        ;;
-                esac
-            elif [ "$codeybox_alive" = "alive" ]; then
-                printf 'alive %s\n' "$codeybox_pgid"
-            else
-                printf 'exited %s\n' "$codeybox_pgid"
-            fi
-            exit 0
-            """;
         var result = await RunMultipassAsync(
-            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", pollCommand, "codeybox-detached-poll", processGroupMarker],
+            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", DetachedProcessGroupPollCommand, "codeybox-detached-poll", processGroupMarker],
             stdin: null,
             ct: ct,
             maxStdoutBytes: 128,
@@ -7551,15 +7551,6 @@ while True:
         if (_preserveOnDispose)
             return;
 
-        try
-        {
-            _onNoLongerTrackedActive?.Invoke(_name);
-        }
-        catch (Exception callbackEx)
-        {
-            _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
-        }
-
         var metrics = await EnsureResourceMetricsCapturedAsync(CancellationToken.None).ConfigureAwait(false);
 
         await using var disposeScope = await TimingScope.BeginAsync(
@@ -7580,6 +7571,14 @@ while True:
             if (_ownedByShutdownHandler)
                 throw;
             return;
+        }
+        try
+        {
+            _onNoLongerTrackedActive?.Invoke(_name);
+        }
+        catch (Exception callbackEx)
+        {
+            _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
         }
         _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name, metrics);

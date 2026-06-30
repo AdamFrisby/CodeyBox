@@ -42,6 +42,7 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
     public List<ExecRule> ExecRules { get; } = new();
 
     public string? HostAddress { get; set; } = "10.42.0.10";
+    public Func<DeploymentEndpointRequest, DeploymentEndpoint>? PublishEndpointOverride { get; set; }
     public HashSet<string> DisposeThrowsFor { get; } = new(StringComparer.Ordinal);
     public HashSet<string> SandboxDisposeThrowsFor { get; } = new(StringComparer.Ordinal);
 
@@ -190,7 +191,8 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpo
         if (!CanPublishEndpoint(request))
             throw new NotSupportedException(
                 $"Fake deployment sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
-        return DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
+        return _provider.PublishEndpointOverride?.Invoke(request)
+            ?? DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
     }
 
     public ValueTask DisposeAsync()

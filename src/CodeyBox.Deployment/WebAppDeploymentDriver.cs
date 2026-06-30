@@ -9,8 +9,8 @@ namespace CodeyBox.Deployment;
 /// <see cref="DeploymentRecipe.HealthEndpoint"/> against the primary port.
 ///
 /// <para>The driver starts the app via <see cref="DeploymentRecipe.RunCommand"/>
-/// in an attached sandbox exec that must return quickly, then polls the configured health endpoint
-/// inside the sandbox using <c>curl</c> (or a busybox equivalent if the
+/// under a managed background supervisor, then polls the configured health endpoint
+/// inside the substrate using <c>curl</c> (or a busybox equivalent if the
 /// recipe overrides it via <see cref="DeploymentRecipe.Settings"/> key
 /// <c>health-probe-command</c>). Polling stays inside the substrate so we
 /// do not require host-side network reachability for the readiness check.</para>
@@ -20,7 +20,10 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     public const string SettingsKeyHealthProbeCommand = "health-probe-command";
     public const string SettingsKeyScheme = "scheme";
     public const string SettingsKeyProbeIntervalSeconds = "probe-interval-seconds";
-    private static readonly HttpClient HostProbeHttp = new()
+    private static readonly HttpClient HostProbeHttp = new(new HttpClientHandler
+    {
+        AllowAutoRedirect = false,
+    })
     {
         Timeout = TimeSpan.FromSeconds(5),
     };
@@ -49,22 +52,18 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override async Task StartRuntimeAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
     {
-        // The recipe's RunCommand is expected to background the server (or
-        // exec with nohup) — sandbox.ExecAsync is one-shot, so a foreground
-        // server would block forever. The driver does NOT manage the daemonisation
-        // itself; that is recipe-author territory (different stacks have different
-        // conventions: systemd-via-spawn, nohup, npm pm2, …).
-        var result = await RunDeploymentExecAsync(
-            sandbox,
+        var result = await StartManagedProcessAsync(
+            substrate,
             recipe,
             context,
             "web-app start",
-            ["sh", "-c", recipe.RunCommand!],
+            "primary",
+            recipe.RunCommand!,
             recipe.Environment,
             ct).ConfigureAwait(false);
         if (!result.Success)
@@ -72,7 +71,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override async Task ProbeReadyAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -100,7 +99,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         {
             ct.ThrowIfCancellationRequested();
             var result = await RunDeploymentExecAsync(
-                sandbox,
+                substrate,
                 recipe,
                 context,
                 "web-app readiness probe",
@@ -114,7 +113,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override Task ValidateProvisionedSubstrateAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -125,24 +124,24 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
             Scheme = ResolveScheme(recipe),
             Port = recipe.Ports[0],
         };
-        if (!CanPublishEndpoint(sandbox, request))
+        if (!CanPublishEndpoint(substrate, request))
             throw new NotSupportedException(
                 $"Deployment kind '{Kind}' requires a substrate that can publish HTTP endpoint port {recipe.Ports[0]} before the app is started.");
         return Task.CompletedTask;
     }
 
-    protected override DeploymentEndpoint BuildEndpoint(ISandbox sandbox, DeploymentRecipe recipe, DeploymentContext context)
+    protected override DeploymentEndpoint BuildEndpoint(IDeploymentSubstrate substrate, DeploymentRecipe recipe, DeploymentContext context)
     {
         var port = recipe.Ports[0];
         var scheme = ResolveScheme(recipe);
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["sandbox.id"] = sandbox.Id,
+            ["substrate.id"] = substrate.Id,
             ["sandbox.local-url"] = $"{scheme}://127.0.0.1:{port}",
             ["http.health-path"] = recipe.HealthEndpoint!,
         };
-        AddServiceEndpointMetadata(metadata, sandbox, recipe, scheme);
-        return PublishEndpoint(sandbox, new DeploymentEndpointRequest
+        AddServiceEndpointMetadata(metadata, substrate, recipe, scheme);
+        return PublishEndpoint(substrate, new DeploymentEndpointRequest
         {
             Kind = DeploymentEndpointKind.Http,
             Port = port,
@@ -152,7 +151,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override async Task VerifyExposedEndpointAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         DeploymentEndpoint endpoint,
@@ -173,14 +172,24 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override async Task RunHealthCheckAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
     {
-        await base.RunHealthCheckAsync(sandbox, recipe, context, ct).ConfigureAwait(false);
-        var endpoint = BuildEndpoint(sandbox, recipe, context);
-        await VerifyExposedEndpointAsync(sandbox, recipe, context, endpoint, ct).ConfigureAwait(false);
+        using var healthCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        healthCts.CancelAfter(recipe.StartupTimeout);
+        try
+        {
+            await base.RunHealthCheckAsync(substrate, recipe, context, healthCts.Token).ConfigureAwait(false);
+            var endpoint = BuildEndpoint(substrate, recipe, context);
+            await VerifyExposedEndpointAsync(substrate, recipe, context, endpoint, healthCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"Deployment kind '{Kind}' health check did not complete within {recipe.StartupTimeout}.");
+        }
     }
 
     private static string ResolveScheme(DeploymentRecipe recipe)

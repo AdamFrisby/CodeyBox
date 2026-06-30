@@ -8,7 +8,7 @@ namespace CodeyBox.Deployment;
 /// recipe, then verify the tool runs by invoking the recipe's
 /// readiness command (defaults to <c>&lt;artifact-path&gt; --version</c>).
 /// "Expose" returns the in-substrate binary path so callers can invoke the
-/// tool through the same sandbox handle.
+/// tool through the same deployment handle.
 ///
 /// <para>The default invocation runs the artifact path through
 /// <see cref="Shell.Quote"/>; recipes that override via
@@ -32,7 +32,7 @@ public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override async Task ProbeReadyAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -47,7 +47,7 @@ public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
                 : $"{quotedArtifact} --version";
 
         var result = await RunDeploymentExecAsync(
-            sandbox,
+            substrate,
             recipe,
             context,
             "cli invocation",
@@ -59,14 +59,14 @@ public sealed class CliDeploymentDriver : SandboxDeploymentDriverBase
                 $"cli invocation '{Tail(invocation)}' exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
     }
 
-    protected override DeploymentEndpoint BuildEndpoint(ISandbox sandbox, DeploymentRecipe recipe, DeploymentContext context)
+    protected override DeploymentEndpoint BuildEndpoint(IDeploymentSubstrate substrate, DeploymentRecipe recipe, DeploymentContext context)
         => new()
         {
             Kind = DeploymentEndpointKind.Cli,
             Path = recipe.ArtifactPath,
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["sandbox.id"] = sandbox.Id,
+                ["substrate.id"] = substrate.Id,
                 ["endpoint.scope"] = "sandbox-exec",
                 ["sandbox.path"] = recipe.ArtifactPath!,
             },

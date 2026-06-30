@@ -1,7 +1,5 @@
 using CodeyBox.Core;
 using CodeyBox.Deployment;
-using CodeyBox.ExploratoryTesting;
-using CodeyBox.ExploratoryTesting.Recipes;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -18,22 +16,42 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class DeploymentDriverSubstrateSmokeTests
 {
-    [SkippableFact]
+    [Fact]
     public async Task WebApp_JobTrackPilot_Deploys_HealthChecks_Exposes_AndTearsDown_OnProcessSubstrate()
     {
-        var source = Environment.GetEnvironmentVariable("JOBTRACK_SOURCE");
-        Skip.If(
-            string.IsNullOrWhiteSpace(source) || !Directory.Exists(source),
-            "Set JOBTRACK_SOURCE to a real JobTrack checkout to run the deployment-driver JobTrack pilot.");
-
-        var jobTrack = JobTrackRecipe.Default(Path.GetFullPath(source!));
+        using var fixture = CreateJobTrackFixture();
+        var port = GetFreeTcpPort();
         var provider = new RoutableProcessSandboxProvider();
         var driver = new WebAppDeploymentDriver();
-        var recipe = ToDeploymentRecipe(jobTrack);
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ignored",
+            BuildCommand = "test -f index.html && test -f health",
+            RunCommand = $"timeout 30 python3 -m http.server {port} --bind 127.0.0.1",
+            Ports = [port],
+            HealthEndpoint = "/health",
+            StartupTimeout = TimeSpan.FromSeconds(15),
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.05",
+            },
+        };
 
-        await using var handle = await driver.DeployAsync(recipe, Ctx(provider, jobTrack.Mounts), CancellationToken.None);
+        await using var handle = await driver.DeployAsync(
+            recipe,
+            Ctx(provider,
+            [
+                new DeploymentMount
+                {
+                    SubstratePath = "/work",
+                    HostPath = fixture.Path,
+                    ReadOnly = false,
+                },
+            ]),
+            CancellationToken.None);
         Assert.Equal(DeploymentEndpointKind.Http, handle.Endpoint.Kind);
-        Assert.Equal(JobTrackRecipe.DefaultEntryUrl.Replace("localhost", "127.0.0.1", StringComparison.Ordinal), handle.Endpoint.Url);
+        Assert.Equal($"http://127.0.0.1:{port}", handle.Endpoint.Url);
         await handle.HealthCheckAsync();
     }
 
@@ -48,18 +66,14 @@ public sealed class DeploymentDriverSubstrateSmokeTests
             ImageReference = "ignored",
             RunCommand = """
                 touch daemon.keepalive
-                (
-                  deadline=$(( $(date +%s) + 120 ))
-                  while [ -f daemon.keepalive ] && [ "$(date +%s)" -lt "$deadline" ]; do
-                    sleep 1
-                  done
-                ) >/dev/null 2>&1 < /dev/null &
-                echo $! > daemon.pid
+                deadline=$(( $(date +%s) + 120 ))
+                while [ -f daemon.keepalive ] && [ "$(date +%s)" -lt "$deadline" ]; do
+                  sleep 1
+                done
                 """,
             StartupTimeout = TimeSpan.FromSeconds(15),
             Settings = new Dictionary<string, string>
             {
-                [DaemonDeploymentDriver.SettingsKeyLivenessCommand] = "test -r daemon.pid && kill -0 $(cat daemon.pid)",
                 [DaemonDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.05",
             },
         };
@@ -98,7 +112,7 @@ public sealed class DeploymentDriverSubstrateSmokeTests
         Assert.Equal(DeploymentEndpointKind.Cli, handle.Endpoint.Kind);
         Assert.Equal("./bin/codeybox-smoke-cli", handle.Endpoint.Path);
 
-        var result = await handle.ExecAsync(new SandboxExec
+        var result = await handle.ExecAsync(new DeploymentCommand
         {
             Argv = ["sh", "-c", "./bin/codeybox-smoke-cli --version"],
         });
@@ -115,11 +129,25 @@ public sealed class DeploymentDriverSubstrateSmokeTests
         {
             Kind = DeploymentKinds.Library,
             ImageReference = "ignored",
-            BuildCommand = "mkdir -p pkg && printf 'package bytes' > pkg/sample.nupkg",
+            BuildCommand = """
+                rm -rf pkg consumer
+                mkdir -p pkg/lib
+                cat > pkg/lib/sample-tool <<'SH'
+                #!/usr/bin/env sh
+                echo codeybox-library-ok
+                SH
+                chmod +x pkg/lib/sample-tool
+                tar -czf pkg/sample.nupkg -C pkg/lib sample-tool
+                """,
             ArtifactPath = "./pkg/sample.nupkg",
             Settings = new Dictionary<string, string>
             {
-                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = "test -s {artifact}",
+                [LibraryDeploymentDriver.SettingsKeyHarnessCommand] = """
+                    rm -rf consumer &&
+                    mkdir consumer &&
+                    tar -xzf {artifact} -C consumer &&
+                    test "$(consumer/sample-tool)" = "codeybox-library-ok"
+                    """,
             },
         };
 
@@ -129,43 +157,53 @@ public sealed class DeploymentDriverSubstrateSmokeTests
         await handle.HealthCheckAsync();
     }
 
-    private static DeploymentContext Ctx(ISandboxProvider provider, IReadOnlyList<SandboxMount>? mounts = null) => new()
+    private static DeploymentContext Ctx(ISandboxProvider provider, IReadOnlyList<DeploymentMount>? mounts = null) => new()
     {
-        SandboxProvider = provider,
+        SubstrateProvider = new SandboxDeploymentSubstrateProvider(provider),
         Mounts = mounts ?? [],
         WorkingDirectory = "/work",
     };
 
-    private static DeploymentRecipe ToDeploymentRecipe(WebAppRecipe recipe)
+    private static TempDirectory CreateJobTrackFixture()
     {
-        var entry = new Uri(recipe.EntryUrl);
-        var buildCommands = recipe.BuildSteps
-            .Where(step => !string.Equals(step.Label, "install-firefox", StringComparison.Ordinal))
-            .Concat(recipe.SeedSteps)
-            .Where(step => step.Command.Count > 0)
-            .Select(step => string.Join(' ', step.Command.Select(QuoteShellWord)));
-        var runCommand = string.Join(' ', recipe.RunCommand.Command.Select(QuoteShellWord));
-        return new DeploymentRecipe
-        {
-            Kind = DeploymentKinds.WebApp,
-            ImageReference = string.IsNullOrWhiteSpace(recipe.ImageReference) ? "ignored" : recipe.ImageReference,
-            BuildCommand = string.Join(" && ", buildCommands),
-            RunCommand = $"nohup {runCommand} >/tmp/jobtrack-deployment.log 2>&1 &",
-            Ports = [entry.Port],
-            HealthEndpoint = string.IsNullOrWhiteSpace(entry.AbsolutePath) ? "/" : entry.AbsolutePath,
-            StartupTimeout = recipe.ReadinessTimeout,
-            Environment = recipe.Environment,
-            NetworkProfile = recipe.NetworkProfile,
-            Settings = new Dictionary<string, string>
-            {
-                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] =
-                    Math.Max(0.05, recipe.ReadinessPollInterval.TotalSeconds).ToString(System.Globalization.CultureInfo.InvariantCulture),
-            },
-        };
+        var dir = new TempDirectory();
+        File.WriteAllText(Path.Combine(dir.Path, "index.html"), "<!doctype html><title>JobTrack</title>");
+        File.WriteAllText(Path.Combine(dir.Path, "health"), "ok");
+        return dir;
     }
 
-    private static string QuoteShellWord(string value)
-        => "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
+    private static int GetFreeTcpPort()
+    {
+        using var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        return ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    private sealed class TempDirectory : IDisposable
+    {
+        public TempDirectory()
+        {
+            Path = System.IO.Path.Combine(
+                System.IO.Path.GetTempPath(),
+                "codeybox-deployment-jobtrack-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path);
+        }
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            try
+            {
+                if (Directory.Exists(Path))
+                    Directory.Delete(Path, recursive: true);
+            }
+            catch
+            {
+                // Best-effort test cleanup.
+            }
+        }
+    }
 
     private sealed class RoutableProcessSandboxProvider : ISandboxProvider
     {

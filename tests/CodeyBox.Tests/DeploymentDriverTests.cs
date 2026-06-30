@@ -13,7 +13,7 @@ public sealed class DeploymentDriverTests
 {
     private static DeploymentContext Ctx(FakeDeploymentSandboxProvider provider) => new()
     {
-        SandboxProvider = provider,
+        SubstrateProvider = new SandboxDeploymentSubstrateProvider(provider),
     };
 
     private static WebAppDeploymentDriver NewWebAppDriver(
@@ -43,7 +43,7 @@ public sealed class DeploymentDriverTests
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
             BuildCommand = "echo build",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             StartupTimeout = TimeSpan.FromSeconds(30),
@@ -105,7 +105,7 @@ public sealed class DeploymentDriverTests
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
             BuildCommand = "echo build",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
         };
@@ -135,7 +135,7 @@ public sealed class DeploymentDriverTests
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
             BuildCommand = "too-chatty",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
         };
@@ -161,7 +161,7 @@ public sealed class DeploymentDriverTests
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
             BuildCommand = "leak-secret",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
         };
@@ -207,7 +207,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
         };
@@ -231,7 +231,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             StartupTimeout = TimeSpan.FromMilliseconds(100),
@@ -244,6 +244,39 @@ public sealed class DeploymentDriverTests
         await Assert.ThrowsAsync<TimeoutException>(
             () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
 
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
+    }
+
+    [Fact]
+    public async Task WebApp_PublisherReturnsHttpEndpointWithoutUrl_TearsDownAndThrows()
+    {
+        var provider = new FakeDeploymentSandboxProvider
+        {
+            PublishEndpointOverride = request => new DeploymentEndpoint
+            {
+                Kind = request.Kind,
+                Host = "10.42.0.10",
+                Port = request.Port,
+                Metadata = request.Metadata,
+            },
+        };
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        Assert.Contains("without a URL", ex.Message);
         Assert.Single(provider.Created);
         Assert.True(provider.Created[0].IsDisposed);
     }
@@ -263,7 +296,7 @@ public sealed class DeploymentDriverTests
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
             BuildCommand = "slow-build",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             StartupTimeout = TimeSpan.FromMilliseconds(50),
@@ -353,7 +386,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8443],
             HealthEndpoint = "/ready",
             Settings = new Dictionary<string, string>
@@ -382,7 +415,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -424,7 +457,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -456,7 +489,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             StartupTimeout = TimeSpan.FromMilliseconds(120),
@@ -495,7 +528,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -515,6 +548,8 @@ public sealed class DeploymentDriverTests
         Assert.Contains(provider.ExecLog, c =>
             c.StartsWith("bash -c", StringComparison.Ordinal)
             && c.Contains("/dev/tcp/127.0.0.1/5432", StringComparison.Ordinal));
+        Assert.Equal("127.0.0.1:5432", handle.Endpoint.Metadata["service.db.sandbox-local-endpoint"]);
+        Assert.Equal("10.42.0.10:5432", handle.Endpoint.Metadata["service.db.endpoint"]);
     }
 
     // ── Daemon ──────────────────────────────────────────────────────────────
@@ -530,7 +565,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.Daemon,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./daemon &",
+            RunCommand = "./daemon",
             Settings = new Dictionary<string, string>
             {
                 [DaemonDeploymentDriver.SettingsKeyLivenessCommand] = "pgrep -f daemon",
@@ -555,7 +590,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.Daemon,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "./daemon &",
+            RunCommand = "./daemon",
             Ports = [5432],
         };
 
@@ -592,8 +627,9 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
-    public void Daemon_WithoutPortOrLiveness_FailsValidation()
+    public async Task Daemon_WithoutPortOrLiveness_UsesManagedProcessSidecar()
     {
+        var provider = new FakeDeploymentSandboxProvider();
         var driver = new DaemonDeploymentDriver();
         var recipe = new DeploymentRecipe
         {
@@ -601,7 +637,63 @@ public sealed class DeploymentDriverTests
             ImageReference = "ubuntu-22.04",
             RunCommand = "./daemon",
         };
-        Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Equal(DeploymentEndpointKind.Process, handle.Endpoint.Kind);
+        Assert.Equal("sandbox-process", handle.Endpoint.Metadata["endpoint.scope"]);
+        Assert.Contains(provider.ExecLog, c => c.Contains("codeybox_base.pid", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Daemon_PortFallbackWithoutPublisher_ReturnsSandboxLocalTcpEndpoint()
+    {
+        var provider = new FakeDeploymentSandboxProvider { HostAddress = null };
+        provider.ExecRules.Add(new ExecRule("/dev/tcp", new SandboxExecResult(0, "", "")));
+
+        var driver = new DaemonDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Daemon,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./daemon",
+            Ports = [5432],
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Equal(DeploymentEndpointKind.Tcp, handle.Endpoint.Kind);
+        Assert.Equal("127.0.0.1", handle.Endpoint.Host);
+        Assert.Equal(5432, handle.Endpoint.Port);
+        Assert.Equal("sandbox-local", handle.Endpoint.Metadata["endpoint.scope"]);
+        Assert.Equal("127.0.0.1:5432", handle.Endpoint.Metadata["sandbox.local-endpoint"]);
+    }
+
+    [Fact]
+    public async Task Daemon_PortReadinessNeverSucceeds_TimesOutAndTearsDown()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("/dev/tcp", new SandboxExecResult(1, "", "refused")));
+
+        var driver = new DaemonDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Daemon,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./daemon",
+            Ports = [5432],
+            StartupTimeout = TimeSpan.FromMilliseconds(120),
+            Settings = new Dictionary<string, string>
+            {
+                [DaemonDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.01",
+            },
+        };
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        Assert.Single(provider.Created);
+        Assert.True(provider.Created[0].IsDisposed);
     }
 
     // ── Cli ─────────────────────────────────────────────────────────────────
@@ -624,7 +716,7 @@ public sealed class DeploymentDriverTests
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Equal(DeploymentEndpointKind.Cli, handle.Endpoint.Kind);
         Assert.Equal("/usr/local/bin/mytool", handle.Endpoint.Path);
-        var result = await handle.ExecAsync(new SandboxExec
+        var result = await handle.ExecAsync(new DeploymentCommand
         {
             Argv = [handle.Endpoint.Path!, "--version"],
         });
@@ -820,8 +912,13 @@ public sealed class DeploymentDriverTests
         var provider = new FakeDeploymentSandboxProvider();
         var readinessProbe = new ExecRule("curl", new SandboxExecResult(0, "200", ""));
         provider.ExecRules.Add(readinessProbe);
+        var hostProbeCount = 0;
 
-        var driver = NewWebAppDriver();
+        var driver = NewWebAppDriver((_, _) =>
+        {
+            hostProbeCount++;
+            return Task.FromResult(true);
+        });
         var recipe = new DeploymentRecipe
         {
             Kind = DeploymentKinds.WebApp,
@@ -833,9 +930,42 @@ public sealed class DeploymentDriverTests
 
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
         Assert.Equal(1, readinessProbe.InvocationCount);
+        Assert.Equal(1, hostProbeCount);
 
         await handle.HealthCheckAsync();   // does not throw
         Assert.Equal(2, readinessProbe.InvocationCount);
+        Assert.Equal(2, hostProbeCount);
+    }
+
+    [Fact]
+    public async Task HealthCheck_DefaultToken_TimesOutWhenHostExposureFails()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+        var hostProbeCount = 0;
+        var driver = NewWebAppDriver((_, _) =>
+        {
+            hostProbeCount++;
+            return Task.FromResult(hostProbeCount == 1);
+        });
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [9000],
+            HealthEndpoint = "/health",
+            StartupTimeout = TimeSpan.FromMilliseconds(120),
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.01",
+            },
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        await Assert.ThrowsAsync<TimeoutException>(() => handle.HealthCheckAsync());
+        Assert.True(hostProbeCount > 1, $"expected host probe retries; saw {hostProbeCount}");
     }
 
     /// <summary>
@@ -944,7 +1074,7 @@ public sealed class DeploymentDriverTests
         await handle.DisposeAsync();
 
         await Assert.ThrowsAsync<ObjectDisposedException>(() =>
-            handle.ExecAsync(new SandboxExec { Argv = ["true"] }));
+            handle.ExecAsync(new DeploymentCommand { Argv = ["true"] }));
     }
 
     [Fact]
@@ -964,14 +1094,14 @@ public sealed class DeploymentDriverTests
             },
         };
         var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
-        provider.SandboxDisposeThrowsFor.Add(handle.SandboxId!);
+        provider.SandboxDisposeThrowsFor.Add(handle.SubstrateId!);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await handle.DisposeAsync());
 
         Assert.True(handle.IsAlive);
         Assert.False(provider.Created[0].IsDisposed);
 
-        provider.SandboxDisposeThrowsFor.Remove(handle.SandboxId!);
+        provider.SandboxDisposeThrowsFor.Remove(handle.SubstrateId!);
         await handle.DisposeAsync();
 
         Assert.False(handle.IsAlive);
@@ -1115,7 +1245,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -1141,7 +1271,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services = [null!],
@@ -1161,7 +1291,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -1190,7 +1320,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -1217,7 +1347,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -1243,7 +1373,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -1270,7 +1400,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./server &",
+            RunCommand = "./server",
             Ports = [8080],
             HealthEndpoint = "/healthz",
             Services =
@@ -1332,15 +1462,10 @@ public sealed class DeploymentDriverTests
         Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
     }
 
-    /// <summary>
-    /// Regression: ValidateRecipe used ContainsKey for the liveness-command
-    /// setting, so a recipe with Settings["liveness-command"]="" and no
-    /// ports passed validation and then crashed inside ProbeReadyAsync on
-    /// recipe.Ports[0] with IndexOutOfRangeException.
-    /// </summary>
     [Fact]
-    public void Daemon_EmptyLivenessCommandAndNoPorts_FailsValidation()
+    public async Task Daemon_EmptyLivenessCommandAndNoPorts_FallsBackToManagedProcessSidecar()
     {
+        var provider = new FakeDeploymentSandboxProvider();
         var driver = new DaemonDeploymentDriver();
         var recipe = new DeploymentRecipe
         {
@@ -1352,7 +1477,11 @@ public sealed class DeploymentDriverTests
                 [DaemonDeploymentDriver.SettingsKeyLivenessCommand] = "",
             },
         };
-        Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Equal(DeploymentEndpointKind.Process, handle.Endpoint.Kind);
+        Assert.Contains(provider.ExecLog, c => c.Contains("codeybox_base.pid", StringComparison.Ordinal));
     }
 
     // ── Daemon probe portability + retry loop ───────────────────────────────
@@ -1373,7 +1502,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.Daemon,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "./d &",
+            RunCommand = "./d",
             Ports = [5432],
         };
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
@@ -1403,7 +1532,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.Daemon,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./d &",
+            RunCommand = "./d",
             Settings = new Dictionary<string, string>
             {
                 [DaemonDeploymentDriver.SettingsKeyLivenessCommand] = "pgrep -f d",
@@ -1461,6 +1590,23 @@ public sealed class DeploymentDriverTests
         Assert.Contains(provider.ExecLog, c => c.Contains("/lib/out.nupkg", StringComparison.Ordinal) && c.Contains("harness", StringComparison.Ordinal));
     }
 
+    // ── Endpoint publisher guards ──────────────────────────────────────────
+
+    [Fact]
+    public void DeploymentEndpointPublisher_ForHostPort_RejectsInvalidInputs()
+    {
+        var valid = new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Tcp,
+            Port = 1234,
+        };
+
+        Assert.Throws<ArgumentException>(() => DeploymentEndpointPublisher.ForHostPort(valid, " "));
+        Assert.Throws<ArgumentException>(() => DeploymentEndpointPublisher.ForHostPort(valid with { Port = null }, "127.0.0.1"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => DeploymentEndpointPublisher.ForHostPort(valid with { Port = 0 }, "127.0.0.1"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => DeploymentEndpointPublisher.ForHostPort(valid with { Port = 65536 }, "127.0.0.1"));
+    }
+
     // ── StartRuntimeAsync actually runs ─────────────────────────────────────
 
     [Fact]
@@ -1474,7 +1620,7 @@ public sealed class DeploymentDriverTests
         {
             Kind = DeploymentKinds.WebApp,
             ImageReference = "ubuntu-22.04",
-            RunCommand = "nohup ./signature-runcmd &",
+            RunCommand = "./signature-runcmd",
             Ports = [8080],
             HealthEndpoint = "/healthz",
         };

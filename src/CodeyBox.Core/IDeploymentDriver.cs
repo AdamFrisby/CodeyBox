@@ -222,19 +222,19 @@ public sealed record DeploymentService
 
 /// <summary>
 /// Inputs the orchestrator hands the driver at deploy time. The driver uses
-/// <see cref="SandboxProvider"/> to provision its substrate; everything else
-/// is recipe + context metadata.
+/// <see cref="SubstrateProvider"/> to provision an execution substrate;
+/// everything else is recipe + context metadata.
 /// </summary>
 public sealed record DeploymentContext
 {
     /// <summary>Working directory inside the substrate. Defaults to the conventional /work mount.</summary>
     public string WorkingDirectory { get; init; } = "/work";
 
-    /// <summary>Sandbox provider used to provision substrate VMs.</summary>
-    public required ISandboxProvider SandboxProvider { get; init; }
+    /// <summary>Provider used to provision deployment substrates.</summary>
+    public required IDeploymentSubstrateProvider SubstrateProvider { get; init; }
 
     /// <summary>Optional host-path bind mounts the driver should request when provisioning.</summary>
-    public IReadOnlyList<SandboxMount> Mounts { get; init; } = [];
+    public IReadOnlyList<DeploymentMount> Mounts { get; init; } = [];
 
     /// <summary>
     /// Project owning this deployment. Used by tracking / leak detection
@@ -272,12 +272,12 @@ public interface IDeploymentHandle : IAsyncDisposable
     bool IsAlive { get; }
 
     /// <summary>
-    /// Optional in-VM name of the substrate sandbox this handle owns. The
+    /// Optional provider-specific substrate identifier this handle owns. The
     /// leak reaper reads this to skip currently-active deployments when
-    /// scanning provider-managed sandboxes for orphans. Null when the
-    /// deployment does not provision a sandbox.
+    /// scanning provider-managed resources for orphans. Null when the
+    /// deployment does not provision a persistent substrate.
     /// </summary>
-    string? SandboxId { get; }
+    string? SubstrateId { get; }
 
     /// <summary>
     /// Re-runs the driver's readiness check against the live deployment.
@@ -291,11 +291,76 @@ public interface IDeploymentHandle : IAsyncDisposable
     /// Executes a command inside the live deployment substrate. This is the
     /// invocation channel for sandbox-scoped endpoints such as CLI binaries or
     /// packaged library artifacts whose <see cref="DeploymentEndpoint.Path"/> is
-    /// meaningful inside the deployment sandbox rather than on the host file
+    /// meaningful inside the deployment substrate rather than on the host file
     /// system. Implementations that do not own an executable substrate should
     /// throw <see cref="NotSupportedException"/>.
     /// </summary>
-    Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
+    Task<DeploymentCommandResult> ExecAsync(DeploymentCommand command, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Deployment-level provider abstraction for the runtime substrate. The
+/// built-in adapter provisions existing CodeyBox sandboxes, but drivers only
+/// depend on this surface so a future cloud-VM pool can provide the same
+/// command and endpoint capabilities without changing driver APIs.
+/// </summary>
+public interface IDeploymentSubstrateProvider
+{
+    string Name { get; }
+    Task<IDeploymentSubstrate> CreateAsync(DeploymentSubstrateSpec spec, CancellationToken ct = default);
+}
+
+/// <summary>Live execution substrate owned by a deployment handle.</summary>
+public interface IDeploymentSubstrate : IAsyncDisposable
+{
+    string Id { get; }
+    Task<DeploymentCommandResult> ExecAsync(DeploymentCommand command, CancellationToken ct = default);
+    bool CanPublishEndpoint(DeploymentEndpointRequest request);
+    DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request);
+}
+
+/// <summary>Description of a deployment substrate to provision.</summary>
+public sealed record DeploymentSubstrateSpec
+{
+    public required string ImageReference { get; init; }
+    public IReadOnlyList<DeploymentMount> Mounts { get; init; } = [];
+    public IReadOnlyDictionary<string, string> Environment { get; init; } = new Dictionary<string, string>();
+    public string? NetworkProfile { get; init; }
+    public string WorkingDirectory { get; init; } = "/work";
+}
+
+/// <summary>Host path mounted into a deployment substrate.</summary>
+public sealed record DeploymentMount
+{
+    public required string SubstratePath { get; init; }
+    public string? HostPath { get; init; }
+    public bool ReadOnly { get; init; } = true;
+    public bool Tmpfs { get; init; }
+    public long? SizeBytes { get; init; }
+}
+
+/// <summary>Command executed inside a live deployment substrate.</summary>
+public sealed record DeploymentCommand
+{
+    public required IReadOnlyList<string> Argv { get; init; }
+    public string? WorkingDirectory { get; init; }
+    public IReadOnlyDictionary<string, string>? ExtraEnvironment { get; init; }
+    public string? Stdin { get; init; }
+    public int? MaxStdoutBytes { get; init; }
+    public int? MaxStderrBytes { get; init; }
+    public bool KillOnOutputLimit { get; init; } = true;
+}
+
+public sealed record DeploymentCommandResult(
+    int ExitCode,
+    string Stdout,
+    string Stderr,
+    bool StdoutLimitExceeded = false,
+    bool StderrLimitExceeded = false,
+    bool ExecutionUnavailable = false)
+{
+    public bool OutputLimitExceeded => StdoutLimitExceeded || StderrLimitExceeded;
+    public bool Success => ExitCode == 0 && !OutputLimitExceeded && !ExecutionUnavailable;
 }
 
 /// <summary>
@@ -358,9 +423,9 @@ public sealed record DeploymentEndpointRequest
 }
 
 /// <summary>
-/// Optional sandbox capability for publishing a deployment endpoint reachable
-/// by the orchestrator host / deployment caller. Sandbox drivers depend on
-/// this deployment-level capability rather than assuming the VM's internal
+/// Optional substrate capability for publishing a deployment endpoint reachable
+/// by the orchestrator host / deployment caller. Drivers depend on this
+/// deployment-level capability rather than assuming the substrate's internal
 /// port is directly reachable from the host.
 /// </summary>
 public interface IDeploymentEndpointPublisher
@@ -426,7 +491,7 @@ public sealed record ActiveDeploymentInfo(
     string Id,
     string Kind,
     ProjectId? ProjectId,
-    string? SandboxId,
+    string? SubstrateId,
     DateTimeOffset StartedAt,
     DeploymentEndpoint Endpoint);
 

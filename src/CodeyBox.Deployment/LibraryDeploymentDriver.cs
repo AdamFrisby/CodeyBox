@@ -36,7 +36,7 @@ public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     protected override async Task ProbeReadyAsync(
-        ISandbox sandbox,
+        IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
         CancellationToken ct)
@@ -50,7 +50,7 @@ public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
             .Replace("{artifact}", quotedArtifact, StringComparison.Ordinal);
 
         var result = await RunDeploymentExecAsync(
-            sandbox,
+            substrate,
             recipe,
             context,
             "library harness",
@@ -62,14 +62,14 @@ public sealed class LibraryDeploymentDriver : SandboxDeploymentDriverBase
                 $"library harness '{Tail(harness)}' exited {result.ExitCode}; stderr tail: {Tail(result.Stderr)}");
     }
 
-    protected override DeploymentEndpoint BuildEndpoint(ISandbox sandbox, DeploymentRecipe recipe, DeploymentContext context)
+    protected override DeploymentEndpoint BuildEndpoint(IDeploymentSubstrate substrate, DeploymentRecipe recipe, DeploymentContext context)
         => new()
         {
             Kind = DeploymentEndpointKind.Library,
             Path = recipe.ArtifactPath,
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["sandbox.id"] = sandbox.Id,
+                ["substrate.id"] = substrate.Id,
                 ["endpoint.scope"] = "sandbox-artifact",
                 ["sandbox.path"] = recipe.ArtifactPath!,
             },

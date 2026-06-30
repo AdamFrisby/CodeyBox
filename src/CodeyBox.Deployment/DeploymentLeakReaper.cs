@@ -105,8 +105,8 @@ public sealed class DeploymentLeakReaper : BackgroundService
         {
             var managed = await _provider.ListAllManagedAsync(ct).ConfigureAwait(false);
             var active = _manager.GetActive();
-            var activeSandboxIds = new HashSet<string>(
-                active.Where(a => a.SandboxId is not null).Select(a => a.SandboxId!),
+            var activeSubstrateIds = new HashSet<string>(
+                active.Where(a => a.SubstrateId is not null).Select(a => a.SubstrateId!),
                 StringComparer.Ordinal);
             var suspendedNames = _suspendedNameProvider is null
                 ? (IReadOnlySet<string>)new HashSet<string>(StringComparer.Ordinal)
@@ -126,7 +126,7 @@ public sealed class DeploymentLeakReaper : BackgroundService
 
                 // Currently held by a deployment we know about — the manager's
                 // active set is authoritative for the in-process case.
-                if (activeSandboxIds.Contains(info.Name)) continue;
+                if (activeSubstrateIds.Contains(info.Name)) continue;
 
                 // Honour the work-item suspend index. The startup resume
                 // handler reattaches these on the next orchestrator start;
