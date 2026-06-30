@@ -363,6 +363,12 @@ unification is in flight for that case.
   enabled, auditors with `CanShortCircuitOnBlockingFinding=true` run before
   the rest; a blocking gate result skips all remaining auditors for that
   iteration and sends the preserved gate findings to rework.
+* `CodeyBox:PipelineTuning:BlockRedundantDotnetBuildTestInAuditSandbox` —
+  global, hot-reloadable switch for the audit-sandbox `dotnet` shim. Default
+  `true`. The shim turns auditor-initiated `dotnet build` and `dotnet test`
+  into immediate successful no-ops with a notice because the deterministic
+  build/test gate already ran; other `dotnet` subcommands pass through, and
+  work/merge/conflict-resolution sandboxes are not modified.
 
 ## Adding a new auditor
 

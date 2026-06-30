@@ -1015,6 +1015,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.SandboxPressureThreshold,
                 opts.AuditShortCircuitEnabled,
                 AuditorIdleTimeoutSeconds = opts.AuditorIdleTimeout.TotalSeconds,
+                opts.BlockRedundantDotnetBuildTestInAuditSandbox,
             },
             JsonOpts);
 

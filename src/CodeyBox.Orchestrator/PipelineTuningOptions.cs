@@ -113,6 +113,16 @@ public sealed class PipelineTuningOptions
     public TimeSpan AuditorIdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Whether audit sandboxes prepend a lightweight <c>dotnet</c> shim that
+    /// turns redundant auditor-initiated <c>dotnet build</c> and
+    /// <c>dotnet test</c> invocations into an immediate successful no-op.
+    /// The deterministic required-build gate has already run before LLM
+    /// review, so this protects auditor capacity without changing work,
+    /// merge, or conflict-resolution sandboxes. Default true.
+    /// </summary>
+    public bool BlockRedundantDotnetBuildTestInAuditSandbox { get; set; } = true;
+
+    /// <summary>
     /// Whether to build and seed a cross-agent handoff brief on the next
     /// invocation after the orchestrator falls back from one
     /// <c>AgentKind</c> to another mid-iteration. The brief itself is built
