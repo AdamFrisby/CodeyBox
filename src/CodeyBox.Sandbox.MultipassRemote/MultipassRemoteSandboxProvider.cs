@@ -185,7 +185,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             {
                 lastHostFailure = ex;
                 skippedHosts.Add(opts.HostId);
-                MarkRuntimeUnhealthy(opts, ex);
+                if (IsRuntimeUnhealthyProvisioningFailure(ex))
+                    MarkRuntimeUnhealthy(opts, ex);
                 await RollBackCreateFailureAsync(opts, reservation, transport, vmName, remoteSandboxRoot, ex, ct).ConfigureAwait(false);
 
                 _log.LogWarning(
@@ -236,17 +237,15 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 "Retaining remote host reservation for {Vm} on host {HostId} because create rollback cleanup could not confirm deletion",
                 vmName,
                 opts.HostId);
-            if (cause is null)
-            {
-                throw new SandboxProvisioningDeferredException(
-                    provider: Name,
-                    operation: "create-rollback-cleanup",
-                    errorClass: "remote-cleanup-unconfirmed",
-                    detail: $"host={opts.HostId}; vm={vmName}; {cleanupEx.Message}",
-                    recheckIn: opts.PlacementRecheckIn,
-                    retainedSandboxName: vmName,
-                    innerException: cleanupEx);
-            }
+            var causeDetail = cause is null ? "" : $"create failure: {cause.Message}; ";
+            throw new SandboxProvisioningDeferredException(
+                provider: Name,
+                operation: "create-rollback-cleanup",
+                errorClass: "remote-cleanup-unconfirmed",
+                detail: $"host={opts.HostId}; vm={vmName}; {causeDetail}{cleanupEx.Message}",
+                recheckIn: opts.PlacementRecheckIn,
+                retainedSandboxName: vmName,
+                innerException: cleanupEx);
         }
     }
 
@@ -434,6 +433,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             }
             catch (JsonException ex)
             {
+                MarkRuntimeUnhealthy(opts, $"failed to parse multipass list JSON: {ex.Message}");
                 _log.LogWarning(ex,
                     "Failed to parse remote multipass list JSON from host {HostId}; skipping host",
                     opts.HostId);
@@ -852,10 +852,19 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
         if (delete.ExitCode != 0)
         {
-            throw new RemoteHostProvisioningException(
+            if (await SandboxMayStillExistAfterFailedDeleteAsync(opts, transport, vmName, ct).ConfigureAwait(false))
+            {
+                throw new RemoteHostProvisioningException(
+                    opts.HostId,
+                    "delete",
+                    $"multipass delete --purge {vmName} exited {delete.ExitCode}: {TruncateForLog(delete.Stderr)}");
+            }
+
+            _log.LogWarning(
+                "Remote VM {Vm} on host {HostId} was already absent after delete --purge exited {ExitCode}; continuing staging cleanup",
+                vmName,
                 opts.HostId,
-                "delete",
-                $"multipass delete --purge {vmName} exited {delete.ExitCode}: {TruncateForLog(delete.Stderr)}");
+                delete.ExitCode);
         }
 
         ProcessRunResult rm;
@@ -878,6 +887,43 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 opts.HostId,
                 "staging-cleanup",
                 $"rm -rf {remoteSandboxRoot} exited {rm.ExitCode}: {TruncateForLog(rm.Stderr)}");
+        }
+    }
+
+    private async Task<bool> SandboxMayStillExistAfterFailedDeleteAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        CancellationToken ct)
+    {
+        try
+        {
+            var info = await RunRemoteAsync(
+                transport,
+                [opts.RemoteMultipassPath, "info", vmName, "--format", "json"],
+                ct).ConfigureAwait(false);
+            if (info.ExitCode == 0)
+                return true;
+            if (IsInstanceNotFound(info.Stderr))
+                return false;
+
+            _log.LogWarning(
+                "Could not prove remote sandbox {Vm} on host {HostId} was absent after delete --purge failed (info exit {ExitCode}): {Stderr}",
+                vmName,
+                opts.HostId,
+                info.ExitCode,
+                TruncateForLog(info.Stderr));
+            return true;
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            MarkRuntimeUnhealthy(opts, ex);
+            _log.LogWarning(
+                ex,
+                "Could not prove remote sandbox {Vm} on host {HostId} was absent after delete --purge failed",
+                vmName,
+                opts.HostId);
+            return true;
         }
     }
 
@@ -906,7 +952,11 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     private async Task<HostReservation> ReserveHostAsync(SandboxSpec spec, ISet<string> skippedHosts, CancellationToken ct)
     {
         var hosts = ResolveHosts();
-        var inventory = await CountManagedByHostForPlacementAsync(hosts, ct).ConfigureAwait(false);
+        var inventoryCandidates = GetPlacementInventoryCandidates(spec, skippedHosts, hosts);
+        if (inventoryCandidates.Count == 0)
+            return ReserveHost(spec, skippedHosts, hosts, new Dictionary<string, int>(StringComparer.Ordinal));
+
+        var inventory = await CountManagedByHostForPlacementAsync(inventoryCandidates, ct).ConfigureAwait(false);
         try
         {
             return ReserveHost(spec, skippedHosts, hosts, inventory.ManagedCounts);
@@ -921,6 +971,29 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 ex.RecheckIn,
                 innerException: inventory.LastFailure);
         }
+    }
+
+    private IReadOnlyList<MultipassRemoteSandboxOptions> GetPlacementInventoryCandidates(
+        SandboxSpec spec,
+        ISet<string> skippedHosts,
+        IReadOnlyList<MultipassRemoteSandboxOptions> hosts)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var candidates = new List<MultipassRemoteSandboxOptions>(hosts.Count);
+        foreach (var host in hosts)
+        {
+            if (skippedHosts.Contains(host.HostId))
+                continue;
+            if (!host.Healthy || host.Cordoned)
+                continue;
+            if (!HostAllowsNetworkProfile(host, spec.Network.ProfileName))
+                continue;
+            if (!IsRuntimeHealthy(host.HostId, now, out _, removeExpired: true))
+                continue;
+            candidates.Add(host);
+        }
+
+        return candidates;
     }
 
     private async Task<PlacementInventory> CountManagedByHostForPlacementAsync(
@@ -1170,6 +1243,9 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         _log.LogInformation("Remote executor host {HostId} runtime health restored", hostId);
     }
 
+    private static bool IsRuntimeUnhealthyProvisioningFailure(RemoteHostProvisioningException ex) =>
+        string.Equals(ex.Operation, "list", StringComparison.Ordinal);
+
     private bool IsRuntimeHealthy(
         string hostId,
         DateTimeOffset now,
@@ -1183,7 +1259,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         if (state.Until <= now)
         {
             if (removeExpired)
-                _runtimeUnhealthy.TryRemove(hostId, out _);
+                MarkRuntimeHealthy(hostId);
             return true;
         }
 
@@ -1212,6 +1288,17 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
     private static string NormalizeNetworkProfile(string? profileName) =>
         string.IsNullOrWhiteSpace(profileName) ? "(default)" : profileName.Trim();
+
+    private static bool IsInstanceNotFound(string? stderr)
+    {
+        if (string.IsNullOrWhiteSpace(stderr))
+            return false;
+
+        return stderr.Contains("argument not found", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("instance not found", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("does not exist", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("not found", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static string CommandName(IReadOnlyList<string> argv)
     {

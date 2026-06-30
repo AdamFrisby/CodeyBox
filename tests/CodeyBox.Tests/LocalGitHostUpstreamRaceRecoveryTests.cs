@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -310,6 +312,45 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
         Assert.True(exists);
         Assert.Equal(2, starts);
+    }
+
+    [Fact]
+    public async Task RunGitAsync_RecordsCoordinatorGitCommandDurationMetric()
+    {
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var gitHost = CreateGitHost(processFactory: _ => new FakeLocalGitProcess(exitCode: 0));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        Assert.True(await gitHost.BranchExistsAsync(repoId, "main"));
+
+        var observed = SpinWait.SpinUntil(
+            () => measurements.Any(m => m.Operation == "rev-parse" && m.Outcome == "success"),
+            TimeSpan.FromSeconds(2));
+        Assert.True(observed, "Expected LocalGitHost to emit git command duration metric for rev-parse.");
     }
 
     [Fact]

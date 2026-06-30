@@ -5474,10 +5474,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     await sandbox.DisposeAsync();
                 }
-                catch
+                catch (Exception ex) when (!phaseSucceeded)
                 {
                     // Best-effort disposal — the outer exception (if any) is
                     // the meaningful failure.
+                    _log.LogWarning(ex, "Sandbox disposal failed after unsuccessful phase {Phase} for work item {Id}", agentPhase, item.Id);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Sandbox disposal failed after successful phase {Phase} for work item {Id}", agentPhase, item.Id);
+                    throw;
                 }
             }
             else if (useClaudeSession)

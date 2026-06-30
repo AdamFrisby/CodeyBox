@@ -278,6 +278,28 @@ public sealed class MetricsEmissionTests
         }
     }
 
+    [Fact]
+    public async Task CoordinatorAgentStreamDroppedBytes_EmitsFromCaptureSizeCap()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"cb-stream-drop-metrics-{Guid.NewGuid():N}");
+        var path = Path.Combine(dir, "agent.log");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.agent_stream.dropped_bytes",
+            "reason");
+        using (listener)
+        {
+            var capture = new AgentStreamCapture(path, maxBytes: 256, phase: "work", NullLogger.Instance);
+            capture.WriteChunk(new string('x', 4096));
+            await capture.DisposeAsync();
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value > 0 && measurement.TagValue == "size_cap");
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
+    }
+
     // NOTE: codeybox.dispatch.count, codeybox.agent.invocations,
     // codeybox.agent.fallbacks, codeybox.phase.duration_ms, codeybox.agent.tokens,
     // codeybox.agent.cost_usd, and codeybox.webhook.deliveries are intentionally

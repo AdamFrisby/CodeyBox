@@ -50,6 +50,7 @@ internal static class SandboxEndpoints
     private static async Task<IResult> DisposeLeakedAsync(
         string name,
         IManagedSandboxLifecycle provider,
+        string? hostId,
         SandboxLeakReaper reaper,
         IWebhookDispatcher webhooks,
         ILogger<Program> log,
@@ -64,7 +65,20 @@ internal static class SandboxEndpoints
 
         // Cross-check against the latest leak list so that active sandboxes (those
         // tied to a running work item) cannot be purged via this endpoint.
-        var leak = reaper.GetLatestLeaks().FirstOrDefault(l => l.Name == name);
+        var matchingLeaks = reaper.GetLatestLeaks()
+            .Where(l => l.Name == name)
+            .ToArray();
+        LeakedSandboxInfo? leak;
+        if (string.IsNullOrWhiteSpace(hostId))
+        {
+            if (matchingLeaks.Length > 1 && HasMultipleHostIds(matchingLeaks))
+                return Results.Conflict(new { error = "multiple leaked sandboxes share this name; specify hostId" });
+            leak = matchingLeaks.FirstOrDefault();
+        }
+        else
+        {
+            leak = matchingLeaks.FirstOrDefault(l => string.Equals(l.HostId, hostId, StringComparison.Ordinal));
+        }
         if (leak is null)
             return Results.NotFound(new { error = "sandbox not found in latest leaked list; verify via GET /sandboxes/leaked" });
 
@@ -163,4 +177,25 @@ internal static class SandboxEndpoints
             IsTrackedActive: false,
             LifecycleProviderId: leak.LifecycleProviderId,
             HostId: leak.HostId);
+
+    private static bool HasMultipleHostIds(IEnumerable<LeakedSandboxInfo> leaks)
+    {
+        string? firstHostId = null;
+        foreach (var leak in leaks)
+        {
+            if (string.IsNullOrWhiteSpace(leak.HostId))
+                continue;
+
+            if (firstHostId is null)
+            {
+                firstHostId = leak.HostId;
+                continue;
+            }
+
+            if (!string.Equals(firstHostId, leak.HostId, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
 }

@@ -78,7 +78,7 @@ public sealed class MultipassRemoteHostPoolTests
             Host("a", cap: 2),
             Host("b", cap: 2));
         var transports = new HostTransportSet();
-        transports["a"].ThrowTransportOnRun = true;
+        transports["a"].ThrowTransportOnLaunch = true;
         var provider = Provider(() => opts, transports);
 
         await using var sandbox = await provider.CreateAsync(Spec());
@@ -88,6 +88,63 @@ public sealed class MultipassRemoteHostPoolTests
         Assert.False(unhealthy.RuntimeHealthy);
         Assert.Contains("simulated transport drop", unhealthy.RuntimeUnhealthyReason);
         Assert.Equal(1, transports["b"].LaunchCount);
+        Assert.Equal(1, transports["a"].DeleteCount);
+    }
+
+    [Fact]
+    public async Task CreateAsync_runtime_unhealthy_host_is_not_probed_until_backoff_expires()
+    {
+        var current = Options(
+            Host("a", cap: 2),
+            Host("b", cap: 2));
+        var transports = new HostTransportSet();
+        transports["a"].ThrowTransportOnLaunch = true;
+        var provider = Provider(() => current, transports);
+
+        var first = await provider.CreateAsync(Spec());
+        transports["a"].ThrowTransportOnLaunch = false;
+        var listCountAfterFailure = transports["a"].ListCount;
+        var second = await provider.CreateAsync(Spec());
+        try
+        {
+            Assert.Equal("b", ((MultipassRemoteSandbox)first).HostId);
+            Assert.Equal("b", ((MultipassRemoteSandbox)second).HostId);
+            Assert.Equal(listCountAfterFailure, transports["a"].ListCount);
+        }
+        finally
+        {
+            await first.DisposeAsync();
+            await second.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task CreateAsync_allows_runtime_unhealthy_host_after_backoff_expires()
+    {
+        var current = Options(
+            [
+            Host("a", cap: 2),
+            Host("b", cap: 2),
+            ],
+            runtimeUnhealthyBackoff: TimeSpan.FromMilliseconds(25));
+        var transports = new HostTransportSet();
+        transports["a"].ThrowTransportOnLaunch = true;
+        var provider = Provider(() => current, transports);
+
+        var first = await provider.CreateAsync(Spec());
+        transports["a"].ThrowTransportOnLaunch = false;
+        await Task.Delay(TimeSpan.FromMilliseconds(60));
+        var second = await provider.CreateAsync(Spec());
+        try
+        {
+            Assert.Equal("b", ((MultipassRemoteSandbox)first).HostId);
+            Assert.Equal("a", ((MultipassRemoteSandbox)second).HostId);
+        }
+        finally
+        {
+            await first.DisposeAsync();
+            await second.DisposeAsync();
+        }
     }
 
     [Fact]
@@ -164,6 +221,26 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task CreateAsync_does_not_inventory_hosts_filtered_out_before_placement()
+    {
+        var opts = Options(
+            Host("cordoned", cap: 2, cordoned: true),
+            Host("unhealthy", cap: 2, healthy: false),
+            Host("profile", cap: 2, allowedProfiles: ["audit"]),
+            Host("eligible", cap: 2, allowedProfiles: ["work"]));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+
+        await using var sandbox = await provider.CreateAsync(Spec("work"));
+
+        Assert.Equal("eligible", ((MultipassRemoteSandbox)sandbox).HostId);
+        Assert.Equal(0, transports["cordoned"].ListCount);
+        Assert.Equal(0, transports["unhealthy"].ListCount);
+        Assert.Equal(0, transports["profile"].ListCount);
+        Assert.Equal(1, transports["eligible"].ListCount);
+    }
+
+    [Fact]
     public async Task CreateAsync_counts_existing_managed_vms_against_host_capacity()
     {
         var opts = Options(
@@ -231,6 +308,62 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task ListAllManagedAsync_releases_retained_reservation_when_inventory_proves_vm_absent()
+    {
+        var opts = Options(Host("a", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].LaunchExitCode = 1;
+        transports["a"].DeleteExitCode = 1;
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await provider.CreateAsync(Spec()));
+        Assert.Equal("create-rollback-cleanup", ex.Operation);
+        Assert.NotNull(ex.RetainedSandboxName);
+        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+
+        await provider.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+    }
+
+    [Fact]
+    public async Task CreateAsync_failed_delete_does_not_retain_capacity_when_info_proves_vm_absent()
+    {
+        var opts = Options(Host("a", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].LaunchExitCode = 1;
+        transports["a"].DeleteExitCode = 1;
+        transports["a"].InfoExitCode = 1;
+        transports["a"].InfoStderr = "instance not found";
+        var provider = Provider(() => opts, transports);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await provider.CreateAsync(Spec()));
+
+        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+        Assert.Equal(1, transports["a"].DeleteCount);
+        Assert.Equal(1, transports["a"].InfoCount);
+        Assert.Equal(1, transports["a"].RmCount);
+    }
+
+    [Fact]
+    public async Task CreateAsync_request_specific_launch_failure_does_not_mark_host_runtime_unhealthy()
+    {
+        var opts = Options(Host("a", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].LaunchExitCode = 1;
+        var provider = Provider(() => opts, transports);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await provider.CreateAsync(Spec()));
+
+        var host = Assert.Single(provider.SnapshotHostPool());
+        Assert.True(host.RuntimeHealthy);
+        Assert.Equal(0, host.Reserved);
+    }
+
+    [Fact]
     public async Task ListAllManagedAsync_returns_healthy_hosts_when_one_host_fails()
     {
         var opts = Options(
@@ -264,6 +397,72 @@ public sealed class MultipassRemoteHostPoolTests
         Assert.Equal(0, transports["a"].DeleteCount);
         Assert.Equal(1, transports["b"].DeleteCount);
         Assert.Equal(1, transports["b"].RmCount);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_refuses_duplicate_bare_name_discovery()
+    {
+        var opts = Options(
+            Host("a", cap: 1),
+            Host("b", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].ManagedNames.Add("codeybox-r-same");
+        transports["b"].ManagedNames.Add("codeybox-r-same");
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.DisposeLeakedAsync("codeybox-r-same", CancellationToken.None));
+
+        Assert.Contains("multiple executor hosts", ex.Message);
+        Assert.Equal(0, transports["a"].DeleteCount);
+        Assert.Equal(0, transports["b"].DeleteCount);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_refuses_shared_prefix_bare_name()
+    {
+        var opts = Options(
+            Host("a", cap: 1, vmNamePrefix: "codeybox-r-"),
+            Host("b", cap: 1, vmNamePrefix: "codeybox-r-"));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.DisposeLeakedAsync("codeybox-r-orphan", CancellationToken.None));
+
+        Assert.Contains("share a matching prefix", ex.Message);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_refuses_unknown_managed_host_id()
+    {
+        var opts = Options(Host("a", cap: 1));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.DisposeLeakedAsync(
+                new ManagedSandboxInfo("codeybox-r-leak", null, null, IsTrackedActive: false, HostId: "missing"),
+                CancellationToken.None));
+
+        Assert.Contains("not configured", ex.Message);
+        Assert.Equal(0, transports["a"].DeleteCount);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_refuses_managed_host_prefix_mismatch()
+    {
+        var opts = Options(Host("a", cap: 1, vmNamePrefix: "codeybox-a-"));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.DisposeLeakedAsync(
+                new ManagedSandboxInfo("codeybox-b-leak", null, null, IsTrackedActive: false, HostId: "a"),
+                CancellationToken.None));
+
+        Assert.Contains("does not match", ex.Message);
+        Assert.Equal(0, transports["a"].DeleteCount);
     }
 
     [Fact]
@@ -329,12 +528,18 @@ public sealed class MultipassRemoteHostPoolTests
         Network = new SandboxNetworkPolicy { ProfileName = networkProfile },
     };
 
-    private static MultipassRemoteSandboxOptions Options(params MultipassRemoteExecutorHostOptions[] hosts) => new()
+    private static MultipassRemoteSandboxOptions Options(
+        params MultipassRemoteExecutorHostOptions[] hosts) =>
+        Options(hosts, runtimeUnhealthyBackoff: TimeSpan.FromMinutes(10));
+
+    private static MultipassRemoteSandboxOptions Options(
+        IReadOnlyList<MultipassRemoteExecutorHostOptions> hosts,
+        TimeSpan runtimeUnhealthyBackoff) => new()
     {
         SshTarget = "unused-default",
         RemoteStagingRoot = "/remote/staging",
         PlacementRecheckIn = TimeSpan.FromMilliseconds(10),
-        RuntimeUnhealthyBackoff = TimeSpan.FromMinutes(10),
+        RuntimeUnhealthyBackoff = runtimeUnhealthyBackoff,
         ExecutorHosts = hosts,
     };
 
@@ -343,7 +548,8 @@ public sealed class MultipassRemoteHostPoolTests
         int cap,
         bool cordoned = false,
         bool healthy = true,
-        IReadOnlyList<string>? allowedProfiles = null) =>
+        IReadOnlyList<string>? allowedProfiles = null,
+        string? vmNamePrefix = null) =>
         new()
         {
             Id = id,
@@ -352,6 +558,7 @@ public sealed class MultipassRemoteHostPoolTests
             Cordoned = cordoned,
             Healthy = healthy,
             AllowedNetworkProfiles = allowedProfiles,
+            VmNamePrefix = vmNamePrefix,
         };
 
     private sealed class HostTransportSet
@@ -368,13 +575,18 @@ public sealed class MultipassRemoteHostPoolTests
 
         public string DiagnosticId => $"fake-{hostId}";
         public bool ThrowTransportOnRun { get; set; }
+        public bool ThrowTransportOnLaunch { get; set; }
         public bool ThrowTransportOnExec { get; set; }
         public int LaunchExitCode { get; set; }
         public int DeleteExitCode { get; set; }
+        public int InfoExitCode { get; set; }
+        public string InfoStderr { get; set; } = "";
         public List<string> ManagedNames { get; } = [];
         public int LaunchCount => _calls.Count(argv => argv.Contains("launch"));
         public int DeleteCount => _calls.Count(argv => argv.Contains("delete"));
         public int RmCount => _calls.Count(argv => argv.Count >= 2 && argv[0] == "rm" && argv[1] == "-rf");
+        public int ListCount => _calls.Count(argv => argv.Contains("list"));
+        public int InfoCount => _calls.Count(argv => argv.Contains("info"));
 
         public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
@@ -386,6 +598,8 @@ public sealed class MultipassRemoteHostPoolTests
             _calls.Enqueue(argv.ToArray());
             if (ThrowTransportOnRun)
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop");
+            if (ThrowTransportOnLaunch && argv.Contains("launch"))
+                throw new RemoteSshTransportException($"{hostId}: simulated transport drop during launch");
             if (ThrowTransportOnExec && argv.Contains("exec") && argv.Contains("bash"))
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during exec");
             if (argv.Contains("launch") && LaunchExitCode != 0)
@@ -395,6 +609,8 @@ public sealed class MultipassRemoteHostPoolTests
             if (argv.Contains("info"))
             {
                 var vm = argv.SkipWhile(a => a != "info").Skip(1).First();
+                if (InfoExitCode != 0)
+                    return Task.FromResult(new ProcessRunResult(InfoExitCode, "", InfoStderr));
                 return Task.FromResult(new ProcessRunResult(
                     0,
                     $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}",

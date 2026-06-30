@@ -255,6 +255,25 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
+    public async Task AutoDispose_PassesHostIdentityToProvider()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-hosted-leak",
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: false,
+            HostId: "executor-b"));
+
+        var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal([("codeybox-hosted-leak", "executor-b")], provider.DisposedManaged);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
     public async Task InactiveSandbox_WithExpiredPreemptMarker_ReportedAsLeak()
     {
         var threshold = TimeSpan.FromMinutes(30);
@@ -645,6 +664,7 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     private readonly object _gate = new();
     private readonly List<FakeSandboxRecord> _sandboxes = [];
     private readonly List<string> _disposedNames = [];
+    private readonly List<(string Name, string? HostId)> _disposedManaged = [];
     private readonly HashSet<string> _throwOnDispose = new(StringComparer.Ordinal);
     private readonly HashSet<string> _cancelOnDispose = new(StringComparer.Ordinal);
     private readonly HashSet<string> _currentPhaseSandboxNames = new(StringComparer.Ordinal);
@@ -659,6 +679,15 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
         {
             lock (_gate)
                 return _disposedNames.ToList();
+        }
+    }
+
+    public IReadOnlyList<(string Name, string? HostId)> DisposedManaged
+    {
+        get
+        {
+            lock (_gate)
+                return _disposedManaged.ToList();
         }
     }
 
@@ -744,6 +773,13 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
         {
             Interlocked.Decrement(ref _activeDisposes);
         }
+    }
+
+    public Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        lock (_gate)
+            _disposedManaged.Add((sandbox.Name, sandbox.HostId));
+        return DisposeLeakedAsync(sandbox.Name, ct);
     }
 
     private void RecordMaxConcurrentDisposes(int active)

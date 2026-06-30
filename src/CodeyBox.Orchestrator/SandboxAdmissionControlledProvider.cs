@@ -17,7 +17,7 @@ internal interface ISandboxAdmissionSnapshot
 /// disposed, so worker, audit, merge, smoke, and verifier call sites all share
 /// the same VM budget without each call site knowing about the policy.
 /// </summary>
-public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider, ISandboxHostPoolSnapshot
+public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider
 {
     private readonly ISandboxProvider _inner;
     private readonly SandboxAdmissionGate _gate;
@@ -68,11 +68,14 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         if (inner is IDiskGuardedSandboxProvider) capabilities |= ProviderCapabilities.DiskGuard;
         if (inner is IBaselineImageResolver) capabilities |= ProviderCapabilities.BaselineResolver;
         if (inner is IBaselineImageProvisioner) capabilities |= ProviderCapabilities.BaselineProvisioner;
+        if (inner is ISandboxHostPoolSnapshot) capabilities |= ProviderCapabilities.HostPool;
 
         return capabilities switch
         {
             ProviderCapabilities.None => new SandboxAdmissionControlledProvider(inner, gate, log),
             ProviderCapabilities.Active => new ActiveProvider(inner, gate, log),
+            ProviderCapabilities.HostPool => new HostPoolProvider(inner, gate, log),
+            ProviderCapabilities.Active | ProviderCapabilities.HostPool => new ActiveHostPoolProvider(inner, gate, log),
             ProviderCapabilities.Suspending => new SuspendingProvider(inner, gate, log),
             ProviderCapabilities.DiskGuard => new DiskGuardProvider(inner, gate, log),
             ProviderCapabilities.BaselineResolver => new BaselineResolverProvider(inner, gate, log),
@@ -164,6 +167,14 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         _preservedLiveSandboxes.TryRemove(name, out _);
         _resumeAdmissions?.Release(name);
         _disposedSandboxAdmissions.Release(name);
+    }
+
+    public async Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        await _inner.DisposeLeakedAsync(sandbox, ct).ConfigureAwait(false);
+        _preservedLiveSandboxes.TryRemove(sandbox.Name, out _);
+        _resumeAdmissions?.Release(sandbox.Name);
+        _disposedSandboxAdmissions.Release(sandbox.Name);
     }
 
     public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
@@ -429,6 +440,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         DiskGuard = 4,
         BaselineResolver = 8,
         BaselineProvisioner = 16,
+        HostPool = 32,
     }
 
     [Flags]
@@ -442,6 +454,14 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     private sealed class ActiveProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
         : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider
+    { }
+
+    private sealed class HostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISandboxHostPoolSnapshot
     { }
 
     private sealed class SuspendingProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)

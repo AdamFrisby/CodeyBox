@@ -145,6 +145,11 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             {
                 await _activeSandbox.DisposeAsync();
             }
+            catch (SandboxProvisioningDeferredException ex)
+            {
+                _log.LogWarning(ex, "Reusable sandbox disposal deferred infrastructure cleanup.");
+                throw;
+            }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "Error disposing reusable sandbox.");

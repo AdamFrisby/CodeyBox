@@ -1188,6 +1188,61 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Fact]
+    public void Validate_RejectsTopLevelMultipassRemoteMaxConcurrentSandboxes()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass-remote";
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = "ubuntu@default",
+            MaxConcurrentSandboxes = 0,
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:MultipassRemoteSandbox:MaxConcurrentSandboxes must be > 0", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsMissingTopLevelSshTargetWhenExecutorHostsAreEmpty()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass-remote";
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = " ",
+            ExecutorHosts = [],
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("SshTarget is required when SandboxProvider=multipass-remote and ExecutorHosts is empty", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsDuplicateMultipassRemoteExecutorHostIds()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass-remote";
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = "ubuntu@default",
+            ExecutorHosts =
+            [
+                new MultipassRemoteExecutorHostConfig { Id = "dup", SshTarget = "ubuntu@a" },
+                new MultipassRemoteExecutorHostConfig { Id = " dup ", SshTarget = "ubuntu@b" },
+            ],
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("ExecutorHosts:1:Id duplicates another executor host id ('dup')", result.FailureMessage);
+    }
+
+    [Fact]
     public void Validate_AllowsBlankHostSshTargetWhenTopLevelTargetIsConfigured()
     {
         var options = ValidCodeyBoxOptions();
@@ -1213,6 +1268,10 @@ public sealed class CodeyBoxOptionsValidatorTests
         {
             SshTarget = "ubuntu@default",
             SshBinary = "/usr/bin/ssh",
+            MaxConcurrentSandboxes = 9,
+            Cordoned = true,
+            Healthy = false,
+            AllowedNetworkProfiles = ["default-work"],
             PlacementRecheckIn = TimeSpan.FromSeconds(7),
             RuntimeUnhealthyBackoff = TimeSpan.FromSeconds(8),
             ExecutorHosts =
@@ -1248,6 +1307,14 @@ public sealed class CodeyBoxOptionsValidatorTests
         var mapped = MultipassRemoteOptionsMapper.Map(cfg);
         var host = Assert.Single(mapped.ExecutorHosts);
 
+        Assert.Equal("ubuntu@default", mapped.SshTarget);
+        Assert.Equal("/usr/bin/ssh", mapped.SshBinary);
+        Assert.Equal(9, mapped.MaxConcurrentSandboxes);
+        Assert.True(mapped.Cordoned);
+        Assert.False(mapped.Healthy);
+        Assert.Equal(["default-work"], mapped.AllowedNetworkProfiles);
+        Assert.Equal(TimeSpan.FromSeconds(7), mapped.PlacementRecheckIn);
+        Assert.Equal(TimeSpan.FromSeconds(8), mapped.RuntimeUnhealthyBackoff);
         Assert.Equal("a", host.Id);
         Assert.Equal("ubuntu@a", host.SshTarget);
         Assert.Equal("/custom/ssh", host.SshBinary);

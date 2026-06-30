@@ -39,6 +39,35 @@ public sealed class WorkSandboxContextTests
     }
 
     [Fact]
+    public async Task DisposeAsync_PropagatesSandboxProvisioningDeferralFromReusableSandbox()
+    {
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass-remote",
+            operation: "sync-back",
+            errorClass: "remote-syncback-failed",
+            detail: "host=executor-a; vm=codeybox-r-leak",
+            recheckIn: TimeSpan.FromSeconds(1),
+            retainedSandboxName: "codeybox-r-leak");
+        var provider = new SingleSandboxProvider(new ThrowingDisposeSandbox(deferred));
+        var context = new WorkSandboxContext(
+            provider,
+            new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = true }),
+            NullLogger.Instance);
+        await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        }, CancellationToken.None))
+        {
+        }
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await context.DisposeAsync());
+
+        Assert.Same(deferred, ex);
+    }
+
+    [Fact]
     public async Task GetOrCreateSandboxAsync_DoesNotReuseAcrossTimingPhases_WhenCapturingMetrics()
     {
         // Capture on: each phase must get its own VM so the per-phase resource
@@ -201,5 +230,15 @@ public sealed class WorkSandboxContextTests
             Disposed = true;
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingDisposeSandbox(SandboxProvisioningDeferredException exception) : ISandbox
+    {
+        public string Id => "throwing-work-context";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.FromException(exception);
     }
 }

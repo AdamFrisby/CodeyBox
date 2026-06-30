@@ -621,9 +621,63 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task DisposeAsync_staging_cleanup_failure_throws_and_keeps_host_reservation()
+    {
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
+        var failCleanup = false;
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (argv.Count >= 2 && argv[0] == "rm" && argv[1] == "-rf" && failCleanup)
+                return new ProcessRunResult(1, "", "rm failed");
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+        failCleanup = true;
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await sb.DisposeAsync());
+
+        Assert.Equal("staging-cleanup", ex.Operation);
+        Assert.Equal("remote-cleanup-unconfirmed", ex.ErrorClass);
+        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_staging_cleanup_transport_failure_throws_and_keeps_host_reservation()
+    {
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
+        var failCleanup = false;
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (argv.Count >= 2 && argv[0] == "rm" && argv[1] == "-rf" && failCleanup)
+                throw new RemoteSshTransportException("ssh dropped during rm");
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+        failCleanup = true;
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await sb.DisposeAsync());
+
+        Assert.Equal("staging-cleanup", ex.Operation);
+        Assert.Equal("remote-host-unreachable", ex.ErrorClass);
+        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+    }
+
+    [Fact]
     public async Task CreateAsync_throws_SandboxMountSourceMissingException_when_host_path_absent()
     {
-        var opts = DefaultOptions();
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
         var transport = new FakeRemoteHostTransport();
         transport.OnRun = (_, _) => ProcessRunOk();
 
@@ -641,6 +695,28 @@ public sealed class MultipassRemoteSandboxProviderTests
                     ReadOnly = false,
                 }],
             }));
+        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+    }
+
+    [Fact]
+    public async Task ListAllManagedAsync_malformed_json_marks_host_unhealthy_without_throwing()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "list")) return new ProcessRunResult(0, "{ not json", "");
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.Empty(managed);
+        var host = Assert.Single(provider.SnapshotHostPool());
+        Assert.False(host.RuntimeHealthy);
+        Assert.Contains("failed to parse", host.RuntimeUnhealthyReason);
     }
 
     [Fact]

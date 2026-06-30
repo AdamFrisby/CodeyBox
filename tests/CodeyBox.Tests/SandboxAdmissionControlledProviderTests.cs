@@ -631,6 +631,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.False(provider is IActiveSandboxProvider);
         Assert.False(provider is ISuspendingSandboxProvider);
         Assert.False(provider is IDiskGuardedSandboxProvider);
+        Assert.False(provider is ISandboxHostPoolSnapshot);
 
         var queued = provider.CreateAsync(Spec(), CancellationToken.None);
         await Task.Delay(50);
@@ -638,6 +639,35 @@ public sealed class SandboxAdmissionControlledProviderTests
 
         await first.DisposeAsync();
         await using var next = await queued.WaitAsync(TestDeadline);
+    }
+
+    [Fact]
+    public async Task Wrap_HostPoolProvider_PreservesSnapshotAndManagedLeakIdentity()
+    {
+        var rows = new[]
+        {
+            new SandboxHostPoolEntry(
+                HostId: "host-b",
+                Capacity: 2,
+                Reserved: 1,
+                Cordoned: false,
+                ConfiguredHealthy: true,
+                RuntimeHealthy: true,
+                RuntimeUnhealthyReason: null,
+                RuntimeUnhealthyUntil: null,
+                AllowedNetworkProfiles: []),
+        };
+        var inner = new HostPoolOnlyProvider(rows);
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var pool = Assert.IsAssignableFrom<ISandboxHostPoolSnapshot>(provider);
+
+        Assert.Equal(rows, pool.SnapshotHostPool());
+
+        await provider.DisposeLeakedAsync(
+            new ManagedSandboxInfo("codeybox-r-leak", null, null, IsTrackedActive: false, HostId: "host-b"),
+            CancellationToken.None);
+
+        Assert.Equal([("codeybox-r-leak", "host-b")], inner.ManagedDisposedLeaks);
     }
 
     [Fact]
@@ -1056,7 +1086,30 @@ public sealed class SandboxAdmissionControlledProviderTests
     private sealed class ActiveOnlyProvider : PlainCountingProvider, IActiveSandboxProvider
     {
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
-            [];
+        [];
+    }
+
+    private sealed class HostPoolOnlyProvider(IReadOnlyList<SandboxHostPoolEntry> rows)
+        : PlainCountingProvider, ISandboxProvider, ISandboxHostPoolSnapshot
+    {
+        private readonly List<(string Name, string? HostId)> _managedDisposedLeaks = [];
+
+        public IReadOnlyList<(string Name, string? HostId)> ManagedDisposedLeaks
+        {
+            get
+            {
+                lock (_managedDisposedLeaks) return _managedDisposedLeaks.ToArray();
+            }
+        }
+
+        public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() => rows;
+
+        Task ISandboxProvider.DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+        {
+            lock (_managedDisposedLeaks)
+                _managedDisposedLeaks.Add((sandbox.Name, sandbox.HostId));
+            return Task.CompletedTask;
+        }
     }
 
     private class SuspendingOnlyProvider : PlainCountingProvider, ISuspendingSandboxProvider

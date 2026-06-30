@@ -88,7 +88,7 @@ public sealed class SandboxLeakDetectionTests
     {
         var threshold = TimeSpan.FromMinutes(30);
         var provider = new UatSandboxProvider();
-        provider.Add(new ManagedSandboxInfo("codeybox-endpoint", OldEnough(threshold), 2 * 1024 * 1024, false));
+        provider.Add(new ManagedSandboxInfo("codeybox-endpoint", OldEnough(threshold), 2 * 1024 * 1024, false, HostId: "executor-a"));
         var webhooks = new CapturingWebhookDispatcher();
         var reaper = BuildReaper(provider, webhooks, leakAgeThreshold: threshold);
         await reaper.RunSweepAsync(CancellationToken.None);
@@ -108,9 +108,11 @@ public sealed class SandboxLeakDetectionTests
         Assert.Equal("codeybox-endpoint", leak.GetProperty("name").GetString());
         Assert.Equal(2, leak.GetProperty("diskMb").GetInt64());
         Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.GetProperty("reason").GetString());
+        Assert.Equal("executor-a", leak.GetProperty("hostId").GetString());
         dispose.EnsureSuccessStatusCode();
         Assert.Equal(HttpStatusCode.NotFound, repeat.StatusCode);
         Assert.Contains("codeybox-endpoint", provider.DisposedNames);
+        Assert.Equal([("codeybox-endpoint", "executor-a")], provider.DisposedManaged);
         var disposed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
         var details = Assert.IsType<SandboxLeakDetails>(disposed.Details);
         Assert.Equal(SandboxLeakReasons.UntrackedSandbox, details.Reason);
@@ -156,6 +158,31 @@ public sealed class SandboxLeakDetectionTests
         Assert.Equal(["codeybox-duplicate"], first.DisposedNames);
         Assert.Equal(["codeybox-duplicate"], second.DisposedNames);
         Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
+    public async Task LeakedSandboxEndpoint_RequiresHostIdForDuplicateNamesAndDisposesOneRecord()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new UatSandboxProvider();
+        provider.Add(new ManagedSandboxInfo("codeybox-duplicate", OldEnough(threshold), null, false, HostId: "executor-a"));
+        provider.Add(new ManagedSandboxInfo("codeybox-duplicate", OldEnough(threshold), null, false, HostId: "executor-b"));
+        var reaper = BuildReaper(provider, new CapturingWebhookDispatcher(), leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+        using var factory = new SandboxProviderApiFactory(
+            sandboxProvider: provider,
+            reaper: reaper,
+            webhooks: new CapturingWebhookDispatcher());
+        using var client = factory.CreateClient();
+
+        var ambiguous = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose", content: null);
+        var disposeB = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose?hostId=executor-b", content: null);
+
+        Assert.Equal(HttpStatusCode.Conflict, ambiguous.StatusCode);
+        disposeB.EnsureSuccessStatusCode();
+        Assert.Equal([("codeybox-duplicate", "executor-b")], provider.DisposedManaged);
+        var remaining = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal("executor-a", remaining.HostId);
     }
 
     [Fact]

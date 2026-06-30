@@ -105,9 +105,11 @@ public sealed class SandboxLeakReaper : BackgroundService
     /// endpoint immediately after a successful disposal so that a second POST call for
     /// the same name returns 404 rather than attempting a redundant multipass delete.
     /// </summary>
-    public void RemoveFromLatestLeaks(string name)
+    public void RemoveFromLatestLeaks(string name, string? hostId = null)
     {
-        _latestLeaks = _latestLeaks.Where(l => l.Name != name).ToList();
+        _latestLeaks = _latestLeaks
+            .Where(l => l.Name != name || !string.Equals(l.HostId, hostId, StringComparison.Ordinal))
+            .ToList();
     }
 
     public void RemoveFromLatestLeaks(LeakedSandboxInfo leak)

@@ -159,7 +159,7 @@ Polled at collection time; registered only when OTel is enabled.
 | `codeybox.sandbox.active` | `{sandbox}` | `provider` | Currently admitted sandbox leases when the provider is wrapped by the global admission gate, including create/provisioning and startup-resume leases; otherwise lifecycle-aware providers report `IActiveSandboxProvider.SnapshotActiveSandboxes()` and ephemeral providers report `SandboxLiveCounter.Active`. |
 | `codeybox.sandbox.max` | `{sandbox}` | — | Configured `MaxConcurrentSandboxes` admission ceiling. |
 | `codeybox.sandbox.remote_host.reserved` | `{sandbox}` | `host_id`, `cordoned`, `configured_healthy`, `runtime_healthy` | Per-host remote multipass reservations held by active or provisioning VMs. |
-| `codeybox.sandbox.remote_host.capacity` | `{sandbox}` | `host_id`, `cordoned`, `configured_healthy`, `runtime_healthy` | Per-host remote multipass capacity cap (`long.MaxValue` means unbounded at the host level). |
+| `codeybox.sandbox.remote_host.capacity` | `{sandbox}` | `host_id`, `cordoned`, `configured_healthy`, `runtime_healthy` | Per-host remote multipass capacity cap (`int.MaxValue` means unbounded at the host level). |
 | `codeybox.agent.quota.available_pct` | `%` | `agent.kind`, `model` | Most-recent subscription quota headroom observed per agent/model during routing (`-1` = unknown). |
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.
