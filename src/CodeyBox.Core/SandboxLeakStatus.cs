@@ -23,4 +23,5 @@ public sealed record LeakedSandboxInfo(
     DateTimeOffset CreatedAt,
     TimeSpan Age,
     long? DiskBytes,
-    string Reason = SandboxLeakReasons.UntrackedSandbox);
+    string Reason = SandboxLeakReasons.UntrackedSandbox,
+    string? LifecycleProviderId = null);

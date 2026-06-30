@@ -62,7 +62,7 @@ public sealed class LocalE2eExecutionPool : IE2eExecutionPool, IManagedSandboxPr
 
     public int InFlight => _gate.CurrentInFlight;
 
-    public IReadOnlyList<ISandboxProvider> ManagedSandboxProviders => [_provider];
+    public IReadOnlyList<IManagedSandboxLifecycle> ManagedSandboxProviders => [_provider];
 
     public async Task<IE2eExecutionSlot> LeaseAsync(CancellationToken ct = default)
     {

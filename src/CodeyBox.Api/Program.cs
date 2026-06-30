@@ -546,7 +546,7 @@ static IE2eExecutionPool BuildRemoteE2eExecutionPool(
 
 static CompositeManagedSandboxProvider BuildManagedSandboxLifecycleProvider(IServiceProvider sp)
 {
-    var providers = new List<ISandboxProvider> { sp.GetRequiredService<ISandboxProvider>() };
+    var providers = new List<IManagedSandboxLifecycle> { sp.GetRequiredService<ISandboxProvider>() };
     if (ShouldIncludeE2eManagedProviders(sp)
         && sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
     {

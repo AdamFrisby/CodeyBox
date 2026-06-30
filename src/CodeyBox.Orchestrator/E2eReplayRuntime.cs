@@ -155,9 +155,11 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             return Fail($"replay driver returned invalid result JSON: {parseError}", "ReplayDriverProtocolError", -1, [], [], 0);
         }
 
-        if (result.ExitCode != 0 && driverResult.Passed)
+        var redactedDriverResult = RedactDriverResult(driverResult);
+
+        if (result.ExitCode != 0 && redactedDriverResult.Passed)
         {
-            return driverResult with
+            return redactedDriverResult with
             {
                 Passed = false,
                 FailureKind = "ReplayDriverFailed",
@@ -166,7 +168,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             };
         }
 
-        return driverResult;
+        return redactedDriverResult;
     }
 
     private async Task<(bool passed, string failureKind, string detail)> RunReadinessAsync(E2eReadinessProbe probe, ISandbox sandbox, CancellationToken ct)
@@ -321,6 +323,25 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             return RawOutputRedactor.Redact(s ?? string.Empty);
         return RawOutputRedactor.Redact(s[^OutputTailBytes..]);
     }
+
+    private static E2eRunResult RedactDriverResult(E2eRunResult result)
+        => result with
+        {
+            Summary = Tail(result.Summary),
+            StepResults = result.StepResults
+                .Select(static step => step with
+                {
+                    StdoutTail = Tail(step.StdoutTail),
+                    StderrTail = Tail(step.StderrTail),
+                })
+                .ToArray(),
+            AssertionResults = result.AssertionResults
+                .Select(static assertion => assertion with
+                {
+                    Detail = Tail(assertion.Detail),
+                })
+                .ToArray(),
+        };
 
     private static bool TryParseDriverResult(string stdout, out E2eRunResult? result, out string error)
     {

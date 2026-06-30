@@ -38,6 +38,15 @@ public interface IManagedSandboxLifecycle
     /// must wrap invocations in try/catch and log the exception.</para>
     /// </summary>
     Task DisposeLeakedAsync(string name, CancellationToken ct);
+
+    /// <summary>
+    /// Best-effort dispose of the exact sandbox snapshot returned by
+    /// <see cref="ListAllManagedAsync"/>. Composite lifecycle views use the
+    /// snapshot metadata to route disposal back to the lifecycle that reported
+    /// the sandbox instead of broadcasting a name across every provider.
+    /// </summary>
+    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+        => DisposeLeakedAsync(sandbox.Name, ct);
 }
 
 /// <summary>
@@ -122,13 +131,19 @@ public interface IResourceMetricsCapturingProvider
 /// depending on any backend's CLI state strings. Always false for providers that
 /// do not model a persistent suspend lifecycle.
 /// </param>
+/// <param name="LifecycleProviderId">
+/// Optional opaque identifier for the lifecycle provider that reported this
+/// snapshot. Plain providers leave this null; composite lifecycle views fill it
+/// so later cleanup can target the reporting provider only.
+/// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
     DateTimeOffset? CreatedAt,
     long? DiskBytes,
     bool IsTrackedActive,
     bool HasPreemptMarker = false,
-    bool IsSuspendLifecycleOrFrozen = false);
+    bool IsSuspendLifecycleOrFrozen = false,
+    string? LifecycleProviderId = null);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable

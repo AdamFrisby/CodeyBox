@@ -42,6 +42,7 @@ public sealed class E2eRunDispatcher : BackgroundService
         ITestCaseStore testCases,
         IOptionsMonitor<E2eExecutionOptions> options,
         E2eRunCancellationRegistry cancellations,
+        E2eReplayArtifactAdmissionValidator artifactValidator,
         ILogger<E2eRunDispatcher> logger)
     {
         _store = store;
@@ -50,8 +51,8 @@ public sealed class E2eRunDispatcher : BackgroundService
         _testCases = testCases;
         _options = options;
         _cancellations = cancellations;
+        _artifactValidator = artifactValidator;
         _logger = logger;
-        _artifactValidator = new E2eReplayArtifactAdmissionValidator(options);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

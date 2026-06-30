@@ -9,5 +9,5 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public interface IManagedSandboxProviderSource
 {
-    IReadOnlyList<ISandboxProvider> ManagedSandboxProviders { get; }
+    IReadOnlyList<IManagedSandboxLifecycle> ManagedSandboxProviders { get; }
 }

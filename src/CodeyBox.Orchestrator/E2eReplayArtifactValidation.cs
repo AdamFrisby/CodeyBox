@@ -176,10 +176,24 @@ internal static class E2eReplayArtifactValidation
             return false;
         }
 
-        if (!IsSafeSandboxWorkingDirectory(step.WorkingDirectory))
+        if (step.Stdin is not null)
         {
-            failureKind = "ArtifactSchemaError";
-            detail = $"steps[{index}].workingDirectory must stay under /work";
+            failureKind = "UnsupportedLegacyField";
+            detail = $"steps[{index}].stdin is not accepted by the replay driver";
+            return false;
+        }
+
+        if (step.WorkingDirectory is not null)
+        {
+            failureKind = "UnsupportedLegacyField";
+            detail = $"steps[{index}].workingDirectory is not accepted by the replay driver";
+            return false;
+        }
+
+        if (!step.FailOnNonZeroExit)
+        {
+            failureKind = "UnsupportedLegacyField";
+            detail = $"steps[{index}].failOnNonZeroExit is not accepted by the replay driver";
             return false;
         }
 
@@ -262,6 +276,27 @@ internal static class E2eReplayArtifactValidation
             return false;
         }
 
+        if (assertion.ExpectExitCode != 0)
+        {
+            failureKind = "UnsupportedLegacyField";
+            detail = $"assertions[{index}].expectExitCode is not accepted by the replay driver";
+            return false;
+        }
+
+        if (assertion.ExpectStdoutContains is not null)
+        {
+            failureKind = "UnsupportedLegacyField";
+            detail = $"assertions[{index}].expectStdoutContains is not accepted by the replay driver";
+            return false;
+        }
+
+        if (assertion.ExpectStdoutNotContains is not null)
+        {
+            failureKind = "UnsupportedLegacyField";
+            detail = $"assertions[{index}].expectStdoutNotContains is not accepted by the replay driver";
+            return false;
+        }
+
         if (string.IsNullOrWhiteSpace(assertion.Kind))
         {
             failureKind = "ArtifactSchemaError";
@@ -319,26 +354,6 @@ internal static class E2eReplayArtifactValidation
         string.Equals(kind, "selectorVisible", StringComparison.OrdinalIgnoreCase)
         || string.Equals(kind, "selectorHidden", StringComparison.OrdinalIgnoreCase)
         || string.Equals(kind, "selectorTextContains", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsSafeSandboxWorkingDirectory(string? workingDirectory)
-    {
-        if (string.IsNullOrWhiteSpace(workingDirectory))
-            return true;
-        if (!workingDirectory.StartsWith("/", StringComparison.Ordinal))
-            return false;
-        string fullPath;
-        try
-        {
-            fullPath = Path.GetFullPath(workingDirectory);
-        }
-        catch
-        {
-            return false;
-        }
-
-        return string.Equals(fullPath, "/work", StringComparison.Ordinal)
-            || fullPath.StartsWith("/work/", StringComparison.Ordinal);
-    }
 
     private static bool IsBoundedString(string? value) =>
         value is null || value.Length <= MaxStringLength;

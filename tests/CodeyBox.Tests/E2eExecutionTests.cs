@@ -107,10 +107,20 @@ public sealed class E2eExecutionTests : IDisposable
             [
                 new E2eReplayStep { Action = "navigate", Target = "http://app.local/" },
                 new E2eReplayStep { Action = "fill", Selector = "#name", Value = "Ada" },
-                new E2eReplayStep { Action = "click", Selector = "#submit" },
+                new E2eReplayStep { Action = "click", Selector = "#submit", DelayAfterMs = 1 },
+                new E2eReplayStep { Action = "doubleClick", Selector = "#double" },
+                new E2eReplayStep { Action = "press", Selector = "#name", Value = "Enter" },
+                new E2eReplayStep { Action = "select", Selector = "#choice", Value = "one" },
+                new E2eReplayStep { Action = "check", Selector = "#accepted" },
+                new E2eReplayStep { Action = "uncheck", Selector = "#archived" },
+                new E2eReplayStep { Action = "hover", Selector = "#menu" },
+                new E2eReplayStep { Action = "waitForSelector", Selector = "#ready" },
+                new E2eReplayStep { Action = "wait", Value = "0" },
             ],
             Assertions =
             [
+                new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#ready" },
+                new E2eReplayAssertion { Kind = "selectorHidden", Selector = "#hidden" },
                 new E2eReplayAssertion { Kind = "selectorTextContains", Selector = "#message", Value = "Welcome Ada" },
                 new E2eReplayAssertion { Kind = "urlContains", Value = "app.local" },
                 new E2eReplayAssertion { Kind = "titleContains", Value = "Dashboard" },
@@ -121,8 +131,8 @@ public sealed class E2eExecutionTests : IDisposable
         var result = await runtime.ExecuteAsync(artifact, sandbox);
 
         Assert.True(result.Passed, result.Summary);
-        Assert.Equal(3, result.StepResults.Count);
-        Assert.Equal(3, result.AssertionResults.Count);
+        Assert.Equal(11, result.StepResults.Count);
+        Assert.Equal(5, result.AssertionResults.Count);
     }
 
     [Fact]
@@ -285,6 +295,85 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     [Fact]
+    public async Task Replay_reports_readiness_dns_exec_exception()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => throw new InvalidOperationException("dns command failed");
+        sandbox.Programs["curl"] = _ => new SandboxExecResult(0, "should not run\n", string.Empty);
+        var artifact = new E2eReplayArtifact
+        {
+            Readiness = new E2eReadinessProbe { Url = "http://app.local/healthz", MaxAttempts = 1, DelayMs = 0 },
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReadinessProbe", result.FailureKind);
+        Assert.Contains("DNS resolution failed", result.Summary);
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "curl");
+    }
+
+    [Fact]
+    public async Task Replay_reports_readiness_dns_nonzero_exit()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(2, string.Empty, "no such host");
+        sandbox.Programs["curl"] = _ => new SandboxExecResult(0, "should not run\n", string.Empty);
+        var artifact = new E2eReplayArtifact
+        {
+            Readiness = new E2eReadinessProbe { Url = "http://app.local/healthz", MaxAttempts = 1, DelayMs = 0 },
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReadinessProbe", result.FailureKind);
+        Assert.Contains("DNS resolution failed", result.Summary);
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "curl");
+    }
+
+    [Fact]
+    public async Task Replay_reports_readiness_dns_without_usable_addresses()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "not-an-ip STREAM app.local\n", string.Empty);
+        sandbox.Programs["curl"] = _ => new SandboxExecResult(0, "should not run\n", string.Empty);
+        var artifact = new E2eReplayArtifact
+        {
+            Readiness = new E2eReadinessProbe { Url = "http://app.local/healthz", MaxAttempts = 1, DelayMs = 0 },
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReadinessProbe", result.FailureKind);
+        Assert.Contains("no usable addresses", result.Summary);
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "curl");
+    }
+
+    [Fact]
+    public async Task Replay_reports_readiness_curl_exec_exception()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "203.0.113.10 STREAM app.local\n", string.Empty);
+        sandbox.Programs["curl"] = _ => throw new InvalidOperationException("curl command failed");
+        var artifact = new E2eReplayArtifact
+        {
+            Readiness = new E2eReadinessProbe { Url = "http://app.local/healthz", MaxAttempts = 1, DelayMs = 0 },
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReadinessProbe", result.FailureKind);
+        Assert.Contains("last exit -1", result.Summary);
+    }
+
+    [Fact]
     public async Task Replay_rejects_navigation_outside_configured_app_origins_before_driver_runs()
     {
         var sandbox = new FakeSandbox();
@@ -364,6 +453,43 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.Equal("OutputLimitExceeded", result.FailureKind);
     }
 
+    [Theory]
+    [InlineData(0, "", "", "ReplayDriverProtocolError")]
+    [InlineData(0, "not-json\n", "", "ReplayDriverProtocolError")]
+    [InlineData(2, "", "driver exploded", "ReplayDriverFailed")]
+    [InlineData(2, "not-json\n", "driver exploded", "ReplayDriverFailed")]
+    public async Task Replay_reports_invalid_driver_protocol_outputs(
+        int exitCode,
+        string stdout,
+        string stderr,
+        string expectedFailureKind)
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["node"] = _ => new SandboxExecResult(exitCode, stdout, stderr);
+        var artifact = new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x" }] };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal(expectedFailureKind, result.FailureKind);
+    }
+
+    [Fact]
+    public async Task Replay_treats_nonzero_driver_exit_with_passed_json_as_driver_failure()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(1, 0), exitCode: 2);
+        var artifact = new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x" }] };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReplayDriverFailed", result.FailureKind);
+        Assert.Equal(-1, result.FailedStepIndex);
+    }
+
     [Fact]
     public async Task Replay_accepts_maximum_valid_step_and_assertion_result_without_small_stdout_cap()
     {
@@ -400,7 +526,9 @@ public sealed class E2eExecutionTests : IDisposable
         yield return [new E2eReplayArtifact { Steps = Enumerable.Range(0, E2eReplayArtifactValidation.MaxSteps + 1).Select(_ => new E2eReplayStep { Action = "click", Selector = "#x" }).ToArray() }, "ArtifactTooLarge"];
         yield return [new E2eReplayArtifact { Assertions = Enumerable.Range(0, E2eReplayArtifactValidation.MaxAssertions + 1).Select(_ => new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#x" }).ToArray() }, "ArtifactTooLarge"];
         yield return [new E2eReplayArtifact { Name = new string('x', E2eReplayArtifactValidation.MaxStringLength + 1), Steps = [new E2eReplayStep { Action = "click", Selector = "#x" }] }, "ArtifactSchemaError"];
-        yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x", WorkingDirectory = "/work2" }] }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x", Stdin = "ignored" }] }, "UnsupportedLegacyField"];
+        yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x", WorkingDirectory = "/work" }] }, "UnsupportedLegacyField"];
+        yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x", FailOnNonZeroExit = false }] }, "UnsupportedLegacyField"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = "#x", Argv = null! }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "bogus" }] }, "ArtifactSchemaError"];
@@ -411,6 +539,9 @@ public sealed class E2eExecutionTests : IDisposable
         yield return [new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "click", Selector = new string('x', E2eReplayArtifactValidation.MaxStringLength + 1) }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Argv = ["sh"], Kind = "selectorVisible", Selector = "#x" }] }, "UnsupportedLegacyArgv"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Argv = null!, Kind = "selectorVisible", Selector = "#x" }] }, "ArtifactSchemaError"];
+        yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#x", ExpectExitCode = 1 }] }, "UnsupportedLegacyField"];
+        yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#x", ExpectStdoutContains = "ignored" }] }, "UnsupportedLegacyField"];
+        yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#x", ExpectStdoutNotContains = "ignored" }] }, "UnsupportedLegacyField"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "bogus" }] }, "ArtifactSchemaError"];
         yield return [new E2eReplayArtifact { Assertions = [new E2eReplayAssertion { Kind = "selectorVisible" }] }, "ArtifactSchemaError"];
@@ -777,6 +908,24 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     [Fact]
+    public async Task MultiHostPool_releases_host_and_global_gates_when_provider_throws_during_lease()
+    {
+        var host = new CountingSandboxProvider { ThrowOnCreate = true };
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { MaxConcurrent = 1 });
+        var pool = new MultiHostE2eExecutionPool(
+            [new E2eExecutionHost("remote-a", host, 1)],
+            monitor,
+            NullLogger<MultiHostE2eExecutionPool>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => pool.LeaseAsync());
+        Assert.Equal(0, pool.InFlight);
+
+        host.ThrowOnCreate = false;
+        await using var slot = await pool.LeaseAsync();
+        Assert.Equal(1, pool.InFlight);
+    }
+
+    [Fact]
     public async Task CompositeLifecycleProvider_aggregates_lists_and_fans_out_dispose()
     {
         var local = new ManagedProviderDouble(
@@ -794,8 +943,72 @@ public sealed class E2eExecutionTests : IDisposable
         await composite.DisposeLeakedAsync("remote-vm", CancellationToken.None);
 
         Assert.Equal(["local-vm", "remote-vm"], listed.Select(vm => vm.Name).OrderBy(name => name, StringComparer.Ordinal).ToArray());
-        Assert.Equal(["remote-vm"], local.DisposedNames);
+        Assert.Empty(local.DisposedNames);
         Assert.Equal(["remote-vm"], remote.DisposedNames);
+    }
+
+    [Fact]
+    public async Task CompositeLifecycleProvider_disposes_provider_scoped_snapshot_only()
+    {
+        var local = new ManagedProviderDouble(
+            "pool",
+            [new ManagedSandboxInfo("codeybox-r-collision", DateTimeOffset.UtcNow, null, IsTrackedActive: false)]);
+        var remote = new ManagedProviderDouble(
+            "pool",
+            [new ManagedSandboxInfo("codeybox-r-collision", DateTimeOffset.UtcNow, null, IsTrackedActive: false)]);
+        var composite = new CompositeManagedSandboxProvider([local, remote]);
+        var listed = await composite.ListAllManagedAsync(CancellationToken.None);
+        var remoteSnapshot = listed.Single(info => info.LifecycleProviderId == "pool#2");
+
+        await composite.DisposeLeakedAsync(remoteSnapshot, CancellationToken.None);
+
+        Assert.Empty(local.DisposedNames);
+        Assert.Equal(["codeybox-r-collision"], remote.DisposedNames);
+    }
+
+    [Fact]
+    public async Task CompositeLifecycleProvider_throws_when_every_list_provider_fails()
+    {
+        var first = new ManagedProviderDouble("first", []) { ThrowOnList = true };
+        var second = new ManagedProviderDouble("second", []) { ThrowOnList = true };
+        var composite = new CompositeManagedSandboxProvider([first, second]);
+
+        await Assert.ThrowsAsync<AggregateException>(() => composite.ListAllManagedAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CompositeLifecycleProvider_throws_when_unscoped_dispose_cannot_be_routed()
+    {
+        var local = new ManagedProviderDouble(
+            "pool",
+            [new ManagedSandboxInfo("codeybox-r-collision", DateTimeOffset.UtcNow, null, IsTrackedActive: false)]);
+        var remote = new ManagedProviderDouble(
+            "pool",
+            [new ManagedSandboxInfo("codeybox-r-collision", DateTimeOffset.UtcNow, null, IsTrackedActive: false)]);
+        var composite = new CompositeManagedSandboxProvider([local, remote]);
+        await composite.ListAllManagedAsync(CancellationToken.None);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            composite.DisposeLeakedAsync("codeybox-r-collision", CancellationToken.None));
+        Assert.Empty(local.DisposedNames);
+        Assert.Empty(remote.DisposedNames);
+    }
+
+    [Fact]
+    public async Task CompositeLifecycleProvider_surfaces_scoped_dispose_failure()
+    {
+        var provider = new ManagedProviderDouble(
+            "remote",
+            [new ManagedSandboxInfo("codeybox-r-failed", DateTimeOffset.UtcNow, null, IsTrackedActive: false)])
+        {
+            ThrowOnDispose = true,
+        };
+        var composite = new CompositeManagedSandboxProvider([provider]);
+        var snapshot = Assert.Single(await composite.ListAllManagedAsync(CancellationToken.None));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            composite.DisposeLeakedAsync(snapshot, CancellationToken.None));
+        Assert.Equal(["codeybox-r-failed"], provider.DisposedNames);
     }
 
     [Fact]
@@ -843,6 +1056,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.False(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -866,6 +1080,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.False(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -903,7 +1118,7 @@ public sealed class E2eExecutionTests : IDisposable
         });
         var pool = new LocalE2eExecutionPool(provider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
         var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
-        var dispatcher = new E2eRunDispatcher(_runs, pool, runtime, _testCases, monitor, new E2eRunCancellationRegistry(), NullLogger<E2eRunDispatcher>.Instance);
+        var dispatcher = new E2eRunDispatcher(_runs, pool, runtime, _testCases, monitor, new E2eRunCancellationRegistry(), Admission(monitor), NullLogger<E2eRunDispatcher>.Instance);
 
         var sw = Stopwatch.StartNew();
         for (var i = 0; i < total; i++)
@@ -981,6 +1196,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         for (var i = 0; i < total; i++)
@@ -1017,6 +1233,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1052,6 +1269,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1083,6 +1301,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1112,7 +1331,7 @@ public sealed class E2eExecutionTests : IDisposable
             PerRunTimeout = TimeSpan.FromSeconds(10),
         });
         var pool = new LocalE2eExecutionPool(new CountingSandboxProvider(), monitor, NullLogger<LocalE2eExecutionPool>.Instance);
-        var dispatcher = new E2eRunDispatcher(_runs, pool, new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance), _testCases, monitor, new E2eRunCancellationRegistry(), NullLogger<E2eRunDispatcher>.Instance);
+        var dispatcher = new E2eRunDispatcher(_runs, pool, new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance), _testCases, monitor, new E2eRunCancellationRegistry(), Admission(monitor), NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
         await WaitForRunStatusAsync(runId, E2eRunStatus.Error);
@@ -1141,7 +1360,7 @@ public sealed class E2eExecutionTests : IDisposable
             PerRunTimeout = TimeSpan.FromMilliseconds(50),
         });
         var pool = new LocalE2eExecutionPool(provider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
-        var dispatcher = new E2eRunDispatcher(_runs, pool, new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance), _testCases, monitor, new E2eRunCancellationRegistry(), NullLogger<E2eRunDispatcher>.Instance);
+        var dispatcher = new E2eRunDispatcher(_runs, pool, new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance), _testCases, monitor, new E2eRunCancellationRegistry(), Admission(monitor), NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
 
@@ -1174,6 +1393,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             registry,
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1226,7 +1446,7 @@ public sealed class E2eExecutionTests : IDisposable
         });
         var pool = new LocalE2eExecutionPool(provider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
         var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
-        var dispatcher = new E2eRunDispatcher(_runs, pool, runtime, _testCases, monitor, new E2eRunCancellationRegistry(), NullLogger<E2eRunDispatcher>.Instance);
+        var dispatcher = new E2eRunDispatcher(_runs, pool, runtime, _testCases, monitor, new E2eRunCancellationRegistry(), Admission(monitor), NullLogger<E2eRunDispatcher>.Instance);
 
         var dispatched = await dispatcher.TryDispatchOneAsync(CancellationToken.None);
         Assert.True(dispatched);
@@ -1279,6 +1499,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1311,6 +1532,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1336,6 +1558,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.False(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1343,10 +1566,57 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     [Fact]
+    public async Task Dispatcher_releases_slot_and_skips_replay_when_sandbox_assignment_loses_race()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        var runId = Guid.NewGuid().ToString("N");
+        var store = new ClaimFailureRunStore
+        {
+            Queued = true,
+            ClaimedRun = new E2eRun
+            {
+                Id = runId,
+                TestCaseId = tcId,
+                Status = E2eRunStatus.Running,
+            },
+            AssignSandboxResult = false,
+            GetRun = new E2eRun
+            {
+                Id = runId,
+                TestCaseId = tcId,
+                Status = E2eRunStatus.Canceled,
+            },
+        };
+        var provider = new CountingSandboxProvider();
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { Enabled = true, MaxConcurrent = 1 });
+        var pool = new LocalE2eExecutionPool(provider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var runtime = new CountingReplayRuntime();
+        var dispatcher = new E2eRunDispatcher(
+            store,
+            pool,
+            runtime,
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            Admission(monitor),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
+        await WaitForDispatcherIdleAsync(dispatcher);
+
+        Assert.Equal(0, pool.InFlight);
+        Assert.True(provider.AllSandboxesDisposed);
+        Assert.Equal(0, runtime.ExecuteCount);
+        Assert.Null(store.UpdatedStatus);
+        Assert.Equal(1, store.AssignSandboxCalls);
+    }
+
+    [Fact]
     public async Task Dispatcher_releases_backoff_paths_for_lease_and_claim_failures()
     {
         var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
-        await _runs.CreateAsync(new E2eRun { Id = Guid.NewGuid().ToString("N"), TestCaseId = tcId, Status = E2eRunStatus.Queued });
+        var leaseFailureRunId = Guid.NewGuid().ToString("N");
+        await _runs.CreateAsync(new E2eRun { Id = leaseFailureRunId, TestCaseId = tcId, Status = E2eRunStatus.Queued });
         var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { Enabled = true, MaxConcurrent = 1 });
         var throwingProvider = new CountingSandboxProvider { ThrowOnCreate = true };
         var throwingPool = new LocalE2eExecutionPool(throwingProvider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
@@ -1357,11 +1627,16 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await leaseDispatcher.TryDispatchOneAsync(CancellationToken.None));
         await WaitForDispatcherIdleAsync(leaseDispatcher);
         Assert.Equal(0, throwingPool.InFlight);
+        var failedLeaseRun = await _runs.GetAsync(leaseFailureRunId);
+        Assert.NotNull(failedLeaseRun);
+        Assert.Equal(E2eRunStatus.Error, failedLeaseRun.Status);
+        Assert.Contains("PoolLeaseFailed", failedLeaseRun.Result);
 
         var claimStore = new ClaimFailureRunStore { Queued = true, ThrowOnClaim = true };
         var claimProvider = new CountingSandboxProvider();
@@ -1373,6 +1648,7 @@ public sealed class E2eExecutionTests : IDisposable
             _testCases,
             monitor,
             new E2eRunCancellationRegistry(),
+            Admission(monitor),
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await claimDispatcher.TryDispatchOneAsync(CancellationToken.None));
@@ -1439,6 +1715,9 @@ public sealed class E2eExecutionTests : IDisposable
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await dispatcher.WaitForIdleAsync(cts.Token);
     }
+
+    private static E2eReplayArtifactAdmissionValidator Admission(IOptionsMonitor<E2eExecutionOptions> monitor)
+        => new(monitor);
 
     private static string MakeTrivialPassArtifact()
         => JsonSerializer.Serialize(new E2eReplayArtifact
@@ -1710,6 +1989,7 @@ public sealed class E2eExecutionTests : IDisposable
     private sealed class ManagedProviderDouble(string name, IReadOnlyList<ManagedSandboxInfo> sandboxes) : ISandboxProvider
     {
         public List<string> DisposedNames { get; } = new();
+        public bool ThrowOnList { get; set; }
         public bool ThrowOnDispose { get; set; }
         public string Name => name;
 
@@ -1717,7 +1997,11 @@ public sealed class E2eExecutionTests : IDisposable
             => throw new NotSupportedException();
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
-            => Task.FromResult(sandboxes);
+        {
+            if (ThrowOnList)
+                throw new InvalidOperationException("list failed");
+            return Task.FromResult(sandboxes);
+        }
 
         public Task DisposeLeakedAsync(string sandboxName, CancellationToken ct)
         {
@@ -1728,18 +2012,36 @@ public sealed class E2eExecutionTests : IDisposable
         }
     }
 
+    private sealed class CountingReplayRuntime : IE2eReplayRuntime
+    {
+        public int ExecuteCount { get; private set; }
+
+        public Task<E2eRunResult> ExecuteAsync(E2eReplayArtifact artifact, ISandbox sandbox, CancellationToken ct = default)
+        {
+            ExecuteCount++;
+            return Task.FromResult(new E2eRunResult
+            {
+                Passed = true,
+                Summary = "ok",
+            });
+        }
+    }
+
     private sealed class ClaimFailureRunStore : IE2eRunStore
     {
         public bool Queued { get; set; }
         public bool ThrowOnClaim { get; set; }
         public bool ReturnNullClaim { get; set; }
+        public bool AssignSandboxResult { get; set; } = true;
         public E2eRun? ClaimedRun { get; set; }
+        public E2eRun? GetRun { get; set; }
         public E2eRunStatus? UpdatedStatus { get; private set; }
         public string? UpdatedResult { get; private set; }
+        public int AssignSandboxCalls { get; private set; }
 
         public Task CreateAsync(E2eRun run, CancellationToken ct = default) => Task.CompletedTask;
 
-        public Task<E2eRun?> GetAsync(string id, CancellationToken ct = default) => Task.FromResult<E2eRun?>(null);
+        public Task<E2eRun?> GetAsync(string id, CancellationToken ct = default) => Task.FromResult(GetRun);
 
         public IAsyncEnumerable<E2eRun> ListAsync(int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default) => Empty();
 
@@ -1769,7 +2071,11 @@ public sealed class E2eExecutionTests : IDisposable
             });
         }
 
-        public Task<bool> AssignSandboxAsync(string id, string sandboxId, CancellationToken ct = default) => Task.FromResult(true);
+        public Task<bool> AssignSandboxAsync(string id, string sandboxId, CancellationToken ct = default)
+        {
+            AssignSandboxCalls++;
+            return Task.FromResult(AssignSandboxResult);
+        }
 
         public Task<int> RequeueRunningAsync(DateTimeOffset startedBefore, CancellationToken ct = default) => Task.FromResult(0);
 

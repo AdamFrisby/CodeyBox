@@ -17,7 +17,7 @@ public sealed class MultiHostE2eExecutionPool : IE2eExecutionPool, IManagedSandb
     private readonly ILogger<MultiHostE2eExecutionPool> _logger;
     private readonly ResizableConcurrencyGate _globalGate;
     private readonly Func<string?> _fallbackImageReference;
-    private int _nextHost;
+    private long _nextHost;
 
     public MultiHostE2eExecutionPool(
         IReadOnlyList<E2eExecutionHost> hosts,
@@ -60,7 +60,7 @@ public sealed class MultiHostE2eExecutionPool : IE2eExecutionPool, IManagedSandb
 
     public int InFlight => _hosts.Sum(static h => h.Gate.CurrentInFlight);
 
-    public IReadOnlyList<ISandboxProvider> ManagedSandboxProviders =>
+    public IReadOnlyList<IManagedSandboxLifecycle> ManagedSandboxProviders =>
         _hosts.Select(static h => h.Provider).ToArray();
 
     public async Task<IE2eExecutionSlot> LeaseAsync(CancellationToken ct = default)
@@ -97,10 +97,11 @@ public sealed class MultiHostE2eExecutionPool : IE2eExecutionPool, IManagedSandb
 
     private HostEntry? TryEnterHost()
     {
-        var start = Interlocked.Increment(ref _nextHost);
+        var start = Interlocked.Increment(ref _nextHost) & long.MaxValue;
         for (var i = 0; i < _hosts.Count; i++)
         {
-            var host = _hosts[(start + i) % _hosts.Count];
+            var index = (int)((start + i) % _hosts.Count);
+            var host = _hosts[index];
             if (host.Gate.TryEnter())
                 return host;
         }

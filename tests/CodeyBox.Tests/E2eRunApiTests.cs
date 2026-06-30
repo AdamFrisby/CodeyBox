@@ -474,7 +474,7 @@ public sealed class E2eRunApiTests : IDisposable
     private static ISandboxProvider GetInnerProvider(IE2eExecutionPool pool)
     {
         if (pool is IManagedSandboxProviderSource { ManagedSandboxProviders.Count: > 0 } source)
-            return source.ManagedSandboxProviders[0];
+            return Assert.IsAssignableFrom<ISandboxProvider>(source.ManagedSandboxProviders[0]);
 
         var field = typeof(LocalE2eExecutionPool).GetField("_provider", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(field);

@@ -220,7 +220,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                         : (info.HasPreemptMarker
                             ? SandboxLeakReasons.ExpiredPreemptRetention
                             : SandboxLeakReasons.UntrackedSandbox));
-                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason));
+                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason, info.LifecycleProviderId));
                 AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
                 _ = _webhooks.PublishAsync(new WebhookEvent
                 {
@@ -321,7 +321,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         var diskMb = leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : (long?)null;
         try
         {
-            await _provider.DisposeLeakedAsync(leak.Name, linkedCts.Token);
+            await _provider.DisposeLeakedAsync(ToManagedSandboxInfo(leak), linkedCts.Token);
             var disposedAt = DateTimeOffset.UtcNow;
             AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes, diskMb, disposedAt, leak.Reason);
             _ = _webhooks.PublishAsync(new WebhookEvent
@@ -388,6 +388,14 @@ public sealed class SandboxLeakReaper : BackgroundService
             return leak.Name;
         }
     }
+
+    private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
+        => new(
+            leak.Name,
+            leak.CreatedAt,
+            leak.DiskBytes,
+            IsTrackedActive: false,
+            LifecycleProviderId: leak.LifecycleProviderId);
 }
 
 /// <summary>
