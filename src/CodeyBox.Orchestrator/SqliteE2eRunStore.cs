@@ -480,9 +480,9 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
     {
         E2eRunStatus status = E2eRunStatus.Queued;
         var statusStr = r.GetString(r.GetOrdinal("status"));
-        // TryParse — forward/backward compatible: an unknown status string
-        // surfaces as Queued and is corrected by the dispatcher's next sweep
-        // rather than poisoning the row.
+        // TryParse — forward/backward compatible for read paths. Unknown
+        // persisted strings surface as Queued in DTOs, but queue claim SQL
+        // still filters on the raw 'Queued' value and will not dispatch them.
         Enum.TryParse(statusStr, ignoreCase: true, out status);
 
         return new E2eRun

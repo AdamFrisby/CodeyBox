@@ -379,6 +379,9 @@ public sealed class E2eRunDispatcher : BackgroundService
         || string.Equals(failureKind, "ReplayDriverFailed", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReplayDriverProtocolError", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReplayDriverUnavailable", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ReplayEgressFirewallUnavailable", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ReplayEgressOriginRejected", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ReplayEgressResolutionFailed", StringComparison.Ordinal)
         || string.Equals(failureKind, "OutputLimitExceeded", StringComparison.Ordinal);
 
     private static TimeSpan NormalizePerRunTimeout(TimeSpan timeout) =>

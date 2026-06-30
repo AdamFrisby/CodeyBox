@@ -51,10 +51,14 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             {
                 failures.Add("CodeyBox:E2eExecution:PoolKind must be 'local' or 'remote-ssh'");
             }
-            if (e2e.Enabled
-                && string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
+            var remoteE2e = string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase);
+            if (e2e.Enabled && remoteE2e)
             {
                 failures.AddRange(E2eRemotePoolConfigValidation.ValidateEnabledRemoteE2eConfig(e2e, options));
+            }
+            else if (remoteE2e)
+            {
+                failures.AddRange(E2eRemotePoolConfigValidation.ValidateConfiguredRemoteLifecycleIsolation(options));
             }
             foreach (var (host, index) in GetE2eRemoteHostConfigs(options).Select((host, index) => (host, index)))
             {
@@ -229,7 +233,7 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             : ValidateOptionsResult.Fail(failures);
     }
 
-    private static IReadOnlyList<MultipassRemoteSandboxConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
+    private static IReadOnlyList<E2eMultipassRemoteHostConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
     {
         if (options.E2eMultipassRemoteSandboxes is { Count: > 0 } hosts)
             return hosts;

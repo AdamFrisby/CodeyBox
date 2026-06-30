@@ -532,7 +532,7 @@ static IE2eExecutionPool BuildRemoteE2eExecutionPool(
 
     var hosts = hostConfigs
         .Select((cfg, index) => new E2eExecutionHost(
-            string.IsNullOrWhiteSpace(cfg.SshTarget) ? $"remote-ssh:{index}" : cfg.SshTarget!,
+            string.IsNullOrWhiteSpace(cfg.RemoteSandbox.SshTarget) ? $"remote-ssh:{index}" : cfg.RemoteSandbox.SshTarget!,
             BuildE2eMultipassRemote(sp, loggerFactory, index),
             cfg.MaxConcurrent ?? 1))
         .ToArray();
@@ -607,7 +607,7 @@ static bool TryValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxO
     return true;
 }
 
-static IReadOnlyList<MultipassRemoteSandboxConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
+static IReadOnlyList<E2eMultipassRemoteHostConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
 {
     if (options.E2eMultipassRemoteSandboxes is { Count: > 0 } hosts)
         return hosts;
@@ -764,7 +764,7 @@ static MultipassRemoteSandboxProvider BuildE2eMultipassRemote(IServiceProvider s
         live =>
         {
             var hosts = GetE2eRemoteHostConfigs(live);
-            return hostIndex >= 0 && hostIndex < hosts.Count ? hosts[hostIndex] : null;
+            return hostIndex >= 0 && hostIndex < hosts.Count ? hosts[hostIndex].RemoteSandbox : null;
         });
 
 static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
@@ -3902,14 +3902,44 @@ namespace CodeyBox.Api
         /// leak-dispose safety check that refuses to delete arbitrary VMs.
         /// </summary>
         public string? VmNamePrefix { get; set; }
+    }
+
+    /// <summary>
+    /// Per-host configuration for the E2E replay pool. Capacity belongs here,
+    /// not on <see cref="MultipassRemoteSandboxConfig"/>, so the normal coding
+    /// fleet's remote provider config remains focused on SSH/provider settings.
+    /// </summary>
+    public sealed class E2eMultipassRemoteHostConfig
+    {
+        /// <summary>Remote Multipass provider settings for this E2E host.</summary>
+        public MultipassRemoteSandboxConfig RemoteSandbox { get; set; } = new();
 
         /// <summary>
-        /// E2E-only per-host lease cap when this config appears under
-        /// <c>CodeyBox:E2eMultipassRemoteSandboxes</c>. Null defaults to one
-        /// replay per host; the global <c>E2eExecution:MaxConcurrent</c> still
-        /// caps aggregate pool pressure.
+        /// Per-host lease cap. Null defaults to one replay per host; the global
+        /// <c>E2eExecution:MaxConcurrent</c> still caps aggregate pool pressure.
         /// </summary>
         public int? MaxConcurrent { get; set; }
+
+        public string? SshTarget { get => RemoteSandbox.SshTarget; set => RemoteSandbox.SshTarget = value; }
+        public string? SshBinary { get => RemoteSandbox.SshBinary; set => RemoteSandbox.SshBinary = value; }
+        public int? SshPort { get => RemoteSandbox.SshPort; set => RemoteSandbox.SshPort = value; }
+        public string? SshKeyPath { get => RemoteSandbox.SshKeyPath; set => RemoteSandbox.SshKeyPath = value; }
+        public IList<string>? ExtraSshOptions { get => RemoteSandbox.ExtraSshOptions; set => RemoteSandbox.ExtraSshOptions = value; }
+        public bool AcceptUnknownHostKeys { get => RemoteSandbox.AcceptUnknownHostKeys; set => RemoteSandbox.AcceptUnknownHostKeys = value; }
+        public int? ServerAliveIntervalSeconds { get => RemoteSandbox.ServerAliveIntervalSeconds; set => RemoteSandbox.ServerAliveIntervalSeconds = value; }
+        public int? ServerAliveCountMax { get => RemoteSandbox.ServerAliveCountMax; set => RemoteSandbox.ServerAliveCountMax = value; }
+        public int? ConnectTimeoutSeconds { get => RemoteSandbox.ConnectTimeoutSeconds; set => RemoteSandbox.ConnectTimeoutSeconds = value; }
+        public string? LocalTarBinary { get => RemoteSandbox.LocalTarBinary; set => RemoteSandbox.LocalTarBinary = value; }
+        public string? RemoteMultipassPath { get => RemoteSandbox.RemoteMultipassPath; set => RemoteSandbox.RemoteMultipassPath = value; }
+        public string? RemoteStagingRoot { get => RemoteSandbox.RemoteStagingRoot; set => RemoteSandbox.RemoteStagingRoot = value; }
+        public string? DefaultImage { get => RemoteSandbox.DefaultImage; set => RemoteSandbox.DefaultImage = value; }
+        public TimeSpan? VmStartTimeout { get => RemoteSandbox.VmStartTimeout; set => RemoteSandbox.VmStartTimeout = value; }
+        public TimeSpan? VmStopTimeout { get => RemoteSandbox.VmStopTimeout; set => RemoteSandbox.VmStopTimeout = value; }
+        public TimeSpan? VmStateCheckInterval { get => RemoteSandbox.VmStateCheckInterval; set => RemoteSandbox.VmStateCheckInterval = value; }
+        public string? VmNamePrefix { get => RemoteSandbox.VmNamePrefix; set => RemoteSandbox.VmNamePrefix = value; }
+
+        public static implicit operator E2eMultipassRemoteHostConfig(MultipassRemoteSandboxConfig config)
+            => new() { RemoteSandbox = config };
     }
 
     /// <summary>
@@ -4249,14 +4279,14 @@ namespace CodeyBox.Api
         /// replay load must target a separately sized cheap CPU pool rather
         /// than the coding-agent remote fleet.
         /// </summary>
-        public MultipassRemoteSandboxConfig? E2eMultipassRemoteSandbox { get; set; }
+        public E2eMultipassRemoteHostConfig? E2eMultipassRemoteSandbox { get; set; }
 
         /// <summary>
         /// Multi-host E2E replay fleet. When populated, this list supersedes
         /// <see cref="E2eMultipassRemoteSandbox"/> and the E2E pool distributes
         /// clone-per-test leases across the configured cheap CPU hosts.
         /// </summary>
-        public List<MultipassRemoteSandboxConfig> E2eMultipassRemoteSandboxes { get; set; } = [];
+        public List<E2eMultipassRemoteHostConfig> E2eMultipassRemoteSandboxes { get; set; } = [];
 
         /// <summary>
         /// Maps logical network-profile names → host bridge names. Operators

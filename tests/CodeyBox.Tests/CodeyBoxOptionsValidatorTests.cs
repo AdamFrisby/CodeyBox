@@ -409,7 +409,7 @@ public sealed class CodeyBoxOptionsValidatorTests
         var options = ValidCodeyBoxOptions();
         options.E2eMultipassRemoteSandboxes =
         [
-            new MultipassRemoteSandboxConfig
+            new E2eMultipassRemoteHostConfig
             {
                 SshTarget = "e2e@example",
                 MaxConcurrent = E2eExecutionOptions.MaximumMaxConcurrent + 1,
@@ -420,6 +420,39 @@ public sealed class CodeyBoxOptionsValidatorTests
 
         Assert.True(result.Failed);
         Assert.Contains("E2eMultipassRemoteSandboxes:0:MaxConcurrent", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsConfiguredRemoteE2eLifecycleOverlapEvenWhenDisabled()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "coding@remote.example" };
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "e2e@remote.example" };
+        options.E2eExecution.Enabled = false;
+        options.E2eExecution.PoolKind = "remote-ssh";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("different SSH host", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsDuplicateConfiguredRemoteE2eHostAndVmPrefix()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.E2eMultipassRemoteSandboxes =
+        [
+            new E2eMultipassRemoteHostConfig { SshTarget = "e2e-a@remote.example", VmNamePrefix = "codeybox-r-" },
+            new E2eMultipassRemoteHostConfig { SshTarget = "e2e-b@remote.example", VmNamePrefix = "codeybox-r-" },
+        ];
+        options.E2eExecution.Enabled = false;
+        options.E2eExecution.PoolKind = "remote-ssh";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("same SSH host with the same VmNamePrefix", result.FailureMessage);
     }
 
     [Fact]

@@ -56,13 +56,13 @@ public sealed class E2eRunApiTests : IDisposable
     [Fact]
     public void Program_remote_e2e_pool_reads_e2e_specific_remote_config()
     {
-        using var factory = new E2ePoolWiringFactory("remote-ssh", globalRemoteTarget: "coding@coding.example", e2eRemoteTarget: "e2e@remote.example");
+        using var factory = new E2ePoolWiringFactory("remote-ssh", globalRemoteTarget: "coding@198.51.100.20", e2eRemoteTarget: "e2e@198.51.100.21");
 
         var pool = factory.Services.GetRequiredService<IE2eExecutionPool>();
         var provider = Assert.IsType<MultipassRemoteSandboxProvider>(GetInnerProvider(pool));
         var opts = ReadRemoteOptions(provider);
 
-        Assert.Equal("e2e@remote.example", opts.SshTarget);
+        Assert.Equal("e2e@198.51.100.21", opts.SshTarget);
     }
 
     [Fact]
@@ -84,8 +84,8 @@ public sealed class E2eRunApiTests : IDisposable
     {
         using var factory = new E2ePoolWiringFactory(
             "remote-ssh",
-            globalRemoteTarget: "coding@remote.example",
-            e2eRemoteTargets: ["e2e-a@remote.example", "e2e-b@remote.example"]);
+            globalRemoteTarget: "coding@198.51.100.20",
+            e2eRemoteTargets: ["e2e@198.51.100.10", "e2e@198.51.100.11"]);
 
         var pool = Assert.IsType<MultiHostE2eExecutionPool>(factory.Services.GetRequiredService<IE2eExecutionPool>());
         var source = Assert.IsAssignableFrom<IManagedSandboxProviderSource>(pool);
@@ -490,6 +490,34 @@ public sealed class E2eRunApiTests : IDisposable
     }
 
     [Fact]
+    public async Task E2eRun_cancel_returns_ok_when_concurrent_cancel_wins_race()
+    {
+        const string runId = "race-run";
+        var store = new CancelRaceE2eRunStore(runId);
+        using var factory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IE2eRunStore>();
+                services.AddSingleton<IE2eRunStore>(store);
+            });
+        });
+        using var client = factory.CreateClient();
+        var registry = factory.Services.GetRequiredService<E2eRunCancellationRegistry>();
+        using var cts = registry.Register(runId);
+
+        var cancel = await client.PostAsync($"/e2eruns/{runId}/cancel", content: null);
+
+        Assert.Equal(HttpStatusCode.OK, cancel.StatusCode);
+        var dto = await cancel.Content.ReadFromJsonAsync<E2eRunDto>();
+        Assert.NotNull(dto);
+        Assert.Equal(E2eRunStatus.Canceled, dto.Status);
+        Assert.True(cts.IsCancellationRequested);
+        Assert.Equal(2, store.GetCalls);
+        Assert.Equal(1, store.CancelCalls);
+    }
+
+    [Fact]
     public async Task E2eRun_bulk_enqueue_creates_batch_and_summary()
     {
         var first = await SeedE2eCaseAsync("api-bulk-first");
@@ -561,6 +589,52 @@ public sealed class E2eRunApiTests : IDisposable
         Assert.NotNull(field);
         var accessor = Assert.IsType<Func<MultipassRemoteSandboxOptions>>(field.GetValue(provider));
         return accessor();
+    }
+
+    private sealed class CancelRaceE2eRunStore(string runId) : IE2eRunStore
+    {
+        public int GetCalls { get; private set; }
+        public int CancelCalls { get; private set; }
+
+        public Task CreateAsync(E2eRun run, CancellationToken ct = default) => Task.CompletedTask;
+        public Task BulkCreateAsync(IReadOnlyList<E2eRun> runs, CancellationToken ct = default) => Task.CompletedTask;
+        public IAsyncEnumerable<E2eRun> ListAsync(int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default) => Empty();
+        public IAsyncEnumerable<E2eRun> ListByTestCaseAsync(string testCaseId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default) => Empty();
+        public IAsyncEnumerable<E2eRun> ListByBatchAsync(string batchId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default) => Empty();
+        public Task<E2eRunBatchCounts?> GetBatchCountsAsync(string batchId, CancellationToken ct = default) => Task.FromResult<E2eRunBatchCounts?>(null);
+        public Task<bool> HasQueuedAsync(CancellationToken ct = default) => Task.FromResult(false);
+        public Task<E2eRun?> ClaimNextQueuedAsync(string? sandboxId, CancellationToken ct = default) => Task.FromResult<E2eRun?>(null);
+        public Task<bool> AssignSandboxAsync(string id, string sandboxId, CancellationToken ct = default) => Task.FromResult(false);
+        public Task<int> RequeueRunningAsync(DateTimeOffset startedBefore, CancellationToken ct = default) => Task.FromResult(0);
+        public Task<bool> UpdateStatusAsync(string id, E2eRunStatus status, DateTimeOffset? startedAt, DateTimeOffset? finishedAt, string? result, CancellationToken ct = default) => Task.FromResult(false);
+
+        public Task<E2eRun?> GetAsync(string id, CancellationToken ct = default)
+        {
+            GetCalls++;
+            if (!string.Equals(id, runId, StringComparison.Ordinal))
+                return Task.FromResult<E2eRun?>(null);
+
+            var status = GetCalls == 1 ? E2eRunStatus.Running : E2eRunStatus.Canceled;
+            return Task.FromResult<E2eRun?>(new E2eRun
+            {
+                Id = runId,
+                TestCaseId = "race-case",
+                Status = status,
+                SandboxId = "sandbox-race",
+            });
+        }
+
+        public Task<bool> CancelAsync(string id, CancellationToken ct = default)
+        {
+            CancelCalls++;
+            return Task.FromResult(false);
+        }
+
+        private static async IAsyncEnumerable<E2eRun> Empty()
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
     }
 }
 

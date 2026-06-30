@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net;
+using System.Net.Sockets;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
@@ -86,7 +87,14 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             }
         }
 
-        var replay = await RunReplayDriverAsync(artifact, sandbox, ct);
+        var egress = await BuildReplayEgressPolicyAsync(sandbox, ct);
+        if (!egress.allowed || egress.policy is null)
+        {
+            sw.Stop();
+            return Fail(egress.detail, egress.failureKind, -1, stepResults, assertionResults, sw.ElapsedMilliseconds);
+        }
+
+        var replay = await RunReplayDriverAsync(artifact, sandbox, egress.policy, ct);
         sw.Stop();
         return replay with
         {
@@ -97,15 +105,25 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         };
     }
 
-    private async Task<E2eRunResult> RunReplayDriverAsync(E2eReplayArtifact artifact, ISandbox sandbox, CancellationToken ct)
+    private async Task<E2eRunResult> RunReplayDriverAsync(
+        E2eReplayArtifact artifact,
+        ISandbox sandbox,
+        ReplayEgressPolicy egressPolicy,
+        CancellationToken ct)
     {
+        var firewall = await InstallReplayEgressFirewallAsync(sandbox, egressPolicy.Endpoints, ct);
+        if (!firewall.installed)
+        {
+            return Fail(firewall.detail, "ReplayEgressFirewallUnavailable", -1, [], [], 0);
+        }
+
         SandboxExecResult result;
         try
         {
             result = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = [ReplayDriverBinary, "-e", ReplayDriverScript],
-                Stdin = JsonSerializer.Serialize(ToReplayDriverInput(artifact), ArtifactJson),
+                Stdin = JsonSerializer.Serialize(ToReplayDriverInput(artifact, egressPolicy), ArtifactJson),
                 WorkingDirectory = "/work",
                 MaxStdoutBytes = OutputCaptureBytes,
                 MaxStderrBytes = OutputCaptureBytes,
@@ -119,6 +137,11 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         {
             _logger.LogWarning(ex, "E2E replay driver threw during exec.");
             return Fail($"replay driver threw: {ex.Message}", "ExecException", -1, [], [], 0);
+        }
+        finally
+        {
+            if (!string.IsNullOrEmpty(firewall.firewallId))
+                await RemoveReplayEgressFirewallAsync(sandbox, firewall.firewallId!, CancellationToken.None);
         }
 
         if (result.OutputLimitExceeded)
@@ -277,7 +300,222 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             : (true, string.Empty, string.Empty, first.ToString());
     }
 
-    private ReplayDriverInput ToReplayDriverInput(E2eReplayArtifact artifact)
+    private async Task<(bool allowed, string failureKind, string detail, ReplayEgressPolicy? policy)> BuildReplayEgressPolicyAsync(
+        ISandbox sandbox,
+        CancellationToken ct)
+    {
+        var endpoints = new Dictionary<(string Address, int Port), ReplayAllowedEndpoint>();
+        var resolverRules = new Dictionary<string, ReplayHostResolverRule>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var origin in CurrentAllowedOrigins()
+                     .Where(static origin => Uri.TryCreate(origin, UriKind.Absolute, out _))
+                     .Select(static origin => E2eReplayOriginPolicy.NormalizeOrigin(new Uri(origin)))
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var uri = new Uri(origin);
+            var host = NormalizeHost(uri.IdnHost);
+            var port = E2eReplayOriginPolicy.EffectivePort(uri);
+            var resolved = await ResolveReplayOriginAddressesAsync(host, sandbox, ct);
+            if (!resolved.allowed)
+                return (false, resolved.failureKind, resolved.detail, null);
+
+            foreach (var ip in resolved.addresses)
+            {
+                endpoints[(ip.ToString(), port)] = new ReplayAllowedEndpoint(ip.ToString(), port, ip.AddressFamily == AddressFamily.InterNetworkV6 ? 6 : 4);
+            }
+
+            if (!IPAddress.TryParse(host, out _) && resolved.addresses.Count > 0)
+            {
+                resolverRules.TryAdd(host, new ReplayHostResolverRule(host, resolved.addresses[0].ToString()));
+            }
+        }
+
+        if (endpoints.Count == 0)
+            return (false, "ReplayEgressResolutionFailed", "no allowed replay origin addresses resolved", null);
+
+        return (true, string.Empty, string.Empty, new ReplayEgressPolicy(
+            endpoints.Values.OrderBy(static e => e.Address, StringComparer.Ordinal).ThenBy(static e => e.Port).ToArray(),
+            resolverRules.Values.OrderBy(static r => r.Host, StringComparer.OrdinalIgnoreCase).ToArray()));
+    }
+
+    private async Task<(bool allowed, string failureKind, string detail, IReadOnlyList<IPAddress> addresses)> ResolveReplayOriginAddressesAsync(
+        string host,
+        ISandbox sandbox,
+        CancellationToken ct)
+    {
+        if (IPAddress.TryParse(host, out var literal))
+        {
+            literal = NormalizeAddress(literal);
+            return E2eReplayOriginPolicy.IsBlockedMetadataIp(literal)
+                ? (false, "ReplayEgressOriginRejected", $"allowed replay origin resolves to disallowed metadata address {literal}", [])
+                : (true, string.Empty, string.Empty, [literal]);
+        }
+
+        SandboxExecResult result;
+        try
+        {
+            result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["getent", "ahosts", host],
+                MaxStdoutBytes = OutputCaptureBytes,
+                MaxStderrBytes = OutputCaptureBytes,
+            }, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return (false, "ReplayEgressResolutionFailed", $"allowed replay origin DNS resolution failed for {host}: {ex.Message}", []);
+        }
+
+        if (result.ExitCode != 0)
+            return (false, "ReplayEgressResolutionFailed", $"allowed replay origin DNS resolution failed for {host}: {Tail(result.Stderr)}", []);
+
+        var addresses = new List<IPAddress>();
+        foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var token = line.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (token is null || !IPAddress.TryParse(token, out var ip))
+                continue;
+
+            ip = NormalizeAddress(ip);
+            if (E2eReplayOriginPolicy.IsBlockedMetadataIp(ip))
+                return (false, "ReplayEgressOriginRejected", $"allowed replay origin resolves to disallowed metadata address {ip}", []);
+            if (!addresses.Contains(ip))
+                addresses.Add(ip);
+        }
+
+        return addresses.Count == 0
+            ? (false, "ReplayEgressResolutionFailed", $"allowed replay origin DNS resolution returned no usable addresses for {host}", [])
+            : (true, string.Empty, string.Empty, addresses);
+    }
+
+    private async Task<(bool installed, string? firewallId, string detail)> InstallReplayEgressFirewallAsync(
+        ISandbox sandbox,
+        IReadOnlyList<ReplayAllowedEndpoint> endpoints,
+        CancellationToken ct)
+    {
+        var firewallId = "CB_E2E_" + Guid.NewGuid().ToString("N")[..12];
+        var script = BuildInstallFirewallScript(firewallId, endpoints);
+        SandboxExecResult result;
+        try
+        {
+            result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-s"],
+                Stdin = script,
+                MaxStdoutBytes = OutputCaptureBytes,
+                MaxStderrBytes = OutputCaptureBytes,
+            }, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await RemoveReplayEgressFirewallAsync(sandbox, firewallId, CancellationToken.None);
+            return (false, null, $"replay VM egress firewall setup threw: {ex.Message}");
+        }
+
+        if (result.ExitCode == 0)
+            return (true, firewallId, string.Empty);
+
+        await RemoveReplayEgressFirewallAsync(sandbox, firewallId, CancellationToken.None);
+        return (false, null, $"replay VM egress firewall setup failed (exit {result.ExitCode}): {Tail(string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr)}");
+    }
+
+    private async Task RemoveReplayEgressFirewallAsync(ISandbox sandbox, string firewallId, CancellationToken ct)
+    {
+        try
+        {
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-s"],
+                Stdin = BuildRemoveFirewallScript(firewallId),
+                MaxStdoutBytes = OutputCaptureBytes,
+                MaxStderrBytes = OutputCaptureBytes,
+            }, ct);
+            if (result.ExitCode != 0)
+                _logger.LogWarning("E2E replay firewall cleanup for {FirewallId} exited {ExitCode}: {Detail}", firewallId, result.ExitCode, Tail(result.Stderr));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "E2E replay firewall cleanup for {FirewallId} threw.", firewallId);
+        }
+    }
+
+    private static string BuildInstallFirewallScript(string firewallId, IReadOnlyList<ReplayAllowedEndpoint> endpoints)
+    {
+        var endpointLines = string.Join("\n", endpoints.Select(static e => $"{e.Family} {e.Address} {e.Port}"));
+        return $$"""
+        set -eu
+        CHAIN='{{firewallId}}'
+        CHAIN4="${CHAIN}_4"
+        CHAIN6="${CHAIN}_6"
+        run() {
+          if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi
+        }
+        command -v iptables >/dev/null 2>&1 || { echo 'iptables is required for replay egress enforcement' >&2; exit 42; }
+        command -v ip6tables >/dev/null 2>&1 || { echo 'ip6tables is required for replay egress enforcement' >&2; exit 42; }
+        cleanup_chain() {
+          table="$1"; chain="$2"
+          while run "$table" -D OUTPUT -p tcp -j "$chain" 2>/dev/null; do :; done
+          while run "$table" -D OUTPUT -p udp -j "$chain" 2>/dev/null; do :; done
+          run "$table" -F "$chain" 2>/dev/null || true
+          run "$table" -X "$chain" 2>/dev/null || true
+        }
+        cleanup_chain iptables "$CHAIN4"
+        cleanup_chain ip6tables "$CHAIN6"
+        run iptables -N "$CHAIN4"
+        run ip6tables -N "$CHAIN6"
+        ENDPOINTS="$(mktemp)"
+        trap 'rm -f "$ENDPOINTS"' EXIT
+        cat > "$ENDPOINTS" <<'CODEYBOX_E2E_ENDPOINTS'
+        {{endpointLines}}
+        CODEYBOX_E2E_ENDPOINTS
+        while read -r family address port; do
+          [ -n "$family" ] || continue
+          if [ "$family" = "4" ]; then
+            run iptables -A "$CHAIN4" -p tcp -d "$address" --dport "$port" -j RETURN
+          elif [ "$family" = "6" ]; then
+            run ip6tables -A "$CHAIN6" -p tcp -d "$address" --dport "$port" -j RETURN
+          fi
+        done < "$ENDPOINTS"
+        run iptables -A "$CHAIN4" -p tcp -j REJECT
+        run iptables -A "$CHAIN4" -p udp -j REJECT
+        run ip6tables -A "$CHAIN6" -p tcp -j REJECT
+        run ip6tables -A "$CHAIN6" -p udp -j REJECT
+        run iptables -I OUTPUT 1 -p tcp -j "$CHAIN4"
+        run iptables -I OUTPUT 1 -p udp -j "$CHAIN4"
+        run ip6tables -I OUTPUT 1 -p tcp -j "$CHAIN6"
+        run ip6tables -I OUTPUT 1 -p udp -j "$CHAIN6"
+        """;
+    }
+
+    private static string BuildRemoveFirewallScript(string firewallId) =>
+        $$"""
+        set -u
+        CHAIN='{{firewallId}}'
+        CHAIN4="${CHAIN}_4"
+        CHAIN6="${CHAIN}_6"
+        run() {
+          if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi
+        }
+        cleanup_chain() {
+          table="$1"; chain="$2"
+          while run "$table" -D OUTPUT -p tcp -j "$chain" 2>/dev/null; do :; done
+          while run "$table" -D OUTPUT -p udp -j "$chain" 2>/dev/null; do :; done
+          run "$table" -F "$chain" 2>/dev/null || true
+          run "$table" -X "$chain" 2>/dev/null || true
+        }
+        cleanup_chain iptables "$CHAIN4"
+        cleanup_chain ip6tables "$CHAIN6"
+        """;
+
+    private ReplayDriverInput ToReplayDriverInput(E2eReplayArtifact artifact, ReplayEgressPolicy egressPolicy)
     {
         var allowed = CurrentAllowedOrigins();
         return new ReplayDriverInput(
@@ -289,8 +527,20 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
                 .Where(static origin => Uri.TryCreate(origin, UriKind.Absolute, out _))
                 .Select(static origin => E2eReplayOriginPolicy.NormalizeOrigin(new Uri(origin)))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray());
+                .ToArray(),
+            egressPolicy.HostResolverRules);
     }
+
+    private static string NormalizeHost(string host)
+    {
+        var trimmed = host.Trim();
+        return trimmed.Length >= 2 && trimmed[0] == '[' && trimmed[^1] == ']'
+            ? trimmed[1..^1]
+            : trimmed;
+    }
+
+    private static IPAddress NormalizeAddress(IPAddress address) =>
+        address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
 
     private static E2eRunResult Fail(string summary, string kind, int failedIndex, IReadOnlyList<E2eStepResult> steps, IReadOnlyList<E2eAssertionResult> assertions, long durationMs)
         => new()
@@ -375,7 +625,21 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         [property: JsonPropertyName("readiness")] E2eReadinessProbe? Readiness,
         [property: JsonPropertyName("steps")] IReadOnlyList<E2eReplayStep> Steps,
         [property: JsonPropertyName("assertions")] IReadOnlyList<E2eReplayAssertion> Assertions,
-        [property: JsonPropertyName("__codeyboxAllowedOrigins")] IReadOnlyList<string> AllowedOrigins);
+        [property: JsonPropertyName("__codeyboxAllowedOrigins")] IReadOnlyList<string> AllowedOrigins,
+        [property: JsonPropertyName("__codeyboxHostResolverRules")] IReadOnlyList<ReplayHostResolverRule> HostResolverRules);
+
+    private sealed record ReplayEgressPolicy(
+        IReadOnlyList<ReplayAllowedEndpoint> Endpoints,
+        IReadOnlyList<ReplayHostResolverRule> HostResolverRules);
+
+    private sealed record ReplayAllowedEndpoint(
+        [property: JsonPropertyName("address")] string Address,
+        [property: JsonPropertyName("port")] int Port,
+        [property: JsonPropertyName("family")] int Family);
+
+    private sealed record ReplayHostResolverRule(
+        [property: JsonPropertyName("host")] string Host,
+        [property: JsonPropertyName("address")] string Address);
 
     private static readonly string ReplayDriverScript =
         $$"""
@@ -420,7 +684,9 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
 
         function normalizeOrigin(raw) {
           const u = new URL(String(raw));
-          if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`non-http URL is not allowed: ${raw}`);
+          if (u.protocol === 'ws:') u.protocol = 'http:';
+          else if (u.protocol === 'wss:') u.protocol = 'https:';
+          else if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`non-http URL is not allowed: ${raw}`);
           if (u.username || u.password) throw new Error(`userinfo is not allowed in URL: ${raw}`);
           return u.origin;
         }
@@ -456,8 +722,18 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             || value === 'fe80:0:0:0:0:0:a9fe:a9fe';
         }
 
-        async function buildHostResolverRules(allowedOrigins) {
+        async function buildHostResolverRules(artifact, allowedOrigins) {
           const rules = [];
+          const provided = Array.isArray(artifact.__codeyboxHostResolverRules) ? artifact.__codeyboxHostResolverRules : [];
+          for (const rule of provided) {
+            const host = normalizeAddress(rule && rule.host);
+            const address = normalizeAddress(rule && rule.address);
+            if (!host || !address) throw new Error('invalid host resolver rule supplied by replay runtime');
+            if (isMetadataAddress(address)) throw new Error(`allowed origin resolves to blocked metadata address ${address}`);
+            rules.push(`MAP ${host} ${address}`);
+          }
+          if (rules.length > 0) return rules.join(',');
+
           for (const origin of allowedOrigins) {
             const u = new URL(origin);
             const host = normalizeAddress(u.hostname);
@@ -547,11 +823,14 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
               return;
             }
 
-            const resolverRules = await buildHostResolverRules(allowedOrigins);
+            const resolverRules = await buildHostResolverRules(artifact, allowedOrigins);
             const launchOptions = { headless: true };
             if (resolverRules) launchOptions.args = [`--host-resolver-rules=${resolverRules}`];
             browser = await chromium.launch(launchOptions);
-            const context = await browser.newContext();
+            const context = await browser.newContext({ serviceWorkers: 'block' });
+            if (typeof context.routeWebSocket !== 'function') {
+              throw new Error('playwright routeWebSocket support is required for replay egress enforcement');
+            }
             await context.route('**/*', route => {
               const url = route.request().url();
               try {
@@ -559,6 +838,17 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
                 return route.continue();
               } catch {
                 return route.abort('blockedbyclient');
+              }
+            });
+            await context.routeWebSocket('**/*', ws => {
+              const url = typeof ws.url === 'function' ? ws.url() : ws.url;
+              try {
+                ensureAllowedUrl(url, allowedOrigins, 'websocket');
+                return ws.connectToServer();
+              } catch {
+                if (typeof ws.close === 'function') return ws.close();
+                if (typeof ws.abort === 'function') return ws.abort();
+                throw new Error('websocket blocked');
               }
             });
             const page = await context.newPage();

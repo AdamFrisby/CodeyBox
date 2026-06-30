@@ -396,6 +396,35 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
+    public async Task AutoDispose_SkipsDuplicateSnapshotsWhenAnyProviderReportsVmActive()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        const string sandboxName = "codeybox-active-duplicate";
+        var first = new FakeSandboxProvider();
+        var second = new FakeSandboxProvider();
+        first.AddSandbox(new ManagedSandboxInfo(sandboxName, OldEnough(threshold), DiskBytes: null, IsTrackedActive: true));
+        second.AddSandbox(new ManagedSandboxInfo(sandboxName, null, DiskBytes: null, IsTrackedActive: false));
+        var opts = new SandboxLeakOptions
+        {
+            Enabled = true,
+            CheckInterval = TimeSpan.FromHours(1),
+            LeakAgeThreshold = threshold,
+            AutoDispose = true,
+        };
+        var reaper = new SandboxLeakReaper(
+            new CompositeManagedSandboxProvider([first, second]),
+            new NullWebhookDispatcher(),
+            opts,
+            NullLogger<SandboxLeakReaper>.Instance);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Empty(first.DisposedNames);
+        Assert.Empty(second.DisposedNames);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
     public async Task AutoDispose_DefaultEnabled_DisposesEligibleLeak()
     {
         var threshold = TimeSpan.FromMinutes(30);

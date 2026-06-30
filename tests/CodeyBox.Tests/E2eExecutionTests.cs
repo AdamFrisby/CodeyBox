@@ -87,7 +87,7 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.All(result.StepResults, step => Assert.True(step.Passed));
         Assert.Single(result.AssertionResults);
         Assert.True(result.AssertionResults[0].Passed);
-        var exec = Assert.Single(sandbox.ExecRequests);
+        var exec = Assert.Single(sandbox.ExecRequests, exec => exec.Argv[0] == "node");
         Assert.Equal("node", exec.Argv[0]);
         Assert.Equal("-e", exec.Argv[1]);
         Assert.Equal(1024 * 1024, exec.MaxStdoutBytes);
@@ -190,13 +190,14 @@ public sealed class E2eExecutionTests : IDisposable
         var result = await runtime.ExecuteAsync(artifact, sandbox);
 
         Assert.False(result.Passed);
-        Assert.Equal("ReplayDriverFailed", result.FailureKind);
-        Assert.Contains("DNS lookup failed", result.Summary);
+        Assert.Equal("ReplayEgressResolutionFailed", result.FailureKind);
+        Assert.Contains("DNS resolution failed", result.Summary);
     }
 
     [Theory]
     [InlineData("http://app.local/blocked-subresource", "request blocked")]
     [InlineData("http://app.local/redirect-off-origin", "final navigation URL origin")]
+    [InlineData("http://app.local/websocket-off-origin", "websocket blocked")]
     public async Task Replay_embedded_driver_enforces_request_firewall_and_final_url(
         string target,
         string expectedDetail)
@@ -213,6 +214,27 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.False(result.Passed);
         Assert.Equal("StepFailed", result.FailureKind);
         Assert.Contains(expectedDetail, result.Summary);
+    }
+
+    [Fact]
+    public async Task Replay_installs_vm_egress_firewall_around_driver()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "203.0.113.10 STREAM app.local\n", string.Empty);
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(1, 0));
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/" }],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.True(result.Passed, result.Summary);
+        Assert.Equal(["getent", "getent", "sh", "node", "sh"], sandbox.ExecLog.Select(static argv => argv[0]).ToArray());
+        var install = sandbox.ExecRequests.Single(exec => exec.Argv.SequenceEqual(["sh", "-s"]) && exec.Stdin!.Contains("iptables -I OUTPUT", StringComparison.Ordinal));
+        Assert.Contains("203.0.113.10 80", install.Stdin, StringComparison.Ordinal);
+        Assert.Contains("203.0.113.10 443", install.Stdin, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -638,7 +660,7 @@ public sealed class E2eExecutionTests : IDisposable
         var result = await runtime.ExecuteAsync(artifact, sandbox);
 
         Assert.True(result.Passed);
-        var exec = Assert.Single(sandbox.ExecRequests);
+        var exec = Assert.Single(sandbox.ExecRequests, exec => exec.Argv[0] == "node");
         Assert.Equal(1024 * 1024, exec.MaxStdoutBytes);
     }
 
@@ -718,6 +740,26 @@ public sealed class E2eExecutionTests : IDisposable
 
         Assert.True(E2eReplayArtifactValidation.TryValidate(artifact, out var failureKind, out var detail),
             $"{failureKind}: {detail}");
+    }
+
+    [Fact]
+    public void AdmissionValidator_rejects_unknown_artifact_json_fields()
+    {
+        var validator = new E2eReplayArtifactAdmissionValidator();
+        var json = """
+            {
+              "steps": [
+                { "action": "navigate", "target": "http://app.local/" }
+              ],
+              "unexpectedField": true
+            }
+            """;
+
+        var accepted = validator.TryValidateJson(json, out _, out var failureKind, out var detail);
+
+        Assert.False(accepted);
+        Assert.Equal("ArtifactParseError", failureKind);
+        Assert.Contains("unexpectedField", detail, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -866,6 +908,43 @@ public sealed class E2eExecutionTests : IDisposable
         await foreach (var r in _runs.ListByBatchAsync(batch)) listed.Add(r);
         Assert.Equal(3, listed.Count);
         Assert.All(listed, r => Assert.Equal(batch, r.BatchId));
+    }
+
+    [Fact]
+    public async Task RunStore_batch_counts_cover_every_reported_status()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        var batch = Guid.NewGuid().ToString("N");
+        foreach (var status in new[]
+                 {
+                     E2eRunStatus.Queued,
+                     E2eRunStatus.Running,
+                     E2eRunStatus.Passed,
+                     E2eRunStatus.Failed,
+                     E2eRunStatus.Error,
+                     E2eRunStatus.Canceled,
+                 })
+        {
+            await _runs.CreateAsync(new E2eRun
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                TestCaseId = tcId,
+                Status = status,
+                BatchId = batch,
+            });
+        }
+
+        var counts = await _runs.GetBatchCountsAsync(batch);
+
+        Assert.NotNull(counts);
+        Assert.Equal(6, counts.Total);
+        Assert.Equal(1, counts.Queued);
+        Assert.Equal(1, counts.Running);
+        Assert.Equal(1, counts.Passed);
+        Assert.Equal(1, counts.Failed);
+        Assert.Equal(1, counts.Error);
+        Assert.Equal(1, counts.Canceled);
+        Assert.False(counts.Complete);
     }
 
     [Fact]
@@ -2088,6 +2167,10 @@ public sealed class E2eExecutionTests : IDisposable
                 return Task.FromResult(new SandboxExecResult(127, string.Empty, "empty"));
             if (Programs.TryGetValue(exec.Argv[0], out var handler))
                 return Task.FromResult(handler(ct));
+            if (exec.Argv[0] == "getent" && exec.Argv.Count >= 3 && exec.Argv[1] == "ahosts" && exec.Argv[2] == "app.local")
+                return Task.FromResult(new SandboxExecResult(0, "127.0.0.1 STREAM app.local\n", string.Empty));
+            if (exec.Argv[0] == "sh" && exec.Argv.SequenceEqual(["sh", "-s"]))
+                return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             return Task.FromResult(new SandboxExecResult(127, string.Empty, $"unknown: {exec.Argv[0]}"));
         }
 
@@ -2110,6 +2193,11 @@ public sealed class E2eExecutionTests : IDisposable
 
         public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "getent" && exec.Argv[1] == "ahosts" && exec.Argv[2] == "app.local")
+                return new SandboxExecResult(0, "127.0.0.1 STREAM app.local\n", string.Empty);
+            if (exec.Argv.SequenceEqual(["sh", "-s"]))
+                return new SandboxExecResult(0, string.Empty, string.Empty);
+
             var psi = new ProcessStartInfo(exec.Argv[0])
             {
                 WorkingDirectory = _root,
@@ -2179,7 +2267,7 @@ public sealed class E2eExecutionTests : IDisposable
               };
             }
 
-            function makePage(routes) {
+            function makePage(routes, webSocketRoutes) {
               return pageInstance = {
                 currentUrl: 'about:blank',
                 values: {},
@@ -2203,6 +2291,17 @@ public sealed class E2eExecutionTests : IDisposable
                       if (aborted) throw new Error('request blocked');
                     }
                   }
+                  if (url.includes('/websocket-off-origin')) {
+                    if (webSocketRoutes.length === 0) throw new Error('websocket route missing');
+                    let closed = false;
+                    let connected = false;
+                    await webSocketRoutes[0]({
+                      url: () => 'ws://evil.local/socket',
+                      connectToServer: () => { connected = true; },
+                      close: () => { closed = true; }
+                    });
+                    if (closed && !connected) throw new Error('websocket blocked');
+                  }
                   this.currentUrl = url.includes('/redirect-off-origin') ? 'http://evil.local/' : url;
                 },
                 url() { return this.currentUrl; },
@@ -2216,11 +2315,14 @@ public sealed class E2eExecutionTests : IDisposable
             exports.chromium = {
               async launch() {
                 const routes = [];
+                const webSocketRoutes = [];
                 return {
-                  async newContext() {
+                  async newContext(options) {
+                    if (!options || options.serviceWorkers !== 'block') throw new Error('service workers not blocked');
                     return {
                       async route(_pattern, handler) { routes.push(handler); },
-                      async newPage() { return makePage(routes); }
+                      async routeWebSocket(_pattern, handler) { webSocketRoutes.push(handler); },
+                      async newPage() { return makePage(routes, webSocketRoutes); }
                     };
                   },
                   async close() {}
@@ -2435,6 +2537,8 @@ public sealed class E2eExecutionTests : IDisposable
         {
             if (exec.Argv.Count > 0 && exec.Argv[0] == "getent")
                 return new SandboxExecResult(0, "203.0.113.10 STREAM app.local\n", string.Empty);
+            if (exec.Argv.SequenceEqual(["sh", "-s"]))
+                return new SandboxExecResult(0, string.Empty, string.Empty);
             if (_execDelay > TimeSpan.Zero)
             {
                 try { await Task.Delay(_execDelay, ct); }

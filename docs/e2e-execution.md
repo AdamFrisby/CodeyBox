@@ -38,10 +38,11 @@ TestCase (E2eReplay) ──→ /e2eruns ──→ SqliteE2eRunStore
 |---|---|---|
 | `Enabled` | `false` | Master switch. The dispatcher does NOT drain the queue when off; the REST surface stays available so operators can enqueue ahead of enabling. |
 | `MaxConcurrent` | `4` | Hard upper bound on concurrent leases. Sized for the cheap-CPU cloud quota, NOT for the coding fleet. Hot-reloadable. Floor 1, ceiling 512. |
-| `PoolKind` | `local` | `local` builds an independent development provider from `CodeyBox:SandboxProvider`. `remote-ssh` uses the existing multipass-over-SSH provider for the cheap CPU cloud pool. |
-| `NetworkProfile` | `null` | Logical bridge profile cloned sandboxes attach to (passed through to `SandboxNetworkPolicy.ProfileName`). Use the app-under-test profile that allows only the HTTP service ports the runtime hits. |
+| `PoolKind` | `remote-ssh` | `remote-ssh` uses the existing multipass-over-SSH provider for the cheap CPU cloud pool. `local` builds an independent development provider from `CodeyBox:SandboxProvider` and is development-only. |
+| `NetworkProfile` | `null` | Logical bridge profile cloned sandboxes attach to (passed through to `SandboxNetworkPolicy.ProfileName`). Currently supported by the local development pool; `remote-ssh` rejects it until remote host-side network profiles are implemented. |
 | `SandboxImageReference` | `null` | Falls back to the orchestrator-wide `SandboxImageReference`. Set when the E2E pool runs from a separate pre-baked image carrying the app stack. |
 | `BaselineImageRef` | `null` | Optional content-hashed baseline pin. Mirrors `SandboxSpec.BaselineImageRef`. |
+| `AllowedReadinessOrigins` | `http://app.local`, `https://app.local` | Full replay app-origin allowlist. The readiness URL, navigation targets, HTTP subresources, and WebSocket origins must stay within this set. |
 | `PollInterval` | `00:00:01` | Idle-queue polling cadence. Hot-reloadable. |
 | `PerRunTimeout` | `00:15:00` | Wall-clock cap per replay. The dispatcher cancels and records `Error`/`PerRunTimeout`. |
 
@@ -139,9 +140,12 @@ Persisted as JSON in `TestCase.ExecutableArtifactJson` for cases whose
 ```
 
 The runtime never executes artifact-controlled argv. It validates the JSON
-schema, checks readiness with a fixed bounded `curl`, then invokes the
-pre-baked image's fixed `codeybox-e2e-replay --artifact-json-stdin` driver and
-passes the artifact on stdin. The driver is the trusted component that turns
+schema, checks readiness with a fixed bounded `curl`, resolves allowed app
+origins with `getent`, installs an `iptables`/`ip6tables` egress guard, then
+invokes `node -e` with CodeyBox's embedded Playwright replay script and passes
+the artifact on stdin. The E2E image must therefore include `curl`, `getent`,
+`iptables`, `ip6tables`, `node`, plus the `playwright` module and browser
+dependencies. The embedded driver is the trusted component that turns
 recorded actions/selectors/assertions into deterministic browser/app
 interaction. The brief calls out a cheap-model selector-repair fallback as a
 future addition; this runtime records failure detail but does not repair.

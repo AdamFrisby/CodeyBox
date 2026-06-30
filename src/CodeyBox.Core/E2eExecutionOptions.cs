@@ -58,9 +58,10 @@ public sealed class E2eExecutionOptions
     public string? BaselineImageRef { get; set; }
 
     /// <summary>
-    /// Origins the artifact readiness URL may probe. Values are normalized as
+    /// Full app-origin allowlist for replay traffic. Values are normalized as
     /// URL origins (<c>scheme://host[:port]</c>) and compared exactly before
-    /// any network request is made. Defaults to the conventional app-under-test
+    /// readiness probes, navigation, HTTP subresources, or WebSocket
+    /// connections are allowed. Defaults to the conventional app-under-test
     /// DNS name baked into E2E images; production deployments should override
     /// this with their own app origin(s).
     /// </summary>

@@ -157,6 +157,11 @@ public sealed class SandboxLeakReaper : BackgroundService
             var allManaged = await _provider.ListAllManagedAsync(ct);
             var now = _clock();
             var observedSuspendOrphans = new HashSet<string>();
+            var duplicateNamesWithActiveSnapshot = allManaged
+                .GroupBy(static info => info.Name, StringComparer.Ordinal)
+                .Where(static group => group.Count() > 1 && group.Any(static info => info.IsTrackedActive))
+                .Select(static group => group.Key)
+                .ToHashSet(StringComparer.Ordinal);
 
             // R8-core: any VM named in a work item's SuspendedVmName is being
             // held across an orchestrator restart and MUST NOT be reaped — the
@@ -170,6 +175,9 @@ public sealed class SandboxLeakReaper : BackgroundService
             foreach (var info in allManaged)
             {
                 if (info.IsTrackedActive)
+                    continue;
+
+                if (duplicateNamesWithActiveSnapshot.Contains(info.Name))
                     continue;
 
                 if (suspendedNames.Contains(info.Name))
