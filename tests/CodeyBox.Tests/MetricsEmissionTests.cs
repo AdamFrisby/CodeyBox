@@ -1,6 +1,8 @@
 using System.Diagnostics.Metrics;
 using System.Collections.Concurrent;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -204,6 +206,75 @@ public sealed class MetricsEmissionTests
                 measurement.Value == 800L && measurement.TagValue == "start");
             AssertEventuallyContains(measurements, measurement =>
                 measurement.Value == 200L && measurement.TagValue == "clone");
+        }
+    }
+
+    [Fact]
+    public async Task CoordinatorSqliteWriteGateWait_EmitsFromGateWait()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"cb-metrics-{Guid.NewGuid():N}.db");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.sqlite.write_gate.wait_ms",
+            "outcome");
+        using (listener)
+        using (var gate1 = SqliteDatabaseWriteGate.ForPath(path))
+        using (var gate2 = SqliteDatabaseWriteGate.ForPath(path))
+        {
+            gate1.Wait();
+            var waiter = Task.Run(async () =>
+            {
+                await gate2.WaitAsync();
+                gate2.Release();
+            });
+
+            await Task.Delay(25);
+            gate1.Release();
+            await waiter;
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.TagValue == "acquired");
+        }
+    }
+
+    [Fact]
+    public async Task CoordinatorAgentStreamCaptureDuration_EmitsFromCaptureDispose()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"cb-stream-metrics-{Guid.NewGuid():N}");
+        var path = Path.Combine(dir, "agent.log");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.agent_stream.capture.duration_ms",
+            "phase");
+        using (listener)
+        {
+            var capture = new AgentStreamCapture(path, maxBytes: 1024 * 1024, phase: "work", NullLogger.Instance);
+            capture.WriteChunk("hello\n");
+            await capture.DisposeAsync();
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.TagValue == "work");
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
+    }
+
+    [Fact]
+    public void CoordinatorAgentStreamBackpressureWait_Histogram_EmitsWithOutcomeTag()
+    {
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.agent_stream.backpressure.wait_ms",
+            "outcome");
+        using (listener)
+        {
+            CodeyBoxMeters.CoordinatorAgentStreamBackpressureWait.Record(
+                12,
+                new KeyValuePair<string, object?>("phase", "work"),
+                new KeyValuePair<string, object?>("outcome", "ready"));
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 12L && measurement.TagValue == "ready");
         }
     }
 

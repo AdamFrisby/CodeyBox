@@ -224,7 +224,9 @@ public sealed record MultipassRemoteSandboxOptions
         {
             var host = hosts[i];
             var hostId = string.IsNullOrWhiteSpace(host.Id)
-                ? $"host-{i + 1}"
+                ? (options.ExecutorHosts.Count == 0
+                    ? "default"
+                    : throw new InvalidOperationException($"MultipassRemoteSandbox executor host at index {i} must set a stable Id."))
                 : host.Id.Trim();
             if (!seen.Add(hostId))
                 throw new InvalidOperationException($"Duplicate MultipassRemoteSandbox executor host id '{hostId}'.");
@@ -232,7 +234,7 @@ public sealed record MultipassRemoteSandboxOptions
             resolved.Add(options with
             {
                 HostId = hostId,
-                SshTarget = host.SshTarget ?? options.SshTarget,
+                SshTarget = FirstNonWhiteSpace(host.SshTarget, options.SshTarget),
                 SshBinary = FirstNonWhiteSpace(host.SshBinary, options.SshBinary),
                 SshPort = host.SshPort ?? options.SshPort,
                 SshKeyPath = host.SshKeyPath ?? options.SshKeyPath,

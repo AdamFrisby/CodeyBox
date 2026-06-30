@@ -235,7 +235,14 @@ public sealed class SandboxLeakReaper : BackgroundService
                         : (info.HasPreemptMarker
                             ? SandboxLeakReasons.ExpiredPreemptRetention
                             : SandboxLeakReasons.UntrackedSandbox));
-                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason, info.LifecycleProviderId));
+                leaks.Add(new LeakedSandboxInfo(
+                    info.Name,
+                    createdAt,
+                    age,
+                    info.DiskBytes,
+                    reason,
+                    info.LifecycleProviderId,
+                    info.HostId));
                 AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
                 _ = _webhooks.PublishAsync(new WebhookEvent
                 {
@@ -406,7 +413,8 @@ public sealed class SandboxLeakReaper : BackgroundService
 
     private static bool SameLeak(LeakedSandboxInfo left, LeakedSandboxInfo right) =>
         string.Equals(left.Name, right.Name, StringComparison.Ordinal)
-        && string.Equals(left.LifecycleProviderId, right.LifecycleProviderId, StringComparison.Ordinal);
+        && string.Equals(left.LifecycleProviderId, right.LifecycleProviderId, StringComparison.Ordinal)
+        && string.Equals(left.HostId, right.HostId, StringComparison.Ordinal);
 
     private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
         => new(
@@ -414,7 +422,8 @@ public sealed class SandboxLeakReaper : BackgroundService
             leak.CreatedAt,
             leak.DiskBytes,
             IsTrackedActive: false,
-            LifecycleProviderId: leak.LifecycleProviderId);
+            LifecycleProviderId: leak.LifecycleProviderId,
+            HostId: leak.HostId);
 }
 
 /// <summary>

@@ -135,9 +135,13 @@ public static class CodeyBoxMeters
     public static readonly Histogram<long> CoordinatorGitCommandDuration =
         CoordinatorMeter.CreateHistogram<long>("codeybox.coordinator.git.command.duration_ms", unit: "ms");
 
-    /// <summary>Agent stream capture writer duration. Tags: <c>phase</c>, <c>outcome</c>.</summary>
+    /// <summary>Agent stream capture writer I/O duration. Tags: <c>phase</c>, <c>outcome</c>.</summary>
     public static readonly Histogram<long> CoordinatorAgentStreamCaptureDuration =
         CoordinatorMeter.CreateHistogram<long>("codeybox.coordinator.agent_stream.capture.duration_ms", unit: "ms");
+
+    /// <summary>Agent stream enqueue backpressure wait. Tags: <c>phase</c>, <c>outcome</c>.</summary>
+    public static readonly Histogram<long> CoordinatorAgentStreamBackpressureWait =
+        CoordinatorMeter.CreateHistogram<long>("codeybox.coordinator.agent_stream.backpressure.wait_ms", unit: "ms");
 
     /// <summary>Agent stream bytes dropped by stream-size caps. Tags: <c>phase</c>, <c>reason</c>.</summary>
     public static readonly Counter<long> CoordinatorAgentStreamDroppedBytes =

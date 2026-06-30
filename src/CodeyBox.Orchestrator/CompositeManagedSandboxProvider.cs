@@ -117,7 +117,9 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
         if (!_providersById.TryGetValue(sandbox.LifecycleProviderId, out var provider))
             throw new InvalidOperationException($"Unknown managed sandbox provider '{sandbox.LifecycleProviderId}' for leaked sandbox '{sandbox.Name}'.");
 
-        await provider.Lifecycle.DisposeLeakedAsync(sandbox.Name, ct).ConfigureAwait(false);
+        await provider.Lifecycle.DisposeLeakedAsync(
+            sandbox with { LifecycleProviderId = null },
+            ct).ConfigureAwait(false);
     }
 
     private sealed record ProviderEntry(string Id, IManagedSandboxLifecycle Lifecycle);

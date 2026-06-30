@@ -226,8 +226,10 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
             await provider.CreateAsync(new SandboxSpec { ImageReference = "bogus" }));
+        Assert.Equal("placement", ex.Operation);
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
 
         // Cleanup must have tried to delete the would-be VM.
         Assert.Contains(transport.RecordedCalls, c =>
@@ -555,6 +557,70 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task DisposeAsync_syncback_failure_throws_and_keeps_host_reservation()
+    {
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+        transport.ThrowOnStageOut = true;
+
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var provider = new MultipassRemoteSandboxProvider(
+                opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+            var sb = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+
+            var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+                await sb.DisposeAsync());
+
+            Assert.Equal("sync-back", ex.Operation);
+            Assert.Equal("remote-syncback-failed", ex.ErrorClass);
+            Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+            Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("delete"));
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_delete_failure_throws_and_keeps_host_reservation()
+    {
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
+        var failDelete = false;
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete") && failDelete) return new ProcessRunResult(1, "", "delete failed");
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+        failDelete = true;
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await sb.DisposeAsync());
+
+        Assert.Equal("delete", ex.Operation);
+        Assert.Equal("remote-cleanup-unconfirmed", ex.ErrorClass);
+        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+    }
+
+    [Fact]
     public async Task CreateAsync_throws_SandboxMountSourceMissingException_when_host_path_absent()
     {
         var opts = DefaultOptions();
@@ -658,6 +724,7 @@ public sealed class MultipassRemoteSandboxProviderTests
         public List<RecordedCall> RecordedCalls { get; } = new();
         public List<StageInCall> StageInCalls { get; } = new();
         public List<StageOutCall> StageOutCalls { get; } = new();
+        public bool ThrowOnStageOut { get; set; }
         public Func<IReadOnlyList<string>, StreamSinks, ProcessRunResult> OnRun { get; set; } =
             (_, _) => new ProcessRunResult(0, "", "");
 
@@ -673,6 +740,8 @@ public sealed class MultipassRemoteSandboxProviderTests
             RecordedCallsQueue.Enqueue(call);
             var sinks = new StreamSinks(stdoutChunkCallback, stderrChunkCallback);
             var result = OnRun(argv, sinks);
+            if (Contains(argv, "list") && result.ExitCode == 0 && string.IsNullOrWhiteSpace(result.Stdout))
+                result = new ProcessRunResult(0, "{\"list\":[]}", result.Stderr);
             return Task.FromResult(result);
         }
 
@@ -684,6 +753,8 @@ public sealed class MultipassRemoteSandboxProviderTests
 
         public Task StageOutAsync(string remotePath, string hostPath, CancellationToken ct)
         {
+            if (ThrowOnStageOut)
+                throw new RemoteSshTransportException("stage-out failed");
             StageOutCalls.Add(new StageOutCall(remotePath, hostPath));
             return Task.CompletedTask;
         }

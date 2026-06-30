@@ -1393,7 +1393,7 @@ public sealed class LocalGitHost : IGitHost
         IReadOnlyDictionary<string, string>? extraEnv,
         params string[] args)
     {
-        var operation = args.Length == 0 ? "(none)" : args[0];
+        var operation = ResolveGitOperation(args);
         var sw = Stopwatch.StartNew();
         SanitizeAlternates(workdir);
         var psi = new ProcessStartInfo
@@ -1451,6 +1451,25 @@ public sealed class LocalGitHost : IGitHost
             sw.ElapsedMilliseconds,
             new KeyValuePair<string, object?>("operation", operation),
             new KeyValuePair<string, object?>("outcome", outcome));
+
+    private static string ResolveGitOperation(IReadOnlyList<string> args)
+    {
+        for (var i = 0; i < args.Count; i++)
+        {
+            if (args[i] == "-c" && i + 1 < args.Count)
+            {
+                i++;
+                continue;
+            }
+
+            if (args[i].StartsWith("-", StringComparison.Ordinal))
+                continue;
+
+            return args[i];
+        }
+
+        return args.Count == 0 ? "(none)" : args[0];
+    }
 
     private static bool IsTextFileBusy(Win32Exception ex)
         => ex.NativeErrorCode == PosixTextFileBusyErrno

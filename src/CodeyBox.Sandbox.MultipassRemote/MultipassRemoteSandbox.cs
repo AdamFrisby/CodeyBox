@@ -32,7 +32,9 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
     private readonly Action<RemoteSshTransportException> _onTransportFailure;
     private readonly Action<string> _onDispose;
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> _activeExecCts = new();
+    private readonly SemaphoreSlim _disposeLock = new(1, 1);
     private int _disposed; // 0/1 via Interlocked
+    private int _cleanupComplete;
 
     public MultipassRemoteSandbox(
         string vmName,
@@ -62,6 +64,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
 
     public string Id { get; }
     public string HostId { get; }
+    internal bool IsTrackedActive => Volatile.Read(ref _disposed) == 0;
     internal MultipassRemoteSandboxOptions HostOptions => _opts;
     internal IRemoteHostTransport Transport => _transport;
 
@@ -210,101 +213,131 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
 
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        if (Volatile.Read(ref _cleanupComplete) != 0)
+            return;
 
-        var opts = _opts;
-        var vmName = Id;
-
-        // 1) Try to cleanly stop the VM so background processes flush.
+        await _disposeLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
-            var stop = await _runRemoteMaybeGated(
-                [opts.RemoteMultipassPath, "stop", "--time", "0", vmName],
-                CancellationToken.None).ConfigureAwait(false);
-            if (stop.ExitCode != 0)
-            {
-                _log.LogWarning(
-                    "Remote VM {Vm} stop exited {ExitCode} during dispose: {Detail}",
-                    vmName,
-                    stop.ExitCode,
-                    stop.Stderr);
-            }
-        }
-        catch (RemoteSshTransportException ex)
-        {
-            _onTransportFailure(ex);
-            _log.LogWarning(ex, "Remote VM {Vm} stop failed during dispose (transport)", vmName);
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Remote VM {Vm} stop failed during dispose", vmName);
-        }
+            if (Volatile.Read(ref _cleanupComplete) != 0)
+                return;
 
-        // 2) Sync writable mounts back to the orchestrator host BEFORE we
-        //    delete the staged copy. A failed sync here is logged but does
-        //    not block deletion — the merge phase will report missing
-        //    artifacts upstream.
-        foreach (var mount in _stagedMounts)
-        {
-            if (mount.SyncBackHostPath is not { } hostPath) continue;
-            if (string.IsNullOrWhiteSpace(hostPath)) continue;
+            Volatile.Write(ref _disposed, 1);
+
+            var opts = _opts;
+            var vmName = Id;
+
+            // 1) Try to cleanly stop the VM so background processes flush.
             try
             {
-                await _transport.StageOutAsync(mount.RemoteStagedPath, hostPath, CancellationToken.None).ConfigureAwait(false);
+                var stop = await _runRemoteMaybeGated(
+                    [opts.RemoteMultipassPath, "stop", "--time", "0", vmName],
+                    CancellationToken.None).ConfigureAwait(false);
+                if (stop.ExitCode != 0)
+                {
+                    _log.LogWarning(
+                        "Remote VM {Vm} stop returned exit {ExitCode} during dispose: {Stderr}",
+                        vmName,
+                        stop.ExitCode,
+                        TruncateForLog(stop.Stderr));
+                }
             }
             catch (RemoteSshTransportException ex)
             {
                 _onTransportFailure(ex);
-                _log.LogWarning(ex,
-                    "Sync-back from remote {Remote} to host {Host} failed (transport)",
-                    mount.RemoteStagedPath, hostPath);
+                _log.LogWarning(ex, "Remote VM {Vm} stop failed during dispose (transport)", vmName);
             }
             catch (Exception ex)
             {
-                _log.LogWarning(ex,
-                    "Sync-back from remote {Remote} to host {Host} failed",
-                    mount.RemoteStagedPath, hostPath);
+                _log.LogWarning(ex, "Remote VM {Vm} stop failed during dispose", vmName);
             }
-        }
 
-        // 3) Delete VM + staging dir.
-        try
-        {
-            var delete = await _runRemoteMaybeGated(
-                [opts.RemoteMultipassPath, "delete", "--purge", vmName],
-                CancellationToken.None).ConfigureAwait(false);
-            if (delete.ExitCode != 0)
+            // 2) Sync writable mounts back to the orchestrator host BEFORE we
+            //    delete the staged copy. If this fails, keep the remote staged
+            //    data intact and surface infrastructure deferral to the caller.
+            foreach (var mount in _stagedMounts)
             {
-                _log.LogWarning(
-                    "Remote VM {Vm} delete exited {ExitCode} during dispose: {Detail}",
-                    vmName,
-                    delete.ExitCode,
-                    delete.Stderr);
+                if (mount.SyncBackHostPath is not { } hostPath) continue;
+                if (string.IsNullOrWhiteSpace(hostPath)) continue;
+                try
+                {
+                    await _transport.StageOutAsync(mount.RemoteStagedPath, hostPath, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (RemoteSshTransportException ex)
+                {
+                    _onTransportFailure(ex);
+                    _log.LogWarning(ex,
+                        "Sync-back from remote {Remote} to host {Host} failed (transport)",
+                        mount.RemoteStagedPath, hostPath);
+                    throw BuildDisposeDeferred("sync-back", "remote-syncback-failed", ex);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "Sync-back from remote {Remote} to host {Host} failed",
+                        mount.RemoteStagedPath, hostPath);
+                    throw BuildDisposeDeferred("sync-back", "remote-syncback-failed", ex);
+                }
             }
+
+            // 3) Delete VM + staging dir. Both exit codes matter: if either
+            //    cleanup step cannot be confirmed, keep the host reservation.
+            await RunCleanupCommandAsync(
+                [opts.RemoteMultipassPath, "delete", "--purge", vmName],
+                "delete",
+                vmName).ConfigureAwait(false);
+            await RunCleanupCommandAsync(
+                ["rm", "-rf", _remoteSandboxRoot],
+                "staging-cleanup",
+                vmName).ConfigureAwait(false);
+
+            SandboxLiveCounter.Decrement();
+            Volatile.Write(ref _cleanupComplete, 1);
+            _onDispose(vmName);
         }
-        catch (Exception ex)
+        finally
         {
-            if (ex is RemoteSshTransportException transportEx)
-                _onTransportFailure(transportEx);
-            _log.LogWarning(ex, "Remote VM {Vm} delete failed during dispose", vmName);
+            _disposeLock.Release();
         }
+    }
+
+    private async Task RunCleanupCommandAsync(IReadOnlyList<string> argv, string operation, string vmName)
+    {
         try
         {
-            await _transport.RunAsync(
-                ["rm", "-rf", _remoteSandboxRoot],
-                stdin: null,
-                ct: CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            if (ex is RemoteSshTransportException transportEx)
-                _onTransportFailure(transportEx);
-            _log.LogWarning(ex, "Remote staging dir {Dir} cleanup failed during dispose", _remoteSandboxRoot);
-        }
+            var result = await _runRemoteMaybeGated(
+                argv,
+                CancellationToken.None).ConfigureAwait(false);
+            if (result.ExitCode == 0)
+                return;
 
-        SandboxLiveCounter.Decrement();
-        _onDispose(vmName);
+            var ex = new RemoteHostProvisioningException(
+                HostId,
+                operation,
+                $"Remote cleanup command '{operation}' for VM '{vmName}' exited {result.ExitCode}: {TruncateForLog(result.Stderr)}");
+            _log.LogWarning(ex, "Remote VM {Vm} cleanup operation {Operation} failed", vmName, operation);
+            throw BuildDisposeDeferred(operation, "remote-cleanup-unconfirmed", ex);
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            _onTransportFailure(ex);
+            _log.LogWarning(ex, "Remote VM {Vm} cleanup operation {Operation} failed (transport)", vmName, operation);
+            throw BuildDisposeDeferred(operation, "remote-host-unreachable", ex);
+        }
     }
+
+    private SandboxProvisioningDeferredException BuildDisposeDeferred(
+        string operation,
+        string errorClass,
+        Exception inner) =>
+        new(
+            provider: "multipass-remote",
+            operation: operation,
+            errorClass: errorClass,
+            detail: $"host={HostId}; vm={Id}; {inner.Message}",
+            recheckIn: _opts.PlacementRecheckIn,
+            retainedSandboxName: Id,
+            innerException: inner);
 
     private static string QuoteArgvForShell(IReadOnlyList<string> argv)
     {
@@ -348,5 +381,13 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
             i += charCount;
         }
         return s;
+    }
+
+    private static string TruncateForLog(string s, int max = 200)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var trimmed = s.Trim();
+        if (trimmed.Length <= max) return trimmed;
+        return trimmed[..max] + "...";
     }
 }

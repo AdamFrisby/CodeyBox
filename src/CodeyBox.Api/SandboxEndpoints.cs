@@ -151,6 +151,8 @@ internal static class SandboxEndpoints
         ageMinutes = Math.Round(l.Age.TotalMinutes, 1),
         diskMb = l.DiskBytes.HasValue ? l.DiskBytes.Value / (1024 * 1024) : (long?)null,
         reason = l.Reason,
+        lifecycleProviderId = l.LifecycleProviderId,
+        hostId = l.HostId,
     };
 
     private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
@@ -159,5 +161,6 @@ internal static class SandboxEndpoints
             leak.CreatedAt,
             leak.DiskBytes,
             IsTrackedActive: false,
-            LifecycleProviderId: leak.LifecycleProviderId);
+            LifecycleProviderId: leak.LifecycleProviderId,
+            HostId: leak.HostId);
 }

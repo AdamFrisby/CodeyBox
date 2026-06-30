@@ -321,9 +321,17 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
 
     private static void ValidateMultipassRemote(CodeyBoxOptions options, List<string> failures)
     {
+        var providerIsRemote = string.Equals(
+            options.SandboxProvider?.Trim(),
+            "multipass-remote",
+            StringComparison.OrdinalIgnoreCase);
         var cfg = options.MultipassRemoteSandbox;
         if (cfg is null)
+        {
+            if (providerIsRemote)
+                failures.Add("CodeyBox:MultipassRemoteSandbox section is required when SandboxProvider=multipass-remote");
             return;
+        }
 
         if (cfg.MaxConcurrentSandboxes is <= 0)
             failures.Add("CodeyBox:MultipassRemoteSandbox:MaxConcurrentSandboxes must be > 0 when set");
@@ -332,10 +340,6 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         if (cfg.RuntimeUnhealthyBackoff is { } backoff && backoff <= TimeSpan.Zero)
             failures.Add("CodeyBox:MultipassRemoteSandbox:RuntimeUnhealthyBackoff must be positive when set");
 
-        var providerIsRemote = string.Equals(
-            options.SandboxProvider?.Trim(),
-            "multipass-remote",
-            StringComparison.OrdinalIgnoreCase);
         var hasTopLevelTarget = !string.IsNullOrWhiteSpace(cfg.SshTarget);
         var hosts = cfg.ExecutorHosts ?? [];
         if (providerIsRemote && hosts.Count == 0 && !hasTopLevelTarget)
@@ -346,6 +350,8 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             var host = hosts[i];
             var prefix = $"CodeyBox:MultipassRemoteSandbox:ExecutorHosts:{i}";
+            if (string.IsNullOrWhiteSpace(host.Id))
+                failures.Add($"{prefix}:Id is required and must be stable across hot reloads");
             if (!string.IsNullOrWhiteSpace(host.Id) && !ids.Add(host.Id.Trim()))
                 failures.Add($"{prefix}:Id duplicates another executor host id ('{host.Id.Trim()}')");
             if (providerIsRemote && !hasTopLevelTarget && string.IsNullOrWhiteSpace(host.SshTarget))

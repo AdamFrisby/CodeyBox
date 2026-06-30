@@ -383,7 +383,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
     private readonly ILogger _log;
     private readonly Channel<string> _chunks;
     private readonly Task _worker;
-    private readonly Stopwatch _duration = Stopwatch.StartNew();
+    private long _writerDurationMs;
     private long _enqueueDroppedBytes;
     private int _enqueueTruncated;
     private int _writerFailed;
@@ -467,21 +467,39 @@ public sealed class AgentStreamCapture : IAsyncDisposable
 
             try
             {
-                if (!_chunks.Writer.WaitToWriteAsync().AsTask().GetAwaiter().GetResult())
+                var sw = Stopwatch.StartNew();
+                var canWrite = _chunks.Writer.WaitToWriteAsync().AsTask().GetAwaiter().GetResult();
+                CodeyBoxMeters.CoordinatorAgentStreamBackpressureWait.Record(
+                    sw.ElapsedMilliseconds,
+                    new KeyValuePair<string, object?>("phase", _phase),
+                    new KeyValuePair<string, object?>("outcome", canWrite ? "ready" : "closed"));
+                if (!canWrite)
                     return false;
             }
             catch (ChannelClosedException)
             {
+                CodeyBoxMeters.CoordinatorAgentStreamBackpressureWait.Record(
+                    0,
+                    new KeyValuePair<string, object?>("phase", _phase),
+                    new KeyValuePair<string, object?>("outcome", "closed"));
                 return false;
             }
             catch (InvalidOperationException ex)
             {
                 _log.LogWarning(ex, "Failed to enqueue agent stream chunk for {Path}", _path);
+                CodeyBoxMeters.CoordinatorAgentStreamBackpressureWait.Record(
+                    0,
+                    new KeyValuePair<string, object?>("phase", _phase),
+                    new KeyValuePair<string, object?>("outcome", "error"));
                 return false;
             }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "Failed to enqueue agent stream chunk for {Path}", _path);
+                CodeyBoxMeters.CoordinatorAgentStreamBackpressureWait.Record(
+                    0,
+                    new KeyValuePair<string, object?>("phase", _phase),
+                    new KeyValuePair<string, object?>("outcome", "error"));
                 return false;
             }
         }
@@ -507,7 +525,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
                     ? "truncated"
                     : "completed";
             CodeyBoxMeters.CoordinatorAgentStreamCaptureDuration.Record(
-                _duration.ElapsedMilliseconds,
+                Interlocked.Read(ref _writerDurationMs),
                 new KeyValuePair<string, object?>("phase", _phase),
                 new KeyValuePair<string, object?>("outcome", outcome));
         }
@@ -546,6 +564,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
 
         await foreach (var chunk in _chunks.Reader.ReadAllAsync().ConfigureAwait(false))
         {
+            var sw = Stopwatch.StartNew();
             DrainChunk(
                 chunk,
                 writer,
@@ -558,10 +577,12 @@ public sealed class AgentStreamCapture : IAsyncDisposable
                 ref bytesWritten,
                 ref droppedBytes,
                 ref truncated);
+            Interlocked.Add(ref _writerDurationMs, sw.ElapsedMilliseconds);
         }
 
         if (buffer.Length > 0)
         {
+            var sw = Stopwatch.StartNew();
             WriteLine(
                 buffer.ToString(),
                 bufferBytes,
@@ -575,6 +596,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
                 ref truncated);
             buffer.Clear();
             bufferBytes = 0;
+            Interlocked.Add(ref _writerDurationMs, sw.ElapsedMilliseconds);
         }
 
         var enqueueDroppedBytes = Interlocked.Read(ref _enqueueDroppedBytes);
@@ -601,7 +623,9 @@ public sealed class AgentStreamCapture : IAsyncDisposable
             bytesWritten += pendingTailBytes;
         }
 
+        var flush = Stopwatch.StartNew();
         await writer.FlushAsync().ConfigureAwait(false);
+        Interlocked.Add(ref _writerDurationMs, flush.ElapsedMilliseconds);
     }
 
     private void DrainChunk(

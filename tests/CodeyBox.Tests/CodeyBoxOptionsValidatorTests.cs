@@ -1133,6 +1133,145 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains(scenario, result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsMissingMultipassRemoteSectionWhenProviderSelected()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass-remote";
+        options.MultipassRemoteSandbox = null;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:MultipassRemoteSandbox section is required", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsInvalidMultipassRemotePoolFields()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass-remote";
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            PlacementRecheckIn = TimeSpan.Zero,
+            RuntimeUnhealthyBackoff = TimeSpan.FromSeconds(-1),
+            ExecutorHosts =
+            [
+                new MultipassRemoteExecutorHostConfig
+                {
+                    Id = "",
+                    MaxConcurrentSandboxes = 0,
+                    ServerAliveIntervalSeconds = 0,
+                    ServerAliveCountMax = -1,
+                    ConnectTimeoutSeconds = 0,
+                    VmStartTimeout = TimeSpan.Zero,
+                    VmStopTimeout = TimeSpan.Zero,
+                    VmStateCheckInterval = TimeSpan.Zero,
+                },
+            ],
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("PlacementRecheckIn must be positive", result.FailureMessage);
+        Assert.Contains("RuntimeUnhealthyBackoff must be positive", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:Id is required", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:SshTarget is required", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:MaxConcurrentSandboxes must be > 0", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:ServerAliveIntervalSeconds must be > 0", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:ServerAliveCountMax must be > 0", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:ConnectTimeoutSeconds must be > 0", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:VmStartTimeout must be positive", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:VmStopTimeout must be positive", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:VmStateCheckInterval must be positive", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AllowsBlankHostSshTargetWhenTopLevelTargetIsConfigured()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass-remote";
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = "ubuntu@default",
+            ExecutorHosts =
+            [
+                new MultipassRemoteExecutorHostConfig { Id = "a", SshTarget = "   ", MaxConcurrentSandboxes = 1 },
+            ],
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Fact]
+    public void MultipassRemoteOptionsMapper_maps_executor_hosts_from_bound_config()
+    {
+        var cfg = new MultipassRemoteSandboxConfig
+        {
+            SshTarget = "ubuntu@default",
+            SshBinary = "/usr/bin/ssh",
+            PlacementRecheckIn = TimeSpan.FromSeconds(7),
+            RuntimeUnhealthyBackoff = TimeSpan.FromSeconds(8),
+            ExecutorHosts =
+            [
+                new MultipassRemoteExecutorHostConfig
+                {
+                    Id = "a",
+                    SshTarget = "ubuntu@a",
+                    SshBinary = "/custom/ssh",
+                    SshPort = 2201,
+                    SshKeyPath = "/keys/a",
+                    ExtraSshOptions = ["BatchMode=yes"],
+                    AcceptUnknownHostKeys = true,
+                    ServerAliveIntervalSeconds = 11,
+                    ServerAliveCountMax = 12,
+                    ConnectTimeoutSeconds = 13,
+                    LocalTarBinary = "/bin/tar",
+                    RemoteMultipassPath = "/usr/bin/multipass",
+                    RemoteStagingRoot = "/stage/a",
+                    DefaultImage = "24.04",
+                    VmStartTimeout = TimeSpan.FromSeconds(14),
+                    VmStopTimeout = TimeSpan.FromSeconds(15),
+                    VmStateCheckInterval = TimeSpan.FromSeconds(16),
+                    VmNamePrefix = "cb-a-",
+                    MaxConcurrentSandboxes = 2,
+                    Cordoned = true,
+                    Healthy = false,
+                    AllowedNetworkProfiles = ["work", "audit"],
+                },
+            ],
+        };
+
+        var mapped = MultipassRemoteOptionsMapper.Map(cfg);
+        var host = Assert.Single(mapped.ExecutorHosts);
+
+        Assert.Equal("a", host.Id);
+        Assert.Equal("ubuntu@a", host.SshTarget);
+        Assert.Equal("/custom/ssh", host.SshBinary);
+        Assert.Equal(2201, host.SshPort);
+        Assert.Equal("/keys/a", host.SshKeyPath);
+        Assert.Equal(["BatchMode=yes"], host.ExtraSshOptions);
+        Assert.True(host.AcceptUnknownHostKeys);
+        Assert.Equal(11, host.ServerAliveIntervalSeconds);
+        Assert.Equal(12, host.ServerAliveCountMax);
+        Assert.Equal(13, host.ConnectTimeoutSeconds);
+        Assert.Equal("/bin/tar", host.LocalTarBinary);
+        Assert.Equal("/usr/bin/multipass", host.RemoteMultipassPath);
+        Assert.Equal("/stage/a", host.RemoteStagingRoot);
+        Assert.Equal("24.04", host.DefaultImage);
+        Assert.Equal(TimeSpan.FromSeconds(14), host.VmStartTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(15), host.VmStopTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(16), host.VmStateCheckInterval);
+        Assert.Equal("cb-a-", host.VmNamePrefix);
+        Assert.Equal(2, host.MaxConcurrentSandboxes);
+        Assert.True(host.Cordoned);
+        Assert.False(host.Healthy);
+        Assert.Equal(["work", "audit"], host.AllowedNetworkProfiles);
+    }
+
     // ----- Enabled remote-ssh E2E: BaselineImageRef + fail-closed DNS -----
 
     [Fact]

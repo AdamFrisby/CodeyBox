@@ -41,12 +41,13 @@ public interface IManagedSandboxLifecycle
 
     /// <summary>
     /// Best-effort dispose of the exact sandbox snapshot returned by
-    /// <see cref="ListAllManagedAsync"/>. Composite lifecycle views use the
-    /// snapshot metadata to route disposal back to the lifecycle that reported
-    /// the sandbox instead of broadcasting a name across every provider.
+    /// <see cref="ListAllManagedAsync"/>. Composite lifecycle views use
+    /// provider metadata to route disposal back to the lifecycle that reported
+    /// the sandbox; multi-host providers use executor metadata to target the
+    /// owning host instead of rediscovering by name across a host pool.
     /// </summary>
-    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
-        => DisposeLeakedAsync(sandbox.Name, ct);
+    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct) =>
+        DisposeLeakedAsync(sandbox.Name, ct);
 }
 
 /// <summary>
@@ -136,6 +137,10 @@ public interface IResourceMetricsCapturingProvider
 /// snapshot. Plain providers leave this null; composite lifecycle views fill it
 /// so later cleanup can target the reporting provider only.
 /// </param>
+/// <param name="HostId">
+/// Provider-specific executor identity for multi-host providers. Null for
+/// providers where the sandbox name alone is sufficient.
+/// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
     DateTimeOffset? CreatedAt,
@@ -143,7 +148,8 @@ public sealed record ManagedSandboxInfo(
     bool IsTrackedActive,
     bool HasPreemptMarker = false,
     bool IsSuspendLifecycleOrFrozen = false,
-    string? LifecycleProviderId = null);
+    string? LifecycleProviderId = null,
+    string? HostId = null);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable
