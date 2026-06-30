@@ -7,6 +7,9 @@ namespace CodeyBox.Cli.Commands;
 
 internal static class QueuePrompt
 {
+    private const int MaxPromptLength = 64 * 1024;
+    private const string PromptLimitLabel = "64 KB";
+
     internal static Command Build(
         Option<string?> apiUrlOpt,
         Option<string?> apiKeyOpt,
@@ -15,13 +18,16 @@ internal static class QueuePrompt
         var cmd = new Command("prompt", "Update the prompt of a work item");
 
         var idArg = new Argument<string>("id", "Work item ID");
-        var promptOpt = new Option<string?>("--prompt", "Inline prompt text");
+        var textArg = new Argument<string?>("text", () => null, "Prompt text")
+        {
+            Arity = ArgumentArity.ZeroOrOne,
+        };
         var promptFileOpt = new Option<string?>("--prompt-file", "Path to prompt file, or '-' for stdin");
         var quietOpt = new Option<bool>("--quiet", "Print only the new prompt revision");
         var jsonOpt = new Option<bool>("--json", "Print raw JSON response");
 
         cmd.AddArgument(idArg);
-        cmd.AddOption(promptOpt);
+        cmd.AddArgument(textArg);
         cmd.AddOption(promptFileOpt);
         cmd.AddOption(quietOpt);
         cmd.AddOption(jsonOpt);
@@ -31,16 +37,21 @@ internal static class QueuePrompt
             var ct = ctx.GetCancellationToken();
 
             var id = ctx.ParseResult.GetValueForArgument(idArg);
-            var promptText = ctx.ParseResult.GetValueForOption(promptOpt);
+            var promptText = ctx.ParseResult.GetValueForArgument(textArg);
             var promptFile = ctx.ParseResult.GetValueForOption(promptFileOpt);
             var quiet = ctx.ParseResult.GetValueForOption(quietOpt);
             var json = ctx.ParseResult.GetValueForOption(jsonOpt);
             var flagUrl = ctx.ParseResult.GetValueForOption(apiUrlOpt);
             var flagKey = ctx.ParseResult.GetValueForOption(apiKeyOpt);
 
-            const int MaxPromptLength = 10 * 1024 * 1024; // 10 MB character cap
-
             string? prompt;
+            if (promptText is not null && promptFile is not null)
+            {
+                await Console.Error.WriteLineAsync("Error: provide either prompt text or --prompt-file, not both.");
+                ctx.ExitCode = 1;
+                return;
+            }
+
             if (promptFile is not null)
             {
                 string? cappedText;
@@ -57,7 +68,8 @@ internal static class QueuePrompt
 
                 if (cappedText is null)
                 {
-                    await Console.Error.WriteLineAsync("Error: prompt exceeds 10 MB limit. Use a smaller file.");
+                    await Console.Error.WriteLineAsync(
+                        $"Error: prompt exceeds {PromptLimitLabel} limit. Use a smaller prompt.");
                     ctx.ExitCode = 1;
                     return;
                 }
@@ -70,7 +82,21 @@ internal static class QueuePrompt
             }
             else
             {
-                await Console.Error.WriteLineAsync("Error: provide --prompt or --prompt-file.");
+                var cappedText = await ReadCappedAsync(Console.In, MaxPromptLength, ct);
+                if (cappedText is null)
+                {
+                    await Console.Error.WriteLineAsync(
+                        $"Error: prompt exceeds {PromptLimitLabel} limit. Use a smaller prompt.");
+                    ctx.ExitCode = 1;
+                    return;
+                }
+
+                prompt = cappedText;
+            }
+
+            if (string.IsNullOrEmpty(prompt))
+            {
+                await Console.Error.WriteLineAsync("Error: prompt is required. Provide text, --prompt-file, or pipe stdin.");
                 ctx.ExitCode = 1;
                 return;
             }
@@ -98,11 +124,12 @@ internal static class QueuePrompt
 
                 using var doc = JsonDocument.Parse(raw);
                 var root = doc.RootElement;
-                
-                int revision = 0;
-                if (root.TryGetProperty("promptRevision", out var revProp) && revProp.ValueKind == JsonValueKind.Number)
+
+                if (!TryGetInt32(root, "promptRevision", out var revision))
                 {
-                    revision = revProp.GetInt32();
+                    await Console.Error.WriteLineAsync("Error: response missing numeric promptRevision.");
+                    ctx.ExitCode = 1;
+                    return;
                 }
 
                 if (quiet)
@@ -127,6 +154,14 @@ internal static class QueuePrompt
         });
 
         return cmd;
+    }
+
+    private static bool TryGetInt32(JsonElement root, string propertyName, out int value)
+    {
+        value = 0;
+        return root.TryGetProperty(propertyName, out var prop)
+            && prop.ValueKind == JsonValueKind.Number
+            && prop.TryGetInt32(out value);
     }
 
     private static async Task<string?> ReadCappedAsync(TextReader reader, int maxLength, CancellationToken ct)

@@ -17,7 +17,6 @@ tooling, not in the agent runner contract.
 | `cursor`    | `agent`           | `CODEYBOX_CURSOR_AUTH_JSON` (subscription credentials JSON) | `CODEYBOX_CURSOR_AUTH_FILE` (file path on host) |
 | `opencode`  | `opencode`        | `OPENCODE_AUTH_JSON` (file-materialised) | `CODEYBOX_OPENCODE_AUTH_FILE` |
 | `antigravity` | `agy`           | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` (OAuth credentials JSON, file-materialised to `~/.agy/oauth_creds.json`) | `CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN` (raw access token fallback) |
-| `crock`     | `crock`           | `CROCK_CONFIG_JSON` (JSON config file-materialised) | `CODEYBOX_CROCK_CONFIG_JSON` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side env
 name is what the orchestrator's `EnvironmentCredentialProvider` looks up
@@ -41,9 +40,8 @@ the most common cause of fresh-class dispatch failures.
 | `codex`   | `npm install -g @openai/codex` | Reuses the Node.js stack from Claude. |
 | `gemini`  | `npm install -g @google/gemini-cli` | `ReasoningMode` is **not** wired into argv — Gemini's reasoning level is encoded in `ModelId` (pick a `gemini-3-*-preview` model for HIGH). See [Gemini quirks](#google-gemini-cli-googlegemini-cli). |
 | `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). See [Cursor quirks](#cursor-cli-agent). |
-| `opencode` | `npm install -g opencode` or `curl -fsSL https://opencode.ai/install \| bash` | Installs the `opencode` CLI. Dedicated subscription credential bundle. See [Opencode quirks](#opencode-cli-sstopencode). |
+| `opencode` | *not yet integrated in this repo — no `IAgentRunner` for opencode has shipped.* Operators tracking the integration can pre-stage with `curl -fsSL https://opencode.ai/install \| bash`, but the orchestrator will not route work to it until a runner is registered. | Listed for doc parity with the install-checklist; **does not** imply opencode is dispatchable today. |
 | `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it into the baseline via `CodeyBox:MultipassExecutableProvisions`* (see [Antigravity quirks](#google-antigravity-cli-agy)). The previously documented `curl -fsSL https://antigravity.google/cli/install.sh \| bash` URL no longer serves a shell script (returns HTML as of 2026-06-17); piping HTML into `bash` fails silently if the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
-| `crock`   | *operator-supplied — stage the `crock` binary on the host and ship it into the baseline via `CodeyBox:MultipassExecutableProvisions`* (see [Crock quirks](#crock-cli-crock)) | Installs the `crock` CLI on the sandbox PATH. Heads-up: drives tasks asynchronously via Anthropic's Message Batches API, and needs both a tunnel and config to be provisioned before enabling. |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. After updating
@@ -868,22 +866,6 @@ variant has its own canonical `--model` string), so
 `AgentMembership.ReasoningMode` is informational only on this runner —
 the same shape Gemini uses.
 
-### Crock CLI (`crock`)
-
-Crock is an asynchronous, headless C# coding agent that runs tasks against Anthropic's Message Batches API. Because tasks are run asynchronously on Anthropic's side, the runner uses a submit-then-poll workflow.
-
-**Binary name:** `crock`.
-
-**Install in the sandbox image:** Stage a vetted copy of the `crock` binary on the host and ship it into the baseline via `CodeyBox:MultipassExecutableProvisions` (same shape as Antigravity).
-
-**Auth setup:** The agent uses a JSON configuration file. Set the `CODEYBOX_CROCK_CONFIG_JSON` environment variable on the orchestrator host to the JSON content of your Crock configuration. The orchestrator maps this to `CROCK_CONFIG_JSON` inside the sandbox, and `CrockAgentRunner` materialises it as `~/.crockcode/config.json` inside the VM.
-
-**Non-interactive invocation:** `crock submit -p "<prompt>"` (with the prompt on stdin to avoid the 128 KiB `MAX_ARG_STRLEN` ceiling), followed by periodic polling using `crock status -- <task-id>`.
-
-**Quota probe:** `CrockQuotaProbe` always returns `UnknownPermanent` (permanent unknown) because there is no programmatic quota/usage endpoint for the batches path. Quota gating is driven by the router's observed failures.
-
-**Smoke probe:** `CrockSmokeProbe` performs a host-side credential-presence check verifying that `CROCK_CONFIG_JSON` is populated. The in-VM `CrockInVmSmokeProbe` performs binary verification (`crock --version`) and materialises the config to run `crock doctor` inside the sandbox.
-
 ## Credential smoke test
 
 Before spending sandbox resources on a work item, CodeyBox performs a
@@ -912,7 +894,6 @@ credentials before they waste expensive compute.
 | `copilot` | *(no probe)* — always passes | — |
 | `cursor` | *(no HTTP probe — Cursor exposes no public usage endpoint)* — verifies the credential bundle carries `CODEYBOX_CURSOR_AUTH_JSON`; real auth check happens on first CLI call | — |
 | `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` |
-| `crock` | *(no network call)* — credential-presence check only | `CROCK_CONFIG_JSON` |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.

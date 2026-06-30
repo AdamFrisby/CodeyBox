@@ -1011,10 +1011,6 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // when an operator wants to inject the JSON directly via env var
         // without an on-host credential file.
         new AgentCredentialMapping(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON", "CODEYBOX_CURSOR_AUTH_JSON"),
-        // Crock: the CLI uses a JSON configuration file. The orchestrator ships
-        // its contents via CODEYBOX_CROCK_CONFIG_JSON and CrockAgentRunner materialises
-        // it inside the VM before submitting tasks.
-        new AgentCredentialMapping(AgentKind.Crock, "CODEYBOX_CROCK_CONFIG_JSON", CrockAgentRunner.ConfigEnvVar),
         // Note: no OPENCODE_API_KEY mapping. The opencode subscription IS the
         // credential path; auth flows exclusively through the auth.json file
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
@@ -1502,9 +1498,6 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new OpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
-builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
-    new CrockSmokeProbe(
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CrockSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.

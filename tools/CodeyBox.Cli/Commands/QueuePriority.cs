@@ -59,10 +59,11 @@ internal static class QueuePriority
                 using var doc = JsonDocument.Parse(raw);
                 var root = doc.RootElement;
 
-                int actualPriority = priority;
-                if (root.TryGetProperty("priority", out var priProp) && priProp.ValueKind == JsonValueKind.Number)
+                if (!TryGetInt32(root, "priority", out var actualPriority))
                 {
-                    actualPriority = priProp.GetInt32();
+                    await Console.Error.WriteLineAsync("Error: response missing numeric priority.");
+                    ctx.ExitCode = 1;
+                    return;
                 }
 
                 if (quiet)
@@ -87,5 +88,13 @@ internal static class QueuePriority
         });
 
         return cmd;
+    }
+
+    private static bool TryGetInt32(JsonElement root, string propertyName, out int value)
+    {
+        value = 0;
+        return root.TryGetProperty(propertyName, out var prop)
+            && prop.ValueKind == JsonValueKind.Number
+            && prop.TryGetInt32(out value);
     }
 }
