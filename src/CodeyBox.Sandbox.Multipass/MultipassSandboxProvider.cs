@@ -6159,6 +6159,18 @@ while True:
         sb.AppendLine("set +e");
         sb.AppendLine("exec </dev/null >/dev/null 2>/dev/null");
         sb.AppendLine("rm -f \"$0\" 2>/dev/null || true");
+        sb.AppendLine("codeybox_close_inherited_stream_fds() {");
+        sb.AppendLine("    local codeybox_fd codeybox_target");
+        sb.AppendLine("    for codeybox_fd in /proc/$$/fd/*; do");
+        sb.AppendLine("        codeybox_fd=${codeybox_fd##*/}");
+        sb.AppendLine("        case \"$codeybox_fd\" in ''|*[!0-9]*|0|1|2) continue ;; esac");
+        sb.AppendLine("        codeybox_target=$(readlink \"/proc/$$/fd/$codeybox_fd\" 2>/dev/null || true)");
+        sb.AppendLine("        case \"$codeybox_target\" in");
+        sb.AppendLine("            pipe:*|socket:*) eval \"exec $codeybox_fd>&-\" ;;");
+        sb.AppendLine("        esac");
+        sb.AppendLine("    done");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_close_inherited_stream_fds");
         sb.AppendLine("codeybox_pgid_marker=$1");
         sb.AppendLine("codeybox_stdin_file=$2");
         sb.AppendLine("codeybox_env_file=$3");
