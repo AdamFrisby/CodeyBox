@@ -1157,7 +1157,6 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var webhooks = new CapturingWebhookDispatcher();
         var captLogger = new CapturingLogger<PipelineRunner>();
 
-        var workAgentKind = AgentKind.Claude;
         var auditAgentKind = new AgentKind("codex");
         var extraRunners = new[] { new ScriptedAgent(Array.Empty<MergeStrategy>()) { Kind = auditAgentKind } };
 
@@ -1193,6 +1192,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
         Assert.NotNull(timeoutEvent);
+        Assert.Equal("1.5", timeoutEvent.EventSchemaVersion);
         var details = timeoutEvent.Details;
         Assert.NotNull(details);
 
@@ -1210,8 +1210,68 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         Assert.NotNull(sandboxIdProp);
         Assert.NotEmpty(sandboxIdProp);
 
-        // Verify the normal timeout log contains (agent: {Agent})
-        Assert.Contains(captLogger.Entries, entry => entry.Message.Contains("(agent: codex)"));
+    }
+
+    [Fact]
+    public async Task AuditSandboxLaunchTimeoutEmitsStructuredEventAndAgentKind()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new HangingCredentialedAuditor("launch-timeout-auditor");
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        var webhooks = new CapturingWebhookDispatcher();
+        var captLogger = new CapturingLogger<PipelineRunner>();
+
+        var auditAgentKind = new AgentKind("codex");
+        var extraRunners = new[] { new ScriptedAgent(Array.Empty<MergeStrategy>()) { Kind = auditAgentKind } };
+        var defaultProvider = new ProcessSandboxProvider(Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance);
+        var launchTimeoutProvider = new AuditCredentialLaunchTimeoutSandboxProvider(defaultProvider);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(gate),
+            maxAuditIterations: 1,
+            credentials: AuditCredentials(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            pipelineTuning: tuning,
+            webhookDispatcher: webhooks,
+            projectAudit: new ProjectAudit
+            {
+                AuditAgent = auditAgentKind,
+                AuditTypes = ["scripted"],
+                MaxIterations = 1
+            },
+            extraAgentRunners: extraRunners,
+            sandboxProvider: launchTimeoutProvider,
+            logger: captLogger);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("incomplete auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("launch-timeout-auditor", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("codex", final.LastError, StringComparison.OrdinalIgnoreCase);
+
+        var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
+        Assert.NotNull(timeoutEvent);
+        Assert.Equal("1.5", timeoutEvent.EventSchemaVersion);
+        var details = timeoutEvent.Details;
+        Assert.NotNull(details);
+
+        var type = details.GetType();
+        Assert.Equal(item.Id.ToString(), type.GetProperty("WorkItemId")?.GetValue(details)?.ToString());
+        Assert.Equal("launch-timeout-auditor", type.GetProperty("Auditor")?.GetValue(details)?.ToString());
+        Assert.Equal("codex", type.GetProperty("Agent")?.GetValue(details)?.ToString());
+        Assert.Equal(1, type.GetProperty("Iteration")?.GetValue(details));
+        Assert.Equal("(launch-timeout)", type.GetProperty("SandboxId")?.GetValue(details)?.ToString());
+
     }
 
     [Fact]
@@ -1226,7 +1286,6 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var webhooks = new CapturingWebhookDispatcher();
         var captLogger = new CapturingLogger<PipelineRunner>();
 
-        var workAgentKind = AgentKind.Claude;
         var auditAgentKind = new AgentKind("codex");
         var extraRunners = new[] { new ScriptedAgent(Array.Empty<MergeStrategy>()) { Kind = auditAgentKind } };
 
@@ -1258,16 +1317,19 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
         var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
 
         // Assert that the logs contain the agent attribution in the teardown warning lines
         var killWarning = captLogger.Entries.FirstOrDefault(entry => entry.Message.Contains("did not kill active execs") || entry.Message.Contains("failed while killing active execs"));
         var disposeWarning = captLogger.Entries.FirstOrDefault(entry => entry.Message.Contains("did not dispose sandbox") || entry.Message.Contains("failed while disposing sandbox"));
-        
+
         Assert.NotNull(killWarning);
         Assert.Contains("(agent: codex)", killWarning.Message);
+        Assert.Equal("codex", killWarning.Properties["Agent"]?.ToString());
 
         Assert.NotNull(disposeWarning);
         Assert.Contains("(agent: codex)", disposeWarning.Message);
+        Assert.Equal("codex", disposeWarning.Properties["Agent"]?.ToString());
     }
 
     private async Task<FakeAuditTools> CreateFakeAuditToolsAsync()
@@ -1844,6 +1906,29 @@ file sealed class HangingCredentialedAuditor : IAuditor
         await Task.Delay(TimeSpan.FromSeconds(30), ct);
         return new AuditResult(true, []);
     }
+}
+
+file sealed class AuditCredentialLaunchTimeoutSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+
+    public AuditCredentialLaunchTimeoutSandboxProvider(ISandboxProvider inner) => _inner = inner;
+
+    public string Name => _inner.Name;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct)
+    {
+        if (spec.TimingPhase == "audit" && spec.Environment.ContainsKey("ANTHROPIC_API_KEY"))
+            await Task.Delay(TimeSpan.FromSeconds(30), ct);
+
+        return await _inner.CreateAsync(spec, ct);
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string sandboxId, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(sandboxId, ct);
 }
 
 file sealed class TimeoutSandboxProvider : ISandboxProvider

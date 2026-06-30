@@ -13,6 +13,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class EventSchemaDocSyncTests
 {
+    private const string ExpectedCurrentSchemaVersion = "1.5";
+
     private static string FindRepoRoot()
     {
         var dir = AppContext.BaseDirectory;
@@ -63,14 +65,30 @@ public sealed class EventSchemaDocSyncTests
     }
 
     [Fact]
+    public void Doc_EventTypeIntroducedVersionsMatchSchema()
+    {
+        var docTypes = ParseDocEventTypeVersions(ReadDoc());
+        var schema = EventSchema.GetSchema();
+
+        Assert.NotEmpty(docTypes);
+        foreach (var (name, introducedIn) in docTypes)
+        {
+            Assert.True(
+                schema.EventTypes.TryGetValue(name, out var eventType),
+                $"docs/EVENT_SCHEMA.md lists event type `{name}` but EventSchema does not");
+            Assert.Equal(introducedIn, eventType.IntroducedIn);
+        }
+    }
+
+    [Fact]
     public void Doc_DeclaresCurrentSchemaVersion()
     {
         var doc = ReadDoc();
-        Assert.Equal("1.5", EventSchema.CurrentVersion);
+        Assert.Equal(ExpectedCurrentSchemaVersion, EventSchema.CurrentVersion);
 
         var declaration = Regex.Match(doc, @"^eventSchemaVersion\s*=\s*""(?<version>\d+\.\d+)""\s*$", RegexOptions.Multiline);
         Assert.True(declaration.Success, "docs/EVENT_SCHEMA.md must declare the current eventSchemaVersion");
-        Assert.Equal("1.5", declaration.Groups["version"].Value);
+        Assert.Equal(ExpectedCurrentSchemaVersion, declaration.Groups["version"].Value);
     }
 
     [Fact]
@@ -86,7 +104,7 @@ public sealed class EventSchemaDocSyncTests
         using var parsed = JsonDocument.Parse(json);
         var root = parsed.RootElement;
 
-        Assert.Equal("1.5", root.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal(ExpectedCurrentSchemaVersion, root.GetProperty("eventSchemaVersion").GetString());
         Assert.True(root.TryGetProperty("evolutionRules", out _));
         Assert.True(root.TryGetProperty("envelope", out var envelope));
         Assert.True(envelope.TryGetProperty("eventSchemaVersion", out _));
@@ -103,22 +121,28 @@ public sealed class EventSchemaDocSyncTests
         // 1.0. This guards the compatibility metadata trackers use to decide
         // whether a payload is safe for their minimum supported schema.
         var schema = EventSchema.GetSchema();
+        var nonInitialEventTypes = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "upstream.pr_stale_base",
+            "worker_pool.stalled",
+            "worker_pool.restart_required",
+            "agent.paused",
+            "agent.resumed",
+            "agent.restore_requeue_swept",
+            "work_item.waiting_for_agent_resume",
+            "work_item.waiting_for_transient_retry",
+            "work_item.agent_restore_requeued",
+            "work_item.planning",
+            "work_item.plan_review",
+            "work_item.plan_approved",
+            "audit.auditor_timed_out",
+        };
 
         Assert.All(schema.Envelope.Values, field =>
             Assert.Equal("1.0", field.IntroducedIn));
-        Assert.All(
-            schema.EventTypes.Where(kv =>
-                !kv.Key.StartsWith("worker_pool.", StringComparison.Ordinal) &&
-                kv.Key is not "agent.paused"
-                    and not "agent.resumed"
-                    and not "agent.restore_requeue_swept"
-                    and not "work_item.waiting_for_agent_resume"
-                    and not "work_item.waiting_for_transient_retry"
-                    and not "work_item.agent_restore_requeued"
-                    and not "work_item.planning"
-                    and not "work_item.plan_review"
-                    and not "work_item.plan_approved"),
+        Assert.All(schema.EventTypes.Where(kv => !nonInitialEventTypes.Contains(kv.Key)),
             kv => Assert.Equal("1.0", kv.Value.IntroducedIn));
+        Assert.Equal("1.1", schema.EventTypes["upstream.pr_stale_base"].IntroducedIn);
         Assert.Equal("1.2", schema.EventTypes["worker_pool.stalled"].IntroducedIn);
         Assert.Equal("1.2", schema.EventTypes["worker_pool.restart_required"].IntroducedIn);
         Assert.Equal("1.3", schema.EventTypes["agent.paused"].IntroducedIn);
@@ -130,5 +154,19 @@ public sealed class EventSchemaDocSyncTests
         Assert.Equal("1.5", schema.EventTypes["work_item.planning"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["work_item.plan_review"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["work_item.plan_approved"].IntroducedIn);
+        Assert.Equal("1.5", schema.EventTypes["audit.auditor_timed_out"].IntroducedIn);
+    }
+
+    private static IReadOnlyDictionary<string, string> ParseDocEventTypeVersions(string doc)
+    {
+        var rowRegex = new Regex(
+            @"^\|\s*`([a-z][a-z0-9_]*\.[a-z0-9_.]+)`\s*\|\s*(\d+\.\d+)\s*\|",
+            RegexOptions.Multiline);
+        return rowRegex
+            .Matches(doc)
+            .ToDictionary(
+                m => m.Groups[1].Value,
+                m => m.Groups[2].Value,
+                StringComparer.Ordinal);
     }
 }

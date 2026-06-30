@@ -156,8 +156,8 @@ See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes.
 Schema 1.1 adds the sandbox leak `reason` details field. Schema 1.2 adds
 worker-pool health watchdog events for dispatcher stalls and restart
 escalation. Schema 1.3 adds per-agent pause/resume and agent-pause waiting
-events. Schema 1.4 adds transient transport retry waiting events. Schema 1.5
-adds planning-phase transition events.
+events. Schema 1.4 adds transient transport retry waiting events. Schema 1.5 adds planning-phase transition events and auditor-timeout
+attribution events.
 
 ---
 

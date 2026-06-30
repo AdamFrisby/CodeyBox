@@ -49,6 +49,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private const int CompletionReviewFileMaxChars = 8 * 1024;
     private const int CompletionReviewMaxFiles = 80;
     private const int PlanArtifactMaxChars = 64 * 1024;
+    private static readonly AgentKind AuditToolAgentKind = new("audit-tool");
+
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly IAgentRegistry _agents;
@@ -12654,11 +12656,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                 isolatedRepoPath = await _gitHost.CreateIsolatedRepositoryCloneAsync(repoId, ctx.WorkItemId, ct);
                                 var isolatedAccess = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
                                 var isolatedSpec = BuildAuditSandboxSpec(isolatedAccess);
+                                var timeoutAgentKind = AuditorTimeoutAgentKind(auditor, runner);
                                 await using var isolatedSandbox = await CreatePreparedToolSandboxAsync(
                                     isolatedAccess,
                                     isolatedSpec,
                                     auditor.Name,
-                                    runner.Kind);
+                                    timeoutAgentKind);
                                 run = await ExecAuditorAsync(
                                     isolatedSandbox,
                                     auditor,
@@ -12691,7 +12694,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         }
                         else
                         {
-                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync(access, spec, auditor.Name, runner.Kind);
+                            var timeoutAgentKind = AuditorTimeoutAgentKind(auditor, runner);
+                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync(access, spec, auditor.Name, timeoutAgentKind);
                             run = await ExecAuditorAsync(
                                 sharedToolSandbox,
                                 auditor,
@@ -13259,6 +13263,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return 2;
     }
 
+    private static AgentKind AuditorTimeoutAgentKind(IAuditor auditor, IAgentRunner runner) =>
+        auditor.Required.HasFlag(AuditCapabilities.AgentCredentials)
+            ? runner.Kind
+            : AuditToolAgentKind;
+
     /// <summary>
     /// Runs a single auditor inside <paramref name="sandbox"/>, wrapping it
     /// in a timing scope. Safe to call concurrently from parallel tasks — all
@@ -13390,7 +13399,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 result = await RunAuditorWithIdleTimeoutAsync(
                     auditor,
-                    runner.Kind,
+                    AuditorTimeoutAgentKind(auditor, runner),
                     sandbox,
                     SandboxConventions.WorkDir,
                     auditorCtx,
@@ -13486,23 +13495,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var timedOutAfter = await timeoutTask.ConfigureAwait(false);
                 if (timedOutAfter is not null)
                 {
-                    try
-                    {
-                        AuditLog.AuditorTimedOut(item.Id, auditorName, agent, iteration, "(launch-timeout)");
-
-                        await TryPublishEventAsync(item, project, "audit.auditor_timed_out", new AuditAuditorTimedOutDetails
-                        {
-                            WorkItemId = item.Id.ToString(),
-                            Auditor = auditorName,
-                            Agent = agent.Value,
-                            Iteration = iteration,
-                            SandboxId = "(launch-timeout)"
-                        }, CancellationToken.None).ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.LogError(ex, "Failed to log or publish auditor timeout event for {Auditor}", auditorName);
-                    }
+                    const string sandboxId = "(launch-timeout)";
+                    LogAuditorTimedOut(item.Id, auditorName, agent, iteration, sandboxId);
 
                     await CancelAndObserveSandboxCreateAfterIdleTimeoutAsync(
                         linkedCts,
@@ -13510,6 +13504,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         "sandbox launch",
                         auditorName,
                         agent).ConfigureAwait(false);
+                    await PublishAuditorTimedOutEventAsync(
+                        item,
+                        project,
+                        auditorName,
+                        agent,
+                        iteration,
+                        sandboxId).ConfigureAwait(false);
                     throw new AuditorIdleTimeoutException(auditorName, agent, timedOutAfter.Value);
                 }
 
@@ -13741,31 +13742,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         int iteration)
     {
+        var sandboxId = sandbox.Id;
         try { await cts.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
 
-        try
-        {
-            AuditLog.AuditorTimedOut(
-                item.Id,
-                auditorName,
-                agent,
-                iteration,
-                sandbox.Id);
-
-            await TryPublishEventAsync(item, project, "audit.auditor_timed_out", new AuditAuditorTimedOutDetails
-            {
-                WorkItemId = item.Id.ToString(),
-                Auditor = auditorName,
-                Agent = agent.Value,
-                Iteration = iteration,
-                SandboxId = sandbox.Id
-            }, CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "Failed to log or publish auditor timeout event for {Auditor}", auditorName);
-        }
+        LogAuditorTimedOut(item.Id, auditorName, agent, iteration, sandboxId);
 
         try
         {
@@ -13781,7 +13762,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 operation,
                 auditorName,
                 agent.Value,
-                sandbox.Id);
+                sandboxId);
         }
         catch (Exception ex)
         {
@@ -13791,7 +13772,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 operation,
                 auditorName,
                 agent.Value,
-                sandbox.Id);
+                sandboxId);
         }
 
         try
@@ -13807,7 +13788,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 operation,
                 auditorName,
                 agent.Value,
-                sandbox.Id);
+                sandboxId);
         }
         catch (Exception ex)
         {
@@ -13817,12 +13798,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 operation,
                 auditorName,
                 agent.Value,
-                sandbox.Id);
+                sandboxId);
+        }
+
+        async Task PublishTimeoutEventAsync()
+        {
+            await PublishAuditorTimedOutEventAsync(
+                item,
+                project,
+                auditorName,
+                agent,
+                iteration,
+                sandboxId).ConfigureAwait(false);
         }
 
         if (task.IsCompleted)
         {
             ObserveTimedOutTask(task, operation, auditorName, agent);
+            await PublishTimeoutEventAsync().ConfigureAwait(false);
             return;
         }
 
@@ -13830,6 +13823,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (completed == task)
         {
             ObserveTimedOutTask(task, operation, auditorName, agent);
+            await PublishTimeoutEventAsync().ConfigureAwait(false);
             return;
         }
 
@@ -13846,6 +13840,49 @@ public sealed partial class PipelineRunner : IPipelineRunner
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
+        await PublishTimeoutEventAsync().ConfigureAwait(false);
+    }
+
+    private void LogAuditorTimedOut(
+        WorkItemId workItemId,
+        string auditorName,
+        AgentKind agent,
+        int iteration,
+        string sandboxId)
+    {
+        try
+        {
+            AuditLog.AuditorTimedOut(workItemId, auditorName, agent, iteration, sandboxId);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Failed to write auditor timeout audit log for {Auditor}", auditorName);
+        }
+    }
+
+    private async Task PublishAuditorTimedOutEventAsync(
+        WorkItem item,
+        Project project,
+        string auditorName,
+        AgentKind agent,
+        int iteration,
+        string sandboxId)
+    {
+        try
+        {
+            await TryPublishEventAsync(item, project, "audit.auditor_timed_out", new AuditAuditorTimedOutDetails
+            {
+                WorkItemId = item.Id.ToString(),
+                Auditor = auditorName,
+                Agent = agent.Value,
+                Iteration = iteration,
+                SandboxId = sandboxId
+            }, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Failed to publish auditor timeout event for {Auditor}", auditorName);
+        }
     }
 
     private async Task CancelAndObserveSandboxCreateAfterIdleTimeoutAsync(

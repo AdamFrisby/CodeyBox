@@ -17,6 +17,7 @@ public static class EventSchema
     /// <summary>Current schema version. Bumped per the rules below.</summary>
     public const string CurrentVersion = WebhookEvent.CurrentSchemaVersion;
     private const string InitialVersion = "1.0";
+    private const string UpstreamPrStaleBaseVersion = "1.1";
     private const string WorkerPoolHealthVersion = "1.2";
     private const string AgentPauseVersion = "1.3";
     private const string TransientRetryVersion = "1.4";
@@ -60,13 +61,15 @@ public static class EventSchema
     private static string EventTypeIntroducedIn(string name)
         => name switch
         {
+            "upstream.pr_stale_base" => UpstreamPrStaleBaseVersion,
             "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
             "work_item.waiting_for_transient_retry" => TransientRetryVersion,
             "agent.restore_requeue_swept"
                 or "work_item.agent_restore_requeued"
                 or "work_item.planning"
                 or "work_item.plan_review"
-                or "work_item.plan_approved" => PlanningVersion,
+                or "work_item.plan_approved"
+                or "audit.auditor_timed_out" => PlanningVersion,
             _ when name.StartsWith("worker_pool.", StringComparison.Ordinal) => WorkerPoolHealthVersion,
             _ => InitialVersion,
         };

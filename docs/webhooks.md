@@ -71,7 +71,7 @@ Every event is a JSON object POSTed as the request body.
 
 ```json
 {
-  "eventSchemaVersion": "1.0",
+  "eventSchemaVersion": "1.5",
   "event": "work_item.audit_passed",
   "occurredAt": "2026-04-29T12:34:56.789+00:00",
   "workItem": {
