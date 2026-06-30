@@ -70,17 +70,38 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
     }
 
     public async Task CreateAsync(E2eRun run, CancellationToken ct = default)
+        => await BulkCreateAsync([run], ct);
+
+    public async Task BulkCreateAsync(IReadOnlyList<E2eRun> runs, CancellationToken ct = default)
     {
+        if (runs.Count == 0)
+            return;
+
         await _writeLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                INSERT INTO e2e_runs (id, test_case_id, status, created_at, started_at, finished_at, result, sandbox_id, batch_id)
-                VALUES ($id, $tc, $st, $ca, $sa, $fa, $res, $sb, $bt);
-                """;
-            Bind(cmd, run);
-            await cmd.ExecuteNonQueryAsync(ct);
+            using var tx = _conn.BeginTransaction();
+            try
+            {
+                foreach (var run in runs)
+                {
+                    using var cmd = _conn.CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = """
+                        INSERT INTO e2e_runs (id, test_case_id, status, created_at, started_at, finished_at, result, sandbox_id, batch_id)
+                        VALUES ($id, $tc, $st, $ca, $sa, $fa, $res, $sb, $bt);
+                        """;
+                    Bind(cmd, run);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(CancellationToken.None);
+                throw;
+            }
         }
         finally
         {

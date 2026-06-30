@@ -2,6 +2,7 @@ using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Options;
+using System.Net;
 
 namespace CodeyBox.Tests;
 
@@ -321,6 +322,41 @@ public sealed class CodeyBoxOptionsValidatorTests
 
         Assert.True(result.Failed);
         Assert.Contains("different SSH host", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("localhost")]
+    [InlineData("codeybox@127.0.0.1")]
+    [InlineData("codeybox@[::1]")]
+    public void Validate_RejectsEnabledRemoteE2eWhenTargetIsLoopbackOrLocalhost(string target)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = null;
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = target };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("dedicated remote SSH host", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEnabledRemoteE2eWhenTargetIsOrchestratorHostName()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = null;
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = $"e2e@{Dns.GetHostName()}" };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("dedicated remote SSH host", result.FailureMessage);
     }
 
     [Fact]

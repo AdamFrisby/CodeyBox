@@ -86,19 +86,6 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             }
         }
 
-        if (artifact.Steps.Count == 0 && artifact.Assertions.Count == 0)
-        {
-            sw.Stop();
-            return new E2eRunResult
-            {
-                Passed = true,
-                Summary = $"readiness succeeded, {sw.ElapsedMilliseconds} ms",
-                StepResults = stepResults,
-                AssertionResults = assertionResults,
-                DurationMs = sw.ElapsedMilliseconds,
-            };
-        }
-
         var replay = await RunReplayDriverAsync(artifact, sandbox, ct);
         sw.Stop();
         return replay with

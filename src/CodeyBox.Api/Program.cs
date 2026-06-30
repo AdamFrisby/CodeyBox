@@ -627,6 +627,12 @@ static bool TryValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxO
         return false;
     }
 
+    if (e2eHosts.Any(static host => E2eRemoteHostValidation.IsLocalSshTarget(host)))
+    {
+        message = "CodeyBox:E2eMultipassRemoteSandbox must target a dedicated remote SSH host, not localhost, loopback, or the orchestrator host; E2E replay load must stay off the local coding fleet.";
+        return false;
+    }
+
     var codingIdentity = RemotePoolIdentity(options.MultipassRemoteSandbox);
     if (codingIdentity is not null
         && e2eHosts.Any(host => string.Equals(RemotePoolIdentity(host), codingIdentity, StringComparison.OrdinalIgnoreCase)))
@@ -652,19 +658,9 @@ static string? RemotePoolIdentity(MultipassRemoteSandboxConfig? config)
 {
     if (string.IsNullOrWhiteSpace(config?.SshTarget))
         return null;
-    var host = SshHostIdentity(config.SshTarget);
+    var host = E2eRemoteHostValidation.SshHostIdentity(config.SshTarget);
     var port = config.SshPort ?? 22;
     return $"{host}:{port}";
-}
-
-static string SshHostIdentity(string sshTarget)
-{
-    var target = sshTarget.Trim();
-    var at = target.LastIndexOf('@');
-    var host = at >= 0 && at + 1 < target.Length ? target[(at + 1)..] : target;
-    if (host.Length >= 2 && host[0] == '[' && host[^1] == ']')
-        host = host[1..^1];
-    return host.Trim().TrimEnd('.').ToLowerInvariant();
 }
 
 static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILoggerFactory loggerFactory)

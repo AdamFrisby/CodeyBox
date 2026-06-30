@@ -87,7 +87,7 @@ internal static class E2eRunEndpoints
             validated.Add(testCase!);
         }
 
-        var created = new List<E2eRunDto>(validated.Count);
+        var runsToCreate = new List<E2eRun>(validated.Count);
         foreach (var testCase in validated)
         {
             var run = new E2eRun
@@ -98,10 +98,12 @@ internal static class E2eRunEndpoints
                 CreatedAt = DateTimeOffset.UtcNow,
                 BatchId = batchId,
             };
-            await runs.CreateAsync(run, ct);
-            created.Add(ToDto(run));
+            runsToCreate.Add(run);
         }
 
+        await runs.BulkCreateAsync(runsToCreate, ct);
+
+        var created = runsToCreate.Select(ToDto).ToArray();
         return Results.Ok(new EnqueueBulkE2eRunsResponse(batchId, created));
     }
 

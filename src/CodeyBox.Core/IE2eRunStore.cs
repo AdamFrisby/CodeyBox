@@ -13,6 +13,8 @@ public interface IE2eRunStore
 {
     Task CreateAsync(E2eRun run, CancellationToken ct = default);
 
+    Task BulkCreateAsync(IReadOnlyList<E2eRun> runs, CancellationToken ct = default);
+
     Task<E2eRun?> GetAsync(string id, CancellationToken ct = default);
 
     /// <summary>Lists runs newest-first using a bounded page.</summary>

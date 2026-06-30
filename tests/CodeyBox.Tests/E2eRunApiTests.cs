@@ -128,6 +128,35 @@ public sealed class E2eRunApiTests : IDisposable
         Assert.Contains("SshTarget", ex.Message);
     }
 
+    [Theory]
+    [InlineData("localhost")]
+    [InlineData("codeybox@127.0.0.1")]
+    [InlineData("codeybox@[::1]")]
+    public void Program_rejects_enabled_remote_e2e_when_target_is_loopback_or_localhost(string target)
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            e2eRemoteTarget: target,
+            e2eEnabled: true);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("dedicated remote SSH host", ex.Message);
+    }
+
+    [Fact]
+    public void Program_rejects_enabled_remote_e2e_when_target_is_orchestrator_host_name()
+    {
+        using var factory = new E2ePoolWiringFactory(
+            "remote-ssh",
+            e2eRemoteTarget: $"e2e@{Dns.GetHostName()}",
+            e2eEnabled: true);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("dedicated remote SSH host", ex.Message);
+    }
+
     [Fact]
     public void Program_rejects_enabled_remote_e2e_when_network_profile_is_set()
     {

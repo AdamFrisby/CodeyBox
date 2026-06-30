@@ -73,16 +73,16 @@ internal static class E2eReplayArtifactValidation
             return false;
         }
 
-        if (artifact.Readiness is null && artifact.Steps.Count == 0 && artifact.Assertions.Count == 0)
-        {
-            failureKind = "EmptyArtifact";
-            detail = "artifact must include a readiness URL, at least one step, or at least one assertion";
-            return false;
-        }
-
         if (artifact.Readiness is { } readiness
             && !TryValidateReadiness(readiness, out failureKind, out detail))
         {
+            return false;
+        }
+
+        if (artifact.Steps.Count == 0 && artifact.Assertions.Count == 0)
+        {
+            failureKind = "EmptyArtifact";
+            detail = "artifact must include at least one replay step or assertion";
             return false;
         }
 
