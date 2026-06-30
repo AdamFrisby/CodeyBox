@@ -144,7 +144,8 @@ internal static class TestSupport
         TimeProvider? retryTimeProvider = null,
         CancellationRegistry? cancellationRegistry = null,
         AgentAvailabilityRegistry? availabilityRegistry = null,
-        ScriptedAgent? agentOverride = null)
+        ScriptedAgent? agentOverride = null,
+        IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -313,7 +314,8 @@ internal static class TestSupport
             terminalRevisionBuilder: terminalTransitions,
             mechanicalFixerComposer: mechanicalComposer,
             mechanicalFixerInputProviders: mechanicalFixerInputProviders,
-            inVmSmokeGate: inVmSmokeGate);
+            inVmSmokeGate: inVmSmokeGate,
+            toolCallCounters: toolCallCounters);
 
         return new TestPipeline(
             pipeline,
@@ -542,6 +544,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// the next candidate.
     /// </summary>
     public Queue<AgentResult> AgenticConflictResults { get; } = new();
+    public string? AgenticConflictResultStdout { get; set; }
 
     /// <summary>
     /// Hunk-scoped resolution handler queue. Each handler receives the
@@ -783,7 +786,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
                 return new AgentResult(false, $"ScriptedAgent: failed to git add '{path}': {add.Stderr}", null, null);
         }
 
-        return new AgentResult(true, "agentic resolved", null, null);
+        return new AgentResult(true, "agentic resolved", AgenticConflictResultStdout, null);
     }
 
     private static IReadOnlyList<string> ParseAgenticConflictFiles(string prompt)

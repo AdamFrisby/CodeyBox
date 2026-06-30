@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit.Presets;
@@ -5,6 +6,7 @@ using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Upstream;
 using CodeyBox.Webhooks;
@@ -159,6 +161,227 @@ public sealed class PipelineRunnerTimingTests : IDisposable
             "expected a phase.merge span on the full Done pipeline");
         Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "merge")),
             "expected a codeybox.phase.duration_ms{phase=merge} measurement");
+    }
+
+    [Fact]
+    public async Task AuditRun_EmitsAuditorSubStepTimingFromRawOutput()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        var auditor = new RawOutputAuditor(
+            "csharp:build-WaE",
+            """
+            Build succeeded.
+            Time Elapsed 00:00:01.234
+            """);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            timingStore: timings,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-substep.txt", "audit\n"));
+
+        var item = NewItem("feature/audit-substep");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var subStep = Assert.Single(timings.CompletedRows, r => r.Step == "csharp.build");
+        Assert.Equal(item.Id, subStep.WorkItemId);
+        Assert.Equal("audit", subStep.Phase);
+        Assert.Equal(1, subStep.Iteration);
+        Assert.Equal(1_234, subStep.DurationMs);
+        Assert.Equal("{}", subStep.MetadataJson);
+        Assert.Equal(subStep.StartedAt.AddMilliseconds(1_234), subStep.EndedAt);
+    }
+
+    [Fact]
+    public async Task AuditRun_EmitsFallbackToolCallTelemetryFromAuditorRawOutputThroughRunAsync()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        var counter = new StaticToolCallCounter(
+            AgentKind.Claude,
+            "audit stream-json",
+            new AgentToolCallCounts(
+                new Dictionary<string, int> { ["AuditTool"] = 3 },
+                FinalText: "audit complete"));
+        var auditor = new RawOutputAuditor("quality:llm-review", "audit stream-json");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            timingStore: timings,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            toolCallCounters: new Dictionary<AgentKind, IAgentToolCallCounter>
+            {
+                [AgentKind.Claude] = counter,
+            });
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-tool-call-telemetry.txt", "audit\n"));
+
+        var item = NewItem("feature/audit-tool-call-telemetry");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Contains("audit stream-json", counter.SeenStdouts);
+
+        var auditorExec = Assert.Single(
+            timings.CompletedRows,
+            r => r.Phase == "audit" && r.Step == "auditor.quality:llm-review");
+        var tool = Assert.Single(
+            timings.CompletedRows,
+            r => r.Phase == "audit" && r.Step == "agent.tool_call.AuditTool");
+        Assert.Equal(item.Id, tool.WorkItemId);
+        Assert.Equal(1, tool.Iteration);
+        Assert.Equal(0, tool.DurationMs);
+        Assert.Equal(tool.StartedAt, tool.EndedAt);
+        using (var metadata = JsonDocument.Parse(tool.MetadataJson))
+        {
+            Assert.Equal(3, metadata.RootElement.GetProperty("count").GetInt32());
+        }
+
+        var thinking = Assert.Single(
+            timings.CompletedRows,
+            r => r.Phase == "audit" && r.Step == "agent.thinking_aggregate");
+        Assert.Equal(item.Id, thinking.WorkItemId);
+        Assert.Equal(1, thinking.Iteration);
+        Assert.Equal(auditorExec.DurationMs, thinking.DurationMs);
+        Assert.Equal("{}", thinking.MetadataJson);
+        Assert.Equal(thinking.StartedAt.AddMilliseconds(thinking.DurationMs!.Value), thinking.EndedAt);
+    }
+
+    [Fact]
+    public async Task UnstructuredWorkAgent_EmitsFallbackToolCallTelemetryThroughRunAsync()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        var counter = new StaticToolCallCounter(
+            AgentKind.Claude,
+            "plain stream-json",
+            new AgentToolCallCounts(
+                new Dictionary<string, int> { ["Bash"] = 2 },
+                FinalText: "done"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            timingStore: timings,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            toolCallCounters: new Dictionary<AgentKind, IAgentToolCallCounter>
+            {
+                [AgentKind.Claude] = counter,
+            });
+
+        tp.Agent.ResultStdout = "plain stream-json";
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("tool-call-telemetry.txt", "telemetry\n"));
+
+        var item = NewItem("feature/tool-call-telemetry");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Contains("plain stream-json", counter.SeenStdouts);
+
+        var agentExec = Assert.Single(timings.CompletedRows, r => r.Phase == "work" && r.Step == "agent.exec");
+        var tool = Assert.Single(timings.CompletedRows, r => r.Step == "agent.tool_call.Bash");
+        Assert.Equal(item.Id, tool.WorkItemId);
+        Assert.Equal("work", tool.Phase);
+        Assert.Null(tool.Iteration);
+        Assert.Equal(0, tool.DurationMs);
+        Assert.Equal(tool.StartedAt, tool.EndedAt);
+        using (var metadata = JsonDocument.Parse(tool.MetadataJson))
+        {
+            Assert.Equal(2, metadata.RootElement.GetProperty("count").GetInt32());
+        }
+
+        var thinking = Assert.Single(timings.CompletedRows, r => r.Step == "agent.thinking_aggregate");
+        Assert.Equal(item.Id, thinking.WorkItemId);
+        Assert.Equal("work", thinking.Phase);
+        Assert.Null(thinking.Iteration);
+        Assert.Equal(agentExec.DurationMs, thinking.DurationMs);
+        Assert.Equal("{}", thinking.MetadataJson);
+        Assert.Equal(thinking.StartedAt.AddMilliseconds(thinking.DurationMs!.Value), thinking.EndedAt);
+    }
+
+    [Fact]
+    public async Task ConflictMerge_EmitsFallbackToolCallTelemetryFromResolverStdoutThroughRunAsync()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        var counter = new StaticToolCallCounter(
+            AgentKind.Claude,
+            "merge stream-json",
+            new AgentToolCallCounts(
+                new Dictionary<string, int> { ["MergeTool"] = 1 },
+                FinalText: "merge complete"));
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            timingStore: timings,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            toolCallCounters: new Dictionary<AgentKind, IAgentToolCallCounter>
+            {
+                [AgentKind.Claude] = counter,
+            });
+        auditor.GitRoot = tp.GitRoot;
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+        tp.Agent.AgenticConflictResultStdout = "merge stream-json";
+        tp.Agent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            Assert.Equal("README.md", file.Path);
+            Assert.Contains("main side", file.Content);
+            Assert.Contains("work side", file.Content);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main side\nwork side\n",
+            };
+        });
+
+        var item = NewItem("feature/merge-tool-call-telemetry");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Contains("merge stream-json", counter.SeenStdouts);
+
+        var mergeExec = Assert.Single(
+            timings.CompletedRows,
+            r => r.Phase == "merge" && r.Step == "agent.exec");
+        var tool = Assert.Single(
+            timings.CompletedRows,
+            r => r.Phase == "merge" && r.Step == "agent.tool_call.MergeTool");
+        Assert.Equal(item.Id, tool.WorkItemId);
+        Assert.Null(tool.Iteration);
+        Assert.Equal(0, tool.DurationMs);
+        Assert.Equal(tool.StartedAt, tool.EndedAt);
+        using (var metadata = JsonDocument.Parse(tool.MetadataJson))
+        {
+            Assert.Equal(1, metadata.RootElement.GetProperty("count").GetInt32());
+        }
+
+        var thinking = Assert.Single(
+            timings.CompletedRows,
+            r => r.Phase == "merge" && r.Step == "agent.thinking_aggregate");
+        Assert.Equal(item.Id, thinking.WorkItemId);
+        Assert.Null(thinking.Iteration);
+        Assert.Equal(mergeExec.DurationMs, thinking.DurationMs);
+        Assert.Equal("{}", thinking.MetadataJson);
+        Assert.Equal(thinking.StartedAt.AddMilliseconds(thinking.DurationMs!.Value), thinking.EndedAt);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -331,6 +554,73 @@ public sealed class PipelineRunnerTimingTests : IDisposable
         {
             await using (var disposeScope = await TimingScope.BeginAsync(_timings, _itemId, _phase, "vm.dispose"))
                 await _inner.DisposeAsync();
+        }
+    }
+
+    private sealed class RawOutputAuditor(string name, string rawOutput) : IAuditor
+    {
+        public string Name => name;
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(new AuditResult(true, [], rawOutput));
+        }
+    }
+
+    private sealed class MainAdvancingAuditor(string workspace, string path, string content) : IAuditor
+    {
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, path), content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            return new AuditResult(true, []);
+        }
+    }
+
+    private sealed class StaticToolCallCounter(
+        AgentKind kind,
+        string expectedStdout,
+        AgentToolCallCounts counts) : IAgentToolCallCounter
+    {
+        public AgentKind Kind => kind;
+        public List<string?> SeenStdouts { get; } = [];
+
+        public AgentToolCallCounts? TryCount(string? bufferedStdout)
+        {
+            SeenStdouts.Add(bufferedStdout);
+            return bufferedStdout == expectedStdout ? counts : null;
         }
     }
 
