@@ -102,6 +102,15 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private readonly IStartupRecoveryInputSink _startupRecovery;
     private readonly IInfrastructureDeferralScheduler? _infrastructureDeferrals;
     private readonly IHostApplicationLifetime? _applicationLifetime;
+
+    /// <summary>
+    /// Clock used for resume/adoption timeout waits and suspend-bookkeeping
+    /// timestamps. Defaults to <see cref="TimeProvider.System"/> so production
+    /// behavior is unchanged; tests inject a <c>FakeTimeProvider</c> to drive
+    /// the configured resume timeout deterministically instead of waiting on a
+    /// real <see cref="Task.Delay(TimeSpan)"/> that starves under CPU load.
+    /// </summary>
+    private readonly TimeProvider _time;
     private readonly Lock _resumeStartGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
@@ -118,7 +127,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         TimeSpan? resumeTimeout = null,
         SandboxStartupResumeMode? mode = null,
         IInfrastructureDeferralScheduler? infrastructureDeferrals = null,
-        IHostApplicationLifetime? applicationLifetime = null)
+        IHostApplicationLifetime? applicationLifetime = null,
+        TimeProvider? timeProvider = null)
         : this(
             provider,
             store,
@@ -136,7 +146,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             },
             recoveryInput,
             infrastructureDeferrals,
-            applicationLifetime)
+            applicationLifetime,
+            timeProvider)
     {
     }
 
@@ -147,7 +158,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         Func<SandboxStartupResumeOptions> optionsAccessor,
         IStartupRecoveryInputSink recoveryInput,
         IInfrastructureDeferralScheduler? infrastructureDeferrals = null,
-        IHostApplicationLifetime? applicationLifetime = null)
+        IHostApplicationLifetime? applicationLifetime = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(recoveryInput);
         _provider = provider;
@@ -157,6 +169,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         _startupRecovery = recoveryInput;
         _infrastructureDeferrals = infrastructureDeferrals;
         _applicationLifetime = applicationLifetime;
+        _time = timeProvider ?? TimeProvider.System;
     }
 
     public Task StartAsync(CancellationToken ct)
@@ -448,7 +461,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 SuspendedVmName = null,
                 SuspendedAt = null,
                 AgentLogPath = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _time.GetUtcNow(),
             };
             if (!resumeSucceeded
                 && WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(
@@ -466,7 +479,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 updatedItem = updatedItem with
                 {
                     PreemptCheckpoint = promotedCheckpointRef,
-                    PreemptedAt = DateTimeOffset.UtcNow,
+                    PreemptedAt = _time.GetUtcNow(),
                 };
             }
             await _store.UpdateAsync(updatedItem, ct);
@@ -507,6 +520,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         Task? resumeTask = null;
+        ITimer? timeoutTimer = null;
         try
         {
             resumeTask = RunLongRunningAsync(
@@ -517,8 +531,13 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             }
             else
             {
-                timeoutCts.CancelAfter(timeout);
-                await resumeTask.WaitAsync(timeout, ct);
+                // Cancel the provider token on the SAME injected clock the wait
+                // below uses, so a fake-clock Advance() that fires WaitAsync also
+                // fires this cancellation (CancellationTokenSource.CancelAfter
+                // has no TimeProvider overload, so it would otherwise stay on the
+                // system clock and leave the provider token uncancelled).
+                timeoutTimer = CreateTimeoutCancellationTimer(timeoutCts, timeout);
+                await resumeTask.WaitAsync(timeout, _time, ct);
             }
             return (true, null, null);
         }
@@ -572,6 +591,11 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 vmName, itemId);
             return (false, ex.Message, null);
         }
+        finally
+        {
+            if (timeoutTimer is not null)
+                await timeoutTimer.DisposeAsync();
+        }
     }
 
     private async Task DeferProvisioningResumeAsync(
@@ -587,7 +611,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             return;
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = _time.GetUtcNow();
         var cleared = fresh with
         {
             SuspendedVmName = null,
@@ -622,92 +646,102 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     {
         var adoptionDeadline = CurrentOptions().AdoptionDeadline;
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(adoptionDeadline);
-
-        Task<int?> adoptionTask;
-        try
-        {
-            adoptionTask = RunLongRunningAsync(
-                () => suspending.WaitForAdoptedAgentCompletionAsync(
-                    vmName,
-                    agentLogPath,
-                    chunk =>
-                    {
-                        if (!string.IsNullOrEmpty(chunk))
-                            _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
-                    },
-                    adoptionDeadline,
-                    timeoutCts.Token));
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            timeoutCts.Cancel();
-            throw;
-        }
-        catch (OperationCanceledException ex)
-        {
-            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
-            _log.LogWarning(ex,
-                "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
-                vmName, itemId, error);
-            return null;
-        }
-        catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
-        {
-            _log.LogWarning(adoptionEx,
-                "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
-                vmName, itemId);
-            return null;
-        }
+        // Cancel the provider token on the injected clock so the deadline fires
+        // on the same clock as WaitForTaskOrTimeoutAsync below; CancelAfter has
+        // no TimeProvider overload and would otherwise stay on the system clock.
+        var timeoutTimer = CreateTimeoutCancellationTimer(timeoutCts, adoptionDeadline);
 
         try
         {
-            await WaitForTaskOrTimeoutAsync(adoptionTask, adoptionDeadline, ct);
-            var adoptionExitCode = await adoptionTask;
-            if (adoptionExitCode is null)
+            Task<int?> adoptionTask;
+            try
             {
-                _log.LogWarning(
-                    "Startup adoption deadline elapsed for sandbox {VmName} (work item {WorkItemId}); the resumed agent has not signalled completion within {Deadline}. The work item will recover via the stranded-item path.",
-                    vmName, itemId, adoptionDeadline);
+                adoptionTask = RunLongRunningAsync(
+                    () => suspending.WaitForAdoptedAgentCompletionAsync(
+                        vmName,
+                        agentLogPath,
+                        chunk =>
+                        {
+                            if (!string.IsNullOrEmpty(chunk))
+                                _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
+                        },
+                        adoptionDeadline,
+                        timeoutCts.Token));
             }
-            return adoptionExitCode;
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                timeoutCts.Cancel();
+                throw;
+            }
+            catch (OperationCanceledException ex)
+            {
+                var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
+                _log.LogWarning(ex,
+                    "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
+                    vmName, itemId, error);
+                return null;
+            }
+            catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
+            {
+                _log.LogWarning(adoptionEx,
+                    "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
+                    vmName, itemId);
+                return null;
+            }
+
+            try
+            {
+                await WaitForTaskOrTimeoutAsync(adoptionTask, adoptionDeadline, ct);
+                var adoptionExitCode = await adoptionTask;
+                if (adoptionExitCode is null)
+                {
+                    _log.LogWarning(
+                        "Startup adoption deadline elapsed for sandbox {VmName} (work item {WorkItemId}); the resumed agent has not signalled completion within {Deadline}. The work item will recover via the stranded-item path.",
+                        vmName, itemId, adoptionDeadline);
+                }
+                return adoptionExitCode;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                timeoutCts.Cancel();
+                throw;
+            }
+            catch (TimeoutException)
+            {
+                timeoutCts.Cancel();
+                ObserveProviderTaskException(adoptionTask);
+                _log.LogWarning(
+                    "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
+                    vmName, itemId, adoptionDeadline);
+                return null;
+            }
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+            {
+                ObserveProviderTaskException(adoptionTask);
+                _log.LogWarning(
+                    "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
+                    vmName, itemId, adoptionDeadline);
+                return null;
+            }
+            catch (OperationCanceledException ex)
+            {
+                var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
+                _log.LogWarning(ex,
+                    "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
+                    vmName, itemId, error);
+                return null;
+            }
+            catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
+            {
+                _log.LogWarning(adoptionEx,
+                    "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
+                    vmName, itemId);
+                return null;
+            }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        finally
         {
-            timeoutCts.Cancel();
-            throw;
-        }
-        catch (TimeoutException)
-        {
-            timeoutCts.Cancel();
-            ObserveProviderTaskException(adoptionTask);
-            _log.LogWarning(
-                "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
-                vmName, itemId, adoptionDeadline);
-            return null;
-        }
-        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
-        {
-            ObserveProviderTaskException(adoptionTask);
-            _log.LogWarning(
-                "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
-                vmName, itemId, adoptionDeadline);
-            return null;
-        }
-        catch (OperationCanceledException ex)
-        {
-            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
-            _log.LogWarning(ex,
-                "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
-                vmName, itemId, error);
-            return null;
-        }
-        catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
-        {
-            _log.LogWarning(adoptionEx,
-                "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
-                vmName, itemId);
-            return null;
+            await timeoutTimer.DisposeAsync();
         }
     }
 
@@ -720,7 +754,10 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     {
         var timeout = CurrentOptions().ResumeTimeout;
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeout);
+        // Cancel the provider token on the injected clock so it fires on the same
+        // clock as the WaitAsync below; CancelAfter has no TimeProvider overload
+        // and would otherwise stay on the system clock (mixed-clock trap).
+        var timeoutTimer = CreateTimeoutCancellationTimer(timeoutCts, timeout);
 
         Task<bool>? promoteTask = null;
         try
@@ -732,7 +769,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                     refName,
                     $"codeybox: suspend-resume checkpoint {itemId}",
                     timeoutCts.Token));
-            var pushed = await promoteTask.WaitAsync(timeout, ct);
+            var pushed = await promoteTask.WaitAsync(timeout, _time, ct);
             if (pushed)
                 return true;
 
@@ -783,6 +820,10 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 vmName, refName, itemId);
             return false;
         }
+        finally
+        {
+            await timeoutTimer.DisposeAsync();
+        }
     }
 
     private static void ObserveProviderTaskException(Task task)
@@ -825,10 +866,42 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
     }
 
+    /// <summary>
+    /// Clock-aware equivalent of <see cref="CancellationTokenSource.CancelAfter(TimeSpan)"/>:
+    /// schedules a single <see cref="CancellationTokenSource.Cancel()"/> on the
+    /// injected <see cref="_time"/> after <paramref name="timeout"/>. The CTS
+    /// version is hard-wired to the system clock; using an <see cref="ITimer"/>
+    /// from <see cref="_time"/> keeps the cancellation on the same clock as the
+    /// <c>WaitAsync(…, _time, …)</c>/<see cref="WaitForTaskOrTimeoutAsync"/> wait,
+    /// so a fake-clock <c>Advance()</c> that fires the wait also fires the
+    /// provider-token cancellation (no mixed-clock trap). Under the default
+    /// <see cref="TimeProvider.System"/> the timer fires on the thread pool, so
+    /// production semantics match <c>CancelAfter</c>. The caller must dispose the
+    /// returned timer (a <c>finally</c>) so a completed-before-timeout path does
+    /// not leak a pending callback. Cancelling an already-disposed CTS is a
+    /// no-op, so a late timer tick after disposal of the CTS is harmless.
+    /// </summary>
+    private ITimer CreateTimeoutCancellationTimer(CancellationTokenSource timeoutCts, TimeSpan timeout) =>
+        _time.CreateTimer(
+            static state =>
+            {
+                try
+                {
+                    ((CancellationTokenSource)state!).Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // The wait completed and disposed the CTS before this fired.
+                }
+            },
+            timeoutCts,
+            timeout,
+            Timeout.InfiniteTimeSpan);
+
     private static bool UseShortResumeTimeoutWait(TimeSpan timeout) =>
         timeout <= TimeSpan.FromSeconds(5);
 
-    private static async Task WaitForTaskOrTimeoutAsync(Task task, TimeSpan timeout, CancellationToken ct)
+    private async Task WaitForTaskOrTimeoutAsync(Task task, TimeSpan timeout, CancellationToken ct)
     {
         if (task.IsCompleted)
         {
@@ -837,7 +910,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var timeoutTask = Task.Delay(timeout, timeoutCts.Token);
+        var timeoutTask = Task.Delay(timeout, _time, timeoutCts.Token);
         var completedTask = await Task.WhenAny(task, timeoutTask).ConfigureAwait(false);
         if (ReferenceEquals(completedTask, task))
         {

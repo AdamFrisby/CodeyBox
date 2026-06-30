@@ -7,6 +7,14 @@ using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Webhooks;
 
+// Disambiguate from the namespace-scope test-local FakeTimeProvider defined in
+// AgentClassRouterScoreTests.cs (overrides only GetUtcNow, so its CreateTimer
+// uses the system clock — a using-alias cannot override that same-namespace
+// type, hence the distinct alias name). The startup-resume timeout tests need
+// the framework FakeTimeProvider whose CreateTimer fires deterministically on
+// Advance().
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
+
 namespace CodeyBox.Tests;
 
 /// <summary>
@@ -61,6 +69,81 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
 
         Assert.True(await condition(), "condition was not met before the timeout elapsed");
+    }
+
+    /// <summary>
+    /// Drives an injected <see cref="ControllableTimeProvider"/> forward until a resume
+    /// sweep whose only completion path is the configured ResumeTimeout firing
+    /// has run to completion. The provider call under test hangs, so the sweep
+    /// can only finish when the <c>Task.Delay(timeout, fakeTime, …)</c> timer
+    /// elapses; advancing the fake clock fires that timer synchronously.
+    ///
+    /// <para>There is an unavoidable scheduling gap between the moment the
+    /// resume coroutine starts and the moment it registers its delay timer
+    /// against the fake clock. We close that gap by re-advancing in a tight
+    /// loop (each <see cref="ControllableTimeProvider.Advance"/> fires any timer that is
+    /// already registered) and yielding so the continuation can run. The real
+    /// wall-clock deadline is only a backstop against a genuine hang regression,
+    /// not the mechanism that makes the timeout fire — so it does not reintroduce
+    /// the wall-clock flakiness this refactor removes.</para>
+    /// </summary>
+    private static async Task AdvancePastResumeTimeoutAsync(
+        ControllableTimeProvider fakeTime,
+        Task resume,
+        TimeSpan timeout)
+    {
+        var backstop = DateTime.UtcNow.AddSeconds(30);
+        while (!resume.IsCompleted)
+        {
+            fakeTime.Advance(timeout);
+            // Let the timeout continuation, the post-cancellation observation,
+            // and the SQLite UPDATE run before checking again.
+            await Task.Yield();
+            if (resume.IsCompleted)
+                break;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(2));
+            if (DateTime.UtcNow > backstop)
+                break;
+        }
+
+        // Surface any fault/cancellation from the sweep and assert it actually
+        // completed within the backstop (a real regression that ignores the
+        // configured timeout would trip this).
+        await resume;
+        Assert.True(resume.IsCompletedSuccessfully,
+            "resume sweep did not complete after advancing the injected clock past the configured timeout");
+    }
+
+    /// <summary>
+    /// Background-mode variant of <see cref="AdvancePastResumeTimeoutAsync"/>:
+    /// the sweep runs on an internal background thread that is not directly
+    /// awaitable, so we advance the injected clock past the configured timeout
+    /// in a loop until the supplied completion condition (typically the startup
+    /// recovery barrier) trips. As with the awaitable variant, the fake clock —
+    /// not the wall clock — is what fires the resume timeout; the real-time
+    /// backstop only guards against a genuine non-completion regression.
+    /// </summary>
+    private static async Task AdvancePastResumeTimeoutUntilAsync(
+        ControllableTimeProvider fakeTime,
+        Func<bool> completed,
+        TimeSpan timeout)
+    {
+        var backstop = DateTime.UtcNow.AddSeconds(30);
+        while (!completed())
+        {
+            fakeTime.Advance(timeout);
+            await Task.Yield();
+            if (completed())
+                break;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(2));
+            if (DateTime.UtcNow > backstop)
+                break;
+        }
+
+        Assert.True(completed(),
+            "background resume sweep did not complete after advancing the injected clock past the configured timeout");
     }
 
     private static void AssertResumeTimeoutHonored(TimeSpan elapsed, TimeSpan configuredTimeout)
@@ -704,16 +787,21 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var provider = new FakeSuspendingProvider { ResumeHangs = true };
         var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             log,
             NoopStartupRecoveryInputSink.Instance,
-            resumeTimeout: configuredTimeout);
+            resumeTimeout: configuredTimeout,
+            timeProvider: fakeTime);
 
-        var sw = Stopwatch.StartNew();
-        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
-        sw.Stop();
+        // The resume provider call hangs forever; the only thing that can
+        // complete the sweep is the configured ResumeTimeout firing. Drive the
+        // injected clock past the timeout deterministically instead of waiting
+        // on a real Task.Delay that starves under CPU saturation.
+        var resume = svc.ResumeAllForTestAsync(CancellationToken.None);
+        await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout);
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, after!.State);
@@ -729,7 +817,57 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             && string.Equals(vmName?.ToString(), "vm-hung-start", StringComparison.Ordinal)
             && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
             && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
-        AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
+    }
+
+    [Fact]
+    public async Task StartupResume_LongResumeTimeout_AboveFiveSeconds_FiresViaInjectedClockNotWallClock()
+    {
+        // The >5s branch of TryResumeSandboxAsync takes the
+        // WaitAsync(timeout, _time, ct) path AND cancels the provider token via
+        // CreateTimeoutCancellationTimer (an ITimer on the injected clock). A
+        // configuredTimeout > 5s exercises that branch specifically: the only
+        // thing that can complete the hung sweep is the injected clock advancing
+        // past the timeout. If this branch were still half-converted (CancelAfter
+        // on the system clock), advancing the fake clock would still fire the
+        // WaitAsync but never cancel the provider token; the assertions below —
+        // and the fact the sweep completes purely via Advance() with no real
+        // wall-clock wait — prove the whole branch is single-clock.
+        var configuredTimeout = TimeSpan.FromSeconds(30);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-hung-long-start",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var fakeTime = new ControllableTimeProvider();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            log,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout,
+            timeProvider: fakeTime);
+
+        var resume = svc.ResumeAllForTestAsync(CancellationToken.None);
+        await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("timed out", after.LastError);
+        Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
+        Assert.Contains(log.Entries, entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+            && entry.Properties.TryGetValue("VmName", out var vmName)
+            && string.Equals(vmName?.ToString(), "vm-hung-long-start", StringComparison.Ordinal)
+            && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
+            && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
     }
 
     [Theory]
@@ -754,14 +892,20 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             },
         };
         var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             log,
             NoopStartupRecoveryInputSink.Instance,
-            resumeTimeout: configuredTimeout);
+            resumeTimeout: configuredTimeout,
+            timeProvider: fakeTime);
 
-        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        // The provider resume blocks on resumeRelease, so the sweep can only
+        // return once the configured ResumeTimeout fires; drive the injected
+        // clock to trip it deterministically.
+        var resume = svc.ResumeAllForTestAsync(CancellationToken.None);
+        await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout);
 
         if (completion == "fault")
         {
@@ -911,17 +1055,22 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         });
 
         var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
             NoopStartupRecoveryInputSink.Instance,
             resumeTimeout: configuredTimeout,
-            mode: SandboxStartupResumeMode.Blocking);
+            mode: SandboxStartupResumeMode.Blocking,
+            timeProvider: fakeTime);
 
-        var sw = Stopwatch.StartNew();
-        await svc.StartingAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
-        sw.Stop();
+        // Blocking mode runs the sweep inline from StartingAsync; the provider
+        // resume hangs, so completion is gated solely on the configured
+        // ResumeTimeout firing. Advance the injected clock to honor it
+        // deterministically.
+        var starting = svc.StartingAsync(CancellationToken.None);
+        await AdvancePastResumeTimeoutAsync(fakeTime, starting, configuredTimeout);
         await svc.StartAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
@@ -929,7 +1078,6 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after.SuspendedVmName);
         Assert.Single(provider.ResumedNames);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
-        AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
     }
 
     [Fact]
@@ -944,21 +1092,25 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         });
 
         var provider = new FakeSuspendingProvider { ResumeBlocksBeforeReturningTask = true };
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
             NoopStartupRecoveryInputSink.Instance,
             resumeTimeout: configuredTimeout,
-            mode: SandboxStartupResumeMode.Blocking);
+            mode: SandboxStartupResumeMode.Blocking,
+            timeProvider: fakeTime);
 
-        var sw = Stopwatch.StartNew();
+        // The provider blocks on its dedicated LongRunning thread before ever
+        // returning a Task, so the sweep can only finish when the configured
+        // ResumeTimeout fires. Wait for the block to be entered (deterministic),
+        // then advance the injected clock to honor the timeout.
         var resumeTask = Task.Run(() => svc.StartingAsync(CancellationToken.None));
-        await provider.ResumeBlockEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await provider.ResumeBlockEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         try
         {
-            await resumeTask.WaitAsync(TimeSpan.FromSeconds(5));
-            sw.Stop();
+            await AdvancePastResumeTimeoutAsync(fakeTime, resumeTask, configuredTimeout);
         }
         finally
         {
@@ -970,7 +1122,6 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after.SuspendedVmName);
         Assert.Contains("timed out", after.LastError);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
-        AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
     }
 
     [Fact]
@@ -1023,15 +1174,23 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             SuspendedAt = DateTimeOffset.UtcNow,
         });
 
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
         var provider = new FakeSuspendingProvider { ResumeObservesCancellation = true };
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
             NoopStartupRecoveryInputSink.Instance,
-            resumeTimeout: TimeSpan.FromMilliseconds(50));
+            resumeTimeout: configuredTimeout,
+            timeProvider: fakeTime);
 
-        await svc.ResumeAllForTestAsync(CancellationToken.None);
+        // The provider spins until its resume cancellation token trips, which
+        // only happens when the configured ResumeTimeout fires and cancels the
+        // linked token. Advance the injected clock to honor that timeout
+        // deterministically.
+        var resume = svc.ResumeAllForTestAsync(CancellationToken.None);
+        await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout);
 
         // The provider task runs on a separate thread and may set
         // ResumeCancellationObserved after TryResumeSandboxAsync returns, so
@@ -1259,21 +1418,29 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             SuspendedAt = DateTimeOffset.UtcNow,
         });
 
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
         var provider = new FakeSuspendingProvider { ResumeHangs = true };
         var barrier = new StartupRecoveryBarrier();
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
             barrier,
-            resumeTimeout: TimeSpan.FromMilliseconds(50),
-            mode: SandboxStartupResumeMode.Background);
+            resumeTimeout: configuredTimeout,
+            mode: SandboxStartupResumeMode.Background,
+            timeProvider: fakeTime);
 
         using var startupCts = new CancellationTokenSource();
         await svc.StartAsync(startupCts.Token);
         startupCts.Cancel();
 
-        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        // Background-mode sweep hangs on the provider resume; its only completion
+        // path is the configured ResumeTimeout firing. Drive the injected clock
+        // until the recovery barrier signals the sweep finished.
+        await AdvancePastResumeTimeoutUntilAsync(
+            fakeTime, () => barrier.RecoveryInputReady.IsCompleted, configuredTimeout);
+        await barrier.RecoveryInputReady;
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, after!.State);
