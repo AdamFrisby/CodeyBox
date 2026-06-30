@@ -55,7 +55,8 @@ public sealed class MultipassResourceMetricsTests : IDisposable
         var opts = new MultipassSandboxOptions
         {
             MultipassBinary = "multipass",
-            StagingDirectory = "/tmp/codeybox-test-staging"
+            StagingDirectory = "/tmp/codeybox-test-staging",
+            CaptureResourceMetrics = true
         };
 
         var spec = new SandboxSpec
@@ -105,7 +106,8 @@ public sealed class MultipassResourceMetricsTests : IDisposable
         var opts = new MultipassSandboxOptions
         {
             MultipassBinary = "multipass",
-            StagingDirectory = "/tmp/codeybox-test-staging"
+            StagingDirectory = "/tmp/codeybox-test-staging",
+            CaptureResourceMetrics = true
         };
 
         var spec = new SandboxSpec

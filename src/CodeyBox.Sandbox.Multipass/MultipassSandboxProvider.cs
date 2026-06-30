@@ -4944,6 +4944,13 @@ public sealed record MultipassSandboxOptions
     public int BaselineCpus { get; init; } = 6;
 
     /// <summary>
+    /// When true, <see cref="MultipassSandbox"/> makes one best-effort in-VM
+    /// exec during disposal to capture teardown resource metrics. Disabled by
+    /// default so ordinary teardown paths do not gain a hidden extra exec.
+    /// </summary>
+    public bool CaptureResourceMetrics { get; init; }
+
+    /// <summary>
     /// Disk-guard configuration. When set, <see cref="MultipassSandboxProvider"/>
     /// checks free space on the configured mounts before every VM launch and
     /// throws <see cref="CodeyBox.Core.SandboxDiskDeferredException"/> when any
@@ -6721,10 +6728,16 @@ while True:
             return;
         }
 
-        var (peakRam, avgCpu, netIo) = await CaptureResourceMetricsAsync(CancellationToken.None).ConfigureAwait(false);
-        if (peakRam.HasValue || avgCpu.HasValue || netIo.HasValue)
+        long? peakRam = null;
+        double? avgCpu = null;
+        long? netIo = null;
+        if (_opts.CaptureResourceMetrics)
         {
-            _resourceMetrics = new SandboxResourceMetrics(peakRam, avgCpu, netIo);
+            (peakRam, avgCpu, netIo) = await CaptureResourceMetricsAsync(CancellationToken.None).ConfigureAwait(false);
+            if (peakRam.HasValue || avgCpu.HasValue || netIo.HasValue)
+            {
+                _resourceMetrics = new SandboxResourceMetrics(peakRam, avgCpu, netIo);
+            }
         }
 
         _disposed = true;

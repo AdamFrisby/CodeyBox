@@ -507,6 +507,7 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
                 MaxConcurrentBoots = multipassSandbox.MaxConcurrentBoots,
                 BootLaunchDelay = TimeSpan.FromMilliseconds(multipassSandbox.BootLaunchDelayMs),
                 DisableAgentOutputHttpIngest = multipassSandbox.DisableAgentOutputHttpIngest,
+                CaptureResourceMetrics = multipassSandbox.CaptureResourceMetrics,
                 DiskGuard = diskGuard,
                 PackageCacheSeeds = live.MultipassPackageCacheSeeds?.Select(s => new PackageCacheSeedOptions
                 {
@@ -3500,6 +3501,13 @@ namespace CodeyBox.Api
         /// transport drops a freshly-created sandbox's agent stdout + exit code.
         /// </summary>
         public bool DisableAgentOutputHttpIngest { get; set; }
+
+        /// <summary>
+        /// When true, multipass sandbox disposal makes one short best-effort
+        /// in-VM exec before delete/preserve teardown to capture resource
+        /// metrics for capacity planning. Default false.
+        /// </summary>
+        public bool CaptureResourceMetrics { get; set; }
     }
 
     /// <summary>
