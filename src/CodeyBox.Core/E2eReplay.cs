@@ -176,6 +176,20 @@ public sealed record E2eRun
     public string? BatchId { get; init; }
 }
 
+/// <summary>Count-only summary for one E2E run batch.</summary>
+public sealed record E2eRunBatchCounts(
+    string BatchId,
+    int Total,
+    int Queued,
+    int Running,
+    int Passed,
+    int Failed,
+    int Error,
+    int Canceled)
+{
+    public bool Complete => Queued == 0 && Running == 0;
+}
+
 /// <summary>
 /// Terminal outcome of a single replay. Stored serialized in <see cref="E2eRun.Result"/>.
 /// Kept in Core so callers, the dispatcher, the API, and the tests share the shape.

@@ -57,9 +57,11 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// <see cref="SandboxExecResult"/> with that exit code, exactly like local
 /// multipass.</para>
 ///
-/// <para><b>Scope (step 1 of 2).</b> This provider intentionally does NOT
-/// implement: baseline image bake/clone, suspend/resume, shutdown teardown,
-/// disk-guard preflight, package-cache seeding. Those host-side concerns
+/// <para><b>Scope.</b> This provider supports cloning from an operator-baked
+/// remote Multipass baseline when <see cref="SandboxSpec.BaselineImageRef"/>
+/// is set. It intentionally does NOT implement: baseline image bake,
+/// suspend/resume, shutdown teardown, disk-guard preflight, package-cache
+/// seeding. Those host-side concerns
 /// either don't translate cleanly to a remote host without further design
 /// (suspend/resume needs network-stable VM identity across orchestrator
 /// restarts; baselines need a per-remote-host cache) or are operator-tuning
@@ -148,10 +150,10 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             }
         }
 
-        // 3) Launch the VM on the remote host. We deliberately keep the
-        //    cloud-init shape minimal in step 1 — operators who need package
-        //    install on first boot can pre-bake the remote multipass image
-        //    or use a baseline image (a future step).
+        // 3) Create the VM on the remote host. E2E replays pass
+        //    BaselineImageRef and take the clone path so expensive setup is
+        //    amortized into the remote image once. Legacy remote coding
+        //    sandboxes without a baseline pin keep the launch path.
         var launchArgv = new List<string> { opts.RemoteMultipassPath, "launch", "--name", vmName };
         if (spec.Limits.CpuCount is { } cpu) { launchArgv.Add("--cpus"); launchArgv.Add(cpu.ToString(CultureInfo.InvariantCulture)); }
         if (spec.Limits.MemoryBytes is { } mem) { launchArgv.Add("--memory"); launchArgv.Add(((mem + (1L << 30) - 1) >> 30).ToString(CultureInfo.InvariantCulture) + "G"); }
@@ -163,7 +165,16 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
         try
         {
-            await RunRemoteOrThrowAsync(launchArgv, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(spec.BaselineImageRef))
+            {
+                await CloneRemoteBaselineAsync(opts, spec.BaselineImageRef!, vmName, ct).ConfigureAwait(false);
+                await RunRemoteOrThrowAsync([opts.RemoteMultipassPath, "start", vmName], ct).ConfigureAwait(false);
+            }
+            else
+            {
+                await RunRemoteOrThrowAsync(launchArgv, ct).ConfigureAwait(false);
+            }
+
             await WaitForVmStateAsync(vmName, "Running", opts.VmStartTimeout, ct).ConfigureAwait(false);
 
             // 4) Apply environment via a stamped /etc/environment.d fragment.
@@ -349,6 +360,17 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         if (r.ExitCode != 0)
             throw new InvalidOperationException(
                 $"Failed to create remote sandbox staging dir '{remoteSandboxRoot}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}");
+    }
+
+    private async Task CloneRemoteBaselineAsync(
+        MultipassRemoteSandboxOptions opts,
+        string baselineName,
+        string vmName,
+        CancellationToken ct)
+    {
+        await RunRemoteOrThrowAsync([opts.RemoteMultipassPath, "stop", baselineName], ct).ConfigureAwait(false);
+        await WaitForVmStateAsync(baselineName, "Stopped", opts.VmStopTimeout, ct).ConfigureAwait(false);
+        await RunRemoteOrThrowAsync([opts.RemoteMultipassPath, "clone", baselineName, "--name", vmName], ct).ConfigureAwait(false);
     }
 
     private async Task ApplyVmEnvironmentAsync(string vmName, IReadOnlyDictionary<string, string> env, CancellationToken ct)

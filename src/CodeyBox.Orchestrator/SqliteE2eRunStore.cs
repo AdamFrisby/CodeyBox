@@ -105,14 +105,20 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
         }
     }
 
-    public async IAsyncEnumerable<E2eRun> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<E2eRun> ListAsync(
+        int offset = 0,
+        int limit = E2eExecutionOptions.DefaultListPageSize,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<E2eRun>();
+        var page = NormalizePage(offset, limit);
         await _writeLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT * FROM e2e_runs ORDER BY created_at DESC;";
+            cmd.CommandText = "SELECT * FROM e2e_runs ORDER BY created_at DESC LIMIT $limit OFFSET $offset;";
+            cmd.Parameters.AddWithValue("$limit", page.Limit);
+            cmd.Parameters.AddWithValue("$offset", page.Offset);
             using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
@@ -126,15 +132,22 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
         foreach (var row in rows) yield return row;
     }
 
-    public async IAsyncEnumerable<E2eRun> ListByTestCaseAsync(string testCaseId, [EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<E2eRun> ListByTestCaseAsync(
+        string testCaseId,
+        int offset = 0,
+        int limit = E2eExecutionOptions.DefaultListPageSize,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<E2eRun>();
+        var page = NormalizePage(offset, limit);
         await _writeLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT * FROM e2e_runs WHERE test_case_id = $tc ORDER BY created_at DESC;";
+            cmd.CommandText = "SELECT * FROM e2e_runs WHERE test_case_id = $tc ORDER BY created_at DESC LIMIT $limit OFFSET $offset;";
             cmd.Parameters.AddWithValue("$tc", testCaseId);
+            cmd.Parameters.AddWithValue("$limit", page.Limit);
+            cmd.Parameters.AddWithValue("$offset", page.Offset);
             using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
@@ -148,26 +161,78 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
         foreach (var row in rows) yield return row;
     }
 
-    public async IAsyncEnumerable<E2eRun> ListByBatchAsync(string batchId, [EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<E2eRun> ListByBatchAsync(
+        string batchId,
+        int offset = 0,
+        int limit = E2eExecutionOptions.DefaultListPageSize,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<E2eRun>();
+        var page = NormalizePage(offset, limit);
         await _writeLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT * FROM e2e_runs WHERE batch_id = $bt ORDER BY created_at ASC;";
+            cmd.CommandText = "SELECT * FROM e2e_runs WHERE batch_id = $bt ORDER BY created_at ASC LIMIT $limit OFFSET $offset;";
+            cmd.Parameters.AddWithValue("$bt", batchId);
+            cmd.Parameters.AddWithValue("$limit", page.Limit);
+            cmd.Parameters.AddWithValue("$offset", page.Offset);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                rows.Add(Read(reader));
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        foreach (var row in rows) yield return row;
+    }
+
+    public async Task<E2eRunBatchCounts?> GetBatchCountsAsync(string batchId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT status, COUNT(*)
+                FROM e2e_runs
+                WHERE batch_id = $bt
+                GROUP BY status;
+                """;
             cmd.Parameters.AddWithValue("$bt", batchId);
             using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var total = 0;
+            var queued = 0;
+            var running = 0;
+            var passed = 0;
+            var failed = 0;
+            var error = 0;
+            var canceled = 0;
             while (await reader.ReadAsync(ct))
             {
-                rows.Add(Read(reader));
+                var status = reader.GetString(0);
+                var count = reader.GetInt32(1);
+                total += count;
+                if (string.Equals(status, nameof(E2eRunStatus.Queued), StringComparison.OrdinalIgnoreCase)) queued = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Running), StringComparison.OrdinalIgnoreCase)) running = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Passed), StringComparison.OrdinalIgnoreCase)) passed = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Failed), StringComparison.OrdinalIgnoreCase)) failed = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Error), StringComparison.OrdinalIgnoreCase)) error = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Canceled), StringComparison.OrdinalIgnoreCase)) canceled = count;
             }
+
+            return total == 0
+                ? null
+                : new E2eRunBatchCounts(batchId, total, queued, running, passed, failed, error, canceled);
         }
         finally
         {
             _writeLock.Release();
         }
-        foreach (var row in rows) yield return row;
     }
 
     public async Task<bool> HasQueuedAsync(CancellationToken ct = default)
@@ -366,5 +431,13 @@ public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
             SandboxId = r.IsDBNull(r.GetOrdinal("sandbox_id")) ? null : r.GetString(r.GetOrdinal("sandbox_id")),
             BatchId = r.IsDBNull(r.GetOrdinal("batch_id")) ? null : r.GetString(r.GetOrdinal("batch_id")),
         };
+    }
+
+    private static (int Offset, int Limit) NormalizePage(int offset, int limit)
+    {
+        if (offset < 0) offset = 0;
+        if (limit < 1) limit = E2eExecutionOptions.DefaultListPageSize;
+        if (limit > E2eExecutionOptions.MaximumListPageSize) limit = E2eExecutionOptions.MaximumListPageSize;
+        return (offset, limit);
     }
 }

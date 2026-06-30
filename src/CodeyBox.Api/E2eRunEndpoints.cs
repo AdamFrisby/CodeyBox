@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
@@ -24,6 +25,7 @@ internal static class E2eRunEndpoints
 
         app.MapGet("/testcases/{testCaseId}/runs", ListByTestCaseAsync);
         app.MapGet("/e2eruns/batches/{batchId}", ListByBatchAsync);
+        app.MapGet("/e2eruns/batches/{batchId}/runs", ListBatchRunsAsync);
     }
 
     private static async Task<IResult> EnqueueAsync(
@@ -104,11 +106,16 @@ internal static class E2eRunEndpoints
         return Results.Ok(new EnqueueBulkE2eRunsResponse(batchId, created));
     }
 
-    private static async Task<IResult> ListAsync(IE2eRunStore runs, CancellationToken ct)
+    private static async Task<IResult> ListAsync(
+        IE2eRunStore runs,
+        [FromQuery] int? offset,
+        [FromQuery] int? limit,
+        CancellationToken ct)
     {
+        var page = NormalizePage(offset, limit);
         var list = new List<E2eRunDto>();
-        await foreach (var r in runs.ListAsync(ct)) list.Add(ToDto(r));
-        return Results.Ok(list);
+        await foreach (var r in runs.ListAsync(page.Offset, page.Limit, ct)) list.Add(ToDto(r));
+        return Results.Ok(new E2eRunPageDto(page.Offset, page.Limit, list));
     }
 
     private static async Task<IResult> GetAsync(string id, IE2eRunStore runs, CancellationToken ct)
@@ -125,10 +132,17 @@ internal static class E2eRunEndpoints
     {
         var run = await runs.GetAsync(id, ct);
         if (run is null) return Results.NotFound();
+        var signaledRunningRun = run.Status == E2eRunStatus.Running;
         if (run.Status == E2eRunStatus.Running)
             cancellations.Cancel(id);
         var ok = await runs.CancelAsync(id, ct);
-        if (!ok) return Results.Conflict(new { error = $"run '{id}' is already terminal (status={run.Status})" });
+        if (!ok)
+        {
+            var current = await runs.GetAsync(id, ct);
+            if (signaledRunningRun && current?.Status == E2eRunStatus.Canceled)
+                return Results.Ok(ToDto(current));
+            return Results.Conflict(new { error = $"run '{id}' is already terminal (status={current?.Status ?? run.Status})" });
+        }
         var refreshed = await runs.GetAsync(id, ct);
         return refreshed is null ? Results.NoContent() : Results.Ok(ToDto(refreshed));
     }
@@ -137,54 +151,51 @@ internal static class E2eRunEndpoints
         string testCaseId,
         ITestCaseStore testCases,
         IE2eRunStore runs,
+        [FromQuery] int? offset,
+        [FromQuery] int? limit,
         CancellationToken ct)
     {
         var testCase = await testCases.GetAsync(testCaseId, ct);
         if (testCase is null)
             return Results.NotFound(new { error = $"TestCase '{testCaseId}' not found" });
 
+        var page = NormalizePage(offset, limit);
         var list = new List<E2eRunDto>();
-        await foreach (var r in runs.ListByTestCaseAsync(testCaseId, ct)) list.Add(ToDto(r));
-        return Results.Ok(list);
+        await foreach (var r in runs.ListByTestCaseAsync(testCaseId, page.Offset, page.Limit, ct)) list.Add(ToDto(r));
+        return Results.Ok(new E2eRunPageDto(page.Offset, page.Limit, list));
     }
 
     private static async Task<IResult> ListByBatchAsync(string batchId, IE2eRunStore runs, CancellationToken ct)
     {
-        var list = new List<E2eRunDto>();
-        await foreach (var r in runs.ListByBatchAsync(batchId, ct)) list.Add(ToDto(r));
-        if (list.Count == 0) return Results.NotFound();
-
-        var summary = SummariseBatch(batchId, list);
-        return Results.Ok(summary);
+        var counts = await runs.GetBatchCountsAsync(batchId, ct);
+        return counts is null ? Results.NotFound() : Results.Ok(ToBatchSummaryDto(counts));
     }
 
-    private static BatchSummaryDto SummariseBatch(string batchId, IReadOnlyList<E2eRunDto> runs)
+    private static async Task<IResult> ListBatchRunsAsync(
+        string batchId,
+        IE2eRunStore runs,
+        [FromQuery] int? offset,
+        [FromQuery] int? limit,
+        CancellationToken ct)
     {
-        int queued = 0, running = 0, passed = 0, failed = 0, error = 0, canceled = 0;
-        foreach (var r in runs)
-        {
-            switch (r.Status)
-            {
-                case E2eRunStatus.Queued: queued++; break;
-                case E2eRunStatus.Running: running++; break;
-                case E2eRunStatus.Passed: passed++; break;
-                case E2eRunStatus.Failed: failed++; break;
-                case E2eRunStatus.Error: error++; break;
-                case E2eRunStatus.Canceled: canceled++; break;
-            }
-        }
-        return new BatchSummaryDto(
-            batchId,
-            runs.Count,
-            queued,
-            running,
-            passed,
-            failed,
-            error,
-            canceled,
-            queued == 0 && running == 0,
-            runs);
+        var counts = await runs.GetBatchCountsAsync(batchId, ct);
+        if (counts is null) return Results.NotFound();
+        var page = NormalizePage(offset, limit);
+        var list = new List<E2eRunDto>();
+        await foreach (var r in runs.ListByBatchAsync(batchId, page.Offset, page.Limit, ct)) list.Add(ToDto(r));
+        return Results.Ok(new E2eRunPageDto(page.Offset, page.Limit, list));
     }
+
+    private static BatchSummaryDto ToBatchSummaryDto(E2eRunBatchCounts counts) => new(
+        counts.BatchId,
+        counts.Total,
+        counts.Queued,
+        counts.Running,
+        counts.Passed,
+        counts.Failed,
+        counts.Error,
+        counts.Canceled,
+        counts.Complete);
 
     private static E2eRunDto ToDto(E2eRun run) => new(
         run.Id,
@@ -193,9 +204,34 @@ internal static class E2eRunEndpoints
         run.CreatedAt,
         run.StartedAt,
         run.FinishedAt,
-        run.Result,
+        DeserializeResult(run.Result),
         run.SandboxId,
         run.BatchId);
+
+    private static E2eRunResult? DeserializeResult(string? result)
+    {
+        if (string.IsNullOrWhiteSpace(result))
+            return null;
+        try
+        {
+            return JsonSerializer.Deserialize<E2eRunResult>(result, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static (int Offset, int Limit) NormalizePage(int? offset, int? limit)
+    {
+        var effectiveOffset = Math.Max(0, offset ?? 0);
+        var effectiveLimit = limit ?? E2eExecutionOptions.DefaultListPageSize;
+        if (effectiveLimit < 1)
+            effectiveLimit = E2eExecutionOptions.DefaultListPageSize;
+        if (effectiveLimit > E2eExecutionOptions.MaximumListPageSize)
+            effectiveLimit = E2eExecutionOptions.MaximumListPageSize;
+        return (effectiveOffset, effectiveLimit);
+    }
 }
 
 public sealed record EnqueueE2eRunRequest(string TestCaseId, string? BatchId = null);
@@ -204,6 +240,8 @@ public sealed record EnqueueBulkE2eRunsRequest(IReadOnlyList<string> TestCaseIds
 
 public sealed record EnqueueBulkE2eRunsResponse(string BatchId, IReadOnlyList<E2eRunDto> Runs);
 
+public sealed record E2eRunPageDto(int Offset, int Limit, IReadOnlyList<E2eRunDto> Runs);
+
 public sealed record E2eRunDto(
     string Id,
     string TestCaseId,
@@ -211,7 +249,7 @@ public sealed record E2eRunDto(
     DateTimeOffset CreatedAt,
     DateTimeOffset? StartedAt,
     DateTimeOffset? FinishedAt,
-    string? Result,
+    E2eRunResult? Result,
     string? SandboxId,
     string? BatchId);
 
@@ -224,5 +262,4 @@ public sealed record BatchSummaryDto(
     int Failed,
     int Error,
     int Canceled,
-    bool Complete,
-    IReadOnlyList<E2eRunDto> Runs);
+    bool Complete);

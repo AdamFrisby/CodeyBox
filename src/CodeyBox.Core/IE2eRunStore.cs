@@ -15,12 +15,14 @@ public interface IE2eRunStore
 
     Task<E2eRun?> GetAsync(string id, CancellationToken ct = default);
 
-    /// <summary>Lists all runs, newest-first.</summary>
-    IAsyncEnumerable<E2eRun> ListAsync(CancellationToken ct = default);
+    /// <summary>Lists runs newest-first using a bounded page.</summary>
+    IAsyncEnumerable<E2eRun> ListAsync(int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default);
 
-    IAsyncEnumerable<E2eRun> ListByTestCaseAsync(string testCaseId, CancellationToken ct = default);
+    IAsyncEnumerable<E2eRun> ListByTestCaseAsync(string testCaseId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default);
 
-    IAsyncEnumerable<E2eRun> ListByBatchAsync(string batchId, CancellationToken ct = default);
+    IAsyncEnumerable<E2eRun> ListByBatchAsync(string batchId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default);
+
+    Task<E2eRunBatchCounts?> GetBatchCountsAsync(string batchId, CancellationToken ct = default);
 
     /// <summary>Returns true when at least one queued run is available to claim.</summary>
     Task<bool> HasQueuedAsync(CancellationToken ct = default);

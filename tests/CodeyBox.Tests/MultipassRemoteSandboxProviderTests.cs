@@ -62,6 +62,39 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_with_baseline_ref_clones_remote_baseline_instead_of_launching()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        const string baseline = "cb-e2e-baseline";
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info"))
+            {
+                var vm = VmNameFromInfo(argv);
+                return InfoJson(vm, vm == baseline ? "Stopped" : "Running");
+            }
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            BaselineImageRef = baseline,
+            WorkingDirectory = "/work",
+        });
+
+        Assert.Contains(transport.RecordedCalls, c =>
+            c.Argv.SequenceEqual([opts.RemoteMultipassPath, "clone", baseline, "--name", sb.Id]));
+        Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
+
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
     public async Task ExecAsync_streams_stdout_chunks_to_callback_in_order()
     {
         var opts = DefaultOptions();
@@ -343,6 +376,17 @@ public sealed class MultipassRemoteSandboxProviderTests
         0,
         $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}",
         "");
+
+    private static ProcessRunResult InfoJson(string vm, string state) => new(
+        0,
+        $"{{\"info\":{{\"{vm}\":{{\"state\":\"{state}\"}}}}}}",
+        "");
+
+    private static string VmNameFromInfo(IReadOnlyList<string> argv)
+    {
+        var idx = argv.ToList().IndexOf("info");
+        return idx >= 0 && idx + 1 < argv.Count ? argv[idx + 1] : "unknown";
+    }
 
     private static string VmNameFromLastLaunch(FakeRemoteHostTransport transport)
     {

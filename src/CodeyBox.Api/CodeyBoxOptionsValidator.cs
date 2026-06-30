@@ -51,6 +51,30 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             {
                 failures.Add("CodeyBox:E2eExecution:PoolKind must be 'local' or 'remote-ssh'");
             }
+            if (e2e.Enabled
+                && string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(e2e.BaselineImageRef))
+            {
+                failures.Add("CodeyBox:E2eExecution:BaselineImageRef is required when E2E execution is enabled with PoolKind=remote-ssh");
+            }
+            if (e2e.AllowedReadinessOrigins.Count == 0)
+            {
+                failures.Add("CodeyBox:E2eExecution:AllowedReadinessOrigins must contain at least one origin");
+            }
+            foreach (var origin in e2e.AllowedReadinessOrigins)
+            {
+                if (string.IsNullOrWhiteSpace(origin)
+                    || !Uri.TryCreate(origin, UriKind.Absolute, out var uri)
+                    || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+                    || !string.IsNullOrEmpty(uri.AbsolutePath.Trim('/'))
+                    || !string.IsNullOrEmpty(uri.Query)
+                    || !string.IsNullOrEmpty(uri.Fragment)
+                    || !string.IsNullOrEmpty(uri.UserInfo))
+                {
+                    failures.Add("CodeyBox:E2eExecution:AllowedReadinessOrigins entries must be http(s) origins without path, query, fragment, or userinfo");
+                    break;
+                }
+            }
         }
 
         foreach (var (agent, tolerance) in options.AgentNetworkTolerance)

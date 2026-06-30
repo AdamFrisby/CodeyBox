@@ -26,12 +26,11 @@ public sealed class E2eExecutionOptions
     public int MaxConcurrent { get; set; } = 4;
 
     /// <summary>
-    /// Which pool implementation to load. <c>local</c> builds an independent
-    /// provider from the development sandbox configuration and keeps it outside
-    /// the coding fleet's admission gate. <c>remote-ssh</c> fans replays out to
-    /// the existing multipass-over-SSH cheap-CPU pool.
+    /// Which pool implementation to load. <c>remote-ssh</c> fans replays out
+    /// to the E2E-specific multipass-over-SSH cheap-CPU pool. <c>local</c> is
+    /// accepted only for development/test deployments.
     /// </summary>
-    public string PoolKind { get; set; } = "local";
+    public string PoolKind { get; set; } = "remote-ssh";
 
     /// <summary>
     /// Logical network profile name used for cloned sandboxes (passed through
@@ -59,6 +58,19 @@ public sealed class E2eExecutionOptions
     public string? BaselineImageRef { get; set; }
 
     /// <summary>
+    /// Origins the artifact readiness URL may probe. Values are normalized as
+    /// URL origins (<c>scheme://host[:port]</c>) and compared exactly before
+    /// any network request is made. Defaults to the conventional app-under-test
+    /// DNS name baked into E2E images; production deployments should override
+    /// this with their own app origin(s).
+    /// </summary>
+    public IReadOnlyList<string> AllowedReadinessOrigins { get; set; } =
+    [
+        "http://app.local",
+        "https://app.local",
+    ];
+
+    /// <summary>
     /// How often the dispatcher polls for queued runs when the pool is idle.
     /// Defaults to 1 second; raise to reduce DB churn on deployments with low
     /// enqueue cadence. Hot-reloadable.
@@ -72,6 +84,12 @@ public sealed class E2eExecutionOptions
     /// fast; a stuck run is almost always an infra issue.
     /// </summary>
     public TimeSpan PerRunTimeout { get; set; } = TimeSpan.FromMinutes(15);
+
+    /// <summary>Default API page size for E2E run listing endpoints.</summary>
+    public const int DefaultListPageSize = 100;
+
+    /// <summary>Strict maximum API page size for E2E run listing endpoints.</summary>
+    public const int MaximumListPageSize = 500;
 
     /// <summary>Floor for <see cref="MaxConcurrent"/>.</summary>
     public const int MinimumMaxConcurrent = 1;

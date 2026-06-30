@@ -276,7 +276,9 @@ builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSectio
 // CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
 // (for the unbound-key validator's walk and operator visibility); the standalone
 // binding is what gets hot-reloaded into the pool's MaxConcurrent.
-builder.Services.Configure<E2eExecutionOptions>(builder.Configuration.GetSection("CodeyBox:E2eExecution"));
+builder.Services.AddOptions<E2eExecutionOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:E2eExecution"))
+    .Validate(static opts => IsValidE2eExecutionOptions(opts), "CodeyBox:E2eExecution is invalid");
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
 // map-shaped binding (audit-type / language overrides / profile inheritance) on
@@ -475,11 +477,39 @@ static IE2eExecutionPool BuildE2eExecutionPool(IServiceProvider sp)
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var e2eOptions = sp.GetRequiredService<IOptionsMonitor<E2eExecutionOptions>>();
-    var poolKind = (e2eOptions.CurrentValue.PoolKind ?? "local").Trim().ToLowerInvariant();
+    var poolKind = (e2eOptions.CurrentValue.PoolKind ?? "remote-ssh").Trim().ToLowerInvariant();
+    var environment = sp.GetRequiredService<IHostEnvironment>();
+    var startupOptions = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+    if (poolKind == "local" && !environment.IsDevelopment())
+    {
+        throw new InvalidOperationException(
+            "CodeyBox:E2eExecution:PoolKind=local is development-only. Use remote-ssh for production E2E replay execution.");
+    }
+
+    if (poolKind == "remote-ssh" && e2eOptions.CurrentValue.Enabled)
+    {
+        if (string.IsNullOrWhiteSpace(e2eOptions.CurrentValue.BaselineImageRef))
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:E2eExecution:BaselineImageRef is required when E2E execution is enabled on PoolKind=remote-ssh; the remote pool clones this pre-baked image per run.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(e2eOptions.CurrentValue.NetworkProfile))
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:E2eExecution:NetworkProfile is not supported by PoolKind=remote-ssh yet. Configure the remote E2E baseline networking directly or leave NetworkProfile unset.");
+        }
+
+        if (string.IsNullOrWhiteSpace(startupOptions.E2eMultipassRemoteSandbox?.SshTarget))
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:E2eMultipassRemoteSandbox:SshTarget is required when E2E execution uses PoolKind=remote-ssh. E2E load must target a pool separate from CodeyBox:MultipassRemoteSandbox.");
+        }
+    }
 
     ISandboxProvider provider = poolKind switch
     {
-        "remote-ssh" => BuildMultipassRemote(sp, loggerFactory),
+        "remote-ssh" => BuildE2eMultipassRemote(sp, loggerFactory),
         "local" => BuildE2eLocalSandboxProvider(sp, loggerFactory),
         _ => throw new InvalidOperationException(
             $"Unknown CodeyBox:E2eExecution:PoolKind '{e2eOptions.CurrentValue.PoolKind}'. Valid: local, remote-ssh"),
@@ -493,11 +523,43 @@ static IE2eExecutionPool BuildE2eExecutionPool(IServiceProvider sp)
         name: poolKind);
 }
 
+static bool IsValidE2eExecutionOptions(E2eExecutionOptions opts)
+{
+    if (opts.MaxConcurrent is < E2eExecutionOptions.MinimumMaxConcurrent or > E2eExecutionOptions.MaximumMaxConcurrent)
+        return false;
+    if (opts.PollInterval < TimeSpan.Zero || opts.PerRunTimeout <= TimeSpan.Zero)
+        return false;
+    if (!string.Equals(opts.PoolKind, "local", StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(opts.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
+        return false;
+    if (opts.AllowedReadinessOrigins.Count == 0)
+        return false;
+    foreach (var origin in opts.AllowedReadinessOrigins)
+    {
+        if (string.IsNullOrWhiteSpace(origin)
+            || !Uri.TryCreate(origin, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || !string.IsNullOrEmpty(uri.AbsolutePath.Trim('/'))
+            || !string.IsNullOrEmpty(uri.Query)
+            || !string.IsNullOrEmpty(uri.Fragment)
+            || !string.IsNullOrEmpty(uri.UserInfo))
+            return false;
+    }
+
+    return true;
+}
+
 static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILoggerFactory loggerFactory)
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var environment = sp.GetRequiredService<IHostEnvironment>();
     var startupLog = loggerFactory.CreateLogger("CodeyBox.E2eSandbox");
+    if (!environment.IsDevelopment())
+    {
+        throw new InvalidOperationException(
+            "CodeyBox:E2eExecution:PoolKind=local is only available in Development.");
+    }
+
     var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
     if (string.IsNullOrEmpty(kind))
     {
@@ -623,6 +685,21 @@ static MultipassSandboxProvider BuildMultipass(
 }
 
 static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory)
+    => BuildMultipassRemoteFromConfig(
+        sp,
+        loggerFactory,
+        live => live.MultipassRemoteSandbox);
+
+static MultipassRemoteSandboxProvider BuildE2eMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory)
+    => BuildMultipassRemoteFromConfig(
+        sp,
+        loggerFactory,
+        live => live.E2eMultipassRemoteSandbox);
+
+static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
+    IServiceProvider sp,
+    ILoggerFactory loggerFactory,
+    Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
 {
     // All options resolved through IOptionsMonitor so SSH endpoint, key path,
     // staging dir, and timeouts hot-reload on the next CreateAsync without an
@@ -631,18 +708,20 @@ static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, 
     var transportLogger = loggerFactory.CreateLogger<OpenSshCliTransport>();
     var runner = sp.GetService<IProcessRunner>() ?? new DefaultProcessRunner();
     var transport = new OpenSshCliTransport(
-        () => ReadRemoteOpts(sp),
+        () => ReadRemoteOpts(sp, configSelector),
         runner,
         transportLogger);
     return new MultipassRemoteSandboxProvider(
-        () => ReadRemoteOpts(sp),
+        () => ReadRemoteOpts(sp, configSelector),
         transport,
         loggerFactory.CreateLogger<MultipassRemoteSandboxProvider>());
 
-    static MultipassRemoteSandboxOptions ReadRemoteOpts(IServiceProvider sp)
+    static MultipassRemoteSandboxOptions ReadRemoteOpts(
+        IServiceProvider sp,
+        Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
     {
         var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
-        var cfg = live.MultipassRemoteSandbox ?? new MultipassRemoteSandboxConfig();
+        var cfg = configSelector(live) ?? new MultipassRemoteSandboxConfig();
         var fromDefaults = new MultipassRemoteSandboxOptions();
         return new MultipassRemoteSandboxOptions
         {
@@ -4080,6 +4159,15 @@ namespace CodeyBox.Api
         /// defaults to the public sprites.dev API and <c>SPRITES_TOKEN</c>.
         /// </summary>
         public SpritesSandboxConfig? Sprites { get; set; }
+
+        /// <summary>
+        /// Dedicated remote Multipass configuration for the E2E replay pool.
+        /// This intentionally does not fall back to
+        /// <see cref="MultipassRemoteSandbox"/> when E2E execution is enabled:
+        /// replay load must target a separately sized cheap CPU pool rather
+        /// than the coding-agent remote fleet.
+        /// </summary>
+        public MultipassRemoteSandboxConfig? E2eMultipassRemoteSandbox { get; set; }
 
         /// <summary>
         /// Maps logical network-profile names → host bridge names. Operators

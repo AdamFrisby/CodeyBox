@@ -15,6 +15,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace CodeyBox.Tests;
@@ -44,6 +45,44 @@ public sealed class E2eRunApiTests : IDisposable
 
         Assert.Equal("remote-ssh", pool.Name);
         Assert.IsType<MultipassRemoteSandboxProvider>(GetInnerProvider(pool));
+    }
+
+    [Fact]
+    public void E2eExecutionOptions_default_pool_is_remote_ssh()
+    {
+        Assert.Equal("remote-ssh", new E2eExecutionOptions().PoolKind);
+    }
+
+    [Fact]
+    public void Program_remote_e2e_pool_reads_e2e_specific_remote_config()
+    {
+        using var factory = new E2ePoolWiringFactory("remote-ssh", globalRemoteTarget: "coding@remote.example", e2eRemoteTarget: "e2e@remote.example");
+
+        var pool = factory.Services.GetRequiredService<IE2eExecutionPool>();
+        var provider = Assert.IsType<MultipassRemoteSandboxProvider>(GetInnerProvider(pool));
+        var opts = ReadRemoteOptions(provider);
+
+        Assert.Equal("e2e@remote.example", opts.SshTarget);
+    }
+
+    [Fact]
+    public void Program_rejects_enabled_remote_e2e_without_baseline_ref()
+    {
+        using var factory = new E2ePoolWiringFactory("remote-ssh", e2eEnabled: true, baselineImageRef: null);
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            factory.Services.GetRequiredService<IE2eExecutionPool>());
+        Assert.Contains("BaselineImageRef", ex.Message);
+    }
+
+    [Fact]
+    public void Program_registers_e2e_dispatcher_as_hosted_service()
+    {
+        using var factory = new E2eHostedServiceWiringFactory();
+
+        var hosted = factory.Services.GetServices<IHostedService>();
+
+        Assert.Contains(hosted, service => service.GetType() == typeof(E2eRunDispatcher));
     }
 
     [Fact]
@@ -80,13 +119,13 @@ public sealed class E2eRunApiTests : IDisposable
         Assert.NotNull(fetched);
         Assert.Equal(created.Id, fetched.Id);
 
-        var all = await _client.GetFromJsonAsync<List<E2eRunDto>>("/e2eruns");
+        var all = await _client.GetFromJsonAsync<E2eRunPageDto>("/e2eruns?limit=10");
         Assert.NotNull(all);
-        Assert.Contains(all, r => r.Id == created.Id);
+        Assert.Contains(all.Runs, r => r.Id == created.Id);
 
-        var byCase = await _client.GetFromJsonAsync<List<E2eRunDto>>($"/testcases/{testCaseId}/runs");
+        var byCase = await _client.GetFromJsonAsync<E2eRunPageDto>($"/testcases/{testCaseId}/runs?limit=10");
         Assert.NotNull(byCase);
-        Assert.Single(byCase, r => r.Id == created.Id);
+        Assert.Single(byCase.Runs, r => r.Id == created.Id);
 
         var cancel = await _client.PostAsync($"/e2eruns/{created.Id}/cancel", content: null);
         Assert.Equal(HttpStatusCode.OK, cancel.StatusCode);
@@ -103,6 +142,10 @@ public sealed class E2eRunApiTests : IDisposable
         Assert.Equal(1, summary.Total);
         Assert.Equal(1, summary.Canceled);
         Assert.True(summary.Complete);
+
+        var batchRuns = await _client.GetFromJsonAsync<E2eRunPageDto>($"/e2eruns/batches/{batchId}/runs?limit=10");
+        Assert.NotNull(batchRuns);
+        Assert.Single(batchRuns.Runs, r => r.Id == created.Id);
     }
 
     [Fact]
@@ -119,6 +162,72 @@ public sealed class E2eRunApiTests : IDisposable
         await foreach (var run in _factory.E2eRunStore.ListAsync())
             runs.Add(run);
         Assert.Empty(runs);
+    }
+
+    [Fact]
+    public async Task E2eRun_enqueue_rejects_invalid_requests()
+    {
+        var missingId = await _client.PostAsJsonAsync("/e2eruns", new EnqueueE2eRunRequest(""));
+        Assert.Equal(HttpStatusCode.BadRequest, missingId.StatusCode);
+
+        var missingCase = await _client.PostAsJsonAsync("/e2eruns", new EnqueueE2eRunRequest("missing-case"));
+        Assert.Equal(HttpStatusCode.NotFound, missingCase.StatusCode);
+
+        var wrongKind = await SeedCaseAsync("api-wrong-kind", AutomationKind.Unit, "{}");
+        var wrongKindResponse = await _client.PostAsJsonAsync("/e2eruns", new EnqueueE2eRunRequest(wrongKind));
+        Assert.Equal(HttpStatusCode.BadRequest, wrongKindResponse.StatusCode);
+
+        var missingArtifact = await SeedCaseAsync("api-missing-artifact", AutomationKind.E2eReplay, null);
+        var missingArtifactResponse = await _client.PostAsJsonAsync("/e2eruns", new EnqueueE2eRunRequest(missingArtifact));
+        Assert.Equal(HttpStatusCode.BadRequest, missingArtifactResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task E2eRun_bulk_enqueue_rejects_invalid_request_shapes()
+    {
+        var empty = await _client.PostAsJsonAsync("/e2eruns/bulk", new EnqueueBulkE2eRunsRequest([]));
+        Assert.Equal(HttpStatusCode.BadRequest, empty.StatusCode);
+
+        var blankEntry = await _client.PostAsJsonAsync("/e2eruns/bulk", new EnqueueBulkE2eRunsRequest([""]));
+        Assert.Equal(HttpStatusCode.BadRequest, blankEntry.StatusCode);
+
+        using var customFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:MaxBulkItems"] = "1",
+                });
+            });
+        });
+        using var client = customFactory.CreateClient();
+        var tooMany = await client.PostAsJsonAsync("/e2eruns/bulk", new EnqueueBulkE2eRunsRequest(["a", "b"]));
+        Assert.Equal(HttpStatusCode.BadRequest, tooMany.StatusCode);
+    }
+
+    [Fact]
+    public async Task E2eRun_cancel_running_run_signals_registry()
+    {
+        var testCaseId = await SeedE2eCaseAsync("api-running-cancel");
+        var runId = Guid.NewGuid().ToString("N");
+        await _factory.E2eRunStore.CreateAsync(new E2eRun
+        {
+            Id = runId,
+            TestCaseId = testCaseId,
+            Status = E2eRunStatus.Running,
+            SandboxId = "sandbox-a",
+        });
+        var registry = _factory.Services.GetRequiredService<E2eRunCancellationRegistry>();
+        using var cts = registry.Register(runId);
+
+        var cancel = await _client.PostAsync($"/e2eruns/{runId}/cancel", content: null);
+
+        Assert.Equal(HttpStatusCode.OK, cancel.StatusCode);
+        Assert.True(cts.IsCancellationRequested);
+        var stored = await _factory.E2eRunStore.GetAsync(runId);
+        Assert.NotNull(stored);
+        Assert.Equal(E2eRunStatus.Canceled, stored.Status);
     }
 
     [Fact]
@@ -144,6 +253,16 @@ public sealed class E2eRunApiTests : IDisposable
     }
 
     private async Task<string> SeedE2eCaseAsync(string id)
+        => await SeedCaseAsync(
+            id,
+            AutomationKind.E2eReplay,
+            JsonSerializer.Serialize(new E2eReplayArtifact
+            {
+                Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/" }],
+                Assertions = [new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#root" }],
+            }));
+
+    private async Task<string> SeedCaseAsync(string id, AutomationKind automationKind, string? artifactJson)
     {
         var item = new WorkItem
         {
@@ -160,12 +279,8 @@ public sealed class E2eRunApiTests : IDisposable
             Name = id,
             Description = "",
             SourceWorkItemId = item.Id.ToString(),
-            AutomationKind = AutomationKind.E2eReplay,
-            ExecutableArtifactJson = JsonSerializer.Serialize(new E2eReplayArtifact
-            {
-                Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/" }],
-                Assertions = [new E2eReplayAssertion { Kind = "selectorVisible", Selector = "#root" }],
-            }),
+            AutomationKind = automationKind,
+            ExecutableArtifactJson = artifactJson,
         };
         await _factory.TestCaseStore.CreateAsync(testCase);
         return testCase.Id;
@@ -177,9 +292,22 @@ public sealed class E2eRunApiTests : IDisposable
         Assert.NotNull(field);
         return Assert.IsAssignableFrom<ISandboxProvider>(field.GetValue(pool));
     }
+
+    private static MultipassRemoteSandboxOptions ReadRemoteOptions(MultipassRemoteSandboxProvider provider)
+    {
+        var field = typeof(MultipassRemoteSandboxProvider).GetField("_optsAccessor", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        var accessor = Assert.IsType<Func<MultipassRemoteSandboxOptions>>(field.GetValue(provider));
+        return accessor();
+    }
 }
 
-internal sealed class E2ePoolWiringFactory(string poolKind) : WebApplicationFactory<Program>
+internal sealed class E2ePoolWiringFactory(
+    string poolKind,
+    string? globalRemoteTarget = null,
+    string? e2eRemoteTarget = "codeybox@e2e.example",
+    bool e2eEnabled = false,
+    string? baselineImageRef = "cb-e2e-baseline") : WebApplicationFactory<Program>
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-e2epool-{Guid.NewGuid():N}.db");
@@ -196,6 +324,10 @@ internal sealed class E2ePoolWiringFactory(string poolKind) : WebApplicationFact
                 ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
                 ["CodeyBox:SandboxProvider"] = "process",
                 ["CodeyBox:E2eExecution:PoolKind"] = poolKind,
+                ["CodeyBox:E2eExecution:Enabled"] = e2eEnabled.ToString(),
+                ["CodeyBox:E2eExecution:BaselineImageRef"] = baselineImageRef,
+                ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = globalRemoteTarget,
+                ["CodeyBox:E2eMultipassRemoteSandbox:SshTarget"] = e2eRemoteTarget,
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
@@ -205,6 +337,55 @@ internal sealed class E2ePoolWiringFactory(string poolKind) : WebApplicationFact
         builder.ConfigureTestServices(services =>
         {
             services.RemoveAll<IHostedService>();
+            services.RemoveAll<IProjectRepository>();
+            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
+                new Project
+                {
+                    Id = new ProjectId(TestCaseApiFactory.ProjectId),
+                    DisplayName = "Test Project",
+                    RepositoryUrl = "https://github.com/test/repo",
+                    DefaultAgent = AgentKind.Claude,
+                    DefaultBaseBranch = "main",
+                }));
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        }
+        base.Dispose(disposing);
+    }
+}
+
+internal sealed class E2eHostedServiceWiringFactory : WebApplicationFactory<Program>
+{
+    private readonly string _dbPath = Path.Combine(
+        Path.GetTempPath(), $"codeybox-e2ehosted-{Guid.NewGuid():N}.db");
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment("Development");
+        builder.ConfigureAppConfiguration((_, cfg) =>
+        {
+            var tmp = Path.GetTempPath();
+            cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+                ["CodeyBox:SandboxProvider"] = "process",
+                ["CodeyBox:E2eExecution:Enabled"] = "false",
+                ["CodeyBox:E2eExecution:PoolKind"] = "local",
+                ["CodeyBox:StateDatabasePath"] = _dbPath,
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+            });
+        });
+        builder.ConfigureTestServices(services =>
+        {
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                 new Project

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
@@ -205,11 +206,15 @@ public sealed class E2eRunDispatcher : BackgroundService
     private async Task RunOneAsync(IE2eExecutionSlot slot, E2eRun run, CancellationTokenSource runCancellation, CancellationToken stoppingToken)
     {
         var opts = _options.CurrentValue;
-        using var timeoutCts = new CancellationTokenSource(opts.PerRunTimeout);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, stoppingToken, runCancellation.Token);
-
+        var perRunTimeout = NormalizePerRunTimeout(opts.PerRunTimeout);
+        CancellationTokenSource? timeoutCts = null;
+        CancellationTokenSource? linked = null;
+        TestCase? testCaseForLastRun = null;
         try
         {
+            timeoutCts = new CancellationTokenSource(perRunTimeout);
+            linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, stoppingToken, runCancellation.Token);
+
             var testCase = await _testCases.GetAsync(run.TestCaseId, linked.Token);
             if (testCase is null)
             {
@@ -217,35 +222,51 @@ public sealed class E2eRunDispatcher : BackgroundService
                 await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("MissingTestCase", $"test case {run.TestCaseId} not found"), CancellationToken.None);
                 return;
             }
+            testCaseForLastRun = testCase;
 
             if (testCase.AutomationKind != AutomationKind.E2eReplay)
             {
-                await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("WrongAutomationKind", $"automation_kind={testCase.AutomationKind} is not E2eReplay"), CancellationToken.None);
+                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, "WrongAutomationKind", $"automation_kind={testCase.AutomationKind} is not E2eReplay", CancellationToken.None);
                 return;
             }
 
             E2eReplayArtifact? artifact;
             try
             {
-                artifact = string.IsNullOrWhiteSpace(testCase.ExecutableArtifactJson)
-                    ? null
-                    : JsonSerializer.Deserialize<E2eReplayArtifact>(testCase.ExecutableArtifactJson, ArtifactJson);
+                if (string.IsNullOrWhiteSpace(testCase.ExecutableArtifactJson))
+                {
+                    artifact = null;
+                }
+                else if (Encoding.UTF8.GetByteCount(testCase.ExecutableArtifactJson) > E2eReplayArtifactValidation.MaxArtifactJsonBytes)
+                {
+                    await PersistErrorAndMaybeStampTestCaseAsync(
+                        run.Id,
+                        testCase,
+                        "ArtifactTooLarge",
+                        $"artifact JSON exceeds {E2eReplayArtifactValidation.MaxArtifactJsonBytes} bytes",
+                        CancellationToken.None);
+                    return;
+                }
+                else
+                {
+                    artifact = JsonSerializer.Deserialize<E2eReplayArtifact>(testCase.ExecutableArtifactJson, ArtifactJson);
+                }
             }
             catch (JsonException ex)
             {
-                await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("ArtifactParseError", ex.Message), CancellationToken.None);
+                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, "ArtifactParseError", ex.Message, CancellationToken.None);
                 return;
             }
 
             if (artifact is null)
             {
-                await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("MissingArtifact", "test case has no executable artifact"), CancellationToken.None);
+                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, "MissingArtifact", "test case has no executable artifact", CancellationToken.None);
                 return;
             }
 
             if (!E2eReplayArtifactValidation.TryValidate(artifact, out var failureKind, out var detail))
             {
-                await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson(failureKind, detail), CancellationToken.None);
+                await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCase, failureKind, detail, CancellationToken.None);
                 return;
             }
 
@@ -258,9 +279,9 @@ public sealed class E2eRunDispatcher : BackgroundService
             if (persisted && status is E2eRunStatus.Passed or E2eRunStatus.Failed or E2eRunStatus.Error)
                 await UpdateTestCaseLastRunAsync(testCase.Id, result, CancellationToken.None);
         }
-        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested == true)
         {
-            await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("PerRunTimeout", $"exceeded {opts.PerRunTimeout}"), CancellationToken.None);
+            await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCaseForLastRun, "PerRunTimeout", $"exceeded {perRunTimeout}", CancellationToken.None);
         }
         catch (OperationCanceledException) when (runCancellation.IsCancellationRequested)
         {
@@ -273,10 +294,12 @@ public sealed class E2eRunDispatcher : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "E2E run {RunId} crashed; recording Error.", run.Id);
-            await PersistResultAsync(run.Id, E2eRunStatus.Error, BuildErrorResultJson("Exception", ex.Message), CancellationToken.None);
+            await PersistErrorAndMaybeStampTestCaseAsync(run.Id, testCaseForLastRun, "Exception", ex.Message, CancellationToken.None);
         }
         finally
         {
+            linked?.Dispose();
+            timeoutCts?.Dispose();
             _activeTasks.TryRemove(run.Id, out _);
             _cancellations.Unregister(run.Id, runCancellation);
             try { await slot.DisposeAsync(); }
@@ -305,22 +328,44 @@ public sealed class E2eRunDispatcher : BackgroundService
             throw new InvalidOperationException($"Updating last-run for test case '{testCaseId}' affected no rows.");
     }
 
+    private async Task PersistErrorAndMaybeStampTestCaseAsync(
+        string runId,
+        TestCase? testCase,
+        string kind,
+        string detail,
+        CancellationToken ct)
+    {
+        var result = BuildErrorResult(kind, detail);
+        var persisted = await PersistResultAsync(runId, E2eRunStatus.Error, JsonSerializer.Serialize(result, ResultJson), ct);
+        if (persisted && testCase is not null)
+            await UpdateTestCaseLastRunAsync(testCase.Id, result, CancellationToken.None);
+    }
+
     private static string BuildErrorResultJson(string kind, string detail)
-        => JsonSerializer.Serialize(new E2eRunResult
+        => JsonSerializer.Serialize(BuildErrorResult(kind, detail), ResultJson);
+
+    private static E2eRunResult BuildErrorResult(string kind, string detail)
+        => new()
         {
             Passed = false,
             Summary = detail,
             FailureKind = kind,
             StepResults = Array.Empty<E2eStepResult>(),
             AssertionResults = Array.Empty<E2eAssertionResult>(),
-        }, ResultJson);
+        };
 
     private static bool IsInfrastructureFailure(string? failureKind) =>
         string.Equals(failureKind, "ReadinessProbe", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ReadinessUrlRejected", StringComparison.Ordinal)
         || string.Equals(failureKind, "ExecException", StringComparison.Ordinal)
         || string.Equals(failureKind, "AssertionException", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ReplayDriverFailed", StringComparison.Ordinal)
+        || string.Equals(failureKind, "ReplayDriverProtocolError", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReplayDriverUnavailable", StringComparison.Ordinal)
         || string.Equals(failureKind, "OutputLimitExceeded", StringComparison.Ordinal);
+
+    private static TimeSpan NormalizePerRunTimeout(TimeSpan timeout) =>
+        timeout > TimeSpan.Zero ? timeout : TimeSpan.FromMinutes(15);
 
     private static async Task DelaySafely(TimeSpan delay, CancellationToken ct)
     {
