@@ -2784,6 +2784,38 @@ public sealed class AcpBridgeUnitTests
         Assert.Same(argv, execArgv);
     }
 
+    [Theory]
+    [InlineData("needsBootstrap")]
+    [InlineData("readArgv")]
+    [InlineData("setGuard")]
+    [InlineData("exec")]
+    public void Bridge_SignalBootstrap_NullDelegatesThrowArgumentNullException(string paramName)
+    {
+        Func<bool> needsBootstrap = () => true;
+        Func<string[]?> readArgv = () => ["dotnet", "exec", "/tmp/bridge.dll"];
+        Action<string?> setGuard = _ => { };
+        Action<string[]> exec = _ => { };
+
+        if (paramName == "needsBootstrap")
+            needsBootstrap = null!;
+        if (paramName == "readArgv")
+            readArgv = null!;
+        if (paramName == "setGuard")
+            setGuard = null!;
+        if (paramName == "exec")
+            exec = null!;
+
+        var ex = Assert.Throws<ArgumentNullException>(() => Bridge.TryRunSignalBootstrap(
+            isLinux: true,
+            guardValue: null,
+            needsBootstrap: needsBootstrap,
+            readArgv: readArgv,
+            setGuard: setGuard,
+            exec: exec));
+
+        Assert.Equal(paramName, ex.ParamName);
+    }
+
     [Fact]
     public void Bridge_SignalBootstrap_OneShotGuardSkipsNeedCheckArgvReadAndExec()
     {
@@ -2796,6 +2828,41 @@ public sealed class AcpBridgeUnitTests
             exec: _ => throw new InvalidOperationException("guard should skip exec"));
 
         Assert.False(ran);
+    }
+
+    [Fact]
+    public void Bridge_SignalBootstrap_NonLinuxSkipsNeedCheckArgvReadAndExec()
+    {
+        var ran = Bridge.TryRunSignalBootstrap(
+            isLinux: false,
+            guardValue: null,
+            needsBootstrap: () => throw new InvalidOperationException("non-Linux should skip needs check"),
+            readArgv: () => throw new InvalidOperationException("non-Linux should skip argv read"),
+            setGuard: _ => throw new InvalidOperationException("non-Linux should not set guard"),
+            exec: _ => throw new InvalidOperationException("non-Linux should skip exec"));
+
+        Assert.False(ran);
+    }
+
+    [Fact]
+    public void Bridge_SignalBootstrap_NoBootstrapNeededDoesNotReadArgvSetGuardOrExec()
+    {
+        var needsCalled = 0;
+
+        var ran = Bridge.TryRunSignalBootstrap(
+            isLinux: true,
+            guardValue: null,
+            needsBootstrap: () =>
+            {
+                needsCalled++;
+                return false;
+            },
+            readArgv: () => throw new InvalidOperationException("no-bootstrap branch should skip argv read"),
+            setGuard: _ => throw new InvalidOperationException("no-bootstrap branch should not set guard"),
+            exec: _ => throw new InvalidOperationException("no-bootstrap branch should skip exec"));
+
+        Assert.False(ran);
+        Assert.Equal(1, needsCalled);
     }
 
     [Fact]
@@ -2842,11 +2909,11 @@ public sealed class AcpBridgeUnitTests
     [Fact]
     public void Bridge_SignalBootstrap_TryReadCurrentArgvReadsProcSelfCmdline()
     {
+        var expected = Bridge.ParseProcCmdlineArgv(File.ReadAllBytes("/proc/self/cmdline"));
         var argv = Bridge.TryReadCurrentArgv();
 
-        Assert.NotNull(argv);
-        Assert.NotEmpty(argv);
-        Assert.All(argv, arg => Assert.False(string.IsNullOrEmpty(arg)));
+        Assert.NotNull(expected);
+        Assert.Equal(expected, argv);
     }
 
     [Fact]
@@ -2922,10 +2989,19 @@ public sealed class AcpBridgeUnitTests
             var lockDir = Path.Combine(tmpDir, "locks");
             Directory.CreateDirectory(workDir);
             // Long-running stub so the bridge stays alive until we signal it.
+            var rootPidPath = Path.Combine(tmpDir, "claude-root.pid");
+            var childPidPath = Path.Combine(tmpDir, "claude-child.pid");
             var stubPath = Path.Combine(tmpDir, "claude-longsleep-stub.sh");
             File.WriteAllText(stubPath,
                 "#!/bin/bash\n" +
-                "exec sleep 60\n");
+                "ROOT_PID_FILE=\"" + rootPidPath + "\"\n" +
+                "CHILD_PID_FILE=\"" + childPidPath + "\"\n" +
+                "sleep 60 &\n" +
+                "child=$!\n" +
+                "trap 'kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; exit 0' TERM INT HUP\n" +
+                "echo $$ > \"$ROOT_PID_FILE\"\n" +
+                "echo \"$child\" > \"$CHILD_PID_FILE\"\n" +
+                "wait \"$child\"\n");
             File.SetUnixFileMode(stubPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
@@ -2972,6 +3048,13 @@ public sealed class AcpBridgeUnitTests
                 Assert.NotNull(lockPath);
                 Assert.True(File.Exists(lockPath),
                     "Lockfile must exist after `ready` envelope — pre-signal state.");
+                for (int i = 0; i < 100 && (!File.Exists(rootPidPath) || !File.Exists(childPidPath)); i++)
+                    await Task.Delay(50);
+                Assert.True(File.Exists(rootPidPath), "Signal cleanup fixture did not record the claude root pid.");
+                Assert.True(File.Exists(childPidPath), "Signal cleanup fixture did not record the claude child pid.");
+                var rootPid = int.Parse(File.ReadAllText(rootPidPath).Trim(), CultureInfo.InvariantCulture);
+                var childPid = int.Parse(File.ReadAllText(childPidPath).Trim(), CultureInfo.InvariantCulture);
+
                 if (inheritIgnoredSignal)
                 {
                     Assert.NotNull(ignoredMarkerPath);
@@ -3012,6 +3095,9 @@ public sealed class AcpBridgeUnitTests
                 Assert.False(File.Exists(lockPath),
                     "Lockfile leaked after " + signalName +
                     " — Shutdown(0) ran but the per-turn lockfile cleanup was skipped.");
+
+                await AssertProcessExitedAsync(rootPid, "claude root process leaked after " + signalName + ".");
+                await AssertProcessExitedAsync(childPid, "claude child process leaked after " + signalName + ".");
 
                 await drainTask.WaitAsync(TimeSpan.FromSeconds(5));
             }
@@ -3094,6 +3180,14 @@ os.execvp("dotnet", ["dotnet", "exec", bridge_dll])
 
     [DllImport("libc", EntryPoint = "signal", SetLastError = true)]
     private static extern IntPtr LibcSignal(int sig, IntPtr handler);
+
+    private static async Task AssertProcessExitedAsync(int pid, string message)
+    {
+        for (int i = 0; i < 100 && Directory.Exists("/proc/" + pid); i++)
+            await Task.Delay(50);
+
+        Assert.False(Directory.Exists("/proc/" + pid), message);
+    }
 
     // ── Helpers for the new orchestration / regression fixtures above ───────────
 
