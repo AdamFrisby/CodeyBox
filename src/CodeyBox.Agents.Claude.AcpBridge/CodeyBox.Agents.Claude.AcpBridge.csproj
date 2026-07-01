@@ -55,7 +55,8 @@
     runtime. The default NativeAOT PInvoke resolver path is `dlopen("libc.so")`
     on first call — which throws DllNotFoundException in a fully-static
     binary. Bridge.NativeMethods uses libc for kill(2), signal disposition
-    inspection/reset, and the one-time signal-bootstrap execvp(3); without
+    inspection/reset, setenv/unsetenv guard propagation, and the one-time
+    signal-bootstrap execvp(3); without
     DirectPInvoke those calls would throw instead of preserving bridge
     shutdown cleanup. The kill(2) path would silently regress to bare
     Process.Kill (SIGKILL only), re-introducing the thinking-block-

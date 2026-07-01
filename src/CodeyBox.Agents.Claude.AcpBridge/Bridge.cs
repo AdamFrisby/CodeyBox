@@ -131,8 +131,8 @@ internal sealed class Bridge : IAsyncDisposable
         ResetInheritedIgnoredSignalToDefault(SigHup);
         _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         if (_stdinOverride is null)
-            ReexecOnceIfSignalRegistrationUnavailable(sigtermBefore, sigintBefore, sighupBefore);
-        Environment.SetEnvironmentVariable(SignalBootstrapReexecEnv, null);
+            _ = ReexecOnceIfSignalRegistrationUnavailable(sigtermBefore, sigintBefore, sighupBefore);
+        SetSignalBootstrapGuard(null);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
 
         Emitter.Emit("bridge_started", w => w.WriteNumber("pid", Environment.ProcessId));
@@ -919,12 +919,12 @@ internal sealed class Bridge : IAsyncDisposable
             : null;
     }
 
-    private static void ReexecOnceIfSignalRegistrationUnavailable(
+    internal static bool ReexecOnceIfSignalRegistrationUnavailable(
         IntPtr? sigtermBefore,
         IntPtr? sigintBefore,
         IntPtr? sighupBefore)
     {
-        TryRunSignalBootstrap(
+        return TryRunSignalBootstrap(
             isLinux: OperatingSystem.IsLinux(),
             guardValue: Environment.GetEnvironmentVariable(SignalBootstrapReexecEnv),
             needsBootstrap: () =>
@@ -932,8 +932,15 @@ internal sealed class Bridge : IAsyncDisposable
                 || NeedsSignalBootstrapReexec(SigInt, sigintBefore)
                 || NeedsSignalBootstrapReexec(SigHup, sighupBefore),
             readArgv: TryReadCurrentArgv,
-            setGuard: value => Environment.SetEnvironmentVariable(SignalBootstrapReexecEnv, value),
+            setGuard: SetSignalBootstrapGuard,
             exec: NativeMethods.ExecVp);
+    }
+
+    private static void SetSignalBootstrapGuard(string? value)
+    {
+        Environment.SetEnvironmentVariable(SignalBootstrapReexecEnv, value);
+        if (OperatingSystem.IsLinux())
+            NativeMethods.SetEnvironmentVariable(SignalBootstrapReexecEnv, value);
     }
 
     internal static bool TryRunSignalBootstrap(
@@ -992,8 +999,7 @@ internal sealed class Bridge : IAsyncDisposable
             if (bytes[i] != 0)
                 continue;
 
-            if (i > start)
-                args.Add(Encoding.UTF8.GetString(bytes, start, i - start));
+            args.Add(Encoding.UTF8.GetString(bytes, start, i - start));
             start = i + 1;
         }
 
@@ -1210,6 +1216,12 @@ internal sealed class Bridge : IAsyncDisposable
         [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "execvp", SetLastError = true)]
         private static extern int ExecVp(IntPtr file, IntPtr argv);
 
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "setenv", SetLastError = true)]
+        private static extern int SetEnv(IntPtr name, IntPtr value, int overwrite);
+
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "unsetenv", SetLastError = true)]
+        private static extern int UnsetEnv(IntPtr name);
+
         internal static bool TryReadSignalHandler(int signalNumber, out IntPtr handler)
         {
             handler = IntPtr.Zero;
@@ -1229,6 +1241,37 @@ internal sealed class Bridge : IAsyncDisposable
             finally
             {
                 Marshal.FreeHGlobal(oldAction);
+            }
+        }
+
+        internal static void SetEnvironmentVariable(string name, string? value)
+        {
+            var namePtr = IntPtr.Zero;
+            var valuePtr = IntPtr.Zero;
+            try
+            {
+                namePtr = Marshal.StringToHGlobalAnsi(name);
+                if (value is null)
+                {
+                    _ = UnsetEnv(namePtr);
+                    return;
+                }
+
+                valuePtr = Marshal.StringToHGlobalAnsi(value);
+                _ = SetEnv(namePtr, valuePtr, overwrite: 1);
+            }
+            catch
+            {
+                // Managed Environment.SetEnvironmentVariable already updated
+                // this process. If libc env mutation fails, continue without
+                // turning bridge startup into a hard failure.
+            }
+            finally
+            {
+                if (valuePtr != IntPtr.Zero)
+                    Marshal.FreeHGlobal(valuePtr);
+                if (namePtr != IntPtr.Zero)
+                    Marshal.FreeHGlobal(namePtr);
             }
         }
 

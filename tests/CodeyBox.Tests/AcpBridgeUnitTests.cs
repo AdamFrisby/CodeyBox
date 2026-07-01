@@ -2900,20 +2900,140 @@ public sealed class AcpBridgeUnitTests
             new[] { "dotnet", "exec" },
             Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec")));
         Assert.Equal(
-            new[] { "dotnet", "/tmp/bridge.dll" },
+            new[] { "dotnet", "", "/tmp/bridge.dll" },
             Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0\0/tmp/bridge.dll\0")));
         Assert.Null(Bridge.ParseProcCmdlineArgv(Array.Empty<byte>()));
-        Assert.Null(Bridge.ParseProcCmdlineArgv(new byte[] { 0 }));
+        Assert.Equal(new[] { "" }, Bridge.ParseProcCmdlineArgv(new byte[] { 0 }));
+        Assert.Equal(new[] { "", "" }, Bridge.ParseProcCmdlineArgv(new byte[] { 0, 0 }));
     }
 
     [Fact]
-    public void Bridge_SignalBootstrap_TryReadCurrentArgvReadsProcSelfCmdline()
+    public async Task Bridge_SignalBootstrap_ProductionReexecPreservesCurrentArgv()
     {
-        var expected = Bridge.ParseProcCmdlineArgv(File.ReadAllBytes("/proc/self/cmdline"));
-        var argv = Bridge.TryReadCurrentArgv();
+        if (!CommandExists("dotnet"))
+            return;
 
-        Assert.NotNull(expected);
-        Assert.Equal(expected, argv);
+        var bridgeDllPath = typeof(Bridge).Assembly.Location;
+        Assert.True(File.Exists(bridgeDllPath),
+            "AcpBridge dll missing at " + bridgeDllPath +
+            " — the test project should ProjectReference the AcpBridge assembly.");
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-signal-bootstrap-").FullName;
+        try
+        {
+            var helperProjectPath = Path.Combine(tmpDir, "SignalBootstrapHelper.csproj");
+            var helperProgramPath = Path.Combine(tmpDir, "Program.cs");
+            var outputDir = Path.Combine(tmpDir, "out");
+            Directory.CreateDirectory(outputDir);
+
+            await File.WriteAllTextAsync(helperProjectPath, $$"""
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CodeyBox.Tests</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="CodeyBox.Agents.Claude.AcpBridge">
+      <HintPath>{{XmlEscape(bridgeDllPath)}}</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
+""");
+
+            await File.WriteAllTextAsync(helperProgramPath, """
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using CodeyBox.Agents.Claude.AcpBridge;
+
+var reexeced = Environment.GetEnvironmentVariable(Bridge.SignalBootstrapReexecEnv) == "1";
+Console.WriteLine(JsonSerializer.Serialize(new
+{
+    phase = reexeced ? "after" : "before",
+    pid = Environment.ProcessId,
+    guard = Environment.GetEnvironmentVariable(Bridge.SignalBootstrapReexecEnv),
+    args = Environment.GetCommandLineArgs()
+}));
+Console.Out.Flush();
+
+if (reexeced)
+    return 0;
+
+_ = Libc.Signal(15, IntPtr.Zero);
+var ran = Bridge.ReexecOnceIfSignalRegistrationUnavailable(IntPtr.Zero, null, null);
+Console.WriteLine(JsonSerializer.Serialize(new
+{
+    phase = "returned",
+    pid = Environment.ProcessId,
+    ran
+}));
+return ran ? 90 : 91;
+
+internal static partial class Libc
+{
+    [DllImport("libc", EntryPoint = "signal", SetLastError = true)]
+    internal static extern IntPtr Signal(int sig, IntPtr handler);
+}
+""");
+
+            var dotnetEnv = new Dictionary<string, string?>
+            {
+                ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
+                ["DOTNET_NOLOGO"] = "1",
+                [Bridge.SignalBootstrapReexecEnv] = null,
+            };
+            var build = await RunProcessAsync(
+                "dotnet",
+                ["build", helperProjectPath, "-c", "Debug", "-o", outputDir, "--nologo", "-v:minimal"],
+                dotnetEnv);
+            Assert.True(build.ExitCode == 0,
+                "helper build failed with exit " + build.ExitCode +
+                "\nstdout:\n" + build.Stdout +
+                "\nstderr:\n" + build.Stderr);
+
+            var helperDllPath = Path.Combine(outputDir, "CodeyBox.Tests.dll");
+            Assert.True(File.Exists(helperDllPath), "helper dll missing at " + helperDllPath);
+
+            var marker = "marker-" + Guid.NewGuid().ToString("N");
+            var run = await RunProcessWithTimeoutAsync(
+                "dotnet",
+                ["exec", helperDllPath, "alpha", "", marker],
+                dotnetEnv,
+                TimeSpan.FromSeconds(15));
+            Assert.True(run.ExitCode == 0,
+                "bootstrap helper failed with exit " + run.ExitCode +
+                "\nstdout:\n" + run.Stdout +
+                "\nstderr:\n" + run.Stderr);
+
+            var lines = run.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            Assert.Equal(2, lines.Length);
+
+            using var beforeDoc = JsonDocument.Parse(lines[0]);
+            using var afterDoc = JsonDocument.Parse(lines[1]);
+            var before = beforeDoc.RootElement;
+            var after = afterDoc.RootElement;
+
+            Assert.Equal("before", before.GetProperty("phase").GetString());
+            Assert.Equal("after", after.GetProperty("phase").GetString());
+            Assert.Equal(before.GetProperty("pid").GetInt32(), after.GetProperty("pid").GetInt32());
+            Assert.Equal("1", after.GetProperty("guard").GetString());
+
+            Assert.Equal(new[] { "alpha", "", marker }, ReadArgvTail(before));
+            Assert.Equal(new[] { "alpha", "", marker }, ReadArgvTail(after));
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+
+        static string[] ReadArgvTail(JsonElement root) =>
+            root.GetProperty("args")
+                .EnumerateArray()
+                .Select(arg => arg.GetString() ?? "")
+                .TakeLast(3)
+                .ToArray();
     }
 
     [Fact]
@@ -3298,6 +3418,13 @@ wait "$child"
         }
         return false;
     }
+
+    private static string XmlEscape(string value) =>
+        value
+            .Replace("&", "&amp;", StringComparison.Ordinal)
+            .Replace("\"", "&quot;", StringComparison.Ordinal)
+            .Replace("<", "&lt;", StringComparison.Ordinal)
+            .Replace(">", "&gt;", StringComparison.Ordinal);
 
     private static async Task<TcpClient> ConnectAuthenticatedWebSocketClientAsync(
         int port,
@@ -4022,6 +4149,51 @@ exit 9
         return (process.ExitCode, stdout, stderr);
     }
 
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessWithTimeoutAsync(
+        string fileName,
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?> env,
+        TimeSpan timeout)
+    {
+        var psi = new ProcessStartInfo(fileName)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        psi.Environment.Remove("CODEYBOX_ACP_BRIDGE_VERIFY_VM");
+        psi.Environment.Remove("CODEYBOX_ACP_BRIDGE_SKIP_VM_VERIFY");
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+        foreach (var (key, value) in env)
+        {
+            if (value is null)
+                psi.Environment.Remove(key);
+            else
+                psi.Environment[key] = value;
+        }
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start " + fileName);
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        var waitTask = process.WaitForExitAsync();
+
+        if (await Task.WhenAny(waitTask, Task.Delay(timeout)).ConfigureAwait(false) != waitTask)
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            await waitTask.ConfigureAwait(false);
+            var timedOutStdout = await stdoutTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            var timedOutStderr = await stderrTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            return (-1, timedOutStdout, timedOutStderr);
+        }
+
+        var stdout = await stdoutTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        var stderr = await stderrTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        return (process.ExitCode, stdout, stderr);
+    }
+
     private sealed record PublishScriptFixture(
         string TempRoot,
         string ScriptPath,
@@ -4037,13 +4209,14 @@ exit 9
     /// linked ELF with NO <c>dlopen</c> support at runtime. The default
     /// NativeAOT PInvoke resolver falls back to <c>dlopen("libc.so")</c> on
     /// first call which throws <see cref="DllNotFoundException"/> in a fully-
-    /// static binary. <c>Bridge.NativeMethods.Kill</c> P/Invokes libc's
-    /// <c>kill(2)</c> for the polite SIGTERM-then-grace-then-SIGKILL teardown
-    /// of <c>claude --ide</c> — the exception is caught silently by
-    /// <c>TerminateClaudeProcess</c> and the SIGTERM-grace path regresses to
-    /// bare SIGKILL, re-introducing the half-written-JSONL → thinking-block
-    /// immutability 400 cluster the polite signal was specifically added to
-    /// prevent.
+    /// static binary. <c>Bridge.NativeMethods</c> P/Invokes libc for
+    /// <c>kill(2)</c>, signal-disposition inspection/reset, setenv/unsetenv
+    /// guard propagation, and execvp. On the polite
+    /// SIGTERM-then-grace-then-SIGKILL teardown of <c>claude --ide</c>, that
+    /// exception is caught silently by <c>TerminateClaudeProcess</c> and the
+    /// SIGTERM-grace path regresses to bare SIGKILL, re-introducing the
+    /// half-written-JSONL → thinking-block immutability 400 cluster the
+    /// polite signal was specifically added to prevent.
     ///
     /// The fix is <c>&lt;DirectPInvoke Include="libc" /&gt;</c> in
     /// <c>CodeyBox.Agents.Claude.AcpBridge.csproj</c>, which resolves the
