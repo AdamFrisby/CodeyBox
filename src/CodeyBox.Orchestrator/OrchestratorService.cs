@@ -2239,7 +2239,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // released in the outer finally.
             if (!agentSlotReserved && !isAgentControlItem)
             {
-                var gateDirectWorkAgent = ShouldResolveAgentClassAtPickup(item);
+                var gateDirectWorkAgent = ShouldGateDirectAgentAtPickup(item);
                 var effectiveDirectAgent = item.Agent ?? project?.DefaultAgent;
                 var directAvailability = gateDirectWorkAgent && effectiveDirectAgent is { } directAgent
                     ? _dispatchAvailability?.GetAvailability(new AgentMembership
@@ -2562,6 +2562,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
+        => item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.WorkComplete
+            or WorkItemState.AuditPassed
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
+
+    private static bool ShouldGateDirectAgentAtPickup(WorkItem item)
         => item.State is WorkItemState.Queued
             or WorkItemState.Planning
             or WorkItemState.PlanReview
