@@ -1,5 +1,4 @@
 using CodeyBox.Core;
-using System.Text.Json;
 
 namespace CodeyBox.ExploratoryTesting.Replay;
 
@@ -175,56 +174,29 @@ public sealed class AccessibilityElementLocator : IElementLocator
 
         if (string.IsNullOrWhiteSpace(json)) return TreeLocateResult.None;
 
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var candidates = new List<LocatedTarget>();
-            SearchTree(doc.RootElement, expected, visual, candidates, ct);
-            return SelectTreeCandidate(candidates);
-        }
-        catch (JsonException)
-        {
+        if (!AccessibilityTreeParser.TryParseNodes(json, ct, out var nodes))
             return TreeLocateResult.None;
-        }
-    }
 
-    private void SearchTree(
-        JsonElement element,
-        TraceAccessibilityDescriptor expected,
-        TraceVisualDescriptor visual,
-        List<LocatedTarget> candidates,
-        CancellationToken ct)
-    {
-        ct.ThrowIfCancellationRequested();
-        if (element.ValueKind == JsonValueKind.Object)
+        var candidates = new List<LocatedTarget>();
+        foreach (var node in nodes)
         {
-            var snap = SnapshotFromObject(element);
-            if (_matcher.Matches(snap, expected) && TryReadBounds(element, out var region))
-            {
-                var (cx, cy) = RecordedClickPointForCurrentBounds(visual, region);
-                candidates.Add(new LocatedTarget
-                {
-                    CenterX = cx,
-                    CenterY = cy,
-                    Region = region,
-                    Source = "accessibility-tree",
-                    Confidence = 1.0,
-                    Evidence = LocatedTargetEvidence.Accessibility,
-                });
-            }
+            ct.ThrowIfCancellationRequested();
+            if (node.Bounds is not { } region || !_matcher.Matches(node.Snapshot, expected))
+                continue;
 
-            foreach (var property in element.EnumerateObject())
+            var (cx, cy) = RecordedClickPointForCurrentBounds(visual, region, expected.Bounds);
+            candidates.Add(new LocatedTarget
             {
-                SearchTree(property.Value, expected, visual, candidates, ct);
-            }
+                CenterX = cx,
+                CenterY = cy,
+                Region = region,
+                Source = "accessibility-tree",
+                Confidence = 1.0,
+                Evidence = LocatedTargetEvidence.Accessibility,
+            });
         }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-            {
-                SearchTree(item, expected, visual, candidates, ct);
-            }
-        }
+
+        return SelectTreeCandidate(candidates);
     }
 
     private static TreeLocateResult SelectTreeCandidate(IReadOnlyList<LocatedTarget> candidates)
@@ -262,149 +234,32 @@ public sealed class AccessibilityElementLocator : IElementLocator
 
     private static (int X, int Y) RecordedClickPointForCurrentBounds(
         TraceVisualDescriptor visual,
-        TraceBoundingRegion currentBounds)
+        TraceBoundingRegion currentBounds,
+        TraceBoundingRegion? recordedAccessibilityBounds)
     {
-        var x = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < currentBounds.Width
-            ? currentBounds.X + offsetX
-            : currentBounds.X + currentBounds.Width / 2;
-        var y = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < currentBounds.Height
-            ? currentBounds.Y + offsetY
-            : currentBounds.Y + currentBounds.Height / 2;
-        return (x, y);
-    }
-
-    private static SandboxAccessibilitySnapshot SnapshotFromObject(JsonElement obj) => new()
-    {
-        Role = ReadString(obj, "role", "Role", "controlType", "type"),
-        Name = ReadString(obj, "name", "Name", "label", "title", "accessibleName"),
-        Text = ReadString(obj, "text", "Text", "value", "description"),
-        ElementType = ReadString(obj, "elementType", "ElementType", "tagName", "className"),
-    };
-
-    private static bool TryReadBounds(JsonElement obj, out TraceBoundingRegion region)
-    {
-        if (TryReadRectObject(obj, out region)) return true;
-
-        foreach (var name in new[] { "bounds", "Bounds", "rect", "Rect", "boundingBox", "BoundingBox" })
+        var recordedClick = RecordedClickPoint(visual);
+        if (recordedAccessibilityBounds is { Width: > 0, Height: > 0 }
+            && Contains(recordedAccessibilityBounds, recordedClick.X, recordedClick.Y))
         {
-            if (!TryGetProperty(obj, name, out var child)) continue;
-            if (child.ValueKind == JsonValueKind.Object && TryReadRectObject(child, out region)) return true;
-            if (child.ValueKind == JsonValueKind.Array && TryReadRectArray(child, out region)) return true;
+            return (
+                currentBounds.X + Clamp(recordedClick.X - recordedAccessibilityBounds.X, 0, currentBounds.Width - 1),
+                currentBounds.Y + Clamp(recordedClick.Y - recordedAccessibilityBounds.Y, 0, currentBounds.Height - 1));
         }
 
-        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-        return false;
+        if (Contains(currentBounds, recordedClick.X, recordedClick.Y))
+            return recordedClick;
+
+        return (currentBounds.X + currentBounds.Width / 2, currentBounds.Y + currentBounds.Height / 2);
     }
 
-    private static bool TryReadRectObject(JsonElement obj, out TraceBoundingRegion region)
-    {
-        if (TryReadInt(obj, "x", out var x)
-            && TryReadInt(obj, "y", out var y)
-            && TryReadInt(obj, "width", out var width)
-            && TryReadInt(obj, "height", out var height)
-            && width > 0
-            && height > 0)
-        {
-            region = new TraceBoundingRegion { X = x, Y = y, Width = width, Height = height };
-            return true;
-        }
+    private static bool Contains(TraceBoundingRegion region, int x, int y)
+        => x >= region.X
+            && x < region.X + region.Width
+            && y >= region.Y
+            && y < region.Y + region.Height;
 
-        if (TryReadInt(obj, "left", out var left)
-            && TryReadInt(obj, "top", out var top)
-            && TryReadInt(obj, "right", out var right)
-            && TryReadInt(obj, "bottom", out var bottom)
-            && right > left
-            && bottom > top)
-        {
-            region = new TraceBoundingRegion
-            {
-                X = left,
-                Y = top,
-                Width = right - left,
-                Height = bottom - top,
-            };
-            return true;
-        }
-
-        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-        return false;
-    }
-
-    private static bool TryReadRectArray(JsonElement array, out TraceBoundingRegion region)
-    {
-        if (array.GetArrayLength() >= 4)
-        {
-            var values = new int[4];
-            var i = 0;
-            foreach (var item in array.EnumerateArray())
-            {
-                if (i >= 4) break;
-                if (!TryReadInt(item, out values[i]))
-                {
-                    region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-                    return false;
-                }
-                i++;
-            }
-
-            if (values[2] > 0 && values[3] > 0)
-            {
-                region = new TraceBoundingRegion
-                {
-                    X = values[0],
-                    Y = values[1],
-                    Width = values[2],
-                    Height = values[3],
-                };
-                return true;
-            }
-        }
-
-        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-        return false;
-    }
-
-    private static string? ReadString(JsonElement obj, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (TryGetProperty(obj, name, out var value) && value.ValueKind == JsonValueKind.String)
-                return value.GetString();
-        }
-        return null;
-    }
-
-    private static bool TryReadInt(JsonElement obj, string name, out int value)
-    {
-        value = 0;
-        return TryGetProperty(obj, name, out var property) && TryReadInt(property, out value);
-    }
-
-    private static bool TryReadInt(JsonElement element, out int value)
-    {
-        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out value))
-            return true;
-        if (element.ValueKind == JsonValueKind.String
-            && int.TryParse(element.GetString(), out value))
-            return true;
-        value = 0;
-        return false;
-    }
-
-    private static bool TryGetProperty(JsonElement obj, string name, out JsonElement value)
-    {
-        if (obj.TryGetProperty(name, out value)) return true;
-        foreach (var property in obj.EnumerateObject())
-        {
-            if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
-            {
-                value = property.Value;
-                return true;
-            }
-        }
-        value = default;
-        return false;
-    }
+    private static int Clamp(int value, int min, int max)
+        => Math.Min(Math.Max(value, min), max);
 
     // Yields every (dx, dy) on the square ring at max(|dx|, |dy|) == radius,
     // stepping by `step`. Probes every step-aligned cell in the ring (not

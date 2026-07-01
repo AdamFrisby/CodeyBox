@@ -109,6 +109,13 @@ public sealed record TraceAccessibilityDescriptor
     public string? Name { get; init; }
     public string? Text { get; init; }
     public string? ElementType { get; init; }
+
+    /// <summary>
+    /// Bounds of the accessibility node at recording time when the provider
+    /// exposed them. Optional for backward compatibility with older traces and
+    /// point-only providers.
+    /// </summary>
+    public TraceBoundingRegion? Bounds { get; init; }
 }
 
 /// <summary>

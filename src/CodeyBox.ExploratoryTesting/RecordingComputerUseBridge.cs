@@ -1,6 +1,5 @@
 using CodeyBox.Core;
 using CodeyBox.Sandbox.Graphical;
-using System.Text.Json;
 
 namespace CodeyBox.ExploratoryTesting;
 
@@ -162,19 +161,16 @@ public sealed class RecordingComputerUseBridge
 
         (int? cx, int? cy) = ResolveActionCentre(canonicalAction, events);
         TraceAccessibilityDescriptor? preAccessibility = null;
+        string? preAccessibilityJson = null;
         if (cx.HasValue && cy.HasValue)
         {
-            var snap = await CaptureAccessibilityBestEffortAsync(sandbox, cx.Value, cy.Value, ct).ConfigureAwait(false);
-            if (snap != null)
-            {
-                preAccessibility = new TraceAccessibilityDescriptor
-                {
-                    Role = snap.Role,
-                    Name = snap.Name,
-                    Text = snap.Text,
-                    ElementType = snap.ElementType,
-                };
-            }
+            preAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
+            preAccessibility = await CaptureAccessibilityBestEffortAsync(
+                sandbox,
+                cx.Value,
+                cy.Value,
+                preAccessibilityJson,
+                ct).ConfigureAwait(false);
         }
 
         var result = await _inner.ExecuteAsync(sandbox, request, ct).ConfigureAwait(false);
@@ -237,24 +233,62 @@ public sealed class RecordingComputerUseBridge
     }
 
     private static async Task<TraceAccessibilityDescriptor?> CaptureAccessibilityBestEffortAsync(
-        ISandbox sandbox, int x, int y, CancellationToken ct)
+        ISandbox sandbox,
+        int x,
+        int y,
+        string? accessibilityJson,
+        CancellationToken ct)
     {
         try
         {
             var snap = await sandbox.GetAccessibilityAtPointAsync(x, y, ct).ConfigureAwait(false);
-            if (snap is null) return null;
-            return new TraceAccessibilityDescriptor
+            if (snap is not null)
             {
-                Role = snap.Role,
-                Name = snap.Name,
-                Text = snap.Text,
-                ElementType = snap.ElementType,
-            };
+                if (AccessibilityTreeParser.TryFindNodeAtPoint(accessibilityJson, x, y, snap, out var parsed))
+                    return parsed.Descriptor;
+
+                return new TraceAccessibilityDescriptor
+                {
+                    Role = snap.Role,
+                    Name = snap.Name,
+                    Text = snap.Text,
+                    ElementType = snap.ElementType,
+                };
+            }
+
+            if (AccessibilityTreeParser.TryFindNodeAtPoint(accessibilityJson, x, y, topMost: null, out var treeOnly))
+                return treeOnly.Descriptor;
+
+            return null;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            if (AccessibilityTreeParser.TryFindNodeAtPoint(accessibilityJson, x, y, topMost: null, out var treeOnly))
+                return treeOnly.Descriptor;
+
             return null;
         }
+    }
+
+    private static TraceTargetDescriptor? TryBuildFocusedTargetDescriptor(
+        string? accessibilityJson,
+        byte[]? screenshot)
+    {
+        if (!AccessibilityTreeParser.TryFindFocusedNode(accessibilityJson, out var focused))
+            return null;
+
+        var region = focused.Bounds ?? new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
+        return new TraceTargetDescriptor
+        {
+            Accessibility = focused.Descriptor,
+            Visual = new TraceVisualDescriptor
+            {
+                Region = region,
+                ClickOffsetX = region.Width > 0 ? region.Width / 2 : null,
+                ClickOffsetY = region.Height > 0 ? region.Height / 2 : null,
+                SourceScreenshotPng = screenshot,
+            },
+        };
     }
 
     private static async Task<string?> CaptureAccessibilityTreeBestEffortAsync(ISandbox sandbox, CancellationToken ct)
@@ -415,220 +449,6 @@ public sealed class RecordingComputerUseBridge
         return action == "events"
             && events.Count > 0
             && events.All(e => e.Type == SandboxInputEventType.Key && !string.IsNullOrWhiteSpace(e.Key));
-    }
-
-    private static TraceTargetDescriptor? TryBuildFocusedTargetDescriptor(
-        string? accessibilityJson,
-        byte[]? screenshot)
-    {
-        if (string.IsNullOrWhiteSpace(accessibilityJson))
-            return null;
-
-        try
-        {
-            using var doc = JsonDocument.Parse(accessibilityJson);
-            return TryFindFocusedTarget(doc.RootElement, screenshot);
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
-
-    private static TraceTargetDescriptor? TryFindFocusedTarget(JsonElement element, byte[]? screenshot)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            if (IsFocusedNode(element))
-            {
-                return BuildDescriptorFromAccessibilityNode(element, screenshot);
-            }
-
-            foreach (var property in element.EnumerateObject())
-            {
-                var hit = TryFindFocusedTarget(property.Value, screenshot);
-                if (hit is not null) return hit;
-            }
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-            {
-                var hit = TryFindFocusedTarget(item, screenshot);
-                if (hit is not null) return hit;
-            }
-        }
-
-        return null;
-    }
-
-    private static TraceTargetDescriptor BuildDescriptorFromAccessibilityNode(JsonElement node, byte[]? screenshot)
-    {
-        var accessibility = new TraceAccessibilityDescriptor
-        {
-            Role = ReadString(node, "role", "Role", "controlType", "type"),
-            Name = ReadString(node, "name", "Name", "label", "title", "accessibleName"),
-            Text = ReadString(node, "text", "Text", "value", "description"),
-            ElementType = ReadString(node, "elementType", "ElementType", "tagName", "className"),
-        };
-        if (!TryReadBounds(node, out var region))
-            region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-
-        return new TraceTargetDescriptor
-        {
-            Accessibility = accessibility,
-            Visual = new TraceVisualDescriptor
-            {
-                Region = region,
-                ClickOffsetX = region.Width > 0 ? region.Width / 2 : null,
-                ClickOffsetY = region.Height > 0 ? region.Height / 2 : null,
-                SourceScreenshotPng = screenshot,
-            },
-        };
-    }
-
-    private static bool IsFocusedNode(JsonElement node)
-    {
-        foreach (var name in new[] { "focused", "Focused", "hasFocus", "HasFocus", "has_focus", "isFocused", "is_focused" })
-        {
-            if (!TryGetProperty(node, name, out var property))
-                continue;
-
-            if (property.ValueKind == JsonValueKind.True) return true;
-            if (property.ValueKind == JsonValueKind.String
-                && bool.TryParse(property.GetString(), out var parsed)
-                && parsed)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool TryReadBounds(JsonElement obj, out TraceBoundingRegion region)
-    {
-        if (TryReadRectObject(obj, out region)) return true;
-
-        foreach (var name in new[] { "bounds", "Bounds", "rect", "Rect", "boundingBox", "BoundingBox" })
-        {
-            if (!TryGetProperty(obj, name, out var child)) continue;
-            if (child.ValueKind == JsonValueKind.Object && TryReadRectObject(child, out region)) return true;
-            if (child.ValueKind == JsonValueKind.Array && TryReadRectArray(child, out region)) return true;
-        }
-
-        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-        return false;
-    }
-
-    private static bool TryReadRectObject(JsonElement obj, out TraceBoundingRegion region)
-    {
-        if (TryReadInt(obj, "x", out var x)
-            && TryReadInt(obj, "y", out var y)
-            && TryReadInt(obj, "width", out var width)
-            && TryReadInt(obj, "height", out var height)
-            && width > 0
-            && height > 0)
-        {
-            region = new TraceBoundingRegion { X = x, Y = y, Width = width, Height = height };
-            return true;
-        }
-
-        if (TryReadInt(obj, "left", out var left)
-            && TryReadInt(obj, "top", out var top)
-            && TryReadInt(obj, "right", out var right)
-            && TryReadInt(obj, "bottom", out var bottom)
-            && right > left
-            && bottom > top)
-        {
-            region = new TraceBoundingRegion
-            {
-                X = left,
-                Y = top,
-                Width = right - left,
-                Height = bottom - top,
-            };
-            return true;
-        }
-
-        region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-        return false;
-    }
-
-    private static bool TryReadRectArray(JsonElement array, out TraceBoundingRegion region)
-    {
-        if (array.GetArrayLength() < 4)
-        {
-            region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-            return false;
-        }
-
-        var values = new int[4];
-        var i = 0;
-        foreach (var item in array.EnumerateArray())
-        {
-            if (i >= 4) break;
-            if (!TryReadInt(item, out values[i]))
-            {
-                region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-                return false;
-            }
-            i++;
-        }
-
-        if (values[2] <= 0 || values[3] <= 0)
-        {
-            region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
-            return false;
-        }
-
-        region = new TraceBoundingRegion { X = values[0], Y = values[1], Width = values[2], Height = values[3] };
-        return true;
-    }
-
-    private static bool TryReadInt(JsonElement obj, string name, out int value)
-    {
-        if (TryGetProperty(obj, name, out var property))
-            return TryReadInt(property, out value);
-
-        value = 0;
-        return false;
-    }
-
-    private static bool TryReadInt(JsonElement element, out int value)
-    {
-        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out value))
-            return true;
-        if (element.ValueKind == JsonValueKind.String
-            && int.TryParse(element.GetString(), out value))
-        {
-            return true;
-        }
-
-        value = 0;
-        return false;
-    }
-
-    private static string? ReadString(JsonElement obj, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (TryGetProperty(obj, name, out var prop) && prop.ValueKind == JsonValueKind.String)
-            {
-                var value = prop.GetString();
-                if (!string.IsNullOrEmpty(value)) return value;
-            }
-        }
-        return null;
-    }
-
-    private static bool TryGetProperty(JsonElement obj, string name, out JsonElement value)
-    {
-        if (obj.ValueKind == JsonValueKind.Object && obj.TryGetProperty(name, out value))
-            return true;
-
-        value = default;
-        return false;
     }
 
     private static bool KeyMayMoveFocus(string? key)

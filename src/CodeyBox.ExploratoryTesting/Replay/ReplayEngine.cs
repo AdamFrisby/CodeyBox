@@ -232,6 +232,29 @@ public sealed class ReplayEngine
 
             if (located is null)
             {
+                var scrollSearch = await TryLocateVisualMissByScrollingAsync(
+                    sandbox,
+                    bridge,
+                    effectiveDescriptor,
+                    options,
+                    ct).ConfigureAwait(false);
+                if (scrollSearch.Target is not null)
+                {
+                    located = scrollSearch.Target;
+                }
+                else if (scrollSearch.FailureKind is { } failureKind)
+                {
+                    return await FailAsync(
+                        sandbox, entry,
+                        failureKind,
+                        $"step {entry.Sequence} ({DiagnosticText.Sanitize(action.Kind)}): {DiagnosticText.Sanitize(scrollSearch.Diagnostic ?? failureKind.ToString())}",
+                        locatedTarget: null,
+                        ct).ConfigureAwait(false);
+                }
+            }
+
+            if (located is null)
+            {
                 return await FailAsync(
                     sandbox, entry,
                     ReplayFailureKind.NotFound,
@@ -347,6 +370,64 @@ public sealed class ReplayEngine
             Passed = true,
             LocatedTarget = located,
         };
+    }
+
+    private async Task<VisualMissScrollSearchResult> TryLocateVisualMissByScrollingAsync(
+        ISandbox sandbox,
+        ComputerUseBridge bridge,
+        TraceTargetDescriptor descriptor,
+        ReplayOptions options,
+        CancellationToken ct)
+    {
+        if (!ShouldScrollSearchAfterVisualMiss(descriptor, options, out var cx, out var cy))
+            return VisualMissScrollSearchResult.Skipped;
+
+        if (options.MaxScrollAttempts <= 0)
+        {
+            return VisualMissScrollSearchResult.Failed(
+                ReplayFailureKind.OffScreen,
+                $"visual target's recorded click point ({cx},{cy}) is outside viewport ({options.ScreenWidth}x{options.ScreenHeight}) and no scroll attempts are allowed");
+        }
+
+        for (var attempt = 1; attempt <= options.MaxScrollAttempts; attempt++)
+        {
+            var (dx, dy) = ResolveScrollDelta(cx, cy, options);
+            var scrollRequest = dx != 0
+                ? new ComputerUseRequest { Action = "scroll", ScrollX = dx }
+                : new ComputerUseRequest { Action = "scroll", ScrollY = dy };
+
+            try
+            {
+                await bridge.ExecuteAsync(sandbox, scrollRequest, ct).ConfigureAwait(false);
+                var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct)
+                    .ConfigureAwait(false);
+                if (settled is null)
+                {
+                    return VisualMissScrollSearchResult.Failed(
+                        ReplayFailureKind.OffScreen,
+                        $"screen did not settle after scrolling toward off-screen visual target ({cx},{cy}) within {options.VisualWaitTimeout}");
+                }
+
+                var relocated = await _locator.LocateAsync(sandbox, descriptor, options, ct)
+                    .ConfigureAwait(false);
+                if (relocated is not null)
+                    return VisualMissScrollSearchResult.Found(relocated);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return VisualMissScrollSearchResult.Failed(
+                    ReplayFailureKind.ActionFailed,
+                    $"scroll search for off-screen visual target failed: {DiagnosticText.Sanitize(ex.Message)}");
+            }
+        }
+
+        return VisualMissScrollSearchResult.Failed(
+            ReplayFailureKind.OffScreen,
+            $"visual target's recorded click point ({cx},{cy}) is outside viewport ({options.ScreenWidth}x{options.ScreenHeight}); target not found after {options.MaxScrollAttempts} scroll attempts");
     }
 
     private async Task<ReplayStepResult> RunScreenshotStepAsync(
@@ -829,6 +910,55 @@ public sealed class ReplayEngine
         action.Kind == "scroll"
         && !HasUsableTargetSignal(action.TargetDescriptor);
 
+    private bool ShouldScrollSearchAfterVisualMiss(
+        TraceTargetDescriptor descriptor,
+        ReplayOptions options,
+        out int cx,
+        out int cy)
+    {
+        var visual = descriptor.Visual;
+        var region = visual.Region;
+        cx = 0;
+        cy = 0;
+
+        if (descriptor.Accessibility is { } accessibility
+            && _accessibilityMatcher.HasAnyAccessibilitySignal(accessibility))
+        {
+            return false;
+        }
+
+        if (region.Width <= 0 || region.Height <= 0)
+            return false;
+
+        if (visual.TemplatePng is not { Length: > 0 }
+            && visual.SourceScreenshotPng is not { Length: > 0 }
+            && string.IsNullOrWhiteSpace(visual.OcrText))
+        {
+            return false;
+        }
+
+        cx = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < region.Width
+            ? region.X + offsetX
+            : region.X + region.Width / 2;
+        cy = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
+            ? region.Y + offsetY
+            : region.Y + region.Height / 2;
+        return !PointInViewport(cx, cy, options);
+    }
+
+    private static bool PointInViewport(int x, int y, ReplayOptions options)
+        => x >= 0 && x < options.ScreenWidth && y >= 0 && y < options.ScreenHeight;
+
+    private static (int Dx, int Dy) ResolveScrollDelta(int x, int y, ReplayOptions options)
+    {
+        if (y < 0) return (0, -options.ScrollStep);
+        if (y >= options.ScreenHeight) return (0, options.ScrollStep);
+        if (x < 0) return (-options.ScrollStep, 0);
+        if (x >= options.ScreenWidth) return (options.ScrollStep, 0);
+        throw new InvalidOperationException(
+            $"ResolveScrollDelta invoked for in-viewport point ({x},{y}).");
+    }
+
     private static bool HasUsableTargetSignal(TraceTargetDescriptor descriptor)
     {
         var accessibility = descriptor.Accessibility;
@@ -909,6 +1039,16 @@ public sealed class ReplayEngine
             // diagnostics when this returns null.
             return null;
         }
+    }
+
+    private sealed record VisualMissScrollSearchResult(
+        LocatedTarget? Target,
+        ReplayFailureKind? FailureKind,
+        string? Diagnostic)
+    {
+        public static VisualMissScrollSearchResult Skipped { get; } = new(null, null, null);
+        public static VisualMissScrollSearchResult Found(LocatedTarget target) => new(target, null, null);
+        public static VisualMissScrollSearchResult Failed(ReplayFailureKind kind, string diagnostic) => new(null, kind, diagnostic);
     }
 
     private static string DescribeDescriptor(TraceTargetDescriptor descriptor)

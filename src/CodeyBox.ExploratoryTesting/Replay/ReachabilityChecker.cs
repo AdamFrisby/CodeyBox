@@ -164,17 +164,11 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 
             if (snap is null)
             {
-                if (!await HasAccessibilityTreeAsync(sandbox, ct).ConfigureAwait(false)
-                    && await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, allowLocatorEvidence: true, ct).ConfigureAwait(false) == VisualTargetVerificationStatus.Verified)
-                {
-                    return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
-                }
-
                 return new ReachabilityOutcome
                 {
                     Status = ReachabilityStatus.Occluded,
                     Target = current,
-                    Diagnostic = $"expected element ({Describe(expectedAccessibility)}) is no longer visible at ({current.CenterX},{current.CenterY}) — display:none / opacity:0 / removed-from-tree",
+                    Diagnostic = $"expected element ({Describe(expectedAccessibility)}) did not answer the top-most accessibility probe at ({current.CenterX},{current.CenterY}); cannot verify it is visible and unobstructed",
                 };
             }
 
@@ -324,23 +318,6 @@ public sealed class ReachabilityChecker : IReachabilityChecker
 
     private static string Describe(TraceAccessibilityDescriptor d) =>
         $"role={DiagnosticText.Sanitize(d.Role ?? "?")} name={DiagnosticText.Sanitize(d.Name ?? "?")}";
-
-    private static async Task<bool> HasAccessibilityTreeAsync(ISandbox sandbox, CancellationToken ct)
-    {
-        try
-        {
-            var tree = await sandbox.GetAccessibilityTreeJsonAsync(ct).ConfigureAwait(false);
-            return !string.IsNullOrWhiteSpace(tree);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch
-        {
-            return false;
-        }
-    }
 
     private static bool TopMostAccessibilityMatchesOcrTarget(
         SandboxAccessibilitySnapshot snap,

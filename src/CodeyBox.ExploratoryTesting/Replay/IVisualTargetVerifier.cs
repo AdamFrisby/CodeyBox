@@ -37,7 +37,8 @@ public sealed class DescriptorVisualTargetVerifier : IVisualTargetVerifier
             && PngBitmap.TryDecode(currentPng, out var currentTemplateScreen)
             && PngBitmap.TryDecode(visual.TemplatePng, out var template))
         {
-            return currentTemplateScreen.MatchesAt(template, target.Region.X, target.Region.Y, PngPixelMatchOptions.ReplayTolerance)
+            var (x, y) = OriginForClickAlignedVisual(visual, target, template.Width, template.Height);
+            return currentTemplateScreen.MatchesAt(template, x, y, PngPixelMatchOptions.ReplayTolerance)
                 ? VisualTargetVerificationStatus.Verified
                 : VisualTargetVerificationStatus.Mismatch;
         }
@@ -48,7 +49,8 @@ public sealed class DescriptorVisualTargetVerifier : IVisualTargetVerifier
                 && PngBitmap.TryDecode(currentPng, out var current)
                 && source.TryCrop(visual.Region, out var crop))
             {
-                return current.MatchesAt(crop, target.Region.X, target.Region.Y, PngPixelMatchOptions.ReplayTolerance)
+                var (x, y) = OriginForClickAlignedVisual(visual, target, crop.Width, crop.Height);
+                return current.MatchesAt(crop, x, y, PngPixelMatchOptions.ReplayTolerance)
                     ? VisualTargetVerificationStatus.Verified
                     : VisualTargetVerificationStatus.Mismatch;
             }
@@ -65,5 +67,16 @@ public sealed class DescriptorVisualTargetVerifier : IVisualTargetVerifier
         }
 
         return VisualTargetVerificationStatus.Unverifiable;
+    }
+
+    private static (int X, int Y) OriginForClickAlignedVisual(
+        TraceVisualDescriptor visual,
+        LocatedTarget target,
+        int width,
+        int height)
+    {
+        var offsetX = visual.ClickOffsetX is int x && x >= 0 && x < width ? x : width / 2;
+        var offsetY = visual.ClickOffsetY is int y && y >= 0 && y < height ? y : height / 2;
+        return (target.CenterX - offsetX, target.CenterY - offsetY);
     }
 }
