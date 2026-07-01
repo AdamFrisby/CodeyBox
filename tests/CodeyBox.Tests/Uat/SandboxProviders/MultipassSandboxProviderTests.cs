@@ -884,7 +884,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.NotNull(transferredLaunchScript);
         Assert.Contains("codeybox_stdin_file='/run/codeybox-exec/detached-", transferredLaunchScript);
         Assert.Contains("codeybox-detached: failed to publish stdin sidecar", transferredLaunchScript);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh'", transferredLaunchScript);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_child_status_file\" \"$codeybox_child_pgid_file\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh'", transferredLaunchScript);
         Assert.DoesNotContain("codeybox_exit_marker", transferredLaunchScript);
         Assert.DoesNotContain(runner.Calls, IsCodeyboxExecCall);
 
@@ -1242,20 +1242,26 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"", script);
         Assert.Contains("codeybox_drain_stdin", script);
         Assert.Contains("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi", script);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_child_status_file\" \"$codeybox_child_pgid_file\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
         Assert.Contains("codeybox_detached_pid=$!", script);
+        Assert.Contains("codeybox_child_status_file=$(mktemp", script);
+        Assert.Contains("codeybox_child_pgid_file=$(mktemp", script);
+        Assert.Contains("codeybox_report_child_status_if_present", script);
+        Assert.Contains("codeybox_child_group_alive", script);
         Assert.Contains("codeybox_pgid=$$", script);
         Assert.Contains("printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\"", script);
+        Assert.Contains("printf '%s\\n' \"$$\" > \"$codeybox_child_pgid_file\"", script);
         Assert.Contains("mv -f \"$exit_tmp\" \"${marker}.exit\"", script);
         Assert.Contains("mv -f \"$stdout_tmp\" \"${marker}.stdout\"", script);
         Assert.Contains("mv -f \"$stderr_tmp\" \"${marker}.stderr\"", script);
-        Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
-        Assert.Contains("while kill -0 \"-$codeybox_detached_pid\"", script);
-        Assert.Contains("kill -KILL \"-$codeybox_detached_pid\"", script);
+        Assert.Contains("codeybox_detached_pgid=$(codeybox_read_child_pgid)", script);
+        Assert.Contains("kill -TERM \"-$codeybox_detached_pgid\"", script);
+        Assert.Contains("while kill -0 \"-$codeybox_detached_pgid\"", script);
+        Assert.Contains("kill -KILL \"-$codeybox_detached_pgid\"", script);
         Assert.Contains("wait \"$codeybox_detached_pid\" 2>/dev/null", script);
-        var termIndex = script.IndexOf("kill -TERM \"-$codeybox_detached_pid\"", StringComparison.Ordinal);
+        var termIndex = script.IndexOf("kill -TERM \"-$codeybox_detached_pgid\"", StringComparison.Ordinal);
         var sleepIndex = script.IndexOf("sleep 0.05", termIndex, StringComparison.Ordinal);
-        var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pid\"", termIndex, StringComparison.Ordinal);
+        var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pgid\"", termIndex, StringComparison.Ordinal);
         var waitIndex = script.IndexOf("wait \"$codeybox_detached_pid\" 2>/dev/null", termIndex, StringComparison.Ordinal);
         var timeoutExitIndex = script.IndexOf(
             "exit 88",
@@ -2084,6 +2090,99 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stdout);
         Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
         Assert.False(File.Exists(processGroupMarker));
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_MarkerTimeoutUsesPublishedPgidWhenSetsidLauncherExitsEarly()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        const string realSetsid = "/usr/bin/setsid";
+        if (!File.Exists(realSetsid))
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "marker-timeout-launcher-exits",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.env");
+        var launchScript = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.pgid");
+        var sudoProcessGroupFile = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.sudo-pgid");
+        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", "-c", "printf should-not-run"],
+                markerWaitSeconds: 5));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var fakeBin = CreateFakeSudoBin($$"""
+            #!/bin/sh
+            if [ "$1" = "-n" ]; then shift; fi
+            if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
+                case "$3" in *'pgid=$2'*)
+                    pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
+                    printf '%s\n' "$pgid" > {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
+                    trap '' TERM
+                    while :; do sleep 1; done
+                    ;;
+                esac
+            fi
+            exec "$@"
+            """);
+        var fakeSetsid = Path.Combine(fakeBin, "setsid");
+        await File.WriteAllTextAsync(
+            fakeSetsid,
+            $$"""
+            #!/bin/sh
+            {{MultipassSandboxProvider.ShellSingleQuote(realSetsid)}} "$@" &
+            exit 88
+            """);
+        File.SetUnixFileMode(fakeSetsid, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var (exit, stdout, stderr) = await RunLocalProcessAsync(
+                "/bin/bash",
+                [launchScript],
+                timeout.Token,
+                environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["PATH"] = fakeBin + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+                });
+
+            Assert.Equal(88, exit);
+            Assert.Equal("", stdout);
+            Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(processGroupMarker));
+
+            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(1));
+            var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
+            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(3));
+        }
+        finally
+        {
+            for (var i = 0; i < 20 && !File.Exists(sudoProcessGroupFile); i++)
+                await Task.Delay(50);
+
+            if (File.Exists(sudoProcessGroupFile))
+            {
+                var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
+                await KillProcessGroupAsync(pgid);
+            }
+        }
     }
 
     [Fact]
