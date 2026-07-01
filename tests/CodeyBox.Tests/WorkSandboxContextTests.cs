@@ -38,6 +38,38 @@ public sealed class WorkSandboxContextTests
         Assert.Equal(SandboxExecLaunchMode.DetachedBatch, agentExec.LaunchMode);
     }
 
+    [Fact]
+    public async Task GetOrCreateSandboxAsync_DoesNotReuseAcrossTimingPhases()
+    {
+        var provider = new RecordingSandboxProvider();
+        await using var context = new WorkSandboxContext(
+            provider,
+            new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = true, MaxSandboxReuses = 10 }),
+            NullLogger.Instance);
+
+        await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            TimingPhase = "work",
+        }, CancellationToken.None))
+        {
+        }
+
+        await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            TimingPhase = "rework",
+        }, CancellationToken.None))
+        {
+        }
+
+        Assert.Equal(2, provider.Created.Count);
+        Assert.True(provider.Created[0].Disposed);
+        Assert.False(provider.Created[1].Disposed);
+    }
+
     private sealed class SingleSandboxProvider(ISandbox sandbox) : ISandboxProvider
     {
         public string Name => "single";
@@ -49,11 +81,33 @@ public sealed class WorkSandboxContextTests
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
+    private sealed class RecordingSandboxProvider : ISandboxProvider
+    {
+        public string Name => "recording";
+        public List<RecordingSandbox> Created { get; } = [];
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var sandbox = new RecordingSandbox(
+                SandboxAgentOutputTransportKind.ExecPipe,
+                SandboxBatchLaunchMode.Attached,
+                $"recording-{Created.Count + 1}");
+            Created.Add(sandbox);
+            return Task.FromResult<ISandbox>(sandbox);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
     private sealed class RecordingSandbox(
         SandboxAgentOutputTransportKind transportKind,
-        SandboxBatchLaunchMode batchLaunchMode) : ISandbox
+        SandboxBatchLaunchMode batchLaunchMode,
+        string? id = null) : ISandbox
     {
-        public string Id => "recording-work-context";
+        public string Id { get; } = id ?? "recording-work-context";
         public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; } = transportKind;
         public SandboxBatchLaunchMode BatchLaunchMode { get; } = batchLaunchMode;
         public List<SandboxExec> Execs { get; } = [];

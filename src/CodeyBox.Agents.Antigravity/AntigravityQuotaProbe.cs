@@ -76,7 +76,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
     /// (400 "Invalid value at 'metadata.plugin_type'"); GEMINI returns the same
     /// account/tier the agy credential is backed by.
     /// </summary>
-    private const string LoadCodeAssistBody = "{\"metadata\":{\"pluginType\":\"GEMINI\"}}";
+    internal const string LoadCodeAssistBody = "{\"metadata\":{\"pluginType\":\"GEMINI\"}}";
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;

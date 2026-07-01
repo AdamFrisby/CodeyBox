@@ -28,6 +28,15 @@ public sealed class AntigravitySmokeProbeTests
         return new(AgentKind.Antigravity, env, new Dictionary<string, string>());
     }
 
+    private static AgentCredential NestedAccessTokenOnlyCred(string accessToken)
+    {
+        var env = new Dictionary<string, string>
+        {
+            [AntigravityConstants.OAuthCredsEnvVar] = $$$"""{"auth_method":"consumer","token":{"access_token":"{{{accessToken}}}","expiry":"2099-01-01T00:00:00Z"}}"""
+        };
+        return new(AgentKind.Antigravity, env, new Dictionary<string, string>());
+    }
+
     private static AgentCredential EmptyCred() =>
         new(AgentKind.Antigravity,
             new Dictionary<string, string>(),
@@ -90,14 +99,26 @@ public sealed class AntigravitySmokeProbeTests
     }
 
     [Fact]
-    public async Task RefreshableOAuthBundle_ReturnsOkWithoutHttpCall()
+    public async Task RefreshableOAuthBundle_StillValidatesAccessTokenWithHttpCall()
     {
         var calls = 0;
-        var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.Unauthorized, "", _ => calls++))
-            .SmokeTestAsync(OAuthCred("expired-access-token"), CancellationToken.None);
+        var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.OK, "{}", _ => calls++))
+            .SmokeTestAsync(OAuthCred("valid-access-token"), CancellationToken.None);
 
         Assert.True(result.Ok);
-        Assert.Equal(0, calls);
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public async Task NestedAccessTokenOnlyOAuthBundle_Http200_ReturnsOk()
+    {
+        string? authHeader = null;
+        var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req =>
+            authHeader = req.Headers.Authorization?.ToString()))
+            .SmokeTestAsync(NestedAccessTokenOnlyCred("nested-access-token"), CancellationToken.None);
+
+        Assert.True(result.Ok);
+        Assert.Equal("Bearer nested-access-token", authHeader);
     }
 
     [Fact]
@@ -115,6 +136,7 @@ public sealed class AntigravitySmokeProbeTests
             .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Equal("auth", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
     }
 
     [Fact]
@@ -124,6 +146,7 @@ public sealed class AntigravitySmokeProbeTests
             .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Equal("auth", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
     }
 
     [Fact]
@@ -133,6 +156,7 @@ public sealed class AntigravitySmokeProbeTests
             .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("transient", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Transient, result.Category);
     }
 
     [Fact]
@@ -152,6 +176,7 @@ public sealed class AntigravitySmokeProbeTests
             .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("transient", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Transient, result.Category);
     }
 
     [Fact]
@@ -162,6 +187,7 @@ public sealed class AntigravitySmokeProbeTests
             .SmokeTestAsync(FlatOAuthCred("agy-oauth-token"), cts.Token);
         Assert.False(result.Ok);
         Assert.Equal("timeout", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Transient, result.Category);
     }
 
     [Fact]
@@ -172,16 +198,19 @@ public sealed class AntigravitySmokeProbeTests
             .SmokeTestAsync(EmptyCred(), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("no token", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
         Assert.Equal(0, calls);
     }
 
     [Fact]
-    public async Task OAuthCredsJson_MissingAccessTokenWithRefreshToken_ReturnsOkWithoutHttpCall()
+    public async Task OAuthCredsJson_MissingAccessTokenWithRefreshToken_ReturnsPersistentFailureWithoutHttpCall()
     {
         int calls = 0;
         var result = await BuildProbe(new SmokeCapturingHandler(HttpStatusCode.OK, "{}", _ => calls++))
             .SmokeTestAsync(OAuthCredMissingAccessToken(), CancellationToken.None);
-        Assert.True(result.Ok);
+        Assert.False(result.Ok);
+        Assert.Contains("no token", result.FailureReason);
+        Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
         Assert.Equal(0, calls);
     }
 

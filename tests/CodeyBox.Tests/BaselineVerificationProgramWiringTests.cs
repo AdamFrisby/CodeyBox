@@ -106,6 +106,56 @@ public sealed class BaselineVerificationProgramWiringTests
     }
 
     [Fact]
+    public void Program_PopulatesResourceMetricsOptions_FromMultipassSandboxConfig()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "multipass",
+            ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+            ["CodeyBox:MultipassSandbox:CaptureResourceMetrics"] = "true",
+            ["CodeyBox:MultipassSandbox:ResourceMetricsCaptureTimeoutSeconds"] = "9",
+        });
+
+        var opts = ResolveLiveMultipassOptions(factory);
+
+        Assert.True(opts.CaptureResourceMetrics);
+        Assert.Equal(TimeSpan.FromSeconds(9), opts.ResourceMetricsCaptureTimeout);
+    }
+
+    [Fact]
+    public void Program_ResourceMetricsOptions_DefaultOffAndNonPositiveTimeoutFallsBack()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "multipass",
+            ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+            ["CodeyBox:MultipassSandbox:ResourceMetricsCaptureTimeoutSeconds"] = "0",
+        });
+
+        var opts = ResolveLiveMultipassOptions(factory);
+
+        Assert.False(opts.CaptureResourceMetrics);
+        Assert.Equal(MultipassSandboxOptions.DefaultResourceMetricsCaptureTimeout, opts.ResourceMetricsCaptureTimeout);
+    }
+
+    [Fact]
+    public void Program_PassesSandboxResourceUsageStoreIntoMultipassProvider()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "multipass",
+            ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+        });
+
+        var multipass = UnwrapToMultipass(factory.Services.GetRequiredService<ISandboxProvider>());
+        var field = typeof(MultipassSandboxProvider).GetField(
+            "_resourceUsageStore", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        Assert.NotNull(field);
+        Assert.Same(factory.Services.GetRequiredService<ISandboxResourceUsageStore>(), field!.GetValue(multipass));
+    }
+
+    [Fact]
     public void Program_LeavesBaselineVerificationCommandsEmpty_WhenBaselineImagesDisabled()
     {
         // When UseBaselineImages=false there is no baseline to verify, so the

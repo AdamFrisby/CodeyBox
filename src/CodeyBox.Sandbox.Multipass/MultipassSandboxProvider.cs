@@ -348,7 +348,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             }
             else
             {
-                var cloudInit = BuildCloudInit(opts.ExtraRuncmd, opts.ExtraCloudInit, spec.Flavor);
+                var cloudInit = BuildCloudInit(
+                    opts.ExtraRuncmd,
+                    opts.ExtraCloudInit,
+                    spec.Flavor,
+                    includePeakRamSampler: opts.CaptureResourceMetrics);
                 var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
                 // The op-gate inside RunAsync now bounds the `launch` CLI
@@ -1430,7 +1434,8 @@ git push origin HEAD:{refName}";
             flavor: flavor,
             startRouteService: true,
             includeGraphicalInstall: false,
-            baselineInstallCommands: opts.ExtraRuncmd);
+            baselineInstallCommands: opts.ExtraRuncmd,
+            includePeakRamSampler: opts.CaptureResourceMetrics);
         var seedsStr = string.Join(";", opts.PackageCacheSeeds.Select(s => $"{s.HostSourcePath}->{s.VmDestPath}({s.MaxSizeMB})"));
         var execsStr = string.Join(";", opts.ExecutableProvisions.Select(RenderExecutableProvisionForHash));
         // Build a canonical, version-prefixed string. The 'v4' prefix lets
@@ -1601,7 +1606,8 @@ git push origin HEAD:{refName}";
             flavor: flavor,
             startRouteService: true,
             includeGraphicalInstall: false,
-            baselineInstallCommands: opts.ExtraRuncmd);
+            baselineInstallCommands: opts.ExtraRuncmd,
+            includePeakRamSampler: opts.CaptureResourceMetrics);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
         TryChmod0700(stagingDir);
@@ -3848,8 +3854,9 @@ test "$work" = present && test "$exec_wrapper" = present
     ///     such as <c>runcmd:</c> or <c>write_files:</c> via
     ///     <paramref name="extraCloudInit"/> — duplicate top-level keys can
     ///     clobber generated user-data, so they are rejected before launch.
-    ///   - Installs a tiny peak-RAM sampler service that records the running
-    ///     max of MemTotal-MemAvailable to /run for teardown capture.
+    ///   - When resource capture is enabled, installs a tiny peak-RAM sampler
+    ///     service that records the running max of MemTotal-MemAvailable to
+    ///     /run for teardown capture.
     ///
     /// Egress filtering is NOT installed in the guest. It lives entirely
     /// on the host (nftables on the profile bridge — see
@@ -3864,13 +3871,18 @@ test "$work" = present && test "$exec_wrapper" = present
         SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
         bool startRouteService = true,
         bool includeGraphicalInstall = true,
-        IReadOnlyList<string>? baselineInstallCommands = null)
+        IReadOnlyList<string>? baselineInstallCommands = null,
+        bool includePeakRamSampler = false)
     {
         ValidateExtraCloudInitFragment(extraCloudInit);
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
-        var peakRamSamplerIndented = string.Join("\n      ", PeakRamSamplerScript.Split('\n'));
-        var peakRamSamplerServiceIndented = string.Join("\n      ", PeakRamSamplerService.Split('\n'));
+        var peakRamSamplerIndented = includePeakRamSampler
+            ? string.Join("\n      ", PeakRamSamplerScript.Split('\n'))
+            : null;
+        var peakRamSamplerServiceIndented = includePeakRamSampler
+            ? string.Join("\n      ", PeakRamSamplerService.Split('\n'))
+            : null;
         var graphicalXvfbIndented = string.Join("\n      ", GraphicalXvfbService.Split('\n'));
         var graphicalXfceIndented = string.Join("\n      ", GraphicalXfceService.Split('\n'));
         var graphicalVncIndented = string.Join("\n      ", GraphicalVncService.Split('\n'));
@@ -3902,10 +3914,13 @@ test "$work" = present && test "$exec_wrapper" = present
         sb.AppendLine("    permissions: '0o755'");
         sb.AppendLine("    content: |");
         sb.Append("      ").AppendLine(routeScriptIndented);
-        sb.AppendLine("  - path: /usr/local/sbin/codeybox-peak-ram-sampler");
-        sb.AppendLine("    permissions: '0o755'");
-        sb.AppendLine("    content: |");
-        sb.Append("      ").AppendLine(peakRamSamplerIndented);
+        if (includePeakRamSampler)
+        {
+            sb.AppendLine("  - path: /usr/local/sbin/codeybox-peak-ram-sampler");
+            sb.AppendLine("    permissions: '0o755'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(peakRamSamplerIndented);
+        }
         sb.AppendLine("  - path: /etc/systemd/system/codeybox-route.service");
         sb.AppendLine("    permissions: '0o644'");
         sb.AppendLine("    content: |");
@@ -3919,10 +3934,13 @@ test "$work" = present && test "$exec_wrapper" = present
         sb.AppendLine("      RemainAfterExit=yes");
         sb.AppendLine("      [Install]");
         sb.AppendLine("      WantedBy=multi-user.target");
-        sb.AppendLine("  - path: /etc/systemd/system/codeybox-peak-ram-sampler.service");
-        sb.AppendLine("    permissions: '0o644'");
-        sb.AppendLine("    content: |");
-        sb.Append("      ").AppendLine(peakRamSamplerServiceIndented);
+        if (includePeakRamSampler)
+        {
+            sb.AppendLine("  - path: /etc/systemd/system/codeybox-peak-ram-sampler.service");
+            sb.AppendLine("    permissions: '0o644'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(peakRamSamplerServiceIndented);
+        }
         if (flavor == SandboxProfileFlavor.Graphical)
         {
             sb.AppendLine("  - path: /etc/systemd/system/codeybox-xvfb.service");
@@ -3962,7 +3980,8 @@ test "$work" = present && test "$exec_wrapper" = present
         sb.AppendLine(startRouteService
             ? "  - systemctl enable --now codeybox-route.service"
             : "  - systemctl enable codeybox-route.service");
-        sb.AppendLine("  - systemctl enable --now codeybox-peak-ram-sampler.service");
+        if (includePeakRamSampler)
+            sb.AppendLine("  - systemctl enable --now codeybox-peak-ram-sampler.service");
         if (flavor == SandboxProfileFlavor.Graphical && includeGraphicalInstall)
             AppendRuncmdCommand(sb, GraphicalInstallRuncmd);
         // Splice caller-supplied runcmd entries into the same block, after the
@@ -5190,6 +5209,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
+    internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
+    internal const int ResourceMetricsCaptureMaxStderrBytes = 4096;
     internal const int AgentOutputHttpSetupFailedExitCode = 86;
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
@@ -5236,7 +5257,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private int _firstExecEmitted;
     private int _disposeStarted;
     private int _disposed;
-    private int _resourceMetricsCaptureStarted;
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
@@ -6815,11 +6835,9 @@ while True:
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0) return;
+        Volatile.Write(ref _disposed, 1);
         if (_preserveOnDispose)
-        {
-            Volatile.Write(ref _disposed, 1);
             return;
-        }
 
         try
         {
@@ -6831,7 +6849,6 @@ while True:
         }
 
         var metrics = await EnsureResourceMetricsCapturedAsync(CancellationToken.None).ConfigureAwait(false);
-        Volatile.Write(ref _disposed, 1);
 
         await using var disposeScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "vm.dispose", log: _log);
@@ -6863,21 +6880,26 @@ while True:
         if (!_opts.CaptureResourceMetrics)
             return null;
 
-        if (Interlocked.Exchange(ref _resourceMetricsCaptureStarted, 1) != 0)
-            return _resourceMetrics;
-
         try
         {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(ResolveResourceMetricsCaptureTimeout(_opts));
+
             await using var captureScope = await TimingScope.BeginAsync(
                 _timings, _timingItemId, _timingPhase, "vm.resource_capture", log: _log);
-            var metrics = await CaptureResourceMetricsAsync(ct).ConfigureAwait(false);
+            var metrics = await CaptureResourceMetricsAsync(cts.Token).ConfigureAwait(false);
             if (metrics is null)
                 return null;
 
             _resourceMetrics = metrics;
-            await PersistResourceMetricsAsync(metrics, CancellationToken.None).ConfigureAwait(false);
+            await TryPersistResourceMetricsAsync(metrics, cts.Token).ConfigureAwait(false);
             RecordResourceMetricInstruments(metrics);
             return metrics;
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning("Timed out capturing resource metrics for multipass VM {Name} before teardown", _name);
+            return null;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -6890,20 +6912,26 @@ while True:
     {
         try
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(ResolveResourceMetricsCaptureTimeout(_opts));
+            var result = await RunMultipassAsync(
+                [_opts.MultipassBinary, "exec", _name, "--", "sh", "-c", BuildResourceMetricsCaptureScript()],
+                stdin: null,
+                ct: ct,
+                maxStdoutBytes: ResourceMetricsCaptureMaxStdoutBytes,
+                maxStderrBytes: ResourceMetricsCaptureMaxStderrBytes,
+                killOnOutputLimit: true).WaitAsync(ct).ConfigureAwait(false);
 
-            var result = await ExecAsync(new SandboxExec
+            if (result.StdoutLimitExceeded || result.StderrLimitExceeded)
             {
-                Argv = ["sh", "-c", BuildResourceMetricsCaptureScript()]
-            }, cts.Token).WaitAsync(cts.Token).ConfigureAwait(false);
+                _log.LogWarning("Resource metrics capture output exceeded limit for multipass VM {Name}", _name);
+                return null;
+            }
 
             if (result.ExitCode == 0)
                 return ParseResourceMetricsOutput(result.Stdout, DateTimeOffset.UtcNow);
         }
         catch (OperationCanceledException)
         {
-            _log.LogWarning("Timed out capturing resource metrics for multipass VM {Name} before teardown", _name);
+            throw;
         }
         catch (Exception ex)
         {
@@ -6913,7 +6941,9 @@ while True:
     }
 
     internal static string BuildResourceMetricsCaptureScript() => $$"""
-        peak_ram_bytes=$(cat {{MultipassSandboxProvider.ShellSingleQuote(MultipassSandboxProvider.PeakRamSamplerPath)}} 2>/dev/null || true)
+        proc_root=${CODEYBOX_PROC_ROOT:-/proc}
+        peak_ram_path=${CODEYBOX_PEAK_RAM_SAMPLER_PATH:-{{MultipassSandboxProvider.ShellSingleQuote(MultipassSandboxProvider.PeakRamSamplerPath)}}}
+        peak_ram_bytes=$(head -c 64 "$peak_ram_path" 2>/dev/null | awk 'NR == 1 { print; exit }' || true)
 
         cpu_pct=$(awk '
             /^cpu / {
@@ -6924,23 +6954,23 @@ while True:
                 busy=total-idle-iowait
                 if (total > 0) printf "%.6f", busy * 100 / total
             }
-        ' /proc/stat)
+        ' "$proc_root/stat")
 
         load1=
         load5=
         load15=
-        if read -r load1 load5 load15 _ < /proc/loadavg; then
+        if read -r load1 load5 load15 _ < "$proc_root/loadavg"; then
             :
         fi
 
-        uptime_sec=$(awk '{print $1}' /proc/uptime 2>/dev/null || true)
+        uptime_sec=$(awk '{print $1}' "$proc_root/uptime" 2>/dev/null || true)
 
         net_rx_bytes=0
         net_tx_bytes=0
         net_line=$(awk -v iface={{MultipassSandboxProvider.ShellSingleQuote(MultipassSandboxProvider.ResourceDataInterface)}} -F'[: ]+' '
             $2 == iface { print $3 " " $11; found=1 }
             END { if (!found) print "0 0" }
-        ' /proc/net/dev)
+        ' "$proc_root/net/dev")
         set -- $net_line
         net_rx_bytes=${1:-0}
         net_tx_bytes=${2:-0}
@@ -6965,8 +6995,12 @@ while True:
             values[rawLine[..eq]] = rawLine[(eq + 1)..];
         }
 
+        var peakRamBytes = ParseNullableLong(values, "peak_ram_bytes", positiveOnly: true);
+        if (peakRamBytes is { } peak && _spec.Limits.MemoryBytes is { } memoryLimit && memoryLimit > 0 && peak > memoryLimit)
+            peakRamBytes = memoryLimit;
+
         var metrics = new SandboxResourceMetrics(
-            PeakRamBytes: ParseNullableLong(values, "peak_ram_bytes", positiveOnly: true),
+            PeakRamBytes: peakRamBytes,
             AvgCpuPercent: ParseNullableDouble(values, "avg_cpu_pct", min: 0, max: 100),
             NetRxBytes: ParseNullableLong(values, "net_rx_bytes", positiveOnly: false),
             NetTxBytes: ParseNullableLong(values, "net_tx_bytes", positiveOnly: false),
@@ -6979,7 +7013,19 @@ while True:
             Phase: _timingPhase,
             CapturedAt: capturedAt);
 
-        return HasAnyResourceMetric(metrics) ? metrics : null;
+        return HasRequiredResourceMetrics(metrics) ? metrics : null;
+    }
+
+    private async Task TryPersistResourceMetricsAsync(SandboxResourceMetrics metrics, CancellationToken ct)
+    {
+        try
+        {
+            await PersistResourceMetricsAsync(metrics, ct).WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning("Timed out persisting resource metrics for multipass VM {Name}", _name);
+        }
     }
 
     private async Task PersistResourceMetricsAsync(SandboxResourceMetrics metrics, CancellationToken ct)
@@ -7027,15 +7073,10 @@ while True:
             CodeyBoxMeters.SandboxNetTxMb.Record(tx, phaseTag, networkTag);
     }
 
-    private static bool HasAnyResourceMetric(SandboxResourceMetrics metrics) =>
+    private static bool HasRequiredResourceMetrics(SandboxResourceMetrics metrics) =>
         metrics.PeakRamBytes.HasValue
-        || metrics.AvgCpuPercent.HasValue
-        || metrics.NetRxBytes.HasValue
-        || metrics.NetTxBytes.HasValue
-        || metrics.UptimeSeconds.HasValue
-        || metrics.LoadAvg1.HasValue
-        || metrics.LoadAvg5.HasValue
-        || metrics.LoadAvg15.HasValue;
+        && metrics.AvgCpuPercent.HasValue
+        && (metrics.NetRxBytes.GetValueOrDefault() > 0 || metrics.NetTxBytes.GetValueOrDefault() > 0);
 
     private static long? ParseNullableLong(
         IReadOnlyDictionary<string, string> values,
@@ -7113,9 +7154,9 @@ while True:
         // recoverable without one. From this point, DisposeAsync must not
         // delete the VM even if multipass stop fails, times out, or shutdown
         // cancellation abandons the wait.
+        await TryWritePreemptMarkerAsync(CancellationToken.None);
         _preserveOnDispose = true;
         await EnsureResourceMetricsCapturedAsync(CancellationToken.None).ConfigureAwait(false);
-        await TryWritePreemptMarkerAsync(CancellationToken.None);
 
         var stop = await RunMultipassAsync(
             [_opts.MultipassBinary, "stop", _name],

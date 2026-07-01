@@ -9,14 +9,12 @@ using CodeyBox.Core;
 namespace CodeyBox.Agents.Antigravity;
 
 /// <summary>
-/// Smoke-tests Antigravity credentials. Refresh-token-bearing OAuth bundles
-/// pass by presence check because the in-VM agy CLI owns token refresh; access-
-/// token-only bundles are validated with a loadCodeAssist request.
+/// Smoke-tests Antigravity credentials with the gateway authorization read.
 /// </summary>
 public sealed class AntigravitySmokeProbe : IAgentSmokeProbe
 {
-    internal const string LoadCodeAssistEndpoint = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-    private const string LoadCodeAssistBody = "{\"metadata\":{\"pluginType\":\"GEMINI\"}}";
+    internal const string LoadCodeAssistEndpoint = AntigravityQuotaProbe.LoadCodeAssistEndpoint;
+    private const string LoadCodeAssistBody = AntigravityQuotaProbe.LoadCodeAssistBody;
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<AntigravitySmokeProbe> _log;
@@ -41,12 +39,6 @@ public sealed class AntigravitySmokeProbe : IAgentSmokeProbe
             }
 
             var parsed = ExtractOAuthCredential(oauthJson, _log);
-            if (parsed.HasRefreshToken)
-            {
-                sw.Stop();
-                return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
-            }
-
             if (string.IsNullOrEmpty(parsed.AccessToken))
             {
                 return Fail("no token in credential bundle", sw, SmokeFailureCategory.Persistent);
