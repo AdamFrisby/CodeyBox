@@ -138,6 +138,25 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_rejects_missing_network_profile_before_unprofiled_launch()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Network = new SandboxNetworkPolicy { ProfileName = "missing-profile" },
+            }));
+
+        Assert.Contains("Network profile 'missing-profile' is not configured", ex.Message);
+        Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
+    }
+
+    [Fact]
     public async Task ExecAsync_streams_stdout_chunks_to_callback_in_order()
     {
         var opts = DefaultOptions();
@@ -806,6 +825,32 @@ public sealed class MultipassRemoteSandboxProviderTests
         var host = Assert.Single(provider.SnapshotHostPool());
         Assert.False(host.RuntimeHealthy);
         Assert.Contains("failed to parse", host.RuntimeUnhealthyReason);
+    }
+
+    [Fact]
+    public async Task ListAllManagedAsync_metadata_transport_failure_marks_host_unhealthy_without_throwing()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "list"))
+                return new ProcessRunResult(0, "{\"list\":[{\"name\":\"codeybox-r-one\",\"state\":\"Running\"}]}", "");
+            if (argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c" && argv[2].Contains(".codeybox-created-at", StringComparison.Ordinal))
+                throw new RemoteSshTransportException("metadata ssh dropped");
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.Empty(managed);
+        var host = Assert.Single(provider.SnapshotHostPool());
+        Assert.False(host.RuntimeHealthy);
+        Assert.Contains("metadata ssh dropped", host.RuntimeUnhealthyReason);
+        var inventory = Assert.IsAssignableFrom<IManagedSandboxInventoryResult>(managed);
+        Assert.False(inventory.IsComplete);
     }
 
     [Fact]

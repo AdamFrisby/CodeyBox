@@ -3689,6 +3689,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     "origin",
                     $"HEAD:refs/heads/{workBranch}");
             }
+            await sandbox.SyncStateToHostAsync(ct);
 
             if (rebaseConflictFiles.Count > 0 && rebaseReviewRunner is not null)
             {
@@ -5342,11 +5343,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     {
                         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
                     }
+                    await sandbox.SyncStateToHostAsync(ct);
 
                     if (isInitial && suggestionsJson is not null)
                         await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
                     await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
+                    phaseSucceeded = true;
                     return agentResult.Stdout;
                 }
 
@@ -7131,6 +7134,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
                 $"codeybox: preempt checkpoint {item.Title}\n\n{trailerBlock}");
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
+            await sandbox.SyncStateToHostAsync(ct);
 
             var current = await _store.GetAsync(item.Id, ct) ?? item;
             var preempted = current with
@@ -14427,6 +14431,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
                     mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
                     await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
+                    await sandbox.SyncStateToHostAsync(ct);
                     await ImportIsolatedMergeCommitAsync(repoId, isolatedMergeRepoPath!, verificationRef, ct);
                     mergeSha = await _gitHost.ResolveCommitAsync(repoId, verificationRef, ct);
                     try
@@ -16435,6 +16440,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 SemanticIncompatibleReason: null,
                 FilesChanged: null, Insertions: null, Deletions: null);
         }
+        await sandbox.SyncStateToHostAsync(ct);
 
         // Verify the push landed in the isolated repo and pull the resulting
         // commit back into the durable host bare repo so SetBranchToCommit can

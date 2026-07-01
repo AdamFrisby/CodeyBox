@@ -382,6 +382,29 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task ListAllManagedAsync_returns_healthy_hosts_when_one_host_metadata_scan_fails()
+    {
+        var opts = Options(
+            Host("a", cap: 1),
+            Host("b", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].ThrowTransportOnMetadataScan = true;
+        transports["a"].ManagedNames.Add("codeybox-r-aaaaa");
+        transports["b"].ManagedNames.Add("codeybox-r-bbbbb");
+        var provider = Provider(() => opts, transports);
+
+        var infos = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        var info = Assert.Single(infos);
+        Assert.Equal("codeybox-r-bbbbb", info.Name);
+        Assert.Equal("b", info.HostId);
+        Assert.False(provider.SnapshotHostPool().Single(h => h.HostId == "a").RuntimeHealthy);
+        var inventory = Assert.IsAssignableFrom<IManagedSandboxInventoryResult>(infos);
+        Assert.False(inventory.IsComplete);
+        Assert.Equal(["b"], inventory.InventoriedHostIds.OrderBy(static id => id, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
     public async Task DisposeLeakedAsync_uses_managed_host_identity()
     {
         var opts = Options(
@@ -602,6 +625,7 @@ public sealed class MultipassRemoteHostPoolTests
         public bool ThrowTransportOnRun { get; set; }
         public bool ThrowTransportOnLaunch { get; set; }
         public bool ThrowTransportOnExec { get; set; }
+        public bool ThrowTransportOnMetadataScan { get; set; }
         public int LaunchExitCode { get; set; }
         public int DeleteExitCode { get; set; }
         public int InfoExitCode { get; set; }
@@ -627,6 +651,14 @@ public sealed class MultipassRemoteHostPoolTests
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during launch");
             if (ThrowTransportOnExec && argv.Contains("exec") && argv.Contains("bash"))
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during exec");
+            if (ThrowTransportOnMetadataScan
+                && argv.Count >= 3
+                && argv[0] == "sh"
+                && argv[1] == "-c"
+                && argv[2].Contains(".codeybox-created-at", StringComparison.Ordinal))
+            {
+                throw new RemoteSshTransportException($"{hostId}: simulated transport drop during metadata scan");
+            }
             if (argv.Contains("launch") && LaunchExitCode != 0)
                 return Task.FromResult(new ProcessRunResult(LaunchExitCode, "", "launch failed"));
             if (argv.Contains("delete") && DeleteExitCode != 0)

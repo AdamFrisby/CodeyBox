@@ -70,12 +70,52 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         if (inner is IBaselineImageProvisioner) capabilities |= ProviderCapabilities.BaselineProvisioner;
         if (inner is ISandboxHostPoolSnapshot) capabilities |= ProviderCapabilities.HostPool;
 
-        return capabilities switch
+        var exposesHostPool = capabilities.HasFlag(ProviderCapabilities.HostPool);
+        var providerCapabilities = capabilities & ~ProviderCapabilities.HostPool;
+        if (exposesHostPool)
+        {
+            return providerCapabilities switch
+            {
+                ProviderCapabilities.None => new HostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active => new ActiveHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending => new SuspendingHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.DiskGuard => new DiskGuardHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.BaselineResolver => new BaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.BaselineProvisioner => new BaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending => new ActiveSuspendingHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.DiskGuard => new ActiveDiskGuardHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.BaselineResolver => new ActiveBaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.BaselineProvisioner => new ActiveBaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard => new SuspendingDiskGuardHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending | ProviderCapabilities.BaselineResolver => new SuspendingBaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending | ProviderCapabilities.BaselineProvisioner => new SuspendingBaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver => new DiskGuardBaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineProvisioner => new DiskGuardBaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new BaselineHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard => new ActiveSuspendingDiskGuardHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending | ProviderCapabilities.BaselineResolver => new ActiveSuspendingBaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending | ProviderCapabilities.BaselineProvisioner => new ActiveSuspendingBaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver => new ActiveDiskGuardBaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineProvisioner => new ActiveDiskGuardBaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new ActiveBaselineHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver => new SuspendingDiskGuardBaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineProvisioner => new SuspendingDiskGuardBaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending | ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new SuspendingBaselineHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new DiskGuardBaselineHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver => new ActiveSuspendingDiskGuardBaselineResolverHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineProvisioner => new ActiveSuspendingDiskGuardBaselineProvisionerHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending | ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new ActiveSuspendingBaselineHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new ActiveDiskGuardBaselineHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new SuspendingDiskGuardBaselineHostPoolProvider(inner, gate, log),
+                ProviderCapabilities.Active | ProviderCapabilities.Suspending | ProviderCapabilities.DiskGuard | ProviderCapabilities.BaselineResolver | ProviderCapabilities.BaselineProvisioner => new ActiveSuspendingDiskGuardBaselineHostPoolProvider(inner, gate, log),
+                _ => throw new InvalidOperationException($"Unhandled sandbox provider capability set: {capabilities}"),
+            };
+        }
+
+        return providerCapabilities switch
         {
             ProviderCapabilities.None => new SandboxAdmissionControlledProvider(inner, gate, log),
             ProviderCapabilities.Active => new ActiveProvider(inner, gate, log),
-            ProviderCapabilities.HostPool => new HostPoolProvider(inner, gate, log),
-            ProviderCapabilities.Active | ProviderCapabilities.HostPool => new ActiveHostPoolProvider(inner, gate, log),
             ProviderCapabilities.Suspending => new SuspendingProvider(inner, gate, log),
             ProviderCapabilities.DiskGuard => new DiskGuardProvider(inner, gate, log),
             ProviderCapabilities.BaselineResolver => new BaselineResolverProvider(inner, gate, log),
@@ -155,9 +195,10 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     {
         var managed = await _inner.ListAllManagedAsync(ct).ConfigureAwait(false);
         var managedIds = managed.Select(SandboxAdmissionIdentity.FromManaged).ToArray();
-        _resumeAdmissions?.ReleaseMissing(managedIds);
-        _disposedSandboxAdmissions.ReleaseMissing(managedIds);
-        ReleaseMissingPreservedLiveSandboxes(managedIds);
+        var inventory = SandboxInventoryScope.From(managed);
+        _resumeAdmissions?.ReleaseMissing(managedIds, inventory.CanTreatMissingAsAbsent);
+        _disposedSandboxAdmissions.ReleaseMissing(managedIds, inventory.CanTreatMissingAsAbsent);
+        ReleaseMissingPreservedLiveSandboxes(managedIds, inventory);
         return managed;
     }
 
@@ -390,7 +431,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         }
     }
 
-    private void ReleaseMissingPreservedLiveSandboxes(IReadOnlyCollection<SandboxAdmissionIdentity> managedIds)
+    private void ReleaseMissingPreservedLiveSandboxes(
+        IReadOnlyCollection<SandboxAdmissionIdentity> managedIds,
+        SandboxInventoryScope inventory)
     {
         if (_preservedLiveSandboxes.IsEmpty)
             return;
@@ -398,7 +441,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var present = managedIds.ToHashSet();
         foreach (var identity in _preservedLiveSandboxes.Keys)
         {
-            if (!present.Contains(identity))
+            if (!present.Contains(identity) && inventory.CanTreatMissingAsAbsent(identity))
                 _preservedLiveSandboxes.TryRemove(identity, out _);
         }
     }
@@ -416,7 +459,10 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         try
         {
             var managed = await _inner.ListAllManagedAsync(CancellationToken.None).ConfigureAwait(false);
-            return managed.Any(info => SandboxAdmissionIdentity.FromManaged(info) == identity);
+            if (managed.Any(info => SandboxAdmissionIdentity.FromManaged(info) == identity))
+                return true;
+            var inventory = SandboxInventoryScope.From(managed);
+            return !inventory.CanTreatMissingAsAbsent(identity);
         }
         catch (Exception ex)
         {
@@ -467,6 +513,25 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             string.IsNullOrWhiteSpace(hostId) ? null : hostId;
     }
 
+    private readonly record struct SandboxInventoryScope(
+        bool IsComplete,
+        IReadOnlySet<string> InventoriedHostIds)
+    {
+        public static SandboxInventoryScope From(IReadOnlyList<ManagedSandboxInfo> managed)
+        {
+            if (managed is IManagedSandboxInventoryResult inventory)
+                return new SandboxInventoryScope(inventory.IsComplete, inventory.InventoriedHostIds);
+
+            return new SandboxInventoryScope(
+                IsComplete: true,
+                InventoriedHostIds: new HashSet<string>(StringComparer.Ordinal));
+        }
+
+        public bool CanTreatMissingAsAbsent(SandboxAdmissionIdentity identity) =>
+            IsComplete
+            || (identity.HostId is { } hostId && InventoriedHostIds.Contains(hostId));
+    }
+
     [Flags]
     private enum ProviderCapabilities
     {
@@ -498,6 +563,126 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     private sealed class ActiveHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
         : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class DiskGuardHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IDiskGuardedSandboxProvider, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class BaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class BaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveDiskGuardHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, IDiskGuardedSandboxProvider, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveBaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveBaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingDiskGuardHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingBaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingBaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class DiskGuardBaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IDiskGuardedSandboxProvider, IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class DiskGuardBaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IDiskGuardedSandboxProvider, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class BaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingDiskGuardHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingBaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingBaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveDiskGuardBaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveDiskGuardBaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveBaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingDiskGuardBaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingDiskGuardBaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingBaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class DiskGuardBaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingDiskGuardBaselineResolverHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingDiskGuardBaselineProvisionerHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingBaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveDiskGuardBaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class SuspendingDiskGuardBaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
+    { }
+
+    private sealed class ActiveSuspendingDiskGuardBaselineHostPoolProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, ISandboxHostPoolSnapshot
     { }
 
     private sealed class SuspendingProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
@@ -728,6 +913,11 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         }
 
         public void ReleaseMissing(IEnumerable<SandboxAdmissionIdentity> managedIds)
+            => ReleaseMissing(managedIds, static _ => true);
+
+        public void ReleaseMissing(
+            IEnumerable<SandboxAdmissionIdentity> managedIds,
+            Func<SandboxAdmissionIdentity, bool> canTreatMissingAsAbsent)
         {
             HashSet<SandboxAdmissionIdentity>? present = null;
             List<SandboxAdmissionLease>? toRelease = null;
@@ -739,7 +929,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
                 present = managedIds.ToHashSet();
                 foreach (var (identity, lease) in _leases.ToArray())
                 {
-                    if (present.Contains(identity))
+                    if (present.Contains(identity) || !canTreatMissingAsAbsent(identity))
                         continue;
                     _leases.Remove(identity);
                     (toRelease ??= []).Add(lease);

@@ -397,8 +397,12 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
         var infos = new List<ManagedSandboxInfo>();
+        var hosts = ResolveHosts();
+        var expectedHostIds = hosts
+            .Select(static host => host.HostId)
+            .ToHashSet(StringComparer.Ordinal);
         var inventoriedHostIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var opts in ResolveHosts())
+        foreach (var opts in hosts)
         {
             if (string.IsNullOrWhiteSpace(opts.SshTarget))
                 continue;
@@ -437,6 +441,16 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 AddManagedFromListJson(infos, opts, result.Stdout, createdAtByName);
                 inventoriedHostIds.Add(opts.HostId);
             }
+            catch (RemoteSshTransportException ex)
+            {
+                // A host can drop between the primary inventory call and the
+                // staging metadata scan. Keep the sweep partial instead of
+                // aborting healthy hosts later in the pool.
+                MarkRuntimeUnhealthy(opts, ex);
+                _log.LogWarning(ex,
+                    "ListAllManagedAsync: metadata scan transport failure on remote host {HostId}; continuing with other hosts",
+                    opts.HostId);
+            }
             catch (JsonException ex)
             {
                 MarkRuntimeUnhealthy(opts, $"failed to parse multipass list JSON: {ex.Message}");
@@ -447,7 +461,10 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
 
         ReleaseMissingRetainedReservations(inventoriedHostIds, infos);
-        return infos;
+        return new ManagedSandboxInventory(
+            infos,
+            isComplete: inventoriedHostIds.SetEquals(expectedHostIds),
+            inventoriedHostIds: inventoriedHostIds);
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)

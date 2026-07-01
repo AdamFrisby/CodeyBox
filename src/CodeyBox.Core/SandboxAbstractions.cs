@@ -151,6 +151,42 @@ public sealed record ManagedSandboxInfo(
     string? LifecycleProviderId = null,
     string? HostId = null);
 
+/// <summary>
+/// Optional metadata carried by <see cref="ISandboxProvider.ListAllManagedAsync"/>
+/// results. Providers that fan out to multiple executor hosts can return a
+/// partial inventory when one host is unreachable; callers that release
+/// retained capacity must only treat a missing sandbox as absent when the
+/// relevant host was actually inventoried.
+/// </summary>
+public interface IManagedSandboxInventoryResult
+{
+    bool IsComplete { get; }
+    IReadOnlySet<string> InventoriedHostIds { get; }
+}
+
+public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>, IManagedSandboxInventoryResult
+{
+    private readonly IReadOnlyList<ManagedSandboxInfo> _items;
+
+    public ManagedSandboxInventory(
+        IReadOnlyList<ManagedSandboxInfo> items,
+        bool isComplete,
+        IReadOnlySet<string>? inventoriedHostIds = null)
+    {
+        _items = items;
+        IsComplete = isComplete;
+        InventoriedHostIds = inventoriedHostIds ?? new HashSet<string>(StringComparer.Ordinal);
+    }
+
+    public bool IsComplete { get; }
+    public IReadOnlySet<string> InventoriedHostIds { get; }
+    public int Count => _items.Count;
+    public ManagedSandboxInfo this[int index] => _items[index];
+
+    public IEnumerator<ManagedSandboxInfo> GetEnumerator() => _items.GetEnumerator();
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable
 {

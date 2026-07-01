@@ -1304,7 +1304,13 @@ public sealed class CodeyBoxOptionsValidatorTests
             ],
         };
 
-        var mapped = MultipassRemoteOptionsMapper.Map(cfg);
+        var mapped = MultipassRemoteOptionsMapper.Map(
+            cfg,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["work"] = "cb-work",
+                ["audit"] = "cb-audit",
+            });
         var host = Assert.Single(mapped.ExecutorHosts);
 
         Assert.Equal("ubuntu@default", mapped.SshTarget);
@@ -1313,6 +1319,8 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.True(mapped.Cordoned);
         Assert.False(mapped.Healthy);
         Assert.Equal(["default-work"], mapped.AllowedNetworkProfiles);
+        Assert.Equal("cb-work", mapped.NetworkProfiles["work"]);
+        Assert.Equal("cb-audit", mapped.NetworkProfiles["audit"]);
         Assert.Equal(TimeSpan.FromSeconds(7), mapped.PlacementRecheckIn);
         Assert.Equal(TimeSpan.FromSeconds(8), mapped.RuntimeUnhealthyBackoff);
         Assert.Equal("a", host.Id);

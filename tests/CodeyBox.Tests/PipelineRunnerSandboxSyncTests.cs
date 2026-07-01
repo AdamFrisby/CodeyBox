@@ -63,6 +63,43 @@ public sealed class PipelineRunnerSandboxSyncTests : IDisposable
         Assert.NotEqual(WorkItemState.Failed, persisted.State);
     }
 
+    [Fact]
+    public async Task WorkPhase_DisposeFailureAfterSuccessfulPhase_FailsItemInsteadOfSwallowing()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var sandboxProvider = new DisposeFailingSandboxProvider();
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EnableSandboxReuse = false
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: sandboxProvider,
+            pipelineTuning: tuning,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("dispose-marker.txt", "work completed\n"));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "dispose failure",
+            Prompt = "write the marker",
+            State = WorkItemState.Queued,
+            WorkBranch = "feature/dispose-failure",
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.Equal(1, sandboxProvider.DisposeCalls);
+        var persisted = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(WorkItemState.Failed, persisted!.State);
+        Assert.Contains("dispose failed after successful phase", persisted.LastError);
+    }
+
     private sealed class SyncFailingSandboxProvider : ISandboxProvider
     {
         private readonly SandboxProvisioningDeferredException _exception;
@@ -128,5 +165,60 @@ public sealed class PipelineRunnerSandboxSyncTests : IDisposable
 
         public ValueTask DisposeAsync()
             => _inner.DisposeAsync();
+    }
+
+    private sealed class DisposeFailingSandboxProvider : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner = new(NullLogger<ProcessSandboxProvider>.Instance);
+        private int _disposeCalls;
+
+        public string Name => _inner.Name;
+        public int DisposeCalls => Volatile.Read(ref _disposeCalls);
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => new DisposeFailingSandbox(
+                await _inner.CreateAsync(spec, ct),
+                () => Interlocked.Increment(ref _disposeCalls));
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class DisposeFailingSandbox(ISandbox inner, Action recordDispose) : ISandbox
+    {
+        public string Id => inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => inner.BatchLaunchMode;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => inner.ExecAsync(exec, ct);
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default)
+            => inner.SyncStateToHostAsync(ct);
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default)
+            => inner.KillActiveExecsAsync(ct);
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+            => inner.GetScreenshotAsync(ct);
+
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+            => inner.SynthesizeInputAsync(events, ct);
+
+        public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+            => inner.GetAccessibilityAtPointAsync(x, y, ct);
+
+        public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+            => inner.GetAccessibilityTreeJsonAsync(ct);
+
+        public async ValueTask DisposeAsync()
+        {
+            recordDispose();
+            await inner.DisposeAsync();
+            throw new InvalidOperationException("dispose failed after successful phase");
+        }
     }
 }

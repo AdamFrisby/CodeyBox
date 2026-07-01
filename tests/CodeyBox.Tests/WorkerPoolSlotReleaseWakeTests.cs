@@ -81,6 +81,50 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task CompletedItem_ReleasesWorkerSlotBeforeDependencyFanout()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var completed = MakeItem(createdAt: now);
+        var independentBacklog = MakeItem(createdAt: now.AddMilliseconds(1));
+        var dependent = MakeItem(createdAt: now.AddMilliseconds(2)) with
+        {
+            DependsOn = [completed.Id],
+        };
+        await _store.CreateAsync(completed);
+        await _store.CreateAsync(independentBacklog);
+        await _store.CreateAsync(dependent);
+        queue.BlockEnqueueFor(dependent.Id);
+
+        await queue.EnqueueAsync(completed.Id);
+        Assert.True(await pipeline.WaitForEnteredAsync(completed.Id, DispatchWaitTimeout));
+
+        pipeline.Release(completed.Id);
+        Assert.True(await queue.WaitForBlockedEnqueueAsync(dependent.Id, DispatchWaitTimeout));
+
+        Assert.True(
+            await pipeline.WaitForEnteredAsync(independentBacklog.Id, DispatchWaitTimeout),
+            "The completed worker's slot should be available while dependency fan-out is still blocked.");
+
+        queue.UnblockEnqueueFor(dependent.Id);
+        pipeline.Release(independentBacklog.Id);
+        Assert.True(await pipeline.WaitForEnteredAsync(dependent.Id, DispatchWaitTimeout));
+        pipeline.Release(dependent.Id);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+
+    [Fact]
     public async Task SlotReleaseWake_RefillsAllOpenSlotsFromIndependentReadyBacklogWithoutExternalKick()
     {
         var queue = new ObservedTaskQueue();
@@ -2309,6 +2353,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         private readonly Channel<ObservedDispatch> _channel = Channel.CreateUnbounded<ObservedDispatch>();
         private readonly ConcurrentQueue<ObservedDispatch> _enqueued = new();
         private readonly ConcurrentQueue<ObservedDispatch> _dequeued = new();
+        private readonly ConcurrentDictionary<WorkItemId, TaskCompletionSource> _blockedEnqueueReleases = new();
+        private readonly ConcurrentDictionary<WorkItemId, TaskCompletionSource> _blockedEnqueueStarted = new();
         private readonly TaskCompletionSource _firstDequeue =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _dequeueCalls;
@@ -2321,10 +2367,30 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         }
         public EnqueueFailureMode FailureMode { get; set; } = EnqueueFailureMode.None;
 
+        public void BlockEnqueueFor(WorkItemId id)
+        {
+            _blockedEnqueueReleases.GetOrAdd(id, static _ => NewSignal());
+            _blockedEnqueueStarted.GetOrAdd(id, static _ => NewSignal());
+        }
+
+        public void UnblockEnqueueFor(WorkItemId id)
+        {
+            if (_blockedEnqueueReleases.TryGetValue(id, out var release))
+                release.TrySetResult();
+        }
+
+        public Task<bool> WaitForBlockedEnqueueAsync(WorkItemId id, TimeSpan timeout) =>
+            WaitForSignalAsync(_blockedEnqueueStarted.GetOrAdd(id, static _ => NewSignal()), timeout);
+
         public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
         {
             var dispatch = ObservedDispatch.ForWorkItem(id);
             _enqueued.Enqueue(dispatch);
+            if (_blockedEnqueueReleases.TryGetValue(id, out var release))
+            {
+                _blockedEnqueueStarted.GetOrAdd(id, static _ => NewSignal()).TrySetResult();
+                return new ValueTask(WriteAfterBlockedEnqueueAsync(dispatch, release.Task, ct));
+            }
 
             return FailureMode switch
             {
@@ -2415,6 +2481,21 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             _dequeued.Enqueue(dispatch);
             return dispatch;
         }
+
+        private async Task WriteAfterBlockedEnqueueAsync(ObservedDispatch dispatch, Task release, CancellationToken ct)
+        {
+            await release.WaitAsync(ct);
+            await _channel.Writer.WriteAsync(dispatch, ct);
+        }
+
+        private static async Task<bool> WaitForSignalAsync(TaskCompletionSource signal, TimeSpan timeout)
+        {
+            var completed = await Task.WhenAny(signal.Task, Task.Delay(timeout));
+            return completed == signal.Task;
+        }
+
+        private static TaskCompletionSource NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private readonly record struct ObservedDispatch(WorkItemId? WorkItemId, bool IsGenericWake)
         {

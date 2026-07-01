@@ -4052,7 +4052,11 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class MultipassRemoteSandboxConfig
     {
-        /// <summary>SSH destination passed verbatim to <c>ssh &lt;target&gt;</c>. Required.</summary>
+        /// <summary>
+        /// Default SSH destination passed verbatim to <c>ssh &lt;target&gt;</c>.
+        /// Required for single-host mode; optional when every executor host
+        /// under <see cref="ExecutorHosts"/> supplies its own target.
+        /// </summary>
         public string? SshTarget { get; set; }
 
         /// <summary>OpenSSH binary. Default <c>ssh</c> (resolved via $PATH).</summary>
