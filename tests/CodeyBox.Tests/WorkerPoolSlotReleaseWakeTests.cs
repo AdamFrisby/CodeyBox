@@ -17,6 +17,12 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 {
     private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan NoDispatchQuietPeriod = TimeSpan.FromMilliseconds(500);
+    // Backstop for event-driven positive waits (TaskCompletionSource-backed
+    // WaitForEnteredAsync/WaitForDoneAsync) that must survive severe CPU
+    // starvation under the 6-core capped full suite on a co-resident host —
+    // never the mechanism that makes the assertion pass, only headroom so a
+    // correct-but-slow dispatch is not misread as a failure.
+    private static readonly TimeSpan StarvationBackstopTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan SpawnPacingBranchInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan SpawnPacingEarlyExitTimeout = TimeSpan.FromSeconds(4);
 
@@ -373,15 +379,26 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await _store.CreateAsync(readyBacklog);
         await queue.EnqueueAsync(running.Id);
 
-        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, StarvationBackstopTimeout));
 
         await controller.PauseAsync("slot release wake suppression test");
         pipeline.Release(running.Id);
-        Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
+        Assert.True(await pipeline.WaitForDoneAsync(running.Id, StarvationBackstopTimeout));
         Assert.True(
             await WaitUntilAsync(() => queue.TotalEnqueueCount >= 2, DispatchWaitTimeout),
             "The slot-release wake should be enqueued even when the queue is paused.");
 
+        // Negative suppression check. This is safe against a starved dispatch
+        // loop, not a wall-clock gamble: the pause is fully committed
+        // (PauseAsync awaited) BEFORE the slot-release wake can even exist
+        // (Release → worker completes → wake enqueued), and the dispatch loop
+        // re-reads IsQueuePaused after every dequeue and again after acquiring
+        // the concurrency gate, before any PickNextEligibleAsync (see
+        // OrchestratorService dispatch loop). So the ready backlog cannot be
+        // dispatched while paused regardless of scheduling; the quiet period only
+        // needs to give an ERRONEOUS dispatch time to surface. We additionally
+        // assert the durable row is still Queued, so suppression is proven by
+        // observable state, not solely by the timed window.
         Assert.False(
             await pipeline.WaitForEnteredAsync(readyBacklog.Id, NoDispatchQuietPeriod),
             "The paused queue should hold the slot-release wake without dispatching during the quiet period.");
@@ -389,12 +406,22 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         Assert.Equal(WorkItemState.Queued, stored!.State);
 
         await controller.ResumeAsync();
+        // WaitForEnteredAsync / WaitForDoneAsync are event-driven (TaskCompletion
+        // Source set the instant the pipeline enters/finishes the item), so these
+        // are deterministic signals — the timeout is only a backstop. Under the
+        // 6-core capped full suite the host can be pushed far past the cap (load
+        // has been observed in the 50-90 range from the co-resident orchestrator +
+        // VMs), stretching the resume→dispatch→enter→done latency well beyond the
+        // 10s DispatchWaitTimeout even though the wake fires promptly. Use a
+        // generous backstop so a correct-but-starved resume is not misread as a
+        // failure; a genuine "resume does not dispatch" regression still fails
+        // because the event never fires at all.
         Assert.True(
-            await pipeline.WaitForEnteredAsync(readyBacklog.Id, DispatchWaitTimeout),
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, StarvationBackstopTimeout),
             "The paused branch should preserve the slot-release wake so resume picks up the ready backlog.");
 
         pipeline.Release(readyBacklog.Id);
-        Assert.True(await pipeline.WaitForDoneAsync(readyBacklog.Id, DispatchWaitTimeout));
+        Assert.True(await pipeline.WaitForDoneAsync(readyBacklog.Id, StarvationBackstopTimeout));
 
         using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await svc.StopAsync(stopCts.Token);

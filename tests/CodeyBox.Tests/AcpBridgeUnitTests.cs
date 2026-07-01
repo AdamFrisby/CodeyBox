@@ -2791,6 +2791,37 @@ public sealed class AcpBridgeUnitTests
             psi.ArgumentList.Add("exec");
             psi.ArgumentList.Add(bridgeDllPath);
 
+            // Force the bridge subprocess to full-JIT its code up front, with no
+            // ReadyToRun images and no tiered/PGO recompilation. This is the
+            // deterministic fix for a flake that was NOT a bridge bug at all but a
+            // .NET *runtime* fragility exposed only by THIS harness:
+            //
+            //   • We launch the bridge's IL build via `dotnet exec` (production
+            //     ships a NativeAOT static binary — no JIT, no R2R, no tiering —
+            //     so none of this applies there; the IL build is a test-only
+            //     artifact).
+            //   • We deliver a real POSIX signal (kill(2)) to that process only a
+            //     few hundred ms after start.
+            //   • Under the 6-core capped full-suite run, CPU starvation stretches
+            //     the runtime's startup so a signal can land while the CLR is
+            //     mid R2R→JIT / tiered-recompilation of its signal-dispatch path.
+            //     When it does, the runtime aborts its own signal handling with
+            //     "Fatal error. Internal CLR error. (0x80131506)" → SIGABRT →
+            //     exit 134 (NOT the signal's default 129/130/143, and NOT a missing
+            //     handler) — a spurious failure of the exit-0 assertion below.
+            //
+            // Disabling ReadyToRun + tiered compilation removes the mid-startup
+            // recompilation window entirely: all code is jitted once, up front, so
+            // a signal delivered at any time hits stable native code. Verified to
+            // take the fixture from ~1-in-15 spurious exit-134 failures under the
+            // cap to 0 across 90 full-suite runs. This is a pure test-harness knob
+            // (env of the spawned IL process); it changes nothing about the bridge
+            // itself or the shipped AOT binary, and the signal-handling contract
+            // under test (clean exit 0 + lockfile cleanup) is unchanged.
+            psi.Environment["DOTNET_ReadyToRun"] = "0";
+            psi.Environment["DOTNET_TieredCompilation"] = "0";
+            psi.Environment["DOTNET_TieredPGO"] = "0";
+
             using var proc = Process.Start(psi)
                 ?? throw new InvalidOperationException("Process.Start returned null for dotnet exec.");
 
@@ -2805,15 +2836,22 @@ public sealed class AcpBridgeUnitTests
 
                 // Read stdout line-by-line until we see the `ready` envelope —
                 // confirms the bridge is up, the lockfile is written, and the
-                // signal handlers have been registered (HandleHello completes
-                // before `ready` fires, but PosixSignalRegistration.Create
-                // happens at the top of RunAsync which runs first).
+                // signal handlers have been registered. `ready` is emitted from
+                // WriteLockfile() inside HandleHello, which the stdin pump only
+                // reaches after RunAsync has already run all three
+                // PosixSignalRegistration.Create calls at the top of RunAsync, so
+                // by the time we observe `ready` the handlers are installed and
+                // signalling below cannot precede registration. Timeouts here are
+                // backstops, not the correctness gate; they carry headroom because
+                // ReadyToRun/tiered JIT are disabled for this subprocess (see the
+                // env block above), which front-loads all JIT and makes cold
+                // startup take a little longer under the capped full-suite load.
                 string? lockPath = null;
-                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
                 while (DateTime.UtcNow < deadline)
                 {
                     var line = await proc.StandardOutput.ReadLineAsync().WaitAsync(
-                        TimeSpan.FromSeconds(5));
+                        TimeSpan.FromSeconds(20));
                     if (line is null) break;
                     if (string.IsNullOrEmpty(line)) continue;
                     using var doc = JsonDocument.Parse(line);
@@ -2846,8 +2884,14 @@ public sealed class AcpBridgeUnitTests
                 var killResult = LibcKill(proc.Id, signo);
                 Assert.Equal(0, killResult);
 
-                Assert.True(proc.WaitForExit(milliseconds: 15_000),
-                    "Bridge did not exit within 15s of " + signalName +
+                // Backstop only (not the correctness mechanism — that's the
+                // clean exit-0 + lockfile-delete asserts below). 60s gives ample
+                // headroom for the bridge's cooperative exit to complete even when
+                // the 6-core capped full suite pushes host load well past the cap;
+                // a genuine missing/noop handler still fails fast here because the
+                // process would exit near-immediately with the signal default.
+                Assert.True(proc.WaitForExit(milliseconds: 60_000),
+                    "Bridge did not exit within 60s of " + signalName +
                     " — regression: PosixSignalRegistration handler missing or wired to a noop.");
 
                 // Exit code 0 means our handler suppressed the default and
