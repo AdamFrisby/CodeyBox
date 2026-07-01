@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 
 // Framework FakeTimeProvider (CreateTimer fires on Advance); aliased to avoid
@@ -203,6 +204,127 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             Assert.True(await pipeline.WaitForDoneAsync(item.Id, DispatchWaitTimeout));
 
         await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task DispatchWake_AdmitsDueQuotaWaitingItemByPriorityBeforeQueuedItem()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var now = DateTimeOffset.UtcNow;
+
+        var waitingHighPriority = MakeItem(createdAt: now) with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Priority = 200,
+            AgentClassId = "quota-class",
+            QuotaRetryFrom = "work",
+            NextQuotaRetryAt = now.AddHours(-1),
+        };
+        var queuedLowPriority = MakeItem(createdAt: now.AddMilliseconds(1)) with
+        {
+            Priority = -1000,
+            AgentClassId = "quota-class",
+        };
+
+        await _store.CreateAsync(waitingHighPriority);
+        await _store.CreateAsync(queuedLowPriority);
+
+        var project = new Project
+        {
+            Id = new ProjectId("test"),
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Codex,
+            DefaultAgentClass = "quota-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "quota-class",
+                    DisplayName = "Quota Class",
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Codex,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 100,
+                        },
+                    ],
+                },
+            ],
+            [new FakeProbe(AgentKind.Codex, 100.0)],
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var gitRoot = Directory.CreateTempSubdirectory("codeybox-quota-dispatch-git-").FullName;
+        try
+        {
+            var gitHost = new LocalGitHost(
+                new LocalGitHostOptions { RootDirectory = gitRoot },
+                NullLogger<LocalGitHost>.Instance);
+            var retryOptions = new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    ClockDriftSafetyMargin = TimeSpan.Zero,
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            };
+            var retrier = new WorkItemRetrier(
+                _store,
+                queue,
+                gitHost,
+                NullLogger<WorkItemRetrier>.Instance);
+            using var scheduler = new QuotaRetryScheduler(
+                _store,
+                retrier,
+                retryOptions,
+                NullLogger<QuotaRetryScheduler>.Instance,
+                router,
+                projects);
+            using var svc = new OrchestratorService(
+                queue, _store, pipeline, registry,
+                retryOptions,
+                NullLogger<OrchestratorService>.Instance,
+                router: router,
+                projects: projects,
+                quotaRetryDispatchPromoter: scheduler);
+
+            await svc.StartAsync(CancellationToken.None);
+            await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+            await queue.EnqueueAsync(queuedLowPriority.Id);
+
+            Assert.True(
+                await pipeline.WaitForEnteredAsync(waitingHighPriority.Id, DispatchWaitTimeout),
+                "The dispatcher should promote and run the overdue high-priority quota-waiting item before the low-priority queued item that supplied the wake.");
+            Assert.False(
+                pipeline.HasEntered(queuedLowPriority.Id),
+                "The low-priority queued item must not consume the first available quota/worker slot.");
+
+            var promoted = await _store.GetAsync(waitingHighPriority.Id);
+            Assert.Equal(1, promoted!.QuotaRetryAttempts);
+
+            pipeline.Release(waitingHighPriority.Id);
+            Assert.True(await pipeline.WaitForDoneAsync(waitingHighPriority.Id, DispatchWaitTimeout));
+
+            if (await pipeline.WaitForEnteredAsync(queuedLowPriority.Id, NoDispatchQuietPeriod))
+                pipeline.Release(queuedLowPriority.Id);
+
+            await svc.StopAsync(CancellationToken.None);
+        }
+        finally
+        {
+            try { Directory.Delete(gitRoot, recursive: true); } catch { }
+        }
     }
 
     [Fact]

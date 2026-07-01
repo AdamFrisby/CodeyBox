@@ -8,7 +8,7 @@ namespace CodeyBox.Orchestrator;
 /// <summary>
 /// Hosted service that automatically retries work items parked for quota reset.
 /// </summary>
-public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery, IQuotaFailureAutoRetryScheduler
+public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery, IQuotaFailureAutoRetryScheduler, IQuotaRetryDispatchPromoter
 {
     // There is no provider-agnostic options-change callback on this class: the
     // live options enter through an accessor. While disabled, poll that
@@ -397,6 +397,61 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         catch (Exception ex)
         {
             _log.LogError(ex, "Error during periodic quota retry for work item {Id}; continuing sweep", item.Id);
+        }
+    }
+
+    public async Task<QuotaRetryDispatchPromotionResult> TryPromoteForDispatchAsync(
+        WorkItem item,
+        CancellationToken ct = default)
+    {
+        if (item.State != WorkItemState.WaitingForQuotaReset)
+        {
+            return new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "skipped:not-waiting-for-quota-reset",
+                Reason: $"state={item.State}");
+        }
+
+        var now = _time.GetUtcNow();
+        if (item.NextQuotaRetryAt is { } nextRetryAt && nextRetryAt > now)
+        {
+            return new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "skipped:not-due",
+                Reason: $"nextRetryAt={nextRetryAt:O}");
+        }
+
+        try
+        {
+            var outcome = await TryRetryAsync(item, "dispatch-due", ct);
+            if (outcome.Outcome == "retried")
+            {
+                CancelTargetedRetry(item.Id);
+                return new QuotaRetryDispatchPromotionResult(
+                    Promoted: true,
+                    Outcome: outcome.Outcome,
+                    Reason: outcome.Reason);
+            }
+
+            return new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: outcome.Outcome,
+                Reason: outcome.Reason);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Error promoting quota-waiting work item {Id} for dispatch",
+                item.Id);
+            return new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "error",
+                Reason: ex.Message);
         }
     }
 

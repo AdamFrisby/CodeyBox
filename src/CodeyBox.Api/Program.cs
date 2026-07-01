@@ -2876,6 +2876,8 @@ builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<IQuotaFailureAutoRetryScheduler>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<IQuotaRetryDispatchPromoter>(sp =>
+    sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<ITransientFailureAutoRetryScheduler>(sp =>
     sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
@@ -3014,7 +3016,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>(),
     dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
-    knobRegistry: sp.GetRequiredService<IKnobRegistry>()));
+    knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
+    quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(

@@ -69,6 +69,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
+    private readonly IQuotaRetryDispatchPromoter? _quotaRetryDispatchPromoter;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly IWorkerRegistry? _workerRegistry;
     private readonly DeadWorkerOptions? _deadWorkerOpts;
@@ -255,6 +256,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IStartupInitialRecoverySink? startupRecoveryCompletion = null,
         IAgentDispatchAvailability? dispatchAvailability = null,
         IKnobRegistry? knobRegistry = null,
+        IQuotaRetryDispatchPromoter? quotaRetryDispatchPromoter = null,
         TimeProvider? timeProvider = null)
     {
         _queue = queue;
@@ -267,6 +269,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _projects = projects;
         _queueController = queueController;
         _dispatchAvailability = dispatchAvailability;
+        _quotaRetryDispatchPromoter = quotaRetryDispatchPromoter;
         _webhooks = webhooks;
         _workerRegistry = workerRegistry;
         _deadWorkerOpts = deadWorkerOpts;
@@ -1438,10 +1441,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var pendingRefactorProjects = (await CollectActiveRefactorDrainClaimsAsync(stoppingToken))
             .ToDictionary(c => c.ProjectId.Value, c => c.RefactorWorkItemId, StringComparer.Ordinal);
 
-        await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, stoppingToken))
+        var candidates = await ListPickupCandidatesByPriorityAsync(skipIds, stoppingToken);
+        foreach (var pickupCandidate in candidates)
         {
+            var candidate = pickupCandidate.Item;
             if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
                 continue;
+
+            if (candidate.State == WorkItemState.WaitingForQuotaReset)
+            {
+                if (await TryPromoteQuotaRetryCandidateForDispatchAsync(candidate, stoppingToken))
+                    return candidate.Id;
+
+                continue;
+            }
 
             if (await TryDeferForProjectPauseAtPickupAsync(candidate, stoppingToken))
                 continue;
@@ -1549,6 +1562,101 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 candidate.Id, candidate.State, candidate.DependsOn.Count);
             return false;
         }
+    }
+
+    private async Task<List<DispatchPickupCandidate>> ListPickupCandidatesByPriorityAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        CancellationToken ct)
+    {
+        var candidates = new List<DispatchPickupCandidate>();
+        var sequence = 0;
+
+        await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+        {
+            candidates.Add(new DispatchPickupCandidate(item, item.State, sequence++));
+        }
+
+        if (_quotaRetryDispatchPromoter is null)
+            return candidates;
+
+        var now = _time.GetUtcNow();
+        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        {
+            if (skipIds.Contains(item.Id) || !IsDueQuotaRetryCandidate(item, now))
+                continue;
+
+            candidates.Add(new DispatchPickupCandidate(
+                item,
+                OrderingStateForQuotaRetryCandidate(item),
+                sequence++));
+        }
+
+        candidates.Sort(CompareDispatchPickupCandidates);
+        return candidates;
+    }
+
+    private static bool IsDueQuotaRetryCandidate(WorkItem item, DateTimeOffset now) =>
+        item.NextQuotaRetryAt is null || item.NextQuotaRetryAt <= now;
+
+    private static WorkItemState OrderingStateForQuotaRetryCandidate(WorkItem item)
+    {
+        var phase = !string.IsNullOrWhiteSpace(item.QuotaRetryPhase)
+            ? item.QuotaRetryPhase
+            : item.QuotaRetryFrom;
+
+        return phase?.Trim().ToLowerInvariant() switch
+        {
+            "audit" or "rework" => WorkItemState.WorkComplete,
+            "conflict_rework" => WorkItemState.ReworkingForConflict,
+            "merge" => WorkItemState.AuditPassed,
+            "upstream" => WorkItemState.Merged,
+            _ => WorkItemState.Queued,
+        };
+    }
+
+    private static int CompareDispatchPickupCandidates(
+        DispatchPickupCandidate left,
+        DispatchPickupCandidate right)
+    {
+        var bucket = DispatchPhaseBucket(left.OrderingState).CompareTo(DispatchPhaseBucket(right.OrderingState));
+        if (bucket != 0)
+            return bucket;
+
+        var priority = right.Item.Priority.CompareTo(left.Item.Priority);
+        if (priority != 0)
+            return priority;
+
+        var createdAt = left.Item.CreatedAt.CompareTo(right.Item.CreatedAt);
+        if (createdAt != 0)
+            return createdAt;
+
+        return left.Sequence.CompareTo(right.Sequence);
+    }
+
+    private async Task<bool> TryPromoteQuotaRetryCandidateForDispatchAsync(
+        WorkItem candidate,
+        CancellationToken ct)
+    {
+        if (_quotaRetryDispatchPromoter is null)
+            return false;
+
+        var result = await _quotaRetryDispatchPromoter.TryPromoteForDispatchAsync(candidate, ct);
+        if (result.Promoted)
+        {
+            _log.LogInformation(
+                "Dispatch promoted due quota-waiting work item {Id}: outcome={Outcome} reason={Reason}",
+                candidate.Id,
+                result.Outcome,
+                result.Reason);
+            return true;
+        }
+
+        _log.LogDebug(
+            "Dispatch skipped due quota-waiting work item {Id}: outcome={Outcome} reason={Reason}",
+            candidate.Id,
+            result.Outcome,
+            result.Reason);
+        return false;
     }
 
     private async Task<bool> TryDeferForProjectPauseAtPickupAsync(WorkItem candidate, CancellationToken stoppingToken)
@@ -2821,7 +2929,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         ?? TimeSpan.FromMinutes(1);
 
     private static int DispatchPhaseBucket(WorkItem item) =>
-        item.State is WorkItemState.AuditPassed
+        DispatchPhaseBucket(item.State);
+
+    private static int DispatchPhaseBucket(WorkItemState state) =>
+        state is WorkItemState.AuditPassed
             or WorkItemState.Merging
             or WorkItemState.Merged
             or WorkItemState.UpstreamPushing
@@ -2835,6 +2946,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             or WorkItemState.UpstreamPushing
             ? 0
             : 1;
+
+    private readonly record struct DispatchPickupCandidate(
+        WorkItem Item,
+        WorkItemState OrderingState,
+        int Sequence);
 
     /// <summary>
     /// Mirrors the SQL ordering of <see cref="IWorkItemStore.ListDispatchEligibleByPriorityAsync"/>:
