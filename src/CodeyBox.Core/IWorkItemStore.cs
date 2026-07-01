@@ -295,6 +295,92 @@ public interface IWorkItemStore
     IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default);
 
     /// <summary>
+    /// Returns the dispatcher pickup set in one priority order: ordinary
+    /// dispatch-eligible rows plus <see cref="WorkItemState.WaitingForQuotaReset"/>
+    /// rows whose <see cref="WorkItem.NextQuotaRetryAt"/> is null or due.
+    /// Implementations should apply <paramref name="limit"/> as close to the
+    /// storage query as possible so dispatch wakes cannot scan an unbounded
+    /// parked-quota backlog.
+    /// </summary>
+    async IAsyncEnumerable<WorkItem> ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        DateTimeOffset now,
+        int limit,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var rows = new List<(WorkItem Item, WorkItemState OrderingState, int Sequence)>();
+        var sequence = 0;
+
+        await foreach (var item in ListDispatchEligibleByPriorityAsync(skipIds, ct).ConfigureAwait(false))
+            rows.Add((item, item.State, sequence++));
+
+        await foreach (var item in ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct).ConfigureAwait(false))
+        {
+            if (skipIds.Contains(item.Id) || !IsDueQuotaRetryCandidate(item, now))
+                continue;
+
+            rows.Add((item, OrderingStateForQuotaRetryCandidate(item), sequence++));
+        }
+
+        foreach (var row in rows
+            .OrderBy(static row => DispatchPhaseBucket(row.OrderingState))
+            .ThenByDescending(static row => row.Item.Priority)
+            .ThenBy(static row => row.Item.CreatedAt)
+            .ThenBy(static row => row.Sequence)
+            .Take(Math.Max(0, limit)))
+        {
+            yield return row.Item;
+        }
+    }
+
+    private static bool IsDueQuotaRetryCandidate(WorkItem item, DateTimeOffset now) =>
+        item.NextQuotaRetryAt is null || item.NextQuotaRetryAt <= now;
+
+    private static WorkItemState OrderingStateForQuotaRetryCandidate(WorkItem item)
+    {
+        var retryFrom = !string.IsNullOrWhiteSpace(item.QuotaRetryPhase)
+            ? RetryFromForQuotaPhase(item.QuotaRetryPhase)
+            : NormalizeRetryFrom(item.QuotaRetryFrom);
+
+        return retryFrom switch
+        {
+            "audit" => WorkItemState.WorkComplete,
+            "conflict_rework" => WorkItemState.ReworkingForConflict,
+            "merge" => WorkItemState.AuditPassed,
+            "upstream" => WorkItemState.Merged,
+            _ => WorkItemState.Queued,
+        };
+    }
+
+    private static string RetryFromForQuotaPhase(string? phase) =>
+        phase?.Trim().ToLowerInvariant() switch
+        {
+            "audit" => "audit",
+            "rework" => "audit",
+            "merge" => "merge",
+            "upstream" => "upstream",
+            _ => "work",
+        };
+
+    private static string NormalizeRetryFrom(string? retryFrom) =>
+        retryFrom?.Trim().ToLowerInvariant() switch
+        {
+            "audit" => "audit",
+            "conflict_rework" => "conflict_rework",
+            "merge" => "merge",
+            "upstream" => "upstream",
+            _ => "work",
+        };
+
+    private static int DispatchPhaseBucket(WorkItemState state) =>
+        state is WorkItemState.AuditPassed
+            or WorkItemState.Merging
+            or WorkItemState.Merged
+            or WorkItemState.UpstreamPushing
+            ? 0
+            : 1;
+
+    /// <summary>
     /// Count of work items for <paramref name="projectId"/> whose
     /// <c>started_at</c> timestamp falls within [<paramref name="since"/>, now].
     /// Used for per-project hourly / daily rate-limit checks.

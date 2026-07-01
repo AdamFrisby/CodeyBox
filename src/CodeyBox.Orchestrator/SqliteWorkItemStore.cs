@@ -231,6 +231,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // Index for the priority-aware pickup query: state filter first, then priority,
             // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
+            RunMigration($"""
+                CREATE INDEX IF NOT EXISTS idx_work_items_due_quota_retry
+                ON work_items(state, next_quota_retry_at, priority DESC, created_at ASC)
+                WHERE state = {(int)WorkItemState.WaitingForQuotaReset};
+                """);
 
             // Additive migration: capture the first contributor that cancelled a
             // pipeline phase so the operator can distinguish a configured timeout
@@ -1368,6 +1373,120 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async IAsyncEnumerable<WorkItem> ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        DateTimeOffset now,
+        int limit,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            yield break;
+
+        var rows = new List<WorkItem>();
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                var skipFilter = BuildSkipIdFilter(skipIds, cmd, "wi.id");
+                cmd.CommandText = $"""
+                    SELECT * FROM (
+                        SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
+                        FROM work_items wi
+                        WHERE wi.state NOT IN (
+                            {(int)WorkItemState.Done},
+                            {(int)WorkItemState.Failed},
+                            {(int)WorkItemState.Cancelled},
+                            {(int)WorkItemState.AuditFailed},
+                            {(int)WorkItemState.MergeConflictResolutionFailed},
+                            {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                            {(int)WorkItemState.NeedsOperatorInput},
+                            {(int)WorkItemState.WaitingForQuotaReset},
+                            {(int)WorkItemState.WaitingForAgentResume},
+                            {(int)WorkItemState.WaitingForTransientRetry}
+                        )
+                        {skipFilter}
+
+                        UNION ALL
+
+                        SELECT
+                            wi.*,
+                            CASE
+                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_phase, ''), ''))) IN ('audit', 'rework')
+                                    THEN {(int)WorkItemState.WorkComplete}
+                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_phase, ''), ''))) = 'merge'
+                                    THEN {(int)WorkItemState.AuditPassed}
+                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_phase, ''), ''))) = 'upstream'
+                                    THEN {(int)WorkItemState.Merged}
+                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'audit'
+                                    THEN {(int)WorkItemState.WorkComplete}
+                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'conflict_rework'
+                                    THEN {(int)WorkItemState.ReworkingForConflict}
+                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'merge'
+                                    THEN {(int)WorkItemState.AuditPassed}
+                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'upstream'
+                                    THEN {(int)WorkItemState.Merged}
+                                ELSE {(int)WorkItemState.Queued}
+                            END AS dispatch_ordering_state,
+                            1 AS dispatch_source_order
+                        FROM work_items wi
+                        WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}
+                          AND (wi.next_quota_retry_at IS NULL OR wi.next_quota_retry_at <= $now)
+                        {skipFilter}
+                    )
+                    ORDER BY
+                        CASE
+                            WHEN dispatch_ordering_state IN (
+                                {(int)WorkItemState.AuditPassed},
+                                {(int)WorkItemState.Merging},
+                                {(int)WorkItemState.Merged},
+                                {(int)WorkItemState.UpstreamPushing}
+                            ) THEN 0
+                            ELSE 1
+                        END ASC,
+                        priority DESC,
+                        created_at ASC,
+                        dispatch_source_order ASC
+                    LIMIT $limit;
+                    """;
+                cmd.Parameters.AddWithValue("$now", now.ToString("O"));
+                cmd.Parameters.AddWithValue("$limit", limit);
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    private static string BuildSkipIdFilter(
+        IReadOnlySet<WorkItemId> skipIds,
+        SqliteCommand cmd,
+        string columnName)
+    {
+        if (skipIds.Count == 0)
+            return string.Empty;
+
+        var parameterNames = new List<string>(skipIds.Count);
+        var index = 0;
+        foreach (var id in skipIds)
+        {
+            var parameterName = $"$skip_id_{index++}";
+            parameterNames.Add(parameterName);
+            cmd.Parameters.AddWithValue(parameterName, id.ToString());
+        }
+
+        return $"AND {columnName} NOT IN ({string.Join(", ", parameterNames)})";
     }
 
     public async Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default)

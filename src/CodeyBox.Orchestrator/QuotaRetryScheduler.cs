@@ -436,7 +436,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             return new QuotaRetryDispatchPromotionResult(
                 Promoted: false,
                 Outcome: outcome.Outcome,
-                Reason: outcome.Reason);
+                Reason: outcome.Reason,
+                Disposition: DispatchDispositionForOutcome(outcome));
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -451,8 +452,25 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             return new QuotaRetryDispatchPromotionResult(
                 Promoted: false,
                 Outcome: "error",
-                Reason: ex.Message);
+                Reason: ex.Message,
+                Disposition: QuotaRetryDispatchDisposition.Blocked);
         }
+    }
+
+    private static QuotaRetryDispatchDisposition DispatchDispositionForOutcome(
+        QuotaRetryAttemptResult outcome)
+    {
+        if (outcome.Outcome == "retry-failed"
+            && outcome.Reason?.Contains("state changed concurrently", StringComparison.OrdinalIgnoreCase) == true)
+            return QuotaRetryDispatchDisposition.RestartSelection;
+
+        return outcome.Outcome switch
+        {
+            "skipped:quota-still-gated" => QuotaRetryDispatchDisposition.Blocked,
+            "skipped:max-retries" => QuotaRetryDispatchDisposition.RestartSelection,
+            "moved:waiting-for-agent-resume" => QuotaRetryDispatchDisposition.RestartSelection,
+            _ => QuotaRetryDispatchDisposition.Continue,
+        };
     }
 
     private async Task TryWatchdogRecoveryRetryAsync(WorkItem item, CancellationToken ct)

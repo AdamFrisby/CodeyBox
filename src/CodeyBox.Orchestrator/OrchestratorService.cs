@@ -195,6 +195,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static readonly TimeSpan SlotReleasedDispatchWakeRetryDelay = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan SpawnPacingPausePollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan SpawnPacingPauseObservationWindow = TimeSpan.FromMilliseconds(250);
+    private const int DispatchPickupCandidateLimit = 256;
     // WaitIfPausedAsync re-checks the queue controller's in-memory volatile
     // state field on this cadence. Keeping it short (250ms) means a Resume
     // takes effect promptly without an extra signal channel — matches the
@@ -1440,103 +1441,134 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
         var pendingRefactorProjects = (await CollectActiveRefactorDrainClaimsAsync(stoppingToken))
             .ToDictionary(c => c.ProjectId.Value, c => c.RefactorWorkItemId, StringComparer.Ordinal);
+        var effectiveAgentClassByItemId = new Dictionary<WorkItemId, string?>();
 
-        var candidates = await ListPickupCandidatesByPriorityAsync(skipIds, stoppingToken);
-        foreach (var pickupCandidate in candidates)
+        for (var selectionAttempt = 0; selectionAttempt < 3; selectionAttempt++)
         {
-            var candidate = pickupCandidate.Item;
-            if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
-                continue;
-
-            if (candidate.State == WorkItemState.WaitingForQuotaReset)
+            var quotaRetryBlockers = new List<WorkItem>();
+            var restartSelection = false;
+            var candidates = await ListPickupCandidatesByPriorityAsync(skipIds, stoppingToken);
+            foreach (var candidate in candidates)
             {
-                if (await TryPromoteQuotaRetryCandidateForDispatchAsync(candidate, stoppingToken))
-                    return candidate.Id;
+                if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
+                    continue;
 
-                continue;
-            }
-
-            if (await TryDeferForProjectPauseAtPickupAsync(candidate, stoppingToken))
-                continue;
-
-            if (candidate.JobType == JobType.Refactor)
-            {
-                if (candidate.StartedAt is not null)
-                    return candidate.Id;
-
-                if (pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var ownerRefactorId)
-                    && ownerRefactorId != candidate.Id)
+                if (candidate.State == WorkItemState.WaitingForQuotaReset)
                 {
-                    DeferBehindRefactorDrainOwner(candidate, ownerRefactorId, stoppingToken);
+                    var promotion = await TryPromoteQuotaRetryCandidateForDispatchAsync(candidate, stoppingToken);
+                    if (promotion.Promoted)
+                        return candidate.Id;
+
+                    if (promotion.Disposition == QuotaRetryDispatchDisposition.RestartSelection)
+                    {
+                        restartSelection = true;
+                        break;
+                    }
+
+                    if (promotion.Disposition == QuotaRetryDispatchDisposition.Blocked)
+                        quotaRetryBlockers.Add(candidate);
+
                     continue;
                 }
 
-                if (await TryClaimOrDeferRefactorDrainAsync(candidate, stoppingToken))
+                if (await IsBlockedByHigherPriorityQuotaRetryCandidateAsync(
+                        candidate,
+                        quotaRetryBlockers,
+                        effectiveAgentClassByItemId,
+                        stoppingToken))
                 {
-                    pendingRefactorProjects[candidate.ProjectId.Value] = candidate.Id;
-                    continue;
-                }
-
-                if (candidate.StartedAt is null)
-                    SetRefactorDrainClaim(candidate, RefactorStartReservationReason(candidate));
-                return candidate.Id;
-            }
-
-            if (candidate.StartedAt is null
-                && pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var refactorId))
-            {
-                var reason = RefactorDrainHoldReason(candidate.ProjectId, refactorId);
-                AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
-                ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
-                continue;
-            }
-
-            if (candidate.StartedAt is null)
-            {
-                var (refactorInFlight, _) =
-                    await _store.CountInFlightSplitByRefactorAsync(
-                        candidate.ProjectId,
-                        stoppingToken,
+                    _log.LogDebug(
+                        "Dispatch skip {Id}: higher-priority due quota retry candidate owns the same admission pool",
                         candidate.Id);
-                if (refactorInFlight > 0)
+                    continue;
+                }
+
+                if (await TryDeferForProjectPauseAtPickupAsync(candidate, stoppingToken))
+                    continue;
+
+                if (candidate.JobType == JobType.Refactor)
                 {
-                    var reason =
-                        $"refactor exclusivity: a refactor is in flight for project '{candidate.ProjectId.Value}'; non-refactor items wait until it completes";
+                    if (candidate.StartedAt is not null)
+                        return candidate.Id;
+
+                    if (pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var ownerRefactorId)
+                        && ownerRefactorId != candidate.Id)
+                    {
+                        DeferBehindRefactorDrainOwner(candidate, ownerRefactorId, stoppingToken);
+                        continue;
+                    }
+
+                    if (await TryClaimOrDeferRefactorDrainAsync(candidate, stoppingToken))
+                    {
+                        pendingRefactorProjects[candidate.ProjectId.Value] = candidate.Id;
+                        continue;
+                    }
+
+                    if (candidate.StartedAt is null)
+                        SetRefactorDrainClaim(candidate, RefactorStartReservationReason(candidate));
+                    return candidate.Id;
+                }
+
+                if (candidate.StartedAt is null
+                    && pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var refactorId))
+                {
+                    var reason = RefactorDrainHoldReason(candidate.ProjectId, refactorId);
                     AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
                     ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
                     continue;
                 }
 
-                var drainOwnerRefactor = await FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
-                    RefactorDispatchCandidate.FromWorkItem(candidate),
-                    stoppingToken);
-                if (drainOwnerRefactor is not null)
+                if (candidate.StartedAt is null)
                 {
-                    var (claimedRefactorInFlight, claimedOtherInFlight) =
+                    var (refactorInFlight, _) =
                         await _store.CountInFlightSplitByRefactorAsync(
-                            drainOwnerRefactor.ProjectId,
+                            candidate.ProjectId,
                             stoppingToken,
-                            drainOwnerRefactor.Id);
-                    if (claimedRefactorInFlight > 0 || claimedOtherInFlight > 0)
+                            candidate.Id);
+                    if (refactorInFlight > 0)
                     {
-                        var claimReason = RefactorCandidateBlockedReason(
-                            drainOwnerRefactor,
-                            claimedRefactorInFlight,
-                            claimedOtherInFlight);
-                        SetRefactorDrainClaim(drainOwnerRefactor, claimReason);
-                        pendingRefactorProjects[candidate.ProjectId.Value] = drainOwnerRefactor.Id;
-
-                        var reason = RefactorDrainHoldReason(candidate.ProjectId, drainOwnerRefactor.Id);
+                        var reason =
+                            $"refactor exclusivity: a refactor is in flight for project '{candidate.ProjectId.Value}'; non-refactor items wait until it completes";
                         AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
                         ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
                         continue;
                     }
+
+                    var drainOwnerRefactor = await FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
+                        RefactorDispatchCandidate.FromWorkItem(candidate),
+                        stoppingToken);
+                    if (drainOwnerRefactor is not null)
+                    {
+                        var (claimedRefactorInFlight, claimedOtherInFlight) =
+                            await _store.CountInFlightSplitByRefactorAsync(
+                                drainOwnerRefactor.ProjectId,
+                                stoppingToken,
+                                drainOwnerRefactor.Id);
+                        if (claimedRefactorInFlight > 0 || claimedOtherInFlight > 0)
+                        {
+                            var claimReason = RefactorCandidateBlockedReason(
+                                drainOwnerRefactor,
+                                claimedRefactorInFlight,
+                                claimedOtherInFlight);
+                            SetRefactorDrainClaim(drainOwnerRefactor, claimReason);
+                            pendingRefactorProjects[candidate.ProjectId.Value] = drainOwnerRefactor.Id;
+
+                            var reason = RefactorDrainHoldReason(candidate.ProjectId, drainOwnerRefactor.Id);
+                            AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
+                            ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
+                            continue;
+                        }
+                    }
                 }
+
+                return candidate.Id;
             }
 
-            return candidate.Id;
+            if (!restartSelection)
+                return null;
         }
 
+        _log.LogDebug("Dispatch pickup selection restarted repeatedly after quota retry promotion races; deferring this wake");
         return null;
 
         async Task<bool> DependenciesSatisfiedForPickupAsync(WorkItem candidate, CancellationToken ct)
@@ -1562,83 +1594,59 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 candidate.Id, candidate.State, candidate.DependsOn.Count);
             return false;
         }
+
+        async Task<bool> IsBlockedByHigherPriorityQuotaRetryCandidateAsync(
+            WorkItem candidate,
+            IReadOnlyList<WorkItem> blockers,
+            Dictionary<WorkItemId, string?> classCache,
+            CancellationToken ct)
+        {
+            if (blockers.Count == 0)
+                return false;
+
+            foreach (var blocker in blockers)
+            {
+                if (await SharesQuotaRetryAdmissionPoolAsync(blocker, candidate, classCache, ct))
+                    return true;
+            }
+
+            return false;
+        }
     }
 
-    private async Task<List<DispatchPickupCandidate>> ListPickupCandidatesByPriorityAsync(
+    private async Task<List<WorkItem>> ListPickupCandidatesByPriorityAsync(
         IReadOnlySet<WorkItemId> skipIds,
         CancellationToken ct)
     {
-        var candidates = new List<DispatchPickupCandidate>();
-        var sequence = 0;
-
-        await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
-        {
-            candidates.Add(new DispatchPickupCandidate(item, item.State, sequence++));
-        }
-
+        var candidates = new List<WorkItem>();
         if (_quotaRetryDispatchPromoter is null)
-            return candidates;
-
-        var now = _time.GetUtcNow();
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
         {
-            if (skipIds.Contains(item.Id) || !IsDueQuotaRetryCandidate(item, now))
-                continue;
-
-            candidates.Add(new DispatchPickupCandidate(
-                item,
-                OrderingStateForQuotaRetryCandidate(item),
-                sequence++));
+            await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+                candidates.Add(item);
+            return candidates;
         }
 
-        candidates.Sort(CompareDispatchPickupCandidates);
+        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            skipIds,
+            _time.GetUtcNow(),
+            DispatchPickupCandidateLimit,
+            ct))
+        {
+            candidates.Add(item);
+        }
         return candidates;
     }
 
-    private static bool IsDueQuotaRetryCandidate(WorkItem item, DateTimeOffset now) =>
-        item.NextQuotaRetryAt is null || item.NextQuotaRetryAt <= now;
-
-    private static WorkItemState OrderingStateForQuotaRetryCandidate(WorkItem item)
-    {
-        var phase = !string.IsNullOrWhiteSpace(item.QuotaRetryPhase)
-            ? item.QuotaRetryPhase
-            : item.QuotaRetryFrom;
-
-        return phase?.Trim().ToLowerInvariant() switch
-        {
-            "audit" or "rework" => WorkItemState.WorkComplete,
-            "conflict_rework" => WorkItemState.ReworkingForConflict,
-            "merge" => WorkItemState.AuditPassed,
-            "upstream" => WorkItemState.Merged,
-            _ => WorkItemState.Queued,
-        };
-    }
-
-    private static int CompareDispatchPickupCandidates(
-        DispatchPickupCandidate left,
-        DispatchPickupCandidate right)
-    {
-        var bucket = DispatchPhaseBucket(left.OrderingState).CompareTo(DispatchPhaseBucket(right.OrderingState));
-        if (bucket != 0)
-            return bucket;
-
-        var priority = right.Item.Priority.CompareTo(left.Item.Priority);
-        if (priority != 0)
-            return priority;
-
-        var createdAt = left.Item.CreatedAt.CompareTo(right.Item.CreatedAt);
-        if (createdAt != 0)
-            return createdAt;
-
-        return left.Sequence.CompareTo(right.Sequence);
-    }
-
-    private async Task<bool> TryPromoteQuotaRetryCandidateForDispatchAsync(
+    private async Task<QuotaRetryDispatchPromotionResult> TryPromoteQuotaRetryCandidateForDispatchAsync(
         WorkItem candidate,
         CancellationToken ct)
     {
         if (_quotaRetryDispatchPromoter is null)
-            return false;
+        {
+            return new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "skipped:promoter-unavailable");
+        }
 
         var result = await _quotaRetryDispatchPromoter.TryPromoteForDispatchAsync(candidate, ct);
         if (result.Promoted)
@@ -1648,15 +1656,70 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 candidate.Id,
                 result.Outcome,
                 result.Reason);
-            return true;
+            return result;
         }
 
         _log.LogDebug(
-            "Dispatch skipped due quota-waiting work item {Id}: outcome={Outcome} reason={Reason}",
+            "Dispatch skipped due quota-waiting work item {Id}: outcome={Outcome} disposition={Disposition} reason={Reason}",
             candidate.Id,
             result.Outcome,
+            result.Disposition,
             result.Reason);
-        return false;
+        return result;
+    }
+
+    private async Task<bool> SharesQuotaRetryAdmissionPoolAsync(
+        WorkItem blocker,
+        WorkItem candidate,
+        Dictionary<WorkItemId, string?> classCache,
+        CancellationToken ct)
+    {
+        var blockerClass = await EffectiveAgentClassIdAsync(blocker, classCache, ct);
+        var candidateClass = await EffectiveAgentClassIdAsync(candidate, classCache, ct);
+        if (blockerClass is not null || candidateClass is not null)
+            return string.Equals(blockerClass, candidateClass, StringComparison.Ordinal);
+
+        if (blocker.Agent is { } blockerAgent && candidate.Agent is { } candidateAgent)
+            return blockerAgent == candidateAgent;
+
+        return blocker.ProjectId == candidate.ProjectId;
+    }
+
+    private async Task<string?> EffectiveAgentClassIdAsync(
+        WorkItem item,
+        Dictionary<WorkItemId, string?> classCache,
+        CancellationToken ct)
+    {
+        if (classCache.TryGetValue(item.Id, out var cached))
+            return cached;
+
+        string? resolved = null;
+        if (!string.IsNullOrWhiteSpace(item.AgentClassId))
+        {
+            resolved = item.AgentClassId;
+        }
+        else if (_projects is not null)
+        {
+            try
+            {
+                var project = await _projects.GetAsync(item.ProjectId, ct);
+                resolved = project?.DefaultAgentClass;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(
+                    ex,
+                    "Could not resolve effective agent class for work item {Id}; falling back to direct-agent quota pool comparison",
+                    item.Id);
+            }
+        }
+
+        classCache[item.Id] = resolved;
+        return resolved;
     }
 
     private async Task<bool> TryDeferForProjectPauseAtPickupAsync(WorkItem candidate, CancellationToken stoppingToken)
@@ -2946,11 +3009,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             or WorkItemState.UpstreamPushing
             ? 0
             : 1;
-
-    private readonly record struct DispatchPickupCandidate(
-        WorkItem Item,
-        WorkItemState OrderingState,
-        int Sequence);
 
     /// <summary>
     /// Mirrors the SQL ordering of <see cref="IWorkItemStore.ListDispatchEligibleByPriorityAsync"/>:

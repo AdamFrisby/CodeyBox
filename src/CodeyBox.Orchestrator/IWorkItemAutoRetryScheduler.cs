@@ -24,10 +24,18 @@ public interface IQuotaRetryDispatchPromoter
         CancellationToken ct = default);
 }
 
+public enum QuotaRetryDispatchDisposition
+{
+    Continue,
+    RestartSelection,
+    Blocked,
+}
+
 public readonly record struct QuotaRetryDispatchPromotionResult(
     bool Promoted,
     string Outcome,
-    string? Reason = null);
+    string? Reason = null,
+    QuotaRetryDispatchDisposition Disposition = QuotaRetryDispatchDisposition.Continue);
 
 public interface ITransientFailureAutoRetryScheduler
 {
