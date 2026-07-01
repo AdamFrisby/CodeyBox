@@ -22,7 +22,7 @@ internal sealed class Bridge : IAsyncDisposable
     private const int SigHup = 1;
     private const int SigInt = 2;
     private const int SigTerm = 15;
-    private const string SignalBootstrapReexecEnv = "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED";
+    internal const string SignalBootstrapReexecEnv = "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED";
 
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<TcpListener> _listenerFactory;
@@ -890,7 +890,7 @@ internal sealed class Bridge : IAsyncDisposable
         });
     }
 
-    private static void ResetInheritedIgnoredSignalToDefault(int signalNumber)
+    internal static void ResetInheritedIgnoredSignalToDefault(int signalNumber)
     {
         if (!OperatingSystem.IsLinux())
             return;
@@ -909,7 +909,7 @@ internal sealed class Bridge : IAsyncDisposable
         catch { }
     }
 
-    private static IntPtr? ReadSignalHandlerOrNull(int signalNumber)
+    internal static IntPtr? ReadSignalHandlerOrNull(int signalNumber)
     {
         if (!OperatingSystem.IsLinux())
             return null;
@@ -924,25 +924,41 @@ internal sealed class Bridge : IAsyncDisposable
         IntPtr? sigintBefore,
         IntPtr? sighupBefore)
     {
-        if (!OperatingSystem.IsLinux()
-            || string.Equals(
-                Environment.GetEnvironmentVariable(SignalBootstrapReexecEnv),
-                "1",
-                StringComparison.Ordinal))
+        TryRunSignalBootstrap(
+            isLinux: OperatingSystem.IsLinux(),
+            guardValue: Environment.GetEnvironmentVariable(SignalBootstrapReexecEnv),
+            needsBootstrap: () =>
+                NeedsSignalBootstrapReexec(SigTerm, sigtermBefore)
+                || NeedsSignalBootstrapReexec(SigInt, sigintBefore)
+                || NeedsSignalBootstrapReexec(SigHup, sighupBefore),
+            readArgv: TryReadCurrentArgv,
+            setGuard: value => Environment.SetEnvironmentVariable(SignalBootstrapReexecEnv, value),
+            exec: NativeMethods.ExecVp);
+    }
+
+    internal static bool TryRunSignalBootstrap(
+        bool isLinux,
+        string? guardValue,
+        Func<bool> needsBootstrap,
+        Func<string[]?> readArgv,
+        Action<string?> setGuard,
+        Action<string[]> exec)
+    {
+        ArgumentNullException.ThrowIfNull(needsBootstrap);
+        ArgumentNullException.ThrowIfNull(readArgv);
+        ArgumentNullException.ThrowIfNull(setGuard);
+        ArgumentNullException.ThrowIfNull(exec);
+
+        if (!isLinux
+            || string.Equals(guardValue, "1", StringComparison.Ordinal)
+            || !needsBootstrap())
         {
-            return;
+            return false;
         }
 
-        if (!NeedsSignalBootstrapReexec(SigTerm, sigtermBefore)
-            && !NeedsSignalBootstrapReexec(SigInt, sigintBefore)
-            && !NeedsSignalBootstrapReexec(SigHup, sighupBefore))
-        {
-            return;
-        }
-
-        var argv = TryReadCurrentArgv();
+        var argv = readArgv();
         if (argv is null || argv.Length == 0)
-            return;
+            return false;
 
         // CoreCLR can remember a startup-ignored SIGINT before Bridge.RunAsync
         // gets control; after the reset above, the first runtime may still
@@ -950,8 +966,9 @@ internal sealed class Bridge : IAsyncDisposable
         // publishing any stdout envelopes so the runtime starts from the
         // now-default dispositions. exec preserves pid and stdio fds, so the
         // host's process and pipe tracking remain valid.
-        Environment.SetEnvironmentVariable(SignalBootstrapReexecEnv, "1");
-        NativeMethods.ExecVp(argv);
+        setGuard("1");
+        exec(argv);
+        return true;
     }
 
     private static bool NeedsSignalBootstrapReexec(int signalNumber, IntPtr? handlerBeforeRegistration)
@@ -966,27 +983,31 @@ internal sealed class Bridge : IAsyncDisposable
         return after == NativeMethods.SigDfl || after == NativeMethods.SigIgn;
     }
 
-    private static string[]? TryReadCurrentArgv()
+    internal static string[]? ParseProcCmdlineArgv(byte[] bytes)
+    {
+        var args = new List<string>();
+        var start = 0;
+        for (var i = 0; i < bytes.Length; i++)
+        {
+            if (bytes[i] != 0)
+                continue;
+
+            if (i > start)
+                args.Add(Encoding.UTF8.GetString(bytes, start, i - start));
+            start = i + 1;
+        }
+
+        if (start < bytes.Length)
+            args.Add(Encoding.UTF8.GetString(bytes, start, bytes.Length - start));
+
+        return args.Count == 0 ? null : args.ToArray();
+    }
+
+    internal static string[]? TryReadCurrentArgv()
     {
         try
         {
-            var bytes = File.ReadAllBytes("/proc/self/cmdline");
-            var args = new List<string>();
-            var start = 0;
-            for (var i = 0; i < bytes.Length; i++)
-            {
-                if (bytes[i] != 0)
-                    continue;
-
-                if (i > start)
-                    args.Add(Encoding.UTF8.GetString(bytes, start, i - start));
-                start = i + 1;
-            }
-
-            if (start < bytes.Length)
-                args.Add(Encoding.UTF8.GetString(bytes, start, bytes.Length - start));
-
-            return args.Count == 0 ? null : args.ToArray();
+            return ParseProcCmdlineArgv(File.ReadAllBytes("/proc/self/cmdline"));
         }
         catch
         {

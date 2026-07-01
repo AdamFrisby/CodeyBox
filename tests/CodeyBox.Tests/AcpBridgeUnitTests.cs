@@ -2754,6 +2754,135 @@ public sealed class AcpBridgeUnitTests
     // 130, SIGHUP → 129) OR leave a leaked lockfile in place — both are
     // failure modes this fixture catches.
 
+    [Fact]
+    public void Bridge_SignalBootstrap_ReexecsOnceAndSetsGuardWhenNeeded()
+    {
+        var needsCalled = 0;
+        string? guardValue = null;
+        string[]? execArgv = null;
+        var argv = new[] { "dotnet", "exec", "/tmp/bridge.dll" };
+
+        var ran = Bridge.TryRunSignalBootstrap(
+            isLinux: true,
+            guardValue: null,
+            needsBootstrap: () =>
+            {
+                needsCalled++;
+                return true;
+            },
+            readArgv: () => argv,
+            setGuard: value => guardValue = value,
+            exec: value =>
+            {
+                Assert.Equal("1", guardValue);
+                execArgv = value;
+            });
+
+        Assert.True(ran);
+        Assert.Equal(1, needsCalled);
+        Assert.Equal("1", guardValue);
+        Assert.Same(argv, execArgv);
+    }
+
+    [Fact]
+    public void Bridge_SignalBootstrap_OneShotGuardSkipsNeedCheckArgvReadAndExec()
+    {
+        var ran = Bridge.TryRunSignalBootstrap(
+            isLinux: true,
+            guardValue: "1",
+            needsBootstrap: () => throw new InvalidOperationException("guard should skip needs check"),
+            readArgv: () => throw new InvalidOperationException("guard should skip argv read"),
+            setGuard: _ => throw new InvalidOperationException("guard should not be rewritten"),
+            exec: _ => throw new InvalidOperationException("guard should skip exec"));
+
+        Assert.False(ran);
+    }
+
+    [Fact]
+    public void Bridge_SignalBootstrap_NoArgvFallbackDoesNotSetGuardOrExec()
+    {
+        AssertNoArgvFallback(null);
+        AssertNoArgvFallback(Array.Empty<string>());
+
+        static void AssertNoArgvFallback(string[]? argv)
+        {
+            var guardWasSet = false;
+            var execWasCalled = false;
+
+            var ran = Bridge.TryRunSignalBootstrap(
+                isLinux: true,
+                guardValue: null,
+                needsBootstrap: () => true,
+                readArgv: () => argv,
+                setGuard: _ => guardWasSet = true,
+                exec: _ => execWasCalled = true);
+
+            Assert.False(ran);
+            Assert.False(guardWasSet);
+            Assert.False(execWasCalled);
+        }
+    }
+
+    [Fact]
+    public void Bridge_SignalBootstrap_ProcCmdlineParserHandlesNullDelimitedArgv()
+    {
+        Assert.Equal(
+            new[] { "dotnet", "exec", "/tmp/bridge.dll" },
+            Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec\0/tmp/bridge.dll\0")));
+        Assert.Equal(
+            new[] { "dotnet", "exec" },
+            Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec")));
+        Assert.Equal(
+            new[] { "dotnet", "/tmp/bridge.dll" },
+            Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0\0/tmp/bridge.dll\0")));
+        Assert.Null(Bridge.ParseProcCmdlineArgv(Array.Empty<byte>()));
+        Assert.Null(Bridge.ParseProcCmdlineArgv(new byte[] { 0 }));
+    }
+
+    [Fact]
+    public void Bridge_SignalBootstrap_TryReadCurrentArgvReadsProcSelfCmdline()
+    {
+        var argv = Bridge.TryReadCurrentArgv();
+
+        Assert.NotNull(argv);
+        Assert.NotEmpty(argv);
+        Assert.All(argv, arg => Assert.False(string.IsNullOrEmpty(arg)));
+    }
+
+    [Fact]
+    public void Bridge_ResetInheritedIgnoredSignalToDefault_PreservesExistingCatchableHandler()
+    {
+        const int sighup = 1;
+        var sigIgn = new IntPtr(1);
+        var original = Bridge.ReadSignalHandlerOrNull(sighup);
+        var restoreOriginal = original is { } originalValue
+            && (originalValue == IntPtr.Zero || originalValue == sigIgn);
+
+        if (original == sigIgn)
+            _ = LibcSignal(sighup, IntPtr.Zero);
+
+        try
+        {
+            using var registration = PosixSignalRegistration.Create(
+                PosixSignal.SIGHUP,
+                ctx => ctx.Cancel = true);
+            var before = Bridge.ReadSignalHandlerOrNull(sighup);
+            Assert.NotNull(before);
+            Assert.NotEqual(IntPtr.Zero, before.Value);
+            Assert.NotEqual(sigIgn, before.Value);
+
+            Bridge.ResetInheritedIgnoredSignalToDefault(sighup);
+
+            var after = Bridge.ReadSignalHandlerOrNull(sighup);
+            Assert.Equal(before, after);
+        }
+        finally
+        {
+            if (restoreOriginal)
+                _ = LibcSignal(sighup, original!.Value);
+        }
+    }
+
     [Theory]
     [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
     [InlineData(2, "SIGINT")]  // Ctrl+C
@@ -2962,6 +3091,9 @@ os.execvp("dotnet", ["dotnet", "exec", bridge_dll])
 
     [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
     private static extern int LibcKill(int pid, int sig);
+
+    [DllImport("libc", EntryPoint = "signal", SetLastError = true)]
+    private static extern IntPtr LibcSignal(int sig, IntPtr handler);
 
     // ── Helpers for the new orchestration / regression fixtures above ───────────
 
