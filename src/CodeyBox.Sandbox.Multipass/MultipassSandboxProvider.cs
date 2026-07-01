@@ -6190,7 +6190,6 @@ while True:
         sb.AppendLine("        esac");
         sb.AppendLine("    done");
         sb.AppendLine("}");
-        sb.AppendLine("codeybox_close_inherited_stream_fds");
         sb.AppendLine("codeybox_pgid_marker=$1");
         sb.AppendLine("codeybox_stdin_file=$2");
         sb.AppendLine("codeybox_env_file=$3");
@@ -6240,6 +6239,7 @@ while True:
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1; pgid=$2; tmp=\"${marker}.tmp\"; umask 077; printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\" && { chown root:root \"$marker\" 2>/dev/null || true; } && chmod 0600 \"$marker\"' \"$codeybox_pgid_marker\" \"$codeybox_pgid\"; then");
         sb.AppendLine($"    exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("fi");
+        sb.AppendLine("codeybox_close_inherited_stream_fds");
         sb.AppendLine($"codeybox_stdout_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stdout.XXXXXX\") || exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine($"codeybox_stderr_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stderr.XXXXXX\") || {{ rm -f \"$codeybox_stdout_file\"; exit {DetachedSupervisorSetupFailedExitCode}; }}");
         sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
