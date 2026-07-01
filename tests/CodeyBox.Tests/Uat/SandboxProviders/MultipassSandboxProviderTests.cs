@@ -7229,6 +7229,49 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_SnapshotForIsolationMountsStagedReadOnlySnapshot()
+    {
+        var source = Path.Combine(_workspace, "snapshot-source");
+        Directory.CreateDirectory(source);
+        await File.WriteAllTextAsync(Path.Combine(source, "marker.txt"), "snapshot content");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = BuildSuccessfulCreateRunner(states);
+        var staging = Path.Combine(_workspace, "staging-snapshot-mount");
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    HostPath = source,
+                    SandboxPath = "/repo",
+                    ReadOnly = true,
+                    SnapshotForIsolation = true,
+                },
+            ],
+        });
+
+        var mount = Assert.Single(runner.Calls, call =>
+            call.Argv is [_, "mount", "--type=native", _, var vmTarget]
+            && vmTarget.EndsWith(":/repo", StringComparison.Ordinal));
+        var mountedSource = mount.Argv[3];
+
+        Assert.NotEqual(Path.GetFullPath(source), Path.GetFullPath(mountedSource));
+        Assert.Contains(
+            $"{Path.DirectorySeparatorChar}readonly-binds{Path.DirectorySeparatorChar}",
+            mountedSource,
+            StringComparison.Ordinal);
+        Assert.True(File.Exists(Path.Combine(mountedSource, "marker.txt")));
+        Assert.Equal("snapshot content", await File.ReadAllTextAsync(Path.Combine(mountedSource, "marker.txt")));
+    }
+
+    [Fact]
     public async Task DisposeLeakedAsync_ForTrackedActiveVm_ClearsOwnerSnapshot()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);

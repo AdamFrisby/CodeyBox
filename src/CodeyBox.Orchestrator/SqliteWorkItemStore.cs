@@ -559,16 +559,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // UpdatePriorityAsync / UpdateAuditBudgetAsync /
             // ReplaceExternalIdsAsync / TryReplaceKnobsIfStateAndUpdatedAtAsync
             // to mutate them safely; routine state transitions leave them alone.
+            // Plan columns are written only when the persisted prompt_revision
+            // still matches the snapshot; otherwise a prompt edit has already
+            // invalidated and cleared the plan for the newer prompt.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     agent_instance_id = $agent_instance_id,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
-                    state = $state, updated_at = $ua, last_error = $err,
+                    state = CASE
+                        WHEN prompt_revision <> $prompt_revision
+                         AND $state IN ($planning_state, $plan_review_state, $plan_approved_state)
+                        THEN state
+                        ELSE $state
+                    END,
+                    updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
-                    stuck_retries = $sretries, started_at = $started_at,
+                    stuck_retries = $sretries,
+                    started_at = CASE
+                        WHEN prompt_revision <> $prompt_revision
+                         AND $state IN ($planning_state, $plan_review_state, $plan_approved_state)
+                        THEN started_at
+                        ELSE $started_at
+                    END,
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
                     local_squash_sha = $local_squash_sha,
                     merged_pr_number = $merged_pr_number,
@@ -612,13 +627,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
                     next_terminal_retry_at = $next_terminal_retry_at,
-                    plan_artifact = $plan_artifact,
-                    plan_generated_at = $plan_generated_at,
-                    plan_reviewed_at = $plan_reviewed_at,
-                    plan_review_summary = $plan_review_summary
+                    plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
+                    plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
+                    plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
+            cmd.Parameters.AddWithValue("$planning_state", (int)WorkItemState.Planning);
+            cmd.Parameters.AddWithValue("$plan_review_state", (int)WorkItemState.PlanReview);
+            cmd.Parameters.AddWithValue("$plan_approved_state", (int)WorkItemState.PlanApproved);
             await cmd.ExecuteNonQueryAsync(ct);
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
@@ -639,6 +657,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             using var cmd = _conn.CreateCommand();
             // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s) / knobs
             // are excluded from the full-row UPDATE to avoid stale-snapshot clobber.
+            // Plan columns are guarded by prompt_revision for the same reason.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
@@ -692,10 +711,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
                     next_terminal_retry_at = $next_terminal_retry_at,
-                    plan_artifact = $plan_artifact,
-                    plan_generated_at = $plan_generated_at,
-                    plan_reviewed_at = $plan_reviewed_at,
-                    plan_review_summary = $plan_review_summary
+                    plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
+                    plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
+                    plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -777,10 +796,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
                     next_terminal_retry_at = $next_terminal_retry_at,
-                    plan_artifact = $plan_artifact,
-                    plan_generated_at = $plan_generated_at,
-                    plan_reviewed_at = $plan_reviewed_at,
-                    plan_review_summary = $plan_review_summary
+                    plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
+                    plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
+                    plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
                 WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
                 """;
             Bind(cmd, item);

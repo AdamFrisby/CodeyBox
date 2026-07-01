@@ -1033,8 +1033,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             workToken: attemptCt),
                     ct,
                     phaseCancellation: planningPhase,
-                    attemptTimeout: current.WorkTimeout,
-                    skipInVmSmoke: true);
+                    attemptTimeout: current.WorkTimeout);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
@@ -1287,35 +1286,39 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken hostShutdownToken)
     {
         var credential = await ResolveAgentCredentialForInvocationAsync(runner, project, item, ct);
-        var access = _gitHost.GetSandboxAccess(repoId);
+        string? isolatedRepoPath = null;
+        ISandbox? sandbox = null;
 
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
         var extraEnv = new Dictionary<string, string>
         {
             [PromptRevisionEnvVar] = item.PromptRevision.ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
-        var readOnlyAccess = BuildReadOnlyPlanningRepositoryAccess(access);
-        var sandboxCredential = credential
-            ?? new AgentCredential(runner.Kind, new Dictionary<string, string>(), new Dictionary<string, string>());
-        var spec = BuildSandboxSpec(
-            readOnlyAccess,
-            includeAgentCredential: sandboxCredential,
-            allowAgentNetwork: true,
-            hostNetworkProfile: sandboxTarget.NetworkProfile,
-            timingWorkItemId: item.Id,
-            timingPhase: "planning",
-            flavor: sandboxTarget.Flavor,
-            extraEnvironment: extraEnv,
-            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
-                project,
-                new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
-                item.BaselineImageRef));
-
-        var sandbox = await _sandboxes.CreateAsync(spec, ct);
 
         AgentStreamCapture? streamCapture = null;
         try
         {
+            isolatedRepoPath = await _gitHost.CreateIsolatedRepositoryCloneAsync(repoId, item.Id, ct);
+            var isolatedAccess = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
+            var readOnlyAccess = BuildReadOnlyPlanningRepositoryAccess(isolatedAccess);
+            var sandboxCredential = credential
+                ?? new AgentCredential(runner.Kind, new Dictionary<string, string>(), new Dictionary<string, string>());
+            var spec = BuildSandboxSpec(
+                readOnlyAccess,
+                includeAgentCredential: sandboxCredential,
+                allowAgentNetwork: true,
+                hostNetworkProfile: sandboxTarget.NetworkProfile,
+                timingWorkItemId: item.Id,
+                timingPhase: "planning",
+                flavor: sandboxTarget.Flavor,
+                extraEnvironment: extraEnv,
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                    project,
+                    new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
+                    item.BaselineImageRef));
+
+            sandbox = await _sandboxes.CreateAsync(spec, ct);
+
             if (credential is not null && credential.Files.Count > 0)
                 await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
@@ -1431,12 +1434,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             try
             {
-                await sandbox.DisposeAsync();
+                if (sandbox is not null)
+                    await sandbox.DisposeAsync();
             }
             catch
             {
                 // Best-effort disposal; the phase exception, if any, is the useful signal.
             }
+
+            if (isolatedRepoPath is not null)
+                await _gitHost.DisposeIsolatedMergeCloneAsync(repoId, isolatedRepoPath, CancellationToken.None);
         }
     }
 
@@ -1743,7 +1750,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ? completionModeCheck ? null : "check"
             : skipWork
                 ? null
-                : "work";
+                : planningLifecycleRequiredAtEntry
+                    ? "planning"
+                    : "work";
         if (initialSmokePhase is not null)
         {
             var initialSmokeTarget = ResolvePhaseSmokeTarget(project, initialSmokePhase, item.BaselineImageRef);
@@ -1754,7 +1763,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
                 if (IsOperatorPaused(smokeAvailability))
                 {
-                    await TransitionWaitingForAgentResumeAsync(item, reason, project, agentKind);
+                    await TransitionWaitingForAgentResumeAsync(
+                        item,
+                        reason,
+                        project,
+                        agentKind,
+                        RetryFromForAgentPausePhase(initialSmokePhase, item.State));
                     return;
                 }
 
@@ -2440,7 +2454,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogInformation(
                 "Work item {Id} parking in WaitingForAgentResume: {Reason}",
                 item.Id, ex.Message);
-            await TransitionWaitingForAgentResumeAsync(item, ex.Message, project, ex.Agent);
+            await TransitionWaitingForAgentResumeAsync(
+                item,
+                ex.Message,
+                project,
+                ex.Agent,
+                RetryFromForAgentPausePhase(ex.Phase, item.State));
         }
         catch (AgentAuthRequiredException ex)
         {
@@ -15246,7 +15265,8 @@ Original merge-phase failure (JSON string, for context only):
         WorkItem item,
         string reason,
         Project? project,
-        AgentKind? pausedAgent = null)
+        AgentKind? pausedAgent = null,
+        string? retryFrom = null)
         => await WorkItemAgentPauseParking.ParkAsync(
             _store,
             _webhooks,
@@ -15255,7 +15275,21 @@ Original merge-phase failure (JSON string, for context only):
             reason,
             project,
             pausedAgent,
-            CancellationToken.None);
+            CancellationToken.None,
+            retryFrom);
+
+    private static string RetryFromForAgentPausePhase(string? phase, WorkItemState currentState) =>
+        phase switch
+        {
+            "planning" => "planning",
+            "audit" => "audit",
+            "rework" => "audit",
+            "post-act-recheck" => "audit",
+            ConflictReworkPhaseKey => "conflict_rework",
+            "merge" => "merge",
+            "upstream" => "upstream",
+            _ => AgentPauseResumeMapper.RetryFromForState(currentState),
+        };
 
     private Task TransitionWaitingForTransientRetryAsync(
         WorkItem item,

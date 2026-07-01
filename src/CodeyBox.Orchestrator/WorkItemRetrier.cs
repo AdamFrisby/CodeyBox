@@ -136,6 +136,9 @@ public sealed class WorkItemRetrier
         var actualFrom = requestedFrom;
         var retryingBeforeWork = resumeState.Value is WorkItemState.PlanReview or WorkItemState.PlanApproved;
 
+        if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
+            return (false, planningBoundaryError, null, null, null);
+
         // For from != "work", the pipeline expects the bare repo to still be present.
         if (resumeState != WorkItemState.Queued && !retryingBeforeWork)
         {
@@ -520,6 +523,12 @@ public sealed class WorkItemRetrier
                 $"invalid 'from' value '{from}'; expected one of: planning, plan_review, plan_approved, work, rework, audit, merge",
                 null,
                 null);
+        if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
+            return new ResumeOutcome(
+                ResumeStatus.Conflict,
+                planningBoundaryError,
+                null,
+                null);
         var resumingFromPlanning = requestedFrom == "planning";
         var resumingBeforeWork = requestedFrom is "planning" or "plan_review" or "plan_approved";
 
@@ -625,6 +634,20 @@ public sealed class WorkItemRetrier
         AuditLog.WorkItemResumed(resumed.Id, requestedFrom, reason);
 
         return new ResumeOutcome(ResumeStatus.Ok, null, resumed, resumeState);
+    }
+
+    private static string? ValidatePlanningResumeBoundary(WorkItem item, string requestedFrom)
+    {
+        return requestedFrom switch
+        {
+            "plan_review" when string.IsNullOrWhiteSpace(item.PlanArtifact) =>
+                "cannot resume from 'plan_review': planning artifact is missing; use from=planning to run planning first.",
+            "plan_approved" when string.IsNullOrWhiteSpace(item.PlanArtifact) =>
+                "cannot resume from 'plan_approved': approved planning artifact is missing; use from=planning to run planning first.",
+            "plan_approved" when item.PlanReviewedAt is null =>
+                "cannot resume from 'plan_approved': planning artifact has not been reviewed; use from=plan_review to review it first.",
+            _ => null,
+        };
     }
 
     private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(

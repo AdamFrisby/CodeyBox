@@ -2167,7 +2167,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             decision.Reason,
                             decision.PausedAgents.Count == 1 ? decision.PausedAgents[0] : null,
                             ct,
-                            AgentPauseResumeMapper.RetryFromForState(item.State));
+                            AgentPauseRetryFromForPickup(item, project));
                         return;
                     }
 
@@ -2260,7 +2260,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         $"agent '{pausedCandidate.Value}' {reason}",
                         pausedCandidate,
                         ct,
-                        AgentPauseResumeMapper.RetryFromForState(item.State));
+                        AgentPauseRetryFromForPickup(item, project));
                     return;
                 }
 
@@ -2562,9 +2562,32 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
+        => item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
+
+    private static string AgentPauseRetryFromForPickup(WorkItem item, Project? project)
     {
-        _ = item;
-        return true;
+        if (item.State == WorkItemState.Queued)
+        {
+            if (item.Knobs.TryGetValue("plan", out var itemPlan))
+            {
+                return string.Equals(itemPlan, "on", StringComparison.OrdinalIgnoreCase)
+                    ? "planning"
+                    : "work";
+            }
+
+            if (project?.Knobs.TryGetValue("plan", out var projectPlan) == true
+                && string.Equals(projectPlan, "on", StringComparison.OrdinalIgnoreCase))
+            {
+                return "planning";
+            }
+        }
+
+        return AgentPauseResumeMapper.RetryFromForState(item.State);
     }
 
     private static bool IsOperatorPaused(AgentAvailability? availability) =>

@@ -103,6 +103,8 @@ public interface IWorkItemStore
     /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
     /// <see cref="WorkItem.AuditMaxIterations"/>, and
     /// <see cref="WorkItem.AuditComplexity"/>, and <see cref="WorkItem.Knobs"/>.
+    /// Planning artifact fields are updated only when the persisted prompt
+    /// revision still matches the supplied snapshot.
     /// Use <see cref="UpdatePriorityAsync"/>, <see cref="TryReplacePromptAsync"/>,
     /// <see cref="UpdateAuditBudgetAsync"/>, and
     /// <see cref="TryReplaceKnobsIfStateAndUpdatedAtAsync"/> for those fields so
@@ -116,6 +118,8 @@ public interface IWorkItemStore
     /// <see cref="WorkItem.AuditMaxIterations"/>, and
     /// <see cref="WorkItem.AuditComplexity"/>, and <see cref="WorkItem.Knobs"/>
     /// only when the persisted state still matches <paramref name="onlyIfState"/>.
+    /// Planning artifact fields are updated only when the persisted prompt
+    /// revision still matches the supplied snapshot.
     /// Returns true if the row was updated.
     /// </summary>
     Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default);

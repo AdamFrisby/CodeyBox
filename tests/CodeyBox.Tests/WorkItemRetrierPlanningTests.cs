@@ -189,6 +189,56 @@ public sealed class WorkItemRetrierPlanningTests : IDisposable
     }
 
     [Fact]
+    public async Task RetryManual_FromPlanReviewWithoutPlan_IsRejected()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.Failed) with
+        {
+            WorkBranch = null,
+            LastError = "planning never completed",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.RetryAsync(item, "plan_review");
+
+        Assert.False(result.Success);
+        Assert.Contains("planning artifact is missing", result.Error, StringComparison.Ordinal);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Failed, read!.State);
+        Assert.Equal("planning never completed", read.LastError);
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task RetryManual_FromPlanApprovedWithoutReview_IsRejected()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.Failed) with
+        {
+            WorkBranch = null,
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            LastError = "review never approved",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.RetryAsync(item, "plan_approved");
+
+        Assert.False(result.Success);
+        Assert.Contains("has not been reviewed", result.Error, StringComparison.Ordinal);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Failed, read!.State);
+        Assert.Equal("review never approved", read.LastError);
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
     public async Task RetryManual_FromWork_RequeuesAndClearsApprovedPlan()
     {
         using var store = NewStore();
@@ -245,6 +295,56 @@ public sealed class WorkItemRetrierPlanningTests : IDisposable
         Assert.Null(read.PlanReviewedAt);
         Assert.Null(read.PlanReviewSummary);
         Assert.Null(read.AgentPauseRetryFrom);
+    }
+
+    [Theory]
+    [InlineData("plan_review")]
+    [InlineData("plan_approved")]
+    public async Task ResumeCancelled_ToPlanningBoundaryWithoutRequiredPlan_IsRejected(string from)
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.Cancelled) with
+        {
+            WorkBranch = null,
+            LastError = "cancelled before planning completed",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.ResumeAsync(item, from, "operator resume");
+
+        Assert.Equal(WorkItemRetrier.ResumeStatus.Conflict, result.Status);
+        Assert.Contains("planning artifact", result.Error, StringComparison.Ordinal);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Cancelled, read!.State);
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task ResumeCancelled_FromPlanApprovedWithoutReview_IsRejected()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var retrier = NewRetrier(store, queue);
+        var item = Sample(WorkItemState.Cancelled) with
+        {
+            WorkBranch = null,
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            LastError = "cancelled before plan approval",
+        };
+        await store.CreateAsync(item);
+
+        var result = await retrier.ResumeAsync(item, "plan_approved", "operator resume");
+
+        Assert.Equal(WorkItemRetrier.ResumeStatus.Conflict, result.Status);
+        Assert.Contains("has not been reviewed", result.Error, StringComparison.Ordinal);
+        var read = await store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemState.Cancelled, read!.State);
+        Assert.Equal(0, queue.Count);
     }
 
     private SqliteWorkItemStore NewStore()

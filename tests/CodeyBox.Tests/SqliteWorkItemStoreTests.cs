@@ -918,6 +918,54 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdateAsync_DoesNotResurrectPlanClearedByPromptReplacementFromStaleSnapshot()
+    {
+        var approvedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = Sample() with
+        {
+            State = WorkItemState.PlanApproved,
+            PlanArtifact = """
+                {
+                  "approach": "old prompt plan",
+                  "files": ["old.txt"],
+                  "testStrategy": "old tests",
+                  "risks": "old risks",
+                  "satisfiesTask": "old task"
+                }
+                """,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = approvedAt,
+            PlanReviewSummary = "approved",
+        };
+        await _store.CreateAsync(item);
+        var stalePickupSnapshot = await _store.GetAsync(item.Id);
+        Assert.NotNull(stalePickupSnapshot);
+
+        var replace = await _store.TryReplacePromptAsync(
+            item.Id,
+            "new prompt",
+            stalePickupSnapshot!.UpdatedAt.AddSeconds(1));
+        Assert.Equal(PromptReplaceOutcome.Updated, replace.Outcome);
+
+        await _store.UpdateAsync(stalePickupSnapshot with
+        {
+            LocalSquashSha = "abc123",
+            UpdatedAt = stalePickupSnapshot.UpdatedAt.AddSeconds(2),
+        });
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal("new prompt", read!.Prompt);
+        Assert.Equal(2, read.PromptRevision);
+        Assert.Equal(WorkItemState.Queued, read.State);
+        Assert.Null(read.PlanArtifact);
+        Assert.Null(read.PlanGeneratedAt);
+        Assert.Null(read.PlanReviewedAt);
+        Assert.Null(read.PlanReviewSummary);
+        Assert.Equal("abc123", read.LocalSquashSha);
+    }
+
+    [Fact]
     public async Task ReadKnobs_TolerantOfCaseInsensitiveDuplicatesInPersistedJson()
     {
         // Hand-edited / pre-migration rows can carry a knobs_json blob with

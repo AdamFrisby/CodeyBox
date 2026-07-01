@@ -441,7 +441,7 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Theory]
-    [InlineData(WorkItemState.Planning, "work", WorkItemState.Queued, false)]
+    [InlineData(WorkItemState.Planning, "planning", WorkItemState.Queued, false)]
     [InlineData(WorkItemState.PlanApproved, "plan_approved", WorkItemState.PlanApproved, true)]
     public async Task Worker_PlanningResumeStateWithPausedDirectAgent_ParksWithoutEnteringPipeline(
         WorkItemState state,
@@ -459,6 +459,10 @@ public sealed class AgentPauseTests : IDisposable
         {
             Agent = AgentKind.Claude,
             State = state,
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["plan"] = "on",
+            },
             PlanArtifact = state is WorkItemState.PlanReview or WorkItemState.PlanApproved ? ValidPlan : null,
             PlanGeneratedAt = state is WorkItemState.PlanReview or WorkItemState.PlanApproved
                 ? DateTimeOffset.UtcNow.AddMinutes(-2)
@@ -469,6 +473,7 @@ public sealed class AgentPauseTests : IDisposable
             PlanReviewSummary = state == WorkItemState.PlanApproved ? "approved" : null,
         };
 
+        var startup = new StartupRecoveryBarrier();
         using var registry = new CancellationRegistry(CancellationToken.None);
         using var svc = new OrchestratorService(
             queue,
@@ -478,9 +483,11 @@ public sealed class AgentPauseTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             projects: ProjectRepo(),
+            startupRecoveryCompletion: startup,
             dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
 
         await svc.StartAsync(CancellationToken.None);
+        await startup.InitialRecoveryCompleted.WaitAsync(StateWaitBudget);
         await store.CreateAsync(item);
         Assert.Equal(state, (await store.GetAsync(item.Id))!.State);
         await queue.EnqueueAsync(item.Id);
@@ -572,7 +579,7 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task Worker_AuditPassedDirectItemWithPausedWorkAgent_ParksBeforePipeline()
+    public async Task Worker_AuditPassedDirectItemWithPausedWorkAgent_EntersContinuationPipeline()
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
@@ -601,10 +608,10 @@ public sealed class AgentPauseTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
         await queue.EnqueueAsync(item.Id);
 
-        var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
-        Assert.NotNull(parked);
-        Assert.False(pipeline.Entered);
-        Assert.Equal("merge", parked!.AgentPauseRetryFrom);
+        var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
+        Assert.NotNull(done);
+        Assert.True(pipeline.Entered);
+        Assert.Null(done!.AgentPauseRetryFrom);
         await svc.StopAsync(CancellationToken.None);
     }
 
