@@ -2758,22 +2758,24 @@ public sealed class AcpBridgeUnitTests
     [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
     [InlineData(2, "SIGINT")]  // Ctrl+C
     [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
-    public async Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName)
-        => await AssertBridgeSignalTriggersCleanShutdownAsync(signo, signalName);
+    public Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName) =>
+        RunBridgeSignalCleanupScenarioAsync(signo, signalName, inheritIgnoredSignal: false);
 
-    [Fact]
-    public async Task Bridge_SighupHandler_ResetsInheritedIgnoredDisposition()
-        => await AssertBridgeSignalTriggersCleanShutdownAsync(
-            1,
-            "SIGHUP-inherited-ignore",
-            inheritIgnoredSighup: true);
+    [Theory]
+    [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
+    [InlineData(2, "SIGINT")]  // Ctrl+C
+    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
+    public Task Bridge_PosixSignalHandlers_ResetInheritedIgnoredDispositionAndCleanUp(int signo, string signalName) =>
+        RunBridgeSignalCleanupScenarioAsync(signo, signalName, inheritIgnoredSignal: true);
 
-    private static async Task AssertBridgeSignalTriggersCleanShutdownAsync(
+    private static async Task RunBridgeSignalCleanupScenarioAsync(
         int signo,
         string signalName,
-        bool inheritIgnoredSighup = false)
+        bool inheritIgnoredSignal)
     {
         if (!File.Exists("/bin/bash"))
+            return; // honour Skippable shape without taking the dependency
+        if (inheritIgnoredSignal && !CommandExists("python3"))
             return; // honour Skippable shape without taking the dependency
 
         var bridgeDllPath = typeof(Bridge).Assembly.Location;
@@ -2781,6 +2783,9 @@ public sealed class AcpBridgeUnitTests
             "AcpBridge dll missing at " + bridgeDllPath +
             " — the test project should ProjectReference the AcpBridge assembly.");
 
+        var ignoredMarkerPath = inheritIgnoredSignal ? Path.Combine(
+            Path.GetTempPath(),
+            "cb-acp-posixsig-ignore-" + signalName + "-" + Guid.NewGuid().ToString("N") + ".txt") : null;
         var tmpDir = Directory.CreateTempSubdirectory("cb-acp-posixsig-" + signalName + "-").FullName;
         try
         {
@@ -2795,32 +2800,15 @@ public sealed class AcpBridgeUnitTests
             File.SetUnixFileMode(stubPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-            var psi = new ProcessStartInfo(inheritIgnoredSighup ? "/bin/bash" : "dotnet")
-            {
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WorkingDirectory = tmpDir,
-            };
-            if (inheritIgnoredSighup)
-            {
-                psi.ArgumentList.Add("-c");
-                psi.ArgumentList.Add("trap '' HUP; exec \"$@\"");
-                psi.ArgumentList.Add("cb-acp-bridge");
-                psi.ArgumentList.Add("dotnet");
-                psi.ArgumentList.Add("exec");
-                psi.ArgumentList.Add(bridgeDllPath);
-            }
-            else
-            {
-                psi.ArgumentList.Add("exec");
-                psi.ArgumentList.Add(bridgeDllPath);
-            }
+            var psi = CreateBridgeSignalTestStartInfo(
+                bridgeDllPath,
+                tmpDir,
+                signo,
+                inheritIgnoredSignal,
+                ignoredMarkerPath);
 
             using var proc = Process.Start(psi)
-                ?? throw new InvalidOperationException("Process.Start returned null for dotnet exec.");
+                ?? throw new InvalidOperationException("Process.Start returned null for bridge signal fixture.");
 
             try
             {
@@ -2855,6 +2843,11 @@ public sealed class AcpBridgeUnitTests
                 Assert.NotNull(lockPath);
                 Assert.True(File.Exists(lockPath),
                     "Lockfile must exist after `ready` envelope — pre-signal state.");
+                if (inheritIgnoredSignal)
+                {
+                    Assert.NotNull(ignoredMarkerPath);
+                    Assert.Equal("ignored", File.ReadAllText(ignoredMarkerPath).Trim());
+                }
 
                 // Drain remaining stdout in the background so the pipe doesn't
                 // fill up and block the bridge while we wait for the signal.
@@ -2900,8 +2893,71 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
+            if (ignoredMarkerPath is not null)
+            {
+                try { File.Delete(ignoredMarkerPath); } catch { }
+            }
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
+    }
+
+    private static ProcessStartInfo CreateBridgeSignalTestStartInfo(
+        string bridgeDllPath,
+        string workingDirectory,
+        int signo,
+        bool inheritIgnoredSignal,
+        string? ignoredMarkerPath)
+    {
+        var psi = new ProcessStartInfo(inheritIgnoredSignal ? "python3" : "dotnet")
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = workingDirectory,
+        };
+
+        if (!inheritIgnoredSignal)
+        {
+            psi.ArgumentList.Add("exec");
+            psi.ArgumentList.Add(bridgeDllPath);
+            return psi;
+        }
+
+        if (ignoredMarkerPath is null)
+            throw new ArgumentNullException(nameof(ignoredMarkerPath));
+
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("""
+import os
+import signal
+import sys
+
+signo = int(sys.argv[1])
+bridge_dll = sys.argv[2]
+marker = sys.argv[3]
+
+signal.signal(signo, signal.SIG_IGN)
+
+ignored = False
+with open("/proc/self/status", encoding="utf-8") as status:
+    for line in status:
+        if line.startswith("SigIgn:"):
+            ignored = bool(int(line.split()[1], 16) & (1 << (signo - 1)))
+            break
+if not ignored:
+    sys.exit(86)
+
+with open(marker, "w", encoding="utf-8") as handle:
+    handle.write("ignored\n")
+
+os.execvp("dotnet", ["dotnet", "exec", bridge_dll])
+""");
+        psi.ArgumentList.Add(signo.ToString(CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add(bridgeDllPath);
+        psi.ArgumentList.Add(ignoredMarkerPath);
+        return psi;
     }
 
     [DllImport("libc", EntryPoint = "kill", SetLastError = true)]

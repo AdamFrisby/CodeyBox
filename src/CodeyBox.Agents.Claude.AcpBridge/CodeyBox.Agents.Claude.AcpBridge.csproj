@@ -54,11 +54,13 @@
     statically-linked ELF that has NO dlopen / dynamic-loader support at
     runtime. The default NativeAOT PInvoke resolver path is `dlopen("libc.so")`
     on first call — which throws DllNotFoundException in a fully-static
-    binary. Bridge.NativeMethods.Kill (the libc kill(2) we P/Invoke for
-    the polite SIGTERM-then-grace-then-SIGKILL teardown of the claude IDE
-    subprocess) would therefore silently regress to bare Process.Kill
-    (SIGKILL only), re-introducing the thinking-block-immutability 400
-    cluster the polite SIGTERM fix was specifically added to prevent.
+    binary. Bridge.NativeMethods uses libc for kill(2), signal disposition
+    inspection/reset, and the one-time signal-bootstrap execvp(3); without
+    DirectPInvoke those calls would throw instead of preserving bridge
+    shutdown cleanup. The kill(2) path would silently regress to bare
+    Process.Kill (SIGKILL only), re-introducing the thinking-block-
+    immutability 400 cluster the polite SIGTERM fix was specifically added
+    to prevent.
 
     DirectPInvoke tells the NativeAOT compiler to resolve the libc PInvoke
     at link time (no runtime dlopen). Do NOT add NativeLibrary Include="libc":
