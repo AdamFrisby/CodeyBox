@@ -126,6 +126,36 @@ public sealed class ProcessSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_TranslatesSandboxAbsolutePathEntriesInPathEnvironment()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount { SandboxPath = "/tools", Tmpfs = true },
+            ],
+            Environment = new Dictionary<string, string>
+            {
+                ["PATH"] = "/tools:/usr/bin:/bin",
+            },
+            WorkingDirectory = "/work",
+        });
+
+        var install = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$1\" && chmod 0755 \"$1\"", "sh", "/tools/path-probe"],
+            Stdin = "#!/bin/sh\nprintf translated-path-entry\n",
+        });
+        var run = await sandbox.ExecAsync(new SandboxExec { Argv = ["sh", "-c", "path-probe"] });
+
+        Assert.True(install.Success, install.Stderr);
+        Assert.True(run.Success, run.Stderr);
+        Assert.Equal("translated-path-entry", run.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
     public async Task ExecAsync_MaxStdoutBytes_KillsProcessAndFlagsTruncation()
     {
         var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());

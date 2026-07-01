@@ -44,37 +44,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private const int CompletionReviewFileMaxChars = 8 * 1024;
     private const int CompletionReviewMaxFiles = 80;
     private const int PlanArtifactMaxChars = 64 * 1024;
-    private const string AuditDotnetShimDirectory = "/codeybox/bin";
-    private const string AuditDotnetShimPath = AuditDotnetShimDirectory + "/dotnet";
-    private const long AuditDotnetShimTmpfsBytes = 64 * 1024;
-    private const string DefaultSandboxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    private const string AuditDotnetShimNotice =
-        "build and tests already executed by the deterministic gate before this review; skipped to avoid slow redundant re-runs";
-    private static readonly string AuditDotnetShimScript = $$"""
-        #!/bin/sh
-        if [ "${1:-}" = "build" ] || [ "${1:-}" = "test" ]; then
-            printf '%s\n' "{{AuditDotnetShimNotice}}"
-            exit 0
-        fi
-
-        shim_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
-        old_ifs=$IFS
-        IFS=:
-        next_path=
-        for path_entry in ${PATH:-}; do
-            [ "$path_entry" = "$shim_dir" ] && continue
-            if [ -z "$next_path" ]; then
-                next_path=$path_entry
-            else
-                next_path=$next_path:$path_entry
-            fi
-        done
-        IFS=$old_ifs
-        PATH=$next_path
-        export PATH
-        exec dotnet "$@"
-        """;
-
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly IAgentRegistry _agents;
@@ -8205,10 +8174,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
                     flavor: sandboxTarget.Flavor,
                     baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
-                return ConfigureAuditDotnetShimIfEnabled(built with
+                return built with
                 {
                     Mounts = [.. built.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }],
-                });
+                };
             }
             var spec = BuildAuditSandboxSpec(access);
 
@@ -8235,7 +8204,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             auditorName,
                             async (setupSandbox, setupCt) =>
                             {
-                                await InstallAuditDotnetShimIfEnabledAsync(setupSandbox, setupCt);
                                 if (credential is not null && credential.Files.Count > 0)
                                     await MaterialiseCredentialFilesAsync(setupSandbox, credential, setupCt);
                                 await RunWithCancellation(
@@ -8403,7 +8371,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var maxPar = project.Audit.MaxLlmAuditorParallelism;
                 using var sem = new SemaphoreSlim(maxPar, maxPar);
 
-                SandboxSpec BuildLlmSandboxSpec(AgentCredential? candidateCredential)
+                (SandboxSpec Spec, AuditReviewDotnetShim DotnetShim) BuildLlmSandboxSpec(AgentCredential? candidateCredential)
                 {
                     var candidateSpec = BuildSandboxSpec(access,
                         includeAgentCredential: candidateCredential,
@@ -8413,14 +8381,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         timingPhase: "audit",
                         flavor: sandboxTarget.Flavor,
                         baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
-                    return ConfigureAuditDotnetShimIfEnabled(candidateSpec with
+                    var dotnetShim = AuditReviewDotnetShim.From(_pipelineTuning.Current, _sandboxes.Name);
+                    var specWithAuditMount = candidateSpec with
                     {
                         Mounts =
                         [
                             .. candidateSpec.Mounts,
                             new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 },
                         ],
-                    });
+                    };
+                    return (dotnetShim.Apply(specWithAuditMount), dotnetShim);
                 }
 
                 async Task<AuditorRunRecord> RunLlmPairOnceAsync(
@@ -8432,7 +8402,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     var candidateCredential = needsCreds
                         ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, trialItem, attemptCt)
                         : null;
-                    var candidateSpec = BuildLlmSandboxSpec(candidateCredential);
+                    var (candidateSpec, dotnetShim) = BuildLlmSandboxSpec(candidateCredential);
                     await using var sandbox = await CreateAuditSandboxWithIdleTimeoutAsync(
                         candidateSpec,
                         pair.Auditor.Name,
@@ -8442,7 +8412,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         pair.Auditor.Name,
                         async (setupSandbox, setupCt) =>
                         {
-                            await InstallAuditDotnetShimIfEnabledAsync(setupSandbox, setupCt);
+                            await dotnetShim.InstallAsync(setupSandbox, setupCt);
                             if (candidateCredential is not null && candidateCredential.Files.Count > 0)
                                 await MaterialiseCredentialFilesAsync(setupSandbox, candidateCredential, setupCt);
                             await RunWithCancellation(
@@ -14396,53 +14366,6 @@ Original merge-phase failure (JSON string, for context only):
             TimingPhase = timingPhase,
             BaselineImageRef = baselineImageRef,
         });
-    }
-
-    private SandboxSpec ConfigureAuditDotnetShimIfEnabled(SandboxSpec spec)
-    {
-        if (!_pipelineTuning.Current.BlockRedundantDotnetBuildTestInAuditSandbox)
-            return spec;
-
-        var environment = new Dictionary<string, string>(spec.Environment, StringComparer.Ordinal);
-        var existingPath = environment.TryGetValue("PATH", out var path) && !string.IsNullOrWhiteSpace(path)
-            ? path
-            : DefaultSandboxPath;
-        environment["PATH"] = existingPath.StartsWith(AuditDotnetShimDirectory + ":", StringComparison.Ordinal)
-            ? existingPath
-            : $"{AuditDotnetShimDirectory}:{existingPath}";
-
-        return spec with
-        {
-            Environment = environment,
-            Mounts =
-            [
-                .. spec.Mounts,
-                new SandboxMount
-                {
-                    SandboxPath = AuditDotnetShimDirectory,
-                    Tmpfs = true,
-                    SizeBytes = AuditDotnetShimTmpfsBytes,
-                },
-            ],
-        };
-    }
-
-    private async Task InstallAuditDotnetShimIfEnabledAsync(ISandbox sandbox, CancellationToken ct)
-    {
-        if (!_pipelineTuning.Current.BlockRedundantDotnetBuildTestInAuditSandbox)
-            return;
-
-        await RunWithCancellation(sandbox, ct, "mkdir", "-p", AuditDotnetShimDirectory);
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", "cat > \"$0\" && chmod 0755 \"$0\"", AuditDotnetShimPath],
-            Stdin = AuditDotnetShimScript,
-        }, ct);
-        if (!write.Success)
-        {
-            throw new InvalidOperationException(
-                $"Failed to install audit dotnet shim at {AuditDotnetShimPath}: {write.Stderr}{write.Stdout}");
-        }
     }
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
