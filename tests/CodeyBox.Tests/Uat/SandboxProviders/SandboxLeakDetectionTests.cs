@@ -218,7 +218,7 @@ public sealed class SandboxLeakDetectionTests
     }
 
     [Fact]
-    public async Task LeakedSandboxEndpoint_RejectsNamesOutsideCodeyboxPrefix()
+    public async Task LeakedSandboxEndpoint_ReturnsNotFoundWhenNameIsAbsentFromLeakSnapshot()
     {
         using var factory = new SandboxProviderApiFactory(
             sandboxProvider: new UatSandboxProvider(),
@@ -227,7 +227,27 @@ public sealed class SandboxLeakDetectionTests
 
         var response = await client.PostAsync("/sandboxes/leaked/primary/dispose", content: null);
 
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task LeakedSandboxEndpoint_DisposesLeakWithCustomRemotePrefix()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new UatSandboxProvider();
+        provider.Add(new ManagedSandboxInfo("primary-remote-leak", OldEnough(threshold), null, false, HostId: "executor-a"));
+        var reaper = BuildReaper(provider, new CapturingWebhookDispatcher(), leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+        using var factory = new SandboxProviderApiFactory(
+            sandboxProvider: provider,
+            reaper: reaper,
+            webhooks: new CapturingWebhookDispatcher());
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsync("/sandboxes/leaked/primary-remote-leak/dispose", content: null);
+
+        response.EnsureSuccessStatusCode();
+        Assert.Equal([("primary-remote-leak", "executor-a")], provider.DisposedManaged);
     }
 
     private static SandboxLeakReaper BuildReaper(

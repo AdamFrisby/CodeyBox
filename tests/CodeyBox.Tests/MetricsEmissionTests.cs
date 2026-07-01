@@ -260,22 +260,38 @@ public sealed class MetricsEmissionTests
     }
 
     [Fact]
-    public void CoordinatorAgentStreamBackpressureWait_Histogram_EmitsWithOutcomeTag()
+    public async Task CoordinatorAgentStreamBackpressureWait_Histogram_EmitsWithOutcomeTag()
     {
+        var dir = Path.Combine(Path.GetTempPath(), $"cb-stream-backpressure-{Guid.NewGuid():N}");
+        var path = Path.Combine(dir, "agent.log");
+        var workerGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var (listener, measurements) = CreateLongListener(
             "CodeyBox.Coordinator",
             "codeybox.coordinator.agent_stream.backpressure.wait_ms",
             "outcome");
         using (listener)
         {
-            CodeyBoxMeters.CoordinatorAgentStreamBackpressureWait.Record(
-                12,
-                new KeyValuePair<string, object?>("phase", "work"),
-                new KeyValuePair<string, object?>("outcome", "ready"));
+            var capture = new AgentStreamCapture(
+                path,
+                maxBytes: 1024 * 1024,
+                phase: "work",
+                NullLogger.Instance,
+                maxQueuedChunks: 1,
+                workerStartGate: workerGate.Task);
+            capture.WriteChunk("first\n");
+            var blockedWrite = Task.Run(() => capture.WriteChunk("second\n"));
+
+            await Task.Delay(50);
+            Assert.False(blockedWrite.IsCompleted);
+            workerGate.SetResult();
+            await blockedWrite.WaitAsync(TimeSpan.FromSeconds(2));
+            await capture.DisposeAsync();
 
             AssertEventuallyContains(measurements, measurement =>
-                measurement.Value == 12L && measurement.TagValue == "ready");
+                measurement.TagValue == "ready");
         }
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
     }
 
     [Fact]

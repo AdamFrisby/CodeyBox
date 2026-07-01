@@ -1,10 +1,13 @@
 using CodeyBox.Sandbox.MultipassRemote;
+using System.Collections.Generic;
 
 namespace CodeyBox.Api;
 
 internal static class MultipassRemoteOptionsMapper
 {
-    public static MultipassRemoteSandboxOptions Map(MultipassRemoteSandboxConfig? cfg)
+    public static MultipassRemoteSandboxOptions Map(
+        MultipassRemoteSandboxConfig? cfg,
+        IReadOnlyDictionary<string, string>? networkProfiles = null)
     {
         cfg ??= new MultipassRemoteSandboxConfig();
         var fromDefaults = new MultipassRemoteSandboxOptions();
@@ -31,6 +34,9 @@ internal static class MultipassRemoteOptionsMapper
             Cordoned = cfg.Cordoned,
             Healthy = cfg.Healthy,
             AllowedNetworkProfiles = cfg.AllowedNetworkProfiles?.ToArray() ?? [],
+            NetworkProfiles = networkProfiles is null
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, string>(networkProfiles, StringComparer.OrdinalIgnoreCase),
             PlacementRecheckIn = cfg.PlacementRecheckIn ?? fromDefaults.PlacementRecheckIn,
             RuntimeUnhealthyBackoff = cfg.RuntimeUnhealthyBackoff ?? fromDefaults.RuntimeUnhealthyBackoff,
             ExecutorHosts = cfg.ExecutorHosts?.Select(h => new MultipassRemoteExecutorHostOptions

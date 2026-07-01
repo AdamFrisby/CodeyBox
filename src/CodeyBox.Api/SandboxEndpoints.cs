@@ -59,10 +59,6 @@ internal static class SandboxEndpoints
         if (string.IsNullOrWhiteSpace(name))
             return Results.BadRequest(new { error = "name is required" });
 
-        // Strict prefix check: only touch VMs we own.
-        if (!name.StartsWith("codeybox-", StringComparison.Ordinal))
-            return Results.BadRequest(new { error = "name must start with 'codeybox-'" });
-
         // Cross-check against the latest leak list so that active sandboxes (those
         // tied to a running work item) cannot be purged via this endpoint.
         var matchingLeaks = reaper.GetLatestLeaks()

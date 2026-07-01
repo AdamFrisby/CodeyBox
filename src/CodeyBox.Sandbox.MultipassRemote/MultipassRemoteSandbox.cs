@@ -20,7 +20,7 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// snapshot is correctly typed and a future suspend implementation slots in
 /// without changing the provider surface.</para>
 /// </summary>
-internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
+internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQualifiedSandbox
 {
     private readonly SandboxSpec _spec;
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;
@@ -30,7 +30,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
     private readonly MultipassRemoteSandboxOptions _opts;
     private readonly ILogger _log;
     private readonly Action<RemoteSshTransportException> _onTransportFailure;
-    private readonly Action<string> _onDispose;
+    private readonly Action<string, string> _onDispose;
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> _activeExecCts = new();
     private readonly SemaphoreSlim _disposeLock = new(1, 1);
     private int _disposed; // 0/1 via Interlocked
@@ -47,7 +47,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         MultipassRemoteSandboxOptions opts,
         ILogger log,
         Action<RemoteSshTransportException> onTransportFailure,
-        Action<string> onDispose)
+        Action<string, string> onDispose)
     {
         Id = vmName;
         HostId = hostId;
@@ -211,6 +211,24 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
     public bool IsOwnedByShutdownHandler { get; private set; }
     public void MarkOwnedByShutdownHandler() => IsOwnedByShutdownHandler = true;
 
+    public async Task SyncStateToHostAsync(CancellationToken ct = default)
+    {
+        if (Volatile.Read(ref _cleanupComplete) != 0)
+            return;
+
+        await _disposeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (Volatile.Read(ref _cleanupComplete) != 0)
+                return;
+            await SyncWritableMountsAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _disposeLock.Release();
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Volatile.Read(ref _cleanupComplete) != 0)
@@ -255,45 +273,17 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
             // 2) Sync writable mounts back to the orchestrator host BEFORE we
             //    delete the staged copy. If this fails, keep the remote staged
             //    data intact and surface infrastructure deferral to the caller.
-            foreach (var mount in _stagedMounts)
-            {
-                if (mount.SyncBackHostPath is not { } hostPath) continue;
-                if (string.IsNullOrWhiteSpace(hostPath)) continue;
-                try
-                {
-                    await _transport.StageOutAsync(mount.RemoteStagedPath, hostPath, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (RemoteSshTransportException ex)
-                {
-                    _onTransportFailure(ex);
-                    _log.LogWarning(ex,
-                        "Sync-back from remote {Remote} to host {Host} failed (transport)",
-                        mount.RemoteStagedPath, hostPath);
-                    throw BuildDisposeDeferred("sync-back", "remote-syncback-failed", ex);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex,
-                        "Sync-back from remote {Remote} to host {Host} failed",
-                        mount.RemoteStagedPath, hostPath);
-                    throw BuildDisposeDeferred("sync-back", "remote-syncback-failed", ex);
-                }
-            }
+            await SyncWritableMountsAsync(CancellationToken.None).ConfigureAwait(false);
 
-            // 3) Delete VM + staging dir. Both exit codes matter: if either
-            //    cleanup step cannot be confirmed, keep the host reservation.
-            await RunCleanupCommandAsync(
-                [opts.RemoteMultipassPath, "delete", "--purge", vmName],
-                "delete",
-                vmName).ConfigureAwait(false);
-            await RunCleanupCommandAsync(
-                ["rm", "-rf", _remoteSandboxRoot],
-                "staging-cleanup",
-                vmName).ConfigureAwait(false);
+            // 3) Delete VM + staging dir. Cleanup failures after sync-back are
+            //    infrastructure hygiene, not a reason to replay completed work.
+            var deleteConfirmed = await TryDeleteVmAsync(opts, vmName).ConfigureAwait(false);
+            if (deleteConfirmed)
+                await TryRemoveRemoteStagingAsync(vmName).ConfigureAwait(false);
 
             SandboxLiveCounter.Decrement();
             Volatile.Write(ref _cleanupComplete, 1);
-            _onDispose(vmName);
+            _onDispose(HostId, vmName);
         }
         finally
         {
@@ -301,28 +291,84 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         }
     }
 
-    private async Task RunCleanupCommandAsync(IReadOnlyList<string> argv, string operation, string vmName)
+    private async Task SyncWritableMountsAsync(CancellationToken ct)
+    {
+        foreach (var mount in _stagedMounts)
+        {
+            if (mount.SyncBackHostPath is not { } hostPath) continue;
+            if (string.IsNullOrWhiteSpace(hostPath)) continue;
+            try
+            {
+                await _transport.StageOutAsync(mount.RemoteStagedPath, hostPath, ct).ConfigureAwait(false);
+            }
+            catch (RemoteSshTransportException ex)
+            {
+                _onTransportFailure(ex);
+                _log.LogWarning(ex,
+                    "Sync-back from remote {Remote} to host {Host} failed (transport)",
+                    mount.RemoteStagedPath, hostPath);
+                throw BuildDisposeDeferred("sync-back", "remote-syncback-failed", ex);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Sync-back from remote {Remote} to host {Host} failed",
+                    mount.RemoteStagedPath, hostPath);
+                throw BuildDisposeDeferred("sync-back", "remote-syncback-failed", ex);
+            }
+        }
+    }
+
+    private async Task<bool> TryDeleteVmAsync(MultipassRemoteSandboxOptions opts, string vmName)
     {
         try
         {
             var result = await _runRemoteMaybeGated(
-                argv,
+                [opts.RemoteMultipassPath, "delete", "--purge", vmName],
                 CancellationToken.None).ConfigureAwait(false);
             if (result.ExitCode == 0)
-                return;
+                return true;
 
             var ex = new RemoteHostProvisioningException(
                 HostId,
-                operation,
-                $"Remote cleanup command '{operation}' for VM '{vmName}' exited {result.ExitCode}: {TruncateForLog(result.Stderr)}");
-            _log.LogWarning(ex, "Remote VM {Vm} cleanup operation {Operation} failed", vmName, operation);
-            throw BuildDisposeDeferred(operation, "remote-cleanup-unconfirmed", ex);
+                "delete",
+                $"Remote cleanup command 'delete' for VM '{vmName}' exited {result.ExitCode}: {TruncateForLog(result.Stderr)}");
+            _log.LogWarning(ex, "Remote VM {Vm} cleanup operation delete failed; leaving it for leak reaper cleanup", vmName);
+            return false;
         }
         catch (RemoteSshTransportException ex)
         {
             _onTransportFailure(ex);
-            _log.LogWarning(ex, "Remote VM {Vm} cleanup operation {Operation} failed (transport)", vmName, operation);
-            throw BuildDisposeDeferred(operation, "remote-host-unreachable", ex);
+            _log.LogWarning(ex, "Remote VM {Vm} cleanup operation delete failed (transport); leaving it for leak reaper cleanup", vmName);
+            return false;
+        }
+    }
+
+    private async Task TryRemoveRemoteStagingAsync(string vmName)
+    {
+        try
+        {
+            var result = await _transport.RunAsync(
+                ["rm", "-rf", _remoteSandboxRoot],
+                stdin: null,
+                ct: CancellationToken.None).ConfigureAwait(false);
+            if (result.ExitCode != 0)
+            {
+                _log.LogWarning(
+                    "Remote VM {Vm} staging cleanup exited {ExitCode}: {Stderr}",
+                    vmName,
+                    result.ExitCode,
+                    TruncateForLog(result.Stderr));
+            }
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            _onTransportFailure(ex);
+            _log.LogWarning(ex, "Remote VM {Vm} staging cleanup failed (transport)", vmName);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Remote VM {Vm} staging cleanup failed", vmName);
         }
     }
 
@@ -337,6 +383,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
             detail: $"host={HostId}; vm={Id}; {inner.Message}",
             recheckIn: _opts.PlacementRecheckIn,
             retainedSandboxName: Id,
+            retainedSandboxHostId: HostId,
             innerException: inner);
 
     private static string QuoteArgvForShell(IReadOnlyList<string> argv)

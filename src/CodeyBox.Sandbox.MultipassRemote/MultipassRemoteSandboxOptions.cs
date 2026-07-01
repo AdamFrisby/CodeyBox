@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace CodeyBox.Sandbox.MultipassRemote;
 
 /// <summary>
@@ -44,6 +46,13 @@ public sealed record MultipassRemoteSandboxOptions
     /// explicit <see cref="CodeyBox.Core.SandboxNetworkPolicy.ProfileName"/>.
     /// </summary>
     public IReadOnlyList<string> AllowedNetworkProfiles { get; init; } = [];
+
+    /// <summary>
+    /// Maps logical sandbox network profile names to bridge interface names on
+    /// each remote executor host. Mirrors local MultipassSandboxOptions.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> NetworkProfiles { get; init; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Multi-host pool. When empty, the legacy top-level SSH fields are treated
@@ -255,6 +264,7 @@ public sealed record MultipassRemoteSandboxOptions
                 Cordoned = host.Cordoned ?? options.Cordoned,
                 Healthy = host.Healthy ?? options.Healthy,
                 AllowedNetworkProfiles = host.AllowedNetworkProfiles ?? options.AllowedNetworkProfiles,
+                NetworkProfiles = options.NetworkProfiles,
                 ExecutorHosts = [],
             });
         }

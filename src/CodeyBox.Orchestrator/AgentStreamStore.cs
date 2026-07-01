@@ -382,6 +382,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
     private readonly string _phase;
     private readonly ILogger _log;
     private readonly Channel<string> _chunks;
+    private readonly Task? _workerStartGate;
     private readonly Task _worker;
     private long _writerDurationMs;
     private long _enqueueDroppedBytes;
@@ -389,14 +390,25 @@ public sealed class AgentStreamCapture : IAsyncDisposable
     private int _writerFailed;
 
     public AgentStreamCapture(string path, long maxBytes, string phase, ILogger log)
+        : this(path, maxBytes, phase, log, MaxQueuedChunks, workerStartGate: null)
+    { }
+
+    internal AgentStreamCapture(
+        string path,
+        long maxBytes,
+        string phase,
+        ILogger log,
+        int maxQueuedChunks,
+        Task? workerStartGate)
     {
         _path = path;
         _maxBytes = maxBytes;
         _directWriteLimitBytes = Math.Max(0, maxBytes - TruncationMarkerReserveBytes);
         _phase = phase;
         _log = log;
+        _workerStartGate = workerStartGate;
         _chunks = Channel.CreateBounded<string>(
-            new BoundedChannelOptions(MaxQueuedChunks)
+            new BoundedChannelOptions(maxQueuedChunks)
             {
                 SingleReader = true,
                 SingleWriter = false,
@@ -547,6 +559,9 @@ public sealed class AgentStreamCapture : IAsyncDisposable
 
     private async Task ProcessAsync()
     {
+        if (_workerStartGate is not null)
+            await _workerStartGate.ConfigureAwait(false);
+
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(_path)!);
         await using var file = new FileStream(
             _path, FileMode.Append, FileAccess.Write, FileShare.Read, 64 * 1024, FileOptions.Asynchronous);

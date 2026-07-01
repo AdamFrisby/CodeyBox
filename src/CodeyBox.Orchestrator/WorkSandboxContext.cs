@@ -227,6 +227,11 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             return _inner.ExecAsync(exec, ct);
         }
 
+        public Task SyncStateToHostAsync(CancellationToken ct = default)
+        {
+            return _inner.SyncStateToHostAsync(ct);
+        }
+
         public Task KillActiveExecsAsync(CancellationToken ct = default)
         {
             return _inner.KillActiveExecsAsync(ct);

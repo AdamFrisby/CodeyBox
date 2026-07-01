@@ -5427,6 +5427,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
             }
 
+            await sandbox.SyncStateToHostAsync(ct);
+
             // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
             if (isInitial && suggestionsJson is not null)
                 await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);

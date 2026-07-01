@@ -15,6 +15,7 @@ public sealed class SandboxProvisioningDeferredException : Exception
         string detail,
         TimeSpan recheckIn,
         string? retainedSandboxName = null,
+        string? retainedSandboxHostId = null,
         Exception? innerException = null)
         : base(BuildMessage(provider, operation, errorClass, detail), innerException)
     {
@@ -24,6 +25,7 @@ public sealed class SandboxProvisioningDeferredException : Exception
         Detail = detail;
         RecheckIn = recheckIn;
         RetainedSandboxName = retainedSandboxName;
+        RetainedSandboxHostId = retainedSandboxHostId;
     }
 
     public string Provider { get; }
@@ -32,6 +34,7 @@ public sealed class SandboxProvisioningDeferredException : Exception
     public string Detail { get; }
     public TimeSpan RecheckIn { get; }
     public string? RetainedSandboxName { get; }
+    public string? RetainedSandboxHostId { get; }
 
     private static string BuildMessage(string provider, string operation, string errorClass, string detail)
     {

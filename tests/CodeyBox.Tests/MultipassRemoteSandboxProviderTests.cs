@@ -107,6 +107,37 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_attaches_configured_network_profile_bridge()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "cb-claude",
+            },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await using var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Network = new SandboxNetworkPolicy { ProfileName = "claude" },
+        });
+
+        var launch = Assert.Single(transport.RecordedCalls, c => c.Argv.Contains("launch"));
+        var networkIndex = launch.Argv.ToList().IndexOf("--network");
+        Assert.True(networkIndex >= 0);
+        Assert.Equal("name=cb-claude,mode=auto", launch.Argv[networkIndex + 1]);
+    }
+
+    [Fact]
     public async Task ExecAsync_streams_stdout_chunks_to_callback_in_order()
     {
         var opts = DefaultOptions();
@@ -226,10 +257,9 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+        var ex = await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
             await provider.CreateAsync(new SandboxSpec { ImageReference = "bogus" }));
-        Assert.Equal("placement", ex.Operation);
-        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
+        Assert.Equal("launch", ex.Operation);
 
         // Cleanup must have tried to delete the would-be VM.
         Assert.Contains(transport.RecordedCalls, c =>
@@ -485,6 +515,38 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task ListAllManagedAsync_reads_created_at_from_remote_staging_metadata()
+    {
+        var opts = DefaultOptions();
+        var createdAt = DateTimeOffset.Parse("2026-06-20T10:15:30.0000000+00:00");
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "list"))
+            {
+                return new ProcessRunResult(
+                    0,
+                    """{"list":[{"name":"codeybox-r-created","state":"Running"}]}""",
+                    "");
+            }
+            if (argv.Count >= 3
+                && argv[0] == "sh"
+                && argv[1] == "-c"
+                && argv[2].Contains(".codeybox-created-at", StringComparison.Ordinal))
+            {
+                return new ProcessRunResult(0, $"codeybox-r-created\t{createdAt:O}\n", "");
+            }
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var info = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Equal(createdAt, info.CreatedAt);
+    }
+
+    [Fact]
     public async Task DisposeAsync_attempts_stop_then_delete_and_syncback_for_writable_mounts()
     {
         var opts = DefaultOptions();
@@ -518,6 +580,42 @@ public sealed class MultipassRemoteSandboxProviderTests
             Assert.Contains(transport.RecordedCalls, c => c.Argv.Contains("stop"));
             Assert.Contains(transport.RecordedCalls, c => c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
             Assert.Contains(transport.StageOutCalls, c => c.HostPath == hostTemp);
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task SyncStateToHostAsync_stages_writable_mount_without_deleting_vm()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var provider = new MultipassRemoteSandboxProvider(
+                opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+            var sb = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+
+            await sb.SyncStateToHostAsync(CancellationToken.None);
+
+            Assert.Contains(transport.StageOutCalls, c => c.HostPath == hostTemp);
+            Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("delete"));
+
+            await sb.DisposeAsync();
         }
         finally
         {
@@ -612,12 +710,9 @@ public sealed class MultipassRemoteSandboxProviderTests
         var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
         failDelete = true;
 
-        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
-            await sb.DisposeAsync());
+        await sb.DisposeAsync();
 
-        Assert.Equal("delete", ex.Operation);
-        Assert.Equal("remote-cleanup-unconfirmed", ex.ErrorClass);
-        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
     }
 
     [Fact]
@@ -639,12 +734,9 @@ public sealed class MultipassRemoteSandboxProviderTests
         var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
         failCleanup = true;
 
-        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
-            await sb.DisposeAsync());
+        await sb.DisposeAsync();
 
-        Assert.Equal("staging-cleanup", ex.Operation);
-        Assert.Equal("remote-cleanup-unconfirmed", ex.ErrorClass);
-        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
     }
 
     [Fact]
@@ -666,12 +758,9 @@ public sealed class MultipassRemoteSandboxProviderTests
         var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
         failCleanup = true;
 
-        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
-            await sb.DisposeAsync());
+        await sb.DisposeAsync();
 
-        Assert.Equal("staging-cleanup", ex.Operation);
-        Assert.Equal("remote-host-unreachable", ex.ErrorClass);
-        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
     }
 
     [Fact]

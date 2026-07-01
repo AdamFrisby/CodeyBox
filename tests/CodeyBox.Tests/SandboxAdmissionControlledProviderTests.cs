@@ -684,6 +684,33 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task Wrap_ActiveHostPoolProvider_PreservesBothCapabilities()
+    {
+        var rows = new[]
+        {
+            new SandboxHostPoolEntry(
+                HostId: "host-a",
+                Capacity: 3,
+                Reserved: 1,
+                Cordoned: false,
+                ConfiguredHealthy: true,
+                RuntimeHealthy: true,
+                RuntimeUnhealthyReason: null,
+                RuntimeUnhealthyUntil: null,
+                AllowedNetworkProfiles: ["work"]),
+        };
+        var inner = new ActiveHostPoolOnlyProvider(rows);
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var active = Assert.IsAssignableFrom<IActiveSandboxProvider>(provider);
+        var hostPool = Assert.IsAssignableFrom<ISandboxHostPoolSnapshot>(provider);
+
+        await using var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None);
+
+        Assert.Single(active.SnapshotActiveSandboxes());
+        Assert.Equal(rows, hostPool.SnapshotHostPool());
+    }
+
+    [Fact]
     public async Task Wrap_SuspendingOnlyProvider_PreservesSuspendingCapability()
     {
         var inner = new SuspendingOnlyProvider();
@@ -1087,6 +1114,15 @@ public sealed class SandboxAdmissionControlledProviderTests
     {
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
         [];
+    }
+
+    private sealed class ActiveHostPoolOnlyProvider(IReadOnlyList<SandboxHostPoolEntry> rows)
+        : PlainCountingProvider, IActiveSandboxProvider, ISandboxHostPoolSnapshot
+    {
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
+        [];
+
+        public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() => rows;
     }
 
     private sealed class HostPoolOnlyProvider(IReadOnlyList<SandboxHostPoolEntry> rows)

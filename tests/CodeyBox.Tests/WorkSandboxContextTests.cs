@@ -39,6 +39,28 @@ public sealed class WorkSandboxContextTests
     }
 
     [Fact]
+    public async Task ReusableSandbox_ForwardsSyncStateToHost()
+    {
+        var innerSandbox = new RecordingSandbox(
+            SandboxAgentOutputTransportKind.ExecPipe,
+            SandboxBatchLaunchMode.Attached);
+        var provider = new SingleSandboxProvider(innerSandbox);
+        await using var context = new WorkSandboxContext(
+            provider,
+            new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = true }),
+            NullLogger.Instance);
+        await using var wrapped = await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        }, CancellationToken.None);
+
+        await wrapped.SyncStateToHostAsync(CancellationToken.None);
+
+        Assert.Equal(1, innerSandbox.SyncCalls);
+    }
+
+    [Fact]
     public async Task DisposeAsync_PropagatesSandboxProvisioningDeferralFromReusableSandbox()
     {
         var deferred = new SandboxProvisioningDeferredException(
@@ -209,6 +231,7 @@ public sealed class WorkSandboxContextTests
         public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; } = transportKind;
         public SandboxBatchLaunchMode BatchLaunchMode { get; } = batchLaunchMode;
         public List<SandboxExec> Execs { get; } = [];
+        public int SyncCalls { get; private set; }
         public bool Disposed { get; private set; }
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
@@ -223,6 +246,12 @@ public sealed class WorkSandboxContextTests
             }
 
             return Task.FromResult(new SandboxExecResult(0, "assistant text", ""));
+        }
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default)
+        {
+            SyncCalls++;
+            return Task.CompletedTask;
         }
 
         public ValueTask DisposeAsync()

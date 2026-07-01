@@ -451,7 +451,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         inner.Name,
         orchestratorOptions.MaxConcurrentSandboxes);
     if (inner is ISandboxHostPoolSnapshot hostPool)
-        LogRemoteHostPoolCapacity(hostPool, orchestratorOptions, startupLog);
+        RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
     return SandboxAdmissionControlledProvider.Wrap(
         inner,
         orchestratorOptions.MaxConcurrentSandboxes,
@@ -669,50 +669,6 @@ static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILogge
     return BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
 }
 
-static void LogRemoteHostPoolCapacity(
-    ISandboxHostPoolSnapshot hostPool,
-    OrchestratorOptions orchestratorOptions,
-    ILogger startupLog)
-{
-    var rows = hostPool.SnapshotHostPool();
-    if (rows.Count == 0)
-        return;
-
-    var unbounded = rows.Any(r => r.Capacity == int.MaxValue);
-    long total = 0;
-    if (!unbounded)
-    {
-        foreach (var row in rows)
-            total += row.Capacity;
-    }
-
-    var renderedTotal = unbounded ? "unbounded" : total.ToString(System.Globalization.CultureInfo.InvariantCulture);
-    var hostSummary = string.Join(", ", rows.Select(r =>
-        $"{r.HostId}={FormatHostCapacity(r.Capacity)}" +
-        (r.Cordoned ? ":cordoned" : "") +
-        (!r.ConfiguredHealthy ? ":unhealthy" : "")));
-    startupLog.LogInformation(
-        "Remote sandbox host pool: hosts={HostCount}, configuredCapacity={Capacity}, hosts=[{Hosts}]",
-        rows.Count,
-        renderedTotal,
-        hostSummary);
-
-    var globalCap = Math.Min(orchestratorOptions.MaxConcurrentWorkers, orchestratorOptions.MaxConcurrentSandboxes);
-    if (unbounded || total > globalCap)
-    {
-        startupLog.LogWarning(
-            "Remote sandbox host capacity ({HostCapacity}) exceeds global fan-out cap {GlobalCap} " +
-            "(min(MaxConcurrentWorkers={MaxWorkers}, MaxConcurrentSandboxes={MaxSandboxes})); excess host capacity will not be used until the global cap is raised",
-            renderedTotal,
-            globalCap,
-            orchestratorOptions.MaxConcurrentWorkers,
-            orchestratorOptions.MaxConcurrentSandboxes);
-    }
-
-    static string FormatHostCapacity(int capacity) =>
-        capacity == int.MaxValue ? "unbounded" : capacity.ToString(System.Globalization.CultureInfo.InvariantCulture);
-}
-
 static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
 {
     if (!env.IsDevelopment() && !opts.DangerouslyAllowProcessSandbox)
@@ -857,7 +813,7 @@ static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
         Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
     {
         var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
-        return MultipassRemoteOptionsMapper.Map(configSelector(live));
+        return MultipassRemoteOptionsMapper.Map(configSelector(live), live.SandboxNetworkProfiles);
     }
 }
 

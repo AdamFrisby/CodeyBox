@@ -26,7 +26,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     private readonly NamedAdmissionTracker? _resumeAdmissions;
     private readonly NamedAdmissionTracker _disposedSandboxAdmissions = new();
     private readonly NamedAdmissionTracker _disposedBaselineAdmissions = new();
-    private readonly ConcurrentDictionary<string, AdmissionControlledSandbox> _preservedLiveSandboxes = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<SandboxAdmissionIdentity, AdmissionControlledSandbox> _preservedLiveSandboxes = new();
     private readonly ISuspendingSandboxProvider? _suspendingProvider;
     private readonly IDiskGuardedSandboxProvider? _diskGuardedProvider;
     private readonly IBaselineImageResolver? _baselineResolver;
@@ -154,27 +154,28 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
         var managed = await _inner.ListAllManagedAsync(ct).ConfigureAwait(false);
-        var managedNames = managed.Select(static info => info.Name).ToArray();
-        _resumeAdmissions?.ReleaseMissing(managedNames);
-        _disposedSandboxAdmissions.ReleaseMissing(managedNames);
-        ReleaseMissingPreservedLiveSandboxes(managedNames);
+        var managedIds = managed.Select(SandboxAdmissionIdentity.FromManaged).ToArray();
+        _resumeAdmissions?.ReleaseMissing(managedIds);
+        _disposedSandboxAdmissions.ReleaseMissing(managedIds);
+        ReleaseMissingPreservedLiveSandboxes(managedIds);
         return managed;
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
         await _inner.DisposeLeakedAsync(name, ct).ConfigureAwait(false);
-        _preservedLiveSandboxes.TryRemove(name, out _);
-        _resumeAdmissions?.Release(name);
-        _disposedSandboxAdmissions.Release(name);
+        ReleasePreservedLiveSandboxesByName(name);
+        _resumeAdmissions?.ReleaseName(name);
+        _disposedSandboxAdmissions.ReleaseName(name);
     }
 
     public async Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
     {
         await _inner.DisposeLeakedAsync(sandbox, ct).ConfigureAwait(false);
-        _preservedLiveSandboxes.TryRemove(sandbox.Name, out _);
-        _resumeAdmissions?.Release(sandbox.Name);
-        _disposedSandboxAdmissions.Release(sandbox.Name);
+        var identity = SandboxAdmissionIdentity.FromManaged(sandbox);
+        _preservedLiveSandboxes.TryRemove(identity, out _);
+        _resumeAdmissions?.Release(identity);
+        _disposedSandboxAdmissions.Release(identity);
     }
 
     public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
@@ -193,17 +194,18 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var resumeAdmissions = _resumeAdmissions
             ?? throw new NotSupportedException("The wrapped sandbox provider does not track resume admission.");
 
-        resumeAdmissions.Begin(name);
+        var identity = SandboxAdmissionIdentity.FromName(name);
+        resumeAdmissions.Begin(identity);
         SandboxAdmissionLease? lease = null;
         var retained = false;
         try
         {
             lease = await _gate.AcquireAsync(ct).ConfigureAwait(false);
             await suspendingProvider.ResumeSandboxAsync(name, ct).ConfigureAwait(false);
-            if (TryAdoptResumeAdmission(name, lease))
-                resumeAdmissions.CancelPending(name);
+            if (TryAdoptResumeAdmission(identity, lease))
+                resumeAdmissions.CancelPending(identity);
             else
-                resumeAdmissions.Retain(name, lease);
+                resumeAdmissions.Retain(identity, lease);
             retained = true;
         }
         finally
@@ -211,7 +213,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             if (!retained)
             {
                 lease?.Dispose();
-                resumeAdmissions.CancelPending(name);
+                resumeAdmissions.CancelPending(identity);
             }
         }
     }
@@ -268,7 +270,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var baselineResolver = _baselineResolver
             ?? throw new NotSupportedException("The wrapped sandbox provider does not resolve baseline images.");
         var baselines = await baselineResolver.ListBaselineImagesAsync(ct).ConfigureAwait(false);
-        _disposedBaselineAdmissions.ReleaseMissing(baselines.Select(static info => info.Name));
+        _disposedBaselineAdmissions.ReleaseMissing(baselines.Select(static info => SandboxAdmissionIdentity.FromName(info.Name)));
         return baselines;
     }
 
@@ -277,7 +279,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var baselineResolver = _baselineResolver
             ?? throw new NotSupportedException("The wrapped sandbox provider does not resolve baseline images.");
         await baselineResolver.DisposeBaselineImageAsync(name, ct).ConfigureAwait(false);
-        _disposedBaselineAdmissions.Release(name);
+        _disposedBaselineAdmissions.Release(SandboxAdmissionIdentity.FromName(name));
     }
 
     public async Task<string?> EnsureBaselineImageAsync(
@@ -306,7 +308,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
                 ex,
                 "Retaining sandbox admission token after baseline bake failure because baseline {BaselineName} may still exist",
                 ex.RetainedSandboxName);
-            _disposedBaselineAdmissions.Retain(ex.RetainedSandboxName!, lease);
+            _disposedBaselineAdmissions.Retain(SandboxAdmissionIdentity.FromException(ex), lease);
             releaseLease = false;
             throw;
         }
@@ -348,14 +350,15 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         bool admissionHeld)
     {
         _active?.Remove(sandbox);
-        _preservedLiveSandboxes.TryRemove(sandbox.Id, out _);
-        _resumeAdmissions?.Release(sandbox.Id);
+        var identity = SandboxAdmissionIdentity.FromSandbox(sandbox);
+        _preservedLiveSandboxes.TryRemove(identity, out _);
+        _resumeAdmissions?.Release(identity);
         if (!admissionHeld)
             return;
 
         var releaseAdmission = false;
         if (innerDisposeSucceeded)
-            releaseAdmission = !await IsManagedSandboxStillPresentAsync(sandbox.Id).ConfigureAwait(false);
+            releaseAdmission = !await IsManagedSandboxStillPresentAsync(identity).ConfigureAwait(false);
 
         if (releaseAdmission)
             lease.Dispose();
@@ -367,50 +370,60 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
                     "Retaining sandbox admission token after dispose for sandbox {SandboxId} because provider inventory still lists it or could not prove it absent",
                     sandbox.Id);
             }
-            _disposedSandboxAdmissions.Retain(sandbox.Id, lease);
+            _disposedSandboxAdmissions.Retain(identity, lease);
         }
     }
 
     private void OnSandboxPreserved(AdmissionControlledSandbox sandbox)
     {
-        _preservedLiveSandboxes[sandbox.Id] = sandbox;
-        _resumeAdmissions?.Release(sandbox.Id);
+        var identity = SandboxAdmissionIdentity.FromSandbox(sandbox);
+        _preservedLiveSandboxes[identity] = sandbox;
+        _resumeAdmissions?.Release(identity);
     }
 
-    private void ReleaseMissingPreservedLiveSandboxes(IReadOnlyCollection<string> managedNames)
+    private void ReleasePreservedLiveSandboxesByName(string name)
+    {
+        foreach (var key in _preservedLiveSandboxes.Keys)
+        {
+            if (string.Equals(key.Name, name, StringComparison.Ordinal))
+                _preservedLiveSandboxes.TryRemove(key, out _);
+        }
+    }
+
+    private void ReleaseMissingPreservedLiveSandboxes(IReadOnlyCollection<SandboxAdmissionIdentity> managedIds)
     {
         if (_preservedLiveSandboxes.IsEmpty)
             return;
 
-        var present = new HashSet<string>(managedNames, StringComparer.Ordinal);
-        foreach (var name in _preservedLiveSandboxes.Keys)
+        var present = managedIds.ToHashSet();
+        foreach (var identity in _preservedLiveSandboxes.Keys)
         {
-            if (!present.Contains(name))
-                _preservedLiveSandboxes.TryRemove(name, out _);
+            if (!present.Contains(identity))
+                _preservedLiveSandboxes.TryRemove(identity, out _);
         }
     }
 
-    private bool TryAdoptResumeAdmission(string name, SandboxAdmissionLease lease)
+    private bool TryAdoptResumeAdmission(SandboxAdmissionIdentity identity, SandboxAdmissionLease lease)
     {
-        if (!_preservedLiveSandboxes.TryRemove(name, out var sandbox))
+        if (!_preservedLiveSandboxes.TryRemove(identity, out var sandbox))
             return false;
 
         return sandbox.TryAdoptAdmissionLease(lease);
     }
 
-    private async Task<bool> IsManagedSandboxStillPresentAsync(string name)
+    private async Task<bool> IsManagedSandboxStillPresentAsync(SandboxAdmissionIdentity identity)
     {
         try
         {
             var managed = await _inner.ListAllManagedAsync(CancellationToken.None).ConfigureAwait(false);
-            return managed.Any(info => string.Equals(info.Name, name, StringComparison.Ordinal));
+            return managed.Any(info => SandboxAdmissionIdentity.FromManaged(info) == identity);
         }
         catch (Exception ex)
         {
             _log.LogWarning(
                 ex,
                 "Could not verify whether sandbox {SandboxId} still exists; retaining sandbox admission token",
-                name);
+                identity.Name);
             return true;
         }
     }
@@ -421,15 +434,38 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     {
         if (IsRetainedBaselineProvisioning(ex) && _baselineResolver is not null)
         {
-            _disposedBaselineAdmissions.Retain(ex.RetainedSandboxName!, lease);
+            _disposedBaselineAdmissions.Retain(SandboxAdmissionIdentity.FromException(ex), lease);
             return;
         }
 
-        _disposedSandboxAdmissions.Retain(ex.RetainedSandboxName!, lease);
+        _disposedSandboxAdmissions.Retain(SandboxAdmissionIdentity.FromException(ex), lease);
     }
 
     private static bool IsRetainedBaselineProvisioning(SandboxProvisioningDeferredException ex) =>
         ex.Operation.StartsWith("baseline-", StringComparison.Ordinal);
+
+    private readonly record struct SandboxAdmissionIdentity(string Name, string? HostId)
+    {
+        public static SandboxAdmissionIdentity FromName(string name) =>
+            new(name, HostId: null);
+
+        public static SandboxAdmissionIdentity FromManaged(ManagedSandboxInfo info) =>
+            new(info.Name, NormalizeHostId(info.HostId));
+
+        public static SandboxAdmissionIdentity FromException(SandboxProvisioningDeferredException ex) =>
+            new(ex.RetainedSandboxName!, NormalizeHostId(ex.RetainedSandboxHostId));
+
+        public static SandboxAdmissionIdentity FromSandbox(ISandbox sandbox)
+        {
+            var hostId = sandbox is IHostQualifiedSandbox hostQualified
+                ? hostQualified.HostId
+                : null;
+            return new SandboxAdmissionIdentity(sandbox.Id, NormalizeHostId(hostId));
+        }
+
+        private static string? NormalizeHostId(string? hostId) =>
+            string.IsNullOrWhiteSpace(hostId) ? null : hostId;
+    }
 
     [Flags]
     private enum ProviderCapabilities
@@ -586,7 +622,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     private sealed class ActiveSandboxTracker
     {
-        private readonly ConcurrentDictionary<string, (WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> _active = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<SandboxAdmissionIdentity, (WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> _active = new();
 
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> Snapshot() =>
             _active.Values.ToList();
@@ -596,55 +632,55 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             if (spec.TimingWorkItemId is not { } workItemId
                 || sandbox is not IShutdownTeardownSandbox teardown)
                 return;
-            _active[sandbox.Id] = (workItemId, teardown);
+            _active[SandboxAdmissionIdentity.FromSandbox(sandbox)] = (workItemId, teardown);
         }
 
         public void Remove(ISandbox sandbox)
         {
-            _active.TryRemove(sandbox.Id, out _);
+            _active.TryRemove(SandboxAdmissionIdentity.FromSandbox(sandbox), out _);
         }
     }
 
     private sealed class NamedAdmissionTracker
     {
         private readonly object _sync = new();
-        private readonly Dictionary<string, SandboxAdmissionLease> _leases = new(StringComparer.Ordinal);
-        private readonly HashSet<string> _pending = new(StringComparer.Ordinal);
-        private readonly HashSet<string> _releaseRequested = new(StringComparer.Ordinal);
+        private readonly Dictionary<SandboxAdmissionIdentity, SandboxAdmissionLease> _leases = new();
+        private readonly HashSet<SandboxAdmissionIdentity> _pending = new();
+        private readonly HashSet<SandboxAdmissionIdentity> _releaseRequested = new();
 
-        public void Begin(string name)
+        public void Begin(SandboxAdmissionIdentity identity)
         {
             lock (_sync)
             {
-                _pending.Add(name);
+                _pending.Add(identity);
             }
         }
 
-        public void CancelPending(string name)
+        public void CancelPending(SandboxAdmissionIdentity identity)
         {
             lock (_sync)
             {
-                _pending.Remove(name);
-                _releaseRequested.Remove(name);
+                _pending.Remove(identity);
+                _releaseRequested.Remove(identity);
             }
         }
 
-        public void Retain(string name, SandboxAdmissionLease lease)
+        public void Retain(SandboxAdmissionIdentity identity, SandboxAdmissionLease lease)
         {
             SandboxAdmissionLease? prior = null;
             var releaseNow = false;
             lock (_sync)
             {
-                _pending.Remove(name);
-                if (_releaseRequested.Remove(name))
+                _pending.Remove(identity);
+                if (_releaseRequested.Remove(identity))
                 {
                     releaseNow = true;
                 }
                 else
                 {
-                    if (_leases.Remove(name, out var existing))
+                    if (_leases.Remove(identity, out var existing))
                         prior = existing;
-                    _leases[name] = lease;
+                    _leases[identity] = lease;
                 }
             }
             prior?.Dispose();
@@ -652,34 +688,60 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
                 lease.Dispose();
         }
 
-        public void Release(string name)
+        public void Release(SandboxAdmissionIdentity identity)
         {
             SandboxAdmissionLease? lease = null;
             lock (_sync)
             {
-                if (_leases.Remove(name, out var existing))
+                if (_leases.Remove(identity, out var existing))
                     lease = existing;
-                else if (_pending.Contains(name))
-                    _releaseRequested.Add(name);
+                else if (_pending.Contains(identity))
+                    _releaseRequested.Add(identity);
             }
             lease?.Dispose();
         }
 
-        public void ReleaseMissing(IEnumerable<string> managedNames)
+        public void ReleaseName(string name)
         {
-            HashSet<string>? present = null;
+            List<SandboxAdmissionLease>? leases = null;
+            lock (_sync)
+            {
+                foreach (var (identity, lease) in _leases.ToArray())
+                {
+                    if (!string.Equals(identity.Name, name, StringComparison.Ordinal))
+                        continue;
+                    _leases.Remove(identity);
+                    (leases ??= []).Add(lease);
+                }
+
+                foreach (var identity in _pending.ToArray())
+                {
+                    if (string.Equals(identity.Name, name, StringComparison.Ordinal))
+                        _releaseRequested.Add(identity);
+                }
+            }
+
+            if (leases is null)
+                return;
+            foreach (var lease in leases)
+                lease.Dispose();
+        }
+
+        public void ReleaseMissing(IEnumerable<SandboxAdmissionIdentity> managedIds)
+        {
+            HashSet<SandboxAdmissionIdentity>? present = null;
             List<SandboxAdmissionLease>? toRelease = null;
             lock (_sync)
             {
                 if (_leases.Count == 0)
                     return;
 
-                present = new HashSet<string>(managedNames, StringComparer.Ordinal);
-                foreach (var (name, lease) in _leases.ToArray())
+                present = managedIds.ToHashSet();
+                foreach (var (identity, lease) in _leases.ToArray())
                 {
-                    if (present.Contains(name))
+                    if (present.Contains(identity))
                         continue;
-                    _leases.Remove(name);
+                    _leases.Remove(identity);
                     (toRelease ??= []).Add(lease);
                 }
             }
@@ -819,7 +881,7 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox, ISandboxDecorator
+internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, ISandboxDecorator
 {
     private readonly ISandbox _inner;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
@@ -849,9 +911,11 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
         _onDisposed = onDisposed;
         _onPreserved = onPreserved;
         _log = log;
+        HostId = (inner as IHostQualifiedSandbox)?.HostId ?? "";
     }
 
     public string Id => _inner.Id;
+    public string HostId { get; }
     public ISandbox InnerSandbox => _inner;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
@@ -859,6 +923,9 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
         _inner.ExecAsync(exec, ct);
+
+    public Task SyncStateToHostAsync(CancellationToken ct = default) =>
+        _inner.SyncStateToHostAsync(ct);
 
     public Task KillActiveExecsAsync(CancellationToken ct = default) =>
         _inner.KillActiveExecsAsync(ct);

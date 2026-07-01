@@ -285,7 +285,7 @@ public sealed class MultipassRemoteHostPoolTests
         transports["a"].LaunchExitCode = 1;
         var provider = Provider(() => opts, transports);
 
-        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+        await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
             await provider.CreateAsync(Spec()));
 
         Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
@@ -338,7 +338,7 @@ public sealed class MultipassRemoteHostPoolTests
         transports["a"].InfoStderr = "instance not found";
         var provider = Provider(() => opts, transports);
 
-        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+        await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
             await provider.CreateAsync(Spec()));
 
         Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
@@ -355,7 +355,7 @@ public sealed class MultipassRemoteHostPoolTests
         transports["a"].LaunchExitCode = 1;
         var provider = Provider(() => opts, transports);
 
-        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+        await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
             await provider.CreateAsync(Spec()));
 
         var host = Assert.Single(provider.SnapshotHostPool());
@@ -450,6 +450,26 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task ListAllManagedAsync_tracks_active_sandboxes_by_host_and_name()
+    {
+        var opts = Options(
+            Host("a", cap: 1),
+            Host("b", cap: 1));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+
+        await using var sandbox = await provider.CreateAsync(Spec());
+        var vmName = sandbox.Id;
+        transports["a"].ManagedNames.Add(vmName);
+        transports["b"].ManagedNames.Add(vmName);
+
+        var infos = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.True(Assert.Single(infos, i => i.HostId == "a").IsTrackedActive);
+        Assert.False(Assert.Single(infos, i => i.HostId == "b").IsTrackedActive);
+    }
+
+    [Fact]
     public async Task DisposeLeakedAsync_refuses_managed_host_prefix_mismatch()
     {
         var opts = Options(Host("a", cap: 1, vmNamePrefix: "codeybox-a-"));
@@ -540,6 +560,11 @@ public sealed class MultipassRemoteHostPoolTests
         RemoteStagingRoot = "/remote/staging",
         PlacementRecheckIn = TimeSpan.FromMilliseconds(10),
         RuntimeUnhealthyBackoff = runtimeUnhealthyBackoff,
+        NetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["work"] = "cb-work",
+            ["audit"] = "cb-audit",
+        },
         ExecutorHosts = hosts,
     };
 

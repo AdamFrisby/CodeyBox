@@ -179,6 +179,13 @@ public interface ISandbox : IAsyncDisposable
     Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
 
     /// <summary>
+    /// Flushes provider-specific mutable sandbox state back to the orchestrator
+    /// host without tearing the sandbox down. Providers with remote staging use
+    /// this to make writes visible before later host-side pipeline phases run.
+    /// </summary>
+    Task SyncStateToHostAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    /// <summary>
     /// Best-effort termination for commands currently running through
     /// <see cref="ExecAsync"/>. Used by watchdog paths that must make progress
     /// even when the command ignores cancellation. Providers with real process
@@ -234,6 +241,14 @@ public sealed record SandboxResourceMetrics(
         : null;
 }
 
+/// <summary>
+/// Optional identity extension for sandboxes whose <see cref="ISandbox.Id"/> is
+/// only unique within one executor host.
+/// </summary>
+public interface IHostQualifiedSandbox
+{
+    string HostId { get; }
+}
 
 /// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider
