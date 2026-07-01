@@ -582,19 +582,24 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             queueController: controller);
 
         await svc.StartAsync(CancellationToken.None);
-        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+        // Positive event-driven waits below use StarvationBackstopTimeout: they
+        // are deterministic signals (TaskCompletionSource-backed) that can be
+        // correct-but-slow under the 6-core capped full suite on a co-resident
+        // host, so the timeout is headroom only. The negative suppression check
+        // stays on the short NoDispatchQuietPeriod (a bug would surface fast).
+        await queue.WaitForFirstDequeueAsync(StarvationBackstopTimeout);
 
         var item = MakeItem(createdAt: DateTimeOffset.UtcNow);
         await _store.CreateAsync(item);
         await queue.EnqueueAsync(item.Id);
 
-        await pauseIssued.Task.WaitAsync(DispatchWaitTimeout);
+        await pauseIssued.Task.WaitAsync(StarvationBackstopTimeout);
         Assert.Equal(QueueState.Paused, controller.State);
         Assert.False(
             await pipeline.WaitForEnteredAsync(item.Id, NoDispatchQuietPeriod),
             "The worker must not enter the pipeline when the queue paused between spawn and pipeline start.");
         Assert.True(
-            await WaitUntilAsync(() => !svc.IsActiveForTest(item.Id), DispatchWaitTimeout),
+            await WaitUntilAsync(() => !svc.IsActiveForTest(item.Id), StarvationBackstopTimeout),
             "The skipped worker's finally block must release the slot and reservation.");
 
         var stored = await _store.GetAsync(item.Id);
@@ -602,10 +607,10 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         await controller.ResumeAsync();
         Assert.True(
-            await pipeline.WaitForEnteredAsync(item.Id, DispatchWaitTimeout),
+            await pipeline.WaitForEnteredAsync(item.Id, StarvationBackstopTimeout),
             "After resume the item must dispatch normally.");
         pipeline.Release(item.Id);
-        Assert.True(await pipeline.WaitForDoneAsync(item.Id, DispatchWaitTimeout));
+        Assert.True(await pipeline.WaitForDoneAsync(item.Id, StarvationBackstopTimeout));
         await svc.StopAsync(CancellationToken.None);
     }
 

@@ -72,15 +72,18 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
         try
         {
             // Wait for the pipeline to be invoked the first time so we know
-            // the disk-defer handler has run.
-            var firstCallDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            // the disk-defer handler has run. Deadlines here are backstops for a
+            // deterministic-but-starved event (the 20ms poll observes state that
+            // WILL be reached); 60s gives headroom under the 6-core capped full
+            // suite on a co-resident host without weakening any assertion.
+            var firstCallDeadline = DateTimeOffset.UtcNow.AddSeconds(60);
             while (pipeline.CallCount == 0 && DateTimeOffset.UtcNow < firstCallDeadline)
                 await Task.Delay(20);
 
             Assert.True(pipeline.CallCount >= 1, "pipeline should have been invoked at least once");
 
             // Wait briefly for the async webhook publish + audit emit + schedule.
-            var webhookDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            var webhookDeadline = DateTimeOffset.UtcNow.AddSeconds(60);
             while (webhooks.Events.Count == 0 && DateTimeOffset.UtcNow < webhookDeadline)
                 await Task.Delay(20);
 
@@ -109,7 +112,7 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
             // Recheck-and-requeue: ScheduleDeferredRequeue uses Task.Delay(recheckIn),
             // after which the item is enqueued again. Observe by waiting for the
             // pipeline to be invoked a second time.
-            var requeueDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            var requeueDeadline = DateTimeOffset.UtcNow.AddSeconds(60);
             while (pipeline.CallCount < 2 && DateTimeOffset.UtcNow < requeueDeadline)
                 await Task.Delay(20);
 
