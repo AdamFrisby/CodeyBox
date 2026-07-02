@@ -45,6 +45,46 @@ public sealed class QuotaEndpointTests
     }
 
     [Fact]
+    public async Task GetQuota_ExposesResetCreditsAndRawPerWindowFields()
+    {
+        var reset = DateTimeOffset.FromUnixTimeSeconds(1778091218);
+        using var factory = new WorkItemApiFactory();
+        var client = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Codex, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 63,
+                    ResetCreditsAvailable = 3,
+                    Windows =
+                    [
+                        new WindowQuota
+                        {
+                            Name = "5h-rolling",
+                            AvailablePct = 66,
+                            ResetAt = reset,
+                            UsedPercent = 34,
+                            ResetAtEpochSeconds = 1778091218,
+                        },
+                    ],
+                }));
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/quota");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        var snapshot = doc.RootElement.GetProperty("probes")[0].GetProperty("latestSnapshot");
+        Assert.Equal(3, snapshot.GetProperty("resetCreditsAvailable").GetInt32());
+        var window = snapshot.GetProperty("windows")[0];
+        Assert.Equal(34, window.GetProperty("usedPercent").GetDouble());
+        Assert.Equal(1778091218, window.GetProperty("resetAtEpochSeconds").GetInt64());
+    }
+
+    [Fact]
     public async Task GetQuota_ModelSpecificObservedFailureAffectsWouldAllowEvenWhenProbeOmitsModel()
     {
         using var factory = new WorkItemApiFactory();

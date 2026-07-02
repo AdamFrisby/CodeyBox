@@ -138,6 +138,16 @@ public sealed record AgentQuotaSnapshot
     /// pickup. Empty when the probe has no window concept.
     /// </summary>
     public IReadOnlyList<WindowQuota> Windows { get; init; } = Array.Empty<WindowQuota>();
+
+    /// <summary>
+    /// Number of banked manual quota resets the account can still spend, when
+    /// the provider exposes it (Codex's top-level
+    /// <c>rate_limit_reset_credits.available_count</c>). Null when the provider
+    /// has no reset-credit concept or the field was absent. Purely
+    /// informational — it does not gate routing; it is the foundation for the
+    /// reset-credit-expiry tracker and reset advisor.
+    /// </summary>
+    public int? ResetCreditsAvailable { get; init; }
 }
 
 public sealed record ModelQuota
@@ -167,4 +177,20 @@ public sealed record WindowQuota
     public required double AvailablePct { get; init; }
     /// <summary>When this window resets, if known.</summary>
     public DateTimeOffset? ResetAt { get; init; }
+
+    /// <summary>
+    /// Raw <c>used_percent</c> as reported by the provider, before it is
+    /// inverted/clamped into <see cref="AvailablePct"/>. Null when the provider
+    /// gates the window on an explicit deny flag rather than a percentage.
+    /// Exposed so operators (and the reset advisor) can see the untransformed
+    /// consumption figure.
+    /// </summary>
+    public double? UsedPercent { get; init; }
+
+    /// <summary>
+    /// Raw <c>reset_at</c> epoch (Unix seconds) as reported by the provider,
+    /// preserved verbatim alongside the parsed <see cref="ResetAt"/>. Null when
+    /// the provider expresses the reset as a non-numeric value or omits it.
+    /// </summary>
+    public long? ResetAtEpochSeconds { get; init; }
 }
