@@ -442,6 +442,37 @@ The [`docs/`](docs/README.md) tree is the full reference. Good entry points:
 - [`plugins.md`](docs/plugins.md) — the Plugin SDK
 - [`api.md`](docs/api.md) — the full REST reference
 
+## Roadmap
+
+CodeyBox builds itself, so its roadmap *is* its own work queue. The larger
+threads currently moving through the pipeline — a living list, not a promise:
+
+- **Planning phase** — an optional plan-first flow (draft a plan, review it,
+  then implement against it) is landing incrementally: the phase and stored
+  plan artifact are in, with a panel of plan-reviewers and plan-adherence
+  checking next. → [How it works](#how-it-works)
+- **Run only the tests a change can affect** — sound regression test selection
+  (assembly-graph, then coverage-based) that prunes the suite for the per-item
+  audit while always running everything on merge — turning a full test run into
+  seconds for typical changes.
+- **Stronger, deterministic quality gates** — a diff-scoped coverage gate,
+  flake detection that re-runs and *attributes* non-diff failures instead of
+  blaming the change, and secret-scanning + SAST wired into every audit.
+- **Scale across machines** — remote and multi-host sandbox pools with
+  capacity-aware VM placement, plus more sandbox backends (e.g. Firecracker
+  microVMs).
+- **Autonomous exploratory & E2E testing** — cheap-model agents explore a
+  capability and emit deterministic replay artifacts that become a regression
+  suite; deployment verification as a first-class audit phase.
+- **Smarter quota management** — a reset advisor that pings you at the optimal
+  moment to spend a banked quota reset (and eventually triggers it), plus
+  deadline-aware drain pacing and fairer scheduling across a quota-limited fleet.
+- **A broader, pluggable fleet** — more coding agents, and test runners as
+  plugins, so new agents and languages slot in without forking.
+
+Underneath it all: continuous reliability hardening (graceful shutdown,
+transport robustness) and decomposing the pipeline internals.
+
 ## Status
 
 CodeyBox is under active development and builds clean against .NET 10. Multipass
