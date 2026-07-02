@@ -478,6 +478,151 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.DoesNotContain(applied.Mounts, m => m.SandboxPath == AuditDotnetShimDir);
     }
 
+    // Behavioral coverage for AuditReviewDotnetShim.PrivilegedHardeningScript —
+    // the ONLY defense on the production (multipass) provider against an auditor
+    // bypassing the PATH shim by invoking dotnet via an absolute path (e.g.
+    // /usr/bin/dotnet test). Every other AuditDotnetShim test exercises the PATH
+    // shim only; the ~60-line privileged hardening body never runs there because
+    // CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE is only armed on multipass and
+    // the ProcessSandboxProvider integration path always leaves it off. This
+    // drives the REAL hardening + shim scripts against a throwaway fixture tree
+    // so the load-bearing actions run without root or the /codeybox/bin mount:
+    // the arm-env gate, moving the real dotnet aside to <target>.codeybox-real,
+    // dropping the shim over the target, the {Directory}/* skip guard, and the
+    // shim's ${0}.codeybox-real passthrough for absolute invocations.
+    [Fact]
+    public async Task PrivilegedHardeningScript_MovesRealDotnetAside_AndInterceptsAbsoluteInvocation()
+    {
+        if (OperatingSystem.IsWindows())
+            return; // POSIX shell + unix file modes; the audit sandboxes are Linux.
+
+        var fixture = Directory.CreateTempSubdirectory("codeybox-harden-").FullName;
+        try
+        {
+            var shimDir = Path.Combine(fixture, "codeybox", "bin");
+            Directory.CreateDirectory(shimDir);
+            var shimPath = Path.Combine(shimDir, "dotnet");
+            await File.WriteAllTextAsync(shimPath, AuditReviewDotnetShim.ShimScript);
+            MakeExecutable(shimPath);
+
+            // Force the non-sudo branch deterministically: a fake `sudo` that
+            // fails `sudo -n true` makes the script fall through to the direct
+            // mv/cp/chmod path regardless of whether the host has passwordless
+            // sudo (it does on the multipass image, it does not on CI). The
+            // non-sudo branch is the one the audit finding singled out as
+            // testable without root.
+            var fakeSudo = Path.Combine(shimDir, "sudo");
+            await File.WriteAllTextAsync(fakeSudo, "#!/bin/sh\nexit 1\n");
+            MakeExecutable(fakeSudo);
+
+            // A candidate that lives under the shim directory must be skipped by
+            // the {Directory}/* case guard, never moved aside.
+            var shimDirSibling = Path.Combine(shimDir, "dotnet-tool");
+            await File.WriteAllTextAsync(shimDirSibling, "#!/bin/sh\necho sibling\n");
+            MakeExecutable(shimDirSibling);
+
+            // The real dotnet an auditor could reach by absolute path.
+            var realDir = Path.Combine(fixture, "opt", "dotnet");
+            Directory.CreateDirectory(realDir);
+            var target = Path.Combine(realDir, "dotnet");
+            const string realBody = "#!/bin/sh\necho \"real dotnet $*\"\n";
+            await File.WriteAllTextAsync(target, realBody);
+            MakeExecutable(target);
+
+            var script = AuditReviewDotnetShim.BuildPrivilegedHardeningScript(
+                shimPath, shimDir, shimDirSibling);
+
+            // Gate: without the arming env var the script is a no-op.
+            var noop = await RunHostShimScriptAsync(script, shimDir, target, arm: false);
+            Assert.Equal(0, noop.code);
+            Assert.Equal(realBody, await File.ReadAllTextAsync(target));
+            Assert.False(File.Exists(target + ".codeybox-real"));
+
+            // Armed (non-sudo branch): the real dotnet is moved aside and the
+            // shim takes its place.
+            var armed = await RunHostShimScriptAsync(script, shimDir, target, arm: true);
+            Assert.Equal(0, armed.code);
+            Assert.Equal(AuditReviewDotnetShim.ShimScript, await File.ReadAllTextAsync(target));
+            Assert.Equal(realBody, await File.ReadAllTextAsync(target + ".codeybox-real"));
+
+            // The shim-directory sibling is left untouched by the skip guard.
+            Assert.False(File.Exists(shimDirSibling + ".codeybox-real"));
+
+            // Absolute invocation of the now-shimmed target: build/test are
+            // intercepted with the notice and never reach a compiler...
+            var test = await RunHostBinaryAsync(target, ["test", "--filter", "X"]);
+            Assert.Equal(0, test.code);
+            Assert.Contains(AuditDotnetShimNotice, test.stdout, StringComparison.Ordinal);
+            // ...while other subcommands exec the moved-aside real dotnet via the
+            // shim's ${0}.codeybox-real sibling passthrough.
+            var info = await RunHostBinaryAsync(target, ["--info"]);
+            Assert.Equal(0, info.code);
+            Assert.Contains("real dotnet --info", info.stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture, recursive: true); } catch { }
+        }
+    }
+
+    private static Task<(int code, string stdout, string stderr)> RunHostShimScriptAsync(
+        string script, string shimDir, string target, bool arm)
+    {
+        // shimDir leads PATH so the script's `command -v dotnet` resolves to the
+        // fixture shim (and is skipped) rather than any real host dotnet.
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["PATH"] = shimDir + ":/usr/bin:/bin",
+            // Empty (not absent) so an inherited value can never arm the gate.
+            ["CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE"] = arm ? "1" : "",
+        };
+        return RunHostProcessAsync("/bin/sh", ["-s", "--", target], script, env);
+    }
+
+    private static Task<(int code, string stdout, string stderr)> RunHostBinaryAsync(
+        string path, IReadOnlyList<string> args)
+        => RunHostProcessAsync(path, args, stdin: null, env: null);
+
+    private static void MakeExecutable(string path)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        File.SetUnixFileMode(
+            path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+
+    private static async Task<(int code, string stdout, string stderr)> RunHostProcessAsync(
+        string fileName, IReadOnlyList<string> args, string? stdin, IReadOnlyDictionary<string, string>? env)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = fileName,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = stdin is not null,
+            UseShellExecute = false,
+        };
+        foreach (var a in args)
+            psi.ArgumentList.Add(a);
+        if (env is not null)
+            foreach (var (k, v) in env)
+                psi.Environment[k] = v;
+
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        if (stdin is not null)
+        {
+            await p.StandardInput.WriteAsync(stdin);
+            p.StandardInput.Close();
+        }
+        var stdoutTask = p.StandardOutput.ReadToEndAsync();
+        var stderrTask = p.StandardError.ReadToEndAsync();
+        await p.WaitForExitAsync();
+        return (p.ExitCode, await stdoutTask, await stderrTask);
+    }
+
     private static SandboxSpec BaseAuditSpec() => new()
     {
         ImageReference = "ignored",

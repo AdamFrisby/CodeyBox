@@ -19,7 +19,14 @@ internal sealed class AuditReviewDotnetShim
     private const string DefaultSandboxPath =
         "/codeybox/bin:/home/ubuntu/.local/bin:/home/ubuntu/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
 
-    private static readonly string ShimScript = $$"""
+    // The absolute locations the multipass baseline may install the real dotnet
+    // at. The hardening script moves any of these aside and drops the shim in
+    // their place so an auditor invoking dotnet via an absolute path (rather
+    // than resolving it through PATH) is still intercepted.
+    private const string DefaultAbsoluteDotnetCandidates =
+        "/usr/bin/dotnet /usr/local/bin/dotnet /snap/bin/dotnet /usr/share/dotnet/dotnet";
+
+    internal static readonly string ShimScript = $$"""
         #!/bin/sh
         if [ "${1:-}" = "build" ] || [ "${1:-}" = "test" ]; then
             printf '%s\n' "{{Notice}}"
@@ -50,8 +57,18 @@ internal sealed class AuditReviewDotnetShim
         exit 127
         """;
 
-    private static readonly string PrivilegedHardeningScript = $$"""
-        shim={{Path}}
+    private static readonly string PrivilegedHardeningScript =
+        BuildPrivilegedHardeningScript(Path, Directory, DefaultAbsoluteDotnetCandidates);
+
+    // Extracted as a builder so the paths (shim location, shim directory, and
+    // the absolute dotnet candidate list) are injectable. Production always
+    // calls it with the compiled-in constants; the behavioral test drives it
+    // against a throwaway fixture tree so the load-bearing absolute-path
+    // hardening (move real dotnet aside, drop the shim in its place) is
+    // exercised without needing root or the /codeybox/bin mount.
+    internal static string BuildPrivilegedHardeningScript(
+        string shimPath, string shimDirectory, string absoluteCandidates) => $$"""
+        shim={{shimPath}}
 
         case "${CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE:-}" in
             1|true|TRUE|yes|YES) ;;
@@ -75,12 +92,12 @@ internal sealed class AuditReviewDotnetShim
         fi
 
         candidates="${1:-} $(command -v dotnet 2>/dev/null || true)"
-        candidates="$candidates /usr/bin/dotnet /usr/local/bin/dotnet /snap/bin/dotnet /usr/share/dotnet/dotnet"
+        candidates="$candidates {{absoluteCandidates}}"
         for target in $candidates; do
             [ -n "$target" ] || continue
             [ "$target" = "$shim" ] && continue
             case "$target" in
-                {{Directory}}/*) continue ;;
+                {{shimDirectory}}/*) continue ;;
             esac
             [ -e "$target" ] || continue
             [ ! -d "$target" ] || continue
