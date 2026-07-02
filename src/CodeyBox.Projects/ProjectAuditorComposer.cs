@@ -27,6 +27,7 @@ public sealed class ProjectAuditorComposer
 {
     private readonly IPresetCatalog _catalog;
     private readonly PresetCatalogOptions _catalogOptions;
+    private readonly Func<TestRunOptions>? _testRunOptions;
     private readonly IReadOnlyDictionary<string, IAuditor> _registeredAuditorsByName;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly ILogger<ProjectAuditorComposer> _logger;
@@ -36,14 +37,25 @@ public sealed class ProjectAuditorComposer
     /// by the host and plugin loader (empty enumerable when no optional auditors
     /// are loaded).
     /// </summary>
+    /// <param name="testRunOptions">
+    /// Live accessor for hot-reloadable <see cref="TestRunOptions"/> (blame-hang /
+    /// test-specific idle-timeout). Threaded into the per-project
+    /// <see cref="PresetCatalog"/> built for projects that carry preset overrides
+    /// or a repository preset root, so those projects honour the same
+    /// hot-reloadable knobs as the shared catalog rather than silently falling
+    /// back to <see cref="TestRunOptions.Default"/>. Null keeps the default
+    /// (byte-identical) behaviour used by tests.
+    /// </param>
     public ProjectAuditorComposer(
         IPresetCatalog catalog,
         IEnumerable<IAuditor> registeredAuditors,
         ILogger<ProjectAuditorComposer> logger,
-        PresetCatalogOptions? catalogOptions = null)
+        PresetCatalogOptions? catalogOptions = null,
+        Func<TestRunOptions>? testRunOptions = null)
     {
         _catalog = catalog;
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
+        _testRunOptions = testRunOptions;
         _logger = logger;
 
         var byName = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
@@ -174,7 +186,11 @@ public sealed class ProjectAuditorComposer
             return _catalog;
 
         ProjectRepository.ApplyPresetOverrideOptions(project, options);
-        return new PresetCatalog(options);
+        // Thread the hot-reloadable run-options accessor into the per-project
+        // catalog so override / repo-preset-root projects still source
+        // blame-hang and the test-specific idle timeout through the type;
+        // dropping it here would silently fall back to TestRunOptions.Default.
+        return new PresetCatalog(options, _testRunOptions);
     }
 
     private static bool HasProjectPresetOverrides(Project project)

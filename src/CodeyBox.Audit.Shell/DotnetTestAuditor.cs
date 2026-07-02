@@ -104,8 +104,9 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
     /// <summary>
     /// Maps a set of selected tests to a <c>dotnet test --filter</c> expression.
     /// Bare names are matched by fully-qualified name; entries that already carry
-    /// a filter operator (<c>=</c>, <c>!=</c>, <c>~</c>) are passed through so a
-    /// selector can supply raw expressions. Multiple entries are OR-joined.
+    /// an <c>=</c> or <c>~</c> operator are passed through unchanged so a selector
+    /// can supply raw expressions (this covers <c>!=</c> too, since it contains
+    /// <c>=</c>). Multiple entries are OR-joined.
     /// </summary>
     private static string BuildFilterExpression(IReadOnlyList<string> filters)
         => string.Join("|", filters.Select(f =>
@@ -115,8 +116,8 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
 
     /// <summary>
     /// Formats a hang timeout for <c>--blame-hang-timeout</c>, which accepts a
-    /// number suffixed with a unit. Whole seconds are emitted as <c>s</c>;
-    /// sub-second values fall back to <c>ms</c>.
+    /// number suffixed with a unit. Whole-second values are emitted as <c>s</c>;
+    /// any non-whole-second value (including sub-second) falls back to <c>ms</c>.
     /// </summary>
     private static string FormatHangTimeout(TimeSpan timeout)
     {

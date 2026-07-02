@@ -9160,12 +9160,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// uses the global <see cref="PipelineTuningOptions.AuditorIdleTimeout"/>.
     /// </summary>
     private TimeSpan EffectiveAuditorIdleTimeout(IAuditor auditor)
+        => ResolveEffectiveAuditorIdleTimeout(auditor, _pipelineTuning.Current.AuditorIdleTimeout);
+
+    /// <summary>
+    /// Pure branch logic behind <see cref="EffectiveAuditorIdleTimeout"/>, split
+    /// out so the resolution — direct test-runner, wrapped test-runner via
+    /// <see cref="ITestRunnerAuditorProvider"/>, the <c>&gt; TimeSpan.Zero</c>
+    /// guard, and the global fallback — is unit-testable without standing up a
+    /// full pipeline.
+    /// </summary>
+    internal static TimeSpan ResolveEffectiveAuditorIdleTimeout(IAuditor auditor, TimeSpan globalIdleTimeout)
     {
         var testRunner = auditor as ITestRunnerAuditor
             ?? (auditor as ITestRunnerAuditorProvider)?.TestRunner;
         if (testRunner?.CurrentRunOptions.IdleTimeout is { } idle && idle > TimeSpan.Zero)
             return idle;
-        return _pipelineTuning.Current.AuditorIdleTimeout;
+        return globalIdleTimeout;
     }
 
     private async Task<TimeSpan?> WaitForAuditorIdleTimeoutAsync(

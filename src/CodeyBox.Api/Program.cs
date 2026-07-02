@@ -1775,9 +1775,15 @@ static Func<TestRunOptions> DotnetTestRunOptionsAccessor(IServiceProvider sp)
     };
 }
 
+// Bind the run-options accessor ONCE and share the single closure across the
+// preset catalog, the DI-registered test runner, and every per-project catalog
+// the ProjectAuditorComposer builds. One closure — all consumers observe the
+// same hot-reloadable PipelineTuningSnapshot.
+builder.Services.AddSingleton<Func<TestRunOptions>>(DotnetTestRunOptionsAccessor);
+
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(
     sp.GetRequiredService<PresetCatalogOptions>(),
-    DotnetTestRunOptionsAccessor(sp)));
+    sp.GetRequiredService<Func<TestRunOptions>>()));
 
 // The canonical dotnet-test runner, registered so the ITestSelector seam
 // (a separate work item) can resolve ITestRunnerAuditor from DI and enumerate
@@ -1791,7 +1797,7 @@ builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(ne
     CanShortCircuitOnBlockingFinding = true,
     Role = AuditorRole.BuildTestGate,
     BuildTestGateEvidence = BuildTestGateEvidence.Test,
-    RunOptionsAccessor = DotnetTestRunOptionsAccessor(sp),
+    RunOptionsAccessor = sp.GetRequiredService<Func<TestRunOptions>>(),
 }));
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(

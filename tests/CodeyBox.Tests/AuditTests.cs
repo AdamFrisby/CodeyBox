@@ -835,15 +835,29 @@ public sealed class AuditTests
     }
 
     [Fact]
-    public void DotnetTestAuditor_BlameHangSubSecond_FormatsMilliseconds()
+    public void DotnetTestAuditor_NonWholeSecondBlameHang_FormatsMilliseconds()
     {
         var auditor = CSharpTestPassAuditor();
 
+        // 1500ms is 1.5s — non-whole-second, so it formats as ms, not s.
         var command = auditor.BuildInvocation(
             TestSelection.All,
             new TestRunOptions { BlameHangTimeout = TimeSpan.FromMilliseconds(1500) });
 
         Assert.Equal("1500ms", command[^1]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_SubSecondBlameHang_FormatsMilliseconds()
+    {
+        var auditor = CSharpTestPassAuditor();
+
+        // A genuinely sub-second value stays in ms.
+        var command = auditor.BuildInvocation(
+            TestSelection.All,
+            new TestRunOptions { BlameHangTimeout = TimeSpan.FromMilliseconds(500) });
+
+        Assert.Equal("500ms", command[^1]);
     }
 
     [Fact]
@@ -858,6 +872,39 @@ public sealed class AuditTests
         Assert.Equal<string[]>(
             ["dotnet", "test", "--no-build", "--filter", "FullyQualifiedName=Ns.A|FullyQualifiedName~Slow"],
             [.. command]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_SelectionWithExplicitOperator_PassesThroughUnprefixed()
+    {
+        var auditor = CSharpTestPassAuditor();
+
+        // Entries already carrying '=' (including '!=') must NOT be re-prefixed
+        // with FullyQualifiedName=.
+        var command = auditor.BuildInvocation(
+            new TestSelection(["FullyQualifiedName=Ns.A", "Category!=Slow"]),
+            TestRunOptions.Default);
+
+        Assert.Equal<string[]>(
+            ["dotnet", "test", "--no-build", "--filter", "FullyQualifiedName=Ns.A|Category!=Slow"],
+            [.. command]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_EmptyBaseArgv_Throws()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => new DotnetTestAuditor(new DotnetTestAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            BaseArgv = [],
+        }));
+        Assert.Equal("opts", ex.ParamName);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_NullOptions_Throws()
+    {
+        Assert.Throws<ArgumentNullException>(() => new DotnetTestAuditor(null!));
     }
 
     [Fact]
