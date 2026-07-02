@@ -353,6 +353,9 @@ public sealed class RecordingComputerUseBridge
                 };
             }
 
+            if (action == "scroll" && TryBuildViewportTargetDescriptor(preScreenshot) is { } viewport)
+                return viewport;
+
             region = new TraceBoundingRegion { X = 0, Y = 0, Width = 0, Height = 0 };
         }
 
@@ -377,6 +380,23 @@ public sealed class RecordingComputerUseBridge
             SourceScreenshotPng = screenshot,
         },
     };
+
+    private static TraceTargetDescriptor? TryBuildViewportTargetDescriptor(byte[]? screenshot)
+    {
+        if (!TryReadPngDimensions(screenshot, out var width, out var height))
+            return null;
+
+        return new TraceTargetDescriptor
+        {
+            Visual = new TraceVisualDescriptor
+            {
+                Region = new TraceBoundingRegion { X = 0, Y = 0, Width = width, Height = height },
+                ClickOffsetX = width / 2,
+                ClickOffsetY = height / 2,
+                SourceScreenshotPng = screenshot,
+            },
+        };
+    }
 
     private static (int? X, int? Y) ResolveActionCentre(string action, SandboxInputEvent[] events)
     {

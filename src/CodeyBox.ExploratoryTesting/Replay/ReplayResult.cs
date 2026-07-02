@@ -76,10 +76,9 @@ public sealed record ReplayStepResult
 /// Returned by <see cref="IElementLocator.LocateAsync"/> and consumed by the
 /// engine to drive real input. The <see cref="CenterX"/> / <see cref="CenterY"/>
 /// pair is the engine's click target; <see cref="Region"/> is the best-known
-/// live bounds of the matched target. Point-probe locators that do not receive
-/// live bounds may preserve the recorded shape anchored around the located
-/// point, so consumers should treat it as locator provenance rather than a
-/// guarantee of platform-reported geometry.
+/// live bounds of the matched target. Default locators only return positive
+/// hits when current-screen recognition supplies bounds or visual evidence;
+/// they do not treat stored raw coordinates as a successful relocation.
 /// </summary>
 public sealed record LocatedTarget
 {
@@ -89,9 +88,9 @@ public sealed record LocatedTarget
 
     /// <summary>
     /// Provenance: how the target was re-located. Shipped values from the
-    /// default locators are <c>accessibility-point</c> (the recorded centre
-    /// matched on the accessibility tree), <c>accessibility-ring</c> (a
-    /// nearby probe in the square-ring search matched), and
+    /// default locators include <c>accessibility-tree</c> (a bounded current
+    /// accessibility-tree node matched), <c>visual-template</c>,
+    /// <c>visual-source-crop</c>, <c>visual-ocr</c>, and
     /// <c>visual-signature</c> (the full current screen byte-matches the
     /// recorded source screenshot). Custom <see cref="IElementLocator"/>
     /// implementations and <see cref="ILocatorHealer"/>s may introduce
@@ -101,8 +100,8 @@ public sealed record LocatedTarget
 
     /// <summary>
     /// Locator-supplied confidence in [0, 1]. The default accessibility
-    /// locator returns 1.0 on an exact role/name/text/element-type match at
-    /// the recorded centre and 0.85 on a ring-scan hit at a nearby cell.
+    /// locator returns 1.0 on an exact bounded tree match; visual and OCR
+    /// locators report lower confidence for template, crop, and OCR evidence.
     /// Confidence is informational only — the engine does not compare it
     /// against a threshold today.
     /// </summary>

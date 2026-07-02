@@ -23,10 +23,10 @@ namespace CodeyBox.ExploratoryTesting.Replay;
 ///   <see cref="ReachabilityStatus.Occluded"/> — display:none, opacity:0,
 ///   and other invisibility classes drop the element out of the
 ///   accessibility tree, so a null probe is equivalent to "user can't see
-///   it." For visual-only descriptors, the checker still performs a
-///   top-most accessibility probe: a returned accessibility element means
-///   an accessible surface is on top of an untagged target, and a probe
-///   failure fails closed.</item>
+///   it." For visual-only descriptors, the checker treats verified current
+///   visual evidence as reachable even when a containing accessible surface
+///   answers at the point; canvas/document roots are often the real click
+///   receiver for untagged controls.</item>
 ///   <item><b>Top-most</b>: when the descriptor carries a usable
 ///   accessibility signature, probe
 ///   <see cref="ISandbox.GetAccessibilityAtPointAsync"/> at the centre and
@@ -210,18 +210,18 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                     if (TopMostAccessibilityMatchesOcrTarget(snap, descriptor.Visual, current))
                         return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
 
-                    var topMostVisualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, allowLocatorEvidence: false, ct)
+                    var topMostVisualStatus = await GetCurrentVisualEvidenceStatusAsync(sandbox, current, descriptor, allowLocatorEvidence: true, ct)
                         .ConfigureAwait(false);
+                    if (topMostVisualStatus == VisualTargetVerificationStatus.Verified)
+                        return new ReachabilityOutcome { Status = ReachabilityStatus.Reachable, Target = current };
 
                     return new ReachabilityOutcome
                     {
                         Status = ReachabilityStatus.Occluded,
                         Target = current,
-                        Diagnostic = topMostVisualStatus == VisualTargetVerificationStatus.Verified
-                            ? $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); target pixels still match but the accessible surface would receive the input"
-                            : topMostVisualStatus == VisualTargetVerificationStatus.Mismatch
-                                ? $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}) and target pixels no longer match the recorded descriptor"
-                                : $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
+                        Diagnostic = topMostVisualStatus == VisualTargetVerificationStatus.Mismatch
+                            ? $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}) and target pixels no longer match the recorded descriptor"
+                            : $"accessibility element ({Describe(snap)}) is top-most over visual-only target at ({current.CenterX},{current.CenterY}); cannot verify untagged target is unobstructed",
                     };
                 }
 
@@ -327,11 +327,60 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         if ((current.Evidence & LocatedTargetEvidence.Ocr) == 0) return false;
         var expected = visual.OcrText;
         if (string.IsNullOrWhiteSpace(expected)) return false;
-        return Contains(snap.Name, expected)
-            || Contains(snap.Text, expected)
-            || Contains(snap.ElementType, expected);
+        return ContainsTokenSequence(snap.Name, expected)
+            || ContainsTokenSequence(snap.Text, expected)
+            || ContainsTokenSequence(snap.ElementType, expected);
     }
 
-    private static bool Contains(string? value, string expected)
-        => value?.Contains(expected, StringComparison.OrdinalIgnoreCase) == true;
+    private static bool ContainsTokenSequence(string? value, string expected)
+    {
+        var actualTokens = Tokenize(value);
+        var expectedTokens = Tokenize(expected);
+        if (actualTokens.Length == 0 || expectedTokens.Length == 0 || expectedTokens.Length > actualTokens.Length)
+            return false;
+
+        for (var i = 0; i <= actualTokens.Length - expectedTokens.Length; i++)
+        {
+            var matched = true;
+            for (var j = 0; j < expectedTokens.Length; j++)
+            {
+                if (string.Equals(actualTokens[i + j], expectedTokens[j], StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                matched = false;
+                break;
+            }
+
+            if (matched) return true;
+        }
+
+        return false;
+    }
+
+    private static string[] Tokenize(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return [];
+
+        var tokens = new List<string>();
+        var start = -1;
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (char.IsLetterOrDigit(value[i]))
+            {
+                if (start < 0) start = i;
+                continue;
+            }
+
+            if (start >= 0)
+            {
+                tokens.Add(value[start..i]);
+                start = -1;
+            }
+        }
+
+        if (start >= 0)
+            tokens.Add(value[start..]);
+
+        return tokens.ToArray();
+    }
 }

@@ -136,12 +136,10 @@ public sealed record ReplayOptions
     }
 
     /// <summary>
-    /// Half-size of the accessibility ring search around the recorded click
-    /// centre, in pixels. The locator scans concentric square rings outward
-    /// to this radius and returns the first accessibility match. (Named
-    /// "ring" rather than "spiral" because the implementation is a square-
-    /// ring scan, not a true spiral; the prior "Spiral*" names rotted as
-    /// the implementation crystallised.)
+    /// Custom-locator compatibility knob for bounded coordinate-neighborhood
+    /// searches. The default accessibility locator ignores this value because
+    /// point/ring probes do not supply current bounds and must not be treated
+    /// as successful relocation.
     /// </summary>
     public int RingSearchRadius
     {
@@ -155,8 +153,9 @@ public sealed record ReplayOptions
     }
 
     /// <summary>
-    /// Pixel step of the accessibility ring search grid. Must be &gt; 0 so
-    /// the search loop is guaranteed to advance.
+    /// Pixel step for custom locators that still perform bounded
+    /// coordinate-neighborhood searches. Must be &gt; 0 so custom search loops
+    /// can guarantee forward progress.
     /// </summary>
     public int RingSearchStep
     {

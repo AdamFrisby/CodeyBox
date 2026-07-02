@@ -506,6 +506,24 @@ public sealed class SessionTraceTests
     }
 
     [Fact]
+    public async Task RecordingBridge_BareScrollCapturesViewportVisualDescriptorWhenScreenshotHasDimensions()
+    {
+        var png = BuildPngHeader(width: 200, height: 100);
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new RecordingGraphicalSandbox(png);
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "scroll", ScrollY = 3 });
+
+        var visual = recorder.Trace.Entries[0].Action.TargetDescriptor.Visual;
+        Assert.Equal(new TraceBoundingRegion { X = 0, Y = 0, Width = 200, Height = 100 }, visual.Region);
+        Assert.Equal(100, visual.ClickOffsetX);
+        Assert.Equal(50, visual.ClickOffsetY);
+        Assert.Equal(png, visual.SourceScreenshotPng);
+    }
+
+    [Fact]
     public async Task RecordingBridge_ScrollActionInheritsPreviousTargetDescriptor()
     {
         var timeProvider = new FrozenTimeProvider(FrozenNow);
@@ -869,6 +887,59 @@ public sealed class SessionTraceTests
         Assert.Equal("Submit", entry.Action.TargetDescriptor.Accessibility.Text);
         Assert.NotNull(entry.Observation.AccessibilitySnapshotJson);
         Assert.Equal("{\"tree\":[{\"role\":\"button\"}]}", entry.Observation.AccessibilitySnapshotJson);
+    }
+
+    [Fact]
+    public async Task RecordingBridge_CapturesAccessibilityBoundsFromMatchingTreeNode()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new AccessibilityFaultSandbox(SamplePng)
+        {
+            AtPoint = (_, _, _) => Task.FromResult<SandboxAccessibilitySnapshot?>(new SandboxAccessibilitySnapshot
+            {
+                Role = "button",
+                Name = "Submit",
+                Text = "Submit",
+                ElementType = "button",
+            }),
+            Tree = _ => Task.FromResult<string?>(
+                """
+                {"tree":[{"role":"button","name":"Submit","text":"Submit","elementType":"button","bounds":{"x":90,"y":70,"width":80,"height":40}}]}
+                """),
+        };
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+
+        var accessibility = recorder.Trace.Entries[0].Action.TargetDescriptor.Accessibility;
+        Assert.NotNull(accessibility);
+        Assert.Equal("button", accessibility.Role);
+        Assert.Equal("Submit", accessibility.Name);
+        Assert.Equal(new TraceBoundingRegion { X = 90, Y = 70, Width = 80, Height = 40 }, accessibility.Bounds);
+    }
+
+    [Fact]
+    public async Task RecordingBridge_FallsBackToTreeBoundsWhenPointProbeReturnsNull()
+    {
+        var timeProvider = new FrozenTimeProvider(FrozenNow);
+        var sandbox = new AccessibilityFaultSandbox(SamplePng)
+        {
+            AtPoint = (_, _, _) => Task.FromResult<SandboxAccessibilitySnapshot?>(null),
+            Tree = _ => Task.FromResult<string?>(
+                """
+                {"tree":[{"role":"button","name":"Submit","bounds":{"x":90,"y":70,"width":80,"height":40}}]}
+                """),
+        };
+        var inner = new ComputerUseBridge(timeProvider: timeProvider);
+        var recorder = new RecordingComputerUseBridge(inner, timeProvider);
+
+        await recorder.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 120, Y = 80 });
+
+        var accessibility = recorder.Trace.Entries[0].Action.TargetDescriptor.Accessibility;
+        Assert.NotNull(accessibility);
+        Assert.Equal("Submit", accessibility.Name);
+        Assert.Equal(new TraceBoundingRegion { X = 90, Y = 70, Width = 80, Height = 40 }, accessibility.Bounds);
     }
 
     [Fact]

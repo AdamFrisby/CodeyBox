@@ -422,6 +422,7 @@ public sealed class ReplayEngineTests
         var clock = new FakeTimeProvider(FrozenNow);
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ImmediateNullWait(),
             timeProvider: clock);
         var trace = MakeTrace(ClickEntry(seq: 1,
@@ -523,7 +524,7 @@ public sealed class ReplayEngineTests
         // Each parallel replay carries its own per-step recorded screenshot
         // through VerifyAsync — proves no shared mutable state leaks between
         // concurrent replays sharing one engine + verifier instance.
-        var engine = new ReplayEngine();
+        var engine = new ReplayEngine(locator: TestLocator());
 
         var tasks = Enumerable.Range(0, 8).Select(async i =>
         {
@@ -559,7 +560,7 @@ public sealed class ReplayEngineTests
     {
         const int replayCount = 4;
         var verifier = new BarrierAssertionVerifier(replayCount);
-        var engine = new ReplayEngine(assertions: verifier);
+        var engine = new ReplayEngine(locator: TestLocator(), assertions: verifier);
 
         var tasks = Enumerable.Range(0, replayCount).Select(async i =>
         {
@@ -1260,6 +1261,46 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
+    public async Task Replay_DispatchesBareScroll_WhenViewportVisualDescriptorMatches()
+    {
+        var screenshot = BuildRgbPng(2, 2, [0, 255, 0, 0, 0, 255, 255, 0, 0, 255, 255, 255]);
+        var sandbox = new ScriptedSandbox(screenshot)
+        {
+            AccessibilityAtPoint = (_, _) => null,
+        };
+        var entry = new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 3 }],
+                Kind = "scroll",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 2, Height = 2 },
+                        ClickOffsetX = 1,
+                        ClickOffsetY = 1,
+                        SourceScreenshotPng = screenshot,
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        };
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, MakeTrace(entry));
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        Assert.Contains(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Move && e.X == 1 && e.Y == 1);
+        var scroll = Assert.Single(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Scroll);
+        Assert.Equal(3, scroll.Y);
+        Assert.Null(scroll.X);
+    }
+
+    [Fact]
     public async Task Replay_DispatchesScroll_VerticalWinsWhenTwoAxesTie()
     {
         var sandbox = new ScriptedSandbox(StableScreenshotA)
@@ -1424,7 +1465,7 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
-    public async Task AccessibilityLocator_UsesRecordedClickOffsetForPointProbe()
+    public async Task AccessibilityLocator_ReturnsNull_WhenOnlyRecordedClickOffsetPointProbeMatches()
     {
         var sandbox = new ScriptedSandbox(StableScreenshotA)
         {
@@ -1445,10 +1486,7 @@ public sealed class ReplayEngineTests
         var hit = await new AccessibilityElementLocator()
             .LocateAsync(sandbox, descriptor, new ReplayOptions(), CancellationToken.None);
 
-        Assert.NotNull(hit);
-        Assert.Equal("accessibility-point", hit.Source);
-        Assert.Equal(10, hit.CenterX);
-        Assert.Equal(5, hit.CenterY);
+        Assert.Null(hit);
     }
 
     [Fact]
@@ -1871,6 +1909,7 @@ public sealed class ReplayEngineTests
         var clock = new FakeTimeProvider(FrozenNow);
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             reachability: new ThrowingReachability(new InvalidOperationException("checker offline")),
             visualWait: new ImmediateWait(),
             timeProvider: clock);
@@ -1994,6 +2033,7 @@ public sealed class ReplayEngineTests
         var clock = new FakeTimeProvider(FrozenNow);
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ThrowingVisualWait(new InvalidOperationException("post-input wait failed")),
             timeProvider: clock);
 
@@ -2364,6 +2404,7 @@ public sealed class ReplayEngineTests
         var clock = new FakeTimeProvider(FrozenNow);
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ScreenshotStabilityWait(),
             timeProvider: clock);
         var options = new ReplayOptions
@@ -2400,6 +2441,7 @@ public sealed class ReplayEngineTests
         var clock = new FakeTimeProvider(FrozenNow);
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ScreenshotStabilityWait(clock),
             assertions: verifier,
             timeProvider: clock);
@@ -2439,6 +2481,7 @@ public sealed class ReplayEngineTests
         var clock = new FakeTimeProvider(FrozenNow);
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ScreenshotStabilityWait(clock),
             timeProvider: clock);
         var options = new ReplayOptions
@@ -2486,6 +2529,7 @@ public sealed class ReplayEngineTests
             screenshotComparer: new AlwaysMatchScreenshotComparer());
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ScreenshotStabilityWait(clock),
             assertions: verifier,
             timeProvider: clock);
@@ -2605,6 +2649,7 @@ public sealed class ReplayEngineTests
         var clock = new FakeTimeProvider(FrozenNow);
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ImmediateWait(),
             assertions: new ThrowingAssertionVerifier(new InvalidOperationException("verifier offline")),
             timeProvider: clock);
@@ -3411,7 +3456,133 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
-    public async Task Replay_FailsOccluded_WhenVisualOnlyTargetInsideAccessibleContainer()
+    public async Task Replay_FailsOffScreen_WhenOffScreenVisualMissAllowsNoScrollAttempts()
+    {
+        var source = BuildSingleColumnPngWithTargetAtY(900);
+        var beforeScroll = BuildRgbPng(1, 1, [255, 0, 0]);
+        var sandbox = new ScriptedSandbox(beforeScroll)
+        {
+            AccessibilityAtPoint = (_, _) => null,
+        };
+        var trace = MakeTrace(new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 0, Y = 900 }],
+                Kind = "click",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 0, Y = 900, Width = 1, Height = 1 },
+                        SourceScreenshotPng = source,
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        });
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace, new ReplayOptions { MaxScrollAttempts = 0 });
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.OffScreen, result.FailedStep!.FailureKind);
+        Assert.Contains("no scroll attempts are allowed", result.FailedStep.Diagnostic);
+        Assert.Empty(sandbox.RecordedInputEvents);
+    }
+
+    [Fact]
+    public async Task Replay_FailsOffScreen_WhenVisualMissScrollSearchWaitTimesOut()
+    {
+        var source = BuildSingleColumnPngWithTargetAtY(900);
+        var beforeScroll = BuildRgbPng(1, 1, [255, 0, 0]);
+        var sandbox = new ScriptedSandbox(beforeScroll)
+        {
+            AccessibilityAtPoint = (_, _) => null,
+        };
+        var trace = MakeTrace(new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 0, Y = 900 }],
+                Kind = "click",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 0, Y = 900, Width = 1, Height = 1 },
+                        SourceScreenshotPng = source,
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        });
+        var clock = new FakeTimeProvider(FrozenNow);
+        var engine = new ReplayEngine(
+            bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
+            visualWait: new ImmediateNullWait(),
+            timeProvider: clock);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.OffScreen, result.FailedStep!.FailureKind);
+        Assert.Contains("screen did not settle after scrolling", result.FailedStep.Diagnostic);
+        Assert.Contains(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Scroll);
+        Assert.DoesNotContain(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Click);
+    }
+
+    [Fact]
+    public async Task Replay_FailsActionFailed_WhenVisualMissScrollSearchDispatchThrows()
+    {
+        var source = BuildSingleColumnPngWithTargetAtY(900);
+        var beforeScroll = BuildRgbPng(1, 1, [255, 0, 0]);
+        var sandbox = new ScriptedSandbox(beforeScroll)
+        {
+            AccessibilityAtPoint = (_, _) => null,
+            OnSynthesizeInput = events =>
+            {
+                if (events.Any(e => e.Type == SandboxInputEventType.Scroll))
+                    throw new InvalidOperationException("scroll input rejected");
+            },
+        };
+        var trace = MakeTrace(new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 0, Y = 900 }],
+                Kind = "click",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 0, Y = 900, Width = 1, Height = 1 },
+                        SourceScreenshotPng = source,
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        });
+        var engine = NewEngineFor(sandbox);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.False(result.Passed);
+        Assert.Equal(ReplayFailureKind.ActionFailed, result.FailedStep!.FailureKind);
+        Assert.Contains("scroll search for off-screen visual target failed", result.FailedStep.Diagnostic);
+        Assert.Contains("scroll input rejected", result.FailedStep.Diagnostic);
+        Assert.Empty(sandbox.RecordedInputEvents);
+    }
+
+    [Fact]
+    public async Task Replay_DrivesClick_WhenVisualOnlyTargetInsideAccessibleContainer()
     {
         var screenshot = BuildRgbPng(1, 1, [0, 255, 0]);
         var sandbox = new ScriptedSandbox(screenshot)
@@ -3442,10 +3613,10 @@ public sealed class ReplayEngineTests
 
         var result = await engine.ReplayAsync(sandbox, trace);
 
-        Assert.False(result.Passed);
-        Assert.Equal(ReplayFailureKind.Occluded, result.FailedStep!.FailureKind);
-        Assert.Contains("accessible surface would receive the input", result.FailedStep.Diagnostic);
-        Assert.Empty(sandbox.RecordedInputEvents);
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
+        var click = Assert.Single(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Click);
+        Assert.Equal(0, click.X);
+        Assert.Equal(0, click.Y);
     }
 
     [Fact]
@@ -3916,6 +4087,7 @@ public sealed class ReplayEngineTests
         });
         var engine = new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: new ScreenshotStabilityWait(clock),
             assertions: verifier,
             timeProvider: clock);
@@ -3949,6 +4121,9 @@ public sealed class ReplayEngineTests
             // Sandbox returns "Different" role/name; default matcher would
             // refuse, but the custom matcher below trusts the role only.
             AccessibilityAtPoint = (_, _) => Accessible("button", "Different"),
+            AccessibilityTreeJson = """
+                {"role":"button","name":"Different","bounds":{"x":150,"y":80,"width":40,"height":20}}
+                """,
         };
         var trace = MakeTrace(
             ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
@@ -4123,7 +4298,7 @@ public sealed class ReplayEngineTests
         var trace = MakeTrace(
             ClickEntry(seq: 1, region: new TraceBoundingRegion { X = 150, Y = 80, Width = 40, Height = 20 },
                 accessibility: new TraceAccessibilityDescriptor { Role = "button", Name = "Login" }));
-        var engine = new ReplayEngine(visualWait: new ImmediateWait());
+        var engine = new ReplayEngine(locator: TestLocator(), visualWait: new ImmediateWait());
 
         var result = await engine.ReplayAsync(harness, recipe, trace);
 
@@ -4333,7 +4508,7 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
-    public async Task AccessibilityLocator_ContinuesRingSearch_WhenPointProbeThrows()
+    public async Task AccessibilityLocator_ReturnsNull_WhenTreeHasNoBoundsEvenIfNearbyPointProbeMatches()
     {
         var calls = 0;
         var sandbox = new ScriptedSandbox(StableScreenshotA)
@@ -4357,13 +4532,11 @@ public sealed class ReplayEngineTests
         var hit = await new AccessibilityElementLocator()
             .LocateAsync(sandbox, descriptor, new ReplayOptions(), CancellationToken.None);
 
-        Assert.NotNull(hit);
-        Assert.Equal("accessibility-ring", hit.Source);
-        Assert.Equal(178, hit.CenterX);
+        Assert.Null(hit);
     }
 
     [Fact]
-    public async Task AccessibilityLocator_FallsBackToPointProbe_WhenTreeFetchThrows()
+    public async Task AccessibilityLocator_ReturnsNull_WhenTreeFetchThrows()
     {
         var sandbox = new ScriptedSandbox(StableScreenshotA)
         {
@@ -4382,14 +4555,11 @@ public sealed class ReplayEngineTests
         var hit = await new AccessibilityElementLocator()
             .LocateAsync(sandbox, descriptor, new ReplayOptions(), CancellationToken.None);
 
-        Assert.NotNull(hit);
-        Assert.Equal("accessibility-point", hit.Source);
-        Assert.Equal(170, hit.CenterX);
-        Assert.Equal(90, hit.CenterY);
+        Assert.Null(hit);
     }
 
     [Fact]
-    public async Task AccessibilityLocator_FallsBackToPointProbe_WhenTreeJsonIsMalformed()
+    public async Task AccessibilityLocator_ReturnsNull_WhenTreeJsonIsMalformed()
     {
         var sandbox = new ScriptedSandbox(StableScreenshotA)
         {
@@ -4408,10 +4578,7 @@ public sealed class ReplayEngineTests
         var hit = await new AccessibilityElementLocator()
             .LocateAsync(sandbox, descriptor, new ReplayOptions(), CancellationToken.None);
 
-        Assert.NotNull(hit);
-        Assert.Equal("accessibility-point", hit.Source);
-        Assert.Equal(170, hit.CenterX);
-        Assert.Equal(90, hit.CenterY);
+        Assert.Null(hit);
     }
 
     [Fact]
@@ -4871,6 +5038,53 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
+    public void TesseractOcrLocator_LocatesMultiTokenTextFromAdjacentRows()
+    {
+        var tsv =
+            """
+            level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+            5	1	1	1	1	1	10	10	30	20	96	Sign
+            5	1	1	1	1	2	45	10	20	20	95	In
+            """;
+
+        var hit = TesseractOcrTextLocator.TryLocateFromTsv(tsv, "Sign In");
+
+        Assert.NotNull(hit);
+        Assert.Equal("visual-ocr", hit.Source);
+        Assert.Equal(37, hit.CenterX);
+        Assert.Equal(20, hit.CenterY);
+        Assert.Equal(new TraceBoundingRegion { X = 10, Y = 10, Width = 55, Height = 20 }, hit.Region);
+    }
+
+    [Fact]
+    public void TesseractOcrLocator_DoesNotMatchSubstringInsideLongerToken()
+    {
+        var tsv =
+            """
+            level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+            5	1	1	1	1	1	10	10	60	20	96	Credit
+            """;
+
+        var hit = TesseractOcrTextLocator.TryLocateFromTsv(tsv, "Edit");
+
+        Assert.Null(hit);
+    }
+
+    [Fact]
+    public void TesseractOcrLocator_IgnoresLowConfidenceText()
+    {
+        var tsv =
+            """
+            level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+            5	1	1	1	1	1	10	10	40	20	42	Edit
+            """;
+
+        var hit = TesseractOcrTextLocator.TryLocateFromTsv(tsv, "Edit");
+
+        Assert.Null(hit);
+    }
+
+    [Fact]
     public async Task TesseractOcrLocator_ThrowsForNullInputs()
     {
         var visual = new TraceVisualDescriptor
@@ -5021,6 +5235,59 @@ public sealed class ReplayEngineTests
 
         Assert.True(result.Passed, result.FailedStep?.Diagnostic);
         Assert.True(probeCalls > 0);
+        var click = Assert.Single(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Click);
+        Assert.Equal(240, click.X);
+        Assert.Equal(105, click.Y);
+    }
+
+    [Fact]
+    public async Task Replay_DrivesClick_WhenOcrTargetMatchesTopMostAccessibilityText()
+    {
+        var ocrTarget = new LocatedTarget
+        {
+            CenterX = 240,
+            CenterY = 105,
+            Region = new TraceBoundingRegion { X = 180, Y = 90, Width = 120, Height = 30 },
+            Source = "custom-ocr-provider",
+            Confidence = 0.72,
+            Evidence = LocatedTargetEvidence.Ocr,
+        };
+        var visualLocator = new VisualSignatureElementLocator(
+            new ScriptedLocator(_ => null),
+            new StubOcrTextLocator(ocrTarget));
+        var sandbox = new ScriptedSandbox(StableScreenshotA)
+        {
+            AccessibilityAtPoint = (_, _) => Accessible("button", "Checkout button"),
+        };
+        var trace = MakeTrace(new TraceEntry
+        {
+            Sequence = 1,
+            Timestamp = FrozenNow,
+            Action = new TraceAction
+            {
+                InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 240, Y = 105 }],
+                Kind = "click",
+                TargetDescriptor = new TraceTargetDescriptor
+                {
+                    Visual = new TraceVisualDescriptor
+                    {
+                        Region = new TraceBoundingRegion { X = 180, Y = 90, Width = 120, Height = 30 },
+                        OcrText = "Checkout",
+                    },
+                },
+            },
+            Observation = new TraceObservation { ScreenshotPng = null, CapturedAt = FrozenNow },
+        });
+        var clock = new FakeTimeProvider(FrozenNow);
+        var engine = new ReplayEngine(
+            bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: visualLocator,
+            visualWait: new ImmediateWait(),
+            timeProvider: clock);
+
+        var result = await engine.ReplayAsync(sandbox, trace);
+
+        Assert.True(result.Passed, result.FailedStep?.Diagnostic);
         var click = Assert.Single(sandbox.RecordedInputEvents, e => e.Type == SandboxInputEventType.Click);
         Assert.Equal(240, click.X);
         Assert.Equal(105, click.Y);
@@ -5194,10 +5461,19 @@ public sealed class ReplayEngineTests
         var visualWait = new ImmediateWait();
         return new ReplayEngine(
             bridgeFactory: () => new ComputerUseBridge(timeProvider: clock),
+            locator: TestLocator(),
             visualWait: visualWait,
             healer: healer,
             timeProvider: clock);
     }
+
+    private static IElementLocator TestLocator()
+        => new CompositeElementLocator(
+            new AccessibilityElementLocator(),
+            new PointProbeFixtureLocator(),
+            new VisualSignatureElementLocator(
+                new PointProbeFixtureLocator(),
+                TesseractOcrTextLocator.Instance));
 
     private static SessionTrace MakeTrace(params TraceEntry[] entries) => new()
     {
@@ -5493,6 +5769,119 @@ public sealed class ReplayEngineTests
         public Task<LocatedTarget?> LocateAsync(
             ISandbox sandbox, TraceTargetDescriptor descriptor, ReplayOptions options, CancellationToken ct)
             => Task.FromResult(_produce(descriptor));
+    }
+
+    private sealed class PointProbeFixtureLocator : IElementLocator
+    {
+        private readonly IAccessibilityMatcher _matcher = DefaultAccessibilityMatcher.Instance;
+
+        public async Task<LocatedTarget?> LocateAsync(
+            ISandbox sandbox,
+            TraceTargetDescriptor descriptor,
+            ReplayOptions options,
+            CancellationToken ct)
+        {
+            var expected = descriptor.Accessibility;
+            if (expected is null || !_matcher.HasAnyAccessibilitySignal(expected))
+                return null;
+
+            var region = descriptor.Visual.Region;
+            if (region.Width <= 0 || region.Height <= 0)
+                return null;
+
+            var (cx, cy) = RecordedClickPoint(descriptor.Visual);
+            var point = await ProbeAsync(sandbox, cx, cy, expected, ct);
+            if (point is not null)
+            {
+                return new LocatedTarget
+                {
+                    CenterX = cx,
+                    CenterY = cy,
+                    Region = region,
+                    Source = "accessibility-point",
+                    Confidence = 1.0,
+                    Evidence = LocatedTargetEvidence.Accessibility,
+                };
+            }
+
+            for (var radius = options.RingSearchStep;
+                 radius <= options.RingSearchRadius;
+                 radius += options.RingSearchStep)
+            {
+                foreach (var (dx, dy) in SquareRingOffsets(radius, options.RingSearchStep))
+                {
+                    var px = cx + dx;
+                    var py = cy + dy;
+                    var match = await ProbeAsync(sandbox, px, py, expected, ct);
+                    if (match is null) continue;
+
+                    return new LocatedTarget
+                    {
+                        CenterX = px,
+                        CenterY = py,
+                        Region = new TraceBoundingRegion
+                        {
+                            X = region.X + px - cx,
+                            Y = region.Y + py - cy,
+                            Width = region.Width,
+                            Height = region.Height,
+                        },
+                        Source = "accessibility-ring",
+                        Confidence = 0.85,
+                        Evidence = LocatedTargetEvidence.Accessibility,
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        private async Task<SandboxAccessibilitySnapshot?> ProbeAsync(
+            ISandbox sandbox,
+            int x,
+            int y,
+            TraceAccessibilityDescriptor expected,
+            CancellationToken ct)
+        {
+            try
+            {
+                var snap = await sandbox.GetAccessibilityAtPointAsync(x, y, ct);
+                return snap is not null && _matcher.Matches(snap, expected) ? snap : null;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static (int X, int Y) RecordedClickPoint(TraceVisualDescriptor visual)
+        {
+            var region = visual.Region;
+            var x = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < region.Width
+                ? region.X + offsetX
+                : region.X + region.Width / 2;
+            var y = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
+                ? region.Y + offsetY
+                : region.Y + region.Height / 2;
+            return (x, y);
+        }
+
+        private static IEnumerable<(int Dx, int Dy)> SquareRingOffsets(int radius, int step)
+        {
+            if (radius <= 0) yield break;
+            for (var dy = -radius; dy <= radius; dy += step)
+            {
+                for (var dx = -radius; dx <= radius; dx += step)
+                {
+                    if (Math.Max(Math.Abs(dx), Math.Abs(dy)) != radius) continue;
+                    yield return (dx, dy);
+                }
+            }
+        }
     }
 
     private sealed class StubOcrTextLocator : IOcrTextLocator

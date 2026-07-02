@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using System.Globalization;
 
 namespace CodeyBox.ExploratoryTesting.Replay;
 
@@ -33,6 +34,7 @@ public sealed class TesseractOcrTextLocator : IOcrTextLocator
 
     private const int MaxOcrScreenshotBytes = 8 * 1024 * 1024;
     private const int MaxOcrStdoutBytes = 1024 * 1024;
+    private const double MinOcrConfidence = 50.0;
 
     public async Task<LocatedTarget?> LocateTextAsync(
         ISandbox sandbox,
@@ -123,19 +125,23 @@ public sealed class TesseractOcrTextLocator : IOcrTextLocator
         var topIndex = Array.IndexOf(columns, "top");
         var widthIndex = Array.IndexOf(columns, "width");
         var heightIndex = Array.IndexOf(columns, "height");
+        var confidenceIndex = Array.IndexOf(columns, "conf");
         var textIndex = Array.IndexOf(columns, "text");
-        if (leftIndex < 0 || topIndex < 0 || widthIndex < 0 || heightIndex < 0 || textIndex < 0)
+        if (leftIndex < 0 || topIndex < 0 || widthIndex < 0 || heightIndex < 0 || confidenceIndex < 0 || textIndex < 0)
             return rows;
 
         string? line;
         while ((line = reader.ReadLine()) is not null)
         {
             var parts = line.Split('\t');
-            if (parts.Length <= Math.Max(textIndex, Math.Max(heightIndex, Math.Max(widthIndex, Math.Max(leftIndex, topIndex)))))
+            if (parts.Length <= Math.Max(textIndex, Math.Max(confidenceIndex, Math.Max(heightIndex, Math.Max(widthIndex, Math.Max(leftIndex, topIndex))))))
                 continue;
 
             var text = parts[textIndex].Trim();
             if (string.IsNullOrWhiteSpace(text)) continue;
+            if (!double.TryParse(parts[confidenceIndex], NumberStyles.Float, CultureInfo.InvariantCulture, out var confidence))
+                continue;
+            if (confidence < MinOcrConfidence) continue;
             if (!int.TryParse(parts[leftIndex], out var left)) continue;
             if (!int.TryParse(parts[topIndex], out var top)) continue;
             if (!int.TryParse(parts[widthIndex], out var width)) continue;
@@ -157,7 +163,49 @@ public sealed class TesseractOcrTextLocator : IOcrTextLocator
     }
 
     private static bool TextMatches(string actual, string expected)
-        => actual.Contains(expected, StringComparison.OrdinalIgnoreCase);
+    {
+        var actualTokens = Tokenize(actual);
+        var expectedTokens = Tokenize(expected);
+        if (actualTokens.Length == 0 || expectedTokens.Length == 0)
+            return false;
+        if (actualTokens.Length != expectedTokens.Length)
+            return false;
+
+        for (var i = 0; i < actualTokens.Length; i++)
+        {
+            if (!string.Equals(actualTokens[i], expectedTokens[i], StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string[] Tokenize(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return [];
+
+        var tokens = new List<string>();
+        var start = -1;
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (char.IsLetterOrDigit(value[i]))
+            {
+                if (start < 0) start = i;
+                continue;
+            }
+
+            if (start >= 0)
+            {
+                tokens.Add(value[start..i]);
+                start = -1;
+            }
+        }
+
+        if (start >= 0)
+            tokens.Add(value[start..]);
+
+        return tokens.ToArray();
+    }
 
     private static LocatedTarget FromBounds(TraceBoundingRegion region) => new()
     {
