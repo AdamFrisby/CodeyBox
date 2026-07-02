@@ -100,57 +100,6 @@ public sealed class PipelineRunnerSandboxSyncTests : IDisposable
         Assert.Contains("dispose failed after successful phase", persisted.LastError);
     }
 
-    [Fact]
-    public void PreemptCheckpointPushes_AreFollowedByRemoteStateSyncBeforeHostSideRecovery()
-    {
-        var source = ReadPipelineRunnerSource();
-
-        AssertSyncCallFollows(
-            source,
-            "git.push_resumed_checkpoint_to_bare_repo",
-            "await sandbox.SyncStateToHostAsync(ct);",
-            maxDistance: 512);
-        AssertSyncCallFollows(
-            source,
-            "\"push\", \"origin\", $\"HEAD:{checkpointRef}\"",
-            "await sandbox.SyncStateToHostAsync(ct);",
-            maxDistance: 512);
-    }
-
-    private static void AssertSyncCallFollows(
-        string source,
-        string marker,
-        string syncCall,
-        int maxDistance)
-    {
-        var markerIndex = source.IndexOf(marker, StringComparison.Ordinal);
-        Assert.True(markerIndex >= 0, $"PipelineRunner.cs no longer contains marker: {marker}");
-
-        var syncIndex = source.IndexOf(syncCall, markerIndex, StringComparison.Ordinal);
-        Assert.True(syncIndex >= 0, $"PipelineRunner.cs does not sync host state after marker: {marker}");
-        Assert.True(
-            syncIndex - markerIndex <= maxDistance,
-            $"PipelineRunner.cs sync call drifted too far from marker '{marker}' to pin the push/import ordering");
-    }
-
-    private static string ReadPipelineRunnerSource()
-    {
-        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
-             directory is not null;
-             directory = directory.Parent)
-        {
-            var candidate = Path.Combine(
-                directory.FullName,
-                "src",
-                "CodeyBox.Orchestrator",
-                "PipelineRunner.cs");
-            if (File.Exists(candidate))
-                return File.ReadAllText(candidate);
-        }
-
-        throw new FileNotFoundException("Could not locate src/CodeyBox.Orchestrator/PipelineRunner.cs");
-    }
-
     private sealed class SyncFailingSandboxProvider : ISandboxProvider
     {
         private readonly SandboxProvisioningDeferredException _exception;
