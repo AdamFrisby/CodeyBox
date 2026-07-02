@@ -18,6 +18,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     public abstract AgentKind Kind { get; }
 
     /// <summary>
+    /// Wire <c>type</c> of the JSON envelope used to fold agent stderr
+    /// diagnostics into a structured (NDJSON) capture stream without
+    /// interleaving non-JSON noise. Exposed so runners in sibling assemblies
+    /// that hand-build the same envelope (e.g. antigravity folding its glog
+    /// into the stream) reuse this literal instead of re-hardcoding it and
+    /// silently desynchronising from <see cref="AgentStreamParser"/>'s parser.
+    /// </summary>
+    public const string StderrEnvelopeType = "codeybox.stderr";
+
+    /// <summary>
     /// Sandbox CLI invocation built by concrete agent runners. This stays
     /// protected so argv/environment/stdin details do not leak into Core's
     /// domain/plugin-facing API.
@@ -551,7 +561,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// </summary>
     internal sealed class StderrEnvelopeForwarder
     {
-        public const string EnvelopeType = "codeybox.stderr";
+        public const string EnvelopeType = StderrEnvelopeType;
 
         // A misbehaving CLI / tool can emit a single very long stderr line
         // without a newline (terminal control sequences, JSON dumps, stack

@@ -147,9 +147,9 @@ public sealed class AntigravityAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential);
 
-        var nonTailExecs = sandbox.AllExecs.Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail").ToList();
-        Assert.Equal(2, nonTailExecs.Count);
-        var prep = nonTailExecs[0];
+        var prepAndAgyExecs = NonInfraExecs(sandbox);
+        Assert.Equal(2, prepAndAgyExecs.Count);
+        var prep = prepAndAgyExecs[0];
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
@@ -157,7 +157,7 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Contains(AntigravityConstants.OAuthCredsEnvVar, script);
         Assert.Contains("chmod 600", script);
         // Second exec is the agy CLI invocation, not the prep hook.
-        Assert.Equal("agy", nonTailExecs[1].Argv[0]);
+        Assert.Equal("agy", prepAndAgyExecs[1].Argv[0]);
     }
 
     [Fact]
@@ -175,9 +175,9 @@ public sealed class AntigravityAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential);
 
-        var nonTailExecs = sandbox.AllExecs.Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail").ToList();
-        Assert.Single(nonTailExecs);
-        Assert.Equal("agy", nonTailExecs[0].Argv[0]);
+        var prepAndAgyExecs = NonInfraExecs(sandbox);
+        Assert.Single(prepAndAgyExecs);
+        Assert.Equal("agy", prepAndAgyExecs[0].Argv[0]);
     }
 
     [Fact]
@@ -190,10 +190,19 @@ public sealed class AntigravityAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
-        var nonTailExecs = sandbox.AllExecs.Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail").ToList();
-        Assert.Single(nonTailExecs);
-        Assert.Equal("agy", nonTailExecs[0].Argv[0]);
+        var prepAndAgyExecs = NonInfraExecs(sandbox);
+        Assert.Single(prepAndAgyExecs);
+        Assert.Equal("agy", prepAndAgyExecs[0].Argv[0]);
     }
+
+    // Filters out the infrastructure execs the runner emits around the agy
+    // invocation — the mkdir that guarantees the glog directory exists and the
+    // tail that reads the glog back — so a test can assert on just the prep
+    // hook + agy CLI calls.
+    private static List<SandboxExec> NonInfraExecs(AntigravityCapturingSandbox sandbox) =>
+        sandbox.AllExecs
+            .Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail" && e.Argv[0] != "mkdir")
+            .ToList();
 
     [Fact]
     public async Task RunAsync_WhenCaptureStructuredStreamTrue_AppendsOutputFormatStreamJson()
@@ -280,90 +289,194 @@ public sealed class AntigravityAgentRunnerTests
 
         Assert.False(result.Success);
         Assert.Contains("antigravity auth", result.Summary);
-        Assert.Single(sandbox.AllExecs);
+        // The prep hook failed before agy could run, so no agy invocation was
+        // dispatched (the mkdir that guarantees the log dir may run first).
+        Assert.DoesNotContain(sandbox.AllExecs, e => e.Argv.Count > 0 && e.Argv[0] == "agy");
+        Assert.Contains(sandbox.AllExecs, e => e.Argv.Count > 0 && e.Argv[0] == "bash");
     }
 
     [Fact]
-    public async Task RunAsync_CapturesAgyLogFileAndAppendsToStderrAndStreams()
+    public async Task RunAsync_FailedRun_CapturesAgyLogFileIntoStderrAndStreams()
     {
-        // Arrange
+        // A FAILED agy run is the case where the glog must reach the
+        // failure/quota/auth classifiers — those read result.Stderr. Verify the
+        // glog is both merged into Stderr (classifier input) and archived to the
+        // stream (operator-facing capture).
         var sandbox = new AntigravityLogCapturingSandbox(
-            logFileContent: "Model resolved: gemini-3.5-flash\nRESOURCE_EXHAUSTED (code 429): Individual quota reached"
+            logFileContent: "Model resolved: gemini-3.5-flash\nRESOURCE_EXHAUSTED (code 429): Individual quota reached",
+            agyExitCode: 1
         );
         var runner = new AntigravityAgentRunner();
-        
+
         var streamedChunks = new List<string>();
         Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
 
-        // Act
         var result = await runner.RunAsync(
-            sandbox, 
-            "/work", 
-            "do something", 
-            credential: null, 
-            stdoutChunkCallback: stdoutChunkCallback, 
-            captureStructuredStream: false
-        );
+            sandbox, "/work", "do something", credential: null,
+            stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: false);
 
-        // Assert
-        // 1. Verify tail was executed with the expected log file path.
+        // 1. tail reads back a /work-rooted log path (provider-agnostic, under
+        //    SandboxConventions.AgentLogDir), NOT a hardcoded /home/ubuntu path.
         var tailExec = sandbox.AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "tail");
         Assert.NotNull(tailExec);
-        Assert.Equal("tail", tailExec.Argv[0]);
-        Assert.Equal("-c", tailExec.Argv[1]);
-        Assert.Equal("262144", tailExec.Argv[2]);
-        var logFilePath = tailExec.Argv[3];
-        Assert.StartsWith("/home/ubuntu/.gemini/antigravity-cli/agy-run-", logFilePath);
-        Assert.EndsWith(".log", logFilePath);
+        Assert.Equal("-c", tailExec!.Argv[1]);
+        Assert.Equal((256 * 1024).ToString(), tailExec.Argv[2]);
+        var tailedPath = tailExec.Argv[3];
+        Assert.StartsWith("/work/.codeybox/agent-logs/agy-run-", tailedPath);
+        Assert.EndsWith(".log", tailedPath);
 
-        // 2. Verify the log file contents were merged into the result's Stderr.
+        // 2. agy was invoked with --log-file pointing at the SAME path tail read.
+        //    Without this a regression that dropped/mismatched --log-file would
+        //    leave agy logging to its default file and go undetected.
+        var agyExec = sandbox.CapturedAgyExec;
+        Assert.NotNull(agyExec);
+        var logFileIdx = IndexOf(agyExec!.Argv, "--log-file");
+        Assert.True(logFileIdx >= 0, "expected --log-file in agy argv");
+        Assert.Equal(tailedPath, agyExec.Argv[logFileIdx + 1]);
+
+        // 3. On a failed run the glog is merged into Stderr for the classifiers.
         Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr);
         Assert.Contains("Model resolved: gemini-3.5-flash", result.Stderr);
 
-        // 3. Verify the log file contents were streamed.
+        // 4. And archived to the stream for observability.
         Assert.Contains("Model resolved: gemini-3.5-flash\n", streamedChunks);
         Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
     }
 
     [Fact]
-    public async Task RunAsync_WithStructuredStream_EnvelopesLogLines()
+    public async Task RunAsync_SuccessfulRun_DoesNotMergeGlogIntoStderr()
     {
-        // Arrange
+        // Classifier-safety: agy's glog is cumulative and records transient
+        // errors it later recovered from. The pipeline runs the auth classifier
+        // over Stderr even on SUCCESS, so a recovered "RESOURCE_EXHAUSTED" /
+        // "API Error: 401" line in the glog must NOT reach Stderr on a
+        // successful run — else the member gets falsely benched/parked. The
+        // glog is still archived to the stream for observability.
         var sandbox = new AntigravityLogCapturingSandbox(
-            logFileContent: "Line 1\nLine 2"
+            logFileContent: "applyAuthResult: authMethod=consumer\nRESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)",
+            agyExitCode: 0
         );
         var runner = new AntigravityAgentRunner();
-        
+
         var streamedChunks = new List<string>();
         Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
 
-        // Act
         var result = await runner.RunAsync(
-            sandbox, 
-            "/work", 
-            "do something", 
-            credential: null, 
-            stdoutChunkCallback: stdoutChunkCallback, 
-            captureStructuredStream: true
-        );
+            sandbox, "/work", "do something", credential: null,
+            stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: false);
 
-        // Assert
-        // Verify the log file contents were streamed as JSON envelopes.
+        Assert.True(result.Success);
+        // Stderr must NOT carry the recovered-transient glog lines.
+        Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain("applyAuthResult", result.Stderr ?? string.Empty);
+        // But the stream archive still surfaces the diagnostics to operators.
+        Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)\n", streamedChunks);
+        Assert.Contains("applyAuthResult: authMethod=consumer\n", streamedChunks);
+    }
+
+    [Fact]
+    public async Task RunAsync_CapturedGlog_RedactsGoogleOAuthTokens()
+    {
+        // agy's auth glog is the most likely place a Google OAuth access/refresh
+        // token surfaces in plaintext. The capture must scrub ya29./1// tokens
+        // (via the normal RedactText path) before they land in the stream/audit.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "fileTokenStorage: access_token=ya29.aVeryLongGoogleAccessTokenValue0123456789 refresh=1//0longRefreshTokenValue0123456789",
+            agyExitCode: 1
+        );
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "do something", credential: null,
+            stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: false);
+
+        Assert.DoesNotContain("ya29.aVeryLong", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain("1//0longRefresh", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain(streamedChunks, chunk => chunk.Contains("ya29.aVeryLong"));
+        Assert.DoesNotContain(streamedChunks, chunk => chunk.Contains("1//0longRefresh"));
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_FailedRun_CapturesAgyLogFileIntoStderr()
+    {
+        // The resume override has the same log-capture wiring as RunAsync;
+        // exercise its glog merge on a failed resumed run so the branch is not
+        // left unverified.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "resumed conversation\nRESOURCE_EXHAUSTED (code 429): Individual quota reached",
+            agyExitCode: 1
+        );
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
+
+        var resume = new AgentResumeContext(
+            CheckpointRef: "agy-conversation:conv-7",
+            ScratchpadArchivePath: "/nonexistent/.codeybox/preempt-scratchpad.tgz");
+
+        var result = await runner.RunResumedAsync(
+            sandbox, "/work", "next turn", credential: null, resume,
+            stdoutChunkCallback: stdoutChunkCallback);
+
+        // agy invoked with --log-file matching the tailed path on the resume path too.
+        var tailExec = sandbox.AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "tail");
+        Assert.NotNull(tailExec);
+        var tailedPath = tailExec!.Argv[3];
+        var agyExec = sandbox.CapturedAgyExec;
+        Assert.NotNull(agyExec);
+        var logFileIdx = IndexOf(agyExec!.Argv, "--log-file");
+        Assert.True(logFileIdx >= 0, "expected --log-file in resumed agy argv");
+        Assert.Equal(tailedPath, agyExec.Argv[logFileIdx + 1]);
+
+        Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr);
+        Assert.Contains("resumed conversation\n", streamedChunks);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithStructuredStream_EnvelopesLogLines()
+    {
+        // Structured-stream transport: the glog is folded into the NDJSON stream
+        // as codeybox.stderr envelopes. Failed run so the merge is exercised on
+        // both the stream and Stderr.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Line 1\nLine 2",
+            agyExitCode: 1
+        );
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "do something", credential: null,
+            stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: true);
+
+        // Streamed as JSON envelopes keyed on the shared envelope type.
         Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 1\"}\n", streamedChunks);
         Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 2\"}\n", streamedChunks);
+        // The classifier-facing Stderr merge is populated regardless of transport.
+        Assert.Contains("Line 1", result.Stderr);
+        Assert.Contains("Line 2", result.Stderr);
     }
 
     private sealed class AntigravityLogCapturingSandbox : ISandbox
     {
         private readonly string _logFileContent;
+        private readonly int _agyExitCode;
 
-        public AntigravityLogCapturingSandbox(string logFileContent)
+        public AntigravityLogCapturingSandbox(string logFileContent, int agyExitCode = 0)
         {
             _logFileContent = logFileContent;
+            _agyExitCode = agyExitCode;
         }
 
         public string Id => "fake-antigravity-log-sandbox";
         public List<SandboxExec> AllExecs { get; } = new();
+        public SandboxExec? CapturedAgyExec => AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "agy");
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
@@ -372,7 +485,11 @@ public sealed class AntigravityAgentRunnerTests
             {
                 return Task.FromResult(new SandboxExecResult(0, _logFileContent, string.Empty));
             }
-            return Task.FromResult(new SandboxExecResult(0, "stdout-response", "stderr-response"));
+            if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "bash"))
+            {
+                return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+            }
+            return Task.FromResult(new SandboxExecResult(_agyExitCode, "stdout-response", _agyExitCode == 0 ? string.Empty : "agy failed"));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

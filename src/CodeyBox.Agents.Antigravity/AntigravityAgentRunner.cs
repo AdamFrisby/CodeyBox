@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Threading;
 using CodeyBox.Agents;
@@ -23,13 +24,18 @@ namespace CodeyBox.Agents.Antigravity;
 /// </summary>
 public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
-    private sealed class InvocationTracker
-    {
-        public bool Invoked { get; set; }
-    }
+    /// <summary>
+    /// Upper bound on how many bytes of agy's glog we read back and merge into
+    /// the captured output (256 KiB). agy's glog is cumulative and can grow
+    /// large on a long tool-heavy run; the read is bounded so a runaway log
+    /// can't be ingested unbounded into Stderr, the stream, and the audit log.
+    /// </summary>
+    private const int MaxLogTailBytes = 256 * 1024;
 
+    // Threads the per-invocation agy log path into BuildAgyInvocation (whose
+    // signature is fixed by the base class) without a new IAgentRunner
+    // parameter. Set for the duration of a single run and cleared in finally.
     private readonly AsyncLocal<string?> _currentLogPath = new();
-    private readonly AsyncLocal<InvocationTracker?> _agentInvoked = new();
 
     public override AgentKind Kind => AgentKind.Antigravity;
 
@@ -132,7 +138,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         return null;
     }
 
-    public override async Task<AgentResult> RunAsync(
+    public override Task<AgentResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
         string prompt,
@@ -142,28 +148,14 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
-    {
-        var logFile = $"/home/ubuntu/.gemini/antigravity-cli/agy-run-{Guid.NewGuid():N}.log";
-        _currentLogPath.Value = logFile;
-        var tracker = new InvocationTracker();
-        _agentInvoked.Value = tracker;
-        try
-        {
-            var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback, captureStructuredStream).ConfigureAwait(false);
-            if (tracker.Invoked)
-            {
-                return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream, ct).ConfigureAwait(false);
-            }
-            return result;
-        }
-        finally
-        {
-            _currentLogPath.Value = null;
-            _agentInvoked.Value = null;
-        }
-    }
+        => RunWithLogCaptureAsync(
+            sandbox,
+            captureStructuredStream,
+            stdoutChunkCallback,
+            ct,
+            () => base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback, captureStructuredStream));
 
-    public override async Task<AgentResult> RunResumedAsync(
+    public override Task<AgentResult> RunResumedAsync(
         ISandbox sandbox,
         string workingDirectory,
         string prompt,
@@ -173,25 +165,85 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         string? reasoningMode = null,
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null)
+        => RunWithLogCaptureAsync(
+            sandbox,
+            // Resume turns deliberately do not request the structured stream
+            // (see CliAgentRunnerBase.RunResumedAsync), so the folded glog uses
+            // the same plaintext line shape.
+            captureStructuredStream: false,
+            stdoutChunkCallback,
+            ct,
+            () => base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, stdoutChunkCallback));
+
+    /// <summary>
+    /// Shared lifecycle for both run overrides: pick the per-run agy glog path,
+    /// publish it for <see cref="BuildAgyInvocation"/> to emit as
+    /// <c>--log-file</c>, ensure the directory exists, run the base invocation,
+    /// then fold the glog into the captured output. The setup/teardown lives
+    /// here once so the log-path convention can't drift between the two paths.
+    /// </summary>
+    private async Task<AgentResult> RunWithLogCaptureAsync(
+        ISandbox sandbox,
+        bool captureStructuredStream,
+        Action<string>? stdoutChunkCallback,
+        CancellationToken ct,
+        Func<Task<AgentResult>> runBase)
     {
-        var logFile = $"/home/ubuntu/.gemini/antigravity-cli/agy-run-{Guid.NewGuid():N}.log";
+        var logFile = ComputeAgyLogPath();
         _currentLogPath.Value = logFile;
-        var tracker = new InvocationTracker();
-        _agentInvoked.Value = tracker;
         try
         {
-            var result = await base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, stdoutChunkCallback).ConfigureAwait(false);
-            if (tracker.Invoked)
-            {
-                return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream: false, ct).ConfigureAwait(false);
-            }
-            return result;
+            await EnsureLogDirectoryAsync(sandbox, logFile, ct).ConfigureAwait(false);
+            var result = await runBase().ConfigureAwait(false);
+            return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream, ct).ConfigureAwait(false);
         }
         finally
         {
             _currentLogPath.Value = null;
-            _agentInvoked.Value = null;
         }
+    }
+
+    /// <summary>
+    /// Deterministic per-run path agy is told to write its glog to. Co-located
+    /// with the orchestrator-assigned per-invocation log path
+    /// (<see cref="AgentInvocationLogContext.CurrentLogPath"/>) so it correlates
+    /// with the rest of the run's capture and lives under
+    /// <see cref="SandboxConventions.AgentLogDir"/> — which is on the <c>/work</c>
+    /// mount (survives a multipass suspend) and created by the exec wrapper. The
+    /// fallback (test / non-pipeline callers with no assigned path) still lands
+    /// under <c>AgentLogDir</c> rather than a provider-specific <c>$HOME</c> the
+    /// process/bubblewrap sandboxes do not necessarily share.
+    /// </summary>
+    private static string ComputeAgyLogPath()
+    {
+        var assigned = AgentInvocationLogContext.CurrentLogPath;
+        return string.IsNullOrEmpty(assigned)
+            ? $"{SandboxConventions.AgentLogDir}/agy-run-{Guid.NewGuid():N}.log"
+            : assigned + ".agy.log";
+    }
+
+    /// <summary>
+    /// agy's <c>--log-file</c> open fails if the parent directory is missing.
+    /// The exec wrapper only creates the log dir when <c>CODEYBOX_AGENT_LOG_FILE</c>
+    /// is set, and <see cref="PrepareSandboxAsync"/> only creates
+    /// <c>~/.gemini/…</c> on the OAuth-creds branch — so create the directory
+    /// unconditionally here, before agy runs, independent of the credential path.
+    /// </summary>
+    private static async Task EnsureLogDirectoryAsync(ISandbox sandbox, string logFile, CancellationToken ct)
+    {
+        var dir = PosixDirName(logFile);
+        if (dir.Length == 0)
+            return;
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["mkdir", "-p", dir],
+        }, ct).ConfigureAwait(false);
+    }
+
+    private static string PosixDirName(string path)
+    {
+        var idx = path.LastIndexOf('/');
+        return idx <= 0 ? string.Empty : path[..idx];
     }
 
     private async Task<AgentResult> ProcessResultAsync(
@@ -202,53 +254,91 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         bool captureStructuredStream,
         CancellationToken ct)
     {
+        SandboxExecResult tailCmd;
         try
         {
-            var tailCmd = await sandbox.ExecAsync(new SandboxExec
+            tailCmd = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["tail", "-c", "262144", logFile],
+                // tail keeps the last MaxLogTailBytes; for the motivating case
+                // (near-0-byte stdout, small glog) the whole file fits.
+                Argv = ["tail", "-c", MaxLogTailBytes.ToString(CultureInfo.InvariantCulture), logFile],
             }, ct).ConfigureAwait(false);
-
-            if (!tailCmd.Success || string.IsNullOrEmpty(tailCmd.Stdout))
-            {
-                return result;
-            }
-
-            var logContent = tailCmd.Stdout;
-            var redactedLog = RawOutputRedactor.Redact(logContent);
-
-            var mergedStderr = string.IsNullOrEmpty(result.Stderr)
-                ? redactedLog
-                : result.Stderr + "\n" + redactedLog;
-
-            if (stdoutChunkCallback is not null)
-            {
-                var lines = redactedLog.Replace("\r", "", StringComparison.Ordinal).Split('\n');
-                var count = lines.Length;
-                if (count > 0 && string.IsNullOrEmpty(lines[count - 1]))
-                {
-                    count--;
-                }
-                for (int i = 0; i < count; i++)
-                {
-                    var line = lines[i];
-                    if (captureStructuredStream)
-                    {
-                        var envelope = JsonSerializer.Serialize(new { type = "codeybox.stderr", text = line }) + "\n";
-                        stdoutChunkCallback(envelope);
-                    }
-                    else
-                    {
-                        stdoutChunkCallback(line + "\n");
-                    }
-                }
-            }
-
-            return result with { Stderr = mergedStderr };
         }
-        catch
+        catch (OperationCanceledException)
+        {
+            // A requested cancellation must not be masked as a normal
+            // completion — let it propagate like the base class's own probes do.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // A broken capture path (sandbox/provider fault) must be observable
+            // rather than silently degrading back to zero diagnostics.
+            AuditLog.AgentLogCaptureFailed(Kind, ex.GetType().Name, ex.Message);
+            return result;
+        }
+
+        if (!tailCmd.Success || string.IsNullOrEmpty(tailCmd.Stdout))
         {
             return result;
+        }
+
+        // Redact with the same routine the normal stream-capture path uses
+        // (AgentStreamStore.RedactText) so token/auth lines in agy's glog are
+        // scrubbed identically before they reach Stderr, the stream, or audit.
+        var redactedLog = SensitiveDataRedactionEnricher.RedactText(tailCmd.Stdout);
+
+        // Always archive the glog to the per-run stream (observability / audit),
+        // regardless of run outcome — this is what surfaces agy's otherwise
+        // invisible diagnostics in the agent-stream files.
+        if (stdoutChunkCallback is not null)
+        {
+            ForwardLogToStream(redactedLog, stdoutChunkCallback, captureStructuredStream);
+        }
+
+        // Only feed the glog into result.Stderr when the run FAILED. agy's glog
+        // is cumulative and records transient errors it later recovered from
+        // (an internal 429 a retry cleared, an auth blip a refresh fixed). The
+        // pipeline runs the auth classifier over Stderr even on SUCCESS and the
+        // quota classifier over Stderr on failure; merging the glog on a
+        // successful run would falsely bench/park an item agy actually
+        // completed. Gating the Stderr merge on failure keeps the
+        // classifier-facing input authoritative while the stream archive above
+        // still surfaces the diagnostics.
+        if (result.Success)
+        {
+            return result;
+        }
+
+        var mergedStderr = string.IsNullOrEmpty(result.Stderr)
+            ? redactedLog
+            : result.Stderr + "\n" + redactedLog;
+        return result with { Stderr = mergedStderr };
+    }
+
+    private static void ForwardLogToStream(
+        string redactedLog,
+        Action<string> stdoutChunkCallback,
+        bool captureStructuredStream)
+    {
+        var lines = redactedLog.Replace("\r", "", StringComparison.Ordinal).Split('\n');
+        var count = lines.Length;
+        if (count > 0 && string.IsNullOrEmpty(lines[count - 1]))
+        {
+            count--;
+        }
+        for (int i = 0; i < count; i++)
+        {
+            var line = lines[i];
+            if (captureStructuredStream)
+            {
+                var envelope = JsonSerializer.Serialize(new { type = StderrEnvelopeType, text = line }) + "\n";
+                stdoutChunkCallback(envelope);
+            }
+            else
+            {
+                stdoutChunkCallback(line + "\n");
+            }
         }
     }
 
@@ -291,10 +381,6 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         bool useContinue,
         bool captureStructuredStream)
     {
-        if (_agentInvoked.Value is { } tracker)
-        {
-            tracker.Invoked = true;
-        }
         // agy --print --dangerously-skip-permissions [...]: one-shot prompt
         // that auto-approves tool calls. The sandbox boundary is the real
         // permission boundary — same shape we use for Claude.

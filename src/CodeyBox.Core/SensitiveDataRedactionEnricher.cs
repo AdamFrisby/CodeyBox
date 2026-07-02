@@ -40,6 +40,12 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
         + @"|rk_live_[A-Za-z0-9]{16,}"
         + @"|whsec_[A-Za-z0-9]{16,}"
         + @"|AIza[A-Za-z0-9_-]{35,}"
+        // Google OAuth access tokens (ya29.<...>) and refresh tokens (1//<...>).
+        // agy's auth diagnostics (applyAuthResult / fileTokenStorage) are the
+        // most likely place a Google token surfaces in plaintext, and neither
+        // shape matches the AIza API-key pattern above.
+        + @"|ya29\.[A-Za-z0-9_-]{20,}"
+        + @"|1//[A-Za-z0-9_-]{20,}"
         + @"|(?:A3T[A-Z0-9]|AKIA|ASIA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}"
         + @"|xox[baprs]-[A-Za-z0-9-]{10,}"
         + @"|xapp-[A-Za-z0-9-]{10,}"

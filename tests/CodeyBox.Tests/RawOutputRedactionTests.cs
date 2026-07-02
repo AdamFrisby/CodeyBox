@@ -47,6 +47,24 @@ public sealed class RawOutputRedactionTests
     }
 
     [Fact]
+    public void Redact_GoogleOAuthAccessToken_IsReplaced()
+    {
+        var result = RawOutputRedactor.Redact(
+            "applyAuthResult: access_token=ya29.aVeryLongGoogleAccessTokenValue0123456789");
+        Assert.DoesNotContain("ya29.aVeryLong", result);
+        Assert.Contains("***", result);
+    }
+
+    [Fact]
+    public void Redact_GoogleOAuthRefreshToken_IsReplaced()
+    {
+        var result = RawOutputRedactor.Redact(
+            "refresh_token=1//0longRefreshTokenValue0123456789abcdef");
+        Assert.DoesNotContain("1//0longRefresh", result);
+        Assert.Contains("***", result);
+    }
+
+    [Fact]
     public void Redact_MultipleSecrets_AllReplaced()
     {
         var input = "token1=gho_aaa123 token2=ghp_bbb456 done";

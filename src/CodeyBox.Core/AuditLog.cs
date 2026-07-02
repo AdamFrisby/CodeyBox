@@ -250,6 +250,17 @@ public static class AuditLog
             .Warning("Agent {Agent} killed by stuck probe in phase {Phase}", agent.Value, phase);
 
     /// <summary>
+    /// The post-run capture of an agent's private CLI log file (e.g. agy's
+    /// glog, read back via <c>tail</c>) threw. Emitted at <c>Warning</c> so a
+    /// broken diagnostics-capture path is observable rather than silently
+    /// degrading back to the zero-diagnostics state the capture exists to fix.
+    /// </summary>
+    public static void AgentLogCaptureFailed(AgentKind agent, string exceptionType, string message) =>
+        Audit("agent.log_capture_failed")
+            .Warning("Agent {Agent} CLI log capture failed ({ExceptionType}): {Message}",
+                agent.Value, exceptionType, message);
+
+    /// <summary>
     /// Per-attempt failure of the in-VM agentic conflict resolver. Carries the
     /// full stdout/stderr tail (truncated to <see cref="TruncateAuditTail"/>'s
     /// 2 KiB window) plus the runner kind, sandbox id, working directory, and
