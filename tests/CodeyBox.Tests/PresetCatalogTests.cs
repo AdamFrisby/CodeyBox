@@ -563,6 +563,80 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void ProjectConfigOverride_RejectsInvalidMissingToolSeverity()
+    {
+        var options = new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["security"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "security:bad-tool",
+                            Argv = ["semgrep", "--version"],
+                            MissingToolSeverity = "notice",
+                        },
+                    ],
+                },
+            },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(options));
+
+        Assert.Contains("missingToolSeverity", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("not a recognised audit severity", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProjectConfigOverride_RejectsInvalidRequiredCapability()
+    {
+        var options = new PresetCatalogOptions
+        {
+            AuditTypeOverrides =
+            {
+                ["security"] = new AuditTypePresetOverride
+                {
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "security:bad-capability",
+                            Argv = ["semgrep", "--version"],
+                            RequiredCapabilities = ["internet"],
+                        },
+                    ],
+                },
+            },
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(options));
+
+        Assert.Contains("requiredCapabilities", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("not a recognised audit capability", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void UserOverride_RejectsRepositoryProvidedRequiredCapabilities()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "security.yaml"), """
+            id: security
+            auditors:
+              - name: security:repo-semgrep
+                argv: ["semgrep", "--version"]
+                requiredCapabilities: ["network"]
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("requiredCapabilities is not allowed in repository-provided configuration", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void UserOverride_AdditiveAuditors_AppendsInOrder()
     {
         using var temp = TempProject();

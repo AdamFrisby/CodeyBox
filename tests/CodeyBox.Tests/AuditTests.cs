@@ -447,6 +447,26 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task ShellCommandAuditor_TreatExit127AsMissingTool_AppliesConfiguredSeverity()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "custom:optional-scan",
+            Argv = ["optional-scan"],
+            TreatExit127AsMissingTool = true,
+            MissingToolSeverity = AuditSeverity.Warning,
+        });
+        var sandbox = new FakeSandbox(_ => new SandboxExecResult(127, "", "optional-scan: not found"));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
+        Assert.Contains("tool not installed in sandbox: optional-scan", finding.Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_IgnoresFastFailuresWithoutStackTraceAndReportsRealFailures()
     {
         var auditor = CSharpTestPassAuditor();

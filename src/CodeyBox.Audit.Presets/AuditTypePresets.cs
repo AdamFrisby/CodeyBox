@@ -42,6 +42,8 @@ internal static class AuditTypePresets
                 $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/gateEvidence", a.Role, a.GateEvidence);
             var missingToolSeverity = PresetConfigLoader.ParseOptionalAuditSeverity(
                 $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/missingToolSeverity", a.MissingToolSeverity);
+            var required = PresetConfigLoader.ParseAuditCapabilities(
+                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/requiredCapabilities", a.RequiredCapabilities);
             if (string.IsNullOrWhiteSpace(a.Script))
             {
                 auditors.Add(Shell(
@@ -50,6 +52,7 @@ internal static class AuditTypePresets
                     role,
                     gateEvidence,
                     missingToolSeverity,
+                    required,
                     [.. a.Argv]));
             }
             else
@@ -64,6 +67,7 @@ internal static class AuditTypePresets
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     MissingToolSeverity = missingToolSeverity,
+                    Required = required,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = role,
                     BuildTestGateEvidence = gateEvidence,
@@ -113,12 +117,14 @@ internal static class AuditTypePresets
         AuditorRole role,
         BuildTestGateEvidence gateEvidence,
         AuditSeverity? missingToolSeverity,
+        AuditCapabilities required,
         params string[] argv)
         => new ShellCommandAuditor(new ShellCommandAuditorOptions
         {
             Name = name,
             Argv = argv,
             MissingToolSeverity = missingToolSeverity,
+            Required = required,
             CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
             Role = role,
             BuildTestGateEvidence = gateEvidence,

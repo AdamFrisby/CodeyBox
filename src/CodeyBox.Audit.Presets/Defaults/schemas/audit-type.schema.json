@@ -59,6 +59,17 @@
               "error"
             ]
           },
+          "requiredCapabilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "network",
+                "agent-credentials",
+                "graphical"
+              ]
+            }
+          },
           "canShortCircuitOnBlockingFinding": {
             "type": "boolean"
           },

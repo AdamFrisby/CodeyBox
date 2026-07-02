@@ -15,9 +15,11 @@ namespace CodeyBox.Audit.Shell;
 /// making this generic shell runner aware of language- or tool-specific
 /// output formats.
 ///
-/// Does NOT need agent credentials, so it runs in the credential-free audit
-/// sandbox. Operators concerned about a malicious build script reaching
-/// agent secrets should keep their checks in this auditor type.
+/// By default does not need agent credentials, so ordinary shell auditors run
+/// in the credential-free audit sandbox. Trusted preset/config authors can
+/// opt into additional sandbox capabilities for tool-specific needs such as
+/// package-registry network access; do not request agent credentials for
+/// repository-controlled commands unless that exposure is intentional.
 /// </summary>
 public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 {
@@ -31,7 +33,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 
     public string Name => _opts.Name;
     public string Kind => "shell";
-    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditCapabilities Required => _opts.Required;
     public bool CanShortCircuitOnBlockingFinding => _opts.CanShortCircuitOnBlockingFinding;
 
     public string? SelfReviewGuidance
@@ -175,6 +177,7 @@ public sealed record ShellCommandAuditorOptions
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
     public IShellCommandResultClassifier? ResultClassifier { get; init; }
+    public AuditCapabilities Required { get; init; } = AuditCapabilities.None;
     public AuditSeverity? MissingToolSeverity { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;

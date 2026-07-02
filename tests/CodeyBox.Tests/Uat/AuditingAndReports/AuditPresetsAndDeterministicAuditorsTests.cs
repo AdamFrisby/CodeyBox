@@ -164,6 +164,8 @@ public sealed class AuditPresetsAndDeterministicAuditorsTests
         Assert.Equal(
             ["semgrep", "--config", "auto", "--error", "--quiet"],
             Assert.IsAssignableFrom<IShellAuditorArgvProvider>(auditors["security:semgrep"]).Argv);
+        Assert.Equal(AuditCapabilities.None, auditors["security:gitleaks"].Required);
+        Assert.Equal(AuditCapabilities.Network, auditors["security:semgrep"].Required);
     }
 
     [Fact]
@@ -198,12 +200,14 @@ public sealed class AuditPresetsAndDeterministicAuditorsTests
             ["semgrep", "--config", "auto", "--error", "--quiet"]));
     }
 
-    [Fact]
-    public async Task SecurityPreset_MissingToolSurfacesAsWarning()
+    [Theory]
+    [InlineData("security:gitleaks", "gitleaks")]
+    [InlineData("security:semgrep", "semgrep")]
+    public async Task SecurityPreset_MissingToolSurfacesAsWarning(string auditorName, string toolName)
     {
         var auditor = new PresetCatalog()
             .ResolveAuditType("security", new PresetContext(new CapturingAgent()))
-            .Single(a => a.Name == "security:gitleaks");
+            .Single(a => a.Name == auditorName);
         var sandbox = new RecordingSandbox(exec =>
             IsToolProbe(exec)
                 ? new SandboxExecResult(1, "", "")
@@ -214,9 +218,8 @@ public sealed class AuditPresetsAndDeterministicAuditorsTests
         Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Warning, finding.Severity);
-        Assert.Contains("tool not installed in sandbox: gitleaks", finding.Title, StringComparison.Ordinal);
-        Assert.DoesNotContain(sandbox.Executions, exec => exec.Argv.SequenceEqual(
-            ["gitleaks", "detect", "--source", ".", "--no-banner", "--no-color"]));
+        Assert.Contains($"tool not installed in sandbox: {toolName}", finding.Title, StringComparison.Ordinal);
+        Assert.DoesNotContain(sandbox.Executions, exec => exec.Argv.Count > 0 && exec.Argv[0] == toolName);
     }
 
     [Theory]

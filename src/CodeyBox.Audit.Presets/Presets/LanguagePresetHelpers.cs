@@ -14,7 +14,8 @@ internal static class LanguagePresetHelpers
         bool canShortCircuitOnBlockingFinding = false,
         AuditorRole role = AuditorRole.None,
         BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None,
-        AuditSeverity? missingToolSeverity = null)
+        AuditSeverity? missingToolSeverity = null,
+        AuditCapabilities required = AuditCapabilities.None)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -25,6 +26,7 @@ internal static class LanguagePresetHelpers
                 Argv = argv,
                 ResultClassifier = ResultClassifierFor(language, name, argv),
                 MissingToolSeverity = missingToolSeverity,
+                Required = required,
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
@@ -41,7 +43,8 @@ internal static class LanguagePresetHelpers
         bool canShortCircuitOnBlockingFinding = false,
         AuditorRole role = AuditorRole.None,
         BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None,
-        AuditSeverity? missingToolSeverity = null)
+        AuditSeverity? missingToolSeverity = null,
+        AuditCapabilities required = AuditCapabilities.None)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -53,6 +56,7 @@ internal static class LanguagePresetHelpers
                 ToolName = toolName,
                 TreatExit127AsMissingTool = treatExit127AsMissingTool,
                 MissingToolSeverity = missingToolSeverity,
+                Required = required,
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,

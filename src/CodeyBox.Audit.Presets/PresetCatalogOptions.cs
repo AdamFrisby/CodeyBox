@@ -82,6 +82,7 @@ public sealed class ConfiguredAuditor
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
     public string? MissingToolSeverity { get; set; }
+    public List<string> RequiredCapabilities { get; set; } = [];
     public bool CanShortCircuitOnBlockingFinding { get; set; }
     public string? Role { get; set; }
     public string? GateEvidence { get; set; }
@@ -95,6 +96,7 @@ public sealed class ConfiguredAuditor
             ToolName = ToolName,
             TreatExit127AsMissingTool = TreatExit127AsMissingTool,
             MissingToolSeverity = MissingToolSeverity,
+            RequiredCapabilities = [.. RequiredCapabilities],
             CanShortCircuitOnBlockingFinding = CanShortCircuitOnBlockingFinding,
             Role = Role,
             GateEvidence = GateEvidence,

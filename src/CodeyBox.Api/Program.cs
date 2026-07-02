@@ -3670,6 +3670,9 @@ namespace CodeyBox.Api
             "static.crates.io",
             "github.com",
             "release-assets.githubusercontent.com",
+            "semgrep.dev",
+            "registry.semgrep.dev",
+            "api.semgrep.dev",
         ];
         /// <summary>
         /// Legacy concurrency knob (deprecated). Used as

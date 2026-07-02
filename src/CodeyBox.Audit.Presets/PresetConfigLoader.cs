@@ -148,6 +148,7 @@ internal sealed class PresetConfigLoader
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     MissingToolSeverity = a.MissingToolSeverity,
+                    RequiredCapabilities = [.. a.RequiredCapabilities],
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
                     GateEvidence = a.GateEvidence,
@@ -173,6 +174,7 @@ internal sealed class PresetConfigLoader
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     MissingToolSeverity = a.MissingToolSeverity,
+                    RequiredCapabilities = [.. a.RequiredCapabilities],
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
                     GateEvidence = a.GateEvidence,
@@ -488,6 +490,9 @@ internal sealed class PresetConfigLoader
         }
         if (!string.IsNullOrWhiteSpace(auditor.MissingToolSeverity))
             _ = ParseOptionalAuditSeverity(source, $"{pointer}/missingToolSeverity", auditor.MissingToolSeverity);
+        if (!isTrusted && auditor.RequiredCapabilities.Count > 0)
+            throw new PresetConfigurationException($"{source}: {pointer}/requiredCapabilities is not allowed in repository-provided configuration. Audit sandbox capabilities must come from trusted configuration.");
+        _ = ParseAuditCapabilities(source, $"{pointer}/requiredCapabilities", auditor.RequiredCapabilities);
     }
 
     internal static AuditorRole ParseAuditorRole(string source, string pointer, string? role)
@@ -536,6 +541,30 @@ internal sealed class PresetConfigLoader
             "error" => AuditSeverity.Error,
             _ => throw new PresetConfigurationException($"{source}: {pointer} = '{severity}' is not a recognised audit severity. Allowed values: info, warning, error."),
         };
+    }
+
+    internal static AuditCapabilities ParseAuditCapabilities(
+        string source,
+        string pointer,
+        IReadOnlyList<string>? capabilities)
+    {
+        if (capabilities is null || capabilities.Count == 0)
+            return AuditCapabilities.None;
+
+        var parsed = AuditCapabilities.None;
+        for (var i = 0; i < capabilities.Count; i++)
+        {
+            var capability = capabilities[i];
+            parsed |= capability.Trim().ToLowerInvariant() switch
+            {
+                "network" => AuditCapabilities.Network,
+                "agent-credentials" or "agentcredentials" => AuditCapabilities.AgentCredentials,
+                "graphical" => AuditCapabilities.Graphical,
+                _ => throw new PresetConfigurationException($"{source}: {pointer}/{i} = '{capability}' is not a recognised audit capability. Allowed values: network, agent-credentials, graphical."),
+            };
+        }
+
+        return parsed;
     }
 
     private static void ValidateToolName(string source, string pointer, string? tool, bool isTrusted)
@@ -642,6 +671,10 @@ internal sealed class PresetConfigLoader
                 $"language '{definition.Id}'",
                 $"/auditors/{a.Name}/missingToolSeverity",
                 a.MissingToolSeverity);
+            var required = ParseAuditCapabilities(
+                $"language '{definition.Id}'",
+                $"/auditors/{a.Name}/requiredCapabilities",
+                a.RequiredCapabilities);
             return string.IsNullOrWhiteSpace(a.Script)
                 ? LanguagePresetHelpers.Shell(
                     definition.Id,
@@ -652,7 +685,8 @@ internal sealed class PresetConfigLoader
                     a.CanShortCircuitOnBlockingFinding,
                     role,
                     gateEvidence,
-                    missingToolSeverity)
+                    missingToolSeverity,
+                    required)
                 : LanguagePresetHelpers.ShellScript(
                     definition.Id,
                     markerDescription,
@@ -664,7 +698,8 @@ internal sealed class PresetConfigLoader
                     a.CanShortCircuitOnBlockingFinding,
                     role,
                     gateEvidence,
-                    missingToolSeverity);
+                    missingToolSeverity,
+                    required);
         }).ToList();
     }
 
@@ -734,6 +769,7 @@ internal sealed class AuditorDefinition
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
     public string? MissingToolSeverity { get; set; }
+    public List<string> RequiredCapabilities { get; set; } = [];
     public bool CanShortCircuitOnBlockingFinding { get; set; }
 
     /// <summary>

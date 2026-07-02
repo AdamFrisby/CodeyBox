@@ -139,6 +139,53 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public async Task Compose_AppliesProjectAuditTypeAuditorMissingToolSeverityAndCapabilities()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["security"],
+                AuditTypeOverrides = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["security"] = new()
+                    {
+                        Auditors =
+                        [
+                            new ProjectConfiguredAuditor
+                            {
+                                Name = "security:project-semgrep",
+                                Argv = ["semgrep", "--version"],
+                                MissingToolSeverity = "warning",
+                                RequiredCapabilities = ["network"],
+                            },
+                        ],
+                    },
+                },
+            },
+        };
+
+        var auditor = composer.Compose(project, new CapturingAgent())
+            .Single(a => a.Name == "security:project-semgrep");
+
+        Assert.Equal(AuditCapabilities.Network, auditor.Required);
+        var result = await auditor.RunAsync(new MissingToolSandbox(), "/work", new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work"));
+
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
+        Assert.Contains("tool not installed in sandbox: semgrep", finding.Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Compose_ProjectLanguageOverrideRejectsInvalidTrustedRole()
     {
         var composer = new ProjectAuditorComposer(new PresetCatalog());
@@ -494,6 +541,16 @@ public sealed class ProjectAuditorComposerPresetTests
 
             return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class MissingToolSandbox : ISandbox
+    {
+        public string Id => "missing-tool";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(1, "", ""));
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
