@@ -101,13 +101,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     // deadline under thread-pool starvation, making the test flaky).
     internal TimeSpan? AdoptionPollIntervalOverride { get; set; }
 
-    // Test seam: override the WaitForDetachedCompletionAsync poll interval.
-    // Production polls every 2s; tests set a small value so the loop is not
-    // wall-clock-bound (the same 2s Task.Delay drift under thread-pool
-    // starvation that motivates AdoptionPollIntervalOverride can push a
-    // multi-poll detached-completion loop past a short test deadline).
-    internal TimeSpan? DetachedPollIntervalOverride { get; set; }
-
     // Cache for ListAllManagedAsync results to avoid hammering multipassd.
     private IReadOnlyList<ManagedSandboxInfo>? _listCache;
     private DateTimeOffset _listCacheExpiry = DateTimeOffset.MinValue;
@@ -5122,6 +5115,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedSupervisorSetupFailedExitCode = 88;
     private const int DetachedPollFailureLimit = 5;
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
+
+    // Test seam: override the WaitForDetachedCompletionAsync poll interval.
+    // Production polls every 2s; tests set a small value so the loop is not
+    // wall-clock-bound (a real 2s Task.Delay can drift well past a short test
+    // deadline under thread-pool starvation, making the test flaky).
+    internal TimeSpan? DetachedPollIntervalOverride { get; set; }
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
