@@ -12,6 +12,9 @@ public sealed record MultipassRemoteSandboxOptions
     public const int DefaultServerAliveIntervalSeconds = 30;
     public const int DefaultServerAliveCountMax = 6;
     public const int DefaultConnectTimeoutSeconds = 20;
+    public const long DefaultStageOutMaxArchiveBytes = 2L * 1024 * 1024 * 1024;
+    public const int DefaultStageOutMaxEntries = 200_000;
+    public const double DefaultStageOutMaxExpansionRatio = 1.5d;
     public static readonly TimeSpan DefaultVmStartTimeout = TimeSpan.FromMinutes(3);
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
 
@@ -147,6 +150,26 @@ public sealed record MultipassRemoteSandboxOptions
     public string LocalTarBinary { get; init; } = "tar";
 
     /// <summary>
+    /// Maximum tar bytes accepted from a remote writable mount during stage-out.
+    /// The archive lands on the coordinator before validation, so this cap bounds
+    /// how much sandbox-controlled content can be persisted locally per sync.
+    /// </summary>
+    public long StageOutMaxArchiveBytes { get; init; } = DefaultStageOutMaxArchiveBytes;
+
+    /// <summary>
+    /// Maximum non-metadata tar entries accepted during stage-out validation.
+    /// Keeps hostile trees from forcing unbounded validation/extraction work.
+    /// </summary>
+    public int StageOutMaxEntries { get; init; } = DefaultStageOutMaxEntries;
+
+    /// <summary>
+    /// Maximum declared regular-file payload divided by archive bytes. Remote
+    /// stage-out uses uncompressed tar, so ratios materially above 1 indicate
+    /// sparse or malformed archive content that could expand unexpectedly.
+    /// </summary>
+    public double StageOutMaxExpansionRatio { get; init; } = DefaultStageOutMaxExpansionRatio;
+
+    /// <summary>
     /// Absolute path to the multipass binary on the remote host. The remote
     /// host may have multipass installed via snap (<c>/snap/bin/multipass</c>)
     /// or as a system package; this lets the operator point at whichever.
@@ -212,6 +235,9 @@ public sealed record MultipassRemoteSandboxOptions
                     ServerAliveCountMax = options.ServerAliveCountMax,
                     ConnectTimeoutSeconds = options.ConnectTimeoutSeconds,
                     LocalTarBinary = options.LocalTarBinary,
+                    StageOutMaxArchiveBytes = options.StageOutMaxArchiveBytes,
+                    StageOutMaxEntries = options.StageOutMaxEntries,
+                    StageOutMaxExpansionRatio = options.StageOutMaxExpansionRatio,
                     RemoteMultipassPath = options.RemoteMultipassPath,
                     RemoteStagingRoot = options.RemoteStagingRoot,
                     DefaultImage = options.DefaultImage,
@@ -253,6 +279,9 @@ public sealed record MultipassRemoteSandboxOptions
                 ServerAliveCountMax = host.ServerAliveCountMax ?? options.ServerAliveCountMax,
                 ConnectTimeoutSeconds = host.ConnectTimeoutSeconds ?? options.ConnectTimeoutSeconds,
                 LocalTarBinary = FirstNonWhiteSpace(host.LocalTarBinary, options.LocalTarBinary),
+                StageOutMaxArchiveBytes = host.StageOutMaxArchiveBytes ?? options.StageOutMaxArchiveBytes,
+                StageOutMaxEntries = host.StageOutMaxEntries ?? options.StageOutMaxEntries,
+                StageOutMaxExpansionRatio = host.StageOutMaxExpansionRatio ?? options.StageOutMaxExpansionRatio,
                 RemoteMultipassPath = FirstNonWhiteSpace(host.RemoteMultipassPath, options.RemoteMultipassPath),
                 RemoteStagingRoot = FirstNonWhiteSpace(host.RemoteStagingRoot, options.RemoteStagingRoot),
                 DefaultImage = host.DefaultImage ?? options.DefaultImage,
@@ -292,6 +321,9 @@ public sealed record MultipassRemoteExecutorHostOptions
     public int? ServerAliveCountMax { get; init; }
     public int? ConnectTimeoutSeconds { get; init; }
     public string? LocalTarBinary { get; init; }
+    public long? StageOutMaxArchiveBytes { get; init; }
+    public int? StageOutMaxEntries { get; init; }
+    public double? StageOutMaxExpansionRatio { get; init; }
     public string? RemoteMultipassPath { get; init; }
     public string? RemoteStagingRoot { get; init; }
     public string? DefaultImage { get; init; }

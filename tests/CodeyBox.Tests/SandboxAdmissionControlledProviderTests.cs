@@ -248,18 +248,19 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
-    public async Task RemoteRetainedDisposeFailure_ReleasesGlobalAdmissionForReroute()
+    public async Task RetainedDisposeFailureMarkedNonAdmitted_ReleasesGlobalAdmissionForReroute()
     {
         var inner = new CountingSandboxProvider
         {
             NextSandboxDisposeException = new SandboxProvisioningDeferredException(
-                provider: "multipass-remote",
+                provider: "provider-with-host-local-retention",
                 operation: "sync-back",
                 errorClass: "remote-syncback-failed",
                 detail: "host=executor-a; vm=sandbox-1; ssh dropped",
                 recheckIn: TimeSpan.FromSeconds(1),
                 retainedSandboxName: "sandbox-1",
-                retainedSandboxHostId: "executor-a"),
+                retainedSandboxHostId: "executor-a",
+                retainedSandboxConsumesAdmission: false),
         };
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
         var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);

@@ -489,7 +489,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             .ToArray();
         if (activeMatches.Length == 1)
         {
-            await activeMatches[0].DisposeAsync().ConfigureAwait(false);
+            await activeMatches[0].ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
             return;
         }
         if (activeMatches.Length > 1)
@@ -553,7 +553,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         if (!string.IsNullOrWhiteSpace(sandbox.HostId)
             && _active.TryGetValue(new RemoteSandboxIdentity(sandbox.HostId!, sandbox.Name), out var active))
         {
-            await active.DisposeAsync().ConfigureAwait(false);
+            await active.ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
             return;
         }
 

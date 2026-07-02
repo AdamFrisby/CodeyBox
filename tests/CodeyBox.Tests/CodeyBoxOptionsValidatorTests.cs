@@ -1155,6 +1155,9 @@ public sealed class CodeyBoxOptionsValidatorTests
         {
             PlacementRecheckIn = TimeSpan.Zero,
             RuntimeUnhealthyBackoff = TimeSpan.FromSeconds(-1),
+            StageOutMaxArchiveBytes = 0,
+            StageOutMaxEntries = 0,
+            StageOutMaxExpansionRatio = 0.5d,
             ExecutorHosts =
             [
                 new MultipassRemoteExecutorHostConfig
@@ -1164,6 +1167,9 @@ public sealed class CodeyBoxOptionsValidatorTests
                     ServerAliveIntervalSeconds = 0,
                     ServerAliveCountMax = -1,
                     ConnectTimeoutSeconds = 0,
+                    StageOutMaxArchiveBytes = -1,
+                    StageOutMaxEntries = -1,
+                    StageOutMaxExpansionRatio = double.NaN,
                     VmStartTimeout = TimeSpan.Zero,
                     VmStopTimeout = TimeSpan.Zero,
                     VmStateCheckInterval = TimeSpan.Zero,
@@ -1176,12 +1182,18 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.True(result.Failed);
         Assert.Contains("PlacementRecheckIn must be positive", result.FailureMessage);
         Assert.Contains("RuntimeUnhealthyBackoff must be positive", result.FailureMessage);
+        Assert.Contains("StageOutMaxArchiveBytes must be > 0", result.FailureMessage);
+        Assert.Contains("StageOutMaxEntries must be > 0", result.FailureMessage);
+        Assert.Contains("StageOutMaxExpansionRatio must be >= 1", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:Id is required", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:SshTarget is required", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:MaxConcurrentSandboxes must be > 0", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:ServerAliveIntervalSeconds must be > 0", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:ServerAliveCountMax must be > 0", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:ConnectTimeoutSeconds must be > 0", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:StageOutMaxArchiveBytes must be > 0", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:StageOutMaxEntries must be > 0", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:StageOutMaxExpansionRatio must be >= 1", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:VmStartTimeout must be positive", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:VmStopTimeout must be positive", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:VmStateCheckInterval must be positive", result.FailureMessage);
@@ -1276,6 +1288,9 @@ public sealed class CodeyBoxOptionsValidatorTests
             ServerAliveCountMax = 22,
             ConnectTimeoutSeconds = 23,
             LocalTarBinary = "/usr/local/bin/tar",
+            StageOutMaxArchiveBytes = 123_456,
+            StageOutMaxEntries = 123,
+            StageOutMaxExpansionRatio = 1.25d,
             RemoteMultipassPath = "/remote/multipass",
             RemoteStagingRoot = "/stage/default",
             DefaultImage = "22.04",
@@ -1304,6 +1319,9 @@ public sealed class CodeyBoxOptionsValidatorTests
                     ServerAliveCountMax = 12,
                     ConnectTimeoutSeconds = 13,
                     LocalTarBinary = "/bin/tar",
+                    StageOutMaxArchiveBytes = 654_321,
+                    StageOutMaxEntries = 321,
+                    StageOutMaxExpansionRatio = 1.75d,
                     RemoteMultipassPath = "/usr/bin/multipass",
                     RemoteStagingRoot = "/stage/a",
                     DefaultImage = "24.04",
@@ -1338,6 +1356,9 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Equal(22, mapped.ServerAliveCountMax);
         Assert.Equal(23, mapped.ConnectTimeoutSeconds);
         Assert.Equal("/usr/local/bin/tar", mapped.LocalTarBinary);
+        Assert.Equal(123_456, mapped.StageOutMaxArchiveBytes);
+        Assert.Equal(123, mapped.StageOutMaxEntries);
+        Assert.Equal(1.25d, mapped.StageOutMaxExpansionRatio);
         Assert.Equal("/remote/multipass", mapped.RemoteMultipassPath);
         Assert.Equal("/stage/default", mapped.RemoteStagingRoot);
         Assert.Equal("22.04", mapped.DefaultImage);
@@ -1364,6 +1385,9 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Equal(12, host.ServerAliveCountMax);
         Assert.Equal(13, host.ConnectTimeoutSeconds);
         Assert.Equal("/bin/tar", host.LocalTarBinary);
+        Assert.Equal(654_321, host.StageOutMaxArchiveBytes);
+        Assert.Equal(321, host.StageOutMaxEntries);
+        Assert.Equal(1.75d, host.StageOutMaxExpansionRatio);
         Assert.Equal("/usr/bin/multipass", host.RemoteMultipassPath);
         Assert.Equal("/stage/a", host.RemoteStagingRoot);
         Assert.Equal("24.04", host.DefaultImage);

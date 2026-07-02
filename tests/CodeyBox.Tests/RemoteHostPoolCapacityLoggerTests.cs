@@ -43,6 +43,35 @@ public sealed class RemoteHostPoolCapacityLoggerTests
         Assert.Equal(100, warning.Properties["GlobalCap"]);
     }
 
+    [Fact]
+    public void Log_DoesNotWarnWhenFiniteHostCapacityIsWithinGlobalFanoutCap()
+    {
+        var logger = new CapturingLogger<RemoteHostPoolCapacityLoggerTests>();
+        var pool = new StaticHostPool([Host("a", 2), Host("b", 3)]);
+
+        RemoteHostPoolCapacityLogger.Log(
+            pool,
+            new OrchestratorOptions { MaxConcurrentWorkers = 10, MaxConcurrentSandboxes = 5 },
+            logger);
+
+        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Single(logger.Entries, e => e.Level == LogLevel.Information);
+    }
+
+    [Fact]
+    public void Log_DoesNotLogWhenHostPoolIsEmpty()
+    {
+        var logger = new CapturingLogger<RemoteHostPoolCapacityLoggerTests>();
+        var pool = new StaticHostPool([]);
+
+        RemoteHostPoolCapacityLogger.Log(
+            pool,
+            new OrchestratorOptions { MaxConcurrentWorkers = 10, MaxConcurrentSandboxes = 10 },
+            logger);
+
+        Assert.Empty(logger.Entries);
+    }
+
     private static SandboxHostPoolEntry Host(string id, int capacity) =>
         new(
             HostId: id,

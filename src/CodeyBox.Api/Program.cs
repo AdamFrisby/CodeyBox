@@ -4089,6 +4089,15 @@ namespace CodeyBox.Api
         /// <summary>Local tar binary used by the staging pipeline. Default <c>tar</c>.</summary>
         public string? LocalTarBinary { get; set; }
 
+        /// <summary>Maximum tar bytes accepted from a remote writable mount during sync-back. Null = provider default.</summary>
+        public long? StageOutMaxArchiveBytes { get; set; }
+
+        /// <summary>Maximum non-metadata tar entries accepted during remote sync-back validation. Null = provider default.</summary>
+        public int? StageOutMaxEntries { get; set; }
+
+        /// <summary>Maximum declared-payload/archive-byte ratio accepted during remote sync-back validation. Null = provider default.</summary>
+        public double? StageOutMaxExpansionRatio { get; set; }
+
         /// <summary>Absolute path to <c>multipass</c> on the remote host.</summary>
         public string? RemoteMultipassPath { get; set; }
 
@@ -4159,6 +4168,9 @@ namespace CodeyBox.Api
         public int? ServerAliveCountMax { get; set; }
         public int? ConnectTimeoutSeconds { get; set; }
         public string? LocalTarBinary { get; set; }
+        public long? StageOutMaxArchiveBytes { get; set; }
+        public int? StageOutMaxEntries { get; set; }
+        public double? StageOutMaxExpansionRatio { get; set; }
         public string? RemoteMultipassPath { get; set; }
         public string? RemoteStagingRoot { get; set; }
         public string? DefaultImage { get; set; }

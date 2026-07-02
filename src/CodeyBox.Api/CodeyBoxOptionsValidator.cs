@@ -339,6 +339,12 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add("CodeyBox:MultipassRemoteSandbox:PlacementRecheckIn must be positive when set");
         if (cfg.RuntimeUnhealthyBackoff is { } backoff && backoff <= TimeSpan.Zero)
             failures.Add("CodeyBox:MultipassRemoteSandbox:RuntimeUnhealthyBackoff must be positive when set");
+        if (cfg.StageOutMaxArchiveBytes is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxArchiveBytes must be > 0 when set");
+        if (cfg.StageOutMaxEntries is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxEntries must be > 0 when set");
+        if (cfg.StageOutMaxExpansionRatio is { } ratio && (double.IsNaN(ratio) || double.IsInfinity(ratio) || ratio < 1.0d))
+            failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxExpansionRatio must be >= 1 when set");
 
         var hasTopLevelTarget = !string.IsNullOrWhiteSpace(cfg.SshTarget);
         var hosts = cfg.ExecutorHosts ?? [];
@@ -364,6 +370,12 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 failures.Add($"{prefix}:ServerAliveCountMax must be > 0 when set");
             if (host.ConnectTimeoutSeconds is <= 0)
                 failures.Add($"{prefix}:ConnectTimeoutSeconds must be > 0 when set");
+            if (host.StageOutMaxArchiveBytes is <= 0)
+                failures.Add($"{prefix}:StageOutMaxArchiveBytes must be > 0 when set");
+            if (host.StageOutMaxEntries is <= 0)
+                failures.Add($"{prefix}:StageOutMaxEntries must be > 0 when set");
+            if (host.StageOutMaxExpansionRatio is { } hostRatio && (double.IsNaN(hostRatio) || double.IsInfinity(hostRatio) || hostRatio < 1.0d))
+                failures.Add($"{prefix}:StageOutMaxExpansionRatio must be >= 1 when set");
             if (host.VmStartTimeout is { } start && start <= TimeSpan.Zero)
                 failures.Add($"{prefix}:VmStartTimeout must be positive when set");
             if (host.VmStopTimeout is { } stop && stop <= TimeSpan.Zero)

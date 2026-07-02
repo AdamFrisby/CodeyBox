@@ -401,7 +401,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var releaseAdmission = false;
         if (innerDisposeSucceeded)
             releaseAdmission = !await IsManagedSandboxStillPresentAsync(identity).ConfigureAwait(false);
-        else if (IsRetainedRemoteDisposeFailure(disposeFailure))
+        else if (RetainedDisposeFailureDoesNotConsumeAdmission(disposeFailure))
             releaseAdmission = true;
 
         if (releaseAdmission)
@@ -418,9 +418,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         }
     }
 
-    private static bool IsRetainedRemoteDisposeFailure(Exception? disposeFailure) =>
+    private static bool RetainedDisposeFailureDoesNotConsumeAdmission(Exception? disposeFailure) =>
         disposeFailure is SandboxProvisioningDeferredException ex
-        && string.Equals(ex.Provider, "multipass-remote", StringComparison.Ordinal)
+        && !ex.RetainedSandboxConsumesAdmission
         && !string.IsNullOrWhiteSpace(ex.RetainedSandboxName);
 
     private void OnSandboxPreserved(AdmissionControlledSandbox sandbox)

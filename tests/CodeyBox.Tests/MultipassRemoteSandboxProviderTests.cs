@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Formats.Tar;
+using System.Text;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.MultipassRemote;
@@ -754,7 +756,95 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
-    public async Task DisposeAsync_delete_failure_throws_and_keeps_host_reservation()
+    public async Task DisposeAsync_syncback_content_validation_does_not_mark_host_unhealthy()
+    {
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+        transport.OnStageOut = (_, _, _) =>
+            throw new RemoteSshTransportException(
+                "unsafe tar entry",
+                RemoteSshTransportFailureKind.ContentValidation);
+
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var provider = new MultipassRemoteSandboxProvider(
+                opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+            var sb = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+
+            var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+                await sb.DisposeAsync());
+
+            Assert.Equal("remote-syncback-invalid-content", ex.ErrorClass);
+            Assert.False(ex.RetainedSandboxConsumesAdmission);
+            var host = Assert.Single(provider.SnapshotHostPool());
+            Assert.True(host.RuntimeHealthy);
+            Assert.Equal(1, host.Reserved);
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_active_sandbox_skips_failed_syncback_and_releases_host_reservation()
+    {
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+        transport.ThrowOnStageOut = true;
+
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var provider = new MultipassRemoteSandboxProvider(
+                opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+            var sb = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+
+            await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+                await sb.DisposeAsync());
+            var stageOutAttempts = transport.StageOutCalls.Count;
+
+            await provider.DisposeLeakedAsync(new ManagedSandboxInfo(
+                sb.Id,
+                DateTimeOffset.UtcNow,
+                DiskBytes: null,
+                IsTrackedActive: true,
+                HostId: opts.HostId.Length == 0 ? "default" : opts.HostId), CancellationToken.None);
+
+            Assert.Equal(stageOutAttempts, transport.StageOutCalls.Count);
+            Assert.Contains(transport.RecordedCalls, c => c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
+            Assert.Contains(transport.RecordedCalls, c => c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
+            Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_delete_failure_is_best_effort_and_releases_host_reservation()
     {
         var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
         var failDelete = false;
@@ -777,7 +867,37 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
-    public async Task DisposeAsync_staging_cleanup_failure_throws_and_keeps_host_reservation()
+    public async Task DisposeAsync_delete_not_found_still_removes_remote_staging()
+    {
+        var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
+        var deleteAttempted = false;
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "delete"))
+            {
+                deleteAttempted = true;
+                return new ProcessRunResult(1, "", "instance not found");
+            }
+            if (Contains(argv, "info") && deleteAttempted)
+                return new ProcessRunResult(2, "", "instance not found");
+            if (Contains(argv, "info"))
+                return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+
+        await sb.DisposeAsync();
+
+        Assert.Contains(transport.RecordedCalls, c => c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
+        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_staging_cleanup_failure_is_best_effort_and_releases_host_reservation()
     {
         var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
         var failCleanup = false;
@@ -801,7 +921,7 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
-    public async Task DisposeAsync_staging_cleanup_transport_failure_throws_and_keeps_host_reservation()
+    public async Task DisposeAsync_staging_cleanup_transport_failure_is_best_effort_and_releases_host_reservation()
     {
         var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };
         var failCleanup = false;
@@ -952,9 +1072,246 @@ public sealed class MultipassRemoteSandboxProviderTests
                 await transport.StageOutAsync("/remote/staged/repo", hostTarget, CancellationToken.None));
 
             Assert.Contains("Unsafe tar entry", ex.Message);
+            Assert.Equal(RemoteSshTransportFailureKind.ContentValidation, ex.Kind);
             Assert.Equal("existing\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "existing.txt")));
             Assert.False(File.Exists(Path.Combine(hostTarget, "safe.txt")));
             Assert.False(File.Exists(Path.Combine(hostTarget, "escape")));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task OpenSshCliTransport_StageOut_replaces_host_path_with_valid_archive()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stageout-success-").FullName;
+        try
+        {
+            var archivePath = Path.Combine(root, "archive.tar");
+            await WriteTarArchiveAsync(
+                archivePath,
+                TarFile("repo/new.txt", "new\n"),
+                TarFile("repo/nested/file.txt", "nested\n"));
+            var fakeSsh = await WriteFakeSshCatArchiveAsync(root, archivePath);
+
+            var hostTarget = Path.Combine(root, "host-target");
+            Directory.CreateDirectory(hostTarget);
+            await File.WriteAllTextAsync(Path.Combine(hostTarget, "old.txt"), "old\n");
+
+            var opts = DefaultOptions() with { SshBinary = fakeSsh, SshTarget = "ignored" };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            await transport.StageOutAsync("/remote/staged/repo", hostTarget, CancellationToken.None);
+
+            Assert.False(File.Exists(Path.Combine(hostTarget, "old.txt")));
+            Assert.Equal("new\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "new.txt")));
+            Assert.Equal("nested\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "nested", "file.txt")));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    public static IEnumerable<object[]> UnsafeStageOutArchives()
+    {
+        yield return
+        [
+            "parent-segment",
+            new TarSpec[] { TarFile("repo/../escape.txt", "x\n") },
+            "Unsafe tar entry path",
+            RemoteSshTransportFailureKind.ContentValidation
+        ];
+        yield return
+        [
+            "absolute-path",
+            new TarSpec[] { TarFile("/repo/file.txt", "x\n") },
+            "Unsafe tar entry path",
+            RemoteSshTransportFailureKind.ContentValidation
+        ];
+        yield return
+        [
+            "wrong-root",
+            new TarSpec[] { TarFile("other/file.txt", "x\n") },
+            "outside expected root",
+            RemoteSshTransportFailureKind.ContentValidation
+        ];
+        yield return
+        [
+            "empty-archive",
+            Array.Empty<TarSpec>(),
+            "contained no extractable entries",
+            RemoteSshTransportFailureKind.ContentValidation
+        ];
+        yield return
+        [
+            "too-many-entries",
+            new TarSpec[] { TarFile("repo/a.txt", "a\n"), TarFile("repo/b.txt", "b\n") },
+            "StageOutMaxEntries",
+            RemoteSshTransportFailureKind.ResourceLimit
+        ];
+    }
+
+    [Theory]
+    [MemberData(nameof(UnsafeStageOutArchives))]
+    public async Task OpenSshCliTransport_StageOut_rejects_unsafe_archives_before_replacing_host_path(
+        string scenario,
+        TarSpec[] entries,
+        string expectedMessage,
+        RemoteSshTransportFailureKind expectedKind)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stageout-invalid-").FullName;
+        try
+        {
+            var archivePath = Path.Combine(root, "archive.tar");
+            await WriteTarArchiveAsync(archivePath, entries);
+            var fakeSsh = await WriteFakeSshCatArchiveAsync(root, archivePath);
+
+            var hostTarget = Path.Combine(root, "host-target");
+            Directory.CreateDirectory(hostTarget);
+            await File.WriteAllTextAsync(Path.Combine(hostTarget, "existing.txt"), scenario + "\n");
+
+            var opts = DefaultOptions() with
+            {
+                SshBinary = fakeSsh,
+                SshTarget = "ignored",
+                StageOutMaxEntries = scenario == "too-many-entries" ? 1 : MultipassRemoteSandboxOptions.DefaultStageOutMaxEntries,
+            };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageOutAsync("/remote/staged/repo", hostTarget, CancellationToken.None));
+
+            Assert.Contains(expectedMessage, ex.Message);
+            Assert.Equal(expectedKind, ex.Kind);
+            Assert.Equal(scenario + "\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "existing.txt")));
+            Assert.False(File.Exists(Path.Combine(hostTarget, "a.txt")));
+            Assert.False(File.Exists(Path.Combine(hostTarget, "b.txt")));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task OpenSshCliTransport_StageOut_rejects_archive_byte_cap_before_replacing_host_path()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stageout-cap-").FullName;
+        try
+        {
+            var archivePath = Path.Combine(root, "archive.tar");
+            await WriteTarArchiveAsync(archivePath, TarFile("repo/file.txt", "payload\n"));
+            var fakeSsh = await WriteFakeSshCatArchiveAsync(root, archivePath);
+
+            var hostTarget = Path.Combine(root, "host-target");
+            Directory.CreateDirectory(hostTarget);
+            await File.WriteAllTextAsync(Path.Combine(hostTarget, "existing.txt"), "existing\n");
+
+            var opts = DefaultOptions() with
+            {
+                SshBinary = fakeSsh,
+                SshTarget = "ignored",
+                StageOutMaxArchiveBytes = 1,
+            };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageOutAsync("/remote/staged/repo", hostTarget, CancellationToken.None));
+
+            Assert.Equal(RemoteSshTransportFailureKind.ResourceLimit, ex.Kind);
+            Assert.Contains("StageOutMaxArchiveBytes", ex.Message);
+            Assert.Equal("existing\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "existing.txt")));
+            Assert.False(File.Exists(Path.Combine(hostTarget, "file.txt")));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task OpenSshCliTransport_StageIn_broken_pipe_is_classified_as_transport_failure()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stagein-broken-pipe-").FullName;
+        try
+        {
+            var source = Path.Combine(root, "source");
+            Directory.CreateDirectory(source);
+            var payload = new byte[8 * 1024 * 1024];
+            Array.Fill<byte>(payload, 0x41);
+            await File.WriteAllBytesAsync(Path.Combine(source, "large.bin"), payload);
+
+            var fakeSsh = Path.Combine(root, "fake-ssh");
+            await WriteExecutableScriptAsync(fakeSsh, "#!/usr/bin/env bash\nexit 255\n");
+
+            var opts = DefaultOptions() with { SshBinary = fakeSsh, SshTarget = "ignored" };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageInAsync(source, "/remote/source", CancellationToken.None));
+
+            Assert.Equal(RemoteSshTransportFailureKind.Transport, ex.Kind);
+            Assert.Contains("SSH transport failure", ex.Message);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void OpenSshCliTransport_NormalizeTarEntryName_rejects_nul_as_content_failure()
+    {
+        var ex = Assert.Throws<RemoteSshTransportException>(() =>
+            OpenSshCliTransport.NormalizeTarEntryName("repo/\0evil"));
+
+        Assert.Equal(RemoteSshTransportFailureKind.ContentValidation, ex.Kind);
+        Assert.False(ex.IsHostTransportFailure);
+    }
+
+    [Fact]
+    public void OpenSshCliTransport_ValidateExtractedTree_rejects_post_extract_reparse_points()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stageout-reparse-").FullName;
+        try
+        {
+            File.CreateSymbolicLink(Path.Combine(root, "link"), "target");
+
+            var ex = Assert.Throws<RemoteSshTransportException>(() =>
+                OpenSshCliTransport.ValidateExtractedTree(root));
+
+            Assert.Equal(RemoteSshTransportFailureKind.ContentValidation, ex.Kind);
+            Assert.Contains("reparse point", ex.Message);
         }
         finally
         {
@@ -968,6 +1325,52 @@ public sealed class MultipassRemoteSandboxProviderTests
     {
         foreach (var a in argv) if (a == token) return true;
         return false;
+    }
+
+    private static TarSpec TarFile(string name, string content) =>
+        new(TarEntryType.RegularFile, name, content);
+
+    private static async Task WriteTarArchiveAsync(string archivePath, params TarSpec[] entries)
+    {
+        await using var stream = new FileStream(
+            archivePath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 64 * 1024,
+            useAsync: true);
+        using var writer = new TarWriter(stream, TarEntryFormat.Pax, leaveOpen: true);
+        foreach (var spec in entries)
+        {
+            var entry = new PaxTarEntry(spec.Type, spec.Name);
+            if (spec.LinkName is not null)
+                entry.LinkName = spec.LinkName;
+            if (spec.Content is not null)
+                entry.DataStream = new MemoryStream(Encoding.UTF8.GetBytes(spec.Content));
+            writer.WriteEntry(entry);
+        }
+    }
+
+    private static async Task<string> WriteFakeSshCatArchiveAsync(string root, string archivePath)
+    {
+        var fakeSsh = Path.Combine(root, "fake-ssh");
+        await WriteExecutableScriptAsync(
+            fakeSsh,
+            "#!/usr/bin/env bash\ncat " + OpenSshCliTransport.QuoteShellWord(archivePath) + "\n");
+        return fakeSsh;
+    }
+
+    private static async Task WriteExecutableScriptAsync(string path, string content)
+    {
+        var tmp = path + ".tmp";
+        await File.WriteAllTextAsync(tmp, content);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                tmp,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        File.Move(tmp, path);
     }
 
     private static ProcessRunResult ProcessRunOk() => new(0, "", "");
@@ -1018,6 +1421,7 @@ public sealed class MultipassRemoteSandboxProviderTests
     internal sealed record RecordedCall(IReadOnlyList<string> Argv, string? Stdin);
     internal sealed record StageInCall(string HostPath, string RemotePath);
     internal sealed record StageOutCall(string RemotePath, string HostPath);
+    public sealed record TarSpec(TarEntryType Type, string Name, string? Content = null, string? LinkName = null);
 
     internal sealed class FakeRemoteHostTransport : IRemoteHostTransport
     {
