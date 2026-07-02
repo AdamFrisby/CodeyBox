@@ -198,6 +198,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         try
         {
             await EnsureLogDirectoryAsync(sandbox, logFile, ct).ConfigureAwait(false);
+            await ExcludeGlogFromWorkTreeGitAsync(sandbox, ct).ConfigureAwait(false);
             var result = await runBase().ConfigureAwait(false);
             return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream, ct).ConfigureAwait(false);
         }
@@ -262,6 +263,60 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     {
         var idx = path.LastIndexOf('/');
         return idx <= 0 ? string.Empty : path[..idx];
+    }
+
+    /// <summary>
+    /// Adds the agent-log scratch dir to the work tree's
+    /// <c>.git/info/exclude</c> BEFORE agy runs, so that an agy self-commit's
+    /// <c>git add -A</c> can never stage the glog.
+    ///
+    /// Unlike the other agents, agy writes its diagnostics to a real file
+    /// (<c>--log-file</c>, see <see cref="ComputeAgyLogPath"/>) that lives under
+    /// <see cref="SandboxConventions.AgentLogDir"/> — inside the <c>/work</c> git
+    /// tree — and it is UNREDACTED on disk (agy logs applyAuthResult / auth
+    /// diagnostics and, per the credential contract, ships the OAuth
+    /// refresh_token verbatim). The orchestrator's post-run
+    /// <c>StripAgentLogScratchFromIndexAsync</c> unstages that dir before its OWN
+    /// commit, but cannot rewrite a commit an agent already made itself — and the
+    /// rework prompt explicitly asks agents to make new commits. A local
+    /// <c>.git/info/exclude</c> entry closes that gap: it is never committed, and
+    /// it makes <c>git add -A</c> skip the (never-tracked) scratch dir regardless
+    /// of who runs it.
+    ///
+    /// Best-effort and idempotent. A non-git working directory (unit tests, a
+    /// non-pipeline caller) is a no-op; a failed write leaves the orchestrator's
+    /// post-run strip as the remaining guard, so we do not fail the run over it.
+    /// </summary>
+    private async Task ExcludeGlogFromWorkTreeGitAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        // Anchor on AgentLogDir's leaf under the reserved .codeybox/ namespace so
+        // both ComputeAgyLogPath branches (the "<assigned>.agy.log" production
+        // shape and the Guid fallback) sit under the excluded dir. Relative to the
+        // work tree root; matches the pattern the orchestrator strip targets.
+        const string excludeEntry = ".codeybox/agent-logs/";
+        var script =
+            "[ -d .git ] || exit 0; mkdir -p .git/info; "
+            + $"grep -qxF '{excludeEntry}' .git/info/exclude 2>/dev/null || "
+            + $"printf '%s\\n' '{excludeEntry}' >> .git/info/exclude";
+        try
+        {
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", script],
+                WorkingDirectory = SandboxConventions.WorkDir,
+            }, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Defence-in-depth: the post-run --cached strip still protects the
+            // orchestrator's own commit. Surface the miss so a persistently broken
+            // exclude path is visible rather than silently narrowing the guard.
+            AuditLog.AgentLogCaptureFailed(Kind, ex.GetType().Name, $"git exclude write failed: {ex.Message}");
+        }
     }
 
     private async Task<AgentResult> ProcessResultAsync(

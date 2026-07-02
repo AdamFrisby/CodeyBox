@@ -204,7 +204,10 @@ public sealed class AntigravityAgentRunnerTests
     // hook + agy CLI calls.
     private static List<SandboxExec> NonInfraExecs(AntigravityCapturingSandbox sandbox) =>
         sandbox.AllExecs
-            .Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail" && e.Argv[0] != "mkdir")
+            .Where(e => e.Argv.Count > 0 && e.Argv[0] != "tail" && e.Argv[0] != "mkdir"
+                // The .git/info/exclude glog-leak guard (ExcludeGlogFromWorkTreeGitAsync)
+                // is capture infrastructure, not a prep/agy exec — filter it too.
+                && !(e.Argv[0] == "sh" && e.Argv.Count >= 3 && e.Argv[2].Contains(".git/info/exclude")))
             .ToList();
 
     [Fact]
@@ -611,6 +614,36 @@ public sealed class AntigravityAgentRunnerTests
         Assert.True(agyIdx >= 0, "expected an agy invocation");
         Assert.True(mkdirIdx < agyIdx, "mkdir must run before agy so --log-file can open");
         Assert.Equal("/work/.codeybox/agent-logs", sandbox.AllExecs[mkdirIdx].Argv[2]);
+    }
+
+    [Fact]
+    public async Task RunAsync_ExcludesGlogScratchFromGit_BeforeInvokingAgy()
+    {
+        // Leak guard: agy's --log-file glog lands under .codeybox/agent-logs
+        // inside the /work git tree and is UNREDACTED on disk (auth material,
+        // refresh_token). The rework prompt asks agents to make their own
+        // commits, so an agy `git add -A` could bake the glog into an
+        // agent-authored commit that the orchestrator's post-run --cached strip
+        // can no longer rewrite. The runner must add the scratch dir to
+        // .git/info/exclude BEFORE agy runs so `git add -A` skips it. Pin that a
+        // sh exec writing the exclude entry is dispatched and runs before agy.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Model resolved: gemini-3.5-flash",
+            agyExitCode: 0);
+        var runner = new AntigravityAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "go", credential: null);
+
+        var excludeIdx = sandbox.AllExecs.FindIndex(e =>
+            e.Argv.Count >= 3 && e.Argv[0] == "sh" && e.Argv[1] == "-c"
+            && e.Argv[2].Contains(".git/info/exclude")
+            && e.Argv[2].Contains(".codeybox/agent-logs/"));
+        var agyIdx = sandbox.AllExecs.FindIndex(e => e.Argv.Count > 0 && e.Argv[0] == "agy");
+        Assert.True(excludeIdx >= 0, "expected a .git/info/exclude write for the glog scratch dir");
+        Assert.True(agyIdx >= 0, "expected an agy invocation");
+        Assert.True(excludeIdx < agyIdx, "exclude must be written before agy runs so an agy self-commit skips the glog");
+        // The write targets the work tree root, where .git lives.
+        Assert.Equal("/work", sandbox.AllExecs[excludeIdx].WorkingDirectory);
     }
 
     [Fact]
