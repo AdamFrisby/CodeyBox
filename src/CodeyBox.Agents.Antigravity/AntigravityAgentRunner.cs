@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Text.Json;
 using System.Threading;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -25,10 +24,13 @@ namespace CodeyBox.Agents.Antigravity;
 public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
     /// <summary>
-    /// Upper bound on how many bytes of agy's glog we read back and merge into
-    /// the captured output (256 KiB). agy's glog is cumulative and can grow
-    /// large on a long tool-heavy run; the read is bounded so a runaway log
-    /// can't be ingested unbounded into Stderr, the stream, and the audit log.
+    /// Upper bound on how many bytes of agy's glog we read back for capture
+    /// (256 KiB). agy's glog is cumulative and can grow large on a long tool-heavy
+    /// run; the read is bounded so a runaway log can't be ingested unbounded into
+    /// the per-run stream and the audit log. The full tail is archived to the
+    /// observability stream; only the terminal error region (see
+    /// <see cref="AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion"/>) is
+    /// folded into the classifier-facing <c>result.Stderr</c>, and only on failure.
     /// </summary>
     private const int MaxLogTailBytes = 256 * 1024;
 
@@ -179,8 +181,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// Shared lifecycle for both run overrides: pick the per-run agy glog path,
     /// publish it for <see cref="BuildAgyInvocation"/> to emit as
     /// <c>--log-file</c>, ensure the directory exists, run the base invocation,
-    /// then fold the glog into the captured output. The setup/teardown lives
-    /// here once so the log-path convention can't drift between the two paths.
+    /// then archive the glog to the observability stream and (on failure) fold its
+    /// terminal error region into the classifier-facing <c>Stderr</c>. The
+    /// setup/teardown lives here once so the log-path convention can't drift
+    /// between the two paths.
     /// </summary>
     private async Task<AgentResult> RunWithLogCaptureAsync(
         ISandbox sandbox,
@@ -229,15 +233,29 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// <c>~/.gemini/…</c> on the OAuth-creds branch — so create the directory
     /// unconditionally here, before agy runs, independent of the credential path.
     /// </summary>
-    private static async Task EnsureLogDirectoryAsync(ISandbox sandbox, string logFile, CancellationToken ct)
+    private async Task EnsureLogDirectoryAsync(ISandbox sandbox, string logFile, CancellationToken ct)
     {
         var dir = PosixDirName(logFile);
         if (dir.Length == 0)
             return;
-        await sandbox.ExecAsync(new SandboxExec
+        var mkdir = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["mkdir", "-p", dir],
         }, ct).ConfigureAwait(false);
+
+        // A failed mkdir means agy's `--log-file` open will fail and the whole
+        // capture silently yields nothing. Surface it via the same audit event the
+        // tail-failure path uses so the broken diagnostics path is observable
+        // rather than degrading invisibly to zero-capture. Non-fatal: the run still
+        // proceeds (agy may still write to a default location or fail loudly on its
+        // own), we just record that our capture directory could not be created.
+        if (!mkdir.Success)
+        {
+            AuditLog.AgentLogCaptureFailed(
+                Kind,
+                "mkdir",
+                $"could not create glog directory '{dir}' (exit {mkdir.ExitCode}): {mkdir.Stderr}");
+        }
     }
 
     private static string PosixDirName(string path)
@@ -289,32 +307,54 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // reach the stream or audit.
         var redactedLog = SensitiveDataRedactionEnricher.RedactText(tailCmd.Stdout);
 
-        // Archive the glog to the per-run stream (observability / audit) on EVERY
-        // outcome — this is what surfaces agy's otherwise invisible diagnostics in
-        // the agent-stream files, which the pipeline records and audits.
-        //
-        // The glog is deliberately NOT merged into result.Stderr on any outcome.
-        // agy's glog is CUMULATIVE within a single --print process: it records
-        // transient errors agy later recovered from (an internal 429 a retry
-        // cleared, an auth blip a refresh fixed). The orchestrator substring-scans
-        // result.Stderr with the quota/auth classifiers, which cannot tell a
-        // recovered-then-cleared "RESOURCE_EXHAUSTED"/"API Error: 401" from a
-        // terminal one; folding the cumulative log into Stderr would let a stale
-        // recovered line falsely bench the member or park it in
-        // WaitingForQuotaReset (up to a 7-day lockout) even when the run failed
-        // for an unrelated reason (timeout, tool error, no-changes). The
-        // classifiers therefore stay on agy's own authoritative process
-        // stdout/stderr; whether cumulative-log content is classifier-worthy is
-        // orchestrator policy, not a decision this runner should encode. The
-        // stream archive above still gives operators (and the audit) the full
-        // diagnostics either way.
+        // (1) Archive the FULL glog to the per-run stream (observability / audit) on
+        // EVERY outcome — this is what surfaces agy's otherwise invisible
+        // diagnostics (model resolution, applyAuthResult, tool output) in the
+        // agent-stream files, which the pipeline records and audits.
         if (stdoutChunkCallback is not null)
         {
             ForwardLogToStream(redactedLog, stdoutChunkCallback, captureStructuredStream);
         }
 
+        // (2) On FAILURE only, fold agy's TERMINAL error region into the
+        // classifier-facing result.Stderr so the quota/auth/cost detectors — which
+        // substring-scan Stderr/Stdout — can finally see agy's terminal
+        // RESOURCE_EXHAUSTED / API Error: 401 (agy writes these ONLY to its glog;
+        // its process stderr is frequently ~0 bytes). This is the un-blinding the
+        // task requires: a terminal agy 429 now reaches quota detection and parks
+        // the item in WaitingForQuotaReset with the gateway's reset hint.
+        //
+        // We fold ONLY the terminal region, and ONLY on failure — never the whole
+        // cumulative log. agy's glog is cumulative within one --print process and
+        // records transient errors it later recovered from (a 429 a retry cleared,
+        // an auth blip a refresh fixed). Folding the whole log would let such a
+        // recovered-then-cleared "RESOURCE_EXHAUSTED"/"API Error: 401" falsely
+        // bench/park the member. ExtractTerminalErrorRegion returns only the slice
+        // from the last marker in the tail window to end — agy aborts right after
+        // its terminal error, so that slice is the real cause; an earlier recovered
+        // error sits outside the window and is excluded. A successful run folds
+        // nothing (there is no terminal failure to classify), and a non-quota/-auth
+        // failure (timeout, tool error, no-changes) folds nothing (no marker),
+        // leaving result.Stderr as agy's own process output.
+        if (!result.Success)
+        {
+            var terminalError = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(redactedLog);
+            if (!string.IsNullOrEmpty(terminalError))
+            {
+                result = result with { Stderr = AppendDiagnostic(result.Stderr, terminalError) };
+            }
+        }
+
         return result;
     }
+
+    /// <summary>
+    /// Appends <paramref name="addition"/> to an existing (possibly empty) stderr
+    /// buffer on its own line, preserving agy's original process stderr ahead of
+    /// the folded glog region.
+    /// </summary>
+    private static string AppendDiagnostic(string? existing, string addition)
+        => string.IsNullOrEmpty(existing) ? addition : existing + "\n" + addition;
 
     private static void ForwardLogToStream(
         string redactedLog,
@@ -332,8 +372,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             var line = lines[i];
             if (captureStructuredStream)
             {
-                var envelope = JsonSerializer.Serialize(new { type = StderrEnvelopeType, text = line }) + "\n";
-                stdoutChunkCallback(envelope);
+                // Reuse the base class's serializer so the folded envelope stays
+                // byte-identical to StderrEnvelopeForwarder's and to what
+                // AgentStreamParser expects.
+                stdoutChunkCallback(SerializeStderrEnvelopeLine(line));
             }
             else
             {

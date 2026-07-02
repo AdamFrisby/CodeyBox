@@ -299,16 +299,14 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_FailedRun_ArchivesAgyLogToStreamButNotStderr()
+    public async Task RunAsync_FailedRun_FoldsTerminalErrorIntoStderr_AndArchivesFullGlogToStream()
     {
-        // Classifier-safety on the FAILURE path: agy's glog is cumulative and can
-        // carry a recovered-then-cleared "RESOURCE_EXHAUSTED" that agy retried
-        // past. A run that FAILED for an unrelated reason (here the agy stderr is
-        // "agy failed") must NOT have that cumulative glog folded into
-        // result.Stderr — the orchestrator substring-scans Stderr with the
-        // quota/auth classifiers and would falsely park/bench the member. The glog
-        // is archived to the observability stream instead; result.Stderr stays
-        // agy's own authoritative process output.
+        // Un-blinding the classifiers on the FAILURE path: agy writes its terminal
+        // RESOURCE_EXHAUSTED ONLY to its glog (process stderr is ~0 bytes), so the
+        // quota detector — which substring-scans result.Stderr — could never see it
+        // before. On failure the runner folds the glog's TERMINAL error region into
+        // Stderr so the item can finally park in WaitingForQuotaReset off an agy
+        // cap. The FULL glog is still archived to the observability stream.
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "Model resolved: gemini-3.5-flash\nRESOURCE_EXHAUSTED (code 429): Individual quota reached",
             agyExitCode: 1
@@ -341,17 +339,53 @@ public sealed class AntigravityAgentRunnerTests
         Assert.True(logFileIdx >= 0, "expected --log-file in agy argv");
         Assert.Equal(tailedPath, agyExec.Argv[logFileIdx + 1]);
 
-        // 3. The cumulative glog is NOT folded into the classifier-facing Stderr;
-        //    Stderr stays agy's own process output ("agy failed"), so a
-        //    recovered-transient 429 in the glog can't poison the quota/auth
-        //    classifiers on an unrelated failure.
-        Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        // 3. The TERMINAL error region IS folded into the classifier-facing Stderr
+        //    so the quota detector sees the 429 — the whole point of the task. agy's
+        //    own process stderr ("agy failed") is preserved ahead of it, and the
+        //    NON-terminal noise line ("Model resolved: …", before the terminal
+        //    marker) is excluded so only the terminal cause reaches the classifiers.
+        Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        Assert.Contains("agy failed", result.Stderr ?? string.Empty);
         Assert.DoesNotContain("Model resolved: gemini-3.5-flash", result.Stderr ?? string.Empty);
-        Assert.Equal("agy failed", result.Stderr);
 
-        // 4. But it IS archived to the stream for observability / audit.
+        // 4. The FULL glog (including the non-terminal line) is archived to the
+        //    stream for observability / audit.
         Assert.Contains("Model resolved: gemini-3.5-flash\n", streamedChunks);
         Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
+    }
+
+    [Fact]
+    public async Task RunAsync_FailedRun_RecoveredEarly429ThenNonQuotaFailure_DoesNotFoldIntoStderr()
+    {
+        // Classifier-safety, the exact false-positive the design guards against: agy
+        // hits a 429 early, retries past it, does a lot more work (many glog lines),
+        // then FAILS for an unrelated reason (a timeout with no known marker). The
+        // recovered-then-cleared 429 has scrolled OUT of the terminal window, so it
+        // is NOT folded into Stderr and cannot falsely park/bench the member. The
+        // full glog is still archived to the stream.
+        var lines = new List<string> { "RESOURCE_EXHAUSTED (code 429): recovered after retry" };
+        for (var i = 0; i < 60; i++)
+            lines.Add($"tool call {i}: edited file src/module_{i}.cs");
+        lines.Add("Error: timed out waiting for response");
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: string.Join("\n", lines),
+            agyExitCode: 1);
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "do something", credential: null,
+            stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: false);
+
+        // The early recovered 429 is outside the terminal window (the run ended on a
+        // markerless timeout) so it never reaches the classifiers.
+        Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        Assert.Equal("agy failed", result.Stderr);
+        // Still archived in full to the stream.
+        Assert.Contains("RESOURCE_EXHAUSTED (code 429): recovered after retry\n", streamedChunks);
+        Assert.Contains("Error: timed out waiting for response\n", streamedChunks);
     }
 
     [Fact]
@@ -392,14 +426,14 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_SuccessfulRun_DoesNotMergeGlogIntoStderr()
     {
-        // Classifier-safety: agy's glog is cumulative and records transient
-        // errors it later recovered from. The runner never folds the glog into
-        // result.Stderr (on success or failure), so a recovered
-        // "RESOURCE_EXHAUSTED" / "API Error: 401" line in the glog can't reach
-        // the quota/auth classifiers and falsely bench/park the member. The glog
-        // is still archived to the stream for observability. This test pins the
-        // success case; RunAsync_FailedRun_ArchivesAgyLogToStreamButNotStderr
-        // pins the failure case.
+        // Classifier-safety on SUCCESS: agy's glog is cumulative and records
+        // transient errors it later recovered from. On a SUCCESSFUL run there is no
+        // terminal failure to classify, so the runner folds NOTHING into
+        // result.Stderr — a recovered "RESOURCE_EXHAUSTED" / "API Error: 401" line
+        // in the glog can't reach the quota/auth classifiers and falsely bench/park
+        // the member. The glog is still archived to the stream for observability.
+        // The failure-path fold is pinned by
+        // RunAsync_FailedRun_FoldsTerminalErrorIntoStderr_AndArchivesFullGlogToStream.
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "applyAuthResult: authMethod=consumer\nRESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)",
             agyExitCode: 0
@@ -427,9 +461,15 @@ public sealed class AntigravityAgentRunnerTests
     {
         // agy's auth glog is the most likely place a Google OAuth access/refresh
         // token surfaces in plaintext. The capture must scrub ya29./1// tokens
-        // (via the normal RedactText path) before they land in the stream/audit.
+        // (via the normal RedactText path) before they land in the stream/audit AND
+        // before they land in the folded Stderr. The token rides on the terminal
+        // error line so the FAILURE-path fold into Stderr is exercised too (a
+        // markerless glog would leave Stderr untouched and make the Stderr
+        // assertions vacuous).
         var sandbox = new AntigravityLogCapturingSandbox(
-            logFileContent: "fileTokenStorage: access_token=ya29.aVeryLongGoogleAccessTokenValue0123456789 refresh=1//0longRefreshTokenValue0123456789",
+            logFileContent: "RESOURCE_EXHAUSTED (code 429): quota reached; "
+                + "access_token=ya29.aVeryLongGoogleAccessTokenValue0123456789 "
+                + "refresh=1//0longRefreshTokenValue0123456789",
             agyExitCode: 1
         );
         var runner = new AntigravityAgentRunner();
@@ -441,6 +481,11 @@ public sealed class AntigravityAgentRunnerTests
             sandbox, "/work", "do something", credential: null,
             stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: false);
 
+        // The terminal region DID fold into Stderr (proves the assertions aren't
+        // vacuous)…
+        Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        // …but the tokens were scrubbed on the way, in BOTH the folded Stderr and
+        // the stream copy.
         Assert.DoesNotContain("ya29.aVeryLong", result.Stderr ?? string.Empty);
         Assert.DoesNotContain("1//0longRefresh", result.Stderr ?? string.Empty);
         Assert.DoesNotContain(streamedChunks, chunk => chunk.Contains("ya29.aVeryLong"));
@@ -448,12 +493,12 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunResumedAsync_FailedRun_ArchivesAgyLogToStreamButNotStderr()
+    public async Task RunResumedAsync_FailedRun_FoldsTerminalErrorIntoStderr_AndArchivesFullGlogToStream()
     {
-        // The resume override has the same log-capture wiring as RunAsync;
-        // exercise it on a failed resumed run so the branch is not left
-        // unverified — including the same classifier-safety invariant (glog to
-        // stream, never into result.Stderr).
+        // The resume override has the same log-capture wiring as RunAsync; exercise
+        // it on a failed resumed run so the branch is not left unverified —
+        // including the same behaviour: full glog to the stream AND the terminal
+        // error region folded into the classifier-facing result.Stderr on failure.
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "resumed conversation\nRESOURCE_EXHAUSTED (code 429): Individual quota reached",
             agyExitCode: 1
@@ -481,8 +526,10 @@ public sealed class AntigravityAgentRunnerTests
         Assert.True(logFileIdx >= 0, "expected --log-file in resumed agy argv");
         Assert.Equal(tailedPath, agyExec.Argv[logFileIdx + 1]);
 
-        // Cumulative glog stays out of the classifier-facing Stderr on resume too.
-        Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        // The terminal error region is folded into the classifier-facing Stderr on
+        // resume too; the non-terminal "resumed conversation" line is excluded.
+        Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain("resumed conversation", result.Stderr ?? string.Empty);
         Assert.Contains("resumed conversation\n", streamedChunks);
         Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
     }
@@ -509,8 +556,8 @@ public sealed class AntigravityAgentRunnerTests
         // Streamed as JSON envelopes keyed on the shared envelope type.
         Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 1\"}\n", streamedChunks);
         Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 2\"}\n", streamedChunks);
-        // The glog stays out of the classifier-facing Stderr regardless of
-        // transport — Stderr is agy's own process output only.
+        // These glog lines carry no quota/auth marker, so the failure-path fold
+        // surfaces nothing — Stderr stays agy's own process output ("agy failed").
         Assert.DoesNotContain("Line 1", result.Stderr ?? string.Empty);
         Assert.DoesNotContain("Line 2", result.Stderr ?? string.Empty);
         Assert.Equal("agy failed", result.Stderr);
@@ -589,6 +636,32 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_TailExitsNonZero_ReturnsResultUnchanged_NoForwardOrFold()
+    {
+        // Degradation path: `tail -c N <path>` exits non-zero (missing / rotated
+        // glog, permission fault). ProcessResultAsync gates ingestion on
+        // `!tailCmd.Success` and must pass the base result through untouched —
+        // forwarding NOTHING to the stream and folding NOTHING into Stderr even
+        // though tail's stdout carried content (a partial/error read must not be
+        // mistaken for glog and reach the classifiers).
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "RESOURCE_EXHAUSTED (code 429): looks like a quota error but tail failed",
+            agyExitCode: 1,
+            tailExitCode: 1);
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        var result = await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            stdoutChunkCallback: chunk => streamedChunks.Add(chunk), captureStructuredStream: false);
+
+        Assert.False(result.Success);
+        Assert.Equal("agy failed", result.Stderr);
+        Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        Assert.Empty(streamedChunks);
+    }
+
+    [Fact]
     public async Task RunAsync_GlogEndingInNewline_DoesNotForwardTrailingEmptyLine()
     {
         // Real glog files always end in a trailing newline; ForwardLogToStream
@@ -616,11 +689,13 @@ public sealed class AntigravityAgentRunnerTests
     {
         private readonly string _logFileContent;
         private readonly int _agyExitCode;
+        private readonly int _tailExitCode;
 
-        public AntigravityLogCapturingSandbox(string logFileContent, int agyExitCode = 0)
+        public AntigravityLogCapturingSandbox(string logFileContent, int agyExitCode = 0, int tailExitCode = 0)
         {
             _logFileContent = logFileContent;
             _agyExitCode = agyExitCode;
+            _tailExitCode = tailExitCode;
         }
 
         public string Id => "fake-antigravity-log-sandbox";
@@ -632,7 +707,7 @@ public sealed class AntigravityAgentRunnerTests
             AllExecs.Add(exec);
             if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
             {
-                return Task.FromResult(new SandboxExecResult(0, _logFileContent, string.Empty));
+                return Task.FromResult(new SandboxExecResult(_tailExitCode, _logFileContent, string.Empty));
             }
             if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "bash"))
             {
@@ -745,6 +820,31 @@ public sealed class AntigravityAgentRunnerLogCaptureFailureTests : IDisposable
     }
 
     [Fact]
+    public async Task RunAsync_WhenMkdirFails_EmitsAuditAndStillRuns()
+    {
+        // agy's --log-file open fails if the parent dir is missing, so a failed
+        // `mkdir -p` means the whole capture silently yields nothing. Surface it via
+        // the same agent.log_capture_failed audit event the tail-failure path uses,
+        // rather than degrading invisibly to zero diagnostics. The run still proceeds
+        // (agy is still invoked; the tail below returns empty).
+        var sandbox = new TailBehaviourSandbox(
+            tailBehaviour: () => new SandboxExecResult(0, string.Empty, string.Empty),
+            agyExitCode: 0,
+            agyStderr: string.Empty,
+            mkdirExitCode: 1,
+            mkdirStderr: "mkdir: cannot create directory: Read-only file system");
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "do something", credential: null);
+
+        Assert.True(result.Success); // run not stranded by the capture-dir failure
+
+        var evt = Assert.Single(_sink.Events, e => EventName(e) == "agent.log_capture_failed");
+        Assert.Equal("antigravity", Scalar(evt, "Agent"));
+        Assert.Equal("mkdir", Scalar(evt, "ExceptionType"));
+    }
+
+    [Fact]
     public async Task RunAsync_WhenTailCancelled_PropagatesCancellationAndEmitsNoAudit()
     {
         // A requested cancellation surfacing from the tail exec must NOT be
@@ -778,12 +878,21 @@ public sealed class AntigravityAgentRunnerLogCaptureFailureTests : IDisposable
         private readonly Func<SandboxExecResult> _tailBehaviour;
         private readonly int _agyExitCode;
         private readonly string _agyStderr;
+        private readonly int _mkdirExitCode;
+        private readonly string _mkdirStderr;
 
-        public TailBehaviourSandbox(Func<SandboxExecResult> tailBehaviour, int agyExitCode, string agyStderr)
+        public TailBehaviourSandbox(
+            Func<SandboxExecResult> tailBehaviour,
+            int agyExitCode,
+            string agyStderr,
+            int mkdirExitCode = 0,
+            string mkdirStderr = "")
         {
             _tailBehaviour = tailBehaviour;
             _agyExitCode = agyExitCode;
             _agyStderr = agyStderr;
+            _mkdirExitCode = mkdirExitCode;
+            _mkdirStderr = mkdirStderr;
         }
 
         public string Id => "fake-tail-behaviour";
@@ -792,7 +901,9 @@ public sealed class AntigravityAgentRunnerLogCaptureFailureTests : IDisposable
         {
             if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
                 return Task.FromResult(_tailBehaviour());
-            if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "bash"))
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "mkdir")
+                return Task.FromResult(new SandboxExecResult(_mkdirExitCode, string.Empty, _mkdirStderr));
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             return Task.FromResult(new SandboxExecResult(_agyExitCode, "stdout-response", _agyStderr));
         }

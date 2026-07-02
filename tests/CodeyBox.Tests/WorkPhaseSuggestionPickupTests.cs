@@ -115,6 +115,30 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
         Assert.DoesNotContain(".codeybox/suggestions.json", treeOutput);
     }
 
+    [Fact]
+    public async Task WorkPhase_AgentLogScratch_NotCommittedToWorkBranch()
+    {
+        // An agent that leaves a file under .codeybox/agent-logs/ (the orchestrator's
+        // internal capture dir — where antigravity's UNREDACTED glog also lands) must
+        // never have it committed to the work branch and pushed in the PR. The real
+        // change (output.txt) is committed; the agent-log scratch is stripped.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var setup = BuildPipelineWith(new AgentLogScratchWritingAgent(), _workspace, seed);
+
+        var item = NewItem("feature/agentlog-nocommit");
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
+        var (_, treeOutput, _) = await TestSupport.RunGit(
+            barePath, "ls-tree", "-r", "feature/agentlog-nocommit", "--name-only");
+        Assert.DoesNotContain(".codeybox/agent-logs", treeOutput);
+        Assert.Contains("output.txt", treeOutput); // the real change still lands
+    }
+
     private const string MergeSuggestionsJson = """
         {
           "suggestions": [
@@ -391,6 +415,45 @@ internal sealed partial class SuggestionEmittingAgent : IAgentRunner
     [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`",
         RegexOptions.CultureInvariant | RegexOptions.Singleline)]
     private static partial Regex MergePromptShape();
+}
+
+/// <summary>
+/// Writes a regular file AND a file under .codeybox/agent-logs/ in the work
+/// phase — modelling the orchestrator's internal capture dir (base agent log and,
+/// for antigravity, agy's unredacted glog). The orchestrator must strip the
+/// agent-log scratch from the staged tree so it is never committed / pushed.
+/// </summary>
+internal sealed partial class AgentLogScratchWritingAgent : IAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox, string workingDirectory, string prompt,
+        AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
+    {
+        // Merge task: no-op success (this test only exercises the work phase).
+        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+            return new AgentResult(true, "noop", null, null);
+
+        var r1 = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo 'real change' > \"$0\"", $"{workingDirectory}/output.txt"],
+        }, ct);
+        if (!r1.Success)
+            return new AgentResult(false, "failed to write output.txt", r1.Stdout, r1.Stderr);
+
+        // Leave a file under .codeybox/agent-logs/ — mirrors the unredacted glog
+        // path the orchestrator must keep out of the commit.
+        var r2 = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && printf '%s\\n' 'access_token=ya29.secret' > \"$0\"",
+                $"{workingDirectory}/.codeybox/agent-logs/run.agy.log"],
+        }, ct);
+        if (!r2.Success)
+            return new AgentResult(false, "failed to write agent-log scratch", r2.Stdout, r2.Stderr);
+
+        return new AgentResult(true, "ok", null, null);
+    }
 }
 
 /// <summary>

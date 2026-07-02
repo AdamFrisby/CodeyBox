@@ -309,15 +309,16 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
 
     /// <summary>
     /// Type tag of the codeybox-internal stderr envelope written by
-    /// <c>CliAgentRunnerBase.StderrEnvelopeForwarder</c>. Surfacing these
-    /// envelopes in the summary keeps stderr diagnostics visible even when
-    /// the structured stream contains a few recognised events but no
-    /// provider final message (e.g. an auth/usage failure after a normal
-    /// <c>system/init</c>). Hardcoded here rather than referenced from
-    /// CliAgentRunnerBase because that class is internal-sealed and the
-    /// envelope shape is a tiny stable contract.
+    /// <c>CliAgentRunnerBase.StderrEnvelopeForwarder</c> (and by sibling runners
+    /// such as antigravity that fold a CLI log into the stream). Surfacing these
+    /// envelopes in the summary keeps stderr diagnostics visible even when the
+    /// structured stream contains a few recognised events but no provider final
+    /// message (e.g. an auth/usage failure after a normal <c>system/init</c>).
+    /// Referenced from the shared <see cref="CliAgentRunnerBase.StderrEnvelopeType"/>
+    /// constant (same assembly, <c>public</c>) so the parser and every forwarder
+    /// can never desynchronise.
     /// </summary>
-    internal const string StderrEnvelopeType = "codeybox.stderr";
+    internal const string StderrEnvelopeType = CliAgentRunnerBase.StderrEnvelopeType;
 
     /// <summary>
     /// Maximum number of stderr-envelope characters folded into the parsed

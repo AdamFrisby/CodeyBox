@@ -4622,6 +4622,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ".codeybox/suggestions.json"],
             }, ct);
 
+            // Strip CodeyBox's internal agent-log scratch dir from the staged tree
+            // so it is never committed to the work branch and pushed in the PR.
+            await StripAgentLogScratchFromIndexAsync(sandbox, ct);
+
             var staged = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
@@ -6033,6 +6037,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 WorkingDirectory = SandboxConventions.WorkDir,
             }, ct);
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            // Keep the internal agent-log scratch dir out of the preempt checkpoint
+            // commit too — it is pushed to a remote ref and the tree becomes the
+            // resumed work tree, so an unredacted glog here leaks just like the PR.
+            await StripAgentLogScratchFromIndexAsync(sandbox, ct);
             var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, agentKind, observedModelId, ct);
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
                 $"codeybox: preempt checkpoint {item.Title}\n\n{trailerBlock}");
@@ -11733,6 +11741,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var iterSuffix = iteration.HasValue ? $"-i{iteration.Value}" : string.Empty;
         return $"{SandboxConventions.AgentLogDir}/{workItemId.ToString()}-{safePhase}{iterSuffix}.log";
     }
+
+    /// <summary>
+    /// Unstages CodeyBox's internal agent-log scratch directory
+    /// (<see cref="SandboxConventions.AgentLogDir"/> — <c>.codeybox/agent-logs/</c>)
+    /// from the git index before a commit. Those files are orchestrator diagnostics
+    /// tee'd into the work tree during the agent run — the base stdout/stderr
+    /// capture and, for antigravity, agy's <em>unredacted</em> internal glog
+    /// (auth material, tool output, model resolution). They must never be committed
+    /// to the work branch and pushed in the PR. CodeyBox operates on arbitrary
+    /// target repos and cannot assume they gitignore <c>.codeybox/</c>, so the strip
+    /// is explicit — mirroring the <c>suggestions.json</c> strip. The working-tree
+    /// copies are left in place (<c>--cached</c>) so the suspend/resume re-tail path
+    /// still reads them; <c>--ignore-unmatch</c> makes it a no-op when nothing under
+    /// the dir was staged.
+    /// </summary>
+    private static Task StripAgentLogScratchFromIndexAsync(ISandbox sandbox, CancellationToken ct) =>
+        sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "-r", "--cached",
+                "--ignore-unmatch", "--", ".codeybox/agent-logs"],
+        }, ct);
 
     /// <summary>
     /// Persists <paramref name="agentLogPath"/> on <paramref name="id"/> BEFORE

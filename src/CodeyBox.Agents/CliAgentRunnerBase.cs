@@ -28,6 +28,18 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     public const string StderrEnvelopeType = "codeybox.stderr";
 
     /// <summary>
+    /// Serialises a single stderr-diagnostic line as the codeybox-internal NDJSON
+    /// envelope (<c>{"type":"codeybox.stderr","text":...}</c>) that
+    /// <see cref="AgentStreamParser"/> recognises, terminated with the newline that
+    /// frames one envelope per line. Exposed so sibling-assembly runners that fold a
+    /// CLI log into a structured stream (e.g. antigravity's glog) emit a
+    /// byte-identical envelope via the SAME serializer <see cref="StderrEnvelopeForwarder"/>
+    /// uses, instead of re-implementing the shape and drifting from the parser.
+    /// </summary>
+    public static string SerializeStderrEnvelopeLine(string text)
+        => JsonSerializer.Serialize(new { type = StderrEnvelopeType, text }) + "\n";
+
+    /// <summary>
     /// Sandbox CLI invocation built by concrete agent runners. This stays
     /// protected so argv/environment/stdin details do not leak into Core's
     /// domain/plugin-facing API.
@@ -635,7 +647,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             string envelope;
             try
             {
-                envelope = JsonSerializer.Serialize(new { type = EnvelopeType, text }) + "\n";
+                envelope = SerializeStderrEnvelopeLine(text);
             }
             catch (NotSupportedException)
             {
