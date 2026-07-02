@@ -199,9 +199,9 @@ in 2–4 rounds, with a long tail beyond:
 ```mermaid
 xychart-beta
     title "Audit rounds to merge (114 merged · median 5 · never 1)"
-    x-axis [2, 3, 4, 5, 6, 7, 8, 9, 10]
+    x-axis [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     y-axis "Merged changes" 0 --> 22
-    bar [20, 18, 16, 7, 8, 7, 10, 4, 4]
+    bar [0, 20, 18, 16, 7, 8, 7, 10, 4, 4]
 ```
 
 _Equal-width, one bar per round; a further **20** changes took **11–41** rounds — the long tail, off-chart._
