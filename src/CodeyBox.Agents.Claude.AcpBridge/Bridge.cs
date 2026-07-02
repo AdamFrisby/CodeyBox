@@ -109,6 +109,20 @@ internal sealed class Bridge : IAsyncDisposable
         // cleanup we therefore start a watchdog that Environment.Exit's the
         // process once the grace window expires. RunAsync still gets a chance
         // to return cooperatively first; the watchdog is the backstop.
+        //
+        // Reset the dispositions to SIG_DFL first. .NET's PosixSignalRegistration
+        // deliberately preserves an inherited SIG_IGN (POSIX "parent ignored it,
+        // keep ignoring" / nohup semantics): if any ancestor launched the bridge
+        // with SIGHUP (or SIGTERM/SIGINT) masked to SIG_IGN, the runtime records
+        // that and never installs a catchable handler, so kill(SIGHUP) is silently
+        // discarded and the ~/.claude/ide/<port>.lock file plus the claude --ide
+        // subtree leak on tear-down. A shutdown daemon must catch its term signals
+        // regardless of the disposition it inherited, so we clear SIG_IGN back to
+        // SIG_DFL before registering; the runtime then installs its handler and our
+        // Shutdown(0) runs. The reset→register window is a few instructions wide and
+        // any signal landing inside it takes the default terminate — the same
+        // outcome we want for an un-serviced term signal during startup.
+        ResetSignalDispositionsToDefault();
         _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
@@ -856,6 +870,35 @@ internal sealed class Bridge : IAsyncDisposable
     /// stopped the TCP listener and cancelled the CTS, so force-exit is
     /// safe — the process simply leaves no half-cleaned state behind.
     /// </summary>
+    /// <summary>
+    /// Clears an inherited SIG_IGN disposition on SIGHUP, restoring SIG_DFL so
+    /// that the subsequent <see cref="PosixSignalRegistration.Create"/> call
+    /// installs a catchable handler. Without this, a bridge launched under an
+    /// ancestor that ignores SIGHUP (e.g. nohup) inherits SIG_IGN, the runtime
+    /// honours the POSIX "keep ignoring" convention, and signal-driven shutdown
+    /// never runs — leaking the lockfile and the claude subtree.
+    ///
+    /// Only SIGHUP is reset. SIGINT and SIGTERM are handled by the .NET runtime
+    /// from process startup (for Console.CancelKeyPress / graceful ProcessExit),
+    /// so their catchable handlers are installed unconditionally and survive an
+    /// inherited SIG_IGN; a raw signal(2) reset on those would instead clobber
+    /// the runtime's already-installed handler (PosixSignalRegistration.Create
+    /// would not re-install it), regressing them to the default terminate. SIGHUP
+    /// has no runtime-startup handler, so PosixSignalRegistration.Create below is
+    /// its first installer and honours whatever disposition it observes now.
+    ///
+    /// No-op on Windows, which has no such dispositions; the shipped bridge only
+    /// ever runs on linux-musl-x64.
+    /// </summary>
+    private static void ResetSignalDispositionsToDefault()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        // SIG_DFL == 0. signal(2) returns SIG_ERR (-1) on failure, which we
+        // ignore: an un-resettable disposition just means we fall back to the
+        // pre-existing behaviour rather than crashing the bridge at startup.
+        try { NativeMethods.Signal(NativeMethods.SIGHUP, IntPtr.Zero); } catch { }
+    }
+
     private void ScheduleForceExitAfterSignal()
     {
         _ = Task.Run(async () =>
@@ -1044,6 +1087,19 @@ internal sealed class Bridge : IAsyncDisposable
         // are passed to the linker as file paths rather than -l names.
         [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
         internal static extern int Kill(int pid, int sig);
+
+        // Linux signal number (stable across glibc/musl on the x64 ABI the
+        // bridge ships on). Only SIGHUP needs an explicit disposition reset;
+        // see ResetSignalDispositionsToDefault.
+        internal const int SIGHUP = 1;
+
+        // signal(2): reset a signal's disposition. The handler argument is a
+        // function pointer; SIG_DFL is (void*)0. We only ever pass SIG_DFL so
+        // marshalling it as IntPtr.Zero is sufficient and stays NativeAOT-safe
+        // (primitive-pointer marshalling, no delegate reverse-marshal). The
+        // returned previous handler is discarded.
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "signal", SetLastError = true)]
+        internal static extern IntPtr Signal(int signum, IntPtr handler);
     }
 
     private async Task WaitForBackgroundTasksAsync()
