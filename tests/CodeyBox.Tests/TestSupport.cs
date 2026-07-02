@@ -123,6 +123,7 @@ internal static class TestSupport
         bool cliSessionResumableAgent = false,
         ICheckAndActCompletionRunner? checkCompletionRunner = null,
         IAgentSupervisionService? agentSupervision = null,
+        AgentPromptPreprocessorChain? promptPreprocessors = null,
         CodeyBox.Agents.Claude.ClaudeSessionWorker? claudeSessionWorker = null,
         CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null,
         ISessionAgentRunner? sessionAgentRunnerOverride = null,
@@ -291,6 +292,7 @@ internal static class TestSupport
                 ? null
                 : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
             auditProgress: auditProgressOverride ?? store,
+            promptPreprocessors: promptPreprocessors,
             checkCompletionRunner: checkCompletionRunner,
             agentSupervision: agentSupervision,
             // Tests can supply either:

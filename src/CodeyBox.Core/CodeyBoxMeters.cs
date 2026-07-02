@@ -23,6 +23,36 @@ public static class CodeyBoxMeters
     public static readonly Counter<long> AuditIterations =
         AuditMeter.CreateCounter<long>("codeybox.audit.iterations");
 
+    /// <summary>
+    /// One increment per pre-emptive self-review turn outcome on a session-
+    /// mode work item. Tag: <c>outcome</c> (<c>committed_changes</c> |
+    /// <c>no_changes</c> | <c>failed</c> | <c>skipped_empty_guidance</c>).
+    /// Used to measure how often the feature actually produced new commits
+    /// before the formal audit.
+    /// </summary>
+    public static readonly Counter<long> SessionPreemptiveSelfReviewTurns =
+        AuditMeter.CreateCounter<long>("codeybox.session.preemptive_self_review.turns", unit: "{turn}");
+
+    /// <summary>
+    /// Recorded once per session-mode work-item audit completion. Tags:
+    /// <c>self_review</c> (<c>on</c> | <c>off</c>) and <c>outcome</c>
+    /// (<c>passed</c> | <c>failed</c> | <c>needs_operator_input</c>).
+    /// Value is the iteration count consumed before the verdict. Pair with
+    /// <see cref="SessionFirstAuditOutcome"/> to measure whether the pre-
+    /// emptive self-review pass reduces audit-iteration count.
+    /// </summary>
+    public static readonly Histogram<long> SessionAuditIterations =
+        AuditMeter.CreateHistogram<long>("codeybox.session.audit_iterations", unit: "{iteration}");
+
+    /// <summary>
+    /// One increment per first audit iteration on a session-mode work item.
+    /// Tags: <c>self_review</c> (<c>on</c> | <c>off</c>) and <c>outcome</c>
+    /// (<c>passed</c> | <c>failed</c>). Lets dashboards chart first-audit
+    /// pass-rate with vs without the pre-emptive self-review turn.
+    /// </summary>
+    public static readonly Counter<long> SessionFirstAuditOutcome =
+        AuditMeter.CreateCounter<long>("codeybox.session.first_audit.outcome", unit: "{audit}");
+
     /// <summary>Blocking-finding count per audit iteration.</summary>
     public static readonly Histogram<long> AuditBlockingFindings =
         AuditMeter.CreateHistogram<long>("codeybox.audit.findings.blocking");
