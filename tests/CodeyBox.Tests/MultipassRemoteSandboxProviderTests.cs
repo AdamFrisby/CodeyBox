@@ -279,9 +279,10 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        var ex = await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
             await provider.CreateAsync(new SandboxSpec { ImageReference = "bogus" }));
-        Assert.Equal("launch", ex.Operation);
+        Assert.Equal("placement", ex.Operation);
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
 
         // Cleanup must have tried to delete the would-be VM.
         Assert.Contains(transport.RecordedCalls, c =>
@@ -786,7 +787,7 @@ public sealed class MultipassRemoteSandboxProviderTests
                 await sb.DisposeAsync());
 
             Assert.Equal("remote-syncback-invalid-content", ex.ErrorClass);
-            Assert.False(ex.RetainedSandboxConsumesAdmission);
+            Assert.Equal(sb.Id, ex.RetainedSandboxName);
             var host = Assert.Single(provider.SnapshotHostPool());
             Assert.True(host.RuntimeHealthy);
             Assert.Equal(1, host.Reserved);
@@ -1005,13 +1006,12 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+        var inventory = await provider.ListManagedInventoryAsync(CancellationToken.None);
 
-        Assert.Empty(managed);
+        Assert.Empty(inventory);
         var host = Assert.Single(provider.SnapshotHostPool());
         Assert.False(host.RuntimeHealthy);
         Assert.Contains("metadata ssh dropped", host.RuntimeUnhealthyReason);
-        var inventory = Assert.IsAssignableFrom<IManagedSandboxInventoryResult>(managed);
         Assert.False(inventory.IsComplete);
     }
 
@@ -1251,6 +1251,48 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task OpenSshCliTransport_StageOut_rejects_expansion_ratio_before_replacing_host_path()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stageout-ratio-").FullName;
+        try
+        {
+            var archivePath = Path.Combine(root, "archive.tar");
+            await WriteOverDeclaredTarArchiveAsync(archivePath, "repo/huge.bin", declaredSize: 4096);
+            var fakeSsh = await WriteFakeSshCatArchiveAsync(root, archivePath);
+
+            var hostTarget = Path.Combine(root, "host-target");
+            Directory.CreateDirectory(hostTarget);
+            await File.WriteAllTextAsync(Path.Combine(hostTarget, "existing.txt"), "existing\n");
+
+            var opts = DefaultOptions() with
+            {
+                SshBinary = fakeSsh,
+                SshTarget = "ignored",
+                StageOutMaxExpansionRatio = 1.0d,
+            };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageOutAsync("/remote/staged/repo", hostTarget, CancellationToken.None));
+
+            Assert.Equal(RemoteSshTransportFailureKind.ResourceLimit, ex.Kind);
+            Assert.Contains("StageOutMaxExpansionRatio", ex.Message);
+            Assert.Equal("existing\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "existing.txt")));
+            Assert.False(File.Exists(Path.Combine(hostTarget, "huge.bin")));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task OpenSshCliTransport_StageIn_broken_pipe_is_classified_as_transport_failure()
     {
         if (OperatingSystem.IsWindows())
@@ -1279,6 +1321,41 @@ public sealed class MultipassRemoteSandboxProviderTests
 
             Assert.Equal(RemoteSshTransportFailureKind.Transport, ex.Kind);
             Assert.Contains("SSH transport failure", ex.Message);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task OpenSshCliTransport_StageIn_remote_extract_failure_is_not_transport_failure()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stagein-remote-command-").FullName;
+        try
+        {
+            var source = Path.Combine(root, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "payload.txt"), "payload\n");
+
+            var fakeSsh = Path.Combine(root, "fake-ssh");
+            await WriteExecutableScriptAsync(fakeSsh, "#!/usr/bin/env bash\ncat >/dev/null\nexit 7\n");
+
+            var opts = DefaultOptions() with { SshBinary = fakeSsh, SshTarget = "ignored" };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageInAsync(source, "/remote/source", CancellationToken.None));
+
+            Assert.Equal(RemoteSshTransportFailureKind.RemoteCommand, ex.Kind);
+            Assert.False(ex.IsHostTransportFailure);
+            Assert.Contains("Remote tar-extract failed", ex.Message);
         }
         finally
         {
@@ -1349,6 +1426,54 @@ public sealed class MultipassRemoteSandboxProviderTests
                 entry.DataStream = new MemoryStream(Encoding.UTF8.GetBytes(spec.Content));
             writer.WriteEntry(entry);
         }
+    }
+
+    private static async Task WriteOverDeclaredTarArchiveAsync(string archivePath, string entryName, long declaredSize)
+    {
+        var header = new byte[512];
+        WriteTarString(header, 0, 100, entryName);
+        WriteTarOctal(header, 100, 8, 420);
+        WriteTarOctal(header, 108, 8, 0);
+        WriteTarOctal(header, 116, 8, 0);
+        WriteTarOctal(header, 124, 12, declaredSize);
+        WriteTarOctal(header, 136, 12, 0);
+        for (var i = 148; i < 156; i++)
+            header[i] = (byte)' ';
+        header[156] = (byte)'0';
+        WriteTarString(header, 257, 6, "ustar");
+        WriteTarString(header, 263, 2, "00");
+
+        var checksum = header.Sum(static b => (int)b);
+        var checksumText = Convert.ToString(checksum, 8)!.PadLeft(6, '0');
+        WriteTarString(header, 148, 6, checksumText);
+        header[154] = 0;
+        header[155] = (byte)' ';
+
+        await using var stream = new FileStream(
+            archivePath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 64 * 1024,
+            useAsync: true);
+        await stream.WriteAsync(header);
+        await stream.WriteAsync(new byte[1024]);
+    }
+
+    private static void WriteTarString(byte[] header, int offset, int length, string value)
+    {
+        var bytes = Encoding.ASCII.GetBytes(value);
+        Array.Copy(bytes, 0, header, offset, Math.Min(bytes.Length, length));
+    }
+
+    private static void WriteTarOctal(byte[] header, int offset, int length, long value)
+    {
+        var text = Convert.ToString(value, 8) ?? "0";
+        if (text.Length > length - 1)
+            throw new ArgumentOutOfRangeException(nameof(value), value, "Value does not fit in tar octal field.");
+        text = text.PadLeft(length - 1, '0');
+        WriteTarString(header, offset, length - 1, text);
+        header[offset + length - 1] = 0;
     }
 
     private static async Task<string> WriteFakeSshCatArchiveAsync(string root, string archivePath)

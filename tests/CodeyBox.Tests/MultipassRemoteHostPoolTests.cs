@@ -92,7 +92,7 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
-    public async Task CreateAsync_routes_to_healthy_host_when_failed_host_rollback_is_unconfirmed()
+    public async Task CreateAsync_defers_with_retained_sandbox_when_failed_host_rollback_is_unconfirmed()
     {
         var opts = Options(
             Host("a", cap: 1),
@@ -102,13 +102,37 @@ public sealed class MultipassRemoteHostPoolTests
         transports["a"].DeleteExitCode = 1;
         var provider = Provider(() => opts, transports);
 
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await provider.CreateAsync(Spec()));
+
+        Assert.Equal("create-rollback-cleanup", ex.Operation);
+        Assert.Equal("remote-cleanup-unconfirmed", ex.ErrorClass);
+        Assert.NotNull(ex.RetainedSandboxName);
+        Assert.Equal(1, transports["a"].DeleteCount);
+        Assert.Equal(0, transports["b"].LaunchCount);
+        var snapshot = provider.SnapshotHostPool().OrderBy(h => h.HostId).ToArray();
+        Assert.Equal(1, snapshot[0].Reserved);
+        Assert.Equal(0, snapshot[1].Reserved);
+        Assert.False(snapshot[0].RuntimeHealthy);
+    }
+
+    [Fact]
+    public async Task CreateAsync_routes_around_host_runtime_command_failure_when_cleanup_succeeds()
+    {
+        var opts = Options(
+            Host("a", cap: 1),
+            Host("b", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].LaunchExitCode = 1;
+        var provider = Provider(() => opts, transports);
+
         await using var sandbox = await provider.CreateAsync(Spec());
 
         Assert.Equal("b", ((MultipassRemoteSandbox)sandbox).HostId);
         Assert.Equal(1, transports["a"].DeleteCount);
         Assert.Equal(1, transports["b"].LaunchCount);
         var snapshot = provider.SnapshotHostPool().OrderBy(h => h.HostId).ToArray();
-        Assert.Equal(1, snapshot[0].Reserved);
+        Assert.Equal(0, snapshot[0].Reserved);
         Assert.Equal(1, snapshot[1].Reserved);
         Assert.False(snapshot[0].RuntimeHealthy);
     }
@@ -321,9 +345,10 @@ public sealed class MultipassRemoteHostPoolTests
         transports["a"].LaunchExitCode = 1;
         var provider = Provider(() => opts, transports);
 
-        await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
             await provider.CreateAsync(Spec()));
 
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
         Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
         Assert.Equal(1, transports["a"].DeleteCount);
     }
@@ -374,9 +399,10 @@ public sealed class MultipassRemoteHostPoolTests
         transports["a"].InfoStderr = "instance not found";
         var provider = Provider(() => opts, transports);
 
-        await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
             await provider.CreateAsync(Spec()));
 
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
         Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
         Assert.Equal(1, transports["a"].DeleteCount);
         Assert.Equal(1, transports["a"].InfoCount);
@@ -384,19 +410,45 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
-    public async Task CreateAsync_request_specific_launch_failure_does_not_mark_host_runtime_unhealthy()
+    public async Task CreateAsync_host_runtime_launch_failure_marks_host_runtime_unhealthy()
     {
         var opts = Options(Host("a", cap: 1));
         var transports = new HostTransportSet();
         transports["a"].LaunchExitCode = 1;
         var provider = Provider(() => opts, transports);
 
-        await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
             await provider.CreateAsync(Spec()));
 
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
         var host = Assert.Single(provider.SnapshotHostPool());
-        Assert.True(host.RuntimeHealthy);
+        Assert.False(host.RuntimeHealthy);
         Assert.Equal(0, host.Reserved);
+    }
+
+    [Fact]
+    public async Task CreateAsync_list_exit_marks_host_unhealthy_and_defers_when_all_hosts_fail_inventory()
+    {
+        var opts = Options(
+            Host("a", cap: 1),
+            Host("b", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].ListExitCode = 1;
+        transports["b"].ListExitCode = 1;
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await provider.CreateAsync(Spec()));
+
+        Assert.Equal("placement", ex.Operation);
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
+        Assert.All(provider.SnapshotHostPool(), row =>
+        {
+            Assert.False(row.RuntimeHealthy);
+            Assert.Equal(0, row.Reserved);
+        });
+        Assert.Equal(0, transports["a"].LaunchCount);
+        Assert.Equal(0, transports["b"].LaunchCount);
     }
 
     [Fact]
@@ -429,13 +481,12 @@ public sealed class MultipassRemoteHostPoolTests
         transports["b"].ManagedNames.Add("codeybox-r-bbbbb");
         var provider = Provider(() => opts, transports);
 
-        var infos = await provider.ListAllManagedAsync(CancellationToken.None);
+        var inventory = await provider.ListManagedInventoryAsync(CancellationToken.None);
 
-        var info = Assert.Single(infos);
+        var info = Assert.Single(inventory);
         Assert.Equal("codeybox-r-bbbbb", info.Name);
         Assert.Equal("b", info.HostId);
         Assert.False(provider.SnapshotHostPool().Single(h => h.HostId == "a").RuntimeHealthy);
-        var inventory = Assert.IsAssignableFrom<IManagedSandboxInventoryResult>(infos);
         Assert.False(inventory.IsComplete);
         Assert.Equal(["b"], inventory.InventoriedHostIds.OrderBy(static id => id, StringComparer.Ordinal).ToArray());
     }
@@ -665,6 +716,7 @@ public sealed class MultipassRemoteHostPoolTests
         public int LaunchExitCode { get; set; }
         public int DeleteExitCode { get; set; }
         public int InfoExitCode { get; set; }
+        public int ListExitCode { get; set; }
         public string InfoStderr { get; set; } = "";
         public List<string> ManagedNames { get; } = [];
         public int LaunchCount => _calls.Count(argv => argv.Contains("launch"));
@@ -711,6 +763,8 @@ public sealed class MultipassRemoteHostPoolTests
             }
             if (argv.Contains("list"))
             {
+                if (ListExitCode != 0)
+                    return Task.FromResult(new ProcessRunResult(ListExitCode, "", "list failed"));
                 var entries = string.Join(",", ManagedNames.Select(name => $"{{\"name\":\"{name}\",\"state\":\"Running\"}}"));
                 return Task.FromResult(new ProcessRunResult(0, $"{{\"list\":[{entries}]}}", ""));
             }

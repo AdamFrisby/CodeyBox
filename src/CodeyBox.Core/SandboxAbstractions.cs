@@ -28,6 +28,18 @@ public interface IManagedSandboxLifecycle
     Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct);
 
     /// <summary>
+    /// Returns managed sandboxes together with inventory completeness metadata.
+    /// Multi-host providers must override this when a sweep can partially
+    /// succeed, so callers do not infer that a missing sandbox is absent on a
+    /// host that was never inventoried.
+    /// </summary>
+    async Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
+    {
+        var managed = await ListAllManagedAsync(ct).ConfigureAwait(false);
+        return ManagedSandboxInventory.Complete(managed);
+    }
+
+    /// <summary>
     /// Best-effort dispose of a sandbox by name. Used by the
     /// <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> when
     /// <c>AutoDispose=true</c>, and by the
@@ -151,20 +163,7 @@ public sealed record ManagedSandboxInfo(
     string? LifecycleProviderId = null,
     string? HostId = null);
 
-/// <summary>
-/// Optional metadata carried by <see cref="ISandboxProvider.ListAllManagedAsync"/>
-/// results. Providers that fan out to multiple executor hosts can return a
-/// partial inventory when one host is unreachable; callers that release
-/// retained capacity must only treat a missing sandbox as absent when the
-/// relevant host was actually inventoried.
-/// </summary>
-public interface IManagedSandboxInventoryResult
-{
-    bool IsComplete { get; }
-    IReadOnlySet<string> InventoriedHostIds { get; }
-}
-
-public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>, IManagedSandboxInventoryResult
+public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>
 {
     private readonly IReadOnlyList<ManagedSandboxInfo> _items;
 
@@ -182,6 +181,9 @@ public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>,
     public IReadOnlySet<string> InventoriedHostIds { get; }
     public int Count => _items.Count;
     public ManagedSandboxInfo this[int index] => _items[index];
+
+    public static ManagedSandboxInventory Complete(IReadOnlyList<ManagedSandboxInfo> items) =>
+        new(items, isComplete: true);
 
     public IEnumerator<ManagedSandboxInfo> GetEnumerator() => _items.GetEnumerator();
     System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();

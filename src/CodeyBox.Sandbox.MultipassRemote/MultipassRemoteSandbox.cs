@@ -521,8 +521,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             recheckIn: _opts.PlacementRecheckIn,
             retainedSandboxName: Id,
             retainedSandboxHostId: HostId,
-            innerException: inner,
-            retainedSandboxConsumesAdmission: !string.Equals(operation, "sync-back", StringComparison.Ordinal));
+            innerException: inner);
 
     private static string QuoteArgvForShell(IReadOnlyList<string> argv)
     {

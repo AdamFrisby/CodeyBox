@@ -140,6 +140,7 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         // we keep using IProcessRunner (which already streams stderr) for
         // each leg.
         using var tarProc = StartLocalTar(opts, hostParent, basename);
+        var tarStderrTask = tarProc.StandardError.ReadToEndAsync(ct);
         try
         {
             // IProcessRunner doesn't accept a binary stdin stream — tar
@@ -148,9 +149,11 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             var sshResult = await RunSshWithBinaryStdinAsync(opts, sshArgv, tarProc.StandardOutput.BaseStream, ct).ConfigureAwait(false);
 
             await tarProc.WaitForExitAsync(ct).ConfigureAwait(false);
+            var tarStderr = await tarStderrTask.ConfigureAwait(false);
             if (tarProc.ExitCode != 0)
                 throw new RemoteSshTransportException(
-                    $"Local tar failed (exit {tarProc.ExitCode}) staging '{hostPath}' into '{remotePath}'.");
+                    $"Local tar failed (exit {tarProc.ExitCode}) staging '{hostPath}' into '{remotePath}': {TailFor(tarStderr)}",
+                    RemoteSshTransportFailureKind.RemoteCommand);
 
             if (sshResult.StartFailed)
                 throw new RemoteSshTransportException(
@@ -162,11 +165,13 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
 
             if (sshResult.ExitCode != 0)
                 throw new RemoteSshTransportException(
-                    $"Remote tar-extract failed (exit {sshResult.ExitCode}) for '{remotePath}': {TailFor(sshResult.Stderr)}");
+                    $"Remote tar-extract failed (exit {sshResult.ExitCode}) for '{remotePath}': {TailFor(sshResult.Stderr)}",
+                    RemoteSshTransportFailureKind.RemoteCommand);
         }
         finally
         {
             try { if (!tarProc.HasExited) tarProc.Kill(entireProcessTree: true); } catch { }
+            try { await tarStderrTask.ConfigureAwait(false); } catch { }
         }
     }
 

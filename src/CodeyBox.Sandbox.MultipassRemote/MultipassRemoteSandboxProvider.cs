@@ -167,7 +167,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 MarkRuntimeHealthy(opts.HostId);
                 return sandbox;
             }
-            catch (RemoteSshTransportException ex)
+            catch (RemoteSshTransportException ex) when (ex.IsHostTransportFailure)
             {
                 lastHostFailure = ex;
                 skippedHosts.Add(opts.HostId);
@@ -180,11 +180,40 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                     remoteSandboxRoot,
                     ex,
                     ct,
-                    throwOnCleanupFailure: false).ConfigureAwait(false);
+                    throwOnCleanupFailure: true).ConfigureAwait(false);
 
                 _log.LogWarning(
                     ex,
                     "Remote multipass host {HostId} transport failed during CreateAsync; retrying placement on another eligible host",
+                    opts.HostId);
+            }
+            catch (RemoteSshTransportException ex)
+            {
+                await RollBackCreateFailureAsync(opts, reservation, transport, vmName, remoteSandboxRoot, ex, ct).ConfigureAwait(false);
+                _log.LogWarning(
+                    ex,
+                    "Remote multipass host {HostId} failed request-specific staging during CreateAsync; failing the sandbox request",
+                    opts.HostId);
+                throw;
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+            {
+                lastHostFailure = ex;
+                skippedHosts.Add(opts.HostId);
+                MarkRuntimeUnhealthy(opts, ex);
+                await RollBackCreateFailureAsync(
+                    opts,
+                    reservation,
+                    transport,
+                    vmName,
+                    remoteSandboxRoot,
+                    ex,
+                    ct,
+                    throwOnCleanupFailure: true).ConfigureAwait(false);
+
+                _log.LogWarning(
+                    ex,
+                    "Remote multipass host {HostId} failed host-level provisioning during CreateAsync; retrying placement on another eligible host",
                     opts.HostId);
             }
             catch (RemoteHostProvisioningException ex)
@@ -196,11 +225,9 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                     opts.HostId);
                 throw;
             }
-            catch
+            catch (Exception ex)
             {
-                reservation.Dispose();
-                if (transport is not null && vmName is not null && remoteSandboxRoot is not null)
-                    await BestEffortRemoteDeleteAsync(opts, transport, vmName, remoteSandboxRoot).ConfigureAwait(false);
+                await RollBackCreateFailureAsync(opts, reservation, transport, vmName, remoteSandboxRoot, ex, ct).ConfigureAwait(false);
                 throw;
             }
         }
@@ -406,7 +433,10 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         return sandbox;
     }
 
-    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        await ListManagedInventoryAsync(ct).ConfigureAwait(false);
+
+    public async Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
     {
         var infos = new List<ManagedSandboxInfo>();
         var hosts = ResolveHosts();
@@ -442,6 +472,9 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
             if (result.ExitCode != 0)
             {
+                MarkRuntimeUnhealthy(
+                    opts,
+                    $"multipass list exited {result.ExitCode}: {TruncateForLog(result.Stderr)}");
                 _log.LogWarning("multipass list (remote host {HostId}) exited {Exit}: {Stderr}",
                     opts.HostId, result.ExitCode, result.Stderr);
                 continue;
@@ -650,9 +683,10 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         var r = await RunRemoteMaybeGatedAsync(opts, transport, argv, ct).ConfigureAwait(false);
         if (r.ExitCode != 0)
             throw new RemoteHostProvisioningException(
-                transport.DiagnosticId,
+                opts.HostId,
                 CommandName(argv),
-                $"Remote command failed (exit {r.ExitCode}): argv=[{string.Join(' ', argv)}] stderr={TruncateForLog(r.Stderr)}");
+                $"Remote command failed (exit {r.ExitCode}): argv=[{string.Join(' ', argv)}] stderr={TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: IsHostRuntimeCommand(argv));
     }
 
     internal Task<ProcessRunResultLike> RunRemoteAsync(IReadOnlyList<string> argv, CancellationToken ct) =>
@@ -767,7 +801,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             throw new RemoteHostProvisioningException(
                 transport.DiagnosticId,
                 "staging-dir",
-                $"Failed to create remote sandbox staging dir '{remoteSandboxRoot}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}");
+                $"Failed to create remote sandbox staging dir '{remoteSandboxRoot}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
     }
 
     private async Task CloneRemoteBaselineAsync(
@@ -797,7 +832,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             throw new RemoteHostProvisioningException(
                 transport.DiagnosticId,
                 "staging-metadata",
-                $"Failed to write remote sandbox metadata '{metadataPath}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}");
+                $"Failed to write remote sandbox metadata '{metadataPath}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
     }
 
     private async Task ApplyVmEnvironmentAsync(
@@ -823,7 +859,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             throw new RemoteHostProvisioningException(
                 opts.HostId,
                 "env",
-                $"Failed to apply env to remote VM '{vmName}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}");
+                $"Failed to apply env to remote VM '{vmName}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
     }
 
     internal async Task WaitForVmStateAsync(string vmName, string targetState, TimeSpan timeout, CancellationToken ct)
@@ -855,7 +892,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 throw new RemoteHostProvisioningException(
                     opts.HostId,
                     "wait-state",
-                    $"Remote VM '{vmName}' did not reach state '{targetState}' within {timeout}.");
+                    $"Remote VM '{vmName}' did not reach state '{targetState}' within {timeout}.",
+                    isHostRuntimeFailure: true);
 
             try { await Task.Delay(opts.VmStateCheckInterval, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { throw; }
@@ -1426,6 +1464,15 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         return argv[0];
     }
 
+    private static bool IsHostRuntimeCommand(IReadOnlyList<string> argv)
+    {
+        if (argv.Count == 0)
+            return false;
+        if (argv[0].Contains("multipass", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return argv[0] is "mkdir" or "rm";
+    }
+
     private void AddManagedFromListJson(
         List<ManagedSandboxInfo> infos,
         MultipassRemoteSandboxOptions opts,
@@ -1611,15 +1658,21 @@ internal readonly record struct RemoteSandboxIdentity(string HostId, string Name
 
 internal sealed class RemoteHostProvisioningException : Exception
 {
-    public RemoteHostProvisioningException(string hostId, string operation, string message)
+    public RemoteHostProvisioningException(
+        string hostId,
+        string operation,
+        string message,
+        bool isHostRuntimeFailure = false)
         : base(message)
     {
         HostId = hostId;
         Operation = operation;
+        IsHostRuntimeFailure = isHostRuntimeFailure;
     }
 
     public string HostId { get; }
     public string Operation { get; }
+    public bool IsHostRuntimeFailure { get; }
 }
 
 /// <summary>

@@ -3328,7 +3328,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
-        transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>());
+        transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
+        hostPoolSnapshot: sp.GetService<ISandboxProvider>() as ISandboxHostPoolSnapshot);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(

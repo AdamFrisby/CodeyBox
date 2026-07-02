@@ -193,7 +193,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
-        var managed = await _inner.ListAllManagedAsync(ct).ConfigureAwait(false);
+        var managed = await _inner.ListManagedInventoryAsync(ct).ConfigureAwait(false);
         var managedIds = managed.Select(SandboxAdmissionIdentity.FromManaged).ToArray();
         var inventory = SandboxInventoryScope.From(managed);
         _resumeAdmissions?.ReleaseMissing(managedIds, inventory.CanTreatMissingAsAbsent);
@@ -401,8 +401,6 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var releaseAdmission = false;
         if (innerDisposeSucceeded)
             releaseAdmission = !await IsManagedSandboxStillPresentAsync(identity).ConfigureAwait(false);
-        else if (RetainedDisposeFailureDoesNotConsumeAdmission(disposeFailure))
-            releaseAdmission = true;
 
         if (releaseAdmission)
             lease.Dispose();
@@ -417,11 +415,6 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             _disposedSandboxAdmissions.Retain(identity, lease);
         }
     }
-
-    private static bool RetainedDisposeFailureDoesNotConsumeAdmission(Exception? disposeFailure) =>
-        disposeFailure is SandboxProvisioningDeferredException ex
-        && !ex.RetainedSandboxConsumesAdmission
-        && !string.IsNullOrWhiteSpace(ex.RetainedSandboxName);
 
     private void OnSandboxPreserved(AdmissionControlledSandbox sandbox)
     {
@@ -466,7 +459,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     {
         try
         {
-            var managed = await _inner.ListAllManagedAsync(CancellationToken.None).ConfigureAwait(false);
+            var managed = await _inner.ListManagedInventoryAsync(CancellationToken.None).ConfigureAwait(false);
             if (managed.Any(info => SandboxAdmissionIdentity.FromManaged(info) == identity))
                 return true;
             var inventory = SandboxInventoryScope.From(managed);
@@ -525,15 +518,8 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         bool IsComplete,
         IReadOnlySet<string> InventoriedHostIds)
     {
-        public static SandboxInventoryScope From(IReadOnlyList<ManagedSandboxInfo> managed)
-        {
-            if (managed is IManagedSandboxInventoryResult inventory)
-                return new SandboxInventoryScope(inventory.IsComplete, inventory.InventoriedHostIds);
-
-            return new SandboxInventoryScope(
-                IsComplete: true,
-                InventoriedHostIds: new HashSet<string>(StringComparer.Ordinal));
-        }
+        public static SandboxInventoryScope From(ManagedSandboxInventory inventory) =>
+            new(inventory.IsComplete, inventory.InventoriedHostIds);
 
         public bool CanTreatMissingAsAbsent(SandboxAdmissionIdentity identity) =>
             IsComplete
