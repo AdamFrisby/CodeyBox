@@ -189,6 +189,17 @@ practice — with real numbers from running it on its own codebase:
 - **Every round costs tokens.** Watch per-item cost early to build a feel for
   the economics before scaling up.
 
+Audit rounds to merge, across 113 merged changes to this codebase — most land
+in 2–4 rounds, but the tail is real:
+
+```mermaid
+xychart-beta
+    title "Audit rounds to merge (113 merged changes · median 5 · mean 7 · never 1)"
+    x-axis ["2", "3-4", "5-8", "9-15", "16+"]
+    y-axis "Merged changes" 0 --> 40
+    bar [20, 34, 32, 16, 11]
+```
+
 **Getting good results.**
 
 - **Anchor the fleet with a workhorse** — a strong coding subscription is
