@@ -6110,6 +6110,7 @@ while True:
         sb.AppendLine("codeybox_drain_stdin() {");
         sb.AppendLine("    cat >/dev/null 2>/dev/null || true");
         sb.AppendLine("}");
+        sb.AppendLine("if [ -f \"$codeybox_pgid_marker\" ]; then codeybox_drain_stdin; exit 0; fi");
         sb.AppendLine("if ! codeybox_root_sh 'mkdir -p \"$1\" && { chown root:root \"$1\" 2>/dev/null || true; } && chmod 0700 \"$1\"' \"$codeybox_supervisor_dir\"; then");
         sb.AppendLine("    echo \"codeybox-detached: failed to prepare supervisor directory\" >&2");
         sb.AppendLine("    codeybox_drain_stdin");
