@@ -7,10 +7,10 @@ change on your branch (and on GitHub, if you point it there). You stay in the
 loop for product decisions; it handles the delivery grind.
 
 It drives a *fleet* of agent CLIs — Claude Code, OpenAI Codex, GitHub Copilot,
-Cursor, Gemini, opencode — and routes each task to whichever one is best and
-available, falling back automatically when a provider hits a rate limit. The
-orchestrator itself runs **no LLMs**: it schedules sandboxes, gates quality,
-tracks spend, and keeps state durably across restarts.
+Cursor, Gemini, opencode, Antigravity, and more — and routes each task to
+whichever one is best and available, falling back automatically when a provider
+hits a rate limit. The orchestrator itself runs **no LLMs**: it schedules
+sandboxes, gates quality, tracks spend, and keeps state durably across restarts.
 
 And because every agent is boxed in a real VM behind a host-enforced firewall,
 it's one of the few orchestrators of this kind designed to be **safe to
@@ -37,22 +37,24 @@ actually leave running** — see [Security: defense in depth](#security-defense-
 
 ## How it works
 
-```
-   POST /workitems  ──►  queue  ──►  worker pool
-                                        │  (one fresh VM per phase)
-                                        ▼
-        ┌──────────────────────────────────────────────────────┐
-        │  1. Work     run the agent, commit, push a branch     │
-        │  2. Audit    tool + LLM review → rework until it passes│
-        │  3. Merge    resolve conflicts in-VM, verify on host  │
-        │  4. Push     replicate to GitHub / any git remote     │
-        └──────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-                         a reviewed, merged change
+```mermaid
+flowchart TD
+    A["POST /workitems"] --> Q["Queue"]
+    Q --> W["Worker pool — one fresh VM per phase"]
+    subgraph atomic["Atomic — lands cleanly or not at all"]
+        W --> P1["1 · Work · run the agent, commit, push a branch"]
+        P1 --> P2["2 · Audit · tool + LLM review"]
+        P2 -->|"findings"| RW["Rework"]
+        RW --> P2
+        P2 -->|"all gates pass"| P3["3 · Merge · host-side clean merge; agent only for real conflicts"]
+    end
+    P3 --> P4["4 · Push · retryable — replicate to GitHub / any remote"]
+    P4 --> DONE(["A reviewed, merged change"])
 ```
 
-Phases 1–3 are atomic — the change lands cleanly or not at all. Push is a
+Phases 1–3 are atomic — the change lands cleanly or not at all. Clean merges
+are done host-side (no agent); only genuine conflicts are handed to an in-VM
+agent, then verified by a deterministic host-side scope fence. Push is a
 separate retryable tier, so a flaky remote never corrupts your local result.
 The full state machine is in [`docs/architecture.md`](docs/architecture.md).
 
@@ -98,13 +100,14 @@ matters.
 
 The fastest way to watch it work end-to-end, on your own machine:
 
-> The default sandbox is `process` — it runs the agent **directly on your
-> host with no isolation**. Great for kicking the tires on a throwaway repo,
-> **not** safe for untrusted prompts. For real use, switch to Multipass
-> (see [Going to production](#going-to-production)).
+> Run it on **Multipass** from the start — it's a one-line install
+> (`snap install multipass`) and gives you real KVM isolation. A `process`
+> provider exists for constrained CI, but it runs the agent **directly on your
+> host with no isolation** — never point it at anything untrusted.
 
 **1. Requirements:** the [.NET 10 SDK](https://dotnet.microsoft.com/download),
-git, and at least one agent CLI installed and logged in (e.g. `claude`).
+git, [Multipass](https://multipass.run) (`snap install multipass`), and at
+least one agent CLI installed and logged in (e.g. `claude`).
 
 **2. Build:**
 
@@ -120,6 +123,7 @@ dotnet build CodeyBox.slnx
 ```json
 {
   "CodeyBox": {
+    "SandboxProvider": "multipass",
     "Projects": [
       {
         "Id": "my-app",
@@ -164,6 +168,80 @@ dotnet run --project tools/CodeyBox.Cli -- queue watch <work-item-id>
 See [`docs/projects.md`](docs/projects.md) for the full project schema
 (auditors, per-phase network profiles, upstream config) and
 [`docs/configuration.md`](docs/configuration.md) for everything tunable.
+
+## Running it well
+
+CodeyBox trades wall-clock for review depth. A feel for what that means in
+practice — with real numbers from running it on its own codebase:
+
+**What to expect.**
+
+- **Features take 2–10 audit rounds to merge (median 5, mean ~7), and
+  *nothing* passes on the first audit** — a long tail reaches 30–40 rounds on
+  hard changes. The auditors don't return a complete issue list each pass; the
+  multi-round grind *is* the thoroughness. Budget for iteration, not one-shot.
+- **Throughput is bounded by the lesser of host CPU and agent quota — not raw
+  speed.** Each agent is a full VM, so concurrent capacity is first a CPU
+  decision. With a single quota-limited subscription workhorse expect a handful
+  of merges a day; it climbs as you add parallelism and more agents. Deep in a
+  provider's quota tail it can drop to 1–2/day and items park — that's the
+  system draining quota, not a fault.
+- **Every round costs tokens.** Watch per-item cost early to build a feel for
+  the economics before scaling up.
+
+**Getting good results.**
+
+- **Anchor the fleet with a workhorse** — a strong coding subscription is
+  cost-effective for the bulk of the work — but **run in parallel and add
+  smaller agents too.** CodeyBox pools them into a class and routes across
+  them, so throughput scales with members, not just with one agent's quota.
+- **Concurrency is limited by host CPU first, then agent quota.** Because each
+  agent runs a real VM, vCPUs are the hard ceiling: **3 concurrent works well
+  on modest hardware.** Beefier hosts scale higher — especially on
+  **API / pay-per-use pricing**, where you aren't capped by a subscription's
+  short rolling-window and can push concurrency up to whatever the host allows.
+- **Small, dependent tasks** converge faster and cleaner than monoliths. Chain
+  them with `--depends-on`.
+- Set your auditor set and iteration cap **deliberately**: hard gates compound
+  quality but cost rounds. Config hot-reloads — tune without restart.
+
+**Where it can fail, and how to recover.**
+
+- **Quota exhaustion** → items go `WaitingForQuotaReset` and drain (expected).
+  Recover by waiting for the reset or adding capacity.
+- **Silent agent failures** (a flaky provider returns "no changes", or a hidden
+  429) → the no-changes circuit breaker excludes that agent; retry the affected
+  items once it clears.
+- **Post-redeploy provisioning regressions** (a bad cloud-init / base-image
+  change can fail *every* VM) → after any redeploy, watch the queue for a
+  failure flood.
+- **Clean shutdowns don't auto-restart** under `Restart=on-failure` — if the
+  daemon is down with a clean exit, start it again and check the run log for
+  the real reason.
+- **Suspend can wedge VMs** on some hosts → use `SandboxTeardownMode=Stop`.
+- **Audit non-convergence** → items that hit the iteration cap flag
+  `AuditFailed` and are *not* merged; triage or re-queue with
+  `codeybox queue retry`.
+
+**Run an LLM monitor over the top.** The orchestrator runs no LLMs itself — but
+you can point a capable one (Claude in a terminal, or Claude Code) at the
+**`codeybox` CLI** and have it babysit the fleet unattended: periodic health
+check-ins that read the queue, retry transient/infrastructure failures,
+re-queue starved items, and escalate to you only for genuine decisions.
+
+```mermaid
+flowchart LR
+    M["LLM monitor<br/>Claude via codeybox CLI"] -->|"queue ls / show · /quota · /agents/availability"| C["CodeyBox API"]
+    C -->|"stuck? failed? starved?"| M
+    M -->|"retry / re-queue transient failures"| C
+    M -->|"only genuine decisions"| H["You"]
+```
+
+Give it read access plus scoped `queue retry` / `queue add`, a cadence (e.g.
+every few hours), and clear rules on what's routine versus what needs you.
+Judge health by **state transitions and `updatedAt` advancing**, not by the
+Done count — a quota-throttled queue is slow but healthy; a *wedged* one has
+frozen timestamps.
 
 ## Features
 
@@ -275,6 +353,8 @@ command pipe-friendly. → [`docs/cli.md`](docs/cli.md)
 | Cursor         | `CodeyBox.Agents.Cursor`                         |
 | Gemini         | `CodeyBox.Agents.Gemini`                         |
 | opencode       | `CodeyBox.Agents.Opencode`                       |
+| Antigravity    | `CodeyBox.Agents.Antigravity`                    |
+| Crock          | `CodeyBox.Agents.Crock`                          |
 
 Agents are interchangeable. A class lists members with quality scores; the
 router prefers the highest-scoring one that's within quota and under its
@@ -288,18 +368,20 @@ Pick with `CodeyBox.SandboxProvider`:
 
 | Provider     | Setup                    | Isolation                                       |
 |--------------|--------------------------|-------------------------------------------------|
-| `process`    | none                     | **none — dev only**, shares your host           |
-| `bubblewrap` | `apt install bubblewrap` | namespaces, shared kernel; integration-tested   |
-| `multipass`  | `snap install multipass` | **KVM kernel isolation** — recommended for real use |
+| `multipass`  | `snap install multipass` | **KVM kernel isolation — the recommended default** |
 | `graphical`  | Multipass + XFCE/Xvfb    | kernel isolation **with a desktop**, for GUI build/test |
+| `bubblewrap` | `apt install bubblewrap` | namespaces, shared kernel; integration-tested   |
+| `process`    | none                     | **none — testing only, never with untrusted prompts** |
 
+`multipass` is the isolation-providing configuration you want for anything real.
 The `graphical` flavor exposes screenshots and input synthesis through the
 sandbox API for projects that need a display.
 See [`docs/sandbox-providers.md`](docs/sandbox-providers.md).
 
 ## Going to production
 
-1. **Install Multipass** and set `"SandboxProvider": "multipass"`.
+1. **Use Multipass** (`"SandboxProvider": "multipass"`) — the quickstart already
+   does; nothing to change.
 2. **Set up host egress** once, with sudo: `scripts/setup-host-networks.sh`
    creates a Linux bridge per network profile and writes nftables rules that
    drop anything not on the profile's allowlist. A compromised agent with
@@ -339,7 +421,7 @@ The [`docs/`](docs/README.md) tree is the full reference. Good entry points:
 
 ## Status
 
-CodeyBox is under active development and builds clean against .NET 10. The
-`process` sandbox is for development only; the Multipass path is the
-integration-tested, isolation-providing configuration. Issues and
-contributions are welcome.
+CodeyBox is under active development and builds clean against .NET 10. Multipass
+is the recommended, integration-tested, isolation-providing configuration; the
+`process` sandbox is for constrained testing only and gives no isolation. Issues
+and contributions are welcome.
