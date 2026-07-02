@@ -31,6 +31,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private const string MarkerEnvKey = "CODEYBOX_TEST_MARKER";
     private const string MarkerEnvValue = "marker-credential-present";
     private const string MarkerHost = "agent.example.invalid";
+    private const string AuditDotnetShimDir = AuditReviewDotnetShim.Directory;
+    private const string AuditDotnetShimNotice = AuditReviewDotnetShim.Notice;
 
     private readonly string _workspace = Directory.CreateTempSubdirectory(
         "codeybox-sandbox-wiring-").FullName;
@@ -280,6 +282,363 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.Equal(SandboxExecLaunchMode.DetachedBatch, recorded.LaunchMode);
     }
 
+    [Fact]
+    public async Task AuditDotnetShim_DoesNotInterceptToolOrBuildTestGateAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var auditor = new DotnetShimAuditAuditor(
+            expectShim: false,
+            kind: "tool",
+            role: AuditorRole.BuildTestGate);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            sandboxProvider: recorder);
+
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var fakeBin = $"{workingDirectory}/work-fake-dotnet-bin";
+            var logPath = $"{workingDirectory}/work-dotnet-real.log";
+            await InstallFakeDotnetAsync(sandbox, fakeBin, ct);
+
+            var build = await RunDotnetAsync(
+                sandbox,
+                includeAuditShim: false,
+                fakeBin,
+                logPath,
+                ["build"],
+                ct);
+
+            Assert.True(build.Success, build.Stderr);
+            Assert.Contains("real dotnet build", build.Stdout, StringComparison.Ordinal);
+            Assert.DoesNotContain(AuditDotnetShimNotice, build.Stdout, StringComparison.Ordinal);
+            Assert.Contains("build", await ReadSandboxFileOrEmptyAsync(sandbox, logPath, ct), StringComparison.Ordinal);
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-dotnet-shim.txt", "work\n"));
+
+        var item = NewItem("feature/audit-dotnet-shim-tool-gate");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(auditor.Errors);
+
+        var auditSpec = Assert.Single(recorder.SpecsForPhase("audit"));
+        Assert.DoesNotContain(auditSpec.Mounts, m => m.Tmpfs && m.SandboxPath == AuditDotnetShimDir);
+        if (auditSpec.Environment.TryGetValue("PATH", out var auditPath))
+            Assert.DoesNotContain(AuditDotnetShimDir, auditPath, StringComparison.Ordinal);
+
+        var workSpec = Assert.Single(recorder.SpecsForPhase("work"));
+        Assert.DoesNotContain(workSpec.Mounts, m => m.SandboxPath == AuditDotnetShimDir);
+        if (workSpec.Environment.TryGetValue("PATH", out var workPath))
+            Assert.DoesNotContain(AuditDotnetShimDir, workPath, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AuditDotnetShim_InterceptsBuildAndTestForLlmAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var auditor = new DotnetShimAuditAuditor(
+            expectShim: true,
+            kind: "llm",
+            required: AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            sandboxProvider: recorder,
+            credentials: new MarkerCredentialProvider());
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-dotnet-shim.txt", "work\n"));
+
+        var item = NewItem("feature/audit-dotnet-shim-llm");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(auditor.Errors);
+
+        var auditSpecs = recorder.SpecsForPhase("audit");
+        Assert.Equal(2, auditSpecs.Count);
+        Assert.Contains(auditSpecs, spec =>
+            spec.Environment.TryGetValue("PATH", out var path)
+            && path.StartsWith(AuditDotnetShimDir + ":", StringComparison.Ordinal)
+            && spec.Mounts.Any(m => m.Tmpfs && m.SandboxPath == AuditDotnetShimDir));
+        Assert.Contains(auditSpecs, spec =>
+            !spec.Mounts.Any(m => m.SandboxPath == AuditDotnetShimDir)
+            && (!spec.Environment.TryGetValue("PATH", out var path)
+                || !path.Contains(AuditDotnetShimDir, StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task AuditDotnetShim_DisabledByPipelineTuning_AllowsLlmAuditDotnetBuildAndTest()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var auditor = new DotnetShimAuditAuditor(
+            expectShim: false,
+            kind: "llm",
+            required: AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            BlockRedundantDotnetBuildTestInAuditSandbox = false,
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            sandboxProvider: recorder,
+            credentials: new MarkerCredentialProvider(),
+            pipelineTuning: tuning);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-dotnet-shim-disabled.txt", "work\n"));
+
+        var item = NewItem("feature/audit-dotnet-shim-disabled");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(auditor.Errors);
+
+        var auditSpecs = recorder.SpecsForPhase("audit");
+        Assert.Equal(2, auditSpecs.Count);
+        Assert.All(auditSpecs, auditSpec =>
+        {
+            Assert.DoesNotContain(auditSpec.Mounts, m => m.SandboxPath == AuditDotnetShimDir);
+            if (auditSpec.Environment.TryGetValue("PATH", out var auditPath))
+                Assert.DoesNotContain(AuditDotnetShimDir, auditPath, StringComparison.Ordinal);
+        });
+    }
+
+    // The sandbox-side env var that AuditReviewDotnetShim.Apply injects to arm
+    // the absolute-path hardening script. It is the ONLY defense on the
+    // production (multipass) provider against an auditor bypassing the PATH
+    // shim via an absolute dotnet path (e.g. /usr/bin/dotnet test). The branch
+    // that sets it is environment-independent, so it is unit-tested directly
+    // here rather than only through the ProcessSandboxProvider integration path
+    // (where hardening is always off) — a typo'd provider name or a dropped env
+    // var would otherwise silently disable hardening in production with no
+    // failing test.
+    private const string HardenAbsoluteEnvKey = "CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE";
+
+    [Theory]
+    [InlineData("multipass")]
+    [InlineData("multipass-remote")]
+    public void AuditDotnetShim_ArmsAbsolutePathHardening_OnMultipassProviders(string providerName)
+    {
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
+        var applied = shim.Apply(BaseAuditSpec());
+
+        Assert.True(
+            applied.Environment.TryGetValue(HardenAbsoluteEnvKey, out var value),
+            $"provider '{providerName}' must arm absolute-path hardening — it is the only bypass defense on that provider");
+        Assert.Equal("1", value);
+        AssertShimApplied(applied);
+    }
+
+    [Theory]
+    [InlineData("process")]
+    [InlineData("bubblewrap")]
+    [InlineData("multipass-local")] // near-miss: must NOT match the multipass prefix
+    [InlineData("Multipass")]       // case mismatch: comparison is Ordinal, not IgnoreCase
+    public void AuditDotnetShim_DoesNotArmAbsolutePathHardening_OnOtherProviders(string providerName)
+    {
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
+        var applied = shim.Apply(BaseAuditSpec());
+
+        Assert.DoesNotContain(HardenAbsoluteEnvKey, applied.Environment.Keys);
+        // The PATH shim + tmpfs mount still apply on every provider — only the
+        // privileged absolute-path hardening is multipass-scoped.
+        AssertShimApplied(applied);
+    }
+
+    [Fact]
+    public void AuditDotnetShim_Disabled_AppliesNothing_EvenOnMultipass()
+    {
+        var shim = AuditReviewDotnetShim.From(
+            new PipelineTuningOptions { BlockRedundantDotnetBuildTestInAuditSandbox = false },
+            "multipass");
+        var spec = BaseAuditSpec();
+        var applied = shim.Apply(spec);
+
+        Assert.Same(spec, applied);
+        Assert.DoesNotContain(HardenAbsoluteEnvKey, applied.Environment.Keys);
+        Assert.DoesNotContain(applied.Mounts, m => m.SandboxPath == AuditDotnetShimDir);
+    }
+
+    // Behavioral coverage for AuditReviewDotnetShim.PrivilegedHardeningScript —
+    // the ONLY defense on the production (multipass) provider against an auditor
+    // bypassing the PATH shim by invoking dotnet via an absolute path (e.g.
+    // /usr/bin/dotnet test). Every other AuditDotnetShim test exercises the PATH
+    // shim only; the ~60-line privileged hardening body never runs there because
+    // CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE is only armed on multipass and
+    // the ProcessSandboxProvider integration path always leaves it off. This
+    // drives the REAL hardening + shim scripts against a throwaway fixture tree
+    // so the load-bearing actions run without root or the /codeybox/bin mount:
+    // the arm-env gate, moving the real dotnet aside to <target>.codeybox-real,
+    // dropping the shim over the target, the {Directory}/* skip guard, and the
+    // shim's ${0}.codeybox-real passthrough for absolute invocations.
+    [Fact]
+    public async Task PrivilegedHardeningScript_MovesRealDotnetAside_AndInterceptsAbsoluteInvocation()
+    {
+        if (OperatingSystem.IsWindows())
+            return; // POSIX shell + unix file modes; the audit sandboxes are Linux.
+
+        var fixture = Directory.CreateTempSubdirectory("codeybox-harden-").FullName;
+        try
+        {
+            var shimDir = Path.Combine(fixture, "codeybox", "bin");
+            Directory.CreateDirectory(shimDir);
+            var shimPath = Path.Combine(shimDir, "dotnet");
+            await File.WriteAllTextAsync(shimPath, AuditReviewDotnetShim.ShimScript);
+            MakeExecutable(shimPath);
+
+            // Force the non-sudo branch deterministically: a fake `sudo` that
+            // fails `sudo -n true` makes the script fall through to the direct
+            // mv/cp/chmod path regardless of whether the host has passwordless
+            // sudo (it does on the multipass image, it does not on CI). The
+            // non-sudo branch is the one the audit finding singled out as
+            // testable without root.
+            var fakeSudo = Path.Combine(shimDir, "sudo");
+            await File.WriteAllTextAsync(fakeSudo, "#!/bin/sh\nexit 1\n");
+            MakeExecutable(fakeSudo);
+
+            // A candidate that lives under the shim directory must be skipped by
+            // the {Directory}/* case guard, never moved aside.
+            var shimDirSibling = Path.Combine(shimDir, "dotnet-tool");
+            await File.WriteAllTextAsync(shimDirSibling, "#!/bin/sh\necho sibling\n");
+            MakeExecutable(shimDirSibling);
+
+            // The real dotnet an auditor could reach by absolute path.
+            var realDir = Path.Combine(fixture, "opt", "dotnet");
+            Directory.CreateDirectory(realDir);
+            var target = Path.Combine(realDir, "dotnet");
+            const string realBody = "#!/bin/sh\necho \"real dotnet $*\"\n";
+            await File.WriteAllTextAsync(target, realBody);
+            MakeExecutable(target);
+
+            var script = AuditReviewDotnetShim.BuildPrivilegedHardeningScript(
+                shimPath, shimDir, shimDirSibling);
+
+            // Gate: without the arming env var the script is a no-op.
+            var noop = await RunHostShimScriptAsync(script, shimDir, target, arm: false);
+            Assert.Equal(0, noop.code);
+            Assert.Equal(realBody, await File.ReadAllTextAsync(target));
+            Assert.False(File.Exists(target + ".codeybox-real"));
+
+            // Armed (non-sudo branch): the real dotnet is moved aside and the
+            // shim takes its place.
+            var armed = await RunHostShimScriptAsync(script, shimDir, target, arm: true);
+            Assert.Equal(0, armed.code);
+            Assert.Equal(AuditReviewDotnetShim.ShimScript, await File.ReadAllTextAsync(target));
+            Assert.Equal(realBody, await File.ReadAllTextAsync(target + ".codeybox-real"));
+
+            // The shim-directory sibling is left untouched by the skip guard.
+            Assert.False(File.Exists(shimDirSibling + ".codeybox-real"));
+
+            // Absolute invocation of the now-shimmed target: build/test are
+            // intercepted with the notice and never reach a compiler...
+            var test = await RunHostBinaryAsync(target, ["test", "--filter", "X"]);
+            Assert.Equal(0, test.code);
+            Assert.Contains(AuditDotnetShimNotice, test.stdout, StringComparison.Ordinal);
+            // ...while other subcommands exec the moved-aside real dotnet via the
+            // shim's ${0}.codeybox-real sibling passthrough.
+            var info = await RunHostBinaryAsync(target, ["--info"]);
+            Assert.Equal(0, info.code);
+            Assert.Contains("real dotnet --info", info.stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(fixture, recursive: true); } catch { }
+        }
+    }
+
+    private static Task<(int code, string stdout, string stderr)> RunHostShimScriptAsync(
+        string script, string shimDir, string target, bool arm)
+    {
+        // shimDir leads PATH so the script's `command -v dotnet` resolves to the
+        // fixture shim (and is skipped) rather than any real host dotnet.
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["PATH"] = shimDir + ":/usr/bin:/bin",
+            // Empty (not absent) so an inherited value can never arm the gate.
+            ["CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE"] = arm ? "1" : "",
+        };
+        return RunHostProcessAsync("/bin/sh", ["-s", "--", target], script, env);
+    }
+
+    private static Task<(int code, string stdout, string stderr)> RunHostBinaryAsync(
+        string path, IReadOnlyList<string> args)
+        => RunHostProcessAsync(path, args, stdin: null, env: null);
+
+    private static void MakeExecutable(string path)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        File.SetUnixFileMode(
+            path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+
+    private static async Task<(int code, string stdout, string stderr)> RunHostProcessAsync(
+        string fileName, IReadOnlyList<string> args, string? stdin, IReadOnlyDictionary<string, string>? env)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = fileName,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = stdin is not null,
+            UseShellExecute = false,
+        };
+        foreach (var a in args)
+            psi.ArgumentList.Add(a);
+        if (env is not null)
+            foreach (var (k, v) in env)
+                psi.Environment[k] = v;
+
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        if (stdin is not null)
+        {
+            await p.StandardInput.WriteAsync(stdin);
+            p.StandardInput.Close();
+        }
+        var stdoutTask = p.StandardOutput.ReadToEndAsync();
+        var stderrTask = p.StandardError.ReadToEndAsync();
+        await p.WaitForExitAsync();
+        return (p.ExitCode, await stdoutTask, await stderrTask);
+    }
+
+    private static SandboxSpec BaseAuditSpec() => new()
+    {
+        ImageReference = "ignored",
+        Environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["PATH"] = "/usr/local/bin:/usr/bin:/bin",
+        },
+    };
+
+    private static void AssertShimApplied(SandboxSpec applied)
+    {
+        Assert.True(applied.Environment.TryGetValue("PATH", out var path));
+        Assert.StartsWith(AuditDotnetShimDir + ":", path);
+        Assert.Contains(applied.Mounts, m => m.Tmpfs && m.SandboxPath == AuditDotnetShimDir);
+    }
+
     private static void AssertCredentialAndOpenNetwork(SandboxSpec spec, string phaseName)
     {
         Assert.True(spec.Environment.TryGetValue(MarkerEnvKey, out var marker),
@@ -292,6 +651,70 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         // AND "credential != null" — those are the two switches the resolver
         // sandbox setup defect (#168 follow-up) flipped to the wrong values.
         Assert.NotEmpty(spec.Network.AllowedHosts);
+    }
+
+    private static async Task InstallFakeDotnetAsync(ISandbox sandbox, string fakeBin, CancellationToken ct)
+    {
+        const string script = """
+            #!/bin/sh
+            printf '%s\n' "$*" >> "$CODEYBOX_FAKE_DOTNET_LOG"
+            printf 'real dotnet %s\n' "$*"
+            """;
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "mkdir -p \"$1\" && cat > \"$1/dotnet\" && chmod 0755 \"$1/dotnet\"", "sh", fakeBin],
+            Stdin = script,
+        }, ct);
+        Assert.True(result.Success, result.Stderr);
+    }
+
+    private static Task<SandboxExecResult> RunDotnetAsync(
+        ISandbox sandbox,
+        bool includeAuditShim,
+        string fakeBin,
+        string logPath,
+        string[] args,
+        CancellationToken ct)
+    {
+        var exec = includeAuditShim
+            ? new SandboxExec
+            {
+                Argv =
+                [
+                    "sh",
+                    "-c",
+                    "fake_bin=$1; log_path=$2; shift 2; case \"$PATH\" in *:*) PATH=\"${PATH%%:*}:$fake_bin:${PATH#*:}\" ;; *) PATH=\"$PATH:$fake_bin\" ;; esac; export PATH CODEYBOX_FAKE_DOTNET_LOG=\"$log_path\"; dotnet \"$@\"",
+                    "sh",
+                    fakeBin,
+                    logPath,
+                    .. args,
+                ],
+            }
+            : new SandboxExec
+            {
+                Argv =
+                [
+                    "sh",
+                    "-c",
+                    "fake_bin=$1; log_path=$2; shift 2; PATH=\"$fake_bin:$PATH\"; export PATH CODEYBOX_FAKE_DOTNET_LOG=\"$log_path\"; dotnet \"$@\"",
+                    "sh",
+                    fakeBin,
+                    logPath,
+                    .. args,
+                ],
+            };
+        return sandbox.ExecAsync(exec, ct);
+    }
+
+    private static async Task<string> ReadSandboxFileOrEmptyAsync(ISandbox sandbox, string path, CancellationToken ct)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "[ -f \"$1\" ] && cat \"$1\" || true", "sh", path],
+        }, ct);
+        Assert.True(result.Success, result.Stderr);
+        return result.Stdout;
     }
 
     private async Task CommitToBareBranchAsync(
@@ -505,6 +928,102 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             return result.Success
                 ? new AuditResult(true, [])
                 : new AuditResult(false, [new AuditFinding(Name, AuditSeverity.Error, "batch launch mode exec failed", result.Stderr)]);
+        }
+    }
+
+    private sealed class DotnetShimAuditAuditor(
+        bool expectShim,
+        string kind = "tool",
+        AuditorRole role = AuditorRole.None,
+        AuditCapabilities required = AuditCapabilities.None) : IAuditor, IRequiresPassedBuildTestGate
+    {
+        private readonly List<string> _errors = new();
+
+        public string Name => expectShim ? $"audit-dotnet-shim-{kind}" : $"audit-dotnet-shim-disabled-{kind}";
+        public string Kind => kind;
+        public AuditCapabilities Required => required;
+        public AuditorRole Role => role;
+        public BuildTestGateEvidence BuildTestGateEvidence => role == AuditorRole.BuildTestGate
+            ? BuildTestGateEvidence.BuildAndTest
+            : BuildTestGateEvidence.None;
+        public IReadOnlyList<string> Errors => _errors;
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = context;
+            var fakeBin = $"{workingDirectory}/{Name}-fake-bin";
+            var logPath = $"{workingDirectory}/{Name}-real.log";
+
+            try
+            {
+                await InstallFakeDotnetAsync(sandbox, fakeBin, ct);
+                var build = await RunDotnetAsync(sandbox, expectShim, fakeBin, logPath, ["build", "--no-incremental"], ct);
+                var test = await RunDotnetAsync(sandbox, expectShim, fakeBin, logPath, ["test", "--filter", "FullyQualifiedName~DotnetShim"], ct);
+                var info = await RunDotnetAsync(sandbox, expectShim, fakeBin, logPath, ["--info"], ct);
+                var restore = await RunDotnetAsync(sandbox, expectShim, fakeBin, logPath, ["restore", "--locked-mode"], ct);
+                var nuget = await RunDotnetAsync(sandbox, expectShim, fakeBin, logPath, ["nuget", "locals", "all", "--list"], ct);
+                var realLog = await ReadSandboxFileOrEmptyAsync(sandbox, logPath, ct);
+
+                Require(build.Success, $"dotnet build failed: {build.Stderr}");
+                Require(test.Success, $"dotnet test failed: {test.Stderr}");
+                Require(info.Success, $"dotnet --info failed: {info.Stderr}");
+                Require(restore.Success, $"dotnet restore failed: {restore.Stderr}");
+                Require(nuget.Success, $"dotnet nuget failed: {nuget.Stderr}");
+
+                if (expectShim)
+                {
+                    Require(build.Stdout.Contains(AuditDotnetShimNotice, StringComparison.Ordinal),
+                        $"dotnet build was not intercepted; stdout was: {build.Stdout}");
+                    Require(test.Stdout.Contains(AuditDotnetShimNotice, StringComparison.Ordinal),
+                        $"dotnet test was not intercepted; stdout was: {test.Stdout}");
+                    Require(!realLog.Contains("build --no-incremental", StringComparison.Ordinal),
+                        $"dotnet build reached the real dotnet: {realLog}");
+                    Require(!realLog.Contains("test --filter FullyQualifiedName~DotnetShim", StringComparison.Ordinal),
+                        $"dotnet test reached the real dotnet: {realLog}");
+                }
+                else
+                {
+                    Require(build.Stdout.Contains("real dotnet build --no-incremental", StringComparison.Ordinal),
+                        $"disabled shim did not pass dotnet build through: {build.Stdout}");
+                    Require(test.Stdout.Contains("real dotnet test --filter FullyQualifiedName~DotnetShim", StringComparison.Ordinal),
+                        $"disabled shim did not pass dotnet test through: {test.Stdout}");
+                    Require(realLog.Contains("build --no-incremental", StringComparison.Ordinal),
+                        $"disabled shim did not log real dotnet build: {realLog}");
+                    Require(realLog.Contains("test --filter FullyQualifiedName~DotnetShim", StringComparison.Ordinal),
+                        $"disabled shim did not log real dotnet test: {realLog}");
+                }
+
+                Require(info.Stdout.Contains("real dotnet --info", StringComparison.Ordinal),
+                    $"dotnet --info did not pass through: {info.Stdout}");
+                Require(restore.Stdout.Contains("real dotnet restore --locked-mode", StringComparison.Ordinal),
+                    $"dotnet restore did not pass through: {restore.Stdout}");
+                Require(nuget.Stdout.Contains("real dotnet nuget locals all --list", StringComparison.Ordinal),
+                    $"dotnet nuget did not pass through: {nuget.Stdout}");
+                Require(realLog.Contains("--info", StringComparison.Ordinal),
+                    $"dotnet --info did not reach real dotnet: {realLog}");
+                Require(realLog.Contains("restore --locked-mode", StringComparison.Ordinal),
+                    $"dotnet restore did not reach real dotnet: {realLog}");
+                Require(realLog.Contains("nuget locals all --list", StringComparison.Ordinal),
+                    $"dotnet nuget did not preserve argv: {realLog}");
+            }
+            catch (Exception ex)
+            {
+                _errors.Add(ex.ToString());
+            }
+
+            return _errors.Count == 0
+                ? new AuditResult(true, [])
+                : new AuditResult(false, [new AuditFinding(Name, AuditSeverity.Error, "dotnet shim assertion failed", string.Join("\n", _errors))]);
+        }
+
+        private void Require(bool condition, string message)
+        {
+            if (!condition)
+                _errors.Add(message);
         }
     }
 }

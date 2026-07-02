@@ -44,7 +44,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private const int CompletionReviewFileMaxChars = 8 * 1024;
     private const int CompletionReviewMaxFiles = 80;
     private const int PlanArtifactMaxChars = 64 * 1024;
-
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly IAgentRegistry _agents;
@@ -8414,7 +8413,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var maxPar = project.Audit.MaxLlmAuditorParallelism;
                 using var sem = new SemaphoreSlim(maxPar, maxPar);
 
-                SandboxSpec BuildLlmSandboxSpec(AgentCredential? candidateCredential)
+                (SandboxSpec Spec, AuditReviewDotnetShim DotnetShim) BuildLlmSandboxSpec(AgentCredential? candidateCredential)
                 {
                     var candidateSpec = BuildSandboxSpec(access,
                         includeAgentCredential: candidateCredential,
@@ -8424,7 +8423,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         timingPhase: "audit",
                         flavor: sandboxTarget.Flavor,
                         baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
-                    return candidateSpec with
+                    var dotnetShim = AuditReviewDotnetShim.From(_pipelineTuning.Current, _sandboxes.Name);
+                    var specWithAuditMount = candidateSpec with
                     {
                         Mounts =
                         [
@@ -8432,6 +8432,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 },
                         ],
                     };
+                    return (dotnetShim.Apply(specWithAuditMount), dotnetShim);
                 }
 
                 async Task<AuditorRunRecord> RunLlmPairOnceAsync(
@@ -8443,7 +8444,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     var candidateCredential = needsCreds
                         ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, trialItem, attemptCt)
                         : null;
-                    var candidateSpec = BuildLlmSandboxSpec(candidateCredential);
+                    var (candidateSpec, dotnetShim) = BuildLlmSandboxSpec(candidateCredential);
                     await using var sandbox = await CreateAuditSandboxWithIdleTimeoutAsync(
                         candidateSpec,
                         pair.Auditor.Name,
@@ -8453,6 +8454,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         pair.Auditor.Name,
                         async (setupSandbox, setupCt) =>
                         {
+                            await dotnetShim.InstallAsync(setupSandbox, setupCt);
                             if (candidateCredential is not null && candidateCredential.Files.Count > 0)
                                 await MaterialiseCredentialFilesAsync(setupSandbox, candidateCredential, setupCt);
                             await RunWithCancellation(

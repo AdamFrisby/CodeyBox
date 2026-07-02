@@ -31,21 +31,24 @@ public sealed class PickupSmokeTests : IDisposable
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Agent that increments a counter on each call, then blocks forever.
-    /// Lets us verify whether the agent was ever reached.
+    /// Agent that increments a counter on each call, then returns immediately
+    /// without touching the working tree. The empty diff makes the work phase
+    /// fail with the pipeline's "produced no changes" error — a deterministic,
+    /// non-smoke failure that lets us verify whether the agent was reached
+    /// (and that the item did not fail at the smoke gate) without racing the
+    /// <see cref="WorkItem.WorkTimeout"/> against sandbox setup under load.
     /// </summary>
-    private sealed class TrackingBlockingAgent : IAgentRunner
+    private sealed class TrackingAgent : IAgentRunner
     {
         public int CallCount { get; private set; }
         public AgentKind Kind => AgentKind.Claude;
 
-        public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory,
+        public Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory,
             string prompt, AgentCredential? credential, string? modelId = null,
             string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
         {
             CallCount++;
-            await Task.Delay(Timeout.Infinite, ct);
-            return new AgentResult(true, "unreachable", null, null);
+            return Task.FromResult(new AgentResult(true, "no changes", null, null));
         }
     }
 
@@ -53,7 +56,7 @@ public sealed class PickupSmokeTests : IDisposable
     {
         public PipelineRunner Pipeline { get; init; } = null!;
         public SqliteWorkItemStore Store { get; init; } = null!;
-        public TrackingBlockingAgent Agent { get; init; } = null!;
+        public TrackingAgent Agent { get; init; } = null!;
         public CapturingWebhookDispatcher Webhooks { get; init; } = null!;
         public void Dispose() => Store.Dispose();
     }
@@ -72,7 +75,7 @@ public sealed class PickupSmokeTests : IDisposable
             NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
-        var agent = new TrackingBlockingAgent();
+        var agent = new TrackingAgent();
         var registry = new AgentRegistry([agent]);
         var webhooks = new CapturingWebhookDispatcher();
 
@@ -209,7 +212,7 @@ public sealed class PickupSmokeTests : IDisposable
         smokeOptions.Replace(new SmokeOptions { Enabled = false });
         using var r = BuildResources(seed, gate);
 
-        var item = NewItem(workTimeout: TimeSpan.FromMilliseconds(200));
+        var item = NewItem();
         await r.Store.CreateAsync(item);
         await r.Pipeline.RunAsync(item, CancellationToken.None);
 
@@ -228,7 +231,7 @@ public sealed class PickupSmokeTests : IDisposable
         var (gate, _) = SmokeGateFactory.Build(probePass: false);
         using var r = BuildResources(seed, gate, skipSmoke: true);
 
-        var item = NewItem(workTimeout: TimeSpan.FromMilliseconds(200));
+        var item = NewItem();
         await r.Store.CreateAsync(item);
         await r.Pipeline.RunAsync(item, CancellationToken.None);
 
@@ -243,7 +246,7 @@ public sealed class PickupSmokeTests : IDisposable
         var (gate, _) = SmokeGateFactory.Build(probePass: false);
         using var r = BuildResources(seed, gate, skipSmoke: true);
 
-        var item = NewItem(workTimeout: TimeSpan.FromMilliseconds(200));
+        var item = NewItem();
         await r.Store.CreateAsync(item);
         await r.Pipeline.RunAsync(item, CancellationToken.None);
 

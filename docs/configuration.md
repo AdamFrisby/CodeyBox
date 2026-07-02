@@ -207,7 +207,8 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 ```json
 "PipelineTuning": {
   "AgentSuspendMaxRetries": 1,
-  "AgentSessionResumeMaxAttempts": 2
+  "AgentSessionResumeMaxAttempts": 2,
+  "BlockRedundantDotnetBuildTestInAuditSandbox": true
 }
 ```
 
@@ -215,6 +216,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 |-----|---------|-------------|
 | `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count for unknown failures with suspend-related exit codes. Classified transient-network failures use the durable scheduler instead. |
 | `AgentSessionResumeMaxAttempts` | `2` | CLI-native same-session resume attempts after a transient non-zero agent crash with a captured session id and a live sandbox including `/repo`. Set to `0` to disable session resume. |
+| `BlockRedundantDotnetBuildTestInAuditSandbox` | `true` | Prepends an audit-sandbox-only `dotnet` shim that immediately succeeds `dotnet build` and `dotnet test` with a notice because the deterministic build/test gate already ran. Other `dotnet` subcommands pass through unchanged; work, merge, and conflict-resolution sandboxes are unaffected. |
 
 ---
 

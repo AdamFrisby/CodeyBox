@@ -186,9 +186,9 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         psi.EnvironmentVariables.Clear();
         psi.EnvironmentVariables["PATH"] = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin";
         psi.EnvironmentVariables["HOME"] = ProcessSandboxProvider.MapToHostPathInternal(_root, "/home/codeybox");
-        foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = v;
+        foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = TranslateEnvironmentValue(k, v);
         if (exec.ExtraEnvironment is not null)
-            foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = v;
+            foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = TranslateEnvironmentValue(k, v);
 
         using var proc = new System.Diagnostics.Process { StartInfo = psi };
         var stdout = new StringBuilder();
@@ -407,6 +407,21 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
             }
         }
         return arg;
+    }
+
+    private string TranslateEnvironmentValue(string key, string value)
+    {
+        if (!string.Equals(key, "PATH", StringComparison.Ordinal))
+            return value;
+
+        var entries = value.Split(':');
+        for (var i = 0; i < entries.Length; i++)
+        {
+            if (!string.IsNullOrEmpty(entries[i]) && entries[i][0] == '/')
+                entries[i] = TranslatePath(entries[i]);
+        }
+
+        return string.Join(Path.PathSeparator, entries);
     }
 
     public ValueTask DisposeAsync()
