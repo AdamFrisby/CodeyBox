@@ -6327,10 +6327,13 @@ while True:
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
-        sb.Append("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\"");
+        sb.AppendLine("(");
+        sb.AppendLine("    exec </dev/null >/dev/null 2>/dev/null");
+        sb.Append("    exec setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\"");
         foreach (var arg in command)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
-        sb.AppendLine(" </dev/null >/dev/null 2>/dev/null &");
+        sb.AppendLine();
+        sb.AppendLine(") &");
         sb.AppendLine("codeybox_detached_pid=$!");
         sb.AppendLine("codeybox_marker_deadline=$((SECONDS + codeybox_marker_wait_seconds))");
         sb.AppendLine("while ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; do");
