@@ -16,7 +16,12 @@ public sealed class DeploymentManagerTests
         var provider = new FakeDeploymentSandboxProvider();
         var driver = new LibraryDeploymentDriver();
         var registry = new DeploymentDriverRegistry([driver]);
-        var manager = new DeploymentManager(registry);
+        var startedAt = new DateTimeOffset(2026, 7, 2, 1, 2, 3, TimeSpan.Zero);
+        var manager = new DeploymentManager(
+            registry,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DeploymentManager>.Instance,
+            () => startedAt);
+        var projectId = new ProjectId("jobtrack");
 
         var recipe = new DeploymentRecipe
         {
@@ -32,21 +37,23 @@ public sealed class DeploymentManagerTests
 
         var handle = await manager.StartAsync(
             recipe,
-            Ctx(provider),
+            Ctx(provider) with { ProjectId = projectId },
             CancellationToken.None);
 
         var active = manager.GetActive();
         Assert.Single(active);
         Assert.Equal(handle.Id, active[0].Id);
         Assert.Equal(DeploymentKinds.Library, active[0].Kind);
+        Assert.Equal(projectId, active[0].ProjectId);
         Assert.Equal(handle.SubstrateId, active[0].SubstrateId);
+        Assert.Equal(startedAt, active[0].StartedAt);
 
         await handle.DisposeAsync();
         Assert.Empty(manager.GetActive());
     }
 
     [Fact]
-    public async Task DisposeFailure_KeepsDeploymentTrackedUntilRetrySucceeds()
+    public async Task DisposeFailure_UntracksDeploymentSoLeakReaperCanRetry()
     {
         var provider = new FakeDeploymentSandboxProvider();
         var driver = new LibraryDeploymentDriver();
@@ -73,15 +80,10 @@ public sealed class DeploymentManagerTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await handle.DisposeAsync());
 
-        var activeAfterFailure = Assert.Single(manager.GetActive());
-        Assert.Equal(handle.Id, activeAfterFailure.Id);
-        Assert.True(handle.IsAlive);
-
-        provider.SandboxDisposeThrowsFor.Remove(handle.SubstrateId!);
-        await handle.DisposeAsync();
-
         Assert.Empty(manager.GetActive());
         Assert.False(handle.IsAlive);
+        var cleanupInfo = Assert.Single(await ((IDeploymentCleanupProvider)provider).ListAllManagedAsync(CancellationToken.None));
+        Assert.False(cleanupInfo.IsTrackedActive);
     }
 
     [Fact]

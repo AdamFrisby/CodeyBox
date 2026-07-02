@@ -4067,18 +4067,26 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public void MultipassSandbox_PublishesDeploymentEndpointFromHostAddress()
+    public void MultipassSandbox_PublishesDeploymentEndpointFromProfileBridgeAddress()
     {
         var sandbox = new MultipassSandbox(
             "codeybox-publish",
             Path.Combine(_workspace, "publish-root"),
-            new SandboxSpec { ImageReference = "ignored" },
-            new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
+            new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Network = new SandboxNetworkPolicy { ProfileName = "deploy" },
+            },
+            new MultipassSandboxOptions
+            {
+                MultipassBinary = "/bin/false",
+                NetworkProfiles = new Dictionary<string, string> { ["deploy"] = "cb-deploy" },
+            },
             NullLogger<MultipassSandboxProvider>.Instance,
             runner: new RecordingMultipassRunner((_, _, _) =>
                 Task.FromResult(new ProcessRunResult(0, "", ""))),
             daemonRetryPolicy: InstantDaemonRetryPolicy(),
-            hostAddress: "10.55.0.7");
+            hostAddress: "10.99.2.7");
         var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
         var request = new DeploymentEndpointRequest
         {
@@ -4091,14 +4099,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.True(publisher.CanPublishEndpoint(request));
         var endpoint = publisher.PublishEndpoint(request);
 
-        Assert.Equal("http://10.55.0.7:8080/health", endpoint.Url);
-        Assert.Equal("10.55.0.7", endpoint.Host);
+        Assert.Equal("http://10.99.2.7:8080/health", endpoint.Url);
+        Assert.Equal("10.99.2.7", endpoint.Host);
         Assert.Equal(8080, endpoint.Port);
         Assert.Equal("host-routable", endpoint.Metadata["endpoint.scope"]);
     }
 
     [Fact]
-    public void MultipassSandbox_PublishEndpointRejectsMissingHostAddress()
+    public void MultipassSandbox_PublishEndpointRejectsMissingProfileEvenWithHostAddress()
     {
         var sandbox = new MultipassSandbox(
             "codeybox-no-publish",
@@ -4108,7 +4116,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             NullLogger<MultipassSandboxProvider>.Instance,
             runner: new RecordingMultipassRunner((_, _, _) =>
                 Task.FromResult(new ProcessRunResult(0, "", ""))),
-            daemonRetryPolicy: InstantDaemonRetryPolicy());
+            daemonRetryPolicy: InstantDaemonRetryPolicy(),
+            hostAddress: "10.99.2.7");
         var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
         var request = new DeploymentEndpointRequest
         {
@@ -4154,7 +4163,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("multipass delete --purge codeybox-deletefail failed", ex.Message);
         Assert.Equal(1, deleteCalls);
         Assert.Empty(disposedNames);
-        Assert.Empty(noLongerActiveNames);
+        Assert.Equal(["codeybox-deletefail"], noLongerActiveNames);
 
         await sandbox.DisposeAsync();
 
@@ -4194,11 +4203,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.Contains("multipass delete --purge codeybox-shutdown-deletefail failed", ex.Message);
         Assert.Equal(1, deleteCalls);
-        Assert.Empty(noLongerActiveNames);
+        Assert.Equal(["codeybox-shutdown-deletefail"], noLongerActiveNames);
     }
 
     [Fact]
-    public async Task ProviderCreatedSandbox_DeleteFailureThrowsAndKeepsActiveUntilRetrySucceeds()
+    public async Task ProviderCreatedSandbox_DeleteFailureReleasesActiveTrackingForLeakReaperRetry()
     {
         var staging = Path.Combine(_workspace, "provider-delete-fail-staging");
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -4296,7 +4305,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(1, deleteCalls);
         var stillActive = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
         Assert.Equal(name, stillActive.Name);
-        Assert.True(stillActive.IsTrackedActive);
+        Assert.False(stillActive.IsTrackedActive);
 
         var reaper = new SandboxLeakReaper(
             provider,
@@ -4312,14 +4321,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             NullLogger<SandboxLeakReaper>.Instance);
         await reaper.RunSweepAsync(CancellationToken.None);
 
-        Assert.Equal(1, deleteCalls);
-        Assert.NotEmpty(states);
-        Assert.Empty(reaper.GetLatestLeaks());
-
-        await sandbox.DisposeAsync();
-
         Assert.Equal(2, deleteCalls);
         Assert.Empty(states);
+        Assert.Empty(reaper.GetLatestLeaks());
         Assert.Empty(await provider.ListAllManagedAsync(CancellationToken.None));
     }
 
@@ -4580,7 +4584,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task CreateAsync_PassesMultipassInfoIpv4ToRoutableSandbox()
+    public async Task CreateAsync_WithoutNetworkProfile_DoesNotExposeMultipassManagementIpv4()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         var provider = NewProvider(
@@ -4593,7 +4597,26 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         });
 
         var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
-        Assert.Equal("10.42.0.88", routable.HostAddress);
+        Assert.Null(routable.HostAddress);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithNetworkProfile_PassesProfileBridgeIpv4ToRoutableSandbox()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-profile-host-address"),
+            runner: BuildSuccessfulCreateRunner(states),
+            networkProfiles: new Dictionary<string, string> { ["deploy"] = "cb-deploy" });
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy" },
+        });
+
+        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
+        Assert.Equal("10.99.2.88", routable.HostAddress);
     }
 
     [Fact]
@@ -8352,7 +8375,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                         state = states.TryGetValue(name, out var current) ? current : "Running",
                         memory = new { total = 17179869184L },
                         disks = new Dictionary<string, object>(),
-                        ipv4 = new[] { "10.42.0.88" },
+                        ipv4 = new[] { "10.42.0.88", "10.99.2.88" },
                     },
                     StringComparer.Ordinal);
                 return Task.FromResult(new ProcessRunResult(
@@ -8372,7 +8395,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                             state,
                             memory = new { total = 17179869184L },
                             disks = new Dictionary<string, object>(),
-                            ipv4 = new[] { "10.42.0.88" },
+                            ipv4 = new[] { "10.42.0.88", "10.99.2.88" },
                         },
                     },
                 });

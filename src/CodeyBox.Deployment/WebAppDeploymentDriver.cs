@@ -49,6 +49,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
             throw new ArgumentException("DeploymentRecipe.Ports must contain at least one port for kind 'web-app'.", nameof(recipe));
         if (string.IsNullOrWhiteSpace(recipe.HealthEndpoint))
             throw new ArgumentException("DeploymentRecipe.HealthEndpoint is required for kind 'web-app'.", nameof(recipe));
+        _ = ResolveScheme(recipe);
     }
 
     protected override async Task StartRuntimeAsync(
@@ -80,7 +81,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         var scheme = recipe.Settings.TryGetValue(SettingsKeyScheme, out var s) && !string.IsNullOrWhiteSpace(s)
             ? s
             : "http";
-        var path = recipe.HealthEndpoint!.StartsWith('/') ? recipe.HealthEndpoint! : "/" + recipe.HealthEndpoint;
+        var path = NormalizePath(recipe.HealthEndpoint!);
         var probeUrl = $"{scheme}://127.0.0.1:{port}{path}";
 
         // Shell-quote the probe URL so a recipe with a single quote (or other
@@ -138,7 +139,7 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         {
             ["substrate.id"] = substrate.Id,
             ["sandbox.local-url"] = $"{scheme}://127.0.0.1:{port}",
-            ["http.health-path"] = recipe.HealthEndpoint!,
+            ["http.health-path"] = NormalizePath(recipe.HealthEndpoint!),
         };
         AddServiceEndpointMetadata(metadata, substrate, recipe, scheme);
         return PublishEndpoint(substrate, new DeploymentEndpointRequest
@@ -175,14 +176,14 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
+        DeploymentEndpoint endpoint,
         CancellationToken ct)
     {
         using var healthCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         healthCts.CancelAfter(recipe.StartupTimeout);
         try
         {
-            await base.RunHealthCheckAsync(substrate, recipe, context, healthCts.Token).ConfigureAwait(false);
-            var endpoint = BuildEndpoint(substrate, recipe, context);
+            await base.RunHealthCheckAsync(substrate, recipe, context, endpoint, healthCts.Token).ConfigureAwait(false);
             await VerifyExposedEndpointAsync(substrate, recipe, context, endpoint, healthCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -193,17 +194,25 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
     }
 
     private static string ResolveScheme(DeploymentRecipe recipe)
-        => recipe.Settings.TryGetValue(SettingsKeyScheme, out var s) && !string.IsNullOrWhiteSpace(s)
-            ? s
+    {
+        var scheme = recipe.Settings.TryGetValue(SettingsKeyScheme, out var s) && !string.IsNullOrWhiteSpace(s)
+            ? s.Trim()
             : "http";
+        return scheme is "http" or "https"
+            ? scheme
+            : throw new ArgumentException(
+                $"DeploymentRecipe.Settings['{SettingsKeyScheme}'] must be 'http' or 'https' for kind 'web-app'.",
+                nameof(recipe));
+    }
 
     private static Uri BuildProbeUri(string baseUrl, string healthEndpoint)
     {
-        var normalized = healthEndpoint.StartsWith("/", StringComparison.Ordinal)
-            ? healthEndpoint
-            : "/" + healthEndpoint;
+        var normalized = NormalizePath(healthEndpoint);
         return new Uri(baseUrl.TrimEnd('/') + normalized, UriKind.Absolute);
     }
+
+    private static string NormalizePath(string path)
+        => path.StartsWith("/", StringComparison.Ordinal) ? path : "/" + path;
 
     private static async Task<bool> DefaultHostHttpProbeAsync(Uri uri, CancellationToken ct)
     {

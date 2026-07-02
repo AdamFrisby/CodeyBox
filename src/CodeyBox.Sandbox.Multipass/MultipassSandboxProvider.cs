@@ -423,7 +423,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
-            var hostAddress = await ResolveSandboxHostAddressAsync(opts, name, workItemId, ct).ConfigureAwait(false);
+            var hostAddress = await ResolveSandboxHostAddressAsync(opts, name, spec.Network.ProfileName, workItemId, ct).ConfigureAwait(false);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
             // already baked into the source VM's filesystem, so the clone
@@ -1240,7 +1240,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                     diskBytes,
                     TryReadCreatedAt(vmEntry.Value),
                     state,
-                    TryReadPrimaryIpv4(vmEntry.Value));
+                    TryReadIpv4Addresses(vmEntry.Value));
             }
         }
         catch (JsonException ex)
@@ -1253,12 +1253,18 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private async Task<string?> ResolveSandboxHostAddressAsync(
         MultipassSandboxOptions opts,
         string name,
+        string? networkProfile,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(networkProfile))
+            return null;
+        if (!opts.NetworkProfiles.ContainsKey(networkProfile))
+            return null;
+
         var detailsByName = await FetchSandboxDetailsAsync(opts, [name], ct, workItemId).ConfigureAwait(false);
         return detailsByName.TryGetValue(name, out var details)
-            ? details.PrimaryIpv4
+            ? details.Ipv4Addresses.FirstOrDefault(IsProfileBridgeIpv4)
             : null;
     }
 
@@ -1279,37 +1285,44 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         return null;
     }
 
-    private static string? TryReadPrimaryIpv4(JsonElement vmInfo)
+    private static IReadOnlyList<string> TryReadIpv4Addresses(JsonElement vmInfo)
     {
         if (!vmInfo.TryGetProperty("ipv4", out var ipv4El))
-            return null;
+            return [];
 
         if (ipv4El.ValueKind == JsonValueKind.Array)
         {
+            var result = new List<string>();
             foreach (var value in ipv4El.EnumerateArray())
             {
-                var parsed = TryParseIpv4(value.GetString());
-                if (parsed is not null)
-                    return parsed;
+                foreach (var parsed in ParseIpv4s(value.GetString()))
+                    result.Add(parsed);
             }
-            return null;
+            return result;
         }
 
         return ipv4El.ValueKind == JsonValueKind.String
-            ? TryParseIpv4(ipv4El.GetString())
-            : null;
+            ? ParseIpv4s(ipv4El.GetString()).ToList()
+            : [];
     }
 
-    private static string? TryParseIpv4(string? value)
+    private static IEnumerable<string> ParseIpv4s(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
-            return null;
+            yield break;
         foreach (var token in value.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             if (IPAddress.TryParse(token, out var address) && address.AddressFamily == AddressFamily.InterNetwork)
-                return address.ToString();
+                yield return address.ToString();
         }
-        return null;
+    }
+
+    private static bool IsProfileBridgeIpv4(string value)
+    {
+        if (!IPAddress.TryParse(value, out var address) || address.AddressFamily != AddressFamily.InterNetwork)
+            return false;
+        var bytes = address.GetAddressBytes();
+        return bytes.Length == 4 && bytes[0] == 10 && bytes[1] == 99;
     }
 
     private static bool IsValidSandboxName(string name)
@@ -4689,11 +4702,25 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 }
 
-internal readonly record struct MultipassSandboxDetails(
-    long? DiskBytes,
-    DateTimeOffset? CreatedAt,
-    string? State = null,
-    string? PrimaryIpv4 = null);
+internal readonly record struct MultipassSandboxDetails
+{
+    public MultipassSandboxDetails(
+        long? diskBytes,
+        DateTimeOffset? createdAt,
+        string? state = null,
+        IReadOnlyList<string>? ipv4Addresses = null)
+    {
+        DiskBytes = diskBytes;
+        CreatedAt = createdAt;
+        State = state;
+        Ipv4Addresses = ipv4Addresses ?? [];
+    }
+
+    public long? DiskBytes { get; }
+    public DateTimeOffset? CreatedAt { get; }
+    public string? State { get; }
+    public IReadOnlyList<string> Ipv4Addresses { get; }
+}
 
 internal sealed class MultipassDaemonRetryPolicy
 {
@@ -5461,6 +5488,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
+    private int _activeTrackingReleased;
     private long _activeProgressVersion;
     private string _activeProgressStatus = "active";
 
@@ -5552,6 +5580,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     public bool CanPublishEndpoint(DeploymentEndpointRequest request)
         => !string.IsNullOrWhiteSpace(_hostAddress)
+            && !string.IsNullOrWhiteSpace(_spec.Network.ProfileName)
+            && _opts.NetworkProfiles.ContainsKey(_spec.Network.ProfileName)
             && request.Port is >= 1 and <= 65535
             && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
 
@@ -5565,6 +5595,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     public void ReleaseActiveTracking()
     {
+        if (Interlocked.Exchange(ref _activeTrackingReleased, 1) != 0)
+            return;
         try
         {
             _onNoLongerTrackedActive?.Invoke(_name);
@@ -7580,6 +7612,7 @@ while True:
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
+            ReleaseActiveTracking();
             if (_ownedByShutdownHandler)
                 throw;
             return;

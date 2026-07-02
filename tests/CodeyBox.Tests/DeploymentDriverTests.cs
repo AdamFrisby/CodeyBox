@@ -434,6 +434,97 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
+    public void WebApp_InvalidScheme_FailsValidation()
+    {
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyScheme] = "http://169.254.169.254/latest",
+            },
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => driver.ValidateRecipe(recipe));
+        Assert.Contains("must be 'http' or 'https'", ex.Message);
+    }
+
+    [Fact]
+    public async Task WebApp_HealthCheck_ProbesOriginalEndpointWithoutRepublishing()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+        var hostProbeUris = new List<Uri>();
+        var driver = NewWebAppDriver((uri, _) =>
+        {
+            hostProbeUris.Add(uri);
+            return Task.FromResult(true);
+        });
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+        var publishCountAfterDeploy = provider.PublishRequests.Count;
+
+        await handle.HealthCheckAsync(CancellationToken.None);
+
+        Assert.Equal(1, publishCountAfterDeploy);
+        Assert.Equal(publishCountAfterDeploy, provider.PublishRequests.Count);
+        Assert.All(hostProbeUris, uri => Assert.Equal("http://10.42.0.10:8080/healthz", uri.ToString()));
+    }
+
+    [Fact]
+    public async Task WebApp_UnprefixedHealthPaths_AreNormalizedForProbesAndMetadata()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
+        var hostProbeUris = new List<Uri>();
+        var driver = NewWebAppDriver((uri, _) =>
+        {
+            hostProbeUris.Add(uri);
+            return Task.FromResult(true);
+        });
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [8080],
+            HealthEndpoint = "healthz",
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start",
+                    Ports = [5432],
+                    HealthEndpoint = "ready",
+                },
+            ],
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Contains(provider.ExecLog, c => c.Contains("http://127.0.0.1:8080/healthz", StringComparison.Ordinal));
+        Assert.Contains(provider.ExecLog, c => c.Contains("http://127.0.0.1:5432/ready", StringComparison.Ordinal));
+        Assert.Equal("/healthz", handle.Endpoint.Metadata["http.health-path"]);
+        Assert.Equal("http://10.42.0.10:5432/ready", handle.Endpoint.Metadata["service.db.url"]);
+        Assert.Contains(hostProbeUris, uri => uri.ToString() == "http://10.42.0.10:8080/healthz");
+    }
+
+    [Fact]
     public async Task WebApp_StartsAndProbesBackingServicesBeforePrimary()
     {
         var provider = new FakeDeploymentSandboxProvider();
@@ -475,6 +566,62 @@ public sealed class DeploymentDriverTests
         Assert.Contains(provider.ExecLog, c => c.Contains("'postgres:16'", StringComparison.Ordinal));
         Assert.Equal("postgres:16", handle.Endpoint.Metadata["service.db.image"]);
         Assert.Equal("http://10.42.0.10:5432/ready", handle.Endpoint.Metadata["service.db.url"]);
+    }
+
+    [Fact]
+    public async Task WebApp_ServiceEnvironment_OverlaysPrimaryEnvironmentForStartAndReadinessProbe()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("service-start", new SandboxExecResult(0, "", "")));
+        provider.ExecRules.Add(new ExecRule("127.0.0.1:5432", new SandboxExecResult(0, "ok", "")));
+        provider.ExecRules.Add(new ExecRule("127.0.0.1:8080", new SandboxExecResult(0, "ok", "")));
+
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+            Environment = new Dictionary<string, string>
+            {
+                ["BASE"] = "primary",
+                ["SHARED"] = "primary",
+            },
+            Services =
+            [
+                new DeploymentService
+                {
+                    Name = "db",
+                    ImageReference = "ubuntu-22.04",
+                    RunCommand = "service-start",
+                    Ports = [5432],
+                    HealthEndpoint = "/ready",
+                    Environment = new Dictionary<string, string>
+                    {
+                        ["SERVICE_ONLY"] = "service",
+                        ["SHARED"] = "service",
+                    },
+                },
+            ],
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        var serviceInvocations = provider.ExecInvocations
+            .Where(exec =>
+                string.Join(' ', exec.Argv).Contains("service-start", StringComparison.Ordinal)
+                || string.Join(' ', exec.Argv).Contains("127.0.0.1:5432", StringComparison.Ordinal))
+            .ToList();
+        Assert.Equal(2, serviceInvocations.Count);
+        Assert.All(serviceInvocations, exec =>
+        {
+            Assert.NotNull(exec.ExtraEnvironment);
+            Assert.Equal("primary", exec.ExtraEnvironment!["BASE"]);
+            Assert.Equal("service", exec.ExtraEnvironment["SHARED"]);
+            Assert.Equal("service", exec.ExtraEnvironment["SERVICE_ONLY"]);
+        });
     }
 
     [Fact]

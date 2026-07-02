@@ -47,6 +47,10 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.True(publisher.CanPublishEndpoint(request));
         var endpoint = publisher.PublishEndpoint(request);
         Assert.Equal("http://10.10.0.42:8080", endpoint.Url);
+
+        var lease = Assert.IsAssignableFrom<IActiveSandboxLease>(sandbox);
+        lease.ReleaseActiveTracking();
+        Assert.True(inner.LastSandbox?.ActiveTrackingReleased);
     }
 
     [Fact]
@@ -1858,9 +1862,13 @@ public sealed class SandboxAdmissionControlledProviderTests
     private sealed class RoutableProvider : ISandboxProvider
     {
         public string Name => "routable";
+        public RoutableSandbox? LastSandbox { get; private set; }
 
-        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
-            Task.FromResult<ISandbox>(new RoutableSandbox());
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            LastSandbox = new RoutableSandbox();
+            return Task.FromResult<ISandbox>(LastSandbox);
+        }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
@@ -1869,10 +1877,11 @@ public sealed class SandboxAdmissionControlledProviderTests
             Task.CompletedTask;
     }
 
-    private sealed class RoutableSandbox : IRoutableSandbox, IDeploymentEndpointPublisher
+    private sealed class RoutableSandbox : IRoutableSandbox, IDeploymentEndpointPublisher, IActiveSandboxLease
     {
         public string Id { get; } = "routable-1";
         public string? HostAddress => "10.10.0.42";
+        public bool ActiveTrackingReleased { get; private set; }
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
             Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -1883,6 +1892,8 @@ public sealed class SandboxAdmissionControlledProviderTests
 
         public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
             => DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
+
+        public void ReleaseActiveTracking() => ActiveTrackingReleased = true;
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }

@@ -178,6 +178,108 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task PublishEndpoint_starts_ssh_local_forward_and_returns_loopback_endpoint()
+    {
+        var sshStub = Path.Combine(Path.GetTempPath(), "codeybox-ssh-stub-" + Guid.NewGuid().ToString("N") + ".sh");
+        var argsFile = Path.Combine(Path.GetTempPath(), "codeybox-ssh-stub-args-" + Guid.NewGuid().ToString("N"));
+        var priorArgsFile = Environment.GetEnvironmentVariable("CODEYBOX_SSH_STUB_ARGS");
+        await File.WriteAllTextAsync(sshStub, """
+            #!/bin/sh
+            printf '%s\n' "$@" > "$CODEYBOX_SSH_STUB_ARGS"
+            sleep 60
+            """);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                sshStub,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        Environment.SetEnvironmentVariable("CODEYBOX_SSH_STUB_ARGS", argsFile);
+        try
+        {
+            var opts = DefaultOptions() with { SshBinary = sshStub };
+            var transport = new FakeRemoteHostTransport();
+            transport.OnRun = (argv, _) =>
+            {
+                if (Contains(argv, "launch")) return ProcessRunOk();
+                if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport), "10.55.0.9");
+                if (Contains(argv, "delete")) return ProcessRunOk();
+                return ProcessRunOk();
+            };
+
+            var provider = new MultipassRemoteSandboxProvider(
+                opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+            await using var sb = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                WorkingDirectory = "/work",
+            });
+            var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
+
+            var endpoint = publisher.PublishEndpoint(new DeploymentEndpointRequest
+            {
+                Kind = DeploymentEndpointKind.Http,
+                Scheme = "http",
+                Port = 8080,
+                Path = "/health",
+                Metadata = new Dictionary<string, string> { ["deployment"] = "test" },
+            });
+
+            Assert.Equal(DeploymentEndpointKind.Http, endpoint.Kind);
+            Assert.Equal("127.0.0.1", endpoint.Host);
+            Assert.InRange(endpoint.Port.GetValueOrDefault(), 1, 65535);
+            Assert.Equal($"http://127.0.0.1:{endpoint.Port}/health", endpoint.Url);
+            Assert.Equal("ssh-local-forward", endpoint.Metadata["endpoint.scope"]);
+            Assert.Equal("10.55.0.9", endpoint.Metadata["endpoint.remote-vm-host"]);
+            Assert.Equal("8080", endpoint.Metadata["endpoint.remote-vm-port"]);
+
+            var argv = await ReadStubArgsAsync(argsFile);
+            var forwardIndex = argv.IndexOf("-L");
+            Assert.True(forwardIndex >= 0, "missing -L in ssh argv: " + string.Join(' ', argv));
+            Assert.Equal($"127.0.0.1:{endpoint.Port}:10.55.0.9:8080", argv[forwardIndex + 1]);
+            Assert.Contains("ExitOnForwardFailure=yes", argv);
+            Assert.Contains(opts.SshTarget, argv);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_SSH_STUB_ARGS", priorArgsFile);
+            try { File.Delete(sshStub); } catch { }
+            try { File.Delete(argsFile); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task PublishEndpoint_tunnel_start_failure_throws_without_returning_endpoint()
+    {
+        var opts = DefaultOptions() with
+        {
+            SshBinary = Path.Combine(Path.GetTempPath(), "missing-ssh-" + Guid.NewGuid().ToString("N")),
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport), "10.55.0.9");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await using var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => publisher.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        }));
+        Assert.Contains("Failed to start SSH local forward", ex.Message);
+    }
+
+    [Fact]
     public async Task CreateAsync_attaches_configured_network_profile_bridge()
     {
         var opts = DefaultOptions() with
@@ -2163,6 +2265,17 @@ public sealed class MultipassRemoteSandboxProviderTests
     {
         var idx = argv.ToList().IndexOf("info");
         return idx >= 0 && idx + 1 < argv.Count ? argv[idx + 1] : "unknown";
+    }
+
+    private static async Task<List<string>> ReadStubArgsAsync(string argsFile)
+    {
+        for (var attempt = 0; attempt < 50; attempt++)
+        {
+            if (File.Exists(argsFile))
+                return (await File.ReadAllLinesAsync(argsFile)).ToList();
+            await Task.Delay(20);
+        }
+        throw new TimeoutException("Timed out waiting for SSH stub argv file.");
     }
 
     private static string ExtractQuotedPathAfterRedirect(string script)

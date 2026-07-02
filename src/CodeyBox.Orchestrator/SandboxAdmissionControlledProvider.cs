@@ -1126,12 +1126,13 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, IDeploymentEndpointPublisher, ISandboxDecorator
+internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, IDeploymentEndpointPublisher, ISandboxDecorator, IActiveSandboxLease
 {
     private readonly ISandbox _inner;
     private readonly IRoutableSandbox? _routable;
     private readonly IDeploymentEndpointPublisher? _endpointPublisher;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
+    private readonly IActiveSandboxLease? _activeLease;
     private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> _onDisposed;
     private readonly Action<AdmissionControlledSandbox> _onPreserved;
     private readonly ILogger _log;
@@ -1156,6 +1157,7 @@ internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDispose
         _routable = inner as IRoutableSandbox;
         _endpointPublisher = inner as IDeploymentEndpointPublisher;
         _preserveOnDispose = inner as IPreserveOnDisposeSandbox;
+        _activeLease = inner as IActiveSandboxLease;
         _lease = lease;
         _onDisposed = onDisposed;
         _onPreserved = onPreserved;
@@ -1200,6 +1202,8 @@ internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDispose
             ? _endpointPublisher.PublishEndpoint(request)
             : throw new NotSupportedException(
                 $"Sandbox '{Id}' does not support publishing {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
+
+    public void ReleaseActiveTracking() => _activeLease?.ReleaseActiveTracking();
 
     public async ValueTask DisposeAsync()
     {

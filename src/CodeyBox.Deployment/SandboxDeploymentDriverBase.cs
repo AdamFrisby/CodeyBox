@@ -172,7 +172,7 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
                 Kind,
                 owned,
                 endpoint,
-                runtimeCt => RunHealthCheckAsync(owned, recipe, context, runtimeCt));
+                runtimeCt => RunHealthCheckAsync(owned, recipe, context, endpoint, runtimeCt));
             substrate = null; // ownership transferred
             return handle;
         }
@@ -357,8 +357,10 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
         IDeploymentSubstrate substrate,
         DeploymentRecipe recipe,
         DeploymentContext context,
+        DeploymentEndpoint endpoint,
         CancellationToken ct)
     {
+        _ = endpoint;
         using var healthCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         healthCts.CancelAfter(recipe.StartupTimeout);
         try

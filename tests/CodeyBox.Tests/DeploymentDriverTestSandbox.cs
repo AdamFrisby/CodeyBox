@@ -38,6 +38,9 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider, IDeploym
     /// <summary>Stable ordered list of every full exec request across all created sandboxes.</summary>
     public List<SandboxExec> ExecInvocations { get; } = new();
 
+    /// <summary>Stable ordered list of every endpoint publish request across all created sandboxes.</summary>
+    public List<DeploymentEndpointRequest> PublishRequests { get; } = new();
+
     /// <summary>Script of (commandPattern → result). First match wins.</summary>
     public List<ExecRule> ExecRules { get; } = new();
 
@@ -209,6 +212,7 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpo
         if (!CanPublishEndpoint(request))
             throw new NotSupportedException(
                 $"Fake deployment sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
+        lock (_provider.PublishRequests) _provider.PublishRequests.Add(request);
         return _provider.PublishEndpointOverride?.Invoke(request)
             ?? DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
     }
