@@ -4087,7 +4087,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Task.FromResult(new ProcessRunResult(0, "", ""))),
             daemonRetryPolicy: InstantDaemonRetryPolicy(),
             hostAddress: "10.99.2.7");
-        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sandbox);
         var request = new DeploymentEndpointRequest
         {
             Kind = DeploymentEndpointKind.Http,
@@ -4096,8 +4096,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Path = "/health",
         };
 
-        Assert.True(publisher.CanPublishEndpoint(request));
-        var endpoint = publisher.PublishEndpoint(request);
+        Assert.True(publisher.CanPublishPort(8080));
+        var endpoint = DeploymentEndpointPublisher.ForPublishedPort(request, publisher.PublishPort(8080));
 
         Assert.Equal("http://10.99.2.7:8080/health", endpoint.Url);
         Assert.Equal("10.99.2.7", endpoint.Host);
@@ -4118,15 +4118,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Task.FromResult(new ProcessRunResult(0, "", ""))),
             daemonRetryPolicy: InstantDaemonRetryPolicy(),
             hostAddress: "10.99.2.7");
-        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sandbox);
         var request = new DeploymentEndpointRequest
         {
             Kind = DeploymentEndpointKind.Tcp,
             Port = 5432,
         };
 
-        Assert.False(publisher.CanPublishEndpoint(request));
-        Assert.Throws<NotSupportedException>(() => publisher.PublishEndpoint(request));
+        Assert.False(publisher.CanPublishPort(5432));
+        Assert.Throws<NotSupportedException>(() => publisher.PublishPort(5432));
     }
 
     [Fact]
@@ -4606,8 +4606,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         var provider = NewProvider(
             stagingDirectory: Path.Combine(_workspace, "staging-profile-host-address"),
-            runner: BuildSuccessfulCreateRunner(states),
-            networkProfiles: new Dictionary<string, string> { ["deploy"] = "cb-deploy" });
+            runner: BuildSuccessfulCreateRunner(states, ["10.42.0.88", "172.31.8.88"]),
+            networkProfiles: new Dictionary<string, string> { ["deploy"] = "cb-deploy" },
+            bridgeSubnetResolver: bridge => bridge == "cb-deploy"
+                ? new MultipassSandboxProvider.Ipv4Subnet(
+                    IPAddress.Parse("172.31.8.1"),
+                    IPAddress.Parse("255.255.255.0"))
+                : null);
 
         await using var sandbox = await provider.CreateAsync(new SandboxSpec
         {
@@ -4616,7 +4621,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         });
 
         var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
-        Assert.Equal("10.99.2.88", routable.HostAddress);
+        Assert.Equal("172.31.8.88", routable.HostAddress);
     }
 
     [Fact]
@@ -6169,7 +6174,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         TimeSpan? vmStartTimeout = null,
         TimeSpan? vmStopTimeout = null,
         int? maxConcurrentBoots = null,
-        TimeSpan? bootLaunchDelay = null)
+        TimeSpan? bootLaunchDelay = null,
+        Func<string, MultipassSandboxProvider.Ipv4Subnet?>? bridgeSubnetResolver = null)
     {
         var options = new MultipassSandboxOptions
         {
@@ -6202,7 +6208,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 resolvedLogger,
                 null,
                 runner,
-                daemonRetryPolicy);
+                daemonRetryPolicy,
+                bridgeSubnetResolver: bridgeSubnetResolver);
     }
 
     private MultipassSandbox NewMultipassSandbox(
@@ -8344,8 +8351,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     /// the lifecycle (registry population, etc.) rather than the lifecycle
     /// itself.
     /// </summary>
-    private static RecordingMultipassRunner BuildSuccessfulCreateRunner(ConcurrentDictionary<string, string> states)
+    private static RecordingMultipassRunner BuildSuccessfulCreateRunner(
+        ConcurrentDictionary<string, string> states,
+        IReadOnlyList<string>? ipv4Addresses = null)
     {
+        ipv4Addresses ??= ["10.42.0.88", "10.99.2.88"];
         return new RecordingMultipassRunner((argv, _, ct) =>
         {
             ct.ThrowIfCancellationRequested();
@@ -8375,7 +8385,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                         state = states.TryGetValue(name, out var current) ? current : "Running",
                         memory = new { total = 17179869184L },
                         disks = new Dictionary<string, object>(),
-                        ipv4 = new[] { "10.42.0.88", "10.99.2.88" },
+                        ipv4 = ipv4Addresses,
                     },
                     StringComparer.Ordinal);
                 return Task.FromResult(new ProcessRunResult(
@@ -8395,7 +8405,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                             state,
                             memory = new { total = 17179869184L },
                             disks = new Dictionary<string, object>(),
-                            ipv4 = new[] { "10.42.0.88", "10.99.2.88" },
+                            ipv4 = ipv4Addresses,
                         },
                     },
                 });

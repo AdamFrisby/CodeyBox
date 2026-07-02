@@ -2,7 +2,9 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Formats.Tar;
 using System.Text;
+using System.Text.Json;
 using CodeyBox.Core;
+using CodeyBox.Deployment;
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.MultipassRemote;
 using Microsoft.Extensions.Logging;
@@ -135,12 +137,8 @@ public sealed class MultipassRemoteSandboxProviderTests
         });
 
         Assert.False(sb is IRoutableSandbox);
-        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
-        Assert.True(publisher.CanPublishEndpoint(new DeploymentEndpointRequest
-        {
-            Kind = DeploymentEndpointKind.Http,
-            Port = 8080,
-        }));
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sb);
+        Assert.False(publisher.CanPublishPort(8080));
 
         await sb.DisposeAsync();
     }
@@ -167,12 +165,8 @@ public sealed class MultipassRemoteSandboxProviderTests
             WorkingDirectory = "/work",
         });
 
-        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
-        Assert.False(publisher.CanPublishEndpoint(new DeploymentEndpointRequest
-        {
-            Kind = DeploymentEndpointKind.Http,
-            Port = 8080,
-        }));
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sb);
+        Assert.False(publisher.CanPublishPort(8080));
 
         await sb.DisposeAsync();
     }
@@ -180,87 +174,20 @@ public sealed class MultipassRemoteSandboxProviderTests
     [Fact]
     public async Task PublishEndpoint_starts_ssh_local_forward_and_returns_loopback_endpoint()
     {
-        var sshStub = Path.Combine(Path.GetTempPath(), "codeybox-ssh-stub-" + Guid.NewGuid().ToString("N") + ".sh");
-        var argsFile = Path.Combine(Path.GetTempPath(), "codeybox-ssh-stub-args-" + Guid.NewGuid().ToString("N"));
-        var priorArgsFile = Environment.GetEnvironmentVariable("CODEYBOX_SSH_STUB_ARGS");
-        await File.WriteAllTextAsync(sshStub, """
-            #!/bin/sh
-            printf '%s\n' "$@" > "$CODEYBOX_SSH_STUB_ARGS"
-            sleep 60
-            """);
-        if (!OperatingSystem.IsWindows())
-        {
-            File.SetUnixFileMode(
-                sshStub,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        }
-        Environment.SetEnvironmentVariable("CODEYBOX_SSH_STUB_ARGS", argsFile);
-        try
-        {
-            var opts = DefaultOptions() with { SshBinary = sshStub };
-            var transport = new FakeRemoteHostTransport();
-            transport.OnRun = (argv, _) =>
-            {
-                if (Contains(argv, "launch")) return ProcessRunOk();
-                if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport), "10.55.0.9");
-                if (Contains(argv, "delete")) return ProcessRunOk();
-                return ProcessRunOk();
-            };
-
-            var provider = new MultipassRemoteSandboxProvider(
-                opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
-
-            await using var sb = await provider.CreateAsync(new SandboxSpec
-            {
-                ImageReference = "24.04",
-                WorkingDirectory = "/work",
-            });
-            var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
-
-            var endpoint = publisher.PublishEndpoint(new DeploymentEndpointRequest
-            {
-                Kind = DeploymentEndpointKind.Http,
-                Scheme = "http",
-                Port = 8080,
-                Path = "/health",
-                Metadata = new Dictionary<string, string> { ["deployment"] = "test" },
-            });
-
-            Assert.Equal(DeploymentEndpointKind.Http, endpoint.Kind);
-            Assert.Equal("127.0.0.1", endpoint.Host);
-            Assert.InRange(endpoint.Port.GetValueOrDefault(), 1, 65535);
-            Assert.Equal($"http://127.0.0.1:{endpoint.Port}/health", endpoint.Url);
-            Assert.Equal("ssh-local-forward", endpoint.Metadata["endpoint.scope"]);
-            Assert.Equal("10.55.0.9", endpoint.Metadata["endpoint.remote-vm-host"]);
-            Assert.Equal("8080", endpoint.Metadata["endpoint.remote-vm-port"]);
-
-            var argv = await ReadStubArgsAsync(argsFile);
-            var forwardIndex = argv.IndexOf("-L");
-            Assert.True(forwardIndex >= 0, "missing -L in ssh argv: " + string.Join(' ', argv));
-            Assert.Equal($"127.0.0.1:{endpoint.Port}:10.55.0.9:8080", argv[forwardIndex + 1]);
-            Assert.Contains("ExitOnForwardFailure=yes", argv);
-            Assert.Contains(opts.SshTarget, argv);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CODEYBOX_SSH_STUB_ARGS", priorArgsFile);
-            try { File.Delete(sshStub); } catch { }
-            try { File.Delete(argsFile); } catch { }
-        }
-    }
-
-    [Fact]
-    public async Task PublishEndpoint_tunnel_start_failure_throws_without_returning_endpoint()
-    {
         var opts = DefaultOptions() with
         {
-            SshBinary = Path.Combine(Path.GetTempPath(), "missing-ssh-" + Guid.NewGuid().ToString("N")),
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
         };
         var transport = new FakeRemoteHostTransport();
         transport.OnRun = (argv, _) =>
         {
             if (Contains(argv, "launch")) return ProcessRunOk();
-            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport), "10.55.0.9");
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
             if (Contains(argv, "delete")) return ProcessRunOk();
             return ProcessRunOk();
         };
@@ -268,15 +195,225 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        await using var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
-        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
+        await using var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
 
-        var ex = Assert.Throws<InvalidOperationException>(() => publisher.PublishEndpoint(new DeploymentEndpointRequest
+        var endpoint = substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Scheme = "http",
+            Port = 8080,
+            Path = "/health",
+            Metadata = new Dictionary<string, string> { ["deployment"] = "test" },
+        });
+
+        Assert.Equal(DeploymentEndpointKind.Http, endpoint.Kind);
+        Assert.Equal("127.0.0.1", endpoint.Host);
+        Assert.InRange(endpoint.Port.GetValueOrDefault(), 1, 65535);
+        Assert.Equal($"http://127.0.0.1:{endpoint.Port}/health", endpoint.Url);
+        Assert.Equal("test", endpoint.Metadata["deployment"]);
+        Assert.Equal("ssh-local-forward", endpoint.Metadata["endpoint.scope"]);
+        Assert.Equal("10.55.0.9", endpoint.Metadata["endpoint.remote-vm-host"]);
+        Assert.Equal("8080", endpoint.Metadata["endpoint.remote-vm-port"]);
+
+        var forward = Assert.Single(transport.LocalForwardCalls);
+        Assert.Equal("127.0.0.1", forward.LocalHost);
+        Assert.Equal(endpoint.Port, forward.LocalPort);
+        Assert.Equal("10.55.0.9", forward.RemoteHost);
+        Assert.Equal(8080, forward.RemotePort);
+    }
+
+    [Fact]
+    public async Task PublishEndpoint_supports_tcp_local_forward()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await using var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+
+        var endpoint = substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Tcp,
+            Port = 5432,
+            Metadata = new Dictionary<string, string> { ["deployment"] = "daemon" },
+        });
+
+        Assert.Equal(DeploymentEndpointKind.Tcp, endpoint.Kind);
+        Assert.Equal("127.0.0.1", endpoint.Host);
+        Assert.InRange(endpoint.Port.GetValueOrDefault(), 1, 65535);
+        Assert.Null(endpoint.Url);
+        Assert.Equal("daemon", endpoint.Metadata["deployment"]);
+        Assert.Equal("ssh-local-forward", endpoint.Metadata["endpoint.scope"]);
+        Assert.Equal("10.55.0.9", endpoint.Metadata["endpoint.remote-vm-host"]);
+        Assert.Equal("5432", endpoint.Metadata["endpoint.remote-vm-port"]);
+
+        var forward = Assert.Single(transport.LocalForwardCalls);
+        Assert.Equal("127.0.0.1", forward.LocalHost);
+        Assert.Equal(endpoint.Port, forward.LocalPort);
+        Assert.Equal("10.55.0.9", forward.RemoteHost);
+        Assert.Equal(5432, forward.RemotePort);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_stops_published_endpoint_tunnels()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+        substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        });
+
+        var forward = Assert.Single(transport.LocalForwards);
+        Assert.Equal(0, forward.DisposeCallCount);
+
+        await sb.DisposeAsync();
+
+        Assert.Equal(1, forward.DisposeCallCount);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_tunnel_stop_failure_throws_and_can_retry()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+        substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        });
+
+        transport.LocalForwardDisposeThrows = true;
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await sb.DisposeAsync());
+
+        transport.LocalForwardDisposeThrows = false;
+        await sb.DisposeAsync();
+        Assert.Equal(2, Assert.Single(transport.LocalForwards).DisposeCallCount);
+    }
+
+    [Fact]
+    public async Task PublishEndpoint_tunnel_start_failure_throws_without_returning_endpoint()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport
+        {
+            StartLocalForwardThrows = true,
+        };
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await using var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => substrate.PublishEndpoint(new DeploymentEndpointRequest
         {
             Kind = DeploymentEndpointKind.Http,
             Port = 8080,
         }));
-        Assert.Contains("Failed to start SSH local forward", ex.Message);
+        Assert.Contains("simulated tunnel start failure", ex.Message);
+        Assert.Empty(transport.LocalForwards);
     }
 
     [Fact]
@@ -2249,11 +2386,11 @@ public sealed class MultipassRemoteSandboxProviderTests
             && Interlocked.CompareExchange(ref target, value, existing) != existing);
     }
 
-    private static ProcessRunResult RunningInfoJson(string vm, string? ipv4 = null) => new(
+    private static ProcessRunResult RunningInfoJson(string vm, params string[] ipv4) => new(
         0,
-        ipv4 is null
+        ipv4.Length == 0
             ? $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}"
-            : $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\",\"ipv4\":[\"{ipv4}\"]}}}}}}",
+            : $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\",\"ipv4\":{JsonSerializer.Serialize(ipv4)}}}}}}}",
         "");
 
     private static ProcessRunResult InfoJson(string vm, string state) => new(
@@ -2277,6 +2414,11 @@ public sealed class MultipassRemoteSandboxProviderTests
         }
         throw new TimeoutException("Timed out waiting for SSH stub argv file.");
     }
+
+    private static ProcessRunResult BridgeAddress(string cidr) => new(
+        0,
+        $"2: cb-deploy    inet {cidr} brd 10.55.0.255 scope global cb-deploy\n",
+        "");
 
     private static string ExtractQuotedPathAfterRedirect(string script)
     {
@@ -2312,6 +2454,7 @@ public sealed class MultipassRemoteSandboxProviderTests
     internal sealed record StageInCall(string HostPath, string RemotePath);
     internal sealed record StageOutCall(string RemotePath, string HostPath);
     public sealed record TarSpec(TarEntryType Type, string Name, string? Content = null, string? LinkName = null);
+    internal sealed record LocalForwardCall(string LocalHost, int LocalPort, string RemoteHost, int RemotePort);
 
     private sealed class CapturingLogger<T> : ILogger<T>
     {
@@ -2357,7 +2500,7 @@ public sealed class MultipassRemoteSandboxProviderTests
         }
     }
 
-    internal sealed class FakeRemoteHostTransport : IRemoteHostTransport
+    internal sealed class FakeRemoteHostTransport : IRemotePortForwardTransport
     {
         public string DiagnosticId => "fake";
         public ConcurrentQueue<RecordedCall> RecordedCallsQueue { get; } = new();
@@ -2366,6 +2509,10 @@ public sealed class MultipassRemoteSandboxProviderTests
         public List<StageOutCall> StageOutCalls { get; } = new();
         public bool ThrowOnStageOut { get; set; }
         public Action<string, string, CancellationToken>? OnStageOut { get; set; }
+        public List<LocalForwardCall> LocalForwardCalls { get; } = new();
+        public List<FakeRemotePortForward> LocalForwards { get; } = new();
+        public bool StartLocalForwardThrows { get; set; }
+        public bool LocalForwardDisposeThrows { get; set; }
         public Func<IReadOnlyList<string>, StreamSinks, ProcessRunResult> OnRun { get; set; } =
             (_, _) => new ProcessRunResult(0, "", "");
 
@@ -2406,6 +2553,28 @@ public sealed class MultipassRemoteSandboxProviderTests
                 throw new RemoteSshTransportException("stage-out failed");
             StageOutCalls.Add(new StageOutCall(remotePath, hostPath));
             return Task.CompletedTask;
+        }
+
+        public IRemotePortForward StartLocalForward(string localHost, int localPort, string remoteHost, int remotePort)
+        {
+            if (StartLocalForwardThrows)
+                throw new InvalidOperationException("simulated tunnel start failure");
+            LocalForwardCalls.Add(new LocalForwardCall(localHost, localPort, remoteHost, remotePort));
+            var forward = new FakeRemotePortForward(this);
+            LocalForwards.Add(forward);
+            return forward;
+        }
+    }
+
+    internal sealed class FakeRemotePortForward(FakeRemoteHostTransport owner) : IRemotePortForward
+    {
+        public int DisposeCallCount { get; private set; }
+
+        public void Dispose()
+        {
+            DisposeCallCount++;
+            if (owner.LocalForwardDisposeThrows)
+                throw new InvalidOperationException("simulated tunnel stop failure");
         }
     }
 

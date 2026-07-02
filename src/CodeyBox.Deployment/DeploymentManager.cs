@@ -114,16 +114,7 @@ public sealed class DeploymentManager : IDeploymentManager
             {
                 if (Volatile.Read(ref _disposed) != 0)
                     return;
-                try
-                {
-                    await Inner.DisposeAsync().ConfigureAwait(false);
-                }
-                catch
-                {
-                    Volatile.Write(ref _disposed, 1);
-                    owner.Untrack(Id);
-                    throw;
-                }
+                await Inner.DisposeAsync().ConfigureAwait(false);
                 Volatile.Write(ref _disposed, 1);
                 owner.Untrack(Id);
             }

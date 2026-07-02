@@ -1126,11 +1126,11 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, IDeploymentEndpointPublisher, ISandboxDecorator, IActiveSandboxLease
+internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, ISandboxPortPublisher, ISandboxDecorator, IActiveSandboxLease
 {
     private readonly ISandbox _inner;
     private readonly IRoutableSandbox? _routable;
-    private readonly IDeploymentEndpointPublisher? _endpointPublisher;
+    private readonly ISandboxPortPublisher? _portPublisher;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
     private readonly IActiveSandboxLease? _activeLease;
     private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> _onDisposed;
@@ -1155,7 +1155,7 @@ internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDispose
         ArgumentNullException.ThrowIfNull(log);
         _inner = inner;
         _routable = inner as IRoutableSandbox;
-        _endpointPublisher = inner as IDeploymentEndpointPublisher;
+        _portPublisher = inner as ISandboxPortPublisher;
         _preserveOnDispose = inner as IPreserveOnDisposeSandbox;
         _activeLease = inner as IActiveSandboxLease;
         _lease = lease;
@@ -1194,14 +1194,12 @@ internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDispose
     public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
         _inner.GetAccessibilityTreeJsonAsync(ct);
 
-    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
-        => _endpointPublisher?.CanPublishEndpoint(request) == true;
+    public bool CanPublishPort(int port) => _portPublisher?.CanPublishPort(port) == true;
 
-    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
-        => _endpointPublisher is not null && _endpointPublisher.CanPublishEndpoint(request)
-            ? _endpointPublisher.PublishEndpoint(request)
-            : throw new NotSupportedException(
-                $"Sandbox '{Id}' does not support publishing {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
+    public SandboxPublishedPort PublishPort(int port)
+        => _portPublisher is not null && _portPublisher.CanPublishPort(port)
+            ? _portPublisher.PublishPort(port)
+            : throw new NotSupportedException($"Sandbox '{Id}' does not support publishing port {port}.");
 
     public void ReleaseActiveTracking() => _activeLease?.ReleaseActiveTracking();
 

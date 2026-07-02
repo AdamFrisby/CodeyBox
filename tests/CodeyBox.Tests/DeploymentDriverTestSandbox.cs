@@ -38,14 +38,14 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider, IDeploym
     /// <summary>Stable ordered list of every full exec request across all created sandboxes.</summary>
     public List<SandboxExec> ExecInvocations { get; } = new();
 
-    /// <summary>Stable ordered list of every endpoint publish request across all created sandboxes.</summary>
-    public List<DeploymentEndpointRequest> PublishRequests { get; } = new();
+    /// <summary>Stable ordered list of every sandbox port publication across all created sandboxes.</summary>
+    public List<int> PublishedPorts { get; } = new();
 
     /// <summary>Script of (commandPattern → result). First match wins.</summary>
     public List<ExecRule> ExecRules { get; } = new();
 
     public string? HostAddress { get; set; } = "10.42.0.10";
-    public Func<DeploymentEndpointRequest, DeploymentEndpoint>? PublishEndpointOverride { get; set; }
+    public Func<int, SandboxPublishedPort>? PublishPortOverride { get; set; }
     public HashSet<string> DisposeThrowsFor { get; } = new(StringComparer.Ordinal);
     public HashSet<string> SandboxDisposeThrowsFor { get; } = new(StringComparer.Ordinal);
     public bool SandboxDisposeThrows { get; set; }
@@ -178,7 +178,7 @@ internal sealed class ExecRule
     }
 }
 
-internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpointPublisher, IActiveSandboxLease
+internal sealed class FakeDeploymentSandbox : IRoutableSandbox, ISandboxPortPublisher, IActiveSandboxLease
 {
     private readonly FakeDeploymentSandboxProvider _provider;
     public string Id { get; } = $"codeybox-{Guid.NewGuid():N}"[..23];
@@ -202,19 +202,23 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpo
         return _provider.ResolveExecAsync(exec, ct);
     }
 
-    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+    public bool CanPublishPort(int port)
         => !string.IsNullOrWhiteSpace(HostAddress)
-            && request.Port is >= 1 and <= 65535
-            && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+            && port is >= 1 and <= 65535;
 
-    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+    public SandboxPublishedPort PublishPort(int port)
     {
-        if (!CanPublishEndpoint(request))
-            throw new NotSupportedException(
-                $"Fake deployment sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
-        lock (_provider.PublishRequests) _provider.PublishRequests.Add(request);
-        return _provider.PublishEndpointOverride?.Invoke(request)
-            ?? DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
+        if (!CanPublishPort(port))
+            throw new NotSupportedException($"Fake deployment sandbox '{Id}' cannot publish port {port}.");
+        lock (_provider.PublishedPorts) _provider.PublishedPorts.Add(port);
+        return _provider.PublishPortOverride?.Invoke(port)
+            ?? new SandboxPublishedPort(
+                HostAddress!,
+                port,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["endpoint.scope"] = "host-routable",
+                });
     }
 
     public ValueTask DisposeAsync()

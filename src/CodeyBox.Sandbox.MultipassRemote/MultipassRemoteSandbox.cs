@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -33,7 +32,7 @@ internal sealed class MultipassRemoteSandbox :
     IPrivilegedGuestFileHardeningSandbox,
     IHostQualifiedSandbox,
     IReleaseAdmissionOnHostLossSandbox,
-    IDeploymentEndpointPublisher,
+    ISandboxPortPublisher,
     IActiveSandboxLease
 {
     private readonly SandboxSpec _spec;
@@ -47,7 +46,7 @@ internal sealed class MultipassRemoteSandbox :
     private readonly RemoteMultipassCleanup _cleanup;
     private readonly Action<string, string> _onDispose;
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> _activeExecCts = new();
-    private readonly ConcurrentDictionary<int, Process> _endpointTunnels = new();
+    private readonly ConcurrentDictionary<int, IRemotePortForward> _endpointTunnels = new();
     private readonly SemaphoreSlim _disposeLock = new(1, 1);
     private string? _vmAddress;
     private int _disposed; // 0/1 via Interlocked
@@ -88,11 +87,11 @@ internal sealed class MultipassRemoteSandbox :
     }
 
     /// <summary>
-    /// Records the remote VM's IPv4 address so <see cref="PublishEndpoint"/> can
+    /// Records the remote VM's IPv4 address so <see cref="PublishPort"/> can
     /// open an SSH local-forward to a port inside the guest. The provider calls
     /// this after the VM reaches Running and the address is discoverable via
     /// <c>multipass info</c>. A null or whitespace value leaves the sandbox
-    /// non-publishing (<see cref="CanPublishEndpoint"/> returns false).
+    /// non-publishing (<see cref="CanPublishPort"/> returns false).
     /// </summary>
     internal void RegisterVmAddress(string? address)
     {
@@ -115,54 +114,42 @@ internal sealed class MultipassRemoteSandbox :
 
     public WorkItemId? OwningWorkItemId => _spec.TimingWorkItemId;
 
-    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+    public bool CanPublishPort(int port)
         => !string.IsNullOrWhiteSpace(Volatile.Read(ref _vmAddress))
-            && request.Port is >= 1 and <= 65535
-            && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+            && _transport is IRemotePortForwardTransport
+            && port is >= 1 and <= 65535;
 
-    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+    public SandboxPublishedPort PublishPort(int port)
     {
-        var vmAddress = Volatile.Read(ref _vmAddress);
-        if (string.IsNullOrWhiteSpace(vmAddress)
-            || request.Port is not (>= 1 and <= 65535)
-            || request.Kind is not (DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp))
-        {
-            throw new NotSupportedException(
-                $"Remote multipass sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString(CultureInfo.InvariantCulture) ?? "<none>"}.");
-        }
+        if (!CanPublishPort(port))
+            throw new NotSupportedException($"Remote multipass sandbox '{Id}' cannot publish port {port}.");
 
-        var remotePort = request.Port!.Value;
+        var vmAddress = Volatile.Read(ref _vmAddress);
         var localPort = ReserveLoopbackPort();
-        var argv = OpenSshCliTransport.BuildLocalForwardArgv(
-            _opts,
+        var tunnel = ((IRemotePortForwardTransport)_transport).StartLocalForward(
             IPAddress.Loopback.ToString(),
             localPort,
             vmAddress!,
-            remotePort);
-        var tunnel = StartEndpointTunnel(argv, localPort, vmAddress!, remotePort);
+            port);
         if (!_endpointTunnels.TryAdd(localPort, tunnel))
         {
-            StopTunnel(tunnel);
+            tunnel.Dispose();
             throw new InvalidOperationException($"Failed to track SSH endpoint tunnel for local port {localPort}.");
         }
 
-        var metadata = new Dictionary<string, string>(request.Metadata, StringComparer.Ordinal)
+        _log.LogInformation(
+            "Remote VM {Vm}: published sandbox port via local forward 127.0.0.1:{LocalPort} -> {RemoteHost}:{RemotePort}",
+            Id, localPort, vmAddress, port);
+
+        return new SandboxPublishedPort(
+            "127.0.0.1",
+            localPort,
+            new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["endpoint.scope"] = "ssh-local-forward",
             ["endpoint.remote-vm-host"] = vmAddress!,
-            ["endpoint.remote-vm-port"] = remotePort.ToString(CultureInfo.InvariantCulture),
-        };
-        var path = NormalizeUrlPath(request.Path);
-        return new DeploymentEndpoint
-        {
-            Kind = request.Kind,
-            Url = request.Kind == DeploymentEndpointKind.Http
-                ? $"{request.Scheme}://127.0.0.1:{localPort}{path}"
-                : null,
-            Host = "127.0.0.1",
-            Port = localPort,
-            Metadata = metadata,
-        };
+            ["endpoint.remote-vm-port"] = port.ToString(CultureInfo.InvariantCulture),
+        });
     }
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
@@ -647,64 +634,27 @@ internal sealed class MultipassRemoteSandbox :
         return ((IPEndPoint)listener.LocalEndpoint).Port;
     }
 
-    private Process StartEndpointTunnel(
-        IReadOnlyList<string> argv,
-        int localPort,
-        string remoteHost,
-        int remotePort)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = argv[0],
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        for (var i = 1; i < argv.Count; i++)
-            psi.ArgumentList.Add(argv[i]);
-
-        try
-        {
-            var process = new Process { StartInfo = psi };
-            if (!process.Start())
-                throw new InvalidOperationException("ssh process did not start.");
-            _log.LogInformation(
-                "Remote VM {Vm}: published deployment endpoint via SSH local forward 127.0.0.1:{LocalPort} -> {RemoteHost}:{RemotePort}",
-                Id, localPort, remoteHost, remotePort);
-            return process;
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException(
-                $"Failed to start SSH local forward for remote deployment endpoint 127.0.0.1:{localPort} -> {remoteHost}:{remotePort}.",
-                ex);
-        }
-    }
-
     private void StopEndpointTunnels()
     {
-        foreach (var (port, process) in _endpointTunnels)
+        List<Exception>? failures = null;
+        foreach (var (port, tunnel) in _endpointTunnels.ToArray())
         {
-            _endpointTunnels.TryRemove(port, out _);
-            StopTunnel(process);
+            try
+            {
+                tunnel.Dispose();
+                _endpointTunnels.TryRemove(port, out _);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Remote VM {Vm}: failed to stop endpoint tunnel on local port {Port}", Id, port);
+                (failures ??= new()).Add(ex);
+            }
         }
-    }
 
-    private static void StopTunnel(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-                process.Kill(entireProcessTree: true);
-        }
-        catch { }
-        try { process.Dispose(); } catch { }
-    }
-
-    private static string NormalizeUrlPath(string? path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return string.Empty;
-        return path.StartsWith("/", StringComparison.Ordinal) ? path : "/" + path;
+        if (failures is { Count: 1 })
+            throw new InvalidOperationException("Failed to stop one remote endpoint tunnel.", failures[0]);
+        if (failures is { Count: > 1 })
+            throw new AggregateException("Failed to stop remote endpoint tunnels.", failures);
     }
 
     private static string QuoteArgvForShell(IReadOnlyList<string> argv)

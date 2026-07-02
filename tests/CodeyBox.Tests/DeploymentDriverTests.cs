@@ -20,6 +20,48 @@ public sealed class DeploymentDriverTests
         Func<Uri, CancellationToken, Task<bool>>? hostHttpProbe = null)
         => new(hostHttpProbe: hostHttpProbe ?? ((_, _) => Task.FromResult(true)));
 
+    [Fact]
+    public async Task SandboxDeploymentCleanupAdapter_FiltersDeploymentSandboxesAndPreservesFlags()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ManagedInfoOverride = sb => sb.Spec.Purpose == SandboxPurpose.Deployment
+            ? new ManagedSandboxInfo(
+                sb.Id,
+                new DateTimeOffset(2026, 7, 2, 0, 0, 0, TimeSpan.Zero),
+                DiskBytes: 4096,
+                IsTrackedActive: false,
+                HasPreemptMarker: true,
+                IsSuspendLifecycleOrFrozen: true,
+                Purpose: SandboxPurpose.Deployment)
+            : new ManagedSandboxInfo(
+                sb.Id,
+                sb.CreatedAt,
+                DiskBytes: 2048,
+                IsTrackedActive: true,
+                Purpose: SandboxPurpose.WorkItem);
+
+        await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ubuntu",
+            Purpose = SandboxPurpose.WorkItem,
+        });
+        var deploymentSandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ubuntu",
+            Purpose = SandboxPurpose.Deployment,
+        });
+
+        var adapter = (IDeploymentCleanupProvider)new SandboxDeploymentSubstrateProvider(provider);
+        var info = Assert.Single(await adapter.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Equal(deploymentSandbox.Id, info.Name);
+        Assert.Equal(new DateTimeOffset(2026, 7, 2, 0, 0, 0, TimeSpan.Zero), info.CreatedAt);
+        Assert.Equal(4096, info.DiskBytes);
+        Assert.False(info.IsTrackedActive);
+        Assert.True(info.HasPreemptMarker);
+        Assert.True(info.IsSuspendLifecycleOrFrozen);
+    }
+
     // ── WebApp ───────────────────────────────────────────────────────────────
 
     [Fact]
@@ -280,17 +322,11 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
-    public async Task WebApp_PublisherReturnsHttpEndpointWithoutUrl_TearsDownAndThrows()
+    public async Task WebApp_PublisherReturnsInvalidHost_TearsDownAndThrows()
     {
         var provider = new FakeDeploymentSandboxProvider
         {
-            PublishEndpointOverride = request => new DeploymentEndpoint
-            {
-                Kind = request.Kind,
-                Host = "10.42.0.10",
-                Port = request.Port,
-                Metadata = request.Metadata,
-            },
+            PublishPortOverride = port => new SandboxPublishedPort(" ", port),
         };
         provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "200", "")));
 
@@ -304,10 +340,10 @@ public sealed class DeploymentDriverTests
             HealthEndpoint = "/healthz",
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
             () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
 
-        Assert.Contains("without a URL", ex.Message);
+        Assert.Contains("Published host is required", ex.Message);
         Assert.Single(provider.Created);
         Assert.True(provider.Created[0].IsDisposed);
     }
@@ -475,12 +511,12 @@ public sealed class DeploymentDriverTests
         };
 
         await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
-        var publishCountAfterDeploy = provider.PublishRequests.Count;
+        var publishCountAfterDeploy = provider.PublishedPorts.Count;
 
         await handle.HealthCheckAsync(CancellationToken.None);
 
         Assert.Equal(1, publishCountAfterDeploy);
-        Assert.Equal(publishCountAfterDeploy, provider.PublishRequests.Count);
+        Assert.Equal(publishCountAfterDeploy, provider.PublishedPorts.Count);
         Assert.All(hostProbeUris, uri => Assert.Equal("http://10.42.0.10:8080/healthz", uri.ToString()));
     }
 

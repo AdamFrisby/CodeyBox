@@ -371,6 +371,24 @@ public interface IRoutableSandbox : ISandbox
 
 
 /// <summary>
+/// Optional sandbox-level capability for publishing a sandbox TCP port to the
+/// orchestrator host. Implementations may expose the port directly when the
+/// sandbox has a host-routable address, or return a local tunnel endpoint.
+/// Deployment adapters translate this sandbox capability into deployment
+/// endpoint DTOs; sandbox providers do not depend on deployment APIs.
+/// </summary>
+public interface ISandboxPortPublisher : ISandbox
+{
+    bool CanPublishPort(int port);
+    SandboxPublishedPort PublishPort(int port);
+}
+
+public sealed record SandboxPublishedPort(
+    string Host,
+    int Port,
+    IReadOnlyDictionary<string, string>? Metadata = null);
+
+/// <summary>
 /// Optional sandbox capability for releasing provider-side active tracking
 /// without claiming the sandbox was successfully disposed. Used by deployment
 /// cleanup after a failed delete so leak reapers can retry in-process.

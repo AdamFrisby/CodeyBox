@@ -38,15 +38,11 @@ public sealed class SandboxAdmissionControlledProviderTests
 
         var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
         Assert.Equal("10.10.0.42", routable.HostAddress);
-        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sandbox);
-        var request = new DeploymentEndpointRequest
-        {
-            Kind = DeploymentEndpointKind.Http,
-            Port = 8080,
-        };
-        Assert.True(publisher.CanPublishEndpoint(request));
-        var endpoint = publisher.PublishEndpoint(request);
-        Assert.Equal("http://10.10.0.42:8080", endpoint.Url);
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sandbox);
+        Assert.True(publisher.CanPublishPort(8080));
+        var endpoint = publisher.PublishPort(8080);
+        Assert.Equal("10.10.0.42", endpoint.Host);
+        Assert.Equal(8080, endpoint.Port);
 
         var lease = Assert.IsAssignableFrom<IActiveSandboxLease>(sandbox);
         lease.ReleaseActiveTracking();
@@ -1877,7 +1873,7 @@ public sealed class SandboxAdmissionControlledProviderTests
             Task.CompletedTask;
     }
 
-    private sealed class RoutableSandbox : IRoutableSandbox, IDeploymentEndpointPublisher, IActiveSandboxLease
+    private sealed class RoutableSandbox : IRoutableSandbox, ISandboxPortPublisher, IActiveSandboxLease
     {
         public string Id { get; } = "routable-1";
         public string? HostAddress => "10.10.0.42";
@@ -1886,12 +1882,16 @@ public sealed class SandboxAdmissionControlledProviderTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
             Task.FromResult(new SandboxExecResult(0, "", ""));
 
-        public bool CanPublishEndpoint(DeploymentEndpointRequest request)
-            => request.Port is >= 1 and <= 65535
-                && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+        public bool CanPublishPort(int port) => port is >= 1 and <= 65535;
 
-        public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
-            => DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
+        public SandboxPublishedPort PublishPort(int port)
+            => new(
+                HostAddress!,
+                port,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["endpoint.scope"] = "host-routable",
+                });
 
         public void ReleaseActiveTracking() => ActiveTrackingReleased = true;
 

@@ -53,7 +53,7 @@ public sealed class DeploymentManagerTests
     }
 
     [Fact]
-    public async Task DisposeFailure_UntracksDeploymentSoLeakReaperCanRetry()
+    public async Task DisposeFailure_KeepsDeploymentHandleAliveForRetry()
     {
         var provider = new FakeDeploymentSandboxProvider();
         var driver = new LibraryDeploymentDriver();
@@ -80,10 +80,14 @@ public sealed class DeploymentManagerTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await handle.DisposeAsync());
 
-        Assert.Empty(manager.GetActive());
+        Assert.True(handle.IsAlive);
+        Assert.Single(manager.GetActive());
+
+        provider.SandboxDisposeThrowsFor.Remove(handle.SubstrateId!);
+        await handle.DisposeAsync();
+
         Assert.False(handle.IsAlive);
-        var cleanupInfo = Assert.Single(await ((IDeploymentCleanupProvider)provider).ListAllManagedAsync(CancellationToken.None));
-        Assert.False(cleanupInfo.IsTrackedActive);
+        Assert.Empty(manager.GetActive());
     }
 
     [Fact]

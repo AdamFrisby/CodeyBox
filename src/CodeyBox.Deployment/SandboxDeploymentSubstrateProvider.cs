@@ -70,12 +70,12 @@ public sealed class SandboxDeploymentSubstrateProvider : IDeploymentSubstratePro
 internal sealed class SandboxDeploymentSubstrate : IDeploymentSubstrate, IDeploymentActiveLease
 {
     private readonly ISandbox _inner;
-    private readonly IDeploymentEndpointPublisher? _endpointPublisher;
+    private readonly ISandboxPortPublisher? _portPublisher;
 
     public SandboxDeploymentSubstrate(ISandbox inner)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
-        _endpointPublisher = inner as IDeploymentEndpointPublisher;
+        _portPublisher = inner as ISandboxPortPublisher;
     }
 
     public string Id => _inner.Id;
@@ -96,13 +96,20 @@ internal sealed class SandboxDeploymentSubstrate : IDeploymentSubstrate, IDeploy
     }
 
     public bool CanPublishEndpoint(DeploymentEndpointRequest request)
-        => _endpointPublisher?.CanPublishEndpoint(request) == true;
+        => request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp
+            && request.Port is { } port
+            && _portPublisher?.CanPublishPort(port) == true;
 
     public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
-        => _endpointPublisher is not null && _endpointPublisher.CanPublishEndpoint(request)
-            ? _endpointPublisher.PublishEndpoint(request)
-            : throw new NotSupportedException(
+    {
+        if (!CanPublishEndpoint(request))
+            throw new NotSupportedException(
                 $"Deployment substrate '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
+
+        return DeploymentEndpointPublisher.ForPublishedPort(
+            request,
+            _portPublisher!.PublishPort(request.Port!.Value));
+    }
 
     public async ValueTask DisposeAsync()
     {

@@ -454,18 +454,6 @@ public sealed record DeploymentEndpointRequest
         = new Dictionary<string, string>(StringComparer.Ordinal);
 }
 
-/// <summary>
-/// Optional substrate capability for publishing a deployment endpoint reachable
-/// by the orchestrator host / deployment caller. Drivers depend on this
-/// deployment-level capability rather than assuming the substrate's internal
-/// port is directly reachable from the host.
-/// </summary>
-public interface IDeploymentEndpointPublisher
-{
-    bool CanPublishEndpoint(DeploymentEndpointRequest request);
-    DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request);
-}
-
 public static class DeploymentEndpointPublisher
 {
     public static DeploymentEndpoint ForHostPort(DeploymentEndpointRequest request, string host)
@@ -492,6 +480,37 @@ public static class DeploymentEndpointPublisher
                 : null,
             Host = host,
             Port = port,
+            Metadata = metadata,
+        };
+    }
+
+    public static DeploymentEndpoint ForPublishedPort(
+        DeploymentEndpointRequest request,
+        SandboxPublishedPort published)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(published);
+        if (string.IsNullOrWhiteSpace(published.Host))
+            throw new ArgumentException("Published host is required.", nameof(published));
+        if (published.Port is < 1 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(published), published.Port, "Port must be 1..65535.");
+
+        var metadata = new Dictionary<string, string>(request.Metadata, StringComparer.Ordinal);
+        if (published.Metadata is not null)
+        {
+            foreach (var (key, value) in published.Metadata)
+                metadata[key] = value;
+        }
+
+        var path = NormalizeUrlPath(request.Path);
+        return new DeploymentEndpoint
+        {
+            Kind = request.Kind,
+            Url = request.Kind == DeploymentEndpointKind.Http
+                ? $"{request.Scheme}://{published.Host}:{published.Port}{path}"
+                : null,
+            Host = published.Host,
+            Port = published.Port,
             Metadata = metadata,
         };
     }

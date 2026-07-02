@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -70,6 +71,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private readonly ITimingStore? _timings;
     private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly IDiskSpaceProbe _diskProbe;
+    private readonly Func<string, Ipv4Subnet?> _bridgeSubnetResolver;
     // Per-baseline-name semaphore: serialises bake operations so two
     // concurrent CreateAsync calls for the same profile don't both try to
     // launch the same baseline VM. Lazily populated.
@@ -123,6 +125,29 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private SemaphoreSlim? _bootGate;
     private int _bootGateCapacity;
 
+    internal readonly record struct Ipv4Subnet(IPAddress Address, IPAddress Mask)
+    {
+        public bool Contains(string candidate)
+            => IPAddress.TryParse(candidate, out var parsed)
+                && parsed.AddressFamily == AddressFamily.InterNetwork
+                && Contains(parsed);
+
+        public bool Contains(IPAddress candidate)
+        {
+            if (candidate.AddressFamily != AddressFamily.InterNetwork)
+                return false;
+            var candidateBytes = candidate.GetAddressBytes();
+            var addressBytes = Address.GetAddressBytes();
+            var maskBytes = Mask.GetAddressBytes();
+            if (candidateBytes.Length != 4 || addressBytes.Length != 4 || maskBytes.Length != 4)
+                return false;
+            for (var i = 0; i < 4; i++)
+                if ((candidateBytes[i] & maskBytes[i]) != (addressBytes[i] & maskBytes[i]))
+                    return false;
+            return true;
+        }
+    }
+
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null, ISandboxResourceUsageStore? resourceUsageStore = null)
         : this(() => opts, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore)
@@ -138,8 +163,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
     internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
-        IDiskSpaceProbe? diskProbe = null, ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe, resourceUsageStore)
+        IDiskSpaceProbe? diskProbe = null,
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null)
+        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe, resourceUsageStore, bridgeSubnetResolver)
     {
     }
 
@@ -147,7 +174,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         ILogger<MultipassSandboxProvider> log, ITimingStore? timings, IProcessRunner runner,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         IDiskSpaceProbe? diskProbe = null,
-        ISandboxResourceUsageStore? resourceUsageStore = null)
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null)
     {
         _optsAccessor = optionsAccessor;
         _log = log;
@@ -156,6 +184,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         _timings = timings;
         _resourceUsageStore = resourceUsageStore;
         _diskProbe = diskProbe ?? new DefaultDiskSpaceProbe();
+        _bridgeSubnetResolver = bridgeSubnetResolver ?? TryResolveBridgeSubnet;
         // StagingDirectory is captured once: the provider keeps the directory open
         // for the lifetime of the process. Re-binding it at runtime would orphan
         // already-staged sandboxes.
@@ -1259,13 +1288,23 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     {
         if (string.IsNullOrWhiteSpace(networkProfile))
             return null;
-        if (!opts.NetworkProfiles.ContainsKey(networkProfile))
+        if (!opts.NetworkProfiles.TryGetValue(networkProfile, out var bridge))
             return null;
 
         var detailsByName = await FetchSandboxDetailsAsync(opts, [name], ct, workItemId).ConfigureAwait(false);
-        return detailsByName.TryGetValue(name, out var details)
-            ? details.Ipv4Addresses.FirstOrDefault(IsProfileBridgeIpv4)
-            : null;
+        if (!detailsByName.TryGetValue(name, out var details))
+            return null;
+
+        var subnet = _bridgeSubnetResolver(bridge);
+        if (subnet is null)
+        {
+            _log.LogWarning(
+                "Sandbox {Name}: cannot identify IPv4 subnet for network profile {Profile} bridge {Bridge}; endpoint publishing disabled",
+                name, networkProfile, bridge);
+            return null;
+        }
+
+        return details.Ipv4Addresses.FirstOrDefault(subnet.Value.Contains);
     }
 
     private static DateTimeOffset? TryReadCreatedAt(JsonElement vmInfo)
@@ -1317,12 +1356,37 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         }
     }
 
-    private static bool IsProfileBridgeIpv4(string value)
+    private static Ipv4Subnet? TryResolveBridgeSubnet(string bridgeName)
     {
-        if (!IPAddress.TryParse(value, out var address) || address.AddressFamily != AddressFamily.InterNetwork)
-            return false;
-        var bytes = address.GetAddressBytes();
-        return bytes.Length == 4 && bytes[0] == 10 && bytes[1] == 99;
+        if (string.IsNullOrWhiteSpace(bridgeName))
+            return null;
+
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!string.Equals(nic.Name, bridgeName, StringComparison.Ordinal))
+                continue;
+
+            foreach (var address in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (address.Address.AddressFamily != AddressFamily.InterNetwork)
+                    continue;
+                try
+                {
+                    if (address.IPv4Mask is { AddressFamily: AddressFamily.InterNetwork } mask)
+                        return new Ipv4Subnet(address.Address, mask);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    return null;
+                }
+                catch (NetworkInformationException)
+                {
+                    return null;
+                }
+            }
+        }
+
+        return null;
     }
 
     private static bool IsValidSandboxName(string name)
@@ -5367,7 +5431,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox, IDeploymentEndpointPublisher, IActiveSandboxLease
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox, ISandboxPortPublisher, IActiveSandboxLease
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5578,19 +5642,23 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     public bool CapturesResourceMetrics => _opts.CaptureResourceMetrics;
     public string? HostAddress => _hostAddress;
 
-    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+    public bool CanPublishPort(int port)
         => !string.IsNullOrWhiteSpace(_hostAddress)
             && !string.IsNullOrWhiteSpace(_spec.Network.ProfileName)
             && _opts.NetworkProfiles.ContainsKey(_spec.Network.ProfileName)
-            && request.Port is >= 1 and <= 65535
-            && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+            && port is >= 1 and <= 65535;
 
-    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+    public SandboxPublishedPort PublishPort(int port)
     {
-        if (!CanPublishEndpoint(request))
-            throw new NotSupportedException(
-                $"Multipass sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
-        return DeploymentEndpointPublisher.ForHostPort(request, _hostAddress!);
+        if (!CanPublishPort(port))
+            throw new NotSupportedException($"Multipass sandbox '{Id}' cannot publish port {port}.");
+        return new SandboxPublishedPort(
+            _hostAddress!,
+            port,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["endpoint.scope"] = "host-routable",
+            });
     }
 
     public void ReleaseActiveTracking()

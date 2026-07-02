@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Formats.Tar;
 using System.Globalization;
 using System.Text;
@@ -27,7 +28,7 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// the exit status of the remote command or with 255 if an error occurred").
 /// </para>
 /// </summary>
-public sealed class OpenSshCliTransport : IRemoteHostTransport
+public sealed class OpenSshCliTransport : IRemotePortForwardTransport
 {
     private const int ReadBufferChars = 4096;
 
@@ -296,6 +297,42 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             {
                 _log.LogWarning(ex, "Failed to remove StageOut temp directory {TempRoot}", tempRoot);
             }
+        }
+    }
+
+    public IRemotePortForward StartLocalForward(
+        string localHost,
+        int localPort,
+        string remoteHost,
+        int remotePort)
+    {
+        var opts = _opts();
+        ValidateOptionsOrThrow(opts);
+        var argv = BuildLocalForwardArgv(opts, localHost, localPort, remoteHost, remotePort);
+        var psi = new ProcessStartInfo
+        {
+            FileName = argv[0],
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        for (var i = 1; i < argv.Count; i++)
+            psi.ArgumentList.Add(argv[i]);
+
+        try
+        {
+            var process = new Process { StartInfo = psi };
+            if (!process.Start())
+                throw new InvalidOperationException("ssh process did not start.");
+            _log.LogInformation(
+                "Started SSH local forward 127.0.0.1:{LocalPort} -> {RemoteHost}:{RemotePort} on {Target}",
+                localPort, remoteHost, remotePort, opts.SshTarget);
+            return new OpenSshLocalForward(process);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Failed to start SSH local forward {localHost}:{localPort} -> {remoteHost}:{remotePort}.",
+                ex);
         }
     }
 
@@ -846,6 +883,49 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         argv.Add($"{localHost}:{localPort}:{remoteHost}:{remotePort}");
         argv.Add(opts.SshTarget);
         return argv;
+    }
+
+    private sealed class OpenSshLocalForward(Process process) : IRemotePortForward
+    {
+        private Process? _process = process;
+        private readonly object _gate = new();
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                var process = _process;
+                if (process is null)
+                    return;
+
+                var failures = new List<Exception>();
+                try
+                {
+                    if (!process.HasExited)
+                        process.Kill(entireProcessTree: true);
+                }
+                catch (Exception ex)
+                {
+                    failures.Add(ex);
+                }
+
+                try
+                {
+                    process.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    failures.Add(ex);
+                }
+
+                if (failures.Count == 1)
+                    throw new InvalidOperationException("Failed to stop SSH local forward.", failures[0]);
+                if (failures.Count > 1)
+                    throw new AggregateException("Failed to stop SSH local forward.", failures);
+
+                _process = null;
+            }
+        }
     }
 
     private static IReadOnlyList<string> BuildSshArgv(MultipassRemoteSandboxOptions opts, string remoteCommand)

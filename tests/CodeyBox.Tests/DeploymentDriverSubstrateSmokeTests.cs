@@ -313,7 +313,7 @@ public sealed class DeploymentDriverSubstrateSmokeTests
             => _inner.DisposeLeakedAsync(name, ct);
     }
 
-    private sealed class RoutableProcessSandbox(ISandbox inner) : IRoutableSandbox, IDeploymentEndpointPublisher
+    private sealed class RoutableProcessSandbox(ISandbox inner) : IRoutableSandbox, ISandboxPortPublisher
     {
         public string Id => inner.Id;
         public string? HostAddress => "127.0.0.1";
@@ -324,12 +324,16 @@ public sealed class DeploymentDriverSubstrateSmokeTests
         public Task KillActiveExecsAsync(CancellationToken ct = default)
             => inner.KillActiveExecsAsync(ct);
 
-        public bool CanPublishEndpoint(DeploymentEndpointRequest request)
-            => request.Port is >= 1 and <= 65535
-                && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+        public bool CanPublishPort(int port) => port is >= 1 and <= 65535;
 
-        public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
-            => DeploymentEndpointPublisher.ForHostPort(request, HostAddress!);
+        public SandboxPublishedPort PublishPort(int port)
+            => new(
+                HostAddress!,
+                port,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["endpoint.scope"] = "host-routable",
+                });
 
         public ValueTask DisposeAsync()
             => inner.DisposeAsync();

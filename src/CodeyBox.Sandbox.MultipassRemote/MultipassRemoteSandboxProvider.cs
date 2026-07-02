@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -405,7 +407,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             // drivers can open an SSH local-forward endpoint into the guest.
             // The lookup is best-effort — a missing address leaves the sandbox
             // non-publishing rather than failing placement.
-            var vmAddress = await ResolveRemoteVmAddressAsync(opts, transport, vmName, ct).ConfigureAwait(false);
+            var vmAddress = await ResolveRemoteVmAddressAsync(opts, transport, vmName, spec.Network.ProfileName, ct).ConfigureAwait(false);
             sandbox.RegisterVmAddress(vmAddress);
 
             // 4) Apply environment via a stamped /etc/environment fragment.
@@ -1085,8 +1087,14 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         MultipassRemoteSandboxOptions opts,
         IRemoteHostTransport transport,
         string vmName,
+        string? networkProfile,
         CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(networkProfile))
+            return null;
+        if (!opts.NetworkProfiles.TryGetValue(networkProfile, out var bridge))
+            return null;
+
         ProcessRunResultLike r;
         try
         {
@@ -1117,7 +1125,36 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 vmName, r.ExitCode, opts.HostId, TruncateForLog(r.Stderr));
             return null;
         }
-        return TryParseVmAddress(r.Stdout, vmName, out var address) ? address : null;
+
+        var addresses = TryParseVmAddresses(r.Stdout, vmName);
+        if (addresses.Count == 0)
+            return null;
+
+        var bridgeSubnet = await ResolveRemoteBridgeSubnetAsync(bridge, ct).ConfigureAwait(false);
+        if (bridgeSubnet is null)
+        {
+            _log.LogWarning(
+                "Remote VM {Vm}: cannot identify IPv4 subnet for network profile {Profile} bridge {Bridge}; endpoint publishing disabled",
+                vmName, networkProfile, bridge);
+            return null;
+        }
+
+        return addresses.FirstOrDefault(bridgeSubnet.Value.Contains);
+    }
+
+    private async Task<Ipv4Subnet?> ResolveRemoteBridgeSubnetAsync(string bridge, CancellationToken ct)
+    {
+        var r = await RunRemoteAsync(["ip", "-4", "-o", "addr", "show", "dev", bridge], ct)
+            .ConfigureAwait(false);
+        if (r.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Remote bridge {Bridge}: failed to read IPv4 address for endpoint publishing (exit {ExitCode}): {Stderr}",
+                bridge, r.ExitCode, TruncateForLog(r.Stderr));
+            return null;
+        }
+
+        return TryParseIpv4Subnet(r.Stdout);
     }
 
     private static bool TryParseVmState(string json, string vmName, out string state)
@@ -1141,28 +1178,92 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
     }
 
-    private static bool TryParseVmAddress(string json, string vmName, out string address)
+    private static IReadOnlyList<string> TryParseVmAddresses(string json, string vmName)
     {
-        address = "";
         try
         {
             using var doc = JsonDocument.Parse(json);
-            if (!doc.RootElement.TryGetProperty("info", out var info)) return false;
-            if (!info.TryGetProperty(vmName, out var entry)) return false;
-            if (!entry.TryGetProperty("ipv4", out var ipv4) || ipv4.ValueKind != JsonValueKind.Array) return false;
+            if (!doc.RootElement.TryGetProperty("info", out var info)) return [];
+            if (!info.TryGetProperty(vmName, out var entry)) return [];
+            if (!entry.TryGetProperty("ipv4", out var ipv4)) return [];
+            if (ipv4.ValueKind == JsonValueKind.String)
+                return ParseIpv4s(ipv4.GetString()).ToList();
+            if (ipv4.ValueKind != JsonValueKind.Array) return [];
+
+            var addresses = new List<string>();
             foreach (var item in ipv4.EnumerateArray())
             {
-                if (item.ValueKind != JsonValueKind.String) continue;
-                var candidate = item.GetString();
-                if (string.IsNullOrWhiteSpace(candidate)) continue;
-                address = candidate!;
-                return true;
+                if (item.ValueKind == JsonValueKind.String)
+                    addresses.AddRange(ParseIpv4s(item.GetString()));
             }
-            return false;
+            return addresses;
         }
         catch (JsonException)
         {
-            return false;
+            return [];
+        }
+    }
+
+    private static IEnumerable<string> ParseIpv4s(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            yield break;
+        foreach (var token in value.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (IPAddress.TryParse(token, out var address) && address.AddressFamily == AddressFamily.InterNetwork)
+                yield return address.ToString();
+        }
+    }
+
+    private static Ipv4Subnet? TryParseIpv4Subnet(string output)
+    {
+        foreach (var token in output.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!token.Contains('/', StringComparison.Ordinal))
+                continue;
+            var parts = token.Split('/', 2);
+            if (!IPAddress.TryParse(parts[0], out var address) || address.AddressFamily != AddressFamily.InterNetwork)
+                continue;
+            if (!int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var prefix) || prefix is < 0 or > 32)
+                continue;
+            return new Ipv4Subnet(address, PrefixToMask(prefix));
+        }
+
+        return null;
+    }
+
+    private static IPAddress PrefixToMask(int prefix)
+    {
+        var mask = prefix == 0 ? 0u : uint.MaxValue << (32 - prefix);
+        return new IPAddress(new[]
+        {
+            (byte)(mask >> 24),
+            (byte)(mask >> 16),
+            (byte)(mask >> 8),
+            (byte)mask,
+        });
+    }
+
+    private readonly record struct Ipv4Subnet(IPAddress Address, IPAddress Mask)
+    {
+        public bool Contains(string candidate)
+            => IPAddress.TryParse(candidate, out var parsed)
+                && parsed.AddressFamily == AddressFamily.InterNetwork
+                && Contains(parsed);
+
+        public bool Contains(IPAddress candidate)
+        {
+            if (candidate.AddressFamily != AddressFamily.InterNetwork)
+                return false;
+            var candidateBytes = candidate.GetAddressBytes();
+            var addressBytes = Address.GetAddressBytes();
+            var maskBytes = Mask.GetAddressBytes();
+            if (candidateBytes.Length != 4 || addressBytes.Length != 4 || maskBytes.Length != 4)
+                return false;
+            for (var i = 0; i < 4; i++)
+                if ((candidateBytes[i] & maskBytes[i]) != (addressBytes[i] & maskBytes[i]))
+                    return false;
+            return true;
         }
     }
 
