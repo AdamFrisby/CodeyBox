@@ -1420,8 +1420,21 @@ public sealed class LocalGitHost : IGitHost
             }
             catch (Win32Exception ex) when (attempt < GitStartTextFileBusyMaxAttempts && IsTextFileBusy(ex))
             {
-                await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
+                try
+                {
+                    await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    RecordGitCommandDuration(operation, sw, "canceled");
+                    throw;
+                }
                 continue;
+            }
+            catch
+            {
+                RecordGitCommandDuration(operation, sw, "error");
+                throw;
             }
 
             try

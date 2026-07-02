@@ -92,6 +92,28 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task CreateAsync_routes_to_healthy_host_when_failed_host_rollback_is_unconfirmed()
+    {
+        var opts = Options(
+            Host("a", cap: 1),
+            Host("b", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].ThrowTransportOnLaunch = true;
+        transports["a"].DeleteExitCode = 1;
+        var provider = Provider(() => opts, transports);
+
+        await using var sandbox = await provider.CreateAsync(Spec());
+
+        Assert.Equal("b", ((MultipassRemoteSandbox)sandbox).HostId);
+        Assert.Equal(1, transports["a"].DeleteCount);
+        Assert.Equal(1, transports["b"].LaunchCount);
+        var snapshot = provider.SnapshotHostPool().OrderBy(h => h.HostId).ToArray();
+        Assert.Equal(1, snapshot[0].Reserved);
+        Assert.Equal(1, snapshot[1].Reserved);
+        Assert.False(snapshot[0].RuntimeHealthy);
+    }
+
+    [Fact]
     public async Task CreateAsync_runtime_unhealthy_host_is_not_probed_until_backoff_expires()
     {
         var current = Options(
@@ -202,6 +224,20 @@ public sealed class MultipassRemoteHostPoolTests
         Assert.Equal("audit-host", ((MultipassRemoteSandbox)sandbox).HostId);
         Assert.Equal(0, transports["work-host"].LaunchCount);
         Assert.Equal(1, transports["audit-host"].LaunchCount);
+    }
+
+    [Fact]
+    public async Task CreateAsync_matches_allowed_network_profile_case_insensitively()
+    {
+        var opts = Options(
+            Host("work-host", cap: 2, allowedProfiles: ["Work"]));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+
+        await using var sandbox = await provider.CreateAsync(Spec("work"));
+
+        Assert.Equal("work-host", ((MultipassRemoteSandbox)sandbox).HostId);
+        Assert.Equal(1, transports["work-host"].LaunchCount);
     }
 
     [Fact]

@@ -388,7 +388,8 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         AdmissionControlledSandbox sandbox,
         SandboxAdmissionLease lease,
         bool innerDisposeSucceeded,
-        bool admissionHeld)
+        bool admissionHeld,
+        Exception? disposeFailure)
     {
         _active?.Remove(sandbox);
         var identity = SandboxAdmissionIdentity.FromSandbox(sandbox);
@@ -400,6 +401,8 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var releaseAdmission = false;
         if (innerDisposeSucceeded)
             releaseAdmission = !await IsManagedSandboxStillPresentAsync(identity).ConfigureAwait(false);
+        else if (IsRetainedRemoteDisposeFailure(disposeFailure))
+            releaseAdmission = true;
 
         if (releaseAdmission)
             lease.Dispose();
@@ -414,6 +417,11 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             _disposedSandboxAdmissions.Retain(identity, lease);
         }
     }
+
+    private static bool IsRetainedRemoteDisposeFailure(Exception? disposeFailure) =>
+        disposeFailure is SandboxProvisioningDeferredException ex
+        && string.Equals(ex.Provider, "multipass-remote", StringComparison.Ordinal)
+        && !string.IsNullOrWhiteSpace(ex.RetainedSandboxName);
 
     private void OnSandboxPreserved(AdmissionControlledSandbox sandbox)
     {
@@ -1075,7 +1083,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
 {
     private readonly ISandbox _inner;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
-    private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> _onDisposed;
+    private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> _onDisposed;
     private readonly Action<AdmissionControlledSandbox> _onPreserved;
     private readonly ILogger _log;
     private readonly object _admissionSync = new();
@@ -1086,7 +1094,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
     public AdmissionControlledSandbox(
         ISandbox inner,
         SandboxAdmissionLease lease,
-        Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+        Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
         Action<AdmissionControlledSandbox> onPreserved,
         ILogger log)
     {
@@ -1149,7 +1157,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
             disposeFailure = ex;
             _log.LogWarning(
                 ex,
-                "Retaining sandbox admission token after dispose failed for sandbox {SandboxId}",
+                "Sandbox dispose failed for sandbox {SandboxId}",
                 Id);
             throw;
         }
@@ -1158,7 +1166,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
             try
             {
                 var (lease, admissionHeld) = SnapshotAdmissionForDispose();
-                await _onDisposed(this, lease, innerDisposeSucceeded, admissionHeld).ConfigureAwait(false);
+                await _onDisposed(this, lease, innerDisposeSucceeded, admissionHeld, disposeFailure).ConfigureAwait(false);
             }
             catch (Exception releaseEx)
             {
@@ -1226,7 +1234,7 @@ internal sealed class AdmissionControlledPreemptibleSandbox(
     ISandbox inner,
     IPreemptibleSandbox preemptible,
     SandboxAdmissionLease lease,
-    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
     Action<AdmissionControlledSandbox> onPreserved,
     ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log), IPreemptibleSandbox
 {
@@ -1238,7 +1246,7 @@ internal sealed class AdmissionControlledShutdownSandbox(
     ISandbox inner,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
     Action<AdmissionControlledSandbox> onPreserved,
     ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log), IShutdownTeardownSandbox
 {
@@ -1251,7 +1259,7 @@ internal sealed class AdmissionControlledSuspendableSandbox(
     ISandbox inner,
     ISuspendableSandbox suspendable,
     SandboxAdmissionLease lease,
-    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
     Action<AdmissionControlledSandbox> onPreserved,
     ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log), ISuspendableSandbox
 {
@@ -1268,7 +1276,7 @@ internal sealed class AdmissionControlledPreemptibleSuspendableSandbox(
     IPreemptibleSandbox preemptible,
     ISuspendableSandbox suspendable,
     SandboxAdmissionLease lease,
-    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
     Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),
@@ -1291,7 +1299,7 @@ internal sealed class AdmissionControlledPreemptibleShutdownSandbox(
     IPreemptibleSandbox preemptible,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
     Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),
@@ -1311,7 +1319,7 @@ internal sealed class AdmissionControlledSuspendableShutdownSandbox(
     ISuspendableSandbox suspendable,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
     Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),
@@ -1336,7 +1344,7 @@ internal sealed class AdmissionControlledFullSandbox(
     ISuspendableSandbox suspendable,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, ValueTask> onDisposed,
+    Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> onDisposed,
     Action<AdmissionControlledSandbox> onPreserved,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, onPreserved, log),

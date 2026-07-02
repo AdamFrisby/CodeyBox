@@ -1268,6 +1268,21 @@ public sealed class CodeyBoxOptionsValidatorTests
         {
             SshTarget = "ubuntu@default",
             SshBinary = "/usr/bin/ssh",
+            SshPort = 2222,
+            SshKeyPath = "/keys/default",
+            ExtraSshOptions = ["Compression=yes"],
+            AcceptUnknownHostKeys = true,
+            ServerAliveIntervalSeconds = 21,
+            ServerAliveCountMax = 22,
+            ConnectTimeoutSeconds = 23,
+            LocalTarBinary = "/usr/local/bin/tar",
+            RemoteMultipassPath = "/remote/multipass",
+            RemoteStagingRoot = "/stage/default",
+            DefaultImage = "22.04",
+            VmStartTimeout = TimeSpan.FromSeconds(24),
+            VmStopTimeout = TimeSpan.FromSeconds(25),
+            VmStateCheckInterval = TimeSpan.FromSeconds(26),
+            VmNamePrefix = "cb-default-",
             MaxConcurrentSandboxes = 9,
             Cordoned = true,
             Healthy = false,
@@ -1315,6 +1330,21 @@ public sealed class CodeyBoxOptionsValidatorTests
 
         Assert.Equal("ubuntu@default", mapped.SshTarget);
         Assert.Equal("/usr/bin/ssh", mapped.SshBinary);
+        Assert.Equal(2222, mapped.SshPort);
+        Assert.Equal("/keys/default", mapped.SshKeyPath);
+        Assert.Equal(["Compression=yes"], mapped.ExtraSshOptions);
+        Assert.True(mapped.AcceptUnknownHostKeys);
+        Assert.Equal(21, mapped.ServerAliveIntervalSeconds);
+        Assert.Equal(22, mapped.ServerAliveCountMax);
+        Assert.Equal(23, mapped.ConnectTimeoutSeconds);
+        Assert.Equal("/usr/local/bin/tar", mapped.LocalTarBinary);
+        Assert.Equal("/remote/multipass", mapped.RemoteMultipassPath);
+        Assert.Equal("/stage/default", mapped.RemoteStagingRoot);
+        Assert.Equal("22.04", mapped.DefaultImage);
+        Assert.Equal(TimeSpan.FromSeconds(24), mapped.VmStartTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(25), mapped.VmStopTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(26), mapped.VmStateCheckInterval);
+        Assert.Equal("cb-default-", mapped.VmNamePrefix);
         Assert.Equal(9, mapped.MaxConcurrentSandboxes);
         Assert.True(mapped.Cordoned);
         Assert.False(mapped.Healthy);

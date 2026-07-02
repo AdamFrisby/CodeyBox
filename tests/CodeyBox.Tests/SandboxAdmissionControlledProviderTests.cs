@@ -248,6 +248,31 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task RemoteRetainedDisposeFailure_ReleasesGlobalAdmissionForReroute()
+    {
+        var inner = new CountingSandboxProvider
+        {
+            NextSandboxDisposeException = new SandboxProvisioningDeferredException(
+                provider: "multipass-remote",
+                operation: "sync-back",
+                errorClass: "remote-syncback-failed",
+                detail: "host=executor-a; vm=sandbox-1; ssh dropped",
+                recheckIn: TimeSpan.FromSeconds(1),
+                retainedSandboxName: "sandbox-1",
+                retainedSandboxHostId: "executor-a"),
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+
+        var sandbox = await provider.CreateAsync(Spec());
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () => await sandbox.DisposeAsync());
+
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        await using var next = await provider.CreateAsync(Spec()).WaitAsync(TestDeadline);
+        Assert.Equal(2, inner.Created);
+    }
+
+    [Fact]
     public async Task DisposeLeavesHostSandbox_RetainsAdmissionTokenUntilLeakDisposalSucceeds()
     {
         var inner = new CountingSandboxProvider { LeaveHostSandboxAfterNextDispose = true };
@@ -1114,6 +1139,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         public string? FailNextCreateRetainedSandboxHostId { get; set; }
         public string FailNextCreateRetainedOperation { get; set; } = "create-cleanup";
         public bool ThrowOnNextSandboxDispose { get; set; }
+        public Exception? NextSandboxDisposeException { get; set; }
         public bool LeaveHostSandboxAfterNextDispose { get; set; }
         public bool ThrowOnListManaged { get; set; }
 
@@ -1148,9 +1174,11 @@ public sealed class SandboxAdmissionControlledProviderTests
             UpdatePeak(active);
             var disposeThrows = ThrowOnNextSandboxDispose;
             ThrowOnNextSandboxDispose = false;
+            var disposeException = NextSandboxDisposeException;
+            NextSandboxDisposeException = null;
             var leaveHostSandbox = LeaveHostSandboxAfterNextDispose;
             LeaveHostSandboxAfterNextDispose = false;
-            return Task.FromResult<ISandbox>(new CountingSandbox(this, $"sandbox-{created}", disposeThrows, leaveHostSandbox));
+            return Task.FromResult<ISandbox>(new CountingSandbox(this, $"sandbox-{created}", disposeThrows, disposeException, leaveHostSandbox));
         }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
@@ -1686,6 +1714,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         PlainCountingProvider provider,
         string id,
         bool disposeThrows,
+        Exception? disposeException,
         bool leaveHostSandboxAfterDispose) :
         IPreemptibleSandbox,
         ISuspendableSandbox,
@@ -1763,6 +1792,8 @@ public sealed class SandboxAdmissionControlledProviderTests
             {
                 if (!leaveHostSandboxAfterDispose)
                     provider.Release();
+                if (disposeException is not null)
+                    return ValueTask.FromException(disposeException);
                 if (disposeThrows)
                     return ValueTask.FromException(new InvalidOperationException("dispose failed"));
             }

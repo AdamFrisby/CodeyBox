@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.MultipassRemote;
@@ -643,6 +644,47 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task SyncStateToHostAsync_PropagatesCallerCancellationFromStageOut()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+        using var cts = new CancellationTokenSource();
+        transport.OnStageOut = (_, _, ct) =>
+        {
+            cts.Cancel();
+            throw new OperationCanceledException(ct);
+        };
+
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var provider = new MultipassRemoteSandboxProvider(
+                opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+            var sb = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+
+            await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+                await sb.SyncStateToHostAsync(cts.Token));
+
+            transport.OnStageOut = null;
+            await sb.DisposeAsync();
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task DisposeAsync_skips_syncback_for_readonly_mounts()
     {
         var opts = DefaultOptions();
@@ -870,6 +912,56 @@ public sealed class MultipassRemoteSandboxProviderTests
         Assert.Equal("''", OpenSshCliTransport.QuoteShellWord(""));
     }
 
+    [Fact]
+    public async Task OpenSshCliTransport_StageOut_rejects_symlink_entries_before_replacing_host_path()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stageout-tar-").FullName;
+        try
+        {
+            var sourceParent = Path.Combine(root, "source");
+            var sourceRoot = Path.Combine(sourceParent, "repo");
+            Directory.CreateDirectory(sourceRoot);
+            await File.WriteAllTextAsync(Path.Combine(sourceRoot, "safe.txt"), "safe\n");
+            File.CreateSymbolicLink(Path.Combine(sourceRoot, "escape"), "/tmp/codeybox-stageout-escape");
+
+            var archivePath = Path.Combine(root, "archive.tar");
+            await RunProcessOrThrowAsync("tar", root, ["-C", sourceParent, "-cf", archivePath, "repo"]);
+
+            var fakeSsh = Path.Combine(root, "fake-ssh");
+            await File.WriteAllTextAsync(
+                fakeSsh,
+                "#!/usr/bin/env bash\ncat " + OpenSshCliTransport.QuoteShellWord(archivePath) + "\n");
+            File.SetUnixFileMode(
+                fakeSsh,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            var hostTarget = Path.Combine(root, "host-target");
+            Directory.CreateDirectory(hostTarget);
+            await File.WriteAllTextAsync(Path.Combine(hostTarget, "existing.txt"), "existing\n");
+
+            var opts = DefaultOptions() with { SshBinary = fakeSsh, SshTarget = "ignored" };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageOutAsync("/remote/staged/repo", hostTarget, CancellationToken.None));
+
+            Assert.Contains("Unsafe tar entry", ex.Message);
+            Assert.Equal("existing\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "existing.txt")));
+            Assert.False(File.Exists(Path.Combine(hostTarget, "safe.txt")));
+            Assert.False(File.Exists(Path.Combine(hostTarget, "escape")));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     // ----- helpers ---------------------------------------------------
 
     private static bool Contains(IReadOnlyList<string> argv, string token)
@@ -935,6 +1027,7 @@ public sealed class MultipassRemoteSandboxProviderTests
         public List<StageInCall> StageInCalls { get; } = new();
         public List<StageOutCall> StageOutCalls { get; } = new();
         public bool ThrowOnStageOut { get; set; }
+        public Action<string, string, CancellationToken>? OnStageOut { get; set; }
         public Func<IReadOnlyList<string>, StreamSinks, ProcessRunResult> OnRun { get; set; } =
             (_, _) => new ProcessRunResult(0, "", "");
 
@@ -963,10 +1056,37 @@ public sealed class MultipassRemoteSandboxProviderTests
 
         public Task StageOutAsync(string remotePath, string hostPath, CancellationToken ct)
         {
+            if (OnStageOut is not null)
+            {
+                OnStageOut(remotePath, hostPath, ct);
+                return Task.CompletedTask;
+            }
             if (ThrowOnStageOut)
                 throw new RemoteSshTransportException("stage-out failed");
             StageOutCalls.Add(new StageOutCall(remotePath, hostPath));
             return Task.CompletedTask;
         }
+    }
+
+    private static async Task RunProcessOrThrowAsync(string fileName, string workingDirectory, IReadOnlyList<string> args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = fileName,
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException($"Failed to start {fileName}.");
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"{fileName} {string.Join(' ', args)} failed ({process.ExitCode}): {stderr}{stdout}");
     }
 }

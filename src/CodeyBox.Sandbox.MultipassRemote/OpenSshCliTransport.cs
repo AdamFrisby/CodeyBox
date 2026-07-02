@@ -1,3 +1,4 @@
+using System.Formats.Tar;
 using System.Text;
 using CodeyBox.HostProcess;
 using Microsoft.Extensions.Logging;
@@ -186,9 +187,10 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         var remoteParent = RemoteParent(remotePath);
         var remoteBasename = RemoteBasename(remotePath);
 
-        // Remote tars the source dir to stdout; local tar reads from stdin
-        // into the host parent directory. If the basenames differ we rename
-        // on the host side after extraction.
+        // Remote tars the source dir to stdout; the host writes that stream to
+        // a private temp archive, validates metadata, extracts into a private
+        // temp directory, then swaps the validated tree into place. Never
+        // extract sandbox-controlled tar metadata directly over the host repo.
         var remoteCmd =
             $"set -e; cd {QuoteShellWord(remoteParent)}; " +
             $"if [ ! -e {QuoteShellWord(remoteBasename)} ]; then echo 'remote source missing: {EscapeForSingleQuotes(remoteParent + "/" + remoteBasename)}' >&2; exit 2; fi; " +
@@ -197,19 +199,25 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         var sshArgv = BuildSshArgv(opts, remoteCmd);
 
         using var sshProc = StartSshChild(opts, sshArgv);
-        using var tarProc = StartLocalTarExtract(opts, hostParent);
+        var tempRoot = Path.Combine(hostParent, ".codeybox-stageout-" + Guid.NewGuid().ToString("N"));
+        var extractRoot = Path.Combine(tempRoot, "extract");
+        var archivePath = Path.Combine(tempRoot, "archive.tar");
+        Directory.CreateDirectory(extractRoot);
         try
         {
-            // Stream ssh stdout -> local tar stdin.
-            var copyTask = sshProc.StandardOutput.BaseStream.CopyToAsync(tarProc.StandardInput.BaseStream, ct);
             var sshErrTask = sshProc.StandardError.ReadToEndAsync(ct);
-
-            await copyTask.ConfigureAwait(false);
-            tarProc.StandardInput.Close();
+            await using (var archive = new FileStream(
+                archivePath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 128 * 1024,
+                useAsync: true))
+            {
+                await sshProc.StandardOutput.BaseStream.CopyToAsync(archive, ct).ConfigureAwait(false);
+            }
 
             await sshProc.WaitForExitAsync(ct).ConfigureAwait(false);
-            await tarProc.WaitForExitAsync(ct).ConfigureAwait(false);
-
             var sshErr = await sshErrTask.ConfigureAwait(false);
 
             if (sshProc.ExitCode == SshTransportFailureExitCode)
@@ -220,31 +228,21 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
                 throw new RemoteSshTransportException(
                     $"Remote tar-create failed (exit {sshProc.ExitCode}) for '{remotePath}': {TailFor(sshErr)}");
 
-            if (tarProc.ExitCode != 0)
-                throw new RemoteSshTransportException(
-                    $"Local tar-extract failed (exit {tarProc.ExitCode}) for '{hostPath}'.");
+            ValidateTarArchive(archivePath, remoteBasename);
+            await ExtractTarArchiveAsync(opts, archivePath, extractRoot, ct).ConfigureAwait(false);
+            ValidateExtractedTree(extractRoot);
 
-            // Rename on the host if the host basename differs from the remote.
-            if (!string.Equals(basename, remoteBasename, StringComparison.Ordinal))
-            {
-                var extracted = Path.Combine(hostParent, remoteBasename);
-                var target = Path.Combine(hostParent, basename);
-                if (Directory.Exists(extracted))
-                {
-                    if (Directory.Exists(target)) Directory.Delete(target, recursive: true);
-                    Directory.Move(extracted, target);
-                }
-                else if (File.Exists(extracted))
-                {
-                    if (File.Exists(target)) File.Delete(target);
-                    File.Move(extracted, target);
-                }
-            }
+            var extracted = Path.Combine(extractRoot, remoteBasename);
+            if (!Directory.Exists(extracted) && !File.Exists(extracted))
+                throw new RemoteSshTransportException(
+                    $"Validated tar archive for '{remotePath}' did not contain expected root '{remoteBasename}'.");
+
+            ReplacePath(extracted, Path.Combine(hostParent, basename));
         }
         finally
         {
             try { if (!sshProc.HasExited) sshProc.Kill(entireProcessTree: true); } catch { }
-            try { if (!tarProc.HasExited) tarProc.Kill(entireProcessTree: true); } catch { }
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true); } catch { }
         }
     }
 
@@ -269,24 +267,188 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         return p;
     }
 
-    private static System.Diagnostics.Process StartLocalTarExtract(MultipassRemoteSandboxOptions opts, string hostParent)
+    private static System.Diagnostics.Process StartLocalTarExtract(MultipassRemoteSandboxOptions opts, string archivePath, string extractRoot)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
             FileName = opts.LocalTarBinary,
-            RedirectStandardInput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
-            WorkingDirectory = hostParent,
+            WorkingDirectory = extractRoot,
         };
         psi.ArgumentList.Add("-xf");
-        psi.ArgumentList.Add("-");
+        psi.ArgumentList.Add(archivePath);
         var p = new System.Diagnostics.Process { StartInfo = psi };
         if (!p.Start())
             throw new RemoteSshTransportException(
                 $"Failed to start local tar at '{opts.LocalTarBinary}'.");
         return p;
+    }
+
+    private static async Task ExtractTarArchiveAsync(
+        MultipassRemoteSandboxOptions opts,
+        string archivePath,
+        string extractRoot,
+        CancellationToken ct)
+    {
+        using var tarProc = StartLocalTarExtract(opts, archivePath, extractRoot);
+        try
+        {
+            var stderrTask = tarProc.StandardError.ReadToEndAsync(ct);
+            await tarProc.WaitForExitAsync(ct).ConfigureAwait(false);
+            var stderr = await stderrTask.ConfigureAwait(false);
+            if (tarProc.ExitCode != 0)
+                throw new RemoteSshTransportException(
+                    $"Local tar-extract failed (exit {tarProc.ExitCode}) for staged archive '{archivePath}': {TailFor(stderr)}");
+        }
+        finally
+        {
+            try { if (!tarProc.HasExited) tarProc.Kill(entireProcessTree: true); } catch { }
+        }
+    }
+
+    private static void ValidateTarArchive(string archivePath, string expectedRootName)
+    {
+        var sawRootedEntry = false;
+        using var archive = File.OpenRead(archivePath);
+        using var reader = new TarReader(archive, leaveOpen: false);
+        TarEntry? entry;
+        while ((entry = reader.GetNextEntry(copyData: false)) is not null)
+        {
+            if (IsTarMetadataEntry(entry.EntryType))
+                continue;
+
+            if (!IsSafeTarEntryType(entry.EntryType))
+                throw new RemoteSshTransportException(
+                    $"Unsafe tar entry '{entry.Name}' has unsupported type '{entry.EntryType}'.");
+
+            var name = NormalizeTarEntryName(entry.Name);
+            EnsureTarEntryUnderExpectedRoot(name, expectedRootName);
+            sawRootedEntry = true;
+        }
+
+        if (!sawRootedEntry)
+            throw new RemoteSshTransportException("Remote tar archive contained no extractable entries.");
+    }
+
+    private static bool IsSafeTarEntryType(TarEntryType type) =>
+        type is TarEntryType.Directory
+            or TarEntryType.RegularFile
+            or TarEntryType.V7RegularFile;
+
+    private static bool IsTarMetadataEntry(TarEntryType type) =>
+        type is TarEntryType.ExtendedAttributes
+            or TarEntryType.GlobalExtendedAttributes;
+
+    private static string NormalizeTarEntryName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new RemoteSshTransportException("Tar archive contains an entry with an empty name.");
+        if (name.IndexOf('\0') >= 0)
+            throw new RemoteSshTransportException("Tar archive contains an entry with a NUL byte in its name.");
+
+        var normalized = name.Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+            normalized = normalized[2..];
+        normalized = normalized.TrimEnd('/');
+        if (normalized.Length == 0 || normalized[0] == '/')
+            throw new RemoteSshTransportException($"Unsafe tar entry path '{name}'.");
+
+        var parts = normalized.Split('/');
+        foreach (var part in parts)
+        {
+            if (part.Length == 0 || part == "." || part == "..")
+                throw new RemoteSshTransportException($"Unsafe tar entry path '{name}'.");
+        }
+
+        return normalized;
+    }
+
+    private static void EnsureTarEntryUnderExpectedRoot(string entryName, string expectedRootName)
+    {
+        if (string.Equals(entryName, expectedRootName, StringComparison.Ordinal))
+            return;
+        if (entryName.StartsWith(expectedRootName + "/", StringComparison.Ordinal))
+            return;
+        throw new RemoteSshTransportException(
+            $"Unsafe tar entry '{entryName}' is outside expected root '{expectedRootName}'.");
+    }
+
+    private static void ValidateExtractedTree(string extractRoot)
+    {
+        var root = Path.GetFullPath(extractRoot);
+        foreach (var path in Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories))
+        {
+            var full = Path.GetFullPath(path);
+            EnsureContainedPath(root, full);
+            var attributes = File.GetAttributes(full);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+                throw new RemoteSshTransportException(
+                    $"Unsafe extracted filesystem entry '{full}' is a reparse point.");
+        }
+    }
+
+    private static void EnsureContainedPath(string root, string candidate)
+    {
+        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!candidate.StartsWith(normalizedRoot, StringComparison.Ordinal))
+            throw new RemoteSshTransportException(
+                $"Unsafe extracted filesystem entry '{candidate}' escapes staging root '{root}'.");
+    }
+
+    private static void ReplacePath(string source, string target)
+    {
+        var backup = target + ".codeybox-backup-" + Guid.NewGuid().ToString("N");
+        var hadTarget = PathExists(target);
+        if (hadTarget)
+            MovePath(target, backup);
+
+        try
+        {
+            MovePath(source, target);
+        }
+        catch
+        {
+            if (hadTarget && !PathExists(target) && PathExists(backup))
+                MovePath(backup, target);
+            throw;
+        }
+
+        if (PathExists(backup))
+            DeletePath(backup);
+    }
+
+    private static void MovePath(string source, string target)
+    {
+        if (Directory.Exists(source) && !IsReparsePoint(source))
+        {
+            Directory.Move(source, target);
+            return;
+        }
+
+        File.Move(source, target, overwrite: false);
+    }
+
+    private static void DeletePath(string path)
+    {
+        if (Directory.Exists(path) && !IsReparsePoint(path))
+            Directory.Delete(path, recursive: true);
+        else if (File.Exists(path) || IsReparsePoint(path))
+            File.Delete(path);
+    }
+
+    private static bool PathExists(string path) =>
+        File.Exists(path) || Directory.Exists(path) || IsReparsePoint(path);
+
+    private static bool IsReparsePoint(string path)
+    {
+        try
+        {
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
     }
 
     private static System.Diagnostics.Process StartSshChild(MultipassRemoteSandboxOptions opts, IReadOnlyList<string> sshArgv)

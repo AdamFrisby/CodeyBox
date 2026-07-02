@@ -172,7 +172,15 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 lastHostFailure = ex;
                 skippedHosts.Add(opts.HostId);
                 MarkRuntimeUnhealthy(opts, ex);
-                await RollBackCreateFailureAsync(opts, reservation, transport, vmName, remoteSandboxRoot, ex, ct).ConfigureAwait(false);
+                await RollBackCreateFailureAsync(
+                    opts,
+                    reservation,
+                    transport,
+                    vmName,
+                    remoteSandboxRoot,
+                    ex,
+                    ct,
+                    throwOnCleanupFailure: false).ConfigureAwait(false);
 
                 _log.LogWarning(
                     ex,
@@ -205,7 +213,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         string? vmName,
         string? remoteSandboxRoot,
         Exception? cause,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool throwOnCleanupFailure = true)
     {
         if (transport is null || string.IsNullOrWhiteSpace(vmName) || string.IsNullOrWhiteSpace(remoteSandboxRoot))
         {
@@ -231,6 +240,9 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 "Retaining remote host reservation for {Vm} on host {HostId} because create rollback cleanup could not confirm deletion",
                 vmName,
                 opts.HostId);
+            if (!throwOnCleanupFailure)
+                return;
+
             var causeDetail = cause is null ? "" : $"create failure: {cause.Message}; ";
             throw new SandboxProvisioningDeferredException(
                 provider: Name,
@@ -1385,7 +1397,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             var value = configured.Trim();
             if (value == "*")
                 return true;
-            if (string.Equals(value, profile, StringComparison.Ordinal))
+            if (string.Equals(value, profile, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
         return false;
@@ -1519,9 +1531,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
     private static string NewVmName(MultipassRemoteSandboxOptions opts)
     {
-        // multipass instance name limit is 24 chars. Prefix + 22-char hex
-        // gives 24 when prefix is "codeybox-r-" (11 chars) + ~13 hex chars,
-        // so we trim accordingly.
+        // Multipass instance names are capped at 24 characters. Use the
+        // remaining budget after the configured prefix as a hex suffix.
         var prefix = opts.VmNamePrefix;
         var hex = Guid.NewGuid().ToString("N");
         var budget = 24 - prefix.Length;

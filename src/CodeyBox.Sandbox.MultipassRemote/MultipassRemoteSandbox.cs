@@ -309,6 +309,10 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
                     mount.RemoteStagedPath, hostPath);
                 throw BuildDisposeDeferred("sync-back", "remote-syncback-failed", ex);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 _log.LogWarning(ex,

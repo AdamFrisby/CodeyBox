@@ -274,6 +274,36 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
+    public async Task AutoDispose_FailureTrackingIncludesHostIdentityForDuplicateNames()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        const string duplicateName = "codeybox-duplicate";
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            duplicateName,
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: false,
+            HostId: "executor-a"));
+        provider.AddSandbox(new ManagedSandboxInfo(
+            duplicateName,
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: false,
+            HostId: "executor-b"));
+        provider.SetDisposeThrows(duplicateName, "executor-a");
+
+        var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Contains((duplicateName, "executor-a"), provider.DisposedManaged);
+        Assert.Contains((duplicateName, "executor-b"), provider.DisposedManaged);
+        var remaining = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal(duplicateName, remaining.Name);
+        Assert.Equal("executor-a", remaining.HostId);
+    }
+
+    [Fact]
     public async Task InactiveSandbox_WithExpiredPreemptMarker_ReportedAsLeak()
     {
         var threshold = TimeSpan.FromMinutes(30);
@@ -666,6 +696,7 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     private readonly List<string> _disposedNames = [];
     private readonly List<(string Name, string? HostId)> _disposedManaged = [];
     private readonly HashSet<string> _throwOnDispose = new(StringComparer.Ordinal);
+    private readonly HashSet<(string Name, string? HostId)> _throwOnDisposeByIdentity = [];
     private readonly HashSet<string> _cancelOnDispose = new(StringComparer.Ordinal);
     private readonly HashSet<string> _currentPhaseSandboxNames = new(StringComparer.Ordinal);
     private TimeSpan _disposeDelay = TimeSpan.Zero;
@@ -727,6 +758,8 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     }
 
     public void SetDisposeThrows(string name) => _throwOnDispose.Add(name);
+    public void SetDisposeThrows(string name, string? hostId) =>
+        _throwOnDisposeByIdentity.Add((name, NormalizeHostId(hostId)));
     public void SetDisposeThrowsOperationCanceled(string name) => _cancelOnDispose.Add(name);
     public void SetDisposeDelay(TimeSpan delay) => _disposeDelay = delay;
     public void SetListThrows() => _throwOnList = true;
@@ -779,8 +812,13 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     {
         lock (_gate)
             _disposedManaged.Add((sandbox.Name, sandbox.HostId));
+        if (_throwOnDisposeByIdentity.Contains((sandbox.Name, NormalizeHostId(sandbox.HostId))))
+            throw new InvalidOperationException($"Simulated dispose failure for {sandbox.Name} on {sandbox.HostId}");
         return DisposeLeakedAsync(sandbox.Name, ct);
     }
+
+    private static string? NormalizeHostId(string? hostId) =>
+        string.IsNullOrWhiteSpace(hostId) ? null : hostId;
 
     private void RecordMaxConcurrentDisposes(int active)
     {

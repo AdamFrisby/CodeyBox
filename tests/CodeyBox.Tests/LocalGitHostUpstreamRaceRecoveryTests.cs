@@ -376,6 +376,30 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     [Fact]
     public async Task RunGitAsync_TextFileBusyProcessStartAfterRetryCap_Propagates()
     {
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
         var starts = 0;
         var gitHost = CreateGitHost(processFactory: _ =>
         {
@@ -390,6 +414,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
         Assert.Equal(26, ex.NativeErrorCode);
         Assert.Equal(8, starts);
+        Assert.Contains(measurements, m => m.Operation == "rev-parse" && m.Outcome == "error");
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests;
 
@@ -44,6 +45,31 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         Assert.NotEqual(oldC, rebasedC);
         Assert.Equal("work B\n", await ShowAsync(barePath, $"{item.WorkBranch}:b.txt"));
         Assert.Equal("work C\n", await ShowAsync(barePath, $"{item.WorkBranch}:c.txt"));
+    }
+
+    [Fact]
+    public async Task PickupRebase_SyncsSandboxStateAfterForcePush()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var sandboxProvider = new ForcePushSyncObservingSandboxProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: sandboxProvider,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+
+        await CommitTwoWorkBranchCommitsAsync(barePath, item.WorkBranch!);
+        await CommitToSeedAsync(seed, "main.txt", "main advanced\n", "main advanced");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, sandboxProvider.SyncsAfterForcePush);
     }
 
     [Fact]
@@ -907,6 +933,70 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         string Body,
         string AuthorName,
         string AuthorEmail);
+
+    private sealed class ForcePushSyncObservingSandboxProvider : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner = new(NullLogger<ProcessSandboxProvider>.Instance);
+        private int _syncsAfterForcePush;
+
+        public string Name => _inner.Name;
+        public int SyncsAfterForcePush => Volatile.Read(ref _syncsAfterForcePush);
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            new ForcePushSyncObservingSandbox(
+                await _inner.CreateAsync(spec, ct),
+                () => Interlocked.Increment(ref _syncsAfterForcePush));
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    private sealed class ForcePushSyncObservingSandbox(ISandbox inner, Action recordSyncAfterForcePush) : ISandbox
+    {
+        private bool _sawForcePush;
+
+        public string Id => inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => inner.BatchLaunchMode;
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Contains("push")
+                && exec.Argv.Any(arg => arg.StartsWith("--force-with-lease=refs/heads/", StringComparison.Ordinal)))
+            {
+                _sawForcePush = true;
+            }
+
+            return await inner.ExecAsync(exec, ct);
+        }
+
+        public async Task SyncStateToHostAsync(CancellationToken ct = default)
+        {
+            if (_sawForcePush)
+                recordSyncAfterForcePush();
+            await inner.SyncStateToHostAsync(ct);
+        }
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default) =>
+            inner.KillActiveExecsAsync(ct);
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default) =>
+            inner.GetScreenshotAsync(ct);
+
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default) =>
+            inner.SynthesizeInputAsync(events, ct);
+
+        public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default) =>
+            inner.GetAccessibilityAtPointAsync(x, y, ct);
+
+        public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
+            inner.GetAccessibilityTreeJsonAsync(ct);
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
 
     private static WorkItem NewItem(string? workBranch = null)
     {
