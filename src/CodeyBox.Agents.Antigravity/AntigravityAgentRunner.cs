@@ -284,36 +284,36 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         }
 
         // Redact with the same routine the normal stream-capture path uses
-        // (AgentStreamStore.RedactText) so token/auth lines in agy's glog are
-        // scrubbed identically before they reach Stderr, the stream, or audit.
+        // (SensitiveDataRedactionEnricher.RedactText — see AgentStreamParser)
+        // so token/auth lines in agy's glog are scrubbed identically before they
+        // reach the stream or audit.
         var redactedLog = SensitiveDataRedactionEnricher.RedactText(tailCmd.Stdout);
 
-        // Always archive the glog to the per-run stream (observability / audit),
-        // regardless of run outcome — this is what surfaces agy's otherwise
-        // invisible diagnostics in the agent-stream files.
+        // Archive the glog to the per-run stream (observability / audit) on EVERY
+        // outcome — this is what surfaces agy's otherwise invisible diagnostics in
+        // the agent-stream files, which the pipeline records and audits.
+        //
+        // The glog is deliberately NOT merged into result.Stderr on any outcome.
+        // agy's glog is CUMULATIVE within a single --print process: it records
+        // transient errors agy later recovered from (an internal 429 a retry
+        // cleared, an auth blip a refresh fixed). The orchestrator substring-scans
+        // result.Stderr with the quota/auth classifiers, which cannot tell a
+        // recovered-then-cleared "RESOURCE_EXHAUSTED"/"API Error: 401" from a
+        // terminal one; folding the cumulative log into Stderr would let a stale
+        // recovered line falsely bench the member or park it in
+        // WaitingForQuotaReset (up to a 7-day lockout) even when the run failed
+        // for an unrelated reason (timeout, tool error, no-changes). The
+        // classifiers therefore stay on agy's own authoritative process
+        // stdout/stderr; whether cumulative-log content is classifier-worthy is
+        // orchestrator policy, not a decision this runner should encode. The
+        // stream archive above still gives operators (and the audit) the full
+        // diagnostics either way.
         if (stdoutChunkCallback is not null)
         {
             ForwardLogToStream(redactedLog, stdoutChunkCallback, captureStructuredStream);
         }
 
-        // Only feed the glog into result.Stderr when the run FAILED. agy's glog
-        // is cumulative and records transient errors it later recovered from
-        // (an internal 429 a retry cleared, an auth blip a refresh fixed). The
-        // pipeline runs the auth classifier over Stderr even on SUCCESS and the
-        // quota classifier over Stderr on failure; merging the glog on a
-        // successful run would falsely bench/park an item agy actually
-        // completed. Gating the Stderr merge on failure keeps the
-        // classifier-facing input authoritative while the stream archive above
-        // still surfaces the diagnostics.
-        if (result.Success)
-        {
-            return result;
-        }
-
-        var mergedStderr = string.IsNullOrEmpty(result.Stderr)
-            ? redactedLog
-            : result.Stderr + "\n" + redactedLog;
-        return result with { Stderr = mergedStderr };
+        return result;
     }
 
     private static void ForwardLogToStream(

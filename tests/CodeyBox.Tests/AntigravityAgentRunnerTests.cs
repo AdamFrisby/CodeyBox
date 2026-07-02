@@ -299,12 +299,16 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_FailedRun_CapturesAgyLogFileIntoStderrAndStreams()
+    public async Task RunAsync_FailedRun_ArchivesAgyLogToStreamButNotStderr()
     {
-        // A FAILED agy run is the case where the glog must reach the
-        // failure/quota/auth classifiers — those read result.Stderr. Verify the
-        // glog is both merged into Stderr (classifier input) and archived to the
-        // stream (operator-facing capture).
+        // Classifier-safety on the FAILURE path: agy's glog is cumulative and can
+        // carry a recovered-then-cleared "RESOURCE_EXHAUSTED" that agy retried
+        // past. A run that FAILED for an unrelated reason (here the agy stderr is
+        // "agy failed") must NOT have that cumulative glog folded into
+        // result.Stderr — the orchestrator substring-scans Stderr with the
+        // quota/auth classifiers and would falsely park/bench the member. The glog
+        // is archived to the observability stream instead; result.Stderr stays
+        // agy's own authoritative process output.
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "Model resolved: gemini-3.5-flash\nRESOURCE_EXHAUSTED (code 429): Individual quota reached",
             agyExitCode: 1
@@ -337,11 +341,15 @@ public sealed class AntigravityAgentRunnerTests
         Assert.True(logFileIdx >= 0, "expected --log-file in agy argv");
         Assert.Equal(tailedPath, agyExec.Argv[logFileIdx + 1]);
 
-        // 3. On a failed run the glog is merged into Stderr for the classifiers.
-        Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr);
-        Assert.Contains("Model resolved: gemini-3.5-flash", result.Stderr);
+        // 3. The cumulative glog is NOT folded into the classifier-facing Stderr;
+        //    Stderr stays agy's own process output ("agy failed"), so a
+        //    recovered-transient 429 in the glog can't poison the quota/auth
+        //    classifiers on an unrelated failure.
+        Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain("Model resolved: gemini-3.5-flash", result.Stderr ?? string.Empty);
+        Assert.Equal("agy failed", result.Stderr);
 
-        // 4. And archived to the stream for observability.
+        // 4. But it IS archived to the stream for observability / audit.
         Assert.Contains("Model resolved: gemini-3.5-flash\n", streamedChunks);
         Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
     }
@@ -385,11 +393,13 @@ public sealed class AntigravityAgentRunnerTests
     public async Task RunAsync_SuccessfulRun_DoesNotMergeGlogIntoStderr()
     {
         // Classifier-safety: agy's glog is cumulative and records transient
-        // errors it later recovered from. The pipeline runs the auth classifier
-        // over Stderr even on SUCCESS, so a recovered "RESOURCE_EXHAUSTED" /
-        // "API Error: 401" line in the glog must NOT reach Stderr on a
-        // successful run — else the member gets falsely benched/parked. The
-        // glog is still archived to the stream for observability.
+        // errors it later recovered from. The runner never folds the glog into
+        // result.Stderr (on success or failure), so a recovered
+        // "RESOURCE_EXHAUSTED" / "API Error: 401" line in the glog can't reach
+        // the quota/auth classifiers and falsely bench/park the member. The glog
+        // is still archived to the stream for observability. This test pins the
+        // success case; RunAsync_FailedRun_ArchivesAgyLogToStreamButNotStderr
+        // pins the failure case.
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "applyAuthResult: authMethod=consumer\nRESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)",
             agyExitCode: 0
@@ -438,11 +448,12 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunResumedAsync_FailedRun_CapturesAgyLogFileIntoStderr()
+    public async Task RunResumedAsync_FailedRun_ArchivesAgyLogToStreamButNotStderr()
     {
         // The resume override has the same log-capture wiring as RunAsync;
-        // exercise its glog merge on a failed resumed run so the branch is not
-        // left unverified.
+        // exercise it on a failed resumed run so the branch is not left
+        // unverified — including the same classifier-safety invariant (glog to
+        // stream, never into result.Stderr).
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "resumed conversation\nRESOURCE_EXHAUSTED (code 429): Individual quota reached",
             agyExitCode: 1
@@ -470,16 +481,18 @@ public sealed class AntigravityAgentRunnerTests
         Assert.True(logFileIdx >= 0, "expected --log-file in resumed agy argv");
         Assert.Equal(tailedPath, agyExec.Argv[logFileIdx + 1]);
 
-        Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr);
+        // Cumulative glog stays out of the classifier-facing Stderr on resume too.
+        Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
         Assert.Contains("resumed conversation\n", streamedChunks);
+        Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
     }
 
     [Fact]
     public async Task RunAsync_WithStructuredStream_EnvelopesLogLines()
     {
         // Structured-stream transport: the glog is folded into the NDJSON stream
-        // as codeybox.stderr envelopes. Failed run so the merge is exercised on
-        // both the stream and Stderr.
+        // as codeybox.stderr envelopes. Failed run so the archive path is
+        // exercised alongside a non-zero agy exit.
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "Line 1\nLine 2",
             agyExitCode: 1
@@ -496,9 +509,107 @@ public sealed class AntigravityAgentRunnerTests
         // Streamed as JSON envelopes keyed on the shared envelope type.
         Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 1\"}\n", streamedChunks);
         Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Line 2\"}\n", streamedChunks);
-        // The classifier-facing Stderr merge is populated regardless of transport.
-        Assert.Contains("Line 1", result.Stderr);
-        Assert.Contains("Line 2", result.Stderr);
+        // The glog stays out of the classifier-facing Stderr regardless of
+        // transport — Stderr is agy's own process output only.
+        Assert.DoesNotContain("Line 1", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain("Line 2", result.Stderr ?? string.Empty);
+        Assert.Equal("agy failed", result.Stderr);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithStructuredStream_SuccessfulRun_EnvelopesLogLinesToStreamOnly()
+    {
+        // Success + structured stream: the glog must still be archived as
+        // codeybox.stderr envelopes to the stream while leaving result.Stderr
+        // untouched (agy exited 0, empty stderr). Covers the success/structured
+        // combination the failed-run test above does not.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "applyAuthResult: authMethod=consumer\nModel resolved: gemini-3.5-flash",
+            agyExitCode: 0
+        );
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        Action<string> stdoutChunkCallback = chunk => streamedChunks.Add(chunk);
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "do something", credential: null,
+            stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"applyAuthResult: authMethod=consumer\"}\n", streamedChunks);
+        Assert.Contains("{\"type\":\"codeybox.stderr\",\"text\":\"Model resolved: gemini-3.5-flash\"}\n", streamedChunks);
+        Assert.DoesNotContain("applyAuthResult", result.Stderr ?? string.Empty);
+    }
+
+    [Fact]
+    public async Task RunAsync_CreatesLogDirectory_BeforeInvokingAgy()
+    {
+        // The mkdir -p that guarantees the glog's parent dir exists is
+        // load-bearing: agy's --log-file open fails on a missing directory. Pin
+        // that a `mkdir -p <logdir>` exec is dispatched for the log file's parent
+        // AND runs before the agy invocation. A regression that dropped or
+        // mis-ordered it would break real agy runs while the fakes stayed green.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Model resolved: gemini-3.5-flash",
+            agyExitCode: 0);
+        var runner = new AntigravityAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "go", credential: null);
+
+        var mkdirIdx = sandbox.AllExecs.FindIndex(
+            e => e.Argv.Count >= 3 && e.Argv[0] == "mkdir" && e.Argv[1] == "-p");
+        var agyIdx = sandbox.AllExecs.FindIndex(e => e.Argv.Count > 0 && e.Argv[0] == "agy");
+        Assert.True(mkdirIdx >= 0, "expected a `mkdir -p` exec for the glog directory");
+        Assert.True(agyIdx >= 0, "expected an agy invocation");
+        Assert.True(mkdirIdx < agyIdx, "mkdir must run before agy so --log-file can open");
+        Assert.Equal("/work/.codeybox/agent-logs", sandbox.AllExecs[mkdirIdx].Argv[2]);
+    }
+
+    [Fact]
+    public async Task RunAsync_EmptyGlog_ReturnsResultUnchanged_NoForwardedChunks()
+    {
+        // Degradation path: agy never wrote a glog (file missing / empty), so tail
+        // returns empty stdout. ProcessResultAsync must pass the base result
+        // through untouched and forward nothing to the stream — no spurious empty
+        // envelope, no crash on the empty split.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: string.Empty,
+            agyExitCode: 1);
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        var result = await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            stdoutChunkCallback: chunk => streamedChunks.Add(chunk), captureStructuredStream: false);
+
+        Assert.False(result.Success);
+        Assert.Equal("agy failed", result.Stderr);
+        Assert.Empty(streamedChunks);
+    }
+
+    [Fact]
+    public async Task RunAsync_GlogEndingInNewline_DoesNotForwardTrailingEmptyLine()
+    {
+        // Real glog files always end in a trailing newline; ForwardLogToStream
+        // drops the resulting empty final segment. Every other test authors
+        // content WITHOUT a trailing newline, so this production-always branch is
+        // otherwise uncovered. Assert the last real line survives and no empty /
+        // blank-only chunk is forwarded.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Line A\nLine B\n",
+            agyExitCode: 0);
+        var runner = new AntigravityAgentRunner();
+
+        var streamedChunks = new List<string>();
+        await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            stdoutChunkCallback: chunk => streamedChunks.Add(chunk), captureStructuredStream: false);
+
+        Assert.Contains("Line A\n", streamedChunks);
+        Assert.Contains("Line B\n", streamedChunks);
+        Assert.DoesNotContain("\n", streamedChunks);          // no bare-newline (empty-line) chunk
+        Assert.DoesNotContain(string.Empty, streamedChunks);  // no empty chunk
     }
 
     private sealed class AntigravityLogCapturingSandbox : ISandbox
