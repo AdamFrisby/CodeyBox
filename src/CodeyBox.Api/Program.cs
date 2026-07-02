@@ -2397,6 +2397,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         ShutdownGrace = TimeSpan.FromSeconds(Math.Max(1, opts.Shutdown.GraceSeconds)),
         PhaseAbsoluteTimeoutMultiplier = opts.PhaseAbsoluteTimeoutMultiplier,
         RequiredBuildVerificationTimeout = TimeSpan.FromSeconds(Math.Max(60, opts.RequiredBuildVerificationTimeoutSeconds)),
+        EmitPlanTestCases = opts.EmitPlanTestCases,
         HostGitIdentity = hostIdentity,
     };
 });
@@ -2513,7 +2514,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
-    planReviewGate: sp.GetRequiredService<IPlanReviewGate>()));
+    planReviewGate: sp.GetRequiredService<IPlanReviewGate>(),
+    testCaseStore: sp.GetService<ITestCaseStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -3766,6 +3768,16 @@ namespace CodeyBox.Api
         /// edits require restart.
         /// </summary>
         public int RequiredBuildVerificationTimeoutSeconds { get; set; } = 900;
+
+        /// <summary>
+        /// When true (default), approving a plan (the <c>plan</c> knob on) emits
+        /// and reconciles a test case per declared plan scenario, linked to the
+        /// work item. Unplanned items never reach this path and are unaffected.
+        /// Set false to keep the planning phase without materialising test cases.
+        /// Captured once at startup into
+        /// <see cref="PipelineOptions.EmitPlanTestCases"/>; edits require restart.
+        /// </summary>
+        public bool EmitPlanTestCases { get; set; } = true;
 
         /// <summary>
         /// Maximum concurrent release deep-audit phases across all releases.

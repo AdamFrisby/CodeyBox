@@ -80,6 +80,40 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PlanOn_ApprovingPlan_EmitsLinkedTestCasesFromTestStrategy()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed, wireTestCaseStore: true);
+        var item = NewItem("feature/plan-emits-testcases") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var cases = new List<TestCase>();
+        await foreach (var tc in setup.TestCaseStore!.ListByWorkItemAsync(item.Id.ToString()))
+            cases.Add(tc);
+
+        // The fixture plan declares one testStrategy scenario:
+        // "pipeline integration verifies final branch." -> Integration.
+        var only = Assert.Single(cases);
+        Assert.Equal(item.Id.ToString(), only.SourceWorkItemId);
+        Assert.Equal(AutomationKind.Integration, only.AutomationKind);
+        Assert.Contains("pipeline integration", only.Description, StringComparison.Ordinal);
+        Assert.Null(only.ExecutableArtifactJson);
+    }
+
+    [Fact]
     public async Task PlanOff_Default_DoesNotRunPlanningPhase()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1333,6 +1367,7 @@ public sealed class PlanningPipelineTests : IDisposable
         PipelineOptions? pipelineOptions = null,
         Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         bool omitKnobRegistry = false,
+        bool wireTestCaseStore = false,
         ILogger<PipelineRunner>? pipelineLogger = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -1340,6 +1375,8 @@ public sealed class PlanningPipelineTests : IDisposable
 
         var store = new SqliteWorkItemStore(stateDb);
         var pipelineStore = workItemStoreDecorator?.Invoke(store) ?? store;
+        // Share the same DB file so the test_cases FK to work_items resolves.
+        var testCaseStore = wireTestCaseStore ? new SqliteTestCaseStore(stateDb) : null;
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
@@ -1377,9 +1414,10 @@ public sealed class PlanningPipelineTests : IDisposable
             sessionAgentRunner: sessionRunner,
             sessionDispatchOptions: new AgentSessionDispatchOptions { Enabled = enableClaudeSession },
             planReviewGate: planReviewGate,
-            promptPreprocessors: promptPreprocessors);
+            promptPreprocessors: promptPreprocessors,
+            testCaseStore: testCaseStore);
 
-        return new PlanningPipelineSetup(pipeline, store, webhooks, gitRoot);
+        return new PlanningPipelineSetup(pipeline, store, webhooks, gitRoot, testCaseStore);
     }
 
     private static WorkItem NewItem(string branch) => new()
@@ -1396,14 +1434,20 @@ internal sealed class PlanningPipelineSetup(
     PipelineRunner Pipeline,
     SqliteWorkItemStore Store,
     CapturingWebhookDispatcher Webhooks,
-    string GitRoot) : IDisposable
+    string GitRoot,
+    SqliteTestCaseStore? TestCaseStore = null) : IDisposable
 {
     public PipelineRunner Pipeline { get; } = Pipeline;
     public SqliteWorkItemStore Store { get; } = Store;
     public CapturingWebhookDispatcher Webhooks { get; } = Webhooks;
     public string GitRoot { get; } = GitRoot;
+    public SqliteTestCaseStore? TestCaseStore { get; } = TestCaseStore;
 
-    public void Dispose() => Store.Dispose();
+    public void Dispose()
+    {
+        TestCaseStore?.Dispose();
+        Store.Dispose();
+    }
 }
 
 

@@ -36,7 +36,15 @@ public sealed record PlanArtifactDocument(
     string SatisfiesTask)
 {
     private const int MaxFieldChars = 4000;
-    private const int MaxListItems = 25;
+
+    /// <summary>
+    /// Maximum number of entries kept per plan string-array field
+    /// (<see cref="Files"/>, <see cref="TestStrategy"/>, <see cref="Risks"/>).
+    /// Also the upper bound on how many plan-derived test cases a single work
+    /// item can emit, which <c>PlanTestCaseReconciler</c> relies on to bound
+    /// its prune sweep.
+    /// </summary>
+    public const int MaxListItems = 25;
     private const int MaxListItemChars = 600;
     private const int PressureTrimmedListItems = 10;
     private const int PressureTrimmedFieldChars = MaxFieldChars / 2;
