@@ -64,7 +64,11 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
 
         try
         {
-            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            // Backstop-only deadline for a deterministic-but-starved event (the
+            // poll observes state that WILL be reached once the deferred requeue
+            // task gets CPU): 60s gives headroom under the 6-core capped full
+            // suite on a co-resident host without weakening any assertion.
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
             while (pipeline.CallCount < 1 && DateTimeOffset.UtcNow < deadline)
                 await Task.Delay(20);
 
@@ -173,7 +177,11 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
 
         try
         {
-            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            // Backstop-only deadline for a deterministic-but-starved event (the
+            // poll observes state that WILL be reached once the deferred requeue
+            // task gets CPU): 60s gives headroom under the 6-core capped full
+            // suite on a co-resident host without weakening any assertion.
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
             while (pipeline.CallCount < 2 && DateTimeOffset.UtcNow < deadline)
                 await Task.Delay(20);
 
@@ -232,7 +240,11 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
 
         try
         {
-            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            // Backstop-only deadline for a deterministic-but-starved event (the
+            // poll observes state that WILL be reached once the deferred requeue
+            // task gets CPU): 60s gives headroom under the 6-core capped full
+            // suite on a co-resident host without weakening any assertion.
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
             while (pipeline.CallCount < 2 && DateTimeOffset.UtcNow < deadline)
                 await Task.Delay(20);
 
