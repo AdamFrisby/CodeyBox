@@ -180,10 +180,12 @@ practice — with real numbers from running it on its own codebase:
 
 **What to expect.**
 
-- **Features take 2–10 audit rounds to merge (median 5, mean ~7), and
-  *nothing* passes on the first audit** — a long tail reaches 30–40 rounds on
-  hard changes. The auditors don't return a complete issue list each pass; the
-  multi-round grind *is* the thoroughness. Budget for iteration, not one-shot.
+- **Features take 2–10 audit rounds to merge (median 5, mean ~7), and in 100+
+  merges not one has passed on the first audit** — a worker *could* nail it
+  first try; we've just never seen it happen. A long tail reaches 30–40 rounds
+  on hard changes. The auditors don't return a complete issue list each pass;
+  the multi-round grind *is* the thoroughness. Budget for iteration, not
+  one-shot.
 - **Throughput is bounded by the lesser of host CPU and agent quota — not raw
   speed.** Each agent is a full VM, so concurrent capacity is first a CPU
   decision. With a single quota-limited subscription workhorse expect a handful
@@ -198,7 +200,7 @@ in 2–4 rounds, with a long tail beyond:
 
 ```mermaid
 xychart-beta
-    title "Audit rounds to merge (114 merged · median 5 · never 1)"
+    title "Audit rounds to merge (114 merged · median 5 · 0 first-pass so far)"
     x-axis [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     y-axis "Merged changes" 0 --> 22
     bar [0, 20, 18, 16, 7, 8, 7, 10, 4, 4]
