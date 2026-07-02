@@ -8,6 +8,7 @@ namespace CodeyBox.Audit.Shell;
 /// exit code 0 passes, and non-zero fails with stdout/stderr captured as a
 /// single Error finding. If the top-level tool is confirmed missing before
 /// the command runs, the auditor usually emits a non-blocking Info finding;
+/// callers can raise that to Warning for coverage-sensitive tools, and
 /// BuildTestGate auditors emit Error because missing deterministic build/test
 /// evidence must block dependent auditors.
 /// A command-specific result classifier can refine non-zero exits without
@@ -100,8 +101,8 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         // propagate exit 127 from repository-controlled scripts; those remain
         // blocking command failures.
         var missingTool = IsConfirmedMissingTopLevelTool(result);
-        var severity = missingTool && _opts.Role != AuditorRole.BuildTestGate
-            ? AuditSeverity.Info
+        var severity = missingTool
+            ? MissingToolSeverity()
             : AuditSeverity.Error;
         var title = missingTool
             ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
@@ -155,11 +156,16 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     {
         var finding = new AuditFinding(
             AuditorName: Name,
-            Severity: _opts.Role == AuditorRole.BuildTestGate ? AuditSeverity.Error : AuditSeverity.Info,
+            Severity: MissingToolSeverity(),
             Title: $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)",
             Description: $"The auditor command was not run because '{toolName}' is not available in the audit sandbox.");
         return new AuditResult(false, [finding], RawOutput: rawOutput);
     }
+
+    private AuditSeverity MissingToolSeverity()
+        => _opts.Role == AuditorRole.BuildTestGate
+            ? AuditSeverity.Error
+            : _opts.MissingToolSeverity ?? AuditSeverity.Info;
 }
 
 public sealed record ShellCommandAuditorOptions
@@ -169,6 +175,7 @@ public sealed record ShellCommandAuditorOptions
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
     public IShellCommandResultClassifier? ResultClassifier { get; init; }
+    public AuditSeverity? MissingToolSeverity { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
     public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;

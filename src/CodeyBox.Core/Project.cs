@@ -542,6 +542,7 @@ public sealed record ProjectConfiguredAuditor
     public string? Script { get; init; }
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
+    public string? MissingToolSeverity { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public string? Role { get; init; }
     public string? GateEvidence { get; init; }

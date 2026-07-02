@@ -147,6 +147,7 @@ internal sealed class PresetConfigLoader
                     Script = a.Script,
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                    MissingToolSeverity = a.MissingToolSeverity,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
                     GateEvidence = a.GateEvidence,
@@ -171,6 +172,7 @@ internal sealed class PresetConfigLoader
                     Script = a.Script,
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                    MissingToolSeverity = a.MissingToolSeverity,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = a.Role,
                     GateEvidence = a.GateEvidence,
@@ -484,6 +486,8 @@ internal sealed class PresetConfigLoader
                 throw new PresetConfigurationException($"{source}: {pointer}/gateEvidence is not allowed in repository-provided configuration. Build/test gate metadata must come from trusted configuration.");
             _ = ParseBuildTestGateEvidence(source, $"{pointer}/gateEvidence", auditor.Role, auditor.GateEvidence);
         }
+        if (!string.IsNullOrWhiteSpace(auditor.MissingToolSeverity))
+            _ = ParseOptionalAuditSeverity(source, $"{pointer}/missingToolSeverity", auditor.MissingToolSeverity);
     }
 
     internal static AuditorRole ParseAuditorRole(string source, string pointer, string? role)
@@ -517,6 +521,20 @@ internal sealed class PresetConfigLoader
             "test" => BuildTestGateEvidence.Test,
             "build-and-test" => BuildTestGateEvidence.BuildAndTest,
             _ => throw new PresetConfigurationException($"{source}: {pointer} = '{evidence}' is not a recognised gate evidence value. Allowed values: build, test, build-and-test."),
+        };
+    }
+
+    internal static AuditSeverity? ParseOptionalAuditSeverity(string source, string pointer, string? severity)
+    {
+        if (string.IsNullOrWhiteSpace(severity))
+            return null;
+
+        return severity.Trim().ToLowerInvariant() switch
+        {
+            "info" => AuditSeverity.Info,
+            "warning" or "warn" => AuditSeverity.Warning,
+            "error" => AuditSeverity.Error,
+            _ => throw new PresetConfigurationException($"{source}: {pointer} = '{severity}' is not a recognised audit severity. Allowed values: info, warning, error."),
         };
     }
 
@@ -620,6 +638,10 @@ internal sealed class PresetConfigLoader
                 $"/auditors/{a.Name}/gateEvidence",
                 a.Role,
                 a.GateEvidence);
+            var missingToolSeverity = ParseOptionalAuditSeverity(
+                $"language '{definition.Id}'",
+                $"/auditors/{a.Name}/missingToolSeverity",
+                a.MissingToolSeverity);
             return string.IsNullOrWhiteSpace(a.Script)
                 ? LanguagePresetHelpers.Shell(
                     definition.Id,
@@ -629,7 +651,8 @@ internal sealed class PresetConfigLoader
                     [.. a.Argv],
                     a.CanShortCircuitOnBlockingFinding,
                     role,
-                    gateEvidence)
+                    gateEvidence,
+                    missingToolSeverity)
                 : LanguagePresetHelpers.ShellScript(
                     definition.Id,
                     markerDescription,
@@ -640,7 +663,8 @@ internal sealed class PresetConfigLoader
                     a.TreatExit127AsMissingTool,
                     a.CanShortCircuitOnBlockingFinding,
                     role,
-                    gateEvidence);
+                    gateEvidence,
+                    missingToolSeverity);
         }).ToList();
     }
 
@@ -709,6 +733,7 @@ internal sealed class AuditorDefinition
     public string? Script { get; set; }
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
+    public string? MissingToolSeverity { get; set; }
     public bool CanShortCircuitOnBlockingFinding { get; set; }
 
     /// <summary>

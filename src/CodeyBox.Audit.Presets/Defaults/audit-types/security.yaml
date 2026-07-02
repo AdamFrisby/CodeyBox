@@ -4,8 +4,10 @@ llmAuditorName: security:llm-review
 auditors:
   - name: security:gitleaks
     argv: ["gitleaks", "detect", "--source", ".", "--no-banner", "--no-color"]
+    missingToolSeverity: warning
   - name: security:semgrep
     argv: ["semgrep", "--config", "auto", "--error", "--quiet"]
+    missingToolSeverity: warning
 reviewFocus: |-
   You are performing a security code review aligned to OWASP ASVS 5.0,
   OWASP Top 10 (2021), the CWE Top 25, and current LLM/AI-specific

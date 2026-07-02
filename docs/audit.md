@@ -160,6 +160,11 @@ and cannot unlock LLM review.
 
 Runs an arbitrary command inside the audit sandbox. Exit code 0 = pass;
 non-zero = fail with stdout/stderr captured as a single Error finding.
+If the top-level tool is absent, ordinary shell auditors emit a non-blocking
+Info finding, build/test gate auditors emit Error, and presets can raise the
+missing-tool signal. The built-in `security:gitleaks` and `security:semgrep`
+auditors raise missing tools to Warning so security coverage loss is visible
+without wedging audits by default.
 
 Configured via YAML in `auditors` list:
 
@@ -167,6 +172,7 @@ Configured via YAML in `auditors` list:
 auditors:
   - name: "golangci-lint"
     argv: ["golangci-lint", "run", "./..."]
+    missingToolSeverity: warning
 ```
 
 Use for any tool with the standard "exit 0 = good" contract: linters,

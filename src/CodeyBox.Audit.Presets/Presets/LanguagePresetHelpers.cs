@@ -13,7 +13,8 @@ internal static class LanguagePresetHelpers
         string[] argv,
         bool canShortCircuitOnBlockingFinding = false,
         AuditorRole role = AuditorRole.None,
-        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None)
+        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None,
+        AuditSeverity? missingToolSeverity = null)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -23,6 +24,7 @@ internal static class LanguagePresetHelpers
                 Name = name,
                 Argv = argv,
                 ResultClassifier = ResultClassifierFor(language, name, argv),
+                MissingToolSeverity = missingToolSeverity,
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
@@ -38,7 +40,8 @@ internal static class LanguagePresetHelpers
         bool? treatExit127AsMissingTool = null,
         bool canShortCircuitOnBlockingFinding = false,
         AuditorRole role = AuditorRole.None,
-        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None)
+        BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None,
+        AuditSeverity? missingToolSeverity = null)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -49,6 +52,7 @@ internal static class LanguagePresetHelpers
                 Argv = ["sh", "-c", script],
                 ToolName = toolName,
                 TreatExit127AsMissingTool = treatExit127AsMissingTool,
+                MissingToolSeverity = missingToolSeverity,
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,

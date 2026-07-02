@@ -60,6 +60,15 @@
           "treatExit127AsMissingTool": {
             "type": "boolean"
           },
+          "missingToolSeverity": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warning",
+              "warn",
+              "error"
+            ]
+          },
           "canShortCircuitOnBlockingFinding": {
             "type": "boolean"
           },

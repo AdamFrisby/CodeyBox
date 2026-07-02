@@ -3669,6 +3669,7 @@ namespace CodeyBox.Api
             "index.crates.io",
             "static.crates.io",
             "github.com",
+            "release-assets.githubusercontent.com",
         ];
         /// <summary>
         /// Legacy concurrency knob (deprecated). Used as
