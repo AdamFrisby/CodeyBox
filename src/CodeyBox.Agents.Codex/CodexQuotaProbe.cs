@@ -210,6 +210,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
             var root = doc.RootElement;
             var overall = TryParseRateLimit(root.TryGetProperty("rate_limit", out var rateLimit) ? rateLimit : root);
             var perModel = ParsePerModel(root);
+            var resetCredits = TryGetResetCreditsAvailable(root);
 
             // Cap per-model availability by the overall account quota. The
             // WHAM endpoint exposes a per-model bucket alongside an overall
@@ -243,6 +244,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
                     Notes = overall is null ? "overall quota unknown; parsed per-model rollups" : null,
                     PerModel = perModel,
                     Windows = overall?.Windows ?? Array.Empty<WindowQuota>(),
+                    ResetCreditsAvailable = resetCredits,
                 };
 
             return Unknown(QuotaUnknownReason.Permanent, "unexpected response shape");
@@ -317,6 +319,8 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
                     Name = windowName,
                     AvailablePct = quota.AvailablePct,
                     ResetAt = quota.ResetAt,
+                    UsedPercent = TryGetRawUsedPercent(window.Value),
+                    ResetAtEpochSeconds = TryGetRawResetEpochSeconds(window.Value),
                 });
 
             if (mostConstrained is null || quota.AvailablePct < mostConstrained.AvailablePct)
@@ -391,6 +395,50 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
             JsonValueKind.String => double.TryParse(el.GetString(), out value),
             _ => false,
         };
+    }
+
+    /// <summary>
+    /// Reads the untransformed <c>used_percent</c> (or camelCase
+    /// <c>usedPercent</c>) from a window element, without the invert/clamp
+    /// applied to <see cref="ModelQuota.AvailablePct"/>. Null when absent.
+    /// </summary>
+    private static double? TryGetRawUsedPercent(JsonElement el) =>
+        TryGetDoubleProperty(el, "used_percent", out var pct) ||
+        TryGetDoubleProperty(el, "usedPercent", out pct)
+            ? pct
+            : null;
+
+    /// <summary>
+    /// Reads the raw <c>reset_at</c> (or camelCase <c>resetAt</c>) as Unix epoch
+    /// seconds when the provider expresses it numerically. Null when the field
+    /// is absent or non-numeric (e.g. an ISO-8601 string).
+    /// </summary>
+    private static long? TryGetRawResetEpochSeconds(JsonElement el)
+    {
+        if (el.ValueKind != JsonValueKind.Object)
+            return null;
+        var reset = TryGetProperty(el, "reset_at") ?? TryGetProperty(el, "resetAt");
+        return reset is { ValueKind: JsonValueKind.Number } num && num.TryGetInt64(out var seconds)
+            ? seconds
+            : null;
+    }
+
+    /// <summary>
+    /// Reads the top-level <c>rate_limit_reset_credits.available_count</c> — the
+    /// number of banked manual quota resets the account can still spend. Null
+    /// when the object or field is absent.
+    /// </summary>
+    private static int? TryGetResetCreditsAvailable(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("rate_limit_reset_credits", out var credits) ||
+            credits.ValueKind != JsonValueKind.Object)
+            return null;
+        return credits.TryGetProperty("available_count", out var count) &&
+               count.ValueKind == JsonValueKind.Number &&
+               count.TryGetInt32(out var value)
+            ? value
+            : null;
     }
 
     private static DateTimeOffset? TryGetResetAt(JsonElement el)

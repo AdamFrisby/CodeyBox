@@ -24,4 +24,45 @@ public sealed class CodexQuotaProbeRealShapeTests
         Assert.Contains("capped by overall", snapshot.PerModel["GPT-5.3-Codex-Spark"].Window);
         Assert.NotNull(snapshot.ResetAt);
     }
+
+    [Fact]
+    public async Task CapturedWhamUsageShape_CarriesResetCreditsAndRawWindowFields()
+    {
+        var capturedWhamUsageShape = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Quota", "codex-wham-usage.redacted.json"));
+
+        var snapshot = CodexQuotaProbe.ParseResponse(capturedWhamUsageShape);
+
+        // Top-level banked manual-reset count is preserved verbatim.
+        Assert.Equal(3, snapshot.ResetCreditsAvailable);
+
+        // Each window carries the untransformed used_percent and the raw epoch
+        // reset_at alongside the derived AvailablePct / ResetAt.
+        var fiveH = Assert.Single(snapshot.Windows, w => w.Name == "5h-rolling");
+        Assert.Equal(34, fiveH.UsedPercent);
+        Assert.Equal(1778091218, fiveH.ResetAtEpochSeconds);
+        Assert.Equal(66, fiveH.AvailablePct);
+
+        var weekly = Assert.Single(snapshot.Windows, w => w.Name == "weekly");
+        Assert.Equal(37, weekly.UsedPercent);
+        Assert.Equal(1778605571, weekly.ResetAtEpochSeconds);
+        Assert.Equal(63, weekly.AvailablePct);
+    }
+
+    [Fact]
+    public void ParseResponse_WithoutResetCredits_LeavesFieldNull()
+    {
+        // Absent rate_limit_reset_credits must not fabricate a count — the
+        // reset-credit tracker distinguishes "0 banked" from "unknown".
+        var snapshot = CodexQuotaProbe.ParseResponse("""
+        {
+          "rate_limit": { "primary_window": { "used_percent": 40, "reset_at": 1778091218 } }
+        }
+        """);
+
+        Assert.Null(snapshot.ResetCreditsAvailable);
+        var window = Assert.Single(snapshot.Windows);
+        Assert.Equal(40, window.UsedPercent);
+        Assert.Equal(1778091218, window.ResetAtEpochSeconds);
+    }
 }

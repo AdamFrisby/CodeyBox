@@ -47,5 +47,8 @@
     "overage_limit_reached": false,
     "balance": "0"
   },
+  "rate_limit_reset_credits": {
+    "available_count": 3
+  },
   "rate_limit_reached_type": null
 }
