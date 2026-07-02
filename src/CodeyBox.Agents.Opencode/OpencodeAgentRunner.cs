@@ -69,6 +69,8 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".local/share/opencode", ".config/opencode"];
 
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["OPENCODE_AUTH_JSON"];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>

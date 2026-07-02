@@ -62,6 +62,9 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini/tmp", ".gemini/history"];
 
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
+        [CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar, "CODEYBOX_GEMINI_SETTINGS_JSON"];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>

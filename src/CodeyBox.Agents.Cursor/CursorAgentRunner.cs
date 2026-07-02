@@ -122,6 +122,8 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".cursor/sessions", ".cursor/history"];
 
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["CODEYBOX_CURSOR_AUTH_JSON"];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>

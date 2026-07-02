@@ -103,6 +103,8 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// <summary>Path to the crock binary inside the sandbox.</summary>
     public string Binary { get; init; } = DefaultBinary;
 
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [ConfigEnvVar];
+
     /// <summary>
     /// Initial delay before the first <c>crock status</c> poll, and the floor
     /// for the exponential backoff. Crock's batch latency is minutes-to-hours

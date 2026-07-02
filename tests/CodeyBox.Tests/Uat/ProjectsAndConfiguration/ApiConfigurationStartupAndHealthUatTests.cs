@@ -187,6 +187,29 @@ public sealed class SandboxStartupConfigurationUatTests
         Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
     }
 
+    [Fact]
+    public void SpritesSandboxResolvesAdmissionControlledProvider()
+    {
+        using var factory = new ProjectsAndConfigurationApiFactory(
+            configuration: new Dictionary<string, string?>
+            {
+                ["CodeyBox:SandboxProvider"] = "sprites",
+                ["CodeyBox:WorkerPool:MaxConcurrentSandboxes"] = "2",
+                ["CodeyBox:Sprites:TokenEnvironmentVariable"] = "SPRITES_UAT_TOKEN",
+                ["CodeyBox:Sprites:NetworkProfiles:work:0"] = "api.openai.com",
+                ["CodeyBox:Sprites:SetupCommands:0"] = "true",
+            },
+            projects: new InMemoryProjectRepository());
+
+        var provider = factory.Services.GetRequiredService<ISandboxProvider>();
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+
+        Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(provider);
+        Assert.Equal("sprites", provider.Name);
+        Assert.Equal(2, admission.MaxConcurrentSandboxes);
+        Assert.IsAssignableFrom<IActiveSandboxProgressProvider>(provider);
+    }
+
     private static IDisposable ConfigureRequiredProductionApiSecrets()
         => new CompositeDisposable(
             new EnvironmentVariableScope("CODEYBOX_API_KEY", HealthCheckAndApiAuthUatTests.ValidToken),

@@ -624,7 +624,28 @@ static SpritesSandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory l
                 WaitForCapacity = cfg.WaitForCapacity,
                 UrlAuth = !string.IsNullOrWhiteSpace(cfg.UrlAuth) ? cfg.UrlAuth : defaults.UrlAuth,
                 MaxListPages = cfg.MaxListPages > 0 ? cfg.MaxListPages : defaults.MaxListPages,
+                AllowUnsafeHttp = cfg.AllowUnsafeHttp,
+                AllowPersistentTmpfsDowngrade = cfg.AllowPersistentTmpfsDowngrade,
+                SetupCommands = cfg.SetupCommands ?? defaults.SetupCommands,
                 NetworkProfiles = cfg.NetworkProfiles ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+                MaxSyncArchiveBase64Bytes = cfg.MaxSyncArchiveBase64Bytes > 0
+                    ? cfg.MaxSyncArchiveBase64Bytes
+                    : defaults.MaxSyncArchiveBase64Bytes,
+                MaxSyncArchiveBytes = cfg.MaxSyncArchiveBytes > 0
+                    ? cfg.MaxSyncArchiveBytes
+                    : defaults.MaxSyncArchiveBytes,
+                MaxSyncArchiveExpandedBytes = cfg.MaxSyncArchiveExpandedBytes > 0
+                    ? cfg.MaxSyncArchiveExpandedBytes
+                    : defaults.MaxSyncArchiveExpandedBytes,
+                MaxSyncArchiveEntries = cfg.MaxSyncArchiveEntries > 0
+                    ? cfg.MaxSyncArchiveEntries
+                    : defaults.MaxSyncArchiveEntries,
+                MaxFileSyncBase64Bytes = cfg.MaxFileSyncBase64Bytes > 0
+                    ? cfg.MaxFileSyncBase64Bytes
+                    : defaults.MaxFileSyncBase64Bytes,
+                MaxFileSyncBytes = cfg.MaxFileSyncBytes > 0
+                    ? cfg.MaxFileSyncBytes
+                    : defaults.MaxFileSyncBytes,
                 DefaultCpuCount = cfg.DefaultCpuCount,
                 DefaultMemoryBytes = cfg.DefaultMemoryBytes,
                 Region = cfg.Region,
@@ -3665,8 +3686,49 @@ namespace CodeyBox.Api
         /// <summary>Safety ceiling for paged list calls during leak reaping.</summary>
         public int MaxListPages { get; set; } = 100;
 
+        /// <summary>
+        /// Test-only escape hatch for local mock servers. Production Sprites
+        /// traffic carries bearer tokens and exec environment variables, so
+        /// the provider rejects <c>http://</c> unless this is explicitly true.
+        /// </summary>
+        public bool AllowUnsafeHttp { get; set; }
+
+        /// <summary>
+        /// Explicit downgrade for non-secret tmpfs mounts. Sprites has no
+        /// tmpfs API, so the default is to reject <c>SandboxMount.Tmpfs</c>.
+        /// When true, non-credential tmpfs paths are created as ordinary
+        /// sprite directories and remain subject to sprite persistence until
+        /// teardown succeeds.
+        /// </summary>
+        public bool AllowPersistentTmpfsDowngrade { get; set; }
+
+        /// <summary>
+        /// Shell commands run inside each fresh sprite after network policy is
+        /// applied and before mounts are staged. Use to install agent CLIs and
+        /// project toolchains because rc30 create has no image/baseline field.
+        /// </summary>
+        public List<string> SetupCommands { get; set; } = [];
+
         /// <summary>Sprites egress allow-list domains keyed by CodeyBox network profile name.</summary>
         public Dictionary<string, List<string>> NetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Maximum base64 stdout bytes accepted for directory sync-back.</summary>
+        public int MaxSyncArchiveBase64Bytes { get; set; } = 128 * 1024 * 1024;
+
+        /// <summary>Maximum compressed gzip/tar bytes accepted for directory sync-back.</summary>
+        public int MaxSyncArchiveBytes { get; set; } = 96 * 1024 * 1024;
+
+        /// <summary>Maximum summed regular-file bytes accepted for directory sync-back.</summary>
+        public long MaxSyncArchiveExpandedBytes { get; set; } = 512L * 1024 * 1024;
+
+        /// <summary>Maximum tar entries accepted for directory sync-back.</summary>
+        public int MaxSyncArchiveEntries { get; set; } = 200_000;
+
+        /// <summary>Maximum base64 stdout bytes accepted for single-file sync-back.</summary>
+        public int MaxFileSyncBase64Bytes { get; set; } = 64 * 1024 * 1024;
+
+        /// <summary>Maximum decoded bytes accepted for single-file sync-back.</summary>
+        public long MaxFileSyncBytes { get; set; } = 48L * 1024 * 1024;
 
         /// <summary>Operator hint only; Sprites rc30 has no create-time CPU field.</summary>
         public int? DefaultCpuCount { get; set; }
@@ -3876,7 +3938,8 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Which sandbox provider to use. One of: <c>multipass</c>,
-        /// <c>bubblewrap</c>, <c>process</c>.
+        /// <c>multipass-remote</c>, <c>sprites</c>, <c>bubblewrap</c>,
+        /// <c>process</c>.
         /// Default is empty — startup defaults to 'process' in Development
         /// and refuses to start in other environments.
         /// </summary>

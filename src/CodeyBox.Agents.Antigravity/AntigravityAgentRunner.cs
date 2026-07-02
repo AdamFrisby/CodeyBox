@@ -95,6 +95,9 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // up via --conversation <id>.
         [".gemini/antigravity-cli/conversations", ".gemini/antigravity-cli/brain"];
 
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
+        [AntigravityConstants.OAuthCredsEnvVar];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>

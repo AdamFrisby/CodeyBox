@@ -1,8 +1,11 @@
 using System.Net;
 using System.Net.WebSockets;
+using System.Formats.Tar;
 using System.Globalization;
+using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Sprites;
@@ -94,7 +97,7 @@ public sealed class SpritesSandboxProviderTests
         socket.EnqueueText("""{"type":"session_info","session_id":42,"command":"bash","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
         socket.EnqueueBinary([1, (byte)'o', (byte)'u', (byte)'t']);
         socket.EnqueueBinary([2, (byte)'e', (byte)'r', (byte)'r']);
-        socket.EnqueueText("""{"type":"exit","exit_code":7}""");
+        socket.EnqueueBinary([3, 7]);
 
         var sandbox = NewSandbox(socket, new SandboxSpec
         {
@@ -129,7 +132,50 @@ public sealed class SpritesSandboxProviderTests
     }
 
     [Fact]
-    public async Task CreateAsync_AllowsCredentialTmpfsDirectory_ForEnvironmentOnlyCredentials()
+    public async Task CreateAsync_RejectsCredentialTmpfsDirectory_BeforeProvisioning()
+    {
+        var handler = new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called"));
+        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts = [new SandboxMount { SandboxPath = SandboxConventions.CredentialsDir, Tmpfs = true }],
+        }));
+
+        Assert.Contains("refusing credential mount", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task CreateAsync_RejectsCredentialHostFileMount_BeforeProvisioning()
+    {
+        var handler = new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called"));
+        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+        using var temp = new TempDirectory();
+        var authFile = Path.Combine(temp.Path, "auth.json");
+        File.WriteAllText(authFile, "{}");
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    SandboxPath = $"{SandboxConventions.CredentialsDir}/auth.json",
+                    HostPath = authFile,
+                    ReadOnly = false,
+                },
+            ],
+        }));
+
+        Assert.Contains("refusing credential mount", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task CreateAsync_CreatesNonSecretTmpfsDirectory_WhenDowngradeExplicitlyAllowed()
     {
         var handler = new RecordingHttpHandler(request =>
         {
@@ -145,34 +191,336 @@ public sealed class SpritesSandboxProviderTests
         var socket = new FakeSpritesWebSocket();
         socket.EnqueueText("""{"type":"session_info","session_id":1,"command":"mkdir","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
         socket.EnqueueText("""{"type":"exit","exit_code":0}""");
-        var provider = NewProvider(handler, new SingleSpritesWebSocketFactory(socket), new SpritesSandboxOptions { Token = "sprite-token" });
+        var provider = NewProvider(
+            handler,
+            new SingleSpritesWebSocketFactory(socket),
+            new SpritesSandboxOptions
+            {
+                Token = "sprite-token",
+                AllowPersistentTmpfsDowngrade = true,
+            });
 
         await using var sandbox = await provider.CreateAsync(new SandboxSpec
         {
             ImageReference = "ignored",
-            Mounts = [new SandboxMount { SandboxPath = SandboxConventions.CredentialsDir, Tmpfs = true }],
+            Mounts = [new SandboxMount { SandboxPath = "/scratch", Tmpfs = true, ReadOnly = false }],
         });
 
         await sandbox.DisposeAsync();
 
         var query = ParseQuery(socket.ConnectedUri!);
-        Assert.Equal(["mkdir", "-p", SandboxConventions.CredentialsDir], query["cmd"]);
+        Assert.Equal(["mkdir", "-p", "/scratch"], query["cmd"]);
     }
 
     [Fact]
     public async Task ExecAsync_RefusesCredentialFileMaterialization()
     {
         var socket = new FakeSpritesWebSocket();
-        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
+        var sandbox = NewSandbox(socket, new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = """{"secret":true}""" },
+        });
 
         var ex = await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "umask 077 && cat > \"$0\"", $"{SandboxConventions.CredentialsDir}/auth.json"],
-            Stdin = """{"secret":true}""",
+            Argv =
+            [
+                "bash",
+                "-c",
+                "set -eu; if [ -n \"${CODEX_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.codex\"; printf '%s' \"$CODEX_AUTH_JSON\" > \"$HOME/.codex/auth.json\"; fi",
+            ],
         }));
 
         Assert.Contains("does not expose tmpfs credential storage", ex.Message, StringComparison.Ordinal);
         Assert.Null(socket.ConnectedUri);
+    }
+
+    [Fact]
+    public async Task FileBackedCredentialRunner_FailsBeforePrepareScript()
+    {
+        var socket = new FakeSpritesWebSocket();
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
+        var runner = new CodexAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = "{}" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential);
+
+        Assert.False(result.Success);
+        Assert.Contains("file-backed credentials are not supported", result.Summary, StringComparison.Ordinal);
+        Assert.Null(socket.ConnectedUri);
+    }
+
+    [Fact]
+    public async Task CreateAsync_RejectsReadOnlyMounts()
+    {
+        var handler = new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called"));
+        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+
+        using var temp = new TempDirectory();
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = temp.Path, ReadOnly = true }],
+        }));
+
+        Assert.Contains("cannot enforce read-only mounts", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task CreateAsync_RejectsUnknownNetworkProfile_AndDeletesCreatedSprite()
+    {
+        var handler = SuccessfulLifecycleHandler();
+        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy { ProfileName = "missing" },
+        }));
+
+        Assert.Contains("network profile 'missing' is not configured", ex.Message, StringComparison.Ordinal);
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == "/v1/sprites");
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Delete && r.PathAndQuery.StartsWith("/v1/sprites/codeybox-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CreateAsync_DeleteFailureAfterCreate_ThrowsDeferredWithRetainedSprite()
+    {
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == "/v1/sprites")
+                return JsonResponse("""{"name":"created"}""", HttpStatusCode.Created);
+            if (request.Method == HttpMethod.Post && request.PathAndQuery.EndsWith("/policy/network", StringComparison.Ordinal))
+                return JsonResponse("""{"error":"policy failed"}""", HttpStatusCode.InternalServerError);
+            if (request.Method == HttpMethod.Delete && request.PathAndQuery.StartsWith("/v1/sprites/codeybox-", StringComparison.Ordinal))
+                return JsonResponse("""{"error":"delete failed"}""", HttpStatusCode.InternalServerError);
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+        }));
+
+        Assert.Equal("sprites", ex.Provider);
+        Assert.Equal("create-cleanup", ex.Operation);
+        Assert.StartsWith("codeybox-", ex.RetainedSandboxName, StringComparison.Ordinal);
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Delete && r.PathAndQuery.StartsWith("/v1/sprites/codeybox-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ActiveSnapshots_ReportSpriteUntilDispose()
+    {
+        var handler = SuccessfulLifecycleHandler();
+        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+        var workItemId = new WorkItemId(Guid.NewGuid());
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = workItemId,
+        });
+
+        var active = Assert.Single(provider.SnapshotActiveSandboxes());
+        Assert.Equal(workItemId, active.WorkItemId);
+        Assert.Same(sandbox, active.Sandbox);
+        var progress = Assert.Single(provider.SnapshotActiveSandboxProgress());
+        Assert.Equal(workItemId, progress.WorkItemId);
+        Assert.Equal(sandbox.Id, progress.SandboxId);
+
+        await sandbox.DisposeAsync();
+
+        Assert.Empty(provider.SnapshotActiveSandboxes());
+        Assert.Empty(provider.SnapshotActiveSandboxProgress());
+    }
+
+    [Fact]
+    public async Task ReadValidatedOptions_ResolvesTokenFromEnvironment_AndRejectsMissingToken()
+    {
+        using var env = new EnvironmentVariableScope("SPRITES_TEST_TOKEN", "from-env");
+        var handler = SuccessfulLifecycleHandler();
+        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions
+        {
+            Token = null,
+            TokenEnvironmentVariable = "SPRITES_TEST_TOKEN",
+        });
+
+        var envSandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await envSandbox.DisposeAsync();
+
+        var create = Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == "/v1/sprites");
+        Assert.Equal("from-env", create.AuthorizationParameter);
+
+        using var missing = new EnvironmentVariableScope("SPRITES_MISSING_TOKEN", null);
+        var missingProvider = NewProvider(
+            new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called")),
+            new EmptySpritesWebSocketFactory(),
+            new SpritesSandboxOptions { Token = null, TokenEnvironmentVariable = "SPRITES_MISSING_TOKEN" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            missingProvider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
+        Assert.Contains("SPRITES_MISSING_TOKEN", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadValidatedOptions_RejectsHttpBaseUrl_UnlessExplicitlyAllowed()
+    {
+        var provider = NewProvider(
+            new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called")),
+            new EmptySpritesWebSocketFactory(),
+            new SpritesSandboxOptions { Token = "sprite-token", ApiBaseUrl = "http://api.sprites.test" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
+        Assert.Contains("must use https", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("not-a-url", "SPRITES_TOKEN", "codeybox-", "sprite", "ApiBaseUrl")]
+    [InlineData("https://api.sprites.dev", "", "codeybox-", "sprite", "TokenEnvironmentVariable")]
+    [InlineData("https://api.sprites.dev", "SPRITES_TOKEN", "bad_prefix", "sprite", "NamePrefix")]
+    [InlineData("https://api.sprites.dev", "SPRITES_TOKEN", "codeybox-", "invalid", "UrlAuth")]
+    public async Task ReadValidatedOptions_RejectsInvalidConfiguration(
+        string apiBaseUrl,
+        string tokenEnvironmentVariable,
+        string namePrefix,
+        string urlAuth,
+        string expectedMessage)
+    {
+        var provider = NewProvider(
+            new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called")),
+            new EmptySpritesWebSocketFactory(),
+            new SpritesSandboxOptions
+            {
+                ApiBaseUrl = apiBaseUrl,
+                Token = "sprite-token",
+                TokenEnvironmentVariable = tokenEnvironmentVariable,
+                NamePrefix = namePrefix,
+                UrlAuth = urlAuth,
+            });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
+
+        Assert.Contains(expectedMessage, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_RejectsUnsafeNames()
+    {
+        var provider = NewProvider(
+            new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called")),
+            new EmptySpritesWebSocketFactory(),
+            new SpritesSandboxOptions { Token = "sprite-token" });
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            provider.DisposeLeakedAsync("not-codeybox", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task WritableHostMount_IsUploaded_AndSyncedBackAfterExec()
+    {
+        using var host = new TempDirectory();
+        File.WriteAllText(Path.Combine(host.Path, "before.txt"), "before");
+        var changedArchive = CreateDirectoryArchiveBase64(("after.txt", "after"));
+        var sockets = new QueueSpritesWebSocketFactory(
+            SuccessfulSocket(sessionId: 1),
+            SuccessfulSocket(sessionId: 2),
+            SuccessfulSocket(sessionId: 3, stdout: changedArchive),
+            SuccessfulSocket(sessionId: 4, stdout: changedArchive));
+        var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, new SpritesSandboxOptions { Token = "sprite-token" });
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = host.Path, ReadOnly = false }],
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["true"] });
+
+        Assert.True(result.Success);
+        Assert.False(File.Exists(Path.Combine(host.Path, "before.txt")));
+        Assert.Equal("after", File.ReadAllText(Path.Combine(host.Path, "after.txt")));
+        var upload = sockets.Created[0];
+        Assert.Contains(upload.SentFrames, frame => frame[0] == 0 && frame.Length > 1);
+    }
+
+    [Fact]
+    public async Task CorruptSyncArchive_DoesNotDeleteHostMount()
+    {
+        using var host = new TempDirectory();
+        File.WriteAllText(Path.Combine(host.Path, "keep.txt"), "keep");
+        var sockets = new QueueSpritesWebSocketFactory(
+            SuccessfulSocket(sessionId: 1),
+            SuccessfulSocket(sessionId: 2),
+            SuccessfulSocket(sessionId: 3, stdout: "not-base64"));
+        var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, new SpritesSandboxOptions { Token = "sprite-token" });
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = host.Path, ReadOnly = false }],
+        });
+
+        await Assert.ThrowsAnyAsync<FormatException>(() => sandbox.ExecAsync(new SandboxExec { Argv = ["true"] }));
+
+        Assert.True(Directory.Exists(host.Path));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(host.Path, "keep.txt")));
+    }
+
+    [Fact]
+    public async Task ExecAsync_CancellationAfterSessionInfo_PostsKillForParsedSession()
+    {
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == "/v1/sprites/codeybox-test/exec/42/kill")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {"type":"signal"}
+                        {"type":"exited"}
+                        {"type":"complete","exit_code":143}
+                        """,
+                        Encoding.UTF8,
+                        "application/x-ndjson"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var socket = new BlockingAfterSessionInfoWebSocket(sessionId: 42);
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" }, httpHandler: handler);
+        using var cts = new CancellationTokenSource();
+
+        var exec = sandbox.ExecAsync(new SandboxExec { Argv = ["sleep", "100"] }, cts.Token);
+        await socket.SessionInfoDelivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => exec);
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == "/v1/sprites/codeybox-test/exec/42/kill");
+    }
+
+    [Fact]
+    public async Task ExecAsync_CancellationBeforeSessionInfo_DoesNotPostKill()
+    {
+        var handler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.NotFound));
+        var socket = new BlockingBeforeSessionInfoWebSocket();
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" }, httpHandler: handler);
+        using var cts = new CancellationTokenSource();
+
+        var exec = sandbox.ExecAsync(new SandboxExec { Argv = ["sleep", "100"] }, cts.Token);
+        await socket.ReceiveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => exec);
+        Assert.Empty(handler.Requests);
     }
 
     [Fact]
@@ -216,6 +564,67 @@ public sealed class SpritesSandboxProviderTests
         Assert.Single(handler.Requests, r => r.Method == HttpMethod.Delete && r.PathAndQuery == "/v1/sprites/codeybox-b");
     }
 
+    [Fact]
+    public async Task ApiFailures_SurfaceDetail_AndDeleteNotFoundIsTolerated()
+    {
+        var listHandler = new RecordingHttpHandler(request =>
+            request.Method == HttpMethod.Get
+                ? JsonResponse("""{"error":"list failed"}""", HttpStatusCode.BadGateway)
+                : new HttpResponseMessage(HttpStatusCode.NotFound));
+        var listProvider = NewProvider(listHandler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            listProvider.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Contains("list sprites failed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("list failed", ex.Message, StringComparison.Ordinal);
+
+        var deleteHandler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.NotFound));
+        var deleteProvider = NewProvider(deleteHandler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+
+        await deleteProvider.DisposeLeakedAsync("codeybox-missing", CancellationToken.None);
+
+        Assert.Single(deleteHandler.Requests, r => r.Method == HttpMethod.Delete && r.PathAndQuery == "/v1/sprites/codeybox-missing");
+    }
+
+    private static RecordingHttpHandler SuccessfulLifecycleHandler() =>
+        new(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == "/v1/sprites")
+                return JsonResponse("""{"name":"created"}""", HttpStatusCode.Created);
+            if (request.Method == HttpMethod.Post && request.PathAndQuery.EndsWith("/policy/network", StringComparison.Ordinal))
+                return JsonResponse("""{"rules":[]}""");
+            if (request.Method == HttpMethod.Delete && request.PathAndQuery.StartsWith("/v1/sprites/codeybox-", StringComparison.Ordinal))
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+    private static FakeSpritesWebSocket SuccessfulSocket(int sessionId, string? stdout = null)
+    {
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText($$"""{"type":"session_info","session_id":{{sessionId}},"command":"cmd","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        if (stdout is not null)
+            socket.EnqueueBinary([1, .. Encoding.UTF8.GetBytes(stdout)]);
+        socket.EnqueueText("""{"type":"exit","exit_code":0}""");
+        return socket;
+    }
+
+    private static string CreateDirectoryArchiveBase64(params (string RelativePath, string Contents)[] files)
+    {
+        using var temp = new TempDirectory();
+        foreach (var (relativePath, contents) in files)
+        {
+            var fullPath = Path.Combine(temp.Path, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            File.WriteAllText(fullPath, contents);
+        }
+
+        using var output = new MemoryStream();
+        using (var gzip = new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true))
+            TarFile.CreateFromDirectory(temp.Path, gzip, includeBaseDirectory: false);
+        return Convert.ToBase64String(output.ToArray());
+    }
+
     private static SpritesSandboxProvider NewProvider(
         RecordingHttpHandler handler,
         ISpritesWebSocketFactory webSocketFactory,
@@ -226,9 +635,12 @@ public sealed class SpritesSandboxProviderTests
             webSocketFactory,
             NullLogger<SpritesSandboxProvider>.Instance);
 
-    private static SpritesSandbox NewSandbox(FakeSpritesWebSocket socket, SandboxSpec spec)
+    private static SpritesSandbox NewSandbox(
+        ISpritesWebSocket socket,
+        SandboxSpec spec,
+        RecordingHttpHandler? httpHandler = null)
     {
-        var client = new SpritesApiClient(new HttpClient(new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.NoContent))));
+        var client = new SpritesApiClient(new HttpClient(httpHandler ?? new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.NoContent))));
         return new SpritesSandbox(
             "codeybox-test",
             spec,
@@ -238,6 +650,38 @@ public sealed class SpritesSandboxProviderTests
             [],
             () => { },
             NullLogger<SpritesSandboxProvider>.Instance);
+    }
+
+    private sealed class TempDirectory : IDisposable
+    {
+        public TempDirectory()
+        {
+            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"codeybox-sprites-test-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(Path);
+        }
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            try { Directory.Delete(Path, recursive: true); }
+            catch { }
+        }
+    }
+
+    private sealed class EnvironmentVariableScope : IDisposable
+    {
+        private readonly string _name;
+        private readonly string? _previous;
+
+        public EnvironmentVariableScope(string name, string? value)
+        {
+            _name = name;
+            _previous = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose() => Environment.SetEnvironmentVariable(_name, _previous);
     }
 
     private static HttpResponseMessage JsonResponse(string json, HttpStatusCode status = HttpStatusCode.OK) =>
@@ -315,6 +759,108 @@ public sealed class SpritesSandboxProviderTests
         }
 
         public ISpritesWebSocket Create() => _socket;
+    }
+
+    private sealed class QueueSpritesWebSocketFactory : ISpritesWebSocketFactory
+    {
+        private readonly Queue<FakeSpritesWebSocket> _sockets;
+
+        public QueueSpritesWebSocketFactory(params FakeSpritesWebSocket[] sockets)
+        {
+            _sockets = new Queue<FakeSpritesWebSocket>(sockets);
+        }
+
+        public List<FakeSpritesWebSocket> Created { get; } = [];
+
+        public ISpritesWebSocket Create()
+        {
+            if (_sockets.Count == 0)
+                throw new InvalidOperationException("No fake sprites websocket queued");
+            var socket = _sockets.Dequeue();
+            Created.Add(socket);
+            return socket;
+        }
+    }
+
+    private sealed class BlockingAfterSessionInfoWebSocket : ISpritesWebSocket
+    {
+        private readonly int _sessionId;
+        private bool _sentSessionInfo;
+
+        public BlockingAfterSessionInfoWebSocket(int sessionId)
+        {
+            _sessionId = sessionId;
+        }
+
+        public TaskCompletionSource SessionInfoDelivered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Uri? ConnectedUri { get; private set; }
+        public string? BearerToken { get; private set; }
+        public WebSocketState State { get; private set; } = WebSocketState.None;
+
+        public Task ConnectAsync(Uri uri, string bearerToken, CancellationToken ct)
+        {
+            ConnectedUri = uri;
+            BearerToken = bearerToken;
+            State = WebSocketState.Open;
+            return Task.CompletedTask;
+        }
+
+        public Task SendAsync(ReadOnlyMemory<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public async Task<WebSocketReceiveResult> ReceiveAsync(Memory<byte> buffer, CancellationToken ct)
+        {
+            if (!_sentSessionInfo)
+            {
+                _sentSessionInfo = true;
+                var payload = Encoding.UTF8.GetBytes(
+                    $$"""{"type":"session_info","session_id":{{_sessionId}},"command":"sleep","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+                payload.CopyTo(buffer);
+                SessionInfoDelivered.TrySetResult();
+                return new WebSocketReceiveResult(payload.Length, WebSocketMessageType.Text, endOfMessage: true);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
+            throw new InvalidOperationException("unreachable");
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            State = WebSocketState.Closed;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class BlockingBeforeSessionInfoWebSocket : ISpritesWebSocket
+    {
+        public TaskCompletionSource ReceiveStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public WebSocketState State { get; private set; } = WebSocketState.None;
+
+        public Task ConnectAsync(Uri uri, string bearerToken, CancellationToken ct)
+        {
+            State = WebSocketState.Open;
+            return Task.CompletedTask;
+        }
+
+        public Task SendAsync(ReadOnlyMemory<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public async Task<WebSocketReceiveResult> ReceiveAsync(Memory<byte> buffer, CancellationToken ct)
+        {
+            ReceiveStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
+            throw new InvalidOperationException("unreachable");
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            State = WebSocketState.Closed;
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class FakeSpritesWebSocket : ISpritesWebSocket

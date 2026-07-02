@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Collections.Concurrent;
-using System.Diagnostics.CodeAnalysis;
 using System.Formats.Tar;
 using System.Globalization;
 using System.IO.Compression;
@@ -25,6 +24,7 @@ namespace CodeyBox.Sandbox.Sprites;
 public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider
 {
     public const string DefaultNamePrefix = "codeybox-";
+    private static readonly TimeSpan CreateCleanupRecheckIn = TimeSpan.FromMinutes(5);
 
     private readonly Func<SpritesSandboxOptions> _readOptions;
     private readonly SpritesApiClient _client;
@@ -65,14 +65,14 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
         LogUnsupportedSizingIfNeeded(spec, opts);
 
         var name = GenerateSandboxName(opts.NamePrefix);
-        var syncMounts = ValidateAndPlanMounts(spec);
+        var syncMounts = ValidateAndPlanMounts(spec, opts);
         var workItemId = spec.TimingWorkItemId.GetValueOrDefault();
-        var activeEntry = new ActiveSandboxEntry(workItemId);
+        var created = false;
 
         try
         {
             await _client.CreateSpriteAsync(opts, name, ct).ConfigureAwait(false);
-            await ApplyNetworkPolicyAsync(opts, name, spec.Network, ct).ConfigureAwait(false);
+            created = true;
 
             var sandbox = new SpritesSandbox(
                 name,
@@ -81,24 +81,31 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
                 _client,
                 _webSocketFactory,
                 syncMounts,
-                () => _activeSandboxes.TryRemove(name, out _),
+                () => MarkNoLongerActive(name),
                 _log);
 
-            await sandbox.PrepareFilesystemAsync(ct).ConfigureAwait(false);
-            _activeSandboxes[name] = activeEntry;
+            _activeSandboxes[name] = new ActiveSandboxEntry(workItemId, sandbox);
             SandboxLiveCounter.Increment();
+
+            await ApplyNetworkPolicyAsync(opts, name, spec.Network, ct).ConfigureAwait(false);
+            await sandbox.RunSetupCommandsAsync(ct).ConfigureAwait(false);
+            await sandbox.PrepareFilesystemAsync(ct).ConfigureAwait(false);
 
             _log.LogInformation("Created sprites sandbox {Name}", name);
             return sandbox;
         }
-        catch
+        catch (Exception ex)
         {
-            _activeSandboxes.TryRemove(name, out _);
-            try { await _client.DeleteSpriteAsync(opts, name, ct).ConfigureAwait(false); }
-            catch (Exception deleteEx) when (deleteEx is not OperationCanceledException)
-            {
-                _log.LogWarning(deleteEx, "Failed to delete sprites sandbox {Name} after create failure", name);
-            }
+            MarkNoLongerActive(name);
+            if (created && !await TryDeleteAfterCreateFailureAsync(opts, name).ConfigureAwait(false))
+                throw new SandboxProvisioningDeferredException(
+                    Name,
+                    "create-cleanup",
+                    "sprites-delete-failed",
+                    $"create failed and best-effort delete did not prove sprite {name} was removed: {ex.Message}",
+                    CreateCleanupRecheckIn,
+                    retainedSandboxName: name,
+                    innerException: ex);
             throw;
         }
     }
@@ -127,10 +134,20 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
 
         var opts = ReadValidatedOptions();
         await _client.DeleteSpriteAsync(opts, name, ct).ConfigureAwait(false);
-        _activeSandboxes.TryRemove(name, out _);
+        MarkNoLongerActive(name);
     }
 
-    public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() => [];
+    public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
+    {
+        var result = new List<(WorkItemId, IShutdownTeardownSandbox)>(_activeSandboxes.Count);
+        foreach (var entry in _activeSandboxes.Values)
+        {
+            if (entry.WorkItemId.Value == Guid.Empty)
+                continue;
+            result.Add((entry.WorkItemId, entry.Sandbox));
+        }
+        return result;
+    }
 
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress()
     {
@@ -152,6 +169,11 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
         {
             throw new InvalidOperationException("CodeyBox:Sprites:ApiBaseUrl must be an absolute http(s) URL.");
         }
+        if (baseUri.Scheme == Uri.UriSchemeHttp && !opts.AllowUnsafeHttp)
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:Sprites:ApiBaseUrl must use https://. Set CodeyBox:Sprites:AllowUnsafeHttp=true only for local tests.");
+        }
         if (string.IsNullOrWhiteSpace(opts.TokenEnvironmentVariable))
             throw new InvalidOperationException("CodeyBox:Sprites:TokenEnvironmentVariable must be set.");
         if (string.IsNullOrWhiteSpace(opts.Token))
@@ -168,6 +190,14 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
             throw new InvalidOperationException($"CodeyBox:Sprites:NamePrefix must start with '{DefaultNamePrefix}' so leak reaping can identify managed sprites.");
         if (opts.UrlAuth is not "sprite" and not "public")
             throw new InvalidOperationException("CodeyBox:Sprites:UrlAuth must be either 'sprite' or 'public'.");
+        if (opts.MaxListPages <= 0)
+            throw new InvalidOperationException("CodeyBox:Sprites:MaxListPages must be greater than zero.");
+        if (opts.MaxSyncArchiveBase64Bytes <= 0 || opts.MaxSyncArchiveBytes <= 0 ||
+            opts.MaxSyncArchiveExpandedBytes <= 0 || opts.MaxSyncArchiveEntries <= 0 ||
+            opts.MaxFileSyncBase64Bytes <= 0 || opts.MaxFileSyncBytes <= 0)
+        {
+            throw new InvalidOperationException("CodeyBox:Sprites sync size limits must all be greater than zero.");
+        }
         return opts;
     }
 
@@ -185,7 +215,7 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
     private static bool IsValidNamePrefix(string prefix) =>
         prefix.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-');
 
-    private static IReadOnlyList<SpritesMountSync> ValidateAndPlanMounts(SandboxSpec spec)
+    private static IReadOnlyList<SpritesMountSync> ValidateAndPlanMounts(SandboxSpec spec, SpritesSandboxOptions opts)
     {
         var result = new List<SpritesMountSync>();
         foreach (var mount in spec.Mounts)
@@ -193,18 +223,30 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
             if (!mount.SandboxPath.StartsWith("/", StringComparison.Ordinal))
                 throw new ArgumentException($"Sandbox mount path must be absolute: {mount.SandboxPath}");
 
-            if (mount.Tmpfs)
-            {
-                result.Add(new SpritesMountSync(mount.SandboxPath, HostPath: null, ReadOnly: false, IsTmpfsDirectory: true));
-                continue;
-            }
-
             if (IsCredentialPath(mount.SandboxPath))
             {
                 throw new NotSupportedException(
-                    "sprites.dev does not expose tmpfs mounts; refusing credential host-file mount " +
+                    "sprites.dev does not expose tmpfs mounts; refusing credential mount " +
                     $"{mount.SandboxPath} because it would persist on the sprite ext4 filesystem. " +
                     "Use credential environment variables for sprites-backed sandboxes.");
+            }
+
+            if (mount.Tmpfs)
+            {
+                if (!opts.AllowPersistentTmpfsDowngrade)
+                {
+                    throw new NotSupportedException(
+                        $"sprites.dev does not expose tmpfs mounts; refusing tmpfs mount {mount.SandboxPath}. " +
+                        "Set CodeyBox:Sprites:AllowPersistentTmpfsDowngrade=true only for non-secret scratch paths.");
+                }
+                result.Add(new SpritesMountSync(mount.SandboxPath, HostPath: null, ReadOnly: false, IsPersistentTmpfsDirectory: true));
+                continue;
+            }
+
+            if (mount.ReadOnly)
+            {
+                throw new NotSupportedException(
+                    $"sprites.dev cannot enforce read-only mounts; refusing read-only mount {mount.SandboxPath}.");
             }
 
             if (mount.HostPath is null)
@@ -218,7 +260,7 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
                     $"sprites mount source path does not exist: {hostPath}");
             }
 
-            result.Add(new SpritesMountSync(mount.SandboxPath, hostPath, mount.ReadOnly, IsTmpfsDirectory: false));
+            result.Add(new SpritesMountSync(mount.SandboxPath, hostPath, mount.ReadOnly, IsPersistentTmpfsDirectory: false));
         }
 
         return result;
@@ -254,9 +296,11 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
         var domains = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var host in network.AllowedHosts)
             AddDomain(domains, host);
-        if (!string.IsNullOrWhiteSpace(network.ProfileName) &&
-            opts.NetworkProfiles.TryGetValue(network.ProfileName, out var profileHosts))
+        if (!string.IsNullOrWhiteSpace(network.ProfileName))
         {
+            if (!opts.NetworkProfiles.TryGetValue(network.ProfileName, out var profileHosts))
+                throw new InvalidOperationException(
+                    $"Sprites network profile '{network.ProfileName}' is not configured in CodeyBox:Sprites:NetworkProfiles.");
             foreach (var host in profileHosts)
                 AddDomain(domains, host);
         }
@@ -298,7 +342,27 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
         return host;
     }
 
-    private sealed record ActiveSandboxEntry(WorkItemId WorkItemId);
+    private async Task<bool> TryDeleteAfterCreateFailureAsync(SpritesSandboxOptions opts, string name)
+    {
+        try
+        {
+            await _client.DeleteSpriteAsync(opts, name, CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception deleteEx)
+        {
+            _log.LogWarning(deleteEx, "Failed to delete sprites sandbox {Name} after create failure", name);
+            return false;
+        }
+    }
+
+    private void MarkNoLongerActive(string name)
+    {
+        if (_activeSandboxes.TryRemove(name, out _))
+            SandboxLiveCounter.Decrement();
+    }
+
+    private sealed record ActiveSandboxEntry(WorkItemId WorkItemId, SpritesSandbox Sandbox);
 }
 
 public sealed record SpritesSandboxOptions
@@ -316,6 +380,15 @@ public sealed record SpritesSandboxOptions
     public bool WaitForCapacity { get; init; }
     public string UrlAuth { get; init; } = "sprite";
     public int MaxListPages { get; init; } = 100;
+    public bool AllowUnsafeHttp { get; init; }
+    public bool AllowPersistentTmpfsDowngrade { get; init; }
+    public IReadOnlyList<string> SetupCommands { get; init; } = [];
+    public int MaxSyncArchiveBase64Bytes { get; init; } = 128 * 1024 * 1024;
+    public int MaxSyncArchiveBytes { get; init; } = 96 * 1024 * 1024;
+    public long MaxSyncArchiveExpandedBytes { get; init; } = 512L * 1024 * 1024;
+    public int MaxSyncArchiveEntries { get; init; } = 200_000;
+    public int MaxFileSyncBase64Bytes { get; init; } = 64 * 1024 * 1024;
+    public long MaxFileSyncBytes { get; init; } = 48L * 1024 * 1024;
 
     /// <summary>
     /// Optional sprites-specific profile-to-domain map used when
@@ -339,9 +412,20 @@ public sealed record SpritesSandboxOptions
     public string? Region { get; init; }
 }
 
-internal sealed class SpritesSandbox : ISandbox
+internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBackedAgentCredentials
 {
     private static readonly Encoding Utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    private static readonly string[] KnownFileBackedCredentialEnvVars =
+    [
+        "CODEX_AUTH_JSON",
+        "CODEYBOX_CLAUDE_OAUTH_JSON",
+        "CODEYBOX_CURSOR_AUTH_JSON",
+        "CODEYBOX_GEMINI_OAUTH_CREDS_JSON",
+        "CODEYBOX_GEMINI_SETTINGS_JSON",
+        "OPENCODE_AUTH_JSON",
+        "CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON",
+        "CROCK_CONFIG_JSON",
+    ];
 
     private readonly SandboxSpec _spec;
     private readonly SpritesSandboxOptions _opts;
@@ -352,6 +436,7 @@ internal sealed class SpritesSandbox : ISandbox
     private readonly ILogger _log;
     private readonly ConcurrentDictionary<int, byte> _activeSessions = new();
     private readonly SemaphoreSlim _execGate = new(1, 1);
+    private int _ownedByShutdownHandler;
     private bool _disposing;
     private bool _disposed;
 
@@ -377,17 +462,47 @@ internal sealed class SpritesSandbox : ISandbox
 
     public string Id { get; }
 
+    public string FileBackedAgentCredentialsUnsupportedReason =>
+        "sprites.dev has no tmpfs-backed credential path; file-backed OAuth/subscription credentials would persist on the sprite ext4 filesystem.";
+
+    public bool IsOwnedByShutdownHandler => Volatile.Read(ref _ownedByShutdownHandler) != 0;
+
+    public void MarkOwnedByShutdownHandler() => Interlocked.Exchange(ref _ownedByShutdownHandler, 1);
+
+    internal async Task RunSetupCommandsAsync(CancellationToken ct)
+    {
+        foreach (var command in _opts.SetupCommands)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+                continue;
+
+            var result = await ExecRawAsync(new SandboxExec
+            {
+                Argv = ["bash", "-lc", command],
+                WorkingDirectory = "/",
+                MaxStdoutBytes = 1024 * 1024,
+                MaxStderrBytes = 1024 * 1024,
+                KillOnOutputLimit = true,
+            }, syncWritableMounts: false, allowDuringDispose: false, includeSpecEnvironment: false, ct: ct).ConfigureAwait(false);
+            if (!result.Success)
+            {
+                throw new InvalidOperationException(
+                    $"Sprites setup command failed in {Id} with exit {result.ExitCode}: {Tail(result.Stderr)}");
+            }
+        }
+    }
+
     internal async Task PrepareFilesystemAsync(CancellationToken ct)
     {
         foreach (var mount in _mounts)
         {
-            if (mount.IsTmpfsDirectory)
+            if (mount.IsPersistentTmpfsDirectory)
             {
                 await ExecRawAsync(new SandboxExec
                 {
                     Argv = ["mkdir", "-p", mount.SandboxPath],
                     WorkingDirectory = "/",
-                }, syncWritableMounts: false, allowDuringDispose: false, ct: ct).ConfigureAwait(false);
+                }, syncWritableMounts: false, allowDuringDispose: false, includeSpecEnvironment: false, ct: ct).ConfigureAwait(false);
                 continue;
             }
 
@@ -398,15 +513,6 @@ internal sealed class SpritesSandbox : ISandbox
                 await UploadDirectoryAsync(mount.HostPath, mount.SandboxPath, ct).ConfigureAwait(false);
             else
                 await UploadFileAsync(mount.HostPath, mount.SandboxPath, ct).ConfigureAwait(false);
-
-            if (mount.ReadOnly)
-            {
-                await ExecRawAsync(new SandboxExec
-                {
-                    Argv = ["chmod", "-R", "a-w", mount.SandboxPath],
-                    WorkingDirectory = "/",
-                }, syncWritableMounts: false, allowDuringDispose: false, ct: ct).ConfigureAwait(false);
-            }
         }
     }
 
@@ -415,7 +521,7 @@ internal sealed class SpritesSandbox : ISandbox
         await _execGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var result = await ExecRawAsync(exec, syncWritableMounts: true, allowDuringDispose: false, ct: ct).ConfigureAwait(false);
+            var result = await ExecRawAsync(exec, syncWritableMounts: true, allowDuringDispose: false, includeSpecEnvironment: true, ct: ct).ConfigureAwait(false);
             return result;
         }
         finally
@@ -428,24 +534,26 @@ internal sealed class SpritesSandbox : ISandbox
         SandboxExec exec,
         bool syncWritableMounts,
         bool allowDuringDispose,
+        bool includeSpecEnvironment,
         CancellationToken ct)
     {
         if (_disposed || (_disposing && !allowDuringDispose))
             throw new ObjectDisposedException(nameof(SpritesSandbox));
         if (exec.Argv.Count == 0)
             throw new ArgumentException("Argv must be non-empty", nameof(exec));
-        if (WouldPersistCredentialFile(exec))
+        var effectiveEnvironment = BuildEffectiveEnvironment(exec, includeSpecEnvironment);
+        if (WouldPersistCredentialFile(exec, effectiveEnvironment))
         {
             throw new NotSupportedException(
                 "sprites.dev does not expose tmpfs credential storage; refusing to write credential file material " +
-                $"under {SandboxConventions.CredentialsDir}. Use credential environment variables for sprites-backed sandboxes.");
+                "to the sprite ext4 filesystem. Use non-file credential environment variables for sprites-backed sandboxes.");
         }
 
         int? sessionId = null;
         await using var webSocket = _webSocketFactory.Create();
         try
         {
-            await webSocket.ConnectAsync(BuildExecWebSocketUri(exec), _opts.Token!, ct).ConfigureAwait(false);
+            await webSocket.ConnectAsync(BuildExecWebSocketUri(exec, effectiveEnvironment), _opts.Token!, ct).ConfigureAwait(false);
             var stdout = new LimitedOutputCollector(exec.MaxStdoutBytes, exec.StdoutChunkCallback);
             var stderr = new LimitedOutputCollector(exec.MaxStderrBytes, exec.StderrChunkCallback);
             var exitCode = await ReadExecUntilExitAsync(
@@ -600,7 +708,7 @@ internal sealed class SpritesSandbox : ISandbox
         await webSocket.SendAsync(new byte[] { 4 }, WebSocketMessageType.Binary, endOfMessage: true, ct).ConfigureAwait(false);
     }
 
-    private Uri BuildExecWebSocketUri(SandboxExec exec)
+    private Uri BuildExecWebSocketUri(SandboxExec exec, IReadOnlyDictionary<string, string> effectiveEnvironment)
     {
         var baseUri = new Uri(_opts.ApiBaseUrl);
         var builder = new UriBuilder(baseUri)
@@ -619,7 +727,7 @@ internal sealed class SpritesSandbox : ISandbox
         if (!string.IsNullOrWhiteSpace(workingDirectory))
             query.Add(new KeyValuePair<string, string>("dir", workingDirectory));
 
-        foreach (var (key, value) in BuildEffectiveEnvironment(exec))
+        foreach (var (key, value) in effectiveEnvironment)
             query.Add(new KeyValuePair<string, string>("env", $"{key}={value}"));
 
         builder.Query = string.Join('&', query.Select(q =>
@@ -627,15 +735,18 @@ internal sealed class SpritesSandbox : ISandbox
         return builder.Uri;
     }
 
-    private Dictionary<string, string> BuildEffectiveEnvironment(SandboxExec exec)
+    private Dictionary<string, string> BuildEffectiveEnvironment(SandboxExec exec, bool includeSpecEnvironment)
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             ["HOME"] = "/root",
         };
-        foreach (var (key, value) in _spec.Environment)
-            env[key] = value;
+        if (includeSpecEnvironment)
+        {
+            foreach (var (key, value) in _spec.Environment)
+                env[key] = value;
+        }
         if (exec.ExtraEnvironment is not null)
         {
             foreach (var (key, value) in exec.ExtraEnvironment)
@@ -644,15 +755,40 @@ internal sealed class SpritesSandbox : ISandbox
         return env;
     }
 
-    private static bool WouldPersistCredentialFile(SandboxExec exec)
+    private static bool WouldPersistCredentialFile(
+        SandboxExec exec,
+        IReadOnlyDictionary<string, string> effectiveEnvironment)
     {
-        if (exec.Stdin is null)
+        var argvText = string.Join('\n', exec.Argv);
+        if (exec.Stdin is not null &&
+            exec.Argv.Any(arg =>
+                arg.Equals(SandboxConventions.CredentialsDir, StringComparison.Ordinal) ||
+                arg.StartsWith(SandboxConventions.CredentialsDir + "/", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        if (!LooksLikeShellWrite(argvText))
             return false;
 
-        return exec.Argv.Any(arg =>
-            arg.Equals(SandboxConventions.CredentialsDir, StringComparison.Ordinal) ||
-            arg.StartsWith(SandboxConventions.CredentialsDir + "/", StringComparison.Ordinal));
+        foreach (var key in KnownFileBackedCredentialEnvVars)
+        {
+            if (effectiveEnvironment.TryGetValue(key, out var value) &&
+                !string.IsNullOrEmpty(value) &&
+                argvText.Contains(key, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
+
+    private static bool LooksLikeShellWrite(string argvText) =>
+        argvText.Contains('>', StringComparison.Ordinal) ||
+        argvText.Contains("tee ", StringComparison.Ordinal) ||
+        argvText.Contains("install ", StringComparison.Ordinal) ||
+        argvText.Contains("base64 -d", StringComparison.Ordinal);
 
     private async Task UploadDirectoryAsync(string hostPath, string sandboxPath, CancellationToken ct)
     {
@@ -669,7 +805,7 @@ internal sealed class SpritesSandbox : ISandbox
             ],
             WorkingDirectory = "/",
             Stdin = archive,
-        }, syncWritableMounts: false, allowDuringDispose: false, ct: ct).ConfigureAwait(false);
+        }, syncWritableMounts: false, allowDuringDispose: false, includeSpecEnvironment: false, ct: ct).ConfigureAwait(false);
         if (!result.Success)
             throw new InvalidOperationException($"Failed to stage host directory {hostPath} into sprite {Id}:{sandboxPath}: {result.Stderr}");
     }
@@ -689,7 +825,7 @@ internal sealed class SpritesSandbox : ISandbox
             ],
             WorkingDirectory = "/",
             Stdin = payload,
-        }, syncWritableMounts: false, allowDuringDispose: false, ct: ct).ConfigureAwait(false);
+        }, syncWritableMounts: false, allowDuringDispose: false, includeSpecEnvironment: false, ct: ct).ConfigureAwait(false);
         if (!result.Success)
             throw new InvalidOperationException($"Failed to stage host file {hostPath} into sprite {Id}:{sandboxPath}: {result.Stderr}");
     }
@@ -725,12 +861,14 @@ internal sealed class SpritesSandbox : ISandbox
                 sandboxPath,
             ],
             WorkingDirectory = "/",
+            MaxStdoutBytes = _opts.MaxSyncArchiveBase64Bytes,
             MaxStderrBytes = 64 * 1024,
-        }, syncWritableMounts: false, allowDuringDispose: allowDuringDispose, ct: ct).ConfigureAwait(false);
+            KillOnOutputLimit = true,
+        }, syncWritableMounts: false, allowDuringDispose: allowDuringDispose, includeSpecEnvironment: false, ct: ct).ConfigureAwait(false);
         if (!result.Success)
             throw new InvalidOperationException($"Failed to archive sprite directory {Id}:{sandboxPath}: {result.Stderr}");
 
-        ReplaceHostDirectoryFromArchive(hostPath, result.Stdout.Trim());
+        ReplaceHostDirectoryFromArchive(hostPath, result.Stdout.Trim(), _opts);
     }
 
     private async Task SyncFileToHostAsync(
@@ -743,12 +881,19 @@ internal sealed class SpritesSandbox : ISandbox
         {
             Argv = ["base64", "-w0", sandboxPath],
             WorkingDirectory = "/",
+            MaxStdoutBytes = _opts.MaxFileSyncBase64Bytes,
             MaxStderrBytes = 64 * 1024,
-        }, syncWritableMounts: false, allowDuringDispose: allowDuringDispose, ct: ct).ConfigureAwait(false);
+            KillOnOutputLimit = true,
+        }, syncWritableMounts: false, allowDuringDispose: allowDuringDispose, includeSpecEnvironment: false, ct: ct).ConfigureAwait(false);
         if (!result.Success)
             throw new InvalidOperationException($"Failed to read sprite file {Id}:{sandboxPath}: {result.Stderr}");
 
-        var bytes = Convert.FromBase64String(result.Stdout.Trim());
+        var archiveBase64 = result.Stdout.Trim();
+        if (archiveBase64.Length > _opts.MaxFileSyncBase64Bytes)
+            throw new InvalidOperationException($"Sprite file sync exceeded base64 limit for {Id}:{sandboxPath}.");
+        var bytes = Convert.FromBase64String(archiveBase64);
+        if (bytes.LongLength > _opts.MaxFileSyncBytes)
+            throw new InvalidOperationException($"Sprite file sync exceeded decoded-size limit for {Id}:{sandboxPath}.");
         var parent = Path.GetDirectoryName(hostPath);
         if (!string.IsNullOrEmpty(parent))
             Directory.CreateDirectory(parent);
@@ -763,7 +908,10 @@ internal sealed class SpritesSandbox : ISandbox
         return Convert.ToBase64String(output.ToArray());
     }
 
-    private static void ReplaceHostDirectoryFromArchive(string hostPath, string archiveBase64)
+    private static void ReplaceHostDirectoryFromArchive(
+        string hostPath,
+        string archiveBase64,
+        SpritesSandboxOptions opts)
     {
         var parent = Path.GetDirectoryName(Path.GetFullPath(hostPath))
             ?? throw new InvalidOperationException($"Unable to determine parent directory for {hostPath}");
@@ -772,9 +920,15 @@ internal sealed class SpritesSandbox : ISandbox
         var tempPath = Path.Combine(parent, $".codeybox-sprites-sync-{Guid.NewGuid():N}");
         var backupPath = Path.Combine(parent, $".codeybox-sprites-backup-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempPath);
+        var movedExisting = false;
         try
         {
+            if (archiveBase64.Length > opts.MaxSyncArchiveBase64Bytes)
+                throw new InvalidOperationException($"Sprite sync archive for {hostPath} exceeded base64 limit.");
             var bytes = Convert.FromBase64String(archiveBase64);
+            if (bytes.LongLength > opts.MaxSyncArchiveBytes)
+                throw new InvalidOperationException($"Sprite sync archive for {hostPath} exceeded compressed-size limit.");
+            ValidateTarGzipArchive(bytes, opts, hostPath);
             using (var input = new MemoryStream(bytes))
             using (var gzip = new GZipStream(input, CompressionMode.Decompress))
             {
@@ -783,23 +937,63 @@ internal sealed class SpritesSandbox : ISandbox
 
             var hadExisting = Directory.Exists(hostPath);
             if (hadExisting)
+            {
                 Directory.Move(hostPath, backupPath);
+                movedExisting = true;
+            }
             Directory.Move(tempPath, hostPath);
             if (hadExisting)
                 Directory.Delete(backupPath, recursive: true);
         }
         catch
         {
-            if (Directory.Exists(hostPath))
-                Directory.Delete(hostPath, recursive: true);
-            if (Directory.Exists(backupPath))
+            if (movedExisting && Directory.Exists(backupPath))
+            {
+                if (Directory.Exists(hostPath))
+                    Directory.Delete(hostPath, recursive: true);
                 Directory.Move(backupPath, hostPath);
+            }
             throw;
         }
         finally
         {
             if (Directory.Exists(tempPath))
                 Directory.Delete(tempPath, recursive: true);
+            if (Directory.Exists(backupPath) && !Directory.Exists(hostPath))
+                Directory.Move(backupPath, hostPath);
+        }
+    }
+
+    private static void ValidateTarGzipArchive(byte[] bytes, SpritesSandboxOptions opts, string hostPath)
+    {
+        var entries = 0;
+        long expandedBytes = 0;
+        var root = Path.GetFullPath(hostPath);
+        using var input = new MemoryStream(bytes);
+        using var gzip = new GZipStream(input, CompressionMode.Decompress);
+        using var tar = new TarReader(gzip);
+        TarEntry? entry;
+        while ((entry = tar.GetNextEntry()) is not null)
+        {
+            entries++;
+            if (entries > opts.MaxSyncArchiveEntries)
+                throw new InvalidOperationException($"Sprite sync archive for {hostPath} exceeded file-count limit.");
+
+            var destination = Path.GetFullPath(Path.Combine(root, entry.Name));
+            if (!destination.Equals(root, StringComparison.Ordinal) &&
+                !destination.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"Sprite sync archive for {hostPath} contains an unsafe path.");
+            }
+
+            if (entry.EntryType is TarEntryType.SymbolicLink or TarEntryType.HardLink)
+                throw new InvalidOperationException($"Sprite sync archive for {hostPath} contains a link entry.");
+            if (entry.EntryType is not TarEntryType.Directory and not TarEntryType.RegularFile)
+                throw new InvalidOperationException($"Sprite sync archive for {hostPath} contains unsupported entry type {entry.EntryType}.");
+
+            expandedBytes += entry.Length;
+            if (expandedBytes > opts.MaxSyncArchiveExpandedBytes)
+                throw new InvalidOperationException($"Sprite sync archive for {hostPath} exceeded expanded-size limit.");
         }
     }
 
@@ -826,7 +1020,6 @@ internal sealed class SpritesSandbox : ISandbox
         if (_disposed || _disposing)
             return;
         _disposing = true;
-        SandboxLiveCounter.Decrement();
         _onDisposed();
 
         await KillActiveExecsAsync(CancellationToken.None).ConfigureAwait(false);
@@ -868,6 +1061,12 @@ internal sealed class SpritesSandbox : ISandbox
         return $"{prefix}/{relative.TrimStart('/')}";
     }
 
+    private static string Tail(string text)
+    {
+        const int max = 500;
+        return text.Length <= max ? text : text[^max..];
+    }
+
     private readonly record struct ReceivedWebSocketMessage(WebSocketMessageType MessageType, byte[] Payload);
 }
 
@@ -875,7 +1074,7 @@ internal sealed record SpritesMountSync(
     string SandboxPath,
     string? HostPath,
     bool ReadOnly,
-    bool IsTmpfsDirectory);
+    bool IsPersistentTmpfsDirectory);
 
 internal sealed class LimitedOutputCollector
 {
@@ -1020,6 +1219,36 @@ internal sealed class SpritesApiClient
         if (response.StatusCode == HttpStatusCode.NotFound)
             return;
         await EnsureSuccessAsync(response, "kill sprites exec", ct).ConfigureAwait(false);
+        await WaitForKillCompleteAsync(response, name, sessionId, ct).ConfigureAwait(false);
+    }
+
+    private static async Task WaitForKillCompleteAsync(
+        HttpResponseMessage response,
+        string name,
+        int sessionId,
+        CancellationToken ct)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        var sawAnyEvent = false;
+        while (await reader.ReadLineAsync(ct).ConfigureAwait(false) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+            sawAnyEvent = true;
+            using var doc = JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("type", out var typeElement) &&
+                string.Equals(typeElement.GetString(), "complete", StringComparison.Ordinal))
+            {
+                return;
+            }
+        }
+
+        if (sawAnyEvent)
+        {
+            throw new InvalidOperationException(
+                $"Sprites kill for {name} session {sessionId.ToString(CultureInfo.InvariantCulture)} ended before a complete event.");
+        }
     }
 
     private async Task<SpriteListItem> FillCreatedAtAsync(

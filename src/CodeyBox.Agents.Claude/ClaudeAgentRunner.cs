@@ -131,6 +131,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude/projects", ".claude/todos"];
 
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["CODEYBOX_CLAUDE_OAUTH_JSON"];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>

@@ -255,6 +255,17 @@ public interface IShutdownTeardownSandbox : ISandbox
 }
 
 /// <summary>
+/// Marker for sandbox providers whose filesystem cannot safely host
+/// agent credential files. Runners that normally materialise subscription
+/// or OAuth credential bundles under <c>$HOME</c> must fail before writing
+/// those files when this capability is present.
+/// </summary>
+public interface IRejectsFileBackedAgentCredentials : ISandbox
+{
+    string FileBackedAgentCredentialsUnsupportedReason { get; }
+}
+
+/// <summary>
 /// Optional sandbox capability for providers that can freeze a running sandbox
 /// (including its RAM state) and resume it later via
 /// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/>. Currently
