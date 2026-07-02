@@ -7,9 +7,54 @@ using CodeyBox.Sandbox.Multipass;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Real-runtime tests for the Multipass provider. Skipped unless the
-/// <c>multipass</c> CLI is on PATH. These tests are SLOW (each VM launch
-/// is 10-30s) and run serially; they're tagged so CI can skip them.
+/// Opt-in gate for the real-runtime Multipass tests. They are skipped unless
+/// <c>CODEYBOX_RUN_MULTIPASS_INTEGRATION=1</c> AND the <c>multipass</c> CLI is
+/// on PATH — mirroring the <see cref="Integration.AgentSuspendResilience"/>
+/// smoke gate.
+///
+/// The explicit env var is load-bearing: the deterministic <c>dotnet test</c>
+/// gate runs on the orchestrator host, which HAS multipass installed (it is
+/// the production sandbox provider). Gating on PATH-presence alone made those
+/// slow real-VM tests fire inside the gate, where a spawned multipass gRPC
+/// client can hang on <c>grpc_wait_for_shutdown_with_timeout()</c> and crash
+/// the test host. Requiring the opt-in keeps the gate off the real-VM path.
+/// </summary>
+internal static class MultipassIntegrationGate
+{
+    public const string EnableVariable = "CODEYBOX_RUN_MULTIPASS_INTEGRATION";
+
+    private static readonly bool MultipassOnPath = ProbeMultipass();
+
+    public static bool IsEnabled =>
+        string.Equals(Environment.GetEnvironmentVariable(EnableVariable), "1", StringComparison.Ordinal)
+        && MultipassOnPath;
+
+    private static bool ProbeMultipass()
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo
+            {
+                FileName = "multipass",
+                ArgumentList = { "version" },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            });
+            if (p is null) return false;
+            p.WaitForExit(5_000);
+            return p.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+}
+
+/// <summary>
+/// Real-runtime tests for the Multipass provider. Skipped unless
+/// <c>CODEYBOX_RUN_MULTIPASS_INTEGRATION=1</c> and the <c>multipass</c> CLI is
+/// on PATH (see <see cref="MultipassIntegrationGate"/>). These tests are SLOW
+/// (each VM launch is 10-30s) and run serially; they're tagged so CI can skip
+/// them.
 ///
 /// They assert the actual isolation properties and the env-via-file
 /// mechanism — they would catch bugs like "env values leaked into argv"
@@ -18,7 +63,7 @@ namespace CodeyBox.Tests;
 [Collection("Multipass integration")]
 public sealed class MultipassIntegrationTests : IDisposable
 {
-    private static readonly bool _multipassAvailable = LocateMultipass();
+    private static readonly bool _multipassAvailable = MultipassIntegrationGate.IsEnabled;
     private readonly string _workspace;
 
     public MultipassIntegrationTests()
@@ -38,25 +83,6 @@ public sealed class MultipassIntegrationTests : IDisposable
     }
 
     public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
-
-    private static bool LocateMultipass()
-    {
-        try
-        {
-            using var p = Process.Start(new ProcessStartInfo
-            {
-                FileName = "multipass",
-                ArgumentList = { "version" },
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            });
-            if (p is null) return false;
-            p.WaitForExit(5_000);
-            return p.ExitCode == 0;
-        }
-        catch { return false; }
-    }
 
     private MultipassSandboxProvider NewProvider() => new(
         new MultipassSandboxOptions(),
@@ -390,7 +416,9 @@ public sealed class MultipassIntegrationTests : IDisposable
 
 /// <summary>
 /// Integration tests for <see cref="MultipassSandboxProvider.ListAllManagedAsync"/>.
-/// Skipped unless the <c>multipass</c> CLI is on PATH. These tests verify
+/// Skipped unless <c>CODEYBOX_RUN_MULTIPASS_INTEGRATION=1</c> and the
+/// <c>multipass</c> CLI is on PATH (see <see cref="MultipassIntegrationGate"/>).
+/// These tests verify
 /// that the method correctly shells out to <c>multipass list --format json</c>,
 /// filters results to the <c>codeybox-*</c> prefix (excluding non-CodeyBox VMs
 /// such as the default "primary" VM), and caches results within the TTL.
@@ -398,26 +426,7 @@ public sealed class MultipassIntegrationTests : IDisposable
 [Collection("Multipass integration")]
 public sealed class MultipassListAllTests
 {
-    private static readonly bool _multipassAvailable = IsMultipassOnPath();
-
-    private static bool IsMultipassOnPath()
-    {
-        try
-        {
-            using var p = Process.Start(new ProcessStartInfo
-            {
-                FileName = "multipass",
-                ArgumentList = { "version" },
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            });
-            if (p is null) return false;
-            p.WaitForExit(5_000);
-            return p.ExitCode == 0;
-        }
-        catch { return false; }
-    }
+    private static readonly bool _multipassAvailable = MultipassIntegrationGate.IsEnabled;
 
     private static MultipassSandboxProvider NewProvider() => new(
         new MultipassSandboxOptions(),
