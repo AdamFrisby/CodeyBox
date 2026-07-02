@@ -135,7 +135,44 @@ public sealed class MultipassRemoteSandboxProviderTests
         });
 
         Assert.False(sb is IRoutableSandbox);
-        Assert.False(sb is IDeploymentEndpointPublisher);
+        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
+        Assert.True(publisher.CanPublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        }));
+
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task CreateAsync_without_remote_vm_ip_cannot_publish_deployment_endpoint()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+        });
+
+        var publisher = Assert.IsAssignableFrom<IDeploymentEndpointPublisher>(sb);
+        Assert.False(publisher.CanPublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        }));
 
         await sb.DisposeAsync();
     }
@@ -874,6 +911,42 @@ public sealed class MultipassRemoteSandboxProviderTests
         Assert.Equal(SandboxPurpose.Deployment, managed.Purpose);
 
         await sb.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task CreateAsync_marker_write_failure_removes_remote_staging_and_does_not_leave_active()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (argv is ["sh", "-c", var script]
+                && script.StartsWith("printf %s ", StringComparison.Ordinal)
+                && script.Contains(".codeybox-purpose", StringComparison.Ordinal))
+            {
+                return new ProcessRunResult(1, "", "permission denied");
+            }
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Purpose = SandboxPurpose.Deployment,
+            }));
+
+        Assert.Contains(transport.RecordedCalls, c =>
+            c.Argv.Count >= 3
+            && c.Argv[0] == "rm"
+            && c.Argv[1] == "-rf"
+            && c.Argv[2].Contains(opts.RemoteStagingRoot, StringComparison.Ordinal));
+        Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
+        Assert.Empty(provider.SnapshotActiveSandboxProgress());
+        Assert.Empty(provider.SnapshotActiveSandboxes());
     }
 
     [Fact]

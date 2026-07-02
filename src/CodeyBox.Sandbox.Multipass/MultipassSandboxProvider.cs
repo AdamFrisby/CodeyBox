@@ -5340,7 +5340,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox, IDeploymentEndpointPublisher
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox, IDeploymentEndpointPublisher, IActiveSandboxLease
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5561,6 +5561,18 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             throw new NotSupportedException(
                 $"Multipass sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
         return DeploymentEndpointPublisher.ForHostPort(request, _hostAddress!);
+    }
+
+    public void ReleaseActiveTracking()
+    {
+        try
+        {
+            _onNoLongerTrackedActive?.Invoke(_name);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to release active tracking for multipass VM {Name}", _name);
+        }
     }
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
@@ -7572,14 +7584,7 @@ while True:
                 throw;
             return;
         }
-        try
-        {
-            _onNoLongerTrackedActive?.Invoke(_name);
-        }
-        catch (Exception callbackEx)
-        {
-            _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
-        }
+        ReleaseActiveTracking();
         _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name, metrics);
         try { Directory.Delete(_sandboxRoot, recursive: true); }

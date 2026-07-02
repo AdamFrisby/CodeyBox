@@ -10,7 +10,7 @@ namespace CodeyBox.Tests;
 /// probe transitions) so each test can pin a specific lifecycle outcome
 /// without spinning a real VM.
 /// </summary>
-internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
+internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider, IDeploymentCleanupProvider
 {
     private readonly List<FakeDeploymentSandbox> _created = new();
     private readonly List<SandboxSpec> _specs = new();
@@ -45,6 +45,7 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
     public Func<DeploymentEndpointRequest, DeploymentEndpoint>? PublishEndpointOverride { get; set; }
     public HashSet<string> DisposeThrowsFor { get; } = new(StringComparer.Ordinal);
     public HashSet<string> SandboxDisposeThrowsFor { get; } = new(StringComparer.Ordinal);
+    public bool SandboxDisposeThrows { get; set; }
 
     /// <summary>
     /// Optional override for the synthetic <see cref="ManagedSandboxInfo"/>
@@ -78,11 +79,26 @@ internal sealed class FakeDeploymentSandboxProvider : ISandboxProvider
                         sb.Id,
                         sb.CreatedAt,
                         DiskBytes: null,
-                        IsTrackedActive: !sb.IsDisposed,
+                        IsTrackedActive: sb.IsTrackedActive,
                         Purpose: sb.Spec.Purpose))
                 .ToList();
         }
         return Task.FromResult(snapshot);
+    }
+
+    async Task<IReadOnlyList<DeploymentResourceInfo>> IDeploymentCleanupProvider.ListAllManagedAsync(CancellationToken ct)
+    {
+        var managed = await ListAllManagedAsync(ct).ConfigureAwait(false);
+        return managed
+            .Where(info => info.Purpose == SandboxPurpose.Deployment)
+            .Select(info => new DeploymentResourceInfo(
+                info.Name,
+                info.CreatedAt,
+                info.DiskBytes,
+                info.IsTrackedActive,
+                info.HasPreemptMarker,
+                info.IsSuspendLifecycleOrFrozen))
+            .ToList();
     }
 
     public Task DisposeLeakedAsync(string name, CancellationToken ct)
@@ -159,12 +175,14 @@ internal sealed class ExecRule
     }
 }
 
-internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpointPublisher
+internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpointPublisher, IActiveSandboxLease
 {
     private readonly FakeDeploymentSandboxProvider _provider;
     public string Id { get; } = $"codeybox-{Guid.NewGuid():N}"[..23];
     public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
     public bool IsDisposed { get; private set; }
+    public bool ActiveTrackingReleased { get; private set; }
+    public bool IsTrackedActive => !IsDisposed && !ActiveTrackingReleased;
     public int DisposeCallCount { get; private set; }
     public SandboxSpec Spec { get; }
     public string? HostAddress => _provider.HostAddress;
@@ -197,12 +215,14 @@ internal sealed class FakeDeploymentSandbox : IRoutableSandbox, IDeploymentEndpo
 
     public ValueTask DisposeAsync()
     {
-        if (_provider.SandboxDisposeThrowsFor.Contains(Id))
+        if (_provider.SandboxDisposeThrows || _provider.SandboxDisposeThrowsFor.Contains(Id))
             throw new InvalidOperationException($"Simulated sandbox dispose failure for {Id}.");
         DisposeCallCount++;
         MarkDisposed();
         return ValueTask.CompletedTask;
     }
+
+    public void ReleaseActiveTracking() => ActiveTrackingReleased = true;
 
     internal void MarkDisposed() => IsDisposed = true;
 }

@@ -377,12 +377,17 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         else if (!string.IsNullOrWhiteSpace(opts.DefaultImage))
             launchArgv.Add(opts.DefaultImage!);
 
+        // Cleanup differentiator: pre-launch failures leave only the staging
+        // directory, so best-effort cleanup can skip the (nonexistent) VM
+        // delete. Post-launch failures may have left a VM behind.
+        var launchAttempted = false;
         try
         {
             // Track before clone/launch so an in-progress VM that appears in
             // multipass list is treated as active by leak sweeps.
             var activeKey = new RemoteSandboxIdentity(opts.HostId, vmName);
             _active[activeKey] = sandbox;
+            launchAttempted = true;
 
             if (!string.IsNullOrWhiteSpace(spec.BaselineImageRef))
             {
@@ -395,6 +400,13 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             }
 
             await WaitForVmStateAsync(opts, transport, vmName, "Running", opts.VmStartTimeout, ct).ConfigureAwait(false);
+
+            // Publish the VM's IPv4 address to the sandbox so deployment
+            // drivers can open an SSH local-forward endpoint into the guest.
+            // The lookup is best-effort — a missing address leaves the sandbox
+            // non-publishing rather than failing placement.
+            var vmAddress = await ResolveRemoteVmAddressAsync(opts, transport, vmName, ct).ConfigureAwait(false);
+            sandbox.RegisterVmAddress(vmAddress);
 
             // 4) Apply environment via a stamped /etc/environment fragment.
             //    multipass exec is per-call by default; environment from the
@@ -417,6 +429,13 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         catch
         {
             _active.TryRemove(new RemoteSandboxIdentity(opts.HostId, vmName), out _);
+            // Best-effort cleanup of any partial remote state. We DO NOT log
+            // here at error level — the original exception is the real story
+            // and is about to be rethrown by the caller's try.
+            if (launchAttempted)
+                await BestEffortRemoteDeleteAsync(opts, transport, vmName, remoteSandboxRoot, CancellationToken.None).ConfigureAwait(false);
+            else
+                await BestEffortRemoteStagingCleanupAsync(opts, transport, remoteSandboxRoot).ConfigureAwait(false);
             throw;
         }
 
@@ -1062,6 +1081,45 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
     }
 
+    internal async Task<string?> ResolveRemoteVmAddressAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        CancellationToken ct)
+    {
+        ProcessRunResultLike r;
+        try
+        {
+            r = await RunRemoteInventoryAsync(
+                opts,
+                transport,
+                [opts.RemoteMultipassPath, "info", vmName, "--format", "json"],
+                ct).ConfigureAwait(false);
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            _log.LogWarning(ex,
+                "Remote VM {Vm}: SSH transport failure reading multipass info for deployment endpoint publishing on host {HostId}",
+                vmName, opts.HostId);
+            return null;
+        }
+        catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+        {
+            _log.LogWarning(ex,
+                "Remote VM {Vm}: multipass info failed on host {HostId} for deployment endpoint publishing",
+                vmName, opts.HostId);
+            return null;
+        }
+        if (r.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Remote VM {Vm}: multipass info exit {ExitCode} on host {HostId} for deployment endpoint publishing: {Stderr}",
+                vmName, r.ExitCode, opts.HostId, TruncateForLog(r.Stderr));
+            return null;
+        }
+        return TryParseVmAddress(r.Stdout, vmName, out var address) ? address : null;
+    }
+
     private static bool TryParseVmState(string json, string vmName, out string state)
     {
         state = "";
@@ -1076,6 +1134,31 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             if (s is null) return false;
             state = s;
             return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseVmAddress(string json, string vmName, out string address)
+    {
+        address = "";
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("info", out var info)) return false;
+            if (!info.TryGetProperty(vmName, out var entry)) return false;
+            if (!entry.TryGetProperty("ipv4", out var ipv4) || ipv4.ValueKind != JsonValueKind.Array) return false;
+            foreach (var item in ipv4.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String) continue;
+                var candidate = item.GetString();
+                if (string.IsNullOrWhiteSpace(candidate)) continue;
+                address = candidate!;
+                return true;
+            }
+            return false;
         }
         catch (JsonException)
         {
@@ -1600,6 +1683,33 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
             _owner.ReleaseHostReservation(HostOptions.HostId);
+        }
+    }
+
+    private async Task BestEffortRemoteStagingCleanupAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string remoteSandboxRoot)
+    {
+        try
+        {
+            await RunRemoteControlAsync(
+                opts,
+                transport,
+                ["rm", "-rf", remoteSandboxRoot],
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            _log.LogWarning(ex,
+                "Best-effort remote staging cleanup of {Dir} on host {HostId} failed (transport)",
+                remoteSandboxRoot, opts.HostId);
+        }
+        catch (RemoteHostProvisioningException ex)
+        {
+            _log.LogWarning(ex,
+                "Best-effort remote staging cleanup of {Dir} on host {HostId} failed",
+                remoteSandboxRoot, opts.HostId);
         }
     }
 

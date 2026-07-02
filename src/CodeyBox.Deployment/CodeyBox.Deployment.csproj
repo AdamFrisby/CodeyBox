@@ -2,7 +2,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
-    <ProjectReference Include="..\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />
   </ItemGroup>
 
   <ItemGroup>

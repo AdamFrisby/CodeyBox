@@ -94,6 +94,37 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
+    public async Task WebApp_BuildFails_AndDisposeFails_ReleasesActiveTrackingForReaperRetry()
+    {
+        var provider = new FakeDeploymentSandboxProvider
+        {
+            SandboxDisposeThrows = true,
+        };
+        provider.ExecRules.Add(new ExecRule("build-fail", new SandboxExecResult(2, "", "compile error")));
+
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            BuildCommand = "build-fail",
+            RunCommand = "./server",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None));
+
+        var sandbox = Assert.Single(provider.Created);
+        Assert.False(sandbox.IsDisposed);
+        Assert.True(sandbox.ActiveTrackingReleased);
+
+        var cleanupInfo = Assert.Single(await ((IDeploymentCleanupProvider)provider).ListAllManagedAsync(CancellationToken.None));
+        Assert.False(cleanupInfo.IsTrackedActive);
+    }
+
+    [Fact]
     public async Task DeploymentExecs_SetOutputCaps()
     {
         var provider = new FakeDeploymentSandboxProvider();
@@ -599,6 +630,30 @@ public sealed class DeploymentDriverTests
         Assert.Equal(5432, handle.Endpoint.Port);
         Assert.Equal("10.42.0.10", handle.Endpoint.Host);
         Assert.Equal("host-routable", handle.Endpoint.Metadata["endpoint.scope"]);
+    }
+
+    [Fact]
+    public async Task Daemon_WithHealthEndpoint_UsesHttpHealthProbeInsteadOfRawTcp()
+    {
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("/healthz", new SandboxExecResult(0, "ok", "")));
+        provider.ExecRules.Add(new ExecRule("/dev/tcp", new SandboxExecResult(1, "", "tcp probe should not run")));
+
+        var driver = new DaemonDeploymentDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.Daemon,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./daemon",
+            Ports = [8080],
+            HealthEndpoint = "/healthz",
+        };
+
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Equal(DeploymentEndpointKind.Tcp, handle.Endpoint.Kind);
+        Assert.Contains(provider.ExecLog, c => c.Contains("http://127.0.0.1:8080/healthz", StringComparison.Ordinal));
+        Assert.DoesNotContain(provider.ExecLog, c => c.Contains("/dev/tcp/127.0.0.1/8080", StringComparison.Ordinal));
     }
 
     [Fact]

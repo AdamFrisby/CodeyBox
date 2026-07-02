@@ -7,7 +7,7 @@ namespace CodeyBox.Deployment;
 /// keeps sandbox provisioning and command DTOs out of the public deployment
 /// driver contract while preserving the current Multipass/process substrate.
 /// </summary>
-public sealed class SandboxDeploymentSubstrateProvider : IDeploymentSubstrateProvider
+public sealed class SandboxDeploymentSubstrateProvider : IDeploymentSubstrateProvider, IDeploymentCleanupProvider
 {
     private readonly ISandboxProvider _inner;
 
@@ -26,6 +26,24 @@ public sealed class SandboxDeploymentSubstrateProvider : IDeploymentSubstratePro
         var sandbox = await _inner.CreateAsync(ToSandboxSpec(spec), ct).ConfigureAwait(false);
         return new SandboxDeploymentSubstrate(sandbox);
     }
+
+    public async Task<IReadOnlyList<DeploymentResourceInfo>> ListAllManagedAsync(CancellationToken ct = default)
+    {
+        var managed = await _inner.ListAllManagedAsync(ct).ConfigureAwait(false);
+        return managed
+            .Where(info => info.Purpose == SandboxPurpose.Deployment)
+            .Select(info => new DeploymentResourceInfo(
+                info.Name,
+                info.CreatedAt,
+                info.DiskBytes,
+                info.IsTrackedActive,
+                info.HasPreemptMarker,
+                info.IsSuspendLifecycleOrFrozen))
+            .ToList();
+    }
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct = default)
+        => _inner.DisposeLeakedAsync(name, ct);
 
     private static SandboxSpec ToSandboxSpec(DeploymentSubstrateSpec spec) => new()
     {
@@ -49,7 +67,7 @@ public sealed class SandboxDeploymentSubstrateProvider : IDeploymentSubstratePro
     };
 }
 
-internal sealed class SandboxDeploymentSubstrate : IDeploymentSubstrate
+internal sealed class SandboxDeploymentSubstrate : IDeploymentSubstrate, IDeploymentActiveLease
 {
     private readonly ISandbox _inner;
     private readonly IDeploymentEndpointPublisher? _endpointPublisher;
@@ -86,7 +104,24 @@ internal sealed class SandboxDeploymentSubstrate : IDeploymentSubstrate
             : throw new NotSupportedException(
                 $"Deployment substrate '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString() ?? "<none>"}.");
 
-    public ValueTask DisposeAsync() => _inner.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            await _inner.DisposeAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            ReleaseActiveTracking();
+            throw;
+        }
+    }
+
+    public void ReleaseActiveTracking()
+    {
+        if (_inner is IActiveSandboxLease lease)
+            lease.ReleaseActiveTracking();
+    }
 
     private static SandboxExec ToSandboxExec(DeploymentCommand command) => new()
     {

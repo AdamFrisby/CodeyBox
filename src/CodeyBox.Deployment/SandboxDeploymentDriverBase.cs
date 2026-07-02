@@ -181,7 +181,18 @@ public abstract class SandboxDeploymentDriverBase : IDeploymentDriver
             if (substrate is not null)
             {
                 try { await substrate.DisposeAsync().ConfigureAwait(false); }
-                catch (Exception ex) { Log.LogWarning(ex, "Driver {Kind} teardown after failed deploy threw", Kind); }
+                catch (Exception ex)
+                {
+                    if (substrate is IDeploymentActiveLease lease)
+                    {
+                        try { lease.ReleaseActiveTracking(); }
+                        catch (Exception leaseEx)
+                        {
+                            Log.LogWarning(leaseEx, "Driver {Kind} failed to release active tracking after teardown failure", Kind);
+                        }
+                    }
+                    Log.LogWarning(ex, "Driver {Kind} teardown after failed deploy threw", Kind);
+                }
             }
             throw;
         }

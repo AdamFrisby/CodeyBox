@@ -7,9 +7,9 @@ namespace CodeyBox.Deployment;
 
 /// <summary>
 /// Periodic background sweep that detects — and optionally disposes —
-/// provider-managed sandboxes whose deployment owner no longer exists in
+/// provider-managed deployment resources whose deployment owner no longer exists in
 /// <see cref="IDeploymentManager.GetActive"/>. Follows the same pattern as
-/// <c>SandboxLeakReaper</c>: enumerate the provider's managed sandboxes,
+/// <c>SandboxLeakReaper</c>: enumerate the substrate provider's managed resources,
 /// filter by an age threshold, and dispose the orphans.
 ///
 /// <para>The reaper is the safety net for orchestrator restarts and aborted
@@ -17,11 +17,11 @@ namespace CodeyBox.Deployment;
 /// <see cref="IDeploymentHandle.DisposeAsync"/>; this reaper only acts when
 /// the normal path was interrupted before disposal could run.</para>
 ///
-/// <para>The provider's <see cref="ISandboxProvider.ListAllManagedAsync"/>
-/// surface lists every codeybox-* sandbox, so this reaper only considers
-/// records explicitly tagged <see cref="SandboxPurpose.Deployment"/>. Work,
-/// audit, merge, and session VMs are left to the general sandbox reaper. The
-/// deployment reaper still honours preserve skip-gates for deployment VMs:</para>
+/// <para>The cleanup provider is deployment-scoped: the built-in sandbox
+/// adapter filters to deployment-tagged sandboxes, while future cloud-VM
+/// substrates can expose their own deployment resource inventory without
+/// referencing sandbox APIs. The deployment reaper still honours preserve
+/// skip-gates for deployment VMs:</para>
 /// <list type="bullet">
 ///   <item><b>HasPreemptMarker</b> — graceful-shutdown-preserved VMs are
 ///   exempt for <see cref="DeploymentLeakOptions.PreemptRetention"/>
@@ -39,7 +39,7 @@ namespace CodeyBox.Deployment;
 /// </summary>
 public sealed class DeploymentLeakReaper : BackgroundService
 {
-    private readonly ISandboxProvider _provider;
+    private readonly IDeploymentCleanupProvider _cleanupProvider;
     private readonly IDeploymentManager _manager;
     private readonly Func<DeploymentLeakOptions> _optsAccessor;
     private readonly ILogger<DeploymentLeakReaper> _log;
@@ -50,14 +50,14 @@ public sealed class DeploymentLeakReaper : BackgroundService
     private volatile IReadOnlyList<DeploymentLeakInfo> _latestLeaks = [];
 
     public DeploymentLeakReaper(
-        ISandboxProvider provider,
+        IDeploymentCleanupProvider cleanupProvider,
         IDeploymentManager manager,
         Func<DeploymentLeakOptions> optionsAccessor,
         ILogger<DeploymentLeakReaper> log,
         Func<DateTimeOffset>? clock = null,
         Func<CancellationToken, Task<IReadOnlySet<string>>>? suspendedNameProvider = null)
     {
-        _provider = provider ?? throw new ArgumentNullException(nameof(provider));
+        _cleanupProvider = cleanupProvider ?? throw new ArgumentNullException(nameof(cleanupProvider));
         _manager = manager ?? throw new ArgumentNullException(nameof(manager));
         _optsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log;
@@ -103,7 +103,7 @@ public sealed class DeploymentLeakReaper : BackgroundService
         }
         try
         {
-            var managed = await _provider.ListAllManagedAsync(ct).ConfigureAwait(false);
+            var managed = await _cleanupProvider.ListAllManagedAsync(ct).ConfigureAwait(false);
             var active = _manager.GetActive();
             var activeSubstrateIds = new HashSet<string>(
                 active.Where(a => a.SubstrateId is not null).Select(a => a.SubstrateId!),
@@ -117,10 +117,8 @@ public sealed class DeploymentLeakReaper : BackgroundService
             var leaks = new List<DeploymentLeakInfo>();
             foreach (var info in managed)
             {
-                if (info.Purpose != SandboxPurpose.Deployment) continue;
-
                 // Tracked-active: the current orchestrator process owns this
-                // sandbox via a live phase or active deployment handle. Never
+                // resource via a live phase or active deployment handle. Never
                 // a leak.
                 if (info.IsTrackedActive) continue;
 
@@ -189,7 +187,7 @@ public sealed class DeploymentLeakReaper : BackgroundService
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
                 try
                 {
-                    await _provider.DisposeLeakedAsync(leak.Name, linked.Token).ConfigureAwait(false);
+                    await _cleanupProvider.DisposeLeakedAsync(leak.Name, linked.Token).ConfigureAwait(false);
                     _log.LogInformation(
                         "DeploymentLeakReaper: disposed orphan sandbox {Name} age={AgeMinutes:F1}min",
                         leak.Name, leak.Age.TotalMinutes);

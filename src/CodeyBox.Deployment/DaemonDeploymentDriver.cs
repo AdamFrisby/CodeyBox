@@ -65,6 +65,13 @@ public sealed class DaemonDeploymentDriver : SandboxDeploymentDriverBase
         {
             probeArgv = ["sh", "-c", explicitCmd];
         }
+        else if (recipe.Ports.Count > 0 && !string.IsNullOrWhiteSpace(recipe.HealthEndpoint))
+        {
+            var port = recipe.Ports[0];
+            var path = recipe.HealthEndpoint!.StartsWith('/') ? recipe.HealthEndpoint : "/" + recipe.HealthEndpoint;
+            var probeUrl = $"http://127.0.0.1:{port}{path}";
+            probeArgv = ["sh", "-c", $"curl -fsS -o /dev/null --max-time 5 {Shell.Quote(probeUrl)}"];
+        }
         else
         {
             if (recipe.Ports.Count > 0)

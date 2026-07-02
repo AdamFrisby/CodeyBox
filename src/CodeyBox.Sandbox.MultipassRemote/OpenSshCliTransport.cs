@@ -822,9 +822,44 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
 
     private readonly record struct LimitedTextReadResult(string Text, bool LimitExceeded);
 
+    internal static IReadOnlyList<string> BuildLocalForwardArgv(
+        MultipassRemoteSandboxOptions opts,
+        string localHost,
+        int localPort,
+        string remoteHost,
+        int remotePort)
+    {
+        if (string.IsNullOrWhiteSpace(localHost))
+            throw new ArgumentException("Local host is required.", nameof(localHost));
+        if (string.IsNullOrWhiteSpace(remoteHost))
+            throw new ArgumentException("Remote host is required.", nameof(remoteHost));
+        if (localPort is < 1 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(localPort), localPort, "Port must be 1..65535.");
+        if (remotePort is < 1 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(remotePort), remotePort, "Port must be 1..65535.");
+
+        var argv = BuildSshBaseArgv(opts);
+        argv.Add("-o");
+        argv.Add("ExitOnForwardFailure=yes");
+        argv.Add("-N");
+        argv.Add("-L");
+        argv.Add($"{localHost}:{localPort}:{remoteHost}:{remotePort}");
+        argv.Add(opts.SshTarget);
+        return argv;
+    }
+
     private static IReadOnlyList<string> BuildSshArgv(MultipassRemoteSandboxOptions opts, string remoteCommand)
     {
+        var argv = BuildSshBaseArgv(opts);
+        argv.Add(opts.SshTarget);
+        argv.Add(remoteCommand);
+        return argv;
+    }
+
+    private static List<string> BuildSshBaseArgv(MultipassRemoteSandboxOptions opts)
+    {
         var argv = new List<string>(16) { opts.SshBinary };
+        ValidateOptionsOrThrow(opts);
         // BatchMode=yes prevents OpenSSH from prompting for a password
         // interactively when the key auth fails — that prompt would deadlock
         // the orchestrator. The transport always uses key-based auth.
@@ -863,8 +898,6 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
                     $"ExtraSshOptions entry '{extra}' looks unsafe — expected '<Key>=<Value>' with no whitespace.");
             argv.Add("-o"); argv.Add(extra);
         }
-        argv.Add(opts.SshTarget);
-        argv.Add(remoteCommand);
         return argv;
     }
 

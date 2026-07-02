@@ -3565,8 +3565,12 @@ builder.Services.AddSingleton<IDeploymentDriver, WebAppDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, DaemonDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, CliDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, LibraryDeploymentDriver>();
-builder.Services.AddSingleton<IDeploymentSubstrateProvider>(sp =>
+builder.Services.AddSingleton<SandboxDeploymentSubstrateProvider>(sp =>
     new SandboxDeploymentSubstrateProvider(sp.GetRequiredService<ISandboxProvider>()));
+builder.Services.AddSingleton<IDeploymentSubstrateProvider>(sp =>
+    sp.GetRequiredService<SandboxDeploymentSubstrateProvider>());
+builder.Services.AddSingleton<IDeploymentCleanupProvider>(sp =>
+    sp.GetRequiredService<SandboxDeploymentSubstrateProvider>());
 builder.Services.AddSingleton<IDeploymentDriverRegistry, DeploymentDriverRegistry>();
 builder.Services.AddSingleton<IDeploymentManager>(sp => new DeploymentManager(
     sp.GetRequiredService<IDeploymentDriverRegistry>(),
@@ -3592,7 +3596,7 @@ builder.Services.AddSingleton<DeploymentLeakReaper>(sp =>
         return set;
     };
     return new DeploymentLeakReaper(
-        sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<IDeploymentCleanupProvider>(),
         sp.GetRequiredService<IDeploymentManager>(),
         () => monitor.CurrentValue.DeploymentLeak,
         sp.GetRequiredService<ILogger<DeploymentLeakReaper>>(),
@@ -4575,6 +4579,14 @@ namespace CodeyBox.Api
         /// treated as one legacy host named "default".
         /// </summary>
         public IList<MultipassRemoteExecutorHostConfig>? ExecutorHosts { get; set; }
+
+        /// <summary>
+        /// Maps logical network-profile names to bridge names on the remote
+        /// Multipass host(s). When omitted (null/empty), the remote provider
+        /// falls back to the global <c>SandboxNetworkProfiles</c> map for
+        /// backward compatibility.
+        /// </summary>
+        public Dictionary<string, string>? NetworkProfiles { get; set; }
     }
 
     public sealed class MultipassRemoteExecutorHostConfig

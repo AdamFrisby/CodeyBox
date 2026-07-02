@@ -327,12 +327,15 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
             BaseBranch = "main",
             WorkBranch = "feature/x",
             MergeSha = mergeSha,
-            // Fork a grandchild that survives the parent and keeps stdout open
-            // for 30 seconds. The shell uses (cmd &) to detach without
-            // job-control plumbing; the grandchild inherits the parent's
-            // stdout (FD 1) because that's how the shell sets it up before
-            // fork. Then the parent sleeps so it exceeds the 500ms timeout.
-            Argv = ["/bin/sh", "-c", "(sleep 30 &); sleep 30"],
+            // Fork a child from a short-lived Python process so the holder is
+            // re-parented before the verifier's 500ms timeout. It inherits FD
+            // 1, so stdout remains open after process-tree kill unless the
+            // verifier bounds the drain.
+            Argv =
+            [
+                "/bin/sh", "-c",
+                "python3 -c 'import os,time; pid=os.fork(); time.sleep(30) if pid == 0 else None' && sleep 30",
+            ],
         }, CancellationToken.None);
         var elapsed = DateTime.UtcNow - start;
 

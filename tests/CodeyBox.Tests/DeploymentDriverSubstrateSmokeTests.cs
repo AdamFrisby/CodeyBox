@@ -1,5 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Deployment;
+using CodeyBox.ExploratoryTesting;
+using CodeyBox.ExploratoryTesting.Recipes;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -20,39 +22,30 @@ public sealed class DeploymentDriverSubstrateSmokeTests
     public async Task WebApp_JobTrackPilot_Deploys_HealthChecks_Exposes_AndTearsDown_OnProcessSubstrate()
     {
         using var fixture = CreateJobTrackFixture();
-        var port = GetFreeTcpPort();
+        var jobTrack = JobTrackRecipe.Default(fixture.Path);
         var provider = new RoutableProcessSandboxProvider();
         var driver = new WebAppDeploymentDriver();
-        var recipe = new DeploymentRecipe
-        {
-            Kind = DeploymentKinds.WebApp,
-            ImageReference = "ignored",
-            BuildCommand = "test -f index.html && test -f health",
-            RunCommand = $"timeout 30 python3 -m http.server {port} --bind 127.0.0.1",
-            Ports = [port],
-            HealthEndpoint = "/health",
-            StartupTimeout = TimeSpan.FromSeconds(15),
-            Settings = new Dictionary<string, string>
-            {
-                [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.05",
-            },
-        };
+        var recipe = ToDeploymentRecipe(jobTrack);
 
         await using var handle = await driver.DeployAsync(
             recipe,
-            Ctx(provider,
-            [
-                new DeploymentMount
-                {
-                    SubstratePath = "/work",
-                    HostPath = fixture.Path,
-                    ReadOnly = false,
-                },
-            ]),
+            Ctx(provider, ToDeploymentMounts(jobTrack.Mounts)),
             CancellationToken.None);
         Assert.Equal(DeploymentEndpointKind.Http, handle.Endpoint.Kind);
-        Assert.Equal($"http://127.0.0.1:{port}", handle.Endpoint.Url);
+        Assert.Equal("http://127.0.0.1:5080", handle.Endpoint.Url);
         await handle.HealthCheckAsync();
+
+        var log = File.ReadAllText(Path.Combine(fixture.Path, ".codeybox-harness", "jobtrack-recipe.log"));
+        Assert.Contains("apt-get install", log, StringComparison.Ordinal);
+        Assert.Contains("restore JobTrack.sln", log, StringComparison.Ordinal);
+        Assert.Contains("build JobTrack.sln --no-restore -c Release", log, StringComparison.Ordinal);
+        Assert.Contains("ef database update --project src/JobTrack.Api", log, StringComparison.Ordinal);
+        Assert.Contains("run --project tools/JobTrack.SeedFixtures -- --seed 1", log, StringComparison.Ordinal);
+        Assert.Contains("run --no-build -c Release --project src/JobTrack.Api", log, StringComparison.Ordinal);
+        await handle.ExecAsync(new DeploymentCommand
+        {
+            Argv = ["rm", "-f", ".codeybox-harness/server.keepalive"],
+        });
     }
 
     [Fact]
@@ -164,19 +157,154 @@ public sealed class DeploymentDriverSubstrateSmokeTests
         WorkingDirectory = "/work",
     };
 
+    private static DeploymentRecipe ToDeploymentRecipe(WebAppRecipe recipe) => new()
+    {
+        Kind = DeploymentKinds.WebApp,
+        ImageReference = "ignored",
+        BuildCommand = string.Join(
+            " && ",
+            recipe.BuildSteps.Concat(recipe.SeedSteps).Select(step => "PATH=fake-bin:$PATH " + QuoteArgv(step.Command))),
+        RunCommand = "PATH=fake-bin:$PATH " + QuoteArgv(recipe.RunCommand.Command),
+        Ports = [5080],
+        HealthEndpoint = "/",
+        StartupTimeout = TimeSpan.FromSeconds(15),
+        Environment = new Dictionary<string, string>(recipe.Environment, StringComparer.Ordinal)
+        {
+            ["JOBTRACK_DB_PATH"] = ".codeybox-harness/jobtrack.db",
+        },
+        Settings = new Dictionary<string, string>
+        {
+            [WebAppDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.05",
+        },
+    };
+
+    private static IReadOnlyList<DeploymentMount> ToDeploymentMounts(IReadOnlyList<SandboxMount> mounts)
+        => mounts.Select(m => new DeploymentMount
+        {
+            SubstratePath = m.SandboxPath,
+            HostPath = m.HostPath,
+            ReadOnly = m.ReadOnly,
+            Tmpfs = m.Tmpfs,
+            SizeBytes = m.SizeBytes,
+        }).ToList();
+
+    private static string QuoteArgv(IReadOnlyList<string> argv)
+        => string.Join(' ', argv.Select(QuoteShellWord));
+
+    private static string QuoteShellWord(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "''";
+        return "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
+    }
+
     private static TempDirectory CreateJobTrackFixture()
     {
         var dir = new TempDirectory();
-        File.WriteAllText(Path.Combine(dir.Path, "index.html"), "<!doctype html><title>JobTrack</title>");
-        File.WriteAllText(Path.Combine(dir.Path, "health"), "ok");
+        Directory.CreateDirectory(Path.Combine(dir.Path, "fake-bin"));
+        Directory.CreateDirectory(Path.Combine(dir.Path, "src", "JobTrack.Api"));
+        Directory.CreateDirectory(Path.Combine(dir.Path, "tools", "JobTrack.SeedFixtures"));
+        Directory.CreateDirectory(Path.Combine(dir.Path, ".codeybox-harness"));
+
+        File.WriteAllText(Path.Combine(dir.Path, "JobTrack.sln"), "Microsoft Visual Studio Solution File, Format Version 12.00\n");
+        File.WriteAllText(Path.Combine(dir.Path, "src", "JobTrack.Api", "JobTrack.Api.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk.Web\" />\n");
+        File.WriteAllText(Path.Combine(dir.Path, "tools", "JobTrack.SeedFixtures", "JobTrack.SeedFixtures.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        File.WriteAllText(Path.Combine(dir.Path, "src", "JobTrack.Api", "jobtrack_server.py"), """
+            import os
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path in ("/", "/health", "/healthz"):
+                        body = b"JobTrack deployment ready"
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+
+                def log_message(self, format, *args):
+                    return
+
+            server = HTTPServer(("127.0.0.1", 5080), Handler)
+            server.timeout = 0.2
+            while os.path.exists(".codeybox-harness/server.keepalive"):
+                server.handle_request()
+            """);
+
+        WriteExecutable(Path.Combine(dir.Path, "fake-bin", "sudo"), """
+            #!/usr/bin/env sh
+            set -eu
+            mkdir -p .codeybox-harness
+            printf '%s\n' "$*" >> .codeybox-harness/jobtrack-recipe.log
+            if [ "${1:-}" = "apt-get" ]; then
+              touch .codeybox-harness/firefox-installed
+              exit 0
+            fi
+            exec "$@"
+            """);
+        WriteExecutable(Path.Combine(dir.Path, "fake-bin", "dotnet"), """
+            #!/usr/bin/env sh
+            set -eu
+            mkdir -p .codeybox-harness
+            printf '%s\n' "$*" >> .codeybox-harness/jobtrack-recipe.log
+            case "$*" in
+              "restore JobTrack.sln")
+                test -f JobTrack.sln
+                ;;
+              "build JobTrack.sln --no-restore -c Release")
+                test -f src/JobTrack.Api/JobTrack.Api.csproj
+                touch .codeybox-harness/build.ok
+                ;;
+              "ef database update --project src/JobTrack.Api")
+                test -d src/JobTrack.Api
+                : > "${JOBTRACK_DB_PATH:-.codeybox-harness/jobtrack.db}"
+                ;;
+              "run --project tools/JobTrack.SeedFixtures -- --seed 1")
+                test -f "${JOBTRACK_DB_PATH:-.codeybox-harness/jobtrack.db}"
+                test -f tools/JobTrack.SeedFixtures/JobTrack.SeedFixtures.csproj
+                touch .codeybox-harness/seed.ok
+                ;;
+              "run --no-build -c Release --project src/JobTrack.Api")
+                test -f .codeybox-harness/build.ok
+                test -f .codeybox-harness/seed.ok
+                touch .codeybox-harness/server.keepalive
+                exec timeout 30 python3 src/JobTrack.Api/jobtrack_server.py
+                ;;
+              *)
+                echo "unexpected dotnet invocation: $*" >&2
+                exit 64
+                ;;
+            esac
+            """);
+        WriteExecutable(Path.Combine(dir.Path, "fake-bin", "firefox"), """
+            #!/usr/bin/env sh
+            exit 0
+            """);
         return dir;
     }
 
-    private static int GetFreeTcpPort()
+    private static void WriteExecutable(string path, string content)
     {
-        using var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
-        listener.Start();
-        return ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        File.WriteAllText(path, content.Replace("\r\n", "\n", StringComparison.Ordinal));
+        try
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    path,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                    UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            }
+        }
+        catch
+        {
+            // Non-Unix test hosts ignore mode bits.
+        }
     }
 
     private sealed class TempDirectory : IDisposable

@@ -462,28 +462,24 @@ public sealed class DeploymentLeakReaperTests
         }
     }
 
-    private sealed class ThrowingListProvider : ISandboxProvider
+    private sealed class ThrowingListProvider : IDeploymentCleanupProvider
     {
         public string Name => "throwing-list";
-        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotSupportedException();
-        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        public Task<IReadOnlyList<DeploymentResourceInfo>> ListAllManagedAsync(CancellationToken ct = default)
             => throw new InvalidOperationException("list unavailable");
-        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        public Task DisposeLeakedAsync(string name, CancellationToken ct = default)
             => throw new NotSupportedException();
     }
 
-    private sealed class CancellationAwareListProvider : ISandboxProvider
+    private sealed class CancellationAwareListProvider : IDeploymentCleanupProvider
     {
         public string Name => "cancelling-list";
-        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotSupportedException();
-        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        public Task<IReadOnlyList<DeploymentResourceInfo>> ListAllManagedAsync(CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
-            return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+            return Task.FromResult<IReadOnlyList<DeploymentResourceInfo>>([]);
         }
-        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        public Task DisposeLeakedAsync(string name, CancellationToken ct = default)
             => throw new NotSupportedException();
     }
 }

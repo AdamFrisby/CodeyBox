@@ -47,7 +47,7 @@ public sealed class DeploymentProgramWiringTests
     }
 
     [Fact]
-    public void ProgramBuildMultipassRemoteOptions_CopiesGlobalSandboxNetworkProfiles()
+    public void ProgramBuildMultipassRemoteOptions_FallsBackToGlobalSandboxNetworkProfiles()
     {
         var options = new CodeyBoxOptions
         {
@@ -65,6 +65,31 @@ public sealed class DeploymentProgramWiringTests
 
         Assert.Equal("cb-deploy", remote.NetworkProfiles["deploy-isolated"]);
         Assert.Equal("cb-deploy", remote.NetworkProfiles["DEPLOY-ISOLATED"]);
+    }
+
+    [Fact]
+    public void ProgramBuildMultipassRemoteOptions_UsesRemoteNetworkProfilesWhenConfigured()
+    {
+        var options = new CodeyBoxOptions
+        {
+            MultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+            {
+                SshTarget = "codeybox@remote.example",
+                NetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["deploy-isolated"] = "remote-deploy-bridge",
+                },
+            },
+            SandboxNetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["deploy-isolated"] = "local-deploy-bridge",
+            },
+        };
+
+        var remote = Program.BuildMultipassRemoteSandboxOptions(options);
+
+        Assert.Equal("remote-deploy-bridge", remote.NetworkProfiles["deploy-isolated"]);
+        Assert.Equal("remote-deploy-bridge", remote.NetworkProfiles["DEPLOY-ISOLATED"]);
     }
 
     private sealed class DeploymentProgramWiringFactory : WebApplicationFactory<Program>

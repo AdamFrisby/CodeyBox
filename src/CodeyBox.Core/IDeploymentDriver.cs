@@ -310,6 +310,27 @@ public interface IDeploymentSubstrateProvider
     Task<IDeploymentSubstrate> CreateAsync(DeploymentSubstrateSpec spec, CancellationToken ct = default);
 }
 
+/// <summary>
+/// Deployment-level cleanup inventory. The built-in implementation adapts the
+/// sandbox provider's managed-resource listing, but the leak reaper depends on
+/// this deployment surface so non-sandbox substrates can provide equivalent
+/// orphan enumeration and disposal without implementing sandbox APIs.
+/// </summary>
+public interface IDeploymentCleanupProvider
+{
+    string Name { get; }
+    Task<IReadOnlyList<DeploymentResourceInfo>> ListAllManagedAsync(CancellationToken ct = default);
+    Task DisposeLeakedAsync(string name, CancellationToken ct = default);
+}
+
+public sealed record DeploymentResourceInfo(
+    string Name,
+    DateTimeOffset? CreatedAt,
+    long? DiskBytes,
+    bool IsTrackedActive,
+    bool HasPreemptMarker = false,
+    bool IsSuspendLifecycleOrFrozen = false);
+
 /// <summary>Live execution substrate owned by a deployment handle.</summary>
 public interface IDeploymentSubstrate : IAsyncDisposable
 {
@@ -317,6 +338,17 @@ public interface IDeploymentSubstrate : IAsyncDisposable
     Task<DeploymentCommandResult> ExecAsync(DeploymentCommand command, CancellationToken ct = default);
     bool CanPublishEndpoint(DeploymentEndpointRequest request);
     DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request);
+}
+
+/// <summary>
+/// Optional deployment substrate capability used when ownership is lost after
+/// a teardown failure. Releasing active tracking lets the deployment leak
+/// reaper retry disposal in the same process even though no
+/// <see cref="IDeploymentHandle"/> was returned to the caller.
+/// </summary>
+public interface IDeploymentActiveLease
+{
+    void ReleaseActiveTracking();
 }
 
 /// <summary>Description of a deployment substrate to provision.</summary>

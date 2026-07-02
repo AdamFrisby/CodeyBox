@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -29,7 +32,9 @@ internal sealed class MultipassRemoteSandbox :
     IShutdownTeardownSandbox,
     IPrivilegedGuestFileHardeningSandbox,
     IHostQualifiedSandbox,
-    IReleaseAdmissionOnHostLossSandbox
+    IReleaseAdmissionOnHostLossSandbox,
+    IDeploymentEndpointPublisher,
+    IActiveSandboxLease
 {
     private readonly SandboxSpec _spec;
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;
@@ -42,7 +47,9 @@ internal sealed class MultipassRemoteSandbox :
     private readonly RemoteMultipassCleanup _cleanup;
     private readonly Action<string, string> _onDispose;
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> _activeExecCts = new();
+    private readonly ConcurrentDictionary<int, Process> _endpointTunnels = new();
     private readonly SemaphoreSlim _disposeLock = new(1, 1);
+    private string? _vmAddress;
     private int _disposed; // 0/1 via Interlocked
     private int _activeTrackingReleased;
     private int _executionTransportLost;
@@ -80,6 +87,19 @@ internal sealed class MultipassRemoteSandbox :
             log);
     }
 
+    /// <summary>
+    /// Records the remote VM's IPv4 address so <see cref="PublishEndpoint"/> can
+    /// open an SSH local-forward to a port inside the guest. The provider calls
+    /// this after the VM reaches Running and the address is discoverable via
+    /// <c>multipass info</c>. A null or whitespace value leaves the sandbox
+    /// non-publishing (<see cref="CanPublishEndpoint"/> returns false).
+    /// </summary>
+    internal void RegisterVmAddress(string? address)
+    {
+        var normalized = string.IsNullOrWhiteSpace(address) ? null : address;
+        Volatile.Write(ref _vmAddress, normalized);
+    }
+
     public string Id { get; }
     public string HostId { get; }
 
@@ -94,6 +114,56 @@ internal sealed class MultipassRemoteSandbox :
     public bool ReleaseAdmissionAfterHostLoss => Volatile.Read(ref _releaseAdmissionAfterHostLoss) != 0;
 
     public WorkItemId? OwningWorkItemId => _spec.TimingWorkItemId;
+
+    public bool CanPublishEndpoint(DeploymentEndpointRequest request)
+        => !string.IsNullOrWhiteSpace(Volatile.Read(ref _vmAddress))
+            && request.Port is >= 1 and <= 65535
+            && request.Kind is DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp;
+
+    public DeploymentEndpoint PublishEndpoint(DeploymentEndpointRequest request)
+    {
+        var vmAddress = Volatile.Read(ref _vmAddress);
+        if (string.IsNullOrWhiteSpace(vmAddress)
+            || request.Port is not (>= 1 and <= 65535)
+            || request.Kind is not (DeploymentEndpointKind.Http or DeploymentEndpointKind.Tcp))
+        {
+            throw new NotSupportedException(
+                $"Remote multipass sandbox '{Id}' cannot publish {request.Kind} endpoint on port {request.Port?.ToString(CultureInfo.InvariantCulture) ?? "<none>"}.");
+        }
+
+        var remotePort = request.Port!.Value;
+        var localPort = ReserveLoopbackPort();
+        var argv = OpenSshCliTransport.BuildLocalForwardArgv(
+            _opts,
+            IPAddress.Loopback.ToString(),
+            localPort,
+            vmAddress!,
+            remotePort);
+        var tunnel = StartEndpointTunnel(argv, localPort, vmAddress!, remotePort);
+        if (!_endpointTunnels.TryAdd(localPort, tunnel))
+        {
+            StopTunnel(tunnel);
+            throw new InvalidOperationException($"Failed to track SSH endpoint tunnel for local port {localPort}.");
+        }
+
+        var metadata = new Dictionary<string, string>(request.Metadata, StringComparer.Ordinal)
+        {
+            ["endpoint.scope"] = "ssh-local-forward",
+            ["endpoint.remote-vm-host"] = vmAddress!,
+            ["endpoint.remote-vm-port"] = remotePort.ToString(CultureInfo.InvariantCulture),
+        };
+        var path = NormalizeUrlPath(request.Path);
+        return new DeploymentEndpoint
+        {
+            Kind = request.Kind,
+            Url = request.Kind == DeploymentEndpointKind.Http
+                ? $"{request.Scheme}://127.0.0.1:{localPort}{path}"
+                : null,
+            Host = "127.0.0.1",
+            Port = localPort,
+            Metadata = metadata,
+        };
+    }
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
@@ -347,6 +417,27 @@ internal sealed class MultipassRemoteSandbox :
         fi
         """;
 
+    /// <summary>
+    /// IActiveSandboxLease implementation. Idempotent — subsequent calls are
+    /// a no-op. Deployment cleanup uses this after a failed VM delete so the
+    /// leak reaper can reclaim state on a later sweep without the sandbox
+    /// remaining tracked as active.
+    /// </summary>
+    public void ReleaseActiveTracking()
+    {
+        if (Interlocked.CompareExchange(ref _activeTrackingReleased, 1, 0) != 0)
+            return;
+        SandboxLiveCounter.Decrement();
+        try
+        {
+            _onDispose(HostId, Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to release active tracking for remote VM {Vm}", Id);
+        }
+    }
+
     public bool IsOwnedByShutdownHandler { get; private set; }
     public void MarkOwnedByShutdownHandler() => IsOwnedByShutdownHandler = true;
 
@@ -371,7 +462,10 @@ internal sealed class MultipassRemoteSandbox :
     public async ValueTask DisposeAsync()
     {
         if (Volatile.Read(ref _activeTrackingReleased) != 0)
+        {
+            StopEndpointTunnels();
             return;
+        }
 
         await _disposeLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
@@ -383,6 +477,11 @@ internal sealed class MultipassRemoteSandbox :
 
             var opts = _opts;
             var vmName = Id;
+
+            // Kill any SSH local-forward tunnels for published deployment
+            // endpoints before we teardown the VM so lingering ssh clients
+            // don't hold onto the transport during stop/delete.
+            StopEndpointTunnels();
 
             // 1) Try to cleanly stop the VM so background processes flush.
             try
@@ -531,11 +630,81 @@ internal sealed class MultipassRemoteSandbox :
         Volatile.Read(ref _executionTransportLost) != 0
         && ex.InnerException is RemoteSshTransportException { IsHostTransportFailure: true };
 
+    // Thin overload retained so existing sync-back/leak-cleanup callers keep
+    // the vmName-labelled call sites; the parameterless public overload is
+    // what IActiveSandboxLease exposes and both funnel through the same
+    // idempotent state transition.
     private void ReleaseActiveTracking(string vmName)
     {
-        SandboxLiveCounter.Decrement();
-        Volatile.Write(ref _activeTrackingReleased, 1);
-        _onDispose(HostId, vmName);
+        _ = vmName;
+        ReleaseActiveTracking();
+    }
+
+    private static int ReserveLoopbackPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    private Process StartEndpointTunnel(
+        IReadOnlyList<string> argv,
+        int localPort,
+        string remoteHost,
+        int remotePort)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = argv[0],
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        for (var i = 1; i < argv.Count; i++)
+            psi.ArgumentList.Add(argv[i]);
+
+        try
+        {
+            var process = new Process { StartInfo = psi };
+            if (!process.Start())
+                throw new InvalidOperationException("ssh process did not start.");
+            _log.LogInformation(
+                "Remote VM {Vm}: published deployment endpoint via SSH local forward 127.0.0.1:{LocalPort} -> {RemoteHost}:{RemotePort}",
+                Id, localPort, remoteHost, remotePort);
+            return process;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Failed to start SSH local forward for remote deployment endpoint 127.0.0.1:{localPort} -> {remoteHost}:{remotePort}.",
+                ex);
+        }
+    }
+
+    private void StopEndpointTunnels()
+    {
+        foreach (var (port, process) in _endpointTunnels)
+        {
+            _endpointTunnels.TryRemove(port, out _);
+            StopTunnel(process);
+        }
+    }
+
+    private static void StopTunnel(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+        catch { }
+        try { process.Dispose(); } catch { }
+    }
+
+    private static string NormalizeUrlPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+        return path.StartsWith("/", StringComparison.Ordinal) ? path : "/" + path;
     }
 
     private static string QuoteArgvForShell(IReadOnlyList<string> argv)

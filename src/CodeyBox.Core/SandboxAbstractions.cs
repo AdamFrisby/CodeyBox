@@ -371,6 +371,16 @@ public interface IRoutableSandbox : ISandbox
 
 
 /// <summary>
+/// Optional sandbox capability for releasing provider-side active tracking
+/// without claiming the sandbox was successfully disposed. Used by deployment
+/// cleanup after a failed delete so leak reapers can retry in-process.
+/// </summary>
+public interface IActiveSandboxLease
+{
+    void ReleaseActiveTracking();
+}
+
+/// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider
 /// that can preserve an interrupted sandbox should stop it and make subsequent
 /// disposal a no-op so cached state can survive the orchestrator restart.
