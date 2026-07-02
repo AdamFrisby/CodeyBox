@@ -1,6 +1,9 @@
+using CodeyBox.Agents;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -344,6 +347,41 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_WithOrchestratorAssignedLogPath_DerivesAgyLogPathFromAssignedPath()
+    {
+        // PRODUCTION shape: in the real pipeline the orchestrator always sets
+        // AgentInvocationLogContext.CurrentLogPath before dispatch, so
+        // ComputeAgyLogPath takes the "<assigned>.agy.log" branch — never the
+        // Guid fallback the other tests exercise. Pin the assigned-path
+        // derivation (the shape that actually ships): a regression in the
+        // suffix concatenation or its correlation with the orchestrator log
+        // path would otherwise pass every test. Mirrors the covering pattern in
+        // CliAgentLogFileEnvInjectionTests (BeginScope around the invocation).
+        const string assignedLogPath = "/work/.codeybox/agent-logs/agent-4242.log";
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Model resolved: gemini-3.5-flash\nRESOURCE_EXHAUSTED (code 429): Individual quota reached",
+            agyExitCode: 1);
+        var runner = new AntigravityAgentRunner();
+
+        using (AgentInvocationLogContext.BeginScope(assignedLogPath))
+        {
+            await runner.RunAsync(sandbox, "/work", "go", credential: null);
+        }
+
+        // agy is told to write its glog to the assigned path + ".agy.log"...
+        var agyExec = sandbox.CapturedAgyExec;
+        Assert.NotNull(agyExec);
+        var logFileIdx = IndexOf(agyExec!.Argv, "--log-file");
+        Assert.True(logFileIdx >= 0, "expected --log-file in agy argv");
+        Assert.Equal(assignedLogPath + ".agy.log", agyExec.Argv[logFileIdx + 1]);
+
+        // ...and tail reads back that same derived path (NOT a Guid fallback).
+        var tailExec = sandbox.AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "tail");
+        Assert.NotNull(tailExec);
+        Assert.Equal(assignedLogPath + ".agy.log", tailExec!.Argv[3]);
+    }
+
+    [Fact]
     public async Task RunAsync_SuccessfulRun_DoesNotMergeGlogIntoStderr()
     {
         // Classifier-safety: agy's glog is cumulative and records transient
@@ -536,6 +574,116 @@ public sealed class AntigravityAgentRunnerTests
                 return Task.FromResult(new SandboxExecResult(0, _logFileContent ?? string.Empty, string.Empty));
             }
             return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Coverage for <see cref="AntigravityAgentRunner"/>'s glog-capture FAILURE
+/// path — the "observable failures" half of the change. When the post-run
+/// <c>tail</c> exec throws, <c>ProcessResultAsync</c> must (a) emit the
+/// <c>agent.log_capture_failed</c> audit event so a broken diagnostics-capture
+/// path is visible rather than silently degrading back to zero diagnostics,
+/// and (b) return the base run's result unchanged so the work item is never
+/// stranded. A requested cancellation must instead propagate, not be masked as
+/// a normal completion. These assertions need the Serilog sink, so the class
+/// wires the global logger and shares the <c>GlobalSerilog</c> collection with
+/// the other static-logger tests.
+/// </summary>
+[Collection("GlobalSerilog")]
+public sealed class AntigravityAgentRunnerLogCaptureFailureTests : IDisposable
+{
+    private readonly TestSink _sink = new();
+
+    public AntigravityAgentRunnerLogCaptureFailureTests()
+    {
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
+    }
+
+    public void Dispose() => Log.CloseAndFlush();
+
+    [Fact]
+    public async Task RunAsync_WhenTailThrows_EmitsAuditAndReturnsResultUnchanged()
+    {
+        // Force the post-run tail read to throw (a sandbox/provider fault). The
+        // runner must catch it, emit agent.log_capture_failed, and hand back the
+        // base run's result untouched (no glog merged, run not stranded).
+        var sandbox = new TailBehaviourSandbox(
+            tailBehaviour: () => throw new IOException("sandbox exec channel died"),
+            agyExitCode: 1,
+            agyStderr: "original-agy-stderr");
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "do something", credential: null);
+
+        // Result is returned unchanged: failure preserved, stderr NOT augmented
+        // with any glog (tail never produced content).
+        Assert.False(result.Success);
+        Assert.Equal("original-agy-stderr", result.Stderr);
+
+        // The failure is observable via the audit event, carrying the agent kind
+        // and the thrown exception's type.
+        var evt = Assert.Single(_sink.Events, e => EventName(e) == "agent.log_capture_failed");
+        Assert.Equal("antigravity", Scalar(evt, "Agent"));
+        Assert.Equal(nameof(IOException), Scalar(evt, "ExceptionType"));
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenTailCancelled_PropagatesCancellationAndEmitsNoAudit()
+    {
+        // A requested cancellation surfacing from the tail exec must NOT be
+        // swallowed by the generic capture-failure catch (which would mask it as
+        // a normal completion). It rethrows, and no log-capture-failed audit is
+        // emitted for the cancellation.
+        var sandbox = new TailBehaviourSandbox(
+            tailBehaviour: () => throw new OperationCanceledException(),
+            agyExitCode: 0,
+            agyStderr: string.Empty);
+        var runner = new AntigravityAgentRunner();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => runner.RunAsync(sandbox, "/work", "do something", credential: null));
+
+        Assert.DoesNotContain(_sink.Events, e => EventName(e) == "agent.log_capture_failed");
+    }
+
+    private static string? EventName(LogEvent evt) => Scalar(evt, "EventName");
+
+    private static string? Scalar(LogEvent evt, string key) =>
+        evt.Properties.TryGetValue(key, out var prop) && prop is ScalarValue sv
+            ? sv.Value as string
+            : null;
+
+    // ISandbox fake whose `tail` exec runs an operator-supplied behaviour
+    // (throw), letting a test drive the runner's capture-failure catch paths.
+    // mkdir/bash succeed; the agy invocation returns the configured exit/stderr.
+    private sealed class TailBehaviourSandbox : ISandbox
+    {
+        private readonly Func<SandboxExecResult> _tailBehaviour;
+        private readonly int _agyExitCode;
+        private readonly string _agyStderr;
+
+        public TailBehaviourSandbox(Func<SandboxExecResult> tailBehaviour, int agyExitCode, string agyStderr)
+        {
+            _tailBehaviour = tailBehaviour;
+            _agyExitCode = agyExitCode;
+            _agyStderr = agyStderr;
+        }
+
+        public string Id => "fake-tail-behaviour";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
+                return Task.FromResult(_tailBehaviour());
+            if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "bash"))
+                return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+            return Task.FromResult(new SandboxExecResult(_agyExitCode, "stdout-response", _agyStderr));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
