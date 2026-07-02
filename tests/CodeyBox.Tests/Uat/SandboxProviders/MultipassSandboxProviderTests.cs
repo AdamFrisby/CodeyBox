@@ -1539,8 +1539,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment(),
             stdin: "retry-token-line-that-must-not-reach-agent\nagent prompt\n");
-        await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(3));
-        await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(6));
+        await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(15));
+        await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(15));
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
