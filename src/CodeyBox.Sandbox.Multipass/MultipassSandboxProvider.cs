@@ -6114,17 +6114,26 @@ while True:
         sb.AppendLine($"codeybox_stdout_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stdout.XXXXXX\") || exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine($"codeybox_stderr_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stderr.XXXXXX\") || {{ rm -f \"$codeybox_stdout_file\"; exit {DetachedSupervisorSetupFailedExitCode}; }}");
         sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
+        // Capture the stdin producer's stderr in its OWN file, kept separate from
+        // the agent's stderr. When the agent (consumer) reads only part of stdin and
+        // exits, `cat` is killed by SIGPIPE and emits a broken-pipe diagnostic naming
+        // the sidecar path; merging that into the agent stderr pollutes the captured
+        // output (and its random marker hex intermittently trips exit-code checks). We
+        // only fold the producer stderr back in when it signals a GENUINE read failure.
+        sb.AppendLine($"    codeybox_stdin_stderr_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stdin-stderr.XXXXXX\") || {{ rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"; exit {DetachedSupervisorSetupFailedExitCode}; }}");
         sb.AppendLine("    set -o pipefail");
         sb.AppendLine("    set +e");
-        sb.AppendLine("    codeybox_root_sh 'cat -- \"$1\"' \"$codeybox_stdin_file\" 2>>\"$codeybox_stderr_file\" | \"$@\" >\"$codeybox_stdout_file\" 2>>\"$codeybox_stderr_file\"");
+        sb.AppendLine("    codeybox_root_sh 'cat -- \"$1\"' \"$codeybox_stdin_file\" 2>>\"$codeybox_stdin_stderr_file\" | \"$@\" >\"$codeybox_stdout_file\" 2>>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_status=(\"${PIPESTATUS[@]}\")");
         sb.AppendLine("    set -e");
         sb.AppendLine("    codeybox_stdin_rc=${codeybox_status[0]}");
         sb.AppendLine("    codeybox_wrapper_rc=${codeybox_status[1]}");
-        sb.AppendLine("    if [ \"$codeybox_stdin_rc\" -ne 0 ] && [ \"$codeybox_stdin_rc\" -ne 141 ] && ! grep -qi 'broken pipe' \"$codeybox_stderr_file\"; then");
+        sb.AppendLine("    if [ \"$codeybox_stdin_rc\" -ne 0 ] && [ \"$codeybox_stdin_rc\" -ne 141 ] && ! grep -qi 'broken pipe' \"$codeybox_stdin_stderr_file\"; then");
+        sb.AppendLine("        cat \"$codeybox_stdin_stderr_file\" >>\"$codeybox_stderr_file\" 2>/dev/null || true");
         sb.AppendLine("        printf 'codeybox-detached: failed to read stdin sidecar (exit %s)\\n' \"$codeybox_stdin_rc\" >>\"$codeybox_stderr_file\"");
         sb.AppendLine($"        codeybox_wrapper_rc={DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");
+        sb.AppendLine("    rm -f \"$codeybox_stdin_stderr_file\"");
         sb.AppendLine("else");
         sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_wrapper_rc=$?");

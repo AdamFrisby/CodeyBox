@@ -379,7 +379,10 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
 
         using var spans = new SpanCapture("CodeyBox.Pipeline", "CodeyBox.Audit");
-        using var metrics = new MetricCapture("codeybox.phase.duration_ms", "codeybox.auditor.duration_ms");
+        using var metrics = new MetricCapture(
+            "codeybox.phase.duration_ms",
+            "codeybox.auditor.duration_ms",
+            "codeybox.audit.iterations");
 
         var item = NewItem(initialAgent: AgentKind.Codex);
         await fix.Store.CreateAsync(item);
@@ -416,6 +419,45 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.True(metrics.Any("codeybox.auditor.duration_ms",
                 ("auditor.name", "once-failing-fallback"), ("auditor.kind", "tool")),
             "expected a codeybox.auditor.duration_ms measurement tagged with the auditor name + kind");
+        Assert.True(metrics.Any("codeybox.audit.iterations",
+                ("outcome", "reworking"), ("self_review_checklist", "off"), ("iteration", "1")),
+            "expected the first audit-iteration metric to carry the default opt-in-off self-review tag");
+        Assert.True(metrics.Any("codeybox.audit.iterations",
+                ("outcome", "passed"), ("self_review_checklist", "off"), ("iteration", "2")),
+            "expected the passing audit-iteration metric to carry the default opt-in-off self-review tag");
+    }
+
+    [Fact]
+    public async Task AuditIterationMetrics_TagSelfReviewChecklistOptIn()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            SelfReviewChecklistEnabled = true,
+        });
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            pipelineTuning: tuning);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
+
+        using var metrics = new MetricCapture("codeybox.audit.iterations");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+        Assert.True(metrics.Any("codeybox.audit.iterations",
+                ("outcome", "reworking"), ("self_review_checklist", "on"), ("iteration", "1")),
+            "expected the first audit-iteration metric to carry the opt-in-on self-review tag");
+        Assert.True(metrics.Any("codeybox.audit.iterations",
+                ("outcome", "passed"), ("self_review_checklist", "on"), ("iteration", "2")),
+            "expected the passing audit-iteration metric to carry the opt-in-on self-review tag");
     }
 
     [Fact]
@@ -1948,7 +1990,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         IQuotaFailureStore? quotaFailures = null,
         bool wireAuditProgress = false,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
-        IAgentAvailabilityRegistry? availability = null)
+        IAgentAvailabilityRegistry? availability = null,
+        PipelineTuningSnapshot? pipelineTuning = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -2055,7 +2098,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             terminalRevisionBuilder: terminalTransitions,
             authFailureClassifier: authFailureClassifier,
             availability: availability,
-            authAvailability: authAvailability);
+            authAvailability: authAvailability,
+            pipelineTuning: pipelineTuning);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }

@@ -396,6 +396,29 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void SelfReviewChecklistInjected_emits_event_when_injected()
+    {
+        var id = WorkItemId.New();
+        AuditLog.SelfReviewChecklistInjected(id, injected: true);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("work_prompt.self_review_checklist", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("INJECTED", GetScalar<string>(evt, "State"));
+        Assert.Equal(id.ToString(), GetScalar<string>(evt, "WorkItemId"));
+    }
+
+    [Fact]
+    public void SelfReviewChecklistInjected_emits_event_when_omitted()
+    {
+        AuditLog.SelfReviewChecklistInjected(WorkItemId.New(), injected: false);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("work_prompt.self_review_checklist", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("OMITTED", GetScalar<string>(evt, "State"));
+    }
+
+    [Fact]
     public void WebhookDelivered_emits_webhook_delivered_event()
     {
         AuditLog.WebhookDelivered("my-endpoint", "work_item.done", 200, 1);
