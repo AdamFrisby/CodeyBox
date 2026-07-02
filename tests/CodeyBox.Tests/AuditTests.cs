@@ -373,7 +373,7 @@ public sealed class AuditTests
             "command exited 1",
             "failed");
 
-        var result = classifier.ClassifyFailedCommand(new ShellCommandResultContext(
+        var result = classifier.ClassifyFailedCommand(new AuditResultClassificationContext(
             "custom:shell",
             ["dotnet", "build"],
             new SandboxExecResult(1, "", "build failed"),
@@ -394,7 +394,7 @@ public sealed class AuditTests
             "failed");
         const string output = "/work/Program.cs(1,1): error WHITESPACE: Fix whitespace formatting. [/work/App.csproj]";
 
-        var result = classifier.ClassifyFailedCommand(new ShellCommandResultContext(
+        var result = classifier.ClassifyFailedCommand(new AuditResultClassificationContext(
             "custom:shell",
             ["dotnet", "format", "--verbosity", "diagnostic"],
             new SandboxExecResult(2, "", output),
@@ -807,12 +807,91 @@ public sealed class AuditTests
         Assert.Contains(result.Findings, f => f.Title.Contains("too many failed-test blocks", StringComparison.Ordinal));
     }
 
-    private static ShellCommandAuditor CSharpTestPassAuditor() =>
-        new(new ShellCommandAuditorOptions
+    [Fact]
+    public void DotnetTestAuditor_AllTestsDefaultOptions_EmitsByteIdenticalLegacyCommand()
+    {
+        var auditor = CSharpTestPassAuditor();
+
+        var command = auditor.BuildInvocation(TestSelection.All, TestRunOptions.Default);
+
+        // Invariant: no selection + default options == the legacy generic-shell
+        // path's argv, unchanged.
+        Assert.Equal<string[]>(["dotnet", "test", "--no-build"], [.. command]);
+        Assert.Equal<string[]>(["dotnet", "test", "--no-build"], [.. auditor.Argv]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_BlameHangTimeout_AppendsBlameHangArgs()
+    {
+        var auditor = CSharpTestPassAuditor();
+
+        var command = auditor.BuildInvocation(
+            TestSelection.All,
+            new TestRunOptions { BlameHangTimeout = TimeSpan.FromMinutes(5) });
+
+        Assert.Equal<string[]>(
+            ["dotnet", "test", "--no-build", "--blame-hang", "--blame-hang-timeout", "300s"],
+            [.. command]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_BlameHangSubSecond_FormatsMilliseconds()
+    {
+        var auditor = CSharpTestPassAuditor();
+
+        var command = auditor.BuildInvocation(
+            TestSelection.All,
+            new TestRunOptions { BlameHangTimeout = TimeSpan.FromMilliseconds(1500) });
+
+        Assert.Equal("1500ms", command[^1]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_NarrowedSelection_AppendsFilter()
+    {
+        var auditor = CSharpTestPassAuditor();
+
+        var command = auditor.BuildInvocation(
+            new TestSelection(["Ns.A", "FullyQualifiedName~Slow"]),
+            TestRunOptions.Default);
+
+        Assert.Equal<string[]>(
+            ["dotnet", "test", "--no-build", "--filter", "FullyQualifiedName=Ns.A|FullyQualifiedName~Slow"],
+            [.. command]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_TestSuiteDescriptor_DescribesDotnetEnumeration()
+    {
+        var auditor = CSharpTestPassAuditor();
+
+        Assert.Equal(TestFramework.DotnetTest, auditor.TestSuite.Framework);
+        Assert.Equal<string[]>(
+            ["dotnet", "test", "--no-build", "--list-tests"],
+            [.. auditor.TestSuite.EnumerationArgv]);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_CurrentRunOptions_ReflectsHotReloadableAccessor()
+    {
+        var idle = TimeSpan.FromMinutes(20);
+        var auditor = new DotnetTestAuditor(new DotnetTestAuditorOptions
         {
             Name = "csharp:test-pass",
-            Argv = ["dotnet", "test", "--no-build"],
-            ResultClassifier = new DotnetTestCommandResultClassifier(),
+            BaseArgv = ["dotnet", "test", "--no-build"],
+            RunOptionsAccessor = () => new TestRunOptions { IdleTimeout = idle },
+        });
+
+        Assert.Equal(idle, auditor.CurrentRunOptions.IdleTimeout);
+        // The idle timeout is a run option, not a command argument.
+        Assert.Equal<string[]>(["dotnet", "test", "--no-build"], [.. auditor.Argv]);
+    }
+
+    private static DotnetTestAuditor CSharpTestPassAuditor() =>
+        new(new DotnetTestAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            BaseArgv = ["dotnet", "test", "--no-build"],
         });
 
     private static AuditContext FakeContext() =>

@@ -9092,7 +9092,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AuditContext context,
         CancellationToken ct)
     {
-        var timeout = _pipelineTuning.Current.AuditorIdleTimeout;
+        var timeout = EffectiveAuditorIdleTimeout(auditor);
         if (timeout <= TimeSpan.Zero)
             return await auditor.RunAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
 
@@ -9114,7 +9114,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var auditorTask = auditor.RunAsync(watchedSandbox, workingDirectory, watchedContext, linkedCts.Token);
         var timeoutTask = WaitForAuditorIdleTimeoutAsync(
             linkedCts.Token,
-            () => Volatile.Read(ref lastActivityTicks));
+            () => Volatile.Read(ref lastActivityTicks),
+            () => EffectiveAuditorIdleTimeout(auditor));
 
         try
         {
@@ -9151,15 +9152,32 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
+    /// <summary>
+    /// Resolves the idle-timeout to apply to a single auditor run. A
+    /// test-runner auditor (surfaced directly or through a wrapping provider)
+    /// may declare a longer test-specific window via its
+    /// <see cref="ITestRunnerAuditor.CurrentRunOptions"/>; every other auditor
+    /// uses the global <see cref="PipelineTuningOptions.AuditorIdleTimeout"/>.
+    /// </summary>
+    private TimeSpan EffectiveAuditorIdleTimeout(IAuditor auditor)
+    {
+        var testRunner = auditor as ITestRunnerAuditor
+            ?? (auditor as ITestRunnerAuditorProvider)?.TestRunner;
+        if (testRunner?.CurrentRunOptions.IdleTimeout is { } idle && idle > TimeSpan.Zero)
+            return idle;
+        return _pipelineTuning.Current.AuditorIdleTimeout;
+    }
+
     private async Task<TimeSpan?> WaitForAuditorIdleTimeoutAsync(
         CancellationToken ct,
-        Func<long> getLastActivityTicks)
+        Func<long> getLastActivityTicks,
+        Func<TimeSpan>? timeoutSelector = null)
     {
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                var currentTimeout = _pipelineTuning.Current.AuditorIdleTimeout;
+                var currentTimeout = timeoutSelector?.Invoke() ?? _pipelineTuning.Current.AuditorIdleTimeout;
                 if (currentTimeout <= TimeSpan.Zero)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);

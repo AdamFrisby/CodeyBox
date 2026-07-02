@@ -1755,7 +1755,44 @@ builder.Services.AddSingleton(_ =>
     options.ProjectRoot ??= builder.Environment.ContentRootPath;
     return options;
 });
-builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(sp.GetRequiredService<PresetCatalogOptions>()));
+// Bridges the hot-reloadable pipeline-tuning knobs
+// (CodeyBox:PipelineTuning:CSharpTestPass*) into the TestRunOptions that
+// DotnetTestAuditor reads at run time. Reading through PipelineTuningSnapshot on
+// each call keeps blame-hang / test-idle-timeout edits hot-reloadable without a
+// restart. Defaults (unset knobs) yield TestRunOptions.Default → byte-identical
+// legacy dotnet-test command.
+static Func<TestRunOptions> DotnetTestRunOptionsAccessor(IServiceProvider sp)
+{
+    var tuning = sp.GetRequiredService<PipelineTuningSnapshot>();
+    return () =>
+    {
+        var current = tuning.Current;
+        return new TestRunOptions
+        {
+            BlameHangTimeout = current.CSharpTestPassBlameHangTimeout,
+            IdleTimeout = current.CSharpTestPassAuditorIdleTimeout,
+        };
+    };
+}
+
+builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(
+    sp.GetRequiredService<PresetCatalogOptions>(),
+    DotnetTestRunOptionsAccessor(sp)));
+
+// The canonical dotnet-test runner, registered so the ITestSelector seam
+// (a separate work item) can resolve ITestRunnerAuditor from DI and enumerate
+// its TestSuiteDescriptor. The preset catalog builds its own instance for the
+// audit run from the csharp language YAML; this registration mirrors that
+// command with the same hot-reloadable run options.
+builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(new DotnetTestAuditorOptions
+{
+    Name = "csharp:test-pass",
+    BaseArgv = ["dotnet", "test", "--no-build"],
+    CanShortCircuitOnBlockingFinding = true,
+    Role = AuditorRole.BuildTestGate,
+    BuildTestGateEvidence = BuildTestGateEvidence.Test,
+    RunOptionsAccessor = DotnetTestRunOptionsAccessor(sp),
+}));
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));

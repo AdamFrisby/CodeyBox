@@ -2,9 +2,9 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Shell;
 
-public sealed class DotnetTestCommandResultClassifier : IShellCommandResultClassifier
+public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
 {
-    public AuditResult? ClassifyFailedCommand(ShellCommandResultContext context)
+    public AuditResult? ClassifyFailedCommand(AuditResultClassificationContext context)
     {
         var parsed = DotnetTestOutputParser.Parse(context.AuditorName, context.CombinedOutput);
         if (parsed.ParsedFailureCount == 0)

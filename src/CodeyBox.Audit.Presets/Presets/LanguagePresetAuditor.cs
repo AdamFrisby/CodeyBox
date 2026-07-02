@@ -2,7 +2,7 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Presets.Presets;
 
-internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvider, IAuditorLanguageContext
+internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvider, IAuditorLanguageContext, ITestRunnerAuditorProvider
 {
     private const int MaxRawOutputChars = 1_000_000;
 
@@ -31,6 +31,15 @@ internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvide
     public AuditorRole Role => _inner.Role;
     public BuildTestGateEvidence BuildTestGateEvidence => _inner.BuildTestGateEvidence;
     public IReadOnlyList<string> Argv => _inner is IShellAuditorArgvProvider provider ? provider.Argv : [];
+
+    /// <summary>
+    /// Exposes the wrapped test runner (e.g. <c>DotnetTestAuditor</c>) so the
+    /// pipeline can read its test-specific idle-timeout preference through the
+    /// multi-project wrapper without the wrapper itself claiming to be a test
+    /// runner for non-test auditors (build/format/lint).
+    /// </summary>
+    public ITestRunnerAuditor? TestRunner => _inner as ITestRunnerAuditor;
+
     public string Language => _language;
     public string MarkerScript => _markerScript;
 

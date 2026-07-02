@@ -602,7 +602,9 @@ internal sealed class PresetConfigLoader
         }
     }
 
-    public static IReadOnlyList<IAuditor> MaterialiseLanguage(LanguagePresetDefinition definition)
+    public static IReadOnlyList<IAuditor> MaterialiseLanguage(
+        LanguagePresetDefinition definition,
+        Func<TestRunOptions>? testRunOptions = null)
     {
         var marker = definition.Marker ?? throw new PresetConfigurationException($"Language '{definition.Id}' has no marker.");
         var markerDescription = marker.Globs.Count > 0
@@ -629,7 +631,8 @@ internal sealed class PresetConfigLoader
                     [.. a.Argv],
                     a.CanShortCircuitOnBlockingFinding,
                     role,
-                    gateEvidence)
+                    gateEvidence,
+                    testRunOptions)
                 : LanguagePresetHelpers.ShellScript(
                     definition.Id,
                     markerDescription,
