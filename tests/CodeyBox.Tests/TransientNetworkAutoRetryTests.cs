@@ -619,8 +619,16 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
 
             _time.Advance(TimeSpan.FromMilliseconds(25));
 
+            // Keep nudging the fake clock forward on each poll rather than
+            // relying on a single pre-wait advance. The background loop captures
+            // its first lastSweepAt during startup; under heavy parallel-suite
+            // CPU starvation that startup can land *after* the initial advance,
+            // so a lone 25 ms step no longer crosses the sweep interval and the
+            // sweep would never fire. Advancing every iteration makes the tick
+            // deterministic regardless of startup/advance ordering.
             var retried = await WaitForAsync(
-                async () => (await fixture.Store.GetAsync(transient.Id))?.State == WorkItemState.Queued);
+                async () => (await fixture.Store.GetAsync(transient.Id))?.State == WorkItemState.Queued,
+                advancePerPoll: TimeSpan.FromMilliseconds(25));
             Assert.True(retried);
             var stored = await fixture.Store.GetAsync(transient.Id);
             Assert.NotNull(stored);
@@ -1149,14 +1157,18 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         JitterMode = TransientRetryJitterMode.None,
     };
 
-    private async Task<bool> WaitForAsync(Func<Task<bool>> condition)
+    private async Task<bool> WaitForAsync(Func<Task<bool>> condition, TimeSpan? advancePerPoll = null)
     {
+        // Default is a zero advance so callers that assert on an exact
+        // _time.GetUtcNow() offset are unaffected; the periodic-sweep tick test
+        // opts in to a real per-poll advance to keep its fake clock moving.
+        var advance = advancePerPoll ?? TimeSpan.Zero;
         var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
         while (DateTimeOffset.UtcNow < deadline)
         {
             if (await condition())
                 return true;
-            _time.Advance(TimeSpan.Zero);
+            _time.Advance(advance);
             await Task.Delay(20);
         }
 
