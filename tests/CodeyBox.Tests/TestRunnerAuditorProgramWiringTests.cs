@@ -67,10 +67,47 @@ public sealed class TestRunnerAuditorProgramWiringTests
         Assert.Same(accessor1, field!.GetValue(composer));
     }
 
+    [Fact]
+    public void RunOptionsAccessorMapsCSharpTestPassKnobsToDistinctTargetFields()
+    {
+        // Distinct, whole-second values so a blame-hang <-> idle-timeout FIELD SWAP
+        // in DotnetTestRunOptionsAccessor is caught: the two source knobs map to two
+        // different TestRunOptions fields, and only blame-hang reaches the command.
+        // 3 min blame-hang -> "180s" on the command; 7 min idle-timeout must NOT.
+        using var factory = new WiringFactory(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CodeyBox:PipelineTuning:CSharpTestPassBlameHangTimeout"] = "00:03:00",
+            ["CodeyBox:PipelineTuning:CSharpTestPassAuditorIdleTimeout"] = "00:07:00",
+        });
+
+        var accessor = factory.Services.GetRequiredService<Func<TestRunOptions>>();
+        var options = accessor();
+
+        // The config->TestRunOptions mapping (the linchpin the feature exists to
+        // provide) lands each knob on its own field — not swapped.
+        Assert.Equal(TimeSpan.FromMinutes(3), options.BlameHangTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(7), options.IdleTimeout);
+
+        // ...and blame-hang (only) threads through into the emitted command via the
+        // same shared accessor the DI runner reads on every run.
+        var runner = factory.Services.GetRequiredService<ITestRunnerAuditor>();
+        var argv = runner.BuildInvocation(TestSelection.All, runner.CurrentRunOptions);
+        Assert.Equal<string[]>(
+            ["dotnet", "test", "--no-build", "--blame-hang", "--blame-hang-timeout", "180s"],
+            [.. argv]);
+        // Idle-timeout is an out-of-band guard, never a command arg — a swap would
+        // leak "420s" (7 min) here.
+        Assert.DoesNotContain("420s", argv);
+    }
+
     private sealed class WiringFactory : WebApplicationFactory<Program>
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-testrunner-wiring-{Guid.NewGuid():N}.db");
+        private readonly IReadOnlyDictionary<string, string?> _extra;
+
+        public WiringFactory(IReadOnlyDictionary<string, string?>? extra = null)
+            => _extra = extra ?? new Dictionary<string, string?>();
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -79,7 +116,7 @@ public sealed class TestRunnerAuditorProgramWiringTests
             {
                 cfg.Sources.Clear();
                 var tmp = Path.GetTempPath();
-                cfg.AddInMemoryCollection(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+                var settings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
@@ -87,7 +124,10 @@ public sealed class TestRunnerAuditorProgramWiringTests
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
-                });
+                };
+                foreach (var kv in _extra)
+                    settings[kv.Key] = kv.Value;
+                cfg.AddInMemoryCollection(settings);
             });
             builder.ConfigureTestServices(services => services.RemoveAll<IHostedService>());
         }
