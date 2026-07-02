@@ -627,7 +627,7 @@ static SpritesSandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory l
                 AllowUnsafeHttp = cfg.AllowUnsafeHttp,
                 AllowPersistentTmpfsDowngrade = cfg.AllowPersistentTmpfsDowngrade,
                 SetupCommands = cfg.SetupCommands ?? defaults.SetupCommands,
-                NetworkProfiles = cfg.NetworkProfiles ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase),
+                NetworkProfiles = CopySpritesNetworkProfiles(cfg.NetworkProfiles),
                 MaxSyncArchiveBase64Bytes = cfg.MaxSyncArchiveBase64Bytes > 0
                     ? cfg.MaxSyncArchiveBase64Bytes
                     : defaults.MaxSyncArchiveBase64Bytes,
@@ -652,6 +652,17 @@ static SpritesSandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory l
             };
         },
         loggerFactory.CreateLogger<SpritesSandboxProvider>());
+
+    static Dictionary<string, List<string>> CopySpritesNetworkProfiles(Dictionary<string, List<string>>? source)
+    {
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        if (source is null)
+            return result;
+
+        foreach (var (name, hosts) in source)
+            result[name] = hosts?.ToList() ?? [];
+        return result;
+    }
 }
 
 static void LogDiskGuardBanner(IDiskGuardedSandboxProvider provider, ILogger startupLog)

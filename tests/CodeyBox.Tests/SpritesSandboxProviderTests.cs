@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Sprites;
@@ -91,7 +92,7 @@ public sealed class SpritesSandboxProviderTests
     }
 
     [Fact]
-    public async Task ExecAsync_UsesWebSocketQueryEnv_DemultiplexesFrames_AndSendsStdinFrames()
+    public async Task ExecAsync_SendsEnvironmentOverStdin_DemultiplexesFrames_AndSendsStdinFrames()
     {
         var socket = new FakeSpritesWebSocket();
         socket.EnqueueText("""{"type":"session_info","session_id":42,"command":"bash","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
@@ -120,31 +121,55 @@ public sealed class SpritesSandboxProviderTests
 
         Assert.NotNull(socket.ConnectedUri);
         var query = ParseQuery(socket.ConnectedUri!);
-        Assert.Equal(["bash", "-lc", "cat"], query["cmd"]);
+        AssertWrappedCommand(query, ["bash", "-lc", "cat"]);
         Assert.Equal(["/work"], query["dir"]);
-        Assert.Contains("BASE=1", query["env"]);
-        Assert.Contains("SECRET=env-value", query["env"]);
+        Assert.Equal(["false"], query["tty"]);
+        Assert.False(query.ContainsKey("env"));
+        Assert.DoesNotContain("env-value", socket.ConnectedUri!.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(query.Keys, k => k.Equals("stdin", StringComparison.OrdinalIgnoreCase));
 
         Assert.Equal("sprite-token", socket.BearerToken);
-        Assert.Contains(socket.SentFrames, frame => frame.SequenceEqual(new byte[] { 0, (byte)'h', (byte)'e', (byte)'l', (byte)'l', (byte)'o' }));
+        Assert.Contains(socket.SentFrames, frame =>
+            frame.Length > 1 &&
+            frame[0] == 0 &&
+            Encoding.UTF8.GetString(frame[1..]).EndsWith("hello", StringComparison.Ordinal));
         Assert.Contains(socket.SentFrames, frame => frame.SequenceEqual(new byte[] { 4 }));
     }
 
     [Fact]
-    public async Task CreateAsync_RejectsCredentialTmpfsDirectory_BeforeProvisioning()
+    public async Task CreateAsync_AllowsCredentialTmpfsPlaceholderWithoutPersistingDirectory()
     {
-        var handler = new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called"));
+        var handler = SuccessfulLifecycleHandler();
         var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
 
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => provider.CreateAsync(new SandboxSpec
+        var sandbox = await provider.CreateAsync(new SandboxSpec
         {
             ImageReference = "ignored",
             Mounts = [new SandboxMount { SandboxPath = SandboxConventions.CredentialsDir, Tmpfs = true }],
-        }));
+        });
 
-        Assert.Contains("refusing credential mount", ex.Message, StringComparison.Ordinal);
-        Assert.Empty(handler.Requests);
+        await sandbox.DisposeAsync();
+
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == "/v1/sprites");
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Delete && r.PathAndQuery.StartsWith("/v1/sprites/codeybox-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CreateAsync_AllowsDefaultWorkTmpfsMount()
+    {
+        var sockets = new QueueSpritesWebSocketFactory(SuccessfulSocket(sessionId: 1));
+        var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, new SpritesSandboxOptions { Token = "sprite-token" });
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts = [new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true }],
+        });
+
+        await sandbox.DisposeAsync();
+
+        Assert.Single(sockets.Created);
+        AssertWrappedCommand(ParseQuery(sockets.Created[0].ConnectedUri!), ["mkdir", "-p", SandboxConventions.WorkDir]);
     }
 
     [Fact]
@@ -209,18 +234,60 @@ public sealed class SpritesSandboxProviderTests
         await sandbox.DisposeAsync();
 
         var query = ParseQuery(socket.ConnectedUri!);
-        Assert.Equal(["mkdir", "-p", "/scratch"], query["cmd"]);
+        AssertWrappedCommand(query, ["mkdir", "-p", "/scratch"]);
     }
 
     [Fact]
-    public async Task ExecAsync_RefusesCredentialFileMaterialization()
+    public async Task CreateAsync_RunsSetupCommandsInOrder_AndSkipsBlankCommands()
+    {
+        var sockets = new QueueSpritesWebSocketFactory(
+            SuccessfulSocket(sessionId: 1),
+            SuccessfulSocket(sessionId: 2));
+        var provider = NewProvider(
+            SuccessfulLifecycleHandler(),
+            sockets,
+            new SpritesSandboxOptions
+            {
+                Token = "sprite-token",
+                SetupCommands = ["first", "   ", "second"],
+            });
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(2, sockets.Created.Count);
+        AssertWrappedCommand(ParseQuery(sockets.Created[0].ConnectedUri!), ["bash", "-lc", "first"]);
+        AssertWrappedCommand(ParseQuery(sockets.Created[1].ConnectedUri!), ["bash", "-lc", "second"]);
+    }
+
+    [Fact]
+    public async Task CreateAsync_SetupCommandFailureDeletesSpriteAndSurfacesStderrTail()
+    {
+        var handler = SuccessfulLifecycleHandler();
+        var sockets = new QueueSpritesWebSocketFactory(
+            ExitingSocket(sessionId: 1, exitCode: 12, stderr: "setup failed"));
+        var provider = NewProvider(
+            handler,
+            sockets,
+            new SpritesSandboxOptions
+            {
+                Token = "sprite-token",
+                SetupCommands = ["bad"],
+            });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
+
+        Assert.Contains("Sprites setup command failed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("setup failed", ex.Message, StringComparison.Ordinal);
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Delete && r.PathAndQuery.StartsWith("/v1/sprites/codeybox-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ExecAsync_RefusesStdinWritesToCredentialDirectory()
     {
         var socket = new FakeSpritesWebSocket();
-        var sandbox = NewSandbox(socket, new SandboxSpec
-        {
-            ImageReference = "ignored",
-            Environment = new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = """{"secret":true}""" },
-        });
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
 
         var ex = await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.ExecAsync(new SandboxExec
         {
@@ -228,8 +295,9 @@ public sealed class SpritesSandboxProviderTests
             [
                 "bash",
                 "-c",
-                "set -eu; if [ -n \"${CODEX_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.codex\"; printf '%s' \"$CODEX_AUTH_JSON\" > \"$HOME/.codex/auth.json\"; fi",
+                "cat > /run/codeybox/creds/auth.json",
             ],
+            Stdin = "{}",
         }));
 
         Assert.Contains("does not expose tmpfs credential storage", ex.Message, StringComparison.Ordinal);
@@ -255,20 +323,67 @@ public sealed class SpritesSandboxProviderTests
     }
 
     [Fact]
-    public async Task CreateAsync_RejectsReadOnlyMounts()
+    public async Task RunResumedAsync_FileBackedCredentialRunner_FailsBeforeScratchpadRestore()
     {
-        var handler = new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called"));
-        var provider = NewProvider(handler, new EmptySpritesWebSocketFactory(), new SpritesSandboxOptions { Token = "sprite-token" });
+        var socket = new FakeSpritesWebSocket();
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
+        var runner = new CodexAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = "{}" },
+            new Dictionary<string, string>());
 
+        var result = await runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential,
+            new AgentResumeContext("checkpoint-ref"));
+
+        Assert.False(result.Success);
+        Assert.Contains("file-backed credentials are not supported", result.Summary, StringComparison.Ordinal);
+        Assert.Null(socket.ConnectedUri);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_FileBackedCredentialRunner_ReturnsFailureBeforePrepareScript()
+    {
+        var socket = new FakeSpritesWebSocket();
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
+        var runner = new CursorAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{}" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync(
+            "prompt",
+            credential,
+            sandbox: sandbox,
+            workingDirectory: "/work");
+
+        Assert.False(result.Success);
+        Assert.Contains("file-backed credentials are not supported", result.Summary, StringComparison.Ordinal);
+        Assert.Null(socket.ConnectedUri);
+    }
+
+    [Fact]
+    public async Task CreateAsync_StagesReadOnlyMountsWithoutSyncBack()
+    {
         using var temp = new TempDirectory();
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => provider.CreateAsync(new SandboxSpec
+        File.WriteAllText(Path.Combine(temp.Path, "mirror.txt"), "mirror");
+        var sockets = new QueueSpritesWebSocketFactory(SuccessfulSocket(sessionId: 1));
+        var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, new SpritesSandboxOptions { Token = "sprite-token" });
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
         {
             ImageReference = "ignored",
             Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = temp.Path, ReadOnly = true }],
-        }));
+        });
 
-        Assert.Contains("cannot enforce read-only mounts", ex.Message, StringComparison.Ordinal);
-        Assert.Empty(handler.Requests);
+        await sandbox.DisposeAsync();
+
+        Assert.Single(sockets.Created);
     }
 
     [Fact]
@@ -432,11 +547,10 @@ public sealed class SpritesSandboxProviderTests
         var sockets = new QueueSpritesWebSocketFactory(
             SuccessfulSocket(sessionId: 1),
             SuccessfulSocket(sessionId: 2),
-            SuccessfulSocket(sessionId: 3, stdout: changedArchive),
-            SuccessfulSocket(sessionId: 4, stdout: changedArchive));
+            SuccessfulSocket(sessionId: 3, stdout: changedArchive));
         var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, new SpritesSandboxOptions { Token = "sprite-token" });
 
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        var sandbox = await provider.CreateAsync(new SandboxSpec
         {
             ImageReference = "ignored",
             Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = host.Path, ReadOnly = false }],
@@ -445,10 +559,44 @@ public sealed class SpritesSandboxProviderTests
         var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["true"] });
 
         Assert.True(result.Success);
+        Assert.True(File.Exists(Path.Combine(host.Path, "before.txt")));
+
+        await sandbox.DisposeAsync();
+
         Assert.False(File.Exists(Path.Combine(host.Path, "before.txt")));
         Assert.Equal("after", File.ReadAllText(Path.Combine(host.Path, "after.txt")));
         var upload = sockets.Created[0];
         Assert.Contains(upload.SentFrames, frame => frame[0] == 0 && frame.Length > 1);
+    }
+
+    [Fact]
+    public async Task WritableHostFileMount_IsUploaded_AndSyncedBackOnDispose()
+    {
+        using var host = new TempDirectory();
+        var hostFile = Path.Combine(host.Path, "state.txt");
+        File.WriteAllText(hostFile, "before");
+        var changedFile = Convert.ToBase64String(Encoding.UTF8.GetBytes("after"));
+        var sockets = new QueueSpritesWebSocketFactory(
+            SuccessfulSocket(sessionId: 1),
+            SuccessfulSocket(sessionId: 2),
+            SuccessfulSocket(sessionId: 3, stdout: changedFile));
+        var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, new SpritesSandboxOptions { Token = "sprite-token" });
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts = [new SandboxMount { SandboxPath = "/tmp/state.txt", HostPath = hostFile, ReadOnly = false }],
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["true"] });
+        Assert.True(result.Success);
+        Assert.Equal("before", File.ReadAllText(hostFile));
+
+        await sandbox.DisposeAsync();
+
+        Assert.Equal("after", File.ReadAllText(hostFile));
+        AssertWrappedCommand(ParseQuery(sockets.Created[0].ConnectedUri!), ["sh", "-c", "set -eu; mkdir -p \"$(dirname \"$1\")\"; base64 -d > \"$1\"", "_", "/tmp/state.txt"]);
+        AssertWrappedCommand(ParseQuery(sockets.Created[2].ConnectedUri!), ["base64", "-w0", "/tmp/state.txt"]);
     }
 
     [Fact]
@@ -462,13 +610,16 @@ public sealed class SpritesSandboxProviderTests
             SuccessfulSocket(sessionId: 3, stdout: "not-base64"));
         var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, new SpritesSandboxOptions { Token = "sprite-token" });
 
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        var sandbox = await provider.CreateAsync(new SandboxSpec
         {
             ImageReference = "ignored",
             Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = host.Path, ReadOnly = false }],
         });
 
-        await Assert.ThrowsAnyAsync<FormatException>(() => sandbox.ExecAsync(new SandboxExec { Argv = ["true"] }));
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["true"] });
+        Assert.True(result.Success);
+
+        await sandbox.DisposeAsync();
 
         Assert.True(Directory.Exists(host.Path));
         Assert.Equal("keep", File.ReadAllText(Path.Combine(host.Path, "keep.txt")));
@@ -521,6 +672,85 @@ public sealed class SpritesSandboxProviderTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => exec);
         Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task ExecAsync_NonCancellationExceptionAfterSessionInfo_PostsKill()
+    {
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == "/v1/sprites/codeybox-test/exec/42/kill")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {"type":"signal"}
+                        {"type":"complete","exit_code":143}
+                        """,
+                        Encoding.UTF8,
+                        "application/x-ndjson"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText("""{"type":"session_info","session_id":42,"command":"bash","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        socket.EnqueueText("""{"type":""");
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" }, httpHandler: handler);
+
+        await Assert.ThrowsAnyAsync<JsonException>(() => sandbox.ExecAsync(new SandboxExec { Argv = ["true"] }));
+
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == "/v1/sprites/codeybox-test/exec/42/kill");
+    }
+
+    [Fact]
+    public async Task KillExecAsync_ThrowsWhenEventsEndBeforeComplete()
+    {
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == "/v1/sprites/codeybox-test/exec/42/kill")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {"type":"signal"}
+                        {"type":"exited"}
+                        """,
+                        Encoding.UTF8,
+                        "application/x-ndjson"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var client = new SpritesApiClient(new HttpClient(handler));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.KillExecAsync(new SpritesSandboxOptions { Token = "sprite-token" }, "codeybox-test", 42, CancellationToken.None));
+
+        Assert.Contains("ended before a complete event", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task KillExecAsync_EmptyBodyReturnsWithoutThrowing()
+    {
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == "/v1/sprites/codeybox-test/exec/42/kill")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("", Encoding.UTF8, "application/x-ndjson"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var client = new SpritesApiClient(new HttpClient(handler));
+
+        await client.KillExecAsync(new SpritesSandboxOptions { Token = "sprite-token" }, "codeybox-test", 42, CancellationToken.None);
+
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == "/v1/sprites/codeybox-test/exec/42/kill");
     }
 
     [Fact]
@@ -606,6 +836,18 @@ public sealed class SpritesSandboxProviderTests
         if (stdout is not null)
             socket.EnqueueBinary([1, .. Encoding.UTF8.GetBytes(stdout)]);
         socket.EnqueueText("""{"type":"exit","exit_code":0}""");
+        return socket;
+    }
+
+    private static FakeSpritesWebSocket ExitingSocket(int sessionId, int exitCode, string? stdout = null, string? stderr = null)
+    {
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText($$"""{"type":"session_info","session_id":{{sessionId}},"command":"cmd","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        if (stdout is not null)
+            socket.EnqueueBinary([1, .. Encoding.UTF8.GetBytes(stdout)]);
+        if (stderr is not null)
+            socket.EnqueueBinary([2, .. Encoding.UTF8.GetBytes(stderr)]);
+        socket.EnqueueText($$"""{"type":"exit","exit_code":{{exitCode}}}""");
         return socket;
     }
 
@@ -708,6 +950,19 @@ public sealed class SpritesSandboxProviderTests
             values.Add(value);
         }
         return result;
+    }
+
+    private static void AssertWrappedCommand(Dictionary<string, List<string>> query, IReadOnlyList<string> expectedOriginalArgv)
+    {
+        var cmd = query["cmd"];
+        Assert.True(cmd.Count >= expectedOriginalArgv.Count + 5, $"wrapped command had too few argv entries: {string.Join(" ", cmd)}");
+        Assert.Equal("sh", cmd[0]);
+        Assert.Equal("-c", cmd[1]);
+        Assert.Contains("exec \"$@\"", cmd[2], StringComparison.Ordinal);
+        Assert.Equal("_", cmd[3]);
+        Assert.True(int.TryParse(cmd[4], NumberStyles.None, CultureInfo.InvariantCulture, out var envBytes), "env byte count should be numeric");
+        Assert.True(envBytes > 0);
+        Assert.Equal(expectedOriginalArgv, cmd.Skip(5).ToArray());
     }
 
     private sealed class RecordingHttpHandler : HttpMessageHandler

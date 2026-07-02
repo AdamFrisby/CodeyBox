@@ -197,10 +197,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         Action<string>? stdoutChunkCallback,
         bool captureStructuredStream)
     {
-        await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
-
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return unsupported;
+
+        await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
 
         var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume, ct);
         if (preparation is not null)

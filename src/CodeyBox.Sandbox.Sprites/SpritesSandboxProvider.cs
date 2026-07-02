@@ -129,10 +129,10 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
-        if (!IsValidManagedName(name))
+        var opts = ReadValidatedOptions();
+        if (!IsValidManagedName(name, opts.NamePrefix))
             throw new ArgumentException($"Sprites sandbox name '{name}' is not a managed codeybox sandbox name.", nameof(name));
 
-        var opts = ReadValidatedOptions();
         await _client.DeleteSpriteAsync(opts, name, ct).ConfigureAwait(false);
         MarkNoLongerActive(name);
     }
@@ -207,9 +207,9 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
         return normalizedPrefix + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
     }
 
-    private static bool IsValidManagedName(string name) =>
+    private static bool IsValidManagedName(string name, string namePrefix) =>
         !string.IsNullOrWhiteSpace(name)
-        && name.StartsWith(DefaultNamePrefix, StringComparison.Ordinal)
+        && name.StartsWith(namePrefix, StringComparison.Ordinal)
         && name.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-');
 
     private static bool IsValidNamePrefix(string prefix) =>
@@ -225,6 +225,9 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
 
             if (IsCredentialPath(mount.SandboxPath))
             {
+                if (mount.Tmpfs && mount.HostPath is null)
+                    continue;
+
                 throw new NotSupportedException(
                     "sprites.dev does not expose tmpfs mounts; refusing credential mount " +
                     $"{mount.SandboxPath} because it would persist on the sprite ext4 filesystem. " +
@@ -233,7 +236,8 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
 
             if (mount.Tmpfs)
             {
-                if (!opts.AllowPersistentTmpfsDowngrade)
+                if (!opts.AllowPersistentTmpfsDowngrade &&
+                    !mount.SandboxPath.Equals(SandboxConventions.WorkDir, StringComparison.Ordinal))
                 {
                     throw new NotSupportedException(
                         $"sprites.dev does not expose tmpfs mounts; refusing tmpfs mount {mount.SandboxPath}. " +
@@ -241,12 +245,6 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
                 }
                 result.Add(new SpritesMountSync(mount.SandboxPath, HostPath: null, ReadOnly: false, IsPersistentTmpfsDirectory: true));
                 continue;
-            }
-
-            if (mount.ReadOnly)
-            {
-                throw new NotSupportedException(
-                    $"sprites.dev cannot enforce read-only mounts; refusing read-only mount {mount.SandboxPath}.");
             }
 
             if (mount.HostPath is null)
@@ -415,17 +413,23 @@ public sealed record SpritesSandboxOptions
 internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBackedAgentCredentials
 {
     private static readonly Encoding Utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-    private static readonly string[] KnownFileBackedCredentialEnvVars =
-    [
-        "CODEX_AUTH_JSON",
-        "CODEYBOX_CLAUDE_OAUTH_JSON",
-        "CODEYBOX_CURSOR_AUTH_JSON",
-        "CODEYBOX_GEMINI_OAUTH_CREDS_JSON",
-        "CODEYBOX_GEMINI_SETTINGS_JSON",
-        "OPENCODE_AUTH_JSON",
-        "CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON",
-        "CROCK_CONFIG_JSON",
-    ];
+    private const string EnvironmentBootstrapScript =
+        """
+        set -eu
+        __codeybox_env_bytes="$1"
+        shift
+        __codeybox_env_payload="$(dd bs=1 count="$__codeybox_env_bytes" 2>/dev/null || true)"
+        while IFS= read -r __codeybox_env_line; do
+          [ -n "$__codeybox_env_line" ] || continue
+          __codeybox_env_key="${__codeybox_env_line%%=*}"
+          __codeybox_env_value_b64="${__codeybox_env_line#*=}"
+          __codeybox_env_value="$(printf '%s' "$__codeybox_env_value_b64" | base64 -d)"
+          export "$__codeybox_env_key=$__codeybox_env_value"
+        done <<__CODEYBOX_ENV__
+        $__codeybox_env_payload
+        __CODEYBOX_ENV__
+        exec "$@"
+        """;
 
     private readonly SandboxSpec _spec;
     private readonly SpritesSandboxOptions _opts;
@@ -437,8 +441,8 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
     private readonly ConcurrentDictionary<int, byte> _activeSessions = new();
     private readonly SemaphoreSlim _execGate = new(1, 1);
     private int _ownedByShutdownHandler;
-    private bool _disposing;
-    private bool _disposed;
+    private int _disposing;
+    private int _disposed;
 
     public SpritesSandbox(
         string id,
@@ -521,7 +525,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         await _execGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var result = await ExecRawAsync(exec, syncWritableMounts: true, allowDuringDispose: false, includeSpecEnvironment: true, ct: ct).ConfigureAwait(false);
+            var result = await ExecRawAsync(exec, syncWritableMounts: false, allowDuringDispose: false, includeSpecEnvironment: true, ct: ct).ConfigureAwait(false);
             return result;
         }
         finally
@@ -537,28 +541,31 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         bool includeSpecEnvironment,
         CancellationToken ct)
     {
-        if (_disposed || (_disposing && !allowDuringDispose))
+        if (Volatile.Read(ref _disposed) != 0 ||
+            (Volatile.Read(ref _disposing) != 0 && !allowDuringDispose))
             throw new ObjectDisposedException(nameof(SpritesSandbox));
         if (exec.Argv.Count == 0)
             throw new ArgumentException("Argv must be non-empty", nameof(exec));
         var effectiveEnvironment = BuildEffectiveEnvironment(exec, includeSpecEnvironment);
-        if (WouldPersistCredentialFile(exec, effectiveEnvironment))
+        if (WouldPersistCredentialFile(exec))
         {
             throw new NotSupportedException(
                 "sprites.dev does not expose tmpfs credential storage; refusing to write credential file material " +
                 "to the sprite ext4 filesystem. Use non-file credential environment variables for sprites-backed sandboxes.");
         }
+        var wireExec = BuildWireExec(exec, effectiveEnvironment);
 
         int? sessionId = null;
         await using var webSocket = _webSocketFactory.Create();
         try
         {
-            await webSocket.ConnectAsync(BuildExecWebSocketUri(exec, effectiveEnvironment), _opts.Token!, ct).ConfigureAwait(false);
+            await webSocket.ConnectAsync(BuildExecWebSocketUri(wireExec), _opts.Token!, ct).ConfigureAwait(false);
             var stdout = new LimitedOutputCollector(exec.MaxStdoutBytes, exec.StdoutChunkCallback);
             var stderr = new LimitedOutputCollector(exec.MaxStderrBytes, exec.StderrChunkCallback);
             var exitCode = await ReadExecUntilExitAsync(
                 webSocket,
                 exec,
+                wireExec.Stdin,
                 stdout,
                 stderr,
                 id =>
@@ -580,7 +587,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
                 await SyncWritableMountsToHostAsync(CancellationToken.None, allowDuringDispose: false).ConfigureAwait(false);
             return result;
         }
-        catch (OperationCanceledException)
+        catch
         {
             if (sessionId.HasValue)
                 await KillExecAsync(sessionId.Value, CancellationToken.None).ConfigureAwait(false);
@@ -596,6 +603,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
     private async Task<int?> ReadExecUntilExitAsync(
         ISpritesWebSocket webSocket,
         SandboxExec exec,
+        string? stdin,
         LimitedOutputCollector stdout,
         LimitedOutputCollector stderr,
         Action<int> onSessionInfo,
@@ -630,7 +638,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
                                 onSessionInfo(id);
                                 if (!sentStdin)
                                 {
-                                    await SendStdinAsync(webSocket, exec.Stdin, ct).ConfigureAwait(false);
+                                    await SendStdinAsync(webSocket, stdin, ct).ConfigureAwait(false);
                                     sentStdin = true;
                                 }
                             }
@@ -708,7 +716,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         await webSocket.SendAsync(new byte[] { 4 }, WebSocketMessageType.Binary, endOfMessage: true, ct).ConfigureAwait(false);
     }
 
-    private Uri BuildExecWebSocketUri(SandboxExec exec, IReadOnlyDictionary<string, string> effectiveEnvironment)
+    private Uri BuildExecWebSocketUri(SpritesWireExec exec)
     {
         var baseUri = new Uri(_opts.ApiBaseUrl);
         var builder = new UriBuilder(baseUri)
@@ -722,17 +730,64 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         var query = new List<KeyValuePair<string, string>>();
         foreach (var arg in exec.Argv)
             query.Add(new KeyValuePair<string, string>("cmd", arg));
+        query.Add(new KeyValuePair<string, string>("tty", "false"));
 
         var workingDirectory = exec.WorkingDirectory ?? _spec.WorkingDirectory;
         if (!string.IsNullOrWhiteSpace(workingDirectory))
             query.Add(new KeyValuePair<string, string>("dir", workingDirectory));
 
-        foreach (var (key, value) in effectiveEnvironment)
-            query.Add(new KeyValuePair<string, string>("env", $"{key}={value}"));
-
         builder.Query = string.Join('&', query.Select(q =>
             $"{Uri.EscapeDataString(q.Key)}={Uri.EscapeDataString(q.Value)}"));
         return builder.Uri;
+    }
+
+    private static SpritesWireExec BuildWireExec(
+        SandboxExec exec,
+        IReadOnlyDictionary<string, string> effectiveEnvironment)
+    {
+        var envBlock = BuildEnvironmentBlock(effectiveEnvironment);
+        var envBlockBytes = Utf8.GetByteCount(envBlock);
+        var argv = new List<string>(exec.Argv.Count + 5)
+        {
+            "sh",
+            "-c",
+            EnvironmentBootstrapScript,
+            "_",
+            envBlockBytes.ToString(CultureInfo.InvariantCulture),
+        };
+        argv.AddRange(exec.Argv);
+        return new SpritesWireExec(argv, exec.WorkingDirectory, envBlock + (exec.Stdin ?? ""));
+    }
+
+    private static string BuildEnvironmentBlock(IReadOnlyDictionary<string, string> environment)
+    {
+        var builder = new StringBuilder();
+        foreach (var (key, value) in environment.OrderBy(kvp => kvp.Key, StringComparer.Ordinal))
+        {
+            if (!IsValidEnvironmentKey(key))
+                throw new ArgumentException($"Invalid environment variable name for sprites exec: {key}");
+            builder
+                .Append(key)
+                .Append('=')
+                .Append(Convert.ToBase64String(Utf8.GetBytes(value)))
+                .Append('\n');
+        }
+        return builder.ToString();
+    }
+
+    private static bool IsValidEnvironmentKey(string key)
+    {
+        if (string.IsNullOrEmpty(key))
+            return false;
+        if (key[0] != '_' && !char.IsAsciiLetter(key[0]))
+            return false;
+        for (var i = 1; i < key.Length; i++)
+        {
+            var c = key[i];
+            if (c != '_' && !char.IsAsciiLetterOrDigit(c))
+                return false;
+        }
+        return true;
     }
 
     private Dictionary<string, string> BuildEffectiveEnvironment(SandboxExec exec, bool includeSpecEnvironment)
@@ -755,40 +810,19 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         return env;
     }
 
-    private static bool WouldPersistCredentialFile(
-        SandboxExec exec,
-        IReadOnlyDictionary<string, string> effectiveEnvironment)
+    private static bool WouldPersistCredentialFile(SandboxExec exec)
     {
-        var argvText = string.Join('\n', exec.Argv);
         if (exec.Stdin is not null &&
             exec.Argv.Any(arg =>
                 arg.Equals(SandboxConventions.CredentialsDir, StringComparison.Ordinal) ||
-                arg.StartsWith(SandboxConventions.CredentialsDir + "/", StringComparison.Ordinal)))
+                arg.StartsWith(SandboxConventions.CredentialsDir + "/", StringComparison.Ordinal) ||
+                arg.Contains(SandboxConventions.CredentialsDir + "/", StringComparison.Ordinal)))
         {
             return true;
         }
 
-        if (!LooksLikeShellWrite(argvText))
-            return false;
-
-        foreach (var key in KnownFileBackedCredentialEnvVars)
-        {
-            if (effectiveEnvironment.TryGetValue(key, out var value) &&
-                !string.IsNullOrEmpty(value) &&
-                argvText.Contains(key, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
         return false;
     }
-
-    private static bool LooksLikeShellWrite(string argvText) =>
-        argvText.Contains('>', StringComparison.Ordinal) ||
-        argvText.Contains("tee ", StringComparison.Ordinal) ||
-        argvText.Contains("install ", StringComparison.Ordinal) ||
-        argvText.Contains("base64 -d", StringComparison.Ordinal);
 
     private async Task UploadDirectoryAsync(string hostPath, string sandboxPath, CancellationToken ct)
     {
@@ -1017,9 +1051,15 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed || _disposing)
+        if (Volatile.Read(ref _disposed) != 0)
             return;
-        _disposing = true;
+        if (Interlocked.CompareExchange(ref _disposing, 1, 0) != 0)
+            return;
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            Volatile.Write(ref _disposing, 0);
+            return;
+        }
         _onDisposed();
 
         await KillActiveExecsAsync(CancellationToken.None).ConfigureAwait(false);
@@ -1048,8 +1088,8 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         }
         finally
         {
-            _disposed = true;
-            _disposing = false;
+            Volatile.Write(ref _disposed, 1);
+            Volatile.Write(ref _disposing, 0);
         }
     }
 
@@ -1068,6 +1108,11 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
     }
 
     private readonly record struct ReceivedWebSocketMessage(WebSocketMessageType MessageType, byte[] Payload);
+
+    private readonly record struct SpritesWireExec(
+        IReadOnlyList<string> Argv,
+        string? WorkingDirectory,
+        string? Stdin);
 }
 
 internal sealed record SpritesMountSync(
