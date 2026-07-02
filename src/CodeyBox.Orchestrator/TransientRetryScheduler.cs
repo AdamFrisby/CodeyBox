@@ -521,6 +521,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
 
     private static string NormalizeRetryFrom(string? retryFrom) => retryFrom?.Trim().ToLowerInvariant() switch
     {
+        "planning" => "planning",
         "audit" => "audit",
         "conflict_rework" => "conflict_rework",
         "merge" => "merge",

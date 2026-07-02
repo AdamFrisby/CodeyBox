@@ -1640,6 +1640,72 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildDetachedLaunchScript_ReportsSetupFailureWhenStdinSidecarReadFails()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "detached-stdin-read-fails",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-stdin-read-fails.env");
+        var launchScript = Path.Combine(_workspace, "detached-stdin-read-fails.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-stdin-read-fails.pgid");
+        var stdinFile = processGroupMarker + ".stdin";
+        var exitTokenFile = processGroupMarker + ".exit-token";
+        var sentinel = Path.Combine(_workspace, "detached-stdin-read-fails.started");
+        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment(includeExitToken: false)));
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                stdinFile,
+                ["/bin/sh", "-c", "cat >/dev/null; printf should-not-run > \"$1\"", "codeybox-stdin-read-fail", sentinel],
+                exitTokenFile: exitTokenFile));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var fakeSudo = CreateFakeSudoBin(
+            """
+            #!/bin/sh
+            if [ "$1" = "-n" ]; then shift; fi
+            if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
+                case "$3" in *'cat -- "$1"'*)
+                    case "$5" in *.stdin) exit 23 ;; esac
+                    ;;
+                esac
+            fi
+            exec "$@"
+            """);
+        var (exit, stdout, stderr) = await RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+            },
+            stdin: session.ExitToken + "\nprompt payload");
+
+        Assert.Equal(0, exit);
+        Assert.Equal("", stdout);
+        Assert.Equal("", stderr);
+        await WaitForExitCodeAsync(session, 88, TimeSpan.FromSeconds(6));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        Assert.True(File.Exists(stdinFile));
+        Assert.Contains(
+            "codeybox-detached: failed to read stdin sidecar (exit 23)",
+            await File.ReadAllTextAsync(processGroupMarker + ".stderr"),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task BuildDetachedLaunchScript_ReturnsExit88WhenExitTokenSidecarPublicationFails()
     {
         if (OperatingSystem.IsWindows())
@@ -7160,6 +7226,49 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         {
             await sandbox.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task CreateAsync_SnapshotForIsolationMountsStagedReadOnlySnapshot()
+    {
+        var source = Path.Combine(_workspace, "snapshot-source");
+        Directory.CreateDirectory(source);
+        await File.WriteAllTextAsync(Path.Combine(source, "marker.txt"), "snapshot content");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = BuildSuccessfulCreateRunner(states);
+        var staging = Path.Combine(_workspace, "staging-snapshot-mount");
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    HostPath = source,
+                    SandboxPath = "/repo",
+                    ReadOnly = true,
+                    SnapshotForIsolation = true,
+                },
+            ],
+        });
+
+        var mount = Assert.Single(runner.Calls, call =>
+            call.Argv is [_, "mount", "--type=native", _, var vmTarget]
+            && vmTarget.EndsWith(":/repo", StringComparison.Ordinal));
+        var mountedSource = mount.Argv[3];
+
+        Assert.NotEqual(Path.GetFullPath(source), Path.GetFullPath(mountedSource));
+        Assert.Contains(
+            $"{Path.DirectorySeparatorChar}readonly-binds{Path.DirectorySeparatorChar}",
+            mountedSource,
+            StringComparison.Ordinal);
+        Assert.True(File.Exists(Path.Combine(mountedSource, "marker.txt")));
+        Assert.Equal("snapshot content", await File.ReadAllTextAsync(Path.Combine(mountedSource, "marker.txt")));
     }
 
     [Fact]

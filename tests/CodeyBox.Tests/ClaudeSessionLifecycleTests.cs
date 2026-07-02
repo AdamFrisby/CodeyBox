@@ -244,6 +244,59 @@ public sealed class ClaudeSessionLifecycleTests
     }
 
     [Fact]
+    public async Task GetSandboxAsync_AfterSuspendedSessionDegradesOnResume_ThrowsAndCloses()
+    {
+        // First turn runs, the session suspends, and the next GetSandboxAsync
+        // resumes into fallback-to-one-shot metadata. The lifecycle must throw
+        // and close itself so callers cannot accidentally re-use the dead VM.
+        var worker = new FakeSessionRunner(disposeSandboxOnClose: true)
+        {
+            MarkFallbackOnResume = true,
+        };
+        var sandbox = new RecordingSandbox("planning-degrade-vm");
+        worker.SandboxToDisposeOnClose = sandbox;
+
+        AgentSessionHandle Snapshot(AgentSessionHandle h)
+        {
+            if (!worker.FallbackMarked)
+                return h;
+            var metadata = h.Metadata is null
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : new Dictionary<string, string>(h.Metadata, StringComparer.Ordinal);
+            metadata[AgentSessionMetadataKeys.FallbackToOneShot] = "true";
+            return h with { Metadata = metadata };
+        }
+
+        var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
+            worker,
+            handleSnapshot: Snapshot,
+            sandbox,
+            workingDirectory: "/work",
+            credential: null,
+            modelId: null,
+            reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value,
+            projectId: null,
+            agentClassMember: null,
+            ct: CancellationToken.None);
+
+        // First turn — fresh lifecycle, no resume needed.
+        var planningSandbox = await lifecycle.GetSandboxAsync(CancellationToken.None);
+        Assert.Same(sandbox, planningSandbox);
+        await lifecycle.SendTurnAsync("first turn", CancellationToken.None, stdoutChunkCallback: null);
+
+        // Pipeline normally suspends between phase boundaries — model that
+        // here so the next GetSandboxAsync triggers a Resume cycle.
+        await lifecycle.SuspendAsync(CancellationToken.None);
+
+        await Assert.ThrowsAsync<AgentSessionDegradedException>(() =>
+            lifecycle.GetSandboxAsync(CancellationToken.None));
+
+        Assert.True(lifecycle.IsClosed);
+        Assert.True(sandbox.Disposed);
+    }
+
+    [Fact]
     public async Task GetSandboxAsync_WhenResumeMarksFallback_ClosesAndRequiresFreshSandbox()
     {
         var worker = new FakeSessionRunner(disposeSandboxOnClose: true)

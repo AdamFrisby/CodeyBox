@@ -440,8 +440,146 @@ public sealed class AgentPauseTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning, "planning", WorkItemState.Queued, false)]
+    [InlineData(WorkItemState.PlanApproved, "plan_approved", WorkItemState.PlanApproved, true)]
+    public async Task Worker_PlanningResumeStateWithPausedDirectAgent_ParksWithoutEnteringPipeline(
+        WorkItemState state,
+        string retryFrom,
+        WorkItemState expectedResumeState,
+        bool preservesApprovedPlan)
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new CapturingPipeline(store);
+        var item = Item(classId: null) with
+        {
+            Agent = AgentKind.Claude,
+            State = state,
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["plan"] = "on",
+            },
+            PlanArtifact = state is WorkItemState.PlanReview or WorkItemState.PlanApproved ? ValidPlan : null,
+            PlanGeneratedAt = state is WorkItemState.PlanReview or WorkItemState.PlanApproved
+                ? DateTimeOffset.UtcNow.AddMinutes(-2)
+                : null,
+            PlanReviewedAt = state == WorkItemState.PlanApproved
+                ? DateTimeOffset.UtcNow.AddMinutes(-1)
+                : null,
+            PlanReviewSummary = state == WorkItemState.PlanApproved ? "approved" : null,
+        };
+
+        var startup = new StartupRecoveryBarrier();
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: ProjectRepo(),
+            startupRecoveryCompletion: startup,
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+        await svc.StartAsync(CancellationToken.None);
+        await startup.InitialRecoveryCompleted.WaitAsync(StateWaitBudget);
+        await store.CreateAsync(item);
+        Assert.Equal(state, (await store.GetAsync(item.Id))!.State);
+        await queue.EnqueueAsync(item.Id);
+
+        var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
+        Assert.NotNull(parked);
+        Assert.False(pipeline.Entered);
+        Assert.Equal(retryFrom, parked!.AgentPauseRetryFrom);
+        Assert.Equal(AgentKind.Claude, parked.AgentPauseTarget);
+        await svc.StopAsync(CancellationToken.None);
+
+        await pauses.ResumeAsync(AgentKind.Claude, "test");
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
+        var retried = await scheduler.RetryWaitingItemsForTestAsync("test");
+        Assert.Equal(1, retried);
+
+        var resumed = await store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(expectedResumeState, resumed!.State);
+        if (preservesApprovedPlan)
+        {
+            Assert.Equal(ValidPlan, resumed.PlanArtifact);
+            Assert.NotNull(resumed.PlanGeneratedAt);
+            Assert.NotNull(resumed.PlanReviewedAt);
+            Assert.Equal("approved", resumed.PlanReviewSummary);
+        }
+        else
+        {
+            Assert.Null(resumed.PlanArtifact);
+            Assert.Null(resumed.PlanGeneratedAt);
+            Assert.Null(resumed.PlanReviewedAt);
+            Assert.Null(resumed.PlanReviewSummary);
+        }
+
+        using var resumedRegistry = new CancellationRegistry(CancellationToken.None);
+        using var resumedSvc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            resumedRegistry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: ProjectRepo(),
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+        await resumedSvc.StartAsync(CancellationToken.None);
+        var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
+        Assert.NotNull(done);
+        await resumedSvc.StopAsync(CancellationToken.None);
+    }
+
     [Fact]
-    public async Task Worker_AuditPassedDirectItemWithPausedWorkAgent_EntersPipeline()
+    public async Task Worker_PlanReviewWithPausedDirectAgent_ParksBeforePipeline()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new CapturingPipeline(store);
+        var item = Item(classId: null) with
+        {
+            Agent = AgentKind.Claude,
+            State = WorkItemState.PlanReview,
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+        };
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: ProjectRepo(),
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+        await svc.StartAsync(CancellationToken.None);
+        await store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
+        Assert.NotNull(parked);
+        Assert.False(pipeline.Entered);
+        Assert.Equal("plan_review", parked!.AgentPauseRetryFrom);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Worker_AuditPassedDirectItemWithPausedWorkAgent_EntersContinuationPipeline()
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
@@ -473,6 +611,7 @@ public sealed class AgentPauseTests : IDisposable
         var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
         Assert.NotNull(done);
         Assert.True(pipeline.Entered);
+        Assert.Null(done!.AgentPauseRetryFrom);
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -1131,6 +1270,9 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Theory]
+    [InlineData(WorkItemState.Planning, "planning", WorkItemState.Queued)]
+    [InlineData(WorkItemState.PlanReview, "plan_review", WorkItemState.PlanReview)]
+    [InlineData(WorkItemState.PlanApproved, "plan_approved", WorkItemState.PlanApproved)]
     [InlineData(WorkItemState.WorkComplete, "audit", WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.ReworkingForConflict, "conflict_rework", WorkItemState.ReworkingForConflict)]
     [InlineData(WorkItemState.AuditPassed, "merge", WorkItemState.AuditPassed)]
@@ -1242,6 +1384,16 @@ public sealed class AgentPauseTests : IDisposable
         Prompt = "do work",
         AgentClassId = classId,
     };
+
+    private const string ValidPlan = """
+        {
+          "approach": "pause routing",
+          "files": ["output.txt"],
+          "testStrategy": ["run tests"],
+          "risks": ["none"],
+          "satisfiesTask": "routes through planning state"
+        }
+        """;
 
     private sealed class ThrowingForWorkItemQueue : ITaskQueue
     {

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -297,7 +298,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             }
             else if (m.HostPath is not null)
             {
-                bindMounts.Add(new BindMount(m.HostPath, m.SandboxPath, m.ReadOnly));
+                var hostPath = m.SnapshotForIsolation
+                    ? StageReadOnlyBindSnapshot(sandboxRoot, m.HostPath, m.SandboxPath)
+                    : m.HostPath;
+                bindMounts.Add(new BindMount(hostPath, m.SandboxPath, m.ReadOnly));
             }
         }
 
@@ -444,6 +448,62 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                     innerException: ex);
             }
             throw;
+        }
+    }
+
+    internal static string StageReadOnlyBindSnapshot(string sandboxRoot, string sourcePath, string sandboxPath)
+    {
+        var sourceFullPath = Path.GetFullPath(sourcePath);
+        var snapshotRoot = Path.Combine(sandboxRoot, "readonly-binds");
+        Directory.CreateDirectory(snapshotRoot);
+        TryChmod0700(snapshotRoot);
+
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sourceFullPath + "\0" + sandboxPath)))[..16];
+        var destination = Path.Combine(snapshotRoot, hash);
+        CopyFileSystemSnapshot(sourceFullPath, destination);
+        return destination;
+    }
+
+    private static void CopyFileSystemSnapshot(string sourcePath, string destinationPath)
+    {
+        if (Directory.Exists(sourcePath))
+        {
+            CopyDirectorySnapshot(new DirectoryInfo(sourcePath), new DirectoryInfo(destinationPath));
+            return;
+        }
+
+        if (File.Exists(sourcePath))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+            File.Copy(sourcePath, destinationPath, overwrite: true);
+            return;
+        }
+
+        throw new DirectoryNotFoundException($"Read-only sandbox mount source '{sourcePath}' does not exist.");
+    }
+
+    private static void CopyDirectorySnapshot(DirectoryInfo source, DirectoryInfo destination)
+    {
+        Directory.CreateDirectory(destination.FullName);
+        foreach (var entry in source.EnumerateFileSystemInfos())
+        {
+            var target = Path.Combine(destination.FullName, entry.Name);
+            if (!string.IsNullOrEmpty(entry.LinkTarget))
+            {
+                if (entry is DirectoryInfo)
+                    Directory.CreateSymbolicLink(target, entry.LinkTarget);
+                else
+                    File.CreateSymbolicLink(target, entry.LinkTarget);
+                continue;
+            }
+
+            if (entry is DirectoryInfo directory)
+            {
+                CopyDirectorySnapshot(directory, new DirectoryInfo(target));
+                continue;
+            }
+
+            File.Copy(entry.FullName, target, overwrite: true);
         }
     }
 
@@ -5957,7 +6017,11 @@ while True:
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
         sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, sys, urllib.error, urllib.parse, urllib.request");
+        sb.AppendLine("import os, signal, sys, urllib.error, urllib.parse, urllib.request");
+        sb.AppendLine("def codeybox_timeout(_signum, _frame):");
+        sb.AppendLine("    raise TimeoutError('ready probe timed out')");
+        sb.AppendLine("signal.signal(signal.SIGALRM, codeybox_timeout)");
+        sb.AppendLine("signal.alarm(2)");
         sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
         sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
         sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
@@ -5969,8 +6033,9 @@ while True:
         sb.AppendLine("    data=b'',");
         sb.AppendLine("    method='POST',");
         sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
+        sb.AppendLine("opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))");
         sb.AppendLine("try:");
-        sb.AppendLine("    with urllib.request.urlopen(req, timeout=1.0) as resp:");
+        sb.AppendLine("    with opener.open(req, timeout=1.0) as resp:");
         sb.AppendLine("        code = resp.getcode()");
         sb.AppendLine("        sys.exit(0 if 200 <= code < 300 else 1)");
         sb.AppendLine("except urllib.error.HTTPError:");
@@ -5995,6 +6060,7 @@ while True:
         sb.AppendLine("cat > \"$codeybox_child_script\" <<'CODEYBOX_DETACHED_CHILD'");
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("set +e");
+        sb.AppendLine("exec </dev/null >/dev/null 2>/dev/null");
         sb.AppendLine("rm -f \"$0\" 2>/dev/null || true");
         sb.AppendLine("codeybox_pgid_marker=$1");
         sb.AppendLine("codeybox_stdin_file=$2");
@@ -6049,9 +6115,16 @@ while True:
         sb.AppendLine($"codeybox_stderr_file=$(mktemp \"${{TMPDIR:-/tmp}}/codeybox-detached-stderr.XXXXXX\") || {{ rm -f \"$codeybox_stdout_file\"; exit {DetachedSupervisorSetupFailedExitCode}; }}");
         sb.AppendLine("if [ -n \"$codeybox_stdin_file\" ]; then");
         sb.AppendLine("    set -o pipefail");
+        sb.AppendLine("    set +e");
         sb.AppendLine("    codeybox_root_sh 'cat -- \"$1\"' \"$codeybox_stdin_file\" 2>>\"$codeybox_stderr_file\" | \"$@\" >\"$codeybox_stdout_file\" 2>>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_status=(\"${PIPESTATUS[@]}\")");
+        sb.AppendLine("    set -e");
+        sb.AppendLine("    codeybox_stdin_rc=${codeybox_status[0]}");
         sb.AppendLine("    codeybox_wrapper_rc=${codeybox_status[1]}");
+        sb.AppendLine("    if [ \"$codeybox_stdin_rc\" -ne 0 ] && [ \"$codeybox_stdin_rc\" -ne 141 ] && ! grep -qi 'broken pipe' \"$codeybox_stderr_file\"; then");
+        sb.AppendLine("        printf 'codeybox-detached: failed to read stdin sidecar (exit %s)\\n' \"$codeybox_stdin_rc\" >>\"$codeybox_stderr_file\"");
+        sb.AppendLine($"        codeybox_wrapper_rc={DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    fi");
         sb.AppendLine("else");
         sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_wrapper_rc=$?");

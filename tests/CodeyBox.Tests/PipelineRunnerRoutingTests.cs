@@ -188,6 +188,60 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkCompleteContinuation_ResolvesWorkAgentClassAtPickup()
+    {
+        var frontierClass = new AgentClass
+        {
+            Id = "frontier-coding",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+        var router = new AgentClassRouter(
+            [frontierClass],
+            [new FakeProbe(AgentKind.Claude, 0.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromSeconds(60) },
+            NullLogger<AgentClassRouter>.Instance);
+        var tracking = new AgentTrackingPipeline(_store);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.WorkComplete,
+            AgentClassId = "frontier-coding",
+        };
+        await _store.CreateAsync(item);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            tracking,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: null);
+
+        await queue.EnqueueAsync(item.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+        var completed = await Task.WhenAny(tracking.Ran, Task.Delay(TimeSpan.FromMilliseconds(300)));
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.NotSame(tracking.Ran, completed);
+        Assert.Null(tracking.LastAgent);
+        Assert.False(tracking.ReceivedNullAgent);
+        var stored = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, stored?.State);
+    }
+
+    [Fact]
     public async Task AllMembersBelowFloor_ItemMarkedFailed_PipelineNotCalled()
     {
         // All members have QualityScore=80 but item requires MinModelScore=95 → NoEligibleMembers.

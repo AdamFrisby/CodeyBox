@@ -109,7 +109,9 @@ by extending `IKnob` with optional per-phase methods.
 A knob whose effective value matches its existing default behaviour should
 return `null` from its prompt-fragment method so the prompt stays
 byte-identical to the pre-knob output. This is the contract: *"a knob with
-nothing to say contributes nothing"*.
+nothing to say contributes nothing"*. Some knobs may affect lifecycle outside
+the prompt preprocessor while still using the same registry and validation
+surface; `plan` is the first built-in example.
 
 ## Adding a new knob
 
@@ -169,6 +171,20 @@ requested change.
 This item wires `changeScope` into the **work prompt only**. Its audit-side
 enforcement (e.g. an auditor that flags out-of-scope edits when `surgical`) and
 its merge-friendliness gating ship as separate dependent work items.
+
+### `plan` (default: `off`)
+
+Whether to run a planning-only phase before implementation.
+
+| Value | Behaviour |
+|-------|-----------|
+| `off` | *(none)* — current default lifecycle: `Queued → Working`. |
+| `on` | Runs `Planning → PlanReview → PlanApproved` before `Working`. The agent produces a stored PLAN artifact without imported code changes; the initial review scaffold always approves the artifact so the pipeline can proceed end-to-end. |
+
+When `plan=on`, the approved plan is surfaced on the work item API/dashboard and
+is included in the subsequent implementation prompt. Planning uses the work
+agent and work sandbox/network profile, but its sandbox is discarded: file edits,
+commits, and pushes from the planning turn are not imported.
 
 ## Storage shape
 

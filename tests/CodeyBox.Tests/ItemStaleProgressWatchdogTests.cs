@@ -173,6 +173,46 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         Assert.Equal(1, _queue.Count);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning, WorkItemState.Queued)]
+    [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview)]
+    public async Task Sweep_FrozenPlanningStateUpdatedAt_RecoversAndRequeues(
+        WorkItemState frozenState,
+        WorkItemState expectedState)
+    {
+        var item = MakeItem(
+            frozenState,
+            updatedAt: _time.GetUtcNow().AddMinutes(-95)) with
+        {
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = frozenState is WorkItemState.Planning or WorkItemState.PlanReview
+                ? _time.GetUtcNow().AddMinutes(-100)
+                : null,
+        };
+        await _store.CreateAsync(item);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(expectedState, after!.State);
+        if (expectedState == WorkItemState.Queued)
+        {
+            Assert.Null(after.PlanArtifact);
+            Assert.Null(after.PlanGeneratedAt);
+            Assert.Null(after.PlanReviewedAt);
+            Assert.Null(after.PlanReviewSummary);
+        }
+        else
+        {
+            Assert.Equal(ValidPlan, after.PlanArtifact);
+        }
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("item-stale", after.LastError);
+        Assert.Equal(1, _queue.Count);
+        Assert.Contains(_webhooks.Events, e => e.Event == "work_item.recovered");
+    }
+
     [Fact]
     public async Task Sweep_RecoveredParent_RestoresParentCascadedDependents()
     {
@@ -592,4 +632,14 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         public override DateTimeOffset GetUtcNow() => _now;
         public void Advance(TimeSpan delta) => _now = _now.Add(delta);
     }
+
+    private const string ValidPlan = """
+        {
+          "approach": "recover plan review",
+          "files": ["output.txt"],
+          "testStrategy": ["run tests"],
+          "risks": ["none"],
+          "satisfiesTask": "keeps plan review resumable"
+        }
+        """;
 }

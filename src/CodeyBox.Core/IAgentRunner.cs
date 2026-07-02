@@ -98,6 +98,25 @@ public sealed record TextOnlyAgentResult(bool Success, string Summary, string? O
 public sealed record ConflictResolverFile(string Path, string Content);
 
 /// <summary>
+/// Optional runner capability for CLIs whose planning-phase stdout is a
+/// structured envelope (e.g. NDJSON stream-json) rather than the raw plan
+/// text. Implementations return the agent-visible plan text — typically the
+/// concatenated assistant turn — so the orchestrator's plan-artifact parser
+/// can normalise it without having to know any provider-specific envelope
+/// shape. Returns <c>null</c> when no envelope was detected (the raw stdout
+/// is fed straight to the parser).
+///
+/// <para>This is the runner-side seam that keeps the orchestrator agent-
+/// agnostic: a non-Claude runner that needs similar treatment implements this
+/// interface, instead of growing an <c>AgentKind</c> switch in core pipeline
+/// code.</para>
+/// </summary>
+public interface IPlanArtifactExtractor
+{
+    string? ExtractPlanArtifactText(string rawStdout);
+}
+
+/// <summary>
 /// Optional runner capability for CLIs where CodeyBox pins a default model
 /// even when the work item does not carry an explicit ModelId.
 /// </summary>

@@ -46,6 +46,25 @@ internal static class WorkItemRecoveryPolicy
         return ClearRecoveryAttempts(item);
     }
 
+    public static WorkItem ClearPlanFieldsIfQueued(WorkItem item)
+    {
+        if (item.State != WorkItemState.Queued)
+            return item;
+
+        return item with
+        {
+            PlanArtifact = null,
+            PlanGeneratedAt = null,
+            PlanReviewedAt = null,
+            PlanReviewSummary = null,
+        };
+    }
+
+    public static bool ShouldClearStartedAtForRecoveryTarget(WorkItemState target)
+        => target is WorkItemState.Queued
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved;
+
     private static WorkItem ClearRecoveryAttempts(WorkItem item) => item with
     {
         RecoveryAttempts = 0,
@@ -63,7 +82,11 @@ internal static class WorkItemRecoveryPolicy
             ? IsRealProgressCompletionState(toState)
             : toState switch
             {
-                WorkItemState.WorkComplete => recoverySourceState is WorkItemState.Working or WorkItemState.Reworking,
+                WorkItemState.PlanApproved => recoverySourceState is WorkItemState.Planning or WorkItemState.PlanReview,
+                WorkItemState.WorkComplete => recoverySourceState is
+                    WorkItemState.PlanApproved
+                    or WorkItemState.Working
+                    or WorkItemState.Reworking,
                 WorkItemState.AuditPassed => recoverySourceState is
                     WorkItemState.WorkComplete
                     or WorkItemState.Auditing
@@ -100,6 +123,7 @@ internal static class WorkItemRecoveryPolicy
     private static bool IsRealProgressCompletionState(WorkItemState state) => state switch
     {
         WorkItemState.WorkComplete => true,
+        WorkItemState.PlanApproved => true,
         WorkItemState.AuditPassed => true,
         WorkItemState.Merged => true,
         WorkItemState.Done => true,
@@ -241,11 +265,12 @@ internal static class WorkItemRecoveryPolicy
             ? $"{recoveryReason} while item was {item.State}; re-queued for a fresh run"
             : null;
 
-        return WithRecoveryAttempt(item.With(target.Value, error) with
+        var recovered = ClearPlanFieldsIfQueued(item.With(target.Value, error) with
         {
-            StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+            StartedAt = ShouldClearStartedAtForRecoveryTarget(target.Value) ? null : item.StartedAt,
             UpdatedAt = now,
-        }, attempts, item.State);
+        });
+        return WithRecoveryAttempt(recovered, attempts, item.State);
     }
 
     public static WorkItem? BuildInfrastructureDeferredResumeState(WorkItem item, DateTimeOffset now)
@@ -269,10 +294,10 @@ internal static class WorkItemRecoveryPolicy
         if (target is null)
             return null;
 
-        return ClearInfrastructureDeferralFields(item.With(target.Value), now) with
+        return ClearPlanFieldsIfQueued(ClearInfrastructureDeferralFields(item.With(target.Value), now) with
         {
             StartedAt = null,
-        };
+        });
     }
 
     public static bool HandlesRecoveryState(WorkItemState state)
@@ -289,6 +314,8 @@ internal static class WorkItemRecoveryPolicy
     public static bool IsItemStaleWatchedState(WorkItemState state) => state switch
     {
         WorkItemState.Working => true,
+        WorkItemState.Planning => true,
+        WorkItemState.PlanReview => true,
         WorkItemState.Reworking => true,
         WorkItemState.Auditing => true,
         WorkItemState.Merging => true,
@@ -390,7 +417,7 @@ internal static class WorkItemRecoveryPolicy
             // from Reworking, which has WorkComplete as a durable resume
             // point and is handled by MapToRecoveryState below.
             var preserve = !string.IsNullOrWhiteSpace(item.WorkBranch);
-            return WithRecoveryAttempt(item with
+            var recoveredWorking = ClearPlanFieldsIfQueued(item with
             {
                 State = WorkItemState.Queued,
                 LastError = reason,
@@ -400,19 +427,21 @@ internal static class WorkItemRecoveryPolicy
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
                 UpdatedAt = now,
-            }, attempts, item.State);
+            });
+            return WithRecoveryAttempt(recoveredWorking, attempts, item.State);
         }
 
         var target = MapToRecoveryState(item.State) ?? item.State;
-        return WithRecoveryAttempt(item with
+        var recovered = ClearPlanFieldsIfQueued(item with
         {
             State = target,
             LastError = reason,
-            StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+            StartedAt = ShouldClearStartedAtForRecoveryTarget(target) ? null : item.StartedAt,
             PreemptedAt = null,
             PreemptCheckpoint = null,
             UpdatedAt = now,
-        }, attempts, item.State);
+        });
+        return WithRecoveryAttempt(recovered, attempts, item.State);
     }
 
     /// <summary>
@@ -423,6 +452,9 @@ internal static class WorkItemRecoveryPolicy
     /// </summary>
     public static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
     {
+        WorkItemState.Planning => WorkItemState.Queued,
+        WorkItemState.PlanReview => WorkItemState.PlanReview,
+        WorkItemState.PlanApproved => WorkItemState.PlanApproved,
         WorkItemState.Reworking => WorkItemState.WorkComplete,
         WorkItemState.WorkComplete => WorkItemState.WorkComplete,
         WorkItemState.Auditing => WorkItemState.WorkComplete,

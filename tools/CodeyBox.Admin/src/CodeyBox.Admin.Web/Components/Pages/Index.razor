@@ -246,14 +246,14 @@ else
     // "Active" = an agent is actively doing something with the item right now.
     private static readonly HashSet<string> _activeStates = new(StringComparer.Ordinal)
     {
-        "Working", "Reworking", "ReworkingForConflict",
+        "Planning", "Working", "Reworking", "ReworkingForConflict",
         "Auditing", "AuditPassed", "Merging", "UpstreamPushing",
     };
 
     // "Pending" = waiting for something (queue slot, operator, quota).
     private static readonly HashSet<string> _pendingStates = new(StringComparer.Ordinal)
     {
-        "Queued", "WorkComplete", "NeedsOperatorInput", "WaitingForQuotaReset",
+        "Queued", "PlanReview", "PlanApproved", "WorkComplete", "NeedsOperatorInput", "WaitingForQuotaReset",
     };
 
     private List<WorkItemDto> ItemsForTab(string tab) => tab switch

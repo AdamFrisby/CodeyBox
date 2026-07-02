@@ -145,6 +145,7 @@ public sealed class TransientCancellationRetryTests : IDisposable
     /// table it verifies, so we hit the internal helper directly.
     /// </summary>
     [Theory]
+    [InlineData("planning", WorkItemState.Queued)]
     [InlineData("work", WorkItemState.Queued)]
     [InlineData("rework-resume", WorkItemState.WorkComplete)]
     [InlineData("rework", WorkItemState.WorkComplete)]

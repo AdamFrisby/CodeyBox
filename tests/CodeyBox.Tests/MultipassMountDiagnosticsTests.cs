@@ -611,6 +611,81 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         Assert.Contains(hostSource, ex.Detail);
     }
 
+    [Fact]
+    public void StageReadOnlyBindSnapshot_CopiesHostSourceUnderSandboxRoot()
+    {
+        var source = Path.Combine(_workspace, "durable-repo.git");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "HEAD"), "ref: refs/heads/main\n");
+        Directory.CreateDirectory(Path.Combine(source, "objects"));
+        File.WriteAllText(Path.Combine(source, "objects", "marker"), "durable");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var staged = MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/repo");
+
+        Assert.NotEqual(source, staged);
+        Assert.StartsWith(Path.Combine(sandboxRoot, "readonly-binds"), staged, StringComparison.Ordinal);
+        Assert.Equal("ref: refs/heads/main\n", File.ReadAllText(Path.Combine(staged, "HEAD")));
+        File.WriteAllText(Path.Combine(staged, "HEAD"), "mutated in guest copy\n");
+        File.WriteAllText(Path.Combine(staged, "objects", "marker"), "changed");
+
+        Assert.Equal("ref: refs/heads/main\n", File.ReadAllText(Path.Combine(source, "HEAD")));
+        Assert.Equal("durable", File.ReadAllText(Path.Combine(source, "objects", "marker")));
+    }
+
+    [Fact]
+    public void StageReadOnlyBindSnapshot_CopiesSingleFileSource()
+    {
+        var source = Path.Combine(_workspace, "single-file.txt");
+        File.WriteAllText(source, "single file source");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox-file");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var staged = MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/mounted-file");
+
+        Assert.NotEqual(source, staged);
+        Assert.Equal("single file source", File.ReadAllText(staged));
+        File.WriteAllText(staged, "mutated staged copy");
+        Assert.Equal("single file source", File.ReadAllText(source));
+    }
+
+    [Fact]
+    public void StageReadOnlyBindSnapshot_PreservesFileAndDirectorySymlinks()
+    {
+        var source = Path.Combine(_workspace, "symlink-source");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "target.txt"), "target");
+        Directory.CreateDirectory(Path.Combine(source, "target-dir"));
+        File.WriteAllText(Path.Combine(source, "target-dir", "nested.txt"), "nested");
+        File.CreateSymbolicLink(Path.Combine(source, "file-link.txt"), "target.txt");
+        Directory.CreateSymbolicLink(Path.Combine(source, "dir-link"), "target-dir");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox-symlink");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var staged = MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/repo");
+
+        var fileLink = new FileInfo(Path.Combine(staged, "file-link.txt"));
+        var dirLink = new DirectoryInfo(Path.Combine(staged, "dir-link"));
+        Assert.Equal("target.txt", fileLink.LinkTarget);
+        Assert.Equal("target-dir", dirLink.LinkTarget);
+        Assert.Equal("target", File.ReadAllText(Path.Combine(staged, "file-link.txt")));
+        Assert.Equal("nested", File.ReadAllText(Path.Combine(staged, "dir-link", "nested.txt")));
+    }
+
+    [Fact]
+    public void StageReadOnlyBindSnapshot_MissingSource_ThrowsDirectoryNotFoundException()
+    {
+        var source = Path.Combine(_workspace, "missing-source");
+        var sandboxRoot = Path.Combine(_workspace, "sandbox-missing");
+        Directory.CreateDirectory(sandboxRoot);
+
+        var ex = Assert.Throws<DirectoryNotFoundException>(
+            () => MultipassSandboxProvider.StageReadOnlyBindSnapshot(sandboxRoot, source, "/repo"));
+
+        Assert.Contains(source, ex.Message, StringComparison.Ordinal);
+    }
+
     private static MultipassSandboxProvider NewProvider(
         IProcessRunner runner,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null) => new(

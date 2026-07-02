@@ -872,6 +872,12 @@ public sealed record SandboxMount
     public bool ReadOnly { get; init; } = true;
     public bool Tmpfs { get; init; }
     public long? SizeBytes { get; init; }
+
+    // Provider-neutral isolation hint for read-only host sources that must not
+    // be shared with the sandbox by reference. Providers can satisfy it with a
+    // kernel read-only bind, a staged copy, or another equivalent isolation
+    // strategy; callers should treat it as "do not expose the mutable source".
+    public bool SnapshotForIsolation { get; init; }
 }
 
 /// <summary>

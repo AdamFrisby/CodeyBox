@@ -18,16 +18,6 @@ using CodeyBox.Agents.Claude.AcpBridge;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// ACP bridge fixtures redirect a process-wide static emitter and install
-/// process-wide bridge hooks, so they must not overlap with the parallel
-/// suite.
-/// </summary>
-[CollectionDefinition("ACP bridge", DisableParallelization = true)]
-public sealed class AcpBridgeCollection
-{
-}
-
-/// <summary>
 /// Direct unit tests for the in-sandbox C# bridge. Production tests in
 /// <see cref="ClaudeAcpTransportTests"/> exercise the bridge end-to-end via a
 /// <c>BridgeSandbox</c> fake that synthesises bridge stdout, which means a
@@ -43,9 +33,14 @@ public sealed class AcpBridgeCollection
 /// </list>
 ///
 /// surfaces here rather than via mysterious turn failures in production.
+///
+/// Joined to the "Process environment" collection because the fixtures both
+/// redirect a process-wide static emitter / install process-wide bridge hooks
+/// AND mutate HOME, so they must not overlap with the parallel suite or with
+/// other HOME-sensitive tests.
 /// </summary>
-[Collection("ACP bridge")]
 [SupportedOSPlatform("linux")]
+[Collection("Process environment")]
 public sealed class AcpBridgeUnitTests
 {
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
@@ -2677,19 +2672,20 @@ public sealed class AcpBridgeUnitTests
             var markerPath = Path.Combine(tmpDir, "sigterm-observed.marker");
             var stubPath = Path.Combine(tmpDir, "claude-ignore-sigterm-stub.sh");
 
-            // Install the SIGTERM trap BEFORE writing the pidfile, so that
-            // observing the pidfile (which the test waits on before triggering
-            // shutdown) guarantees the trap is already armed. The reverse order
-            // leaves a window where SIGTERM could land after the pidfile write
-            // but before the trap install, default-terminating the child and
-            // spuriously failing the marker assertion under capped full-suite
-            // load (same race class as the SIGTERM-first fixture above).
+            // Install the SIGTERM trap BEFORE writing the pidfile or emitting
+            // the stdout readiness line, so observing either signal guarantees
+            // the trap is already armed. The reverse order leaves a window
+            // where SIGTERM could land before the trap install,
+            // default-terminating the child and spuriously failing the marker
+            // assertion under capped full-suite load (same race class as the
+            // SIGTERM-first fixture above).
             File.WriteAllText(stubPath,
                 "#!/bin/bash\n" +
                 "PIDFILE=\"$2\"\n" +
                 "MARKER=\"$3\"\n" +
                 "trap 'echo \"got-sigterm-but-staying-alive\" > \"$MARKER\"' SIGTERM\n" +
                 "echo $$ > \"$PIDFILE\"\n" +
+                "echo \"pid-ready:$$\"\n" +
                 "while true; do sleep 60 & wait $!; done\n");
             File.SetUnixFileMode(stubPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -2703,8 +2699,8 @@ public sealed class AcpBridgeUnitTests
             await ctx.WriteStdinLineAsync(hello);
 
             await ctx.WaitForEnvelopeAsync("ready");
-            for (int i = 0; i < 50 && !File.Exists(pidPath); i++)
-                await Task.Delay(50);
+            var pidReady = await ctx.WaitForEnvelopeAsync("claude_stdout", TimeSpan.FromSeconds(15));
+            Assert.Contains("pid-ready:", pidReady.GetProperty("text").GetString(), StringComparison.Ordinal);
             Assert.True(File.Exists(pidPath), "SIGKILL fallback fixture did not record a child pid.");
             var childPid = int.Parse(File.ReadAllText(pidPath).Trim(), CultureInfo.InvariantCulture);
 

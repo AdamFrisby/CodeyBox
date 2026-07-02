@@ -15,7 +15,7 @@ without the other, CI fails.
 ## Current version
 
 ```
-eventSchemaVersion = "1.4"
+eventSchemaVersion = "1.5"
 ```
 
 The `eventSchemaVersion` string is semver (`major.minor`). Trackers should
@@ -37,7 +37,7 @@ Every webhook + SSE payload is a JSON object with this shape:
 ```jsonc
 {
   // ── Required (since 1.0) ─────────────────────────────────────
-  "eventSchemaVersion": "1.4",                  // semver string
+  "eventSchemaVersion": "1.5",                  // semver string
   "eventType":          "work_item.done",       // stable identifier
   "emittedAt":          "2026-05-18T12:34:56.789+00:00",
 
@@ -104,6 +104,9 @@ subscribe to.
 | `project.budget_warning` | 1.0 | Project crossed the cost warning threshold. |
 | `project.budget_exceeded` | 1.0 | Project crossed the cost hard cap. |
 | `project.budget_recovered` | 1.0 | Project spend dropped below the warning threshold. |
+| `work_item.planning` | 1.5 | Planning-only agent turn started. |
+| `work_item.plan_review` | 1.5 | Planning artifact entered review. |
+| `work_item.plan_approved` | 1.5 | Planning artifact was approved; implementation may start. |
 | `work_item.working` | 1.0 | Agent starts the work phase. |
 | `work_item.work_complete` | 1.0 | Work phase succeeded. |
 | `work_item.auditing` | 1.0 | Audit phase started. |
@@ -150,7 +153,8 @@ See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes.
 Schema 1.1 adds the sandbox leak `reason` details field. Schema 1.2 adds
 worker-pool health watchdog events for dispatcher stalls and restart
 escalation. Schema 1.3 adds per-agent pause/resume and agent-pause waiting
-events. Schema 1.4 adds transient transport retry waiting events.
+events. Schema 1.4 adds transient transport retry waiting events. Schema 1.5
+adds planning-phase transition events.
 
 ---
 

@@ -17,6 +17,18 @@ public enum KnobValueType
 }
 
 /// <summary>
+/// Optional lifecycle phases a knob can request from the pipeline. The pipeline
+/// consumes this framework-level shape rather than importing individual knob
+/// descriptor implementations.
+/// </summary>
+[Flags]
+public enum KnobPipelineLifecycle
+{
+    None = 0,
+    Planning = 1 << 0,
+}
+
+/// <summary>
 /// Result of parsing a knob's string storage value into the descriptor's typed
 /// value. <see cref="CanonicalValue"/> is the string written back to storage;
 /// <see cref="TypedValue"/> is used by typed accessors.
@@ -58,8 +70,8 @@ public readonly record struct KnobNormalizationResult(
 /// per work item or per project to nudge the agent's behaviour. The framework
 /// is intentionally minimalist: a knob is identified by its <see cref="Key"/>,
 /// constrained by its typed value parser, and contributes its behaviour via
-/// per-phase hooks (currently just
-/// <see cref="GetWorkPromptFragment"/>).
+/// optional framework-level hooks such as <see cref="GetWorkPromptFragment"/>
+/// and <see cref="GetPipelineLifecycle"/>.
 ///
 /// <para>
 /// Adding a new knob is a localised change: implement
@@ -70,11 +82,12 @@ public readonly record struct KnobNormalizationResult(
 /// </para>
 ///
 /// <para>
-/// Knobs intentionally do NOT carry runtime behaviour beyond the prompt seam:
-/// they are operator-facing dials, not plug-in handlers. Future seams (audit
-/// prompt fragments, merge strategy hints, post-merge behaviour, …) plug in
-/// here by adding optional methods to this interface with default
-/// implementations that contribute nothing — existing knobs need no edits.
+/// Knobs remain operator-facing dials, not arbitrary plug-in handlers. Runtime
+/// effects are limited to the explicit framework hooks on this interface, such
+/// as prompt fragments and pipeline lifecycle requests. Future seams (audit
+/// prompt fragments, merge strategy hints, post-merge behaviour, ...) plug in
+/// here by adding optional methods with default implementations that contribute
+/// nothing — existing knobs need no edits.
 /// </para>
 /// </summary>
 public interface IKnob
@@ -129,6 +142,12 @@ public interface IKnob
     /// existing default behaviour and would just clutter the prompt).
     /// </summary>
     string? GetWorkPromptFragment(string value);
+
+    /// <summary>
+    /// Optional lifecycle phases requested by this knob for the given effective
+    /// value. The default preserves the current pipeline lifecycle.
+    /// </summary>
+    KnobPipelineLifecycle GetPipelineLifecycle(string value) => KnobPipelineLifecycle.None;
 
     /// <summary>
     /// Free-form values can be operator/user controlled. Leave this false

@@ -54,6 +54,51 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         try { File.Delete(_dbPath); } catch { }
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Planning, true)]
+    [InlineData(WorkItemState.PlanReview, true)]
+    [InlineData(WorkItemState.PlanApproved, false)]
+    [InlineData(WorkItemState.Working, true)]
+    [InlineData(WorkItemState.WorkComplete, false)]
+    public void IsWatchedState_IncludesActivePlanningStates(WorkItemState state, bool expected)
+    {
+        Assert.Equal(expected, WorkerProgressWatchdog.IsWatchedState(state));
+    }
+
+    [Fact]
+    public async Task Watchdog_PlanningRecoveryToQueued_ClearsPlanFields()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Planning, staleUpdatedAt) with
+        {
+            PlanArtifact = """
+                {
+                  "approach": "stale",
+                  "files": ["old.txt"],
+                  "testStrategy": ["old"],
+                  "risks": ["old"],
+                  "satisfiesTask": "old"
+                }
+                """,
+            PlanGeneratedAt = staleUpdatedAt.AddMinutes(1),
+            PlanReviewedAt = staleUpdatedAt.AddMinutes(2),
+            PlanReviewSummary = "stale approval",
+        };
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        await PlantHeartbeatingWorkerAsync(workerId, item.Id);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Null(recovered.PlanArtifact);
+        Assert.Null(recovered.PlanGeneratedAt);
+        Assert.Null(recovered.PlanReviewedAt);
+        Assert.Null(recovered.PlanReviewSummary);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static WorkItem MakeItem(

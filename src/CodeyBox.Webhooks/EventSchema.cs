@@ -20,6 +20,7 @@ public static class EventSchema
     private const string WorkerPoolHealthVersion = "1.2";
     private const string AgentPauseVersion = "1.3";
     private const string TransientRetryVersion = "1.4";
+    private const string PlanningVersion = "1.5";
 
     /// <summary>
     /// Returns the schema document. Plain value type so it serialises cleanly
@@ -61,6 +62,7 @@ public static class EventSchema
         {
             "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
             "work_item.waiting_for_transient_retry" => TransientRetryVersion,
+            "work_item.planning" or "work_item.plan_review" or "work_item.plan_approved" => PlanningVersion,
             _ when name.StartsWith("worker_pool.", StringComparison.Ordinal) => WorkerPoolHealthVersion,
             _ => InitialVersion,
         };
@@ -95,6 +97,9 @@ public static class EventSchema
         "project.budget_exceeded",
         "project.budget_recovered",
         // Work-item state transitions
+        "work_item.planning",
+        "work_item.plan_review",
+        "work_item.plan_approved",
         "work_item.working",
         "work_item.work_complete",
         "work_item.auditing",

@@ -49,6 +49,22 @@ public enum WorkItemState
     /// scheduler re-enqueues it after the configured backoff+jitter delay.
     /// </summary>
     WaitingForTransientRetry = 14,
+    /// <summary>
+    /// Optional planning-only agent turn is running. This phase asks the
+    /// selected work agent to produce a reviewable plan artifact and does not
+    /// import commits or file changes.
+    /// </summary>
+    Planning = 15,
+    /// <summary>
+    /// Planning artifact exists and is awaiting plan-review approval. The
+    /// initial rollout uses an always-pass placeholder reviewer.
+    /// </summary>
+    PlanReview = 16,
+    /// <summary>
+    /// Planning artifact has passed review and the item may enter the normal
+    /// work/audit/merge lifecycle.
+    /// </summary>
+    PlanApproved = 17,
     Failed = 100,
     Cancelled = 101,
     AuditFailed = 102,

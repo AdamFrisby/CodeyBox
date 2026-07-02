@@ -818,7 +818,10 @@ internal static class WorkItemEndpoints
         if (item.State == WorkItemState.AbandonedAfterRecoveryAttempts)
             return Results.Ok(new { id = item.Id.ToString(), state = item.State.ToString() });
 
-        if (item.State is WorkItemState.Working
+        if (item.State is WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.Working
             or WorkItemState.WorkComplete
             or WorkItemState.Auditing
             or WorkItemState.Reworking
@@ -1215,6 +1218,9 @@ internal static class WorkItemEndpoints
             updated = updated with { Knobs = normalisedPatchKnobs, UpdatedAt = now };
         }
 
+        if (queuedOnlyPatch)
+            updated = ClearPlanReview(updated) with { UpdatedAt = now };
+
         if (body.AuditMaxIterations is { } auditMaxIterations)
         {
             var auditMaxIterationsError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditMaxIterations);
@@ -1235,17 +1241,19 @@ internal static class WorkItemEndpoints
             updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Queued-only fields go through a guarded row UPDATE. Knob-only PATCHes
-        // still use the partial knob write below so worker state transitions from
-        // stale snapshots cannot erase an accepted queued edit. Mixed knob PATCHes
-        // use the combined guarded row+knob write here so a conflict cannot leave
-        // only part of the request persisted. When knobs and audit budget fields
-        // are sent together, include the audit budget in that same guarded write;
-        // otherwise the later audit-budget write could conflict after the knob
-        // map had already been replaced.
+        // Queued-only fields go through a guarded row UPDATE. Any PATCH that
+        // touches the knob map routes through the combined guarded row+knob
+        // write so the plan-clearing performed by ClearPlanReview above (which
+        // runs for every queuedOnlyPatch, knobs included) is persisted in the
+        // same transaction as the knob replacement — a partial knob write would
+        // leave stale plan_* columns behind. When knobs and audit budget fields
+        // are sent together, include the audit budget in that same guarded
+        // write; otherwise the later audit-budget write could conflict after
+        // the knob map had already been replaced.
         var auditBudgetWrittenWithQueuedUpdate = normalisedPatchKnobs is not null && auditBudgetPatch;
         var needsQueuedRowUpdate =
             queuedRowPatch
+            || normalisedPatchKnobs is not null
             || (depsPatch && queuedOnlyPatch)
             || auditBudgetWrittenWithQueuedUpdate;
         if (needsQueuedRowUpdate)
@@ -1273,18 +1281,6 @@ internal static class WorkItemEndpoints
             if (!written)
                 return Results.Conflict(new { error = "item changed before the queued-field update could be written" });
             queuedUpdateExpectedUpdatedAt = now;
-        }
-        if (normalisedPatchKnobs is not null && !needsQueuedRowUpdate)
-        {
-            var written = await store.TryReplaceKnobsIfStateAndUpdatedAtAsync(
-                updated.Id,
-                normalisedPatchKnobs,
-                now,
-                WorkItemState.Queued,
-                queuedUpdateExpectedUpdatedAt,
-                ct);
-            if (!written)
-                return Results.Conflict(new { error = "item changed before the queued knob update could be written" });
         }
         if (auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate)
         {
@@ -1367,6 +1363,14 @@ internal static class WorkItemEndpoints
         var project = await projects.GetAsync(updated.ProjectId, ct);
         return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
     }
+
+    private static WorkItem ClearPlanReview(WorkItem item) => item with
+    {
+        PlanArtifact = null,
+        PlanGeneratedAt = null,
+        PlanReviewedAt = null,
+        PlanReviewSummary = null,
+    };
 
     /// <summary>
     /// Resolves and validates a <c>dependsOn</c> string array for a PATCH-time
@@ -2155,6 +2159,10 @@ internal static class WorkItemEndpoints
             AgentInstanceId: item.AgentInstanceId,
             TemplateName: item.TemplateName,
             TemplateEntryIndex: item.TemplateEntryIndex,
+            PlanArtifact: item.PlanArtifact,
+            PlanGeneratedAt: item.PlanGeneratedAt,
+            PlanReviewedAt: item.PlanReviewedAt,
+            PlanReviewSummary: item.PlanReviewSummary,
             Knobs: item.Knobs.Count == 0
                 ? null
                 : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
@@ -2580,6 +2588,14 @@ public sealed record WorkItemDto(
     string? TemplateName = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     int? TemplateEntryIndex = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? PlanArtifact = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    DateTimeOffset? PlanGeneratedAt = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    DateTimeOffset? PlanReviewedAt = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? PlanReviewSummary = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyDictionary<string, string>? Knobs = null);
 

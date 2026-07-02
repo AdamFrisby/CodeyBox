@@ -53,25 +53,32 @@ public sealed class StartupResumeApiAvailabilityTests
             CurrentWorkItemId = item.Id.ToString(),
         });
 
-        var sw = Stopwatch.StartNew();
+        var sw = new Stopwatch();
         HttpClient? bootstrapClient = null;
         HttpClient? networkClient = null;
         HttpResponseMessage? response = null;
         try
         {
-            // Blocking mode intentionally waits for a hung resume until
-            // configuredTimeout; the extra wall-clock slack absorbs full-suite
-            // host startup contention without changing the elapsed assertions
-            // that prove the startup resume contract.
-            var availabilityDeadline = mode == SandboxResumeMode.Background
-                ? configuredTimeout
-                : configuredTimeout + TimeSpan.FromSeconds(30);
+            // Both modes get +30s wall-clock slack to absorb parallel-suite
+            // host-startup contention; the per-mode elapsed assertions below
+            // are what prove the resume contract, not the WaitAsync deadline.
+            // Background mode: factory.CreateClient() returns as soon as the
+            // host is up because resume runs in a BackgroundService, so the
+            // stopwatch only spans the GET (host startup is not part of the
+            // signal). Blocking mode: factory.CreateClient() blocks until
+            // the resume timeout elapses, so the stopwatch must span
+            // CreateClient to observe the block.
+            var availabilityDeadline = configuredTimeout + TimeSpan.FromSeconds(30);
             response = await RunOnDedicatedThreadAsync(() =>
             {
+                if (mode == SandboxResumeMode.Blocking)
+                    sw.Start();
                 bootstrapClient = factory.CreateClient();
                 var baseAddress = bootstrapClient.BaseAddress
                     ?? throw new InvalidOperationException("Kestrel-backed client did not expose a base address");
                 networkClient = new HttpClient { BaseAddress = baseAddress };
+                if (mode == SandboxResumeMode.Background)
+                    sw.Start();
                 return networkClient.GetAsync("/quota").GetAwaiter().GetResult();
             }).WaitAsync(availabilityDeadline);
             sw.Stop();

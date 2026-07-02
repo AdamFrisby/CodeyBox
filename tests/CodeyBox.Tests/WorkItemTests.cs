@@ -147,6 +147,10 @@ public sealed class WorkItemTests
 
     [Theory]
     [InlineData(WorkItemState.Queued, WorkItemState.Working)]
+    [InlineData(WorkItemState.Queued, WorkItemState.Planning)]
+    [InlineData(WorkItemState.Planning, WorkItemState.PlanReview)]
+    [InlineData(WorkItemState.PlanReview, WorkItemState.PlanApproved)]
+    [InlineData(WorkItemState.PlanApproved, WorkItemState.Working)]
     [InlineData(WorkItemState.WorkComplete, WorkItemState.Auditing)]
     [InlineData(WorkItemState.AuditPassed, WorkItemState.Merging)]
     [InlineData(WorkItemState.Merged, WorkItemState.UpstreamPushing)]

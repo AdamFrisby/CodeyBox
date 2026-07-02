@@ -38,6 +38,10 @@ public sealed class WorkItemDto
     /// <see cref="MergedPrNumber"/> / <see cref="MergedPrUrl"/> for those.
     /// </summary>
     public string? MergeSha { get; set; }
+    public string? PlanArtifact { get; set; }
+    public DateTimeOffset? PlanGeneratedAt { get; set; }
+    public DateTimeOffset? PlanReviewedAt { get; set; }
+    public string? PlanReviewSummary { get; set; }
 
     /// <summary>Local bare-repo merge sha; not resolvable on GitHub.</summary>
     public string? LocalSquashSha { get; set; }

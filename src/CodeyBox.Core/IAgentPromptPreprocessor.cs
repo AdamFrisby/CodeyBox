@@ -6,6 +6,7 @@ namespace CodeyBox.Core;
 public readonly record struct AgentPromptPhase(string Value)
 {
     public static AgentPromptPhase Work { get; } = new("work");
+    public static AgentPromptPhase Planning { get; } = new("planning");
     public static AgentPromptPhase Rework { get; } = new("rework");
     public static AgentPromptPhase Audit { get; } = new("audit");
     public static AgentPromptPhase Merge { get; } = new("merge");

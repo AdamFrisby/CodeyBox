@@ -16,20 +16,20 @@ public static class Program
     public const int ExitUsage = 2;
     public const int ExitLaunchFailed = 1;
 
-    private static Task<int> Main(string[] args) => RunAsync(args);
+    public static Task<int> Main(string[] args) => RunAsync(args, Console.Out, Console.Error);
 
-    public static async Task<int> RunAsync(string[] args)
+    internal static async Task<int> RunAsync(string[] args, TextWriter output, TextWriter error)
     {
         if (args.Length == 0 || args is ["-h"] or ["--help"] or ["help"])
         {
-            PrintUsage();
+            PrintUsage(error);
             return ExitUsage;
         }
 
         return args[0] switch
         {
-            "jobtrack" => await RunJobTrackAsync(args[1..]),
-            _ => UnknownCommand(args[0]),
+            "jobtrack" => await RunJobTrackAsync(args[1..], output, error),
+            _ => UnknownCommand(args[0], error),
         };
     }
 
@@ -104,11 +104,11 @@ public static class Program
         return new JobTrackParseResult(JobTrackParseStatus.Ok, source, screenshotOut, interactive, null);
     }
 
-    private static async Task<int> RunJobTrackAsync(string[] args)
+    private static async Task<int> RunJobTrackAsync(string[] args, TextWriter output, TextWriter error)
     {
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {
-            PrintJobTrackUsage();
+            PrintJobTrackUsage(error);
             return ExitUsage;
         }
 
@@ -117,10 +117,10 @@ public static class Program
         {
             case JobTrackParseStatus.Usage:
                 if (!string.IsNullOrEmpty(parsed.Error))
-                    Console.Error.WriteLine(parsed.Error);
+                    error.WriteLine(parsed.Error);
                 return ExitUsage;
             case JobTrackParseStatus.SourceMissing:
-                Console.Error.WriteLine(parsed.Error);
+                error.WriteLine(parsed.Error);
                 return ExitLaunchFailed;
         }
 
@@ -134,19 +134,19 @@ public static class Program
         var harness = new WebAppHarness(provider, log);
         var recipe = JobTrackRecipe.Default(Path.GetFullPath(parsed.Source!));
 
-        Console.WriteLine($"Launching JobTrack (recipe target={recipe.TargetName}, entry={recipe.EntryUrl}) …");
+        output.WriteLine($"Launching JobTrack (recipe target={recipe.TargetName}, entry={recipe.EntryUrl}) …");
         AppUnderTestSession? session = null;
         try
         {
             session = await harness.LaunchAsync(recipe);
             await File.WriteAllBytesAsync(parsed.ScreenshotOut, session.ReadinessScreenshotPng);
-            Console.WriteLine($"Ready. Entry URL (in-VM): {session.EntryUrl}");
-            Console.WriteLine($"Readiness screenshot: {parsed.ScreenshotOut} ({session.ReadinessScreenshotPng.Length} bytes)");
-            Console.WriteLine($"Sandbox id: {session.Sandbox.Id}");
+            output.WriteLine($"Ready. Entry URL (in-VM): {session.EntryUrl}");
+            output.WriteLine($"Readiness screenshot: {parsed.ScreenshotOut} ({session.ReadinessScreenshotPng.Length} bytes)");
+            output.WriteLine($"Sandbox id: {session.Sandbox.Id}");
 
             if (parsed.Interactive)
             {
-                Console.WriteLine("Interactive mode — drive via ComputerUseBridge; press Ctrl+C to tear down.");
+                output.WriteLine("Interactive mode — drive via ComputerUseBridge; press Ctrl+C to tear down.");
                 var quit = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 Console.CancelKeyPress += (_, e) =>
                 {
@@ -158,16 +158,16 @@ public static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Launch failed: {ex.Message}");
+            error.WriteLine($"Launch failed: {ex.Message}");
             return ExitLaunchFailed;
         }
         finally
         {
             if (session is not null)
             {
-                Console.WriteLine("Tearing down sandbox …");
+                output.WriteLine("Tearing down sandbox …");
                 await session.DisposeAsync();
-                Console.WriteLine("Teardown complete.");
+                output.WriteLine("Teardown complete.");
             }
         }
 
@@ -189,27 +189,27 @@ public static class Program
         };
     }
 
-    private static int UnknownCommand(string command)
+    private static int UnknownCommand(string command, TextWriter error)
     {
-        Console.Error.WriteLine($"Unknown command: {command}");
-        PrintUsage();
+        error.WriteLine($"Unknown command: {command}");
+        PrintUsage(error);
         return ExitUsage;
     }
 
-    private static void PrintJobTrackUsage()
+    private static void PrintJobTrackUsage(TextWriter error)
     {
-        Console.Error.WriteLine("Usage: codeybox-harness jobtrack launch --source <path> [options]");
-        Console.Error.WriteLine();
-        Console.Error.WriteLine("Options:");
-        Console.Error.WriteLine("  --source <path>       Host directory with the JobTrack source tree (required).");
-        Console.Error.WriteLine("                        Falls back to JOBTRACK_SOURCE when omitted.");
-        Console.Error.WriteLine("  --screenshot-out <p>  Write the readiness PNG here (default: harness-ready.png).");
-        Console.Error.WriteLine("  --interactive         Keep the session alive until Ctrl+C, then tear down.");
+        error.WriteLine("Usage: codeybox-harness jobtrack launch --source <path> [options]");
+        error.WriteLine();
+        error.WriteLine("Options:");
+        error.WriteLine("  --source <path>       Host directory with the JobTrack source tree (required).");
+        error.WriteLine("                        Falls back to JOBTRACK_SOURCE when omitted.");
+        error.WriteLine("  --screenshot-out <p>  Write the readiness PNG here (default: harness-ready.png).");
+        error.WriteLine("  --interactive         Keep the session alive until Ctrl+C, then tear down.");
     }
 
-    private static void PrintUsage()
+    private static void PrintUsage(TextWriter error)
     {
-        Console.Error.WriteLine("""
+        error.WriteLine("""
             codeybox-harness — dev/test launcher for exploratory-testing harnesses
 
             Usage:

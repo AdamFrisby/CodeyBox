@@ -405,7 +405,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             {
                 State = target,
                 LastError = $"watchdog: worker made no progress for {sinceProgressSeconds}s in state {fromState}",
-                StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+                StartedAt = WorkItemRecoveryPolicy.ShouldClearStartedAtForRecoveryTarget(target) ? null : item.StartedAt,
                 WorkBranch = target == WorkItemState.Queued ? null : item.WorkBranch,
                 // Clearing WorkBranch on Queued recovery regenerates the default
                 // rebase-owned branch name on re-dispatch; the operator-resume
@@ -418,6 +418,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 PreemptCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptCheckpoint : null,
                 UpdatedAt = DateTimeOffset.UtcNow,
             }, attempts, item.State);
+            updated = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(updated);
         }
 
         await _store.UpdateAsync(updated, ct);
@@ -558,6 +559,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     /// </summary>
     internal static bool IsWatchedState(WorkItemState state) => state switch
     {
+        WorkItemState.Planning => true,
+        WorkItemState.PlanReview => true,
         WorkItemState.Working => true,
         WorkItemState.Reworking => true,
         WorkItemState.Auditing => true,

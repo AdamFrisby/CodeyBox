@@ -685,6 +685,7 @@ builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptP
 // registry exposes it to the API for set/validate and the work-prompt
 // preprocessor picks up its fragment without further edits.
 builder.Services.AddSingleton<IKnob, CodeyBox.Orchestrator.Knobs.ChangeScopeKnob>();
+builder.Services.AddSingleton<IKnob, CodeyBox.Orchestrator.Knobs.PlanKnob>();
 builder.Services.AddSingleton<IKnobRegistry, KnobRegistry>();
 builder.Services.AddSingleton<IAgentPromptPreprocessor, CodeyBox.Orchestrator.Knobs.KnobWorkPromptPreprocessor>();
 
@@ -2407,6 +2408,7 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
+builder.Services.AddSingleton<IPlanReviewGate, AlwaysPassPlanReviewGate>();
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -2460,6 +2462,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
+    knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
     checkCompletionRunner: sp.GetService<ICheckAndActCompletionRunner>(),
     agentSupervision: sp.GetService<IAgentSupervisionService>(),
     // Resumable session worker (item 3 of the rollout). PipelineRunner
@@ -2483,7 +2486,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
-    authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>()));
+    authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
+    planReviewGate: sp.GetRequiredService<IPlanReviewGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2672,7 +2676,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>(),
-    dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>()));
+    dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
+    knobRegistry: sp.GetRequiredService<IKnobRegistry>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(

@@ -76,6 +76,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly IStartupRecoveryInputBarrier? _startupRecoveryBarrier;
     private readonly IStartupInitialRecoverySink? _startupRecoveryCompletion;
     private readonly ReleaseService? _releaseService;
+    // Consulted by AgentPauseRetryFromForPickup to decide whether a Queued
+    // item resumes into the planning phase or straight into work. Reads through
+    // IKnob.GetPipelineLifecycle so the check stays local to the knob descriptor
+    // and follows the same framework contract PipelineRunner.ShouldUsePlanningPhase
+    // consumes. Null in narrow test bootstraps that don't wire the registry;
+    // the fallback path references PlanKnob's public constants so a missing
+    // registry still routes plan=on Queued items to planning.
+    private readonly IKnobRegistry? _knobRegistry;
     // B1 baseline-pinning: stamps the work/headless baseline ref at pickup time
     // so matching work-profile sandboxes keep using that baseline even after an
     // operator edits config. Later phases with different profiles or graphical
@@ -246,6 +254,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IStartupRecoveryInputBarrier? startupRecoveryBarrier = null,
         IStartupInitialRecoverySink? startupRecoveryCompletion = null,
         IAgentDispatchAvailability? dispatchAvailability = null,
+        IKnobRegistry? knobRegistry = null,
         TimeProvider? timeProvider = null)
     {
         _queue = queue;
@@ -265,6 +274,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _startupRecoveryBarrier = startupRecoveryBarrier;
         _startupRecoveryCompletion = startupRecoveryCompletion;
         _releaseService = releaseService;
+        _knobRegistry = knobRegistry;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _progressClock = progressClock ?? new OrchestratorProgressClock();
         _reaper?.AttachWorkerPoolSlotReleaser(this);
@@ -1924,8 +1934,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }, newAttempts, item.State);
         }
 
+        var recovered = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(item.With(targetState.Value) with
+        {
+            StartedAt = WorkItemRecoveryPolicy.ShouldClearStartedAtForRecoveryTarget(targetState.Value)
+                ? null
+                : item.StartedAt,
+        });
         return WorkItemRecoveryPolicy.WithRecoveryAttempt(
-            item.With(targetState.Value),
+            recovered,
             newAttempts,
             item.State);
     }
@@ -2148,61 +2164,52 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // agent and deferring. When ResolveAsync returns Chosen != null
             // it has already test-and-reserved the chosen member's slot via
             // the gate; the outer finally releases on every exit path.
-            var shouldRouteWorkAgentAtPickup = ShouldRouteWorkAgentAtPickup(item);
-            if (_router is not null && !isAgentControlItem)
+            if (_router is not null && !isAgentControlItem && ShouldResolveAgentClassAtPickup(item))
             {
                 var decision = await _router.ResolveAsync(item, project, ct, slotGate: this);
                 if (decision.ShouldWait)
                 {
-                    if (decision.WaitingForPausedAgent && !shouldRouteWorkAgentAtPickup)
+                    if (decision.WaitingForPausedAgent)
                     {
-                        _log.LogInformation(
-                            "Work item {Id}: paused class-routing verdict deferred to pipeline phase handling for state {State}",
-                            item.Id, item.State);
-                    }
-                    else
-                    {
-                        if (decision.WaitingForPausedAgent)
-                        {
-                            ClearPreStartRefactorDrainClaim(item);
-                            await ParkForAgentResumeAsync(
-                                item,
-                                decision.Reason,
-                                decision.PausedAgents.Count == 1 ? decision.PausedAgents[0] : null,
-                                ct);
-                            return;
-                        }
-
-                        // Honour the router's suggested delay verbatim — when a
-                        // quota-passing member was at cap, the router has already
-                        // picked the short cap-retry interval; pure quota stalls
-                        // use the longer QuotaRecheckInterval. AnyMemberAtCap only
-                        // drives the per-agent ConcurrencyGated audit emission.
-                        var deferDelay = decision.SuggestedRecheckIn;
-                        if (decision.AnyMemberAtCap)
-                        {
-                            if (decision.AtCapMembers.Count > 0)
-                            {
-                                foreach (var atCapMember in decision.AtCapMembers)
-                                {
-                                    AuditLog.ConcurrencyGated(item.Id, atCapMember.Agent,
-                                        GetRunning(atCapMember), GetAgentCap(atCapMember));
-                                }
-                            }
-                            else
-                            {
-                                foreach (var atCapAgent in decision.AtCapAgents)
-                                {
-                                    AuditLog.ConcurrencyGated(item.Id, atCapAgent,
-                                        GetRunning(atCapAgent), GetAgentCap(atCapAgent));
-                                }
-                            }
-                        }
-                        AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
                         ClearPreStartRefactorDrainClaim(item);
-                        ScheduleDeferredRequeue(item.Id, deferDelay, ct);
+                        await ParkForAgentResumeAsync(
+                            item,
+                            decision.Reason,
+                            decision.PausedAgents.Count == 1 ? decision.PausedAgents[0] : null,
+                            ct,
+                            AgentPauseRetryFromForPickup(item, project));
                         return;
                     }
+
+                    // Honour the router's suggested delay verbatim — when a
+                    // quota-passing member was at cap, the router has already
+                    // picked the short cap-retry interval; pure quota stalls
+                    // use the longer QuotaRecheckInterval. AnyMemberAtCap only
+                    // drives the per-agent ConcurrencyGated audit emission.
+                    var deferDelay = decision.SuggestedRecheckIn;
+                    if (decision.AnyMemberAtCap)
+                    {
+                        if (decision.AtCapMembers.Count > 0)
+                        {
+                            foreach (var atCapMember in decision.AtCapMembers)
+                            {
+                                AuditLog.ConcurrencyGated(item.Id, atCapMember.Agent,
+                                    GetRunning(atCapMember), GetAgentCap(atCapMember));
+                            }
+                        }
+                        else
+                        {
+                            foreach (var atCapAgent in decision.AtCapAgents)
+                            {
+                                AuditLog.ConcurrencyGated(item.Id, atCapAgent,
+                                    GetRunning(atCapAgent), GetAgentCap(atCapAgent));
+                            }
+                        }
+                    }
+                    AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
+                    ClearPreStartRefactorDrainClaim(item);
+                    ScheduleDeferredRequeue(item.Id, deferDelay, ct);
+                    return;
                 }
                 if (decision.Chosen is { } chosen)
                 {
@@ -2242,8 +2249,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // released in the outer finally.
             if (!agentSlotReserved && !isAgentControlItem)
             {
+                var checkDirectAgentPause = ShouldCheckDirectAgentPauseAtPickup(item);
+                var reserveDirectAgentSlot = ShouldReserveDirectAgentSlotAtPickup(item);
                 var effectiveDirectAgent = item.Agent ?? project?.DefaultAgent;
-                var directAvailability = shouldRouteWorkAgentAtPickup && effectiveDirectAgent is { } directAgent
+                var directAvailability = checkDirectAgentPause && effectiveDirectAgent is { } directAgent
                     ? _dispatchAvailability?.GetAvailability(new AgentMembership
                     {
                         Agent = directAgent,
@@ -2261,11 +2270,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         item,
                         $"agent '{pausedCandidate.Value}' {reason}",
                         pausedCandidate,
-                        ct);
+                        ct,
+                        AgentPauseRetryFromForPickup(item, project));
                     return;
                 }
 
-                if (item.Agent is { } routedAgent)
+                if (reserveDirectAgentSlot && item.Agent is { } routedAgent)
                 {
                     var routeKey = ResolveDirectRouteKey(routedAgent, item.AgentInstanceId);
                     var cap = GetAgentCapForRoute(routedAgent, routeKey);
@@ -2562,8 +2572,88 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
-    private static bool ShouldRouteWorkAgentAtPickup(WorkItem item) =>
-        item.State is WorkItemState.Queued or WorkItemState.Reworking or WorkItemState.ReworkingForConflict;
+    private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
+        => item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.WorkComplete
+            or WorkItemState.AuditPassed
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
+
+    // Paused-agent parking is only relevant for states that actually invoke the
+    // work agent at pickup (Queued/Reworking + planning-lifecycle). Continuation
+    // states (WorkComplete = audit continuation, AuditPassed = merge continuation)
+    // do NOT invoke the work agent and so must not park on an agent pause — the
+    // audit/merge phase can continue while the work agent is paused.
+    private static bool ShouldCheckDirectAgentPauseAtPickup(WorkItem item)
+        => item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
+
+    // Per-agent concurrency-cap reservation must cover every state where the
+    // direct-agent item consumes a worker slot for real work (including the
+    // audit/merge continuation states). Mirrors ShouldResolveAgentClassAtPickup
+    // so the direct-agent path enforces the same cap coverage as class-routed
+    // items, which the pre-refactor code did unconditionally.
+    private static bool ShouldReserveDirectAgentSlotAtPickup(WorkItem item)
+        => item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.WorkComplete
+            or WorkItemState.AuditPassed
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
+
+    private string AgentPauseRetryFromForPickup(WorkItem item, Project? project)
+    {
+        if (item.State == WorkItemState.Queued && RequestsPlanningLifecycle(item, project))
+            return "planning";
+
+        return AgentPauseResumeMapper.RetryFromForState(item.State);
+    }
+
+    /// <summary>
+    /// Returns true when any registered knob requests <see cref="KnobPipelineLifecycle.Planning"/>
+    /// for the effective knob map. Mirrors PipelineRunner.ShouldUsePlanningPhase so the pickup-time
+    /// pause-resume decision and the pipeline entry decision agree on which items enter planning.
+    /// Falls back to a direct read of <see cref="Knobs.PlanKnob.KeyName"/> / <see cref="Knobs.PlanKnob.ValueOn"/>
+    /// when the registry isn't wired (test bootstraps), so the plan knob still routes correctly.
+    /// </summary>
+    private bool RequestsPlanningLifecycle(WorkItem item, Project? project)
+    {
+        if (_knobRegistry is not null)
+        {
+            var effective = _knobRegistry.Resolve(item.Knobs, project?.Knobs);
+            foreach (var knob in _knobRegistry.All)
+            {
+                if (effective.TryGetValue(knob.Key, out var value)
+                    && knob.GetPipelineLifecycle(value).HasFlag(KnobPipelineLifecycle.Planning))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Registry-missing fallback: read the plan knob's canonical key/value directly
+        // from the descriptor constants so a rename of either can't silently desync
+        // this path from the descriptor. Item precedence: an item-level plan value
+        // (any value) shadows the project default, matching how IKnobRegistry.Resolve
+        // treats item entries as an override of the project defaults.
+        if (item.Knobs.TryGetValue(Knobs.PlanKnob.KeyName, out var itemPlan))
+        {
+            return string.Equals(itemPlan, Knobs.PlanKnob.ValueOn, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return project?.Knobs.TryGetValue(Knobs.PlanKnob.KeyName, out var projectPlan) == true
+            && string.Equals(projectPlan, Knobs.PlanKnob.ValueOn, StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool IsOperatorPaused(AgentAvailability? availability) =>
         AgentDispatchAvailability.IsPausedVerdict(availability);
@@ -2572,7 +2662,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         WorkItem item,
         string reason,
         AgentKind? pausedAgent,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? retryFrom = null)
         => await WorkItemAgentPauseParking.ParkAsync(
             _store,
             _webhooks,
@@ -2581,7 +2672,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             reason,
             project: null,
             pausedAgent,
-            ct);
+            ct,
+            retryFrom);
 
     private sealed class WorkerSlotLease
     {

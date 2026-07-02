@@ -224,6 +224,9 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     [Theory]
     [InlineData(WorkItemState.Working, "work")]
     [InlineData(WorkItemState.Queued, "work")]
+    [InlineData(WorkItemState.Planning, "planning")]
+    [InlineData(WorkItemState.PlanReview, "planning")]
+    [InlineData(WorkItemState.PlanApproved, "work")]
     [InlineData(WorkItemState.Auditing, "audit")]
     [InlineData(WorkItemState.Reworking, "rework")]
     [InlineData(WorkItemState.ReworkingForConflict, "rework")]
@@ -245,6 +248,7 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     /// five-hour incident — fails here.
     /// </summary>
     [Theory]
+    [InlineData("planning", "planning")]
     [InlineData("work", "work")]
     [InlineData("audit", "audit")]
     [InlineData("rework", "audit")]
@@ -269,6 +273,9 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     [Theory]
     [InlineData(WorkItemState.Reworking, "audit")]
     [InlineData(WorkItemState.ReworkingForConflict, "audit")]
+    [InlineData(WorkItemState.Planning, "planning")]
+    [InlineData(WorkItemState.PlanReview, "planning")]
+    [InlineData(WorkItemState.PlanApproved, "work")]
     [InlineData(WorkItemState.Auditing, "audit")]
     [InlineData(WorkItemState.Merging, "merge")]
     [InlineData(WorkItemState.UpstreamPushing, "upstream")]
@@ -338,6 +345,37 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         var retried = await context.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Contains(context.Webhooks.Events, e => e.Event == "work_item.auto_retry");
+    }
+
+    [Fact]
+    public async Task AutoRetryEnabled_PeriodicSweepRetriesPlanningQuotaItemThroughRetrier()
+    {
+        using var context = BuildRetryContext();
+        var item = FailedQuotaItem() with
+        {
+            QuotaRetryFrom = "planning",
+            PlanArtifact = """
+                {
+                  "approach": "old plan",
+                  "files": ["output.txt"],
+                  "testStrategy": ["run tests"],
+                  "risks": ["none"],
+                  "satisfiesTask": "do work"
+                }
+                """,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewSummary = "approved",
+        };
+        await context.Store.CreateAsync(item);
+
+        await InvokePrivateAsync(context.Scheduler, "RunPeriodicSweepAsync", CancellationToken.None);
+
+        var retried = await context.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Null(retried.PlanArtifact);
         Assert.Contains(context.Webhooks.Events, e => e.Event == "work_item.auto_retry");
     }
 

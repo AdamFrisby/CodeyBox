@@ -1020,6 +1020,7 @@ internal sealed class CapturingWebhookDispatcher : IWebhookDispatcher
 {
     private readonly object _gate = new();
     private readonly List<WebhookEvent> _events = [];
+    public Func<WebhookEvent, CancellationToken, Task>? OnPublishAsync { get; set; }
 
     public IReadOnlyList<WebhookEvent> Events
     {
@@ -1034,6 +1035,8 @@ internal sealed class CapturingWebhookDispatcher : IWebhookDispatcher
     {
         lock (_gate)
             _events.Add(evt);
-        return Task.CompletedTask;
+        return OnPublishAsync is null
+            ? Task.CompletedTask
+            : OnPublishAsync(evt, ct);
     }
 }

@@ -147,6 +147,29 @@ public sealed class IndexPageTests : TestContext
         Assert.Contains("Done", cut.Markup);
     }
 
+    [Fact]
+    public void Index_PlanningStates_AppearInDefaultTabs()
+    {
+        var fake = new FakeApiClient([
+            MakeItem("aabbccdd-0000-0000-0000-000000000001", "Planning Task", "Planning"),
+            MakeItem("aabbccdd-0000-0000-0000-000000000002", "Review Task", "PlanReview"),
+            MakeItem("aabbccdd-0000-0000-0000-000000000003", "Approved Task", "PlanApproved"),
+        ]);
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        Assert.Contains("Planning Task", cut.Markup);
+        Assert.DoesNotContain("Review Task", cut.Markup);
+        Assert.DoesNotContain("Approved Task", cut.Markup);
+
+        cut.FindAll("button.filter-chip").First(b => b.TextContent.Contains("Pending")).Click();
+
+        Assert.DoesNotContain("Planning Task", cut.Markup);
+        Assert.Contains("Review Task", cut.Markup);
+        Assert.Contains("Approved Task", cut.Markup);
+    }
+
     // ── Queue state banner tests ─────────────────────────────────────────────
 
     [Fact]

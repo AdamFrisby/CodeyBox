@@ -21,6 +21,16 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class StartupStrandedItemSweepTests : IDisposable
 {
+    private const string ValidPlan = """
+        {
+          "approach": "recover planning",
+          "files": ["output.txt"],
+          "testStrategy": ["run planning recovery tests"],
+          "risks": ["none"],
+          "satisfiesTask": "verifies planning startup recovery"
+        }
+        """;
+
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-stranded-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -253,6 +263,84 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         Assert.Equal(expectedTo, after!.State);
         Assert.Equal(1, after.RecoveryAttempts);
         Assert.Equal(1, _queue.Count);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Planning, WorkItemState.Queued, true, false)]
+    [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview, false, false)]
+    [InlineData(WorkItemState.PlanApproved, WorkItemState.PlanApproved, false, true)]
+    public async Task Sweep_PlanningStates_NoWorker_RecoversAndRequeues(
+        WorkItemState fromState,
+        WorkItemState expectedTo,
+        bool clearsPlan,
+        bool reviewed)
+    {
+        var reviewedAt = DateTimeOffset.UtcNow.AddMinutes(-3);
+        var item = MakeItem(fromState) with
+        {
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-4),
+            PlanReviewedAt = reviewed ? reviewedAt : null,
+            PlanReviewSummary = reviewed ? "approved" : null,
+        };
+        await _store.CreateAsync(item);
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(expectedTo, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        if (clearsPlan)
+        {
+            Assert.Null(after.PlanArtifact);
+            Assert.Null(after.PlanGeneratedAt);
+            Assert.Null(after.PlanReviewedAt);
+            Assert.Null(after.PlanReviewSummary);
+        }
+        else
+        {
+            Assert.Equal(ValidPlan, after.PlanArtifact);
+            Assert.Equal(item.PlanGeneratedAt, after.PlanGeneratedAt);
+            Assert.Equal(item.PlanReviewedAt, after.PlanReviewedAt);
+            Assert.Equal(item.PlanReviewSummary, after.PlanReviewSummary);
+        }
+        Assert.Equal(1, _queue.Count);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(fromState.ToString(), evt.Details?.GetType().GetProperty("fromState")?.GetValue(evt.Details)?.ToString());
+        Assert.Equal(expectedTo.ToString(), evt.Details?.GetType().GetProperty("toState")?.GetValue(evt.Details)?.ToString());
+    }
+
+    [Fact]
+    public async Task Sweep_PlanningStateHeldByLiveWorker_IsLeftAlone()
+    {
+        var item = MakeItem(WorkItemState.PlanReview) with
+        {
+            PlanArtifact = ValidPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+        };
+        await _store.CreateAsync(item);
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = "live-planner",
+            HostName = "host",
+            ProcessId = 1234,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            LastHeartbeatAt = DateTimeOffset.UtcNow,
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.PlanReview, after!.State);
+        Assert.Equal(item.StartedAt, after.StartedAt);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
     }
 
     [Fact]

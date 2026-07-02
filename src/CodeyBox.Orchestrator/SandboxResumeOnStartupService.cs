@@ -527,7 +527,9 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 () => suspending.ResumeSandboxAsync(vmName, timeoutCts.Token));
             if (UseShortResumeTimeoutWait(timeout))
             {
-                await WaitForTaskOrTimeoutAsync(resumeTask, timeout, ct);
+                // Short startup gates must honor wall-clock time even when the
+                // shared thread pool is saturated by the test/audit suite.
+                await WaitForTaskOrTimeoutSynchronouslyAsync(resumeTask, timeout, ct);
             }
             else
             {
@@ -922,6 +924,28 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         if (ct.IsCancellationRequested)
             throw new OperationCanceledException(ct);
         throw new TimeoutException();
+    }
+
+    private static async Task WaitForTaskOrTimeoutSynchronouslyAsync(Task task, TimeSpan timeout, CancellationToken ct)
+    {
+        if (task.IsCompleted)
+        {
+            await task.ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            if (!task.Wait(timeout, ct))
+                throw new TimeoutException();
+        }
+        catch (AggregateException) when (task.IsCompleted)
+        {
+            await task.ConfigureAwait(false);
+            return;
+        }
+
+        await task.ConfigureAwait(false);
     }
 
     private static Task RunLongRunningAsync(Func<Task> work) =>

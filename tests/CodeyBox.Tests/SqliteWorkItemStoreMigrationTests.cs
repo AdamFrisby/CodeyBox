@@ -244,6 +244,31 @@ public sealed class SqliteWorkItemStoreMigrationTests : IDisposable
     }
 
     [Fact]
+    public async Task PlanArtifactFields_RoundTripThroughStore()
+    {
+        var generatedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var reviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = Sample() with
+        {
+            PlanArtifact = "PLAN:\nApproach: test.",
+            PlanGeneratedAt = generatedAt,
+            PlanReviewedAt = reviewedAt,
+            PlanReviewSummary = "Placeholder plan review approved.",
+        };
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+        await store.CreateAsync(item);
+
+        var read = await store.GetAsync(item.Id);
+
+        Assert.NotNull(read);
+        Assert.Equal(item.PlanArtifact, read!.PlanArtifact);
+        Assert.Equal(generatedAt, read.PlanGeneratedAt);
+        Assert.Equal(reviewedAt, read.PlanReviewedAt);
+        Assert.Equal(item.PlanReviewSummary, read.PlanReviewSummary);
+    }
+
+    [Fact]
     public async Task OriginCheckUniqueIndexMigration_ClearsDuplicateBacklinksBeforeCreatingIndex()
     {
         var originCheckId = WorkItemId.New();

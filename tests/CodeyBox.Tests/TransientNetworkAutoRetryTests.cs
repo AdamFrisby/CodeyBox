@@ -151,6 +151,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Theory]
+    [InlineData("planning", WorkItemState.Planning, "planning")]
     [InlineData("work", WorkItemState.Queued, null)]
     [InlineData("audit", WorkItemState.WorkComplete, "audit")]
     [InlineData("rework", WorkItemState.WorkComplete, "audit")]
@@ -563,6 +564,40 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, untouched!.State);
         Assert.Equal(0, untouched.TransientRetryAttempts);
         Assert.Equal(transient.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_RetriesPlanningTransientRowsThroughRetrier()
+    {
+        using var fixture = BuildScheduler(EnabledRetryOptions());
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryFrom = "planning",
+            PlanArtifact = """
+                {
+                  "approach": "old plan",
+                  "files": ["output.txt"],
+                  "testStrategy": ["run tests"],
+                  "risks": ["none"],
+                  "satisfiesTask": "do work"
+                }
+                """,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewSummary = "approved",
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(retried);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.TransientRetryAttempts);
+        Assert.Null(retried.NextTransientRetryAt);
+        Assert.Null(retried.PlanArtifact);
+        Assert.Equal(item.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
     }
 
     [Fact]

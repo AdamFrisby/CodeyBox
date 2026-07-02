@@ -118,6 +118,9 @@ public sealed class WorkItemRetrier
         var requestedFrom = from!.Trim().ToLowerInvariant();
         var resumeState = requestedFrom switch
         {
+            "planning" => WorkItemState.Queued,
+            "plan_review" => WorkItemState.PlanReview,
+            "plan_approved" => WorkItemState.PlanApproved,
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
@@ -131,9 +134,13 @@ public sealed class WorkItemRetrier
             return (false, $"invalid 'from' value '{from}'", null, null, null);
 
         var actualFrom = requestedFrom;
+        var retryingBeforeWork = resumeState.Value is WorkItemState.PlanReview or WorkItemState.PlanApproved;
+
+        if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
+            return (false, planningBoundaryError, null, null, null);
 
         // For from != "work", the pipeline expects the bare repo to still be present.
-        if (resumeState != WorkItemState.Queued)
+        if (resumeState != WorkItemState.Queued && !retryingBeforeWork)
         {
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
@@ -159,6 +166,7 @@ public sealed class WorkItemRetrier
                 actualFrom = "work";
             }
         }
+        var clearingQueuedPlan = resumeState.Value == WorkItemState.Queued;
 
         // Reset RecoveryAttempts and increment only the counter owned by the
         // auto-retry path that invoked us. Terminal-failure-recovery and manual
@@ -187,6 +195,13 @@ public sealed class WorkItemRetrier
             NextTerminalRetryAt = null,
             StartedAt = null
         };
+        if (clearingQueuedPlan)
+        {
+            resumed = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(resumed) with
+            {
+                PreserveWorkBranchOnQueuedPickup = false,
+            };
+        }
 
         // Atomic conditional update to prevent race conditions.
         // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
@@ -364,7 +379,7 @@ public sealed class WorkItemRetrier
         var retryFrom = AgentPauseResumeMapper.NormalizeRetryFrom(
             item.AgentPauseRetryFrom ?? item.QuotaRetryFrom);
         var resumeState = AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom);
-        var resumed = item.With(resumeState, error: null) with
+        var resumed = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(item.With(resumeState, error: null) with
         {
             FailureKind = null,
             QuotaResetAt = null,
@@ -377,7 +392,7 @@ public sealed class WorkItemRetrier
             TransientRetryFrom = null,
             AgentPauseRetryFrom = null,
             StartedAt = null,
-        };
+        });
 
         var updated = await _store.TryUpdateIfStateAsync(
                 resumed,
@@ -493,6 +508,9 @@ public sealed class WorkItemRetrier
         var requestedFrom = (from ?? "work").Trim().ToLowerInvariant();
         var resumeState = requestedFrom switch
         {
+            "planning" => WorkItemState.Queued,
+            "plan_review" => WorkItemState.PlanReview,
+            "plan_approved" => WorkItemState.PlanApproved,
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
@@ -502,9 +520,17 @@ public sealed class WorkItemRetrier
         if (resumeState is null)
             return new ResumeOutcome(
                 ResumeStatus.BadRequest,
-                $"invalid 'from' value '{from}'; expected one of: work, rework, audit, merge",
+                $"invalid 'from' value '{from}'; expected one of: planning, plan_review, plan_approved, work, rework, audit, merge",
                 null,
                 null);
+        if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
+            return new ResumeOutcome(
+                ResumeStatus.Conflict,
+                planningBoundaryError,
+                null,
+                null);
+        var resumingFromPlanning = requestedFrom == "planning";
+        var resumingBeforeWork = requestedFrom is "planning" or "plan_review" or "plan_approved";
 
         // Resume preserves the prior bare repo + work-branch (that is the
         // entire point — recovering the agent commits the operator's cancel
@@ -512,33 +538,36 @@ public sealed class WorkItemRetrier
         // /replay for a fresh start.
         const string preconditionMessage =
             "bare repo or work-branch no longer present; cannot resume — use POST /workitems/{id}/replay for a fresh start";
-        var repoPresent = await _gitHost.RepositoryExistsAsync(item.Id, ct);
-        if (!repoPresent)
-            return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
+        if (!resumingBeforeWork)
+        {
+            var repoPresent = await _gitHost.RepositoryExistsAsync(item.Id, ct);
+            if (!repoPresent)
+                return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
 
-        var workBranch = item.WorkBranch;
-        bool branchPresent;
-        try
-        {
-            branchPresent = !string.IsNullOrEmpty(workBranch)
-                && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+            var workBranch = item.WorkBranch;
+            bool branchPresent;
+            try
+            {
+                branchPresent = !string.IsNullOrEmpty(workBranch)
+                    && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+            }
+            catch (ArgumentException)
+            {
+                // A legacy/corrupt WorkBranch value can fail name validation in the
+                // git host. Treat that the same as "branch not present" — the
+                // operator's recovery path is the same (412 → /replay).
+                branchPresent = false;
+            }
+            if (!branchPresent)
+                return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
         }
-        catch (ArgumentException)
-        {
-            // A legacy/corrupt WorkBranch value can fail name validation in the
-            // git host. Treat that the same as "branch not present" — the
-            // operator's recovery path is the same (412 → /replay).
-            branchPresent = false;
-        }
-        if (!branchPresent)
-            return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
 
         // from=rework / from=audit / from=merge bypass the work phase, so the existing
         // commits on the work branch must already have durable workflow-owned
         // audit progress. Audit reports are diagnostic rows and may be
         // retention-swept, so they are deliberately not used as a resume
         // precondition.
-        if (resumeState.Value != WorkItemState.Queued && _auditProgress is not null)
+        if (!resumingBeforeWork && resumeState.Value != WorkItemState.Queued && _auditProgress is not null)
         {
             var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
             var progress = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
@@ -573,7 +602,11 @@ public sealed class WorkItemRetrier
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             StartedAt = null,
-            PreserveWorkBranchOnQueuedPickup = resumeState.Value == WorkItemState.Queued,
+            PlanArtifact = resumingFromPlanning ? null : item.PlanArtifact,
+            PlanGeneratedAt = resumingFromPlanning ? null : item.PlanGeneratedAt,
+            PlanReviewedAt = resumingFromPlanning ? null : item.PlanReviewedAt,
+            PlanReviewSummary = resumingFromPlanning ? null : item.PlanReviewSummary,
+            PreserveWorkBranchOnQueuedPickup = resumeState.Value == WorkItemState.Queued && !resumingFromPlanning,
         };
 
         // Conditional update guards against a racing cascade-cancel or
@@ -601,6 +634,20 @@ public sealed class WorkItemRetrier
         AuditLog.WorkItemResumed(resumed.Id, requestedFrom, reason);
 
         return new ResumeOutcome(ResumeStatus.Ok, null, resumed, resumeState);
+    }
+
+    private static string? ValidatePlanningResumeBoundary(WorkItem item, string requestedFrom)
+    {
+        return requestedFrom switch
+        {
+            "plan_review" when string.IsNullOrWhiteSpace(item.PlanArtifact) =>
+                "cannot resume from 'plan_review': planning artifact is missing; use from=planning to run planning first.",
+            "plan_approved" when string.IsNullOrWhiteSpace(item.PlanArtifact) =>
+                "cannot resume from 'plan_approved': approved planning artifact is missing; use from=planning to run planning first.",
+            "plan_approved" when item.PlanReviewedAt is null =>
+                "cannot resume from 'plan_approved': planning artifact has not been reviewed; use from=plan_review to review it first.",
+            _ => null,
+        };
     }
 
     private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(

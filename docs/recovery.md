@@ -6,7 +6,7 @@ CodeyBox detects worker crashes via a heartbeat registry and automatically re-qu
 
 ## Problem
 
-If the orchestrator process is killed mid-flight (OOM, host shutdown, `SIGKILL`), any work items in a non-terminal worker-owned state (`Working`, `Auditing`, `Reworking`, `Merging`, `UpstreamPushing`) or a durable phase-boundary state (`WorkComplete`, `AuditPassed`, `Merged`) may be left orphaned. On restart, recovery re-queues them at the correct resume point.
+If the orchestrator process is killed mid-flight (OOM, host shutdown, `SIGKILL`), any work items in a non-terminal worker-owned state (`Planning`, `PlanReview`, `Working`, `Auditing`, `Reworking`, `Merging`, `UpstreamPushing`) or a durable phase-boundary state (`PlanApproved`, `WorkComplete`, `AuditPassed`, `Merged`) may be left orphaned. On restart, recovery re-queues them at the correct resume point.
 
 The dead-worker reaper fixes this: workers prove they are alive every N seconds; items whose worker hasn't heartbeated in M seconds are presumed dead and transitioned back to a safe pick-up point.
 
@@ -54,6 +54,9 @@ The reaper also runs **once synchronously at orchestrator startup** (before the 
 | State when worker died | Recovered to | Why |
 |---|---|---|
 | `Working` | `Failed` | No committed work to preserve; explicit retry required unless a preempt checkpoint exists |
+| `Planning` | `Queued` | Planning edits are discarded; rerun the planning-only turn from a clean sandbox |
+| `PlanReview` | `PlanReview` | A plan artifact already exists; rerun the review placeholder and continue |
+| `PlanApproved` | `PlanApproved` | Re-dispatch implementation from the approved-plan boundary and count the recovery handoff |
 | `Reworking` | `WorkComplete` | Re-run audit against the preserved rework branch, then rework again if findings remain |
 | `WorkComplete` | `WorkComplete` | Re-dispatch audit from the phase boundary and count the recovery handoff |
 | `Auditing` | `WorkComplete` | Re-audit the same commit |
