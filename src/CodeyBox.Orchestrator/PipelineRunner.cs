@@ -4782,7 +4782,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // genuine no-op (no marker → null diagnostic → no detection) still
                 // terminal-fails below, so this adds no false quota parks. Runs BEFORE
                 // RecordNoChangesOutcomeAsync so a quota park never trips the
-                // no-changes circuit breaker.
+                // no-changes circuit breaker. TerminalDiagnostic is a runner-lifted
+                // side-channel (not model-controlled), so this runs in both the
+                // initial and rework phases — the rework-only model-controlled-string
+                // concern that gates the Stderr-based fallback below does not apply.
                 if (!string.IsNullOrEmpty(agentResult.TerminalDiagnostic))
                 {
                     var noChangeQuota = _quotaClassifier.Detect(
@@ -4820,6 +4823,57 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         throw new TerminalQuotaError(noChangeQuota!.Kind,
                             $"Agent {runner.Kind} reported quota failure on clean exit with no changes: {RedactAndTruncateAgentDetail(agentResult.TerminalDiagnostic)}",
                             noChangeQuota.ResetAt);
+                    }
+                }
+
+                // Quota / usage classifier on the clean-exit + no-diff branch —
+                // REWORK ONLY (isInitial==false). The failure-path detector
+                // (above) only fires when the runner exits non-zero, but several
+                // CLIs (Antigravity / agy in particular) swallow usage-cap errors
+                // as exit 0 with the cap signature printed to stdout / stderr.
+                // Without this check the empty result is mis-attributed to "agent
+                // declined to fix findings" rather than infrastructure
+                // exhaustion, and the availability breaker never excludes the
+                // broken agent for peer items in the same class. Match the
+                // failure-path's contract: record an observed quota failure and
+                // throw TerminalQuotaError so the existing router / agent-class
+                // fallback re-routes through a healthy member.
+                //
+                // Scoped to rework only, mirroring STEP 1 of the empty-rework
+                // disambiguation: the initial work phase stays fail-fast and
+                // falls through to the InvalidOperationException below, so an
+                // initial empty commit is never re-routed on a model-controlled
+                // quota-shaped string. (The auth detection above deliberately
+                // spans both phases and is unchanged; only the newly-added quota
+                // classification is gated here.) This is the Stderr-based
+                // fallback for CLIs whose cap signature is printed to stdout /
+                // stderr but not lifted into TerminalDiagnostic by the runner;
+                // the TerminalDiagnostic block above handles the lifted-signal
+                // case in both phases.
+                if (!isInitial)
+                {
+                    _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                        runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
+                    var noDiffQuotaDetection = _quotaClassifier.Detect(
+                        runner.Kind, agentResult.Stderr, agentResult.Stdout);
+                    if (noDiffQuotaDetection is not null)
+                    {
+                        await _quotaClassifier.RecordIfQuotaFailureAsync(
+                            _quotaFailures,
+                            runner.Kind,
+                            observedModelId,
+                            agentResult.Summary,
+                            agentResult.Stderr,
+                            agentEndedAt,
+                            _auditQuotaOptions.ObservedFailureRetention,
+                            ct,
+                            projectId: item.ProjectId,
+                            stdout: agentResult.Stdout);
+
+                        throw new TerminalQuotaError(
+                            noDiffQuotaDetection.Kind,
+                            $"Agent {runner.Kind} reported quota failure (clean exit, no changes): {agentResult.Summary}",
+                            noDiffQuotaDetection.ResetAt);
                     }
                 }
 

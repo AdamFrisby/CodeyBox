@@ -332,22 +332,28 @@ Before treating an empty rework as the agent's verdict on the findings,
 the pipeline runs the agent failure classifiers over the run's captured
 stdout/stderr:
 
-1. The **auth-required classifier** fires *before* the no-diff branch is
-   reached — a Success exit with an auth-required signature in stderr
-   throws `AgentAuthRequiredException` from `RunAgentPhaseAsync`, which
-   the availability breaker turns into a per-agent exclusion. The
-   work item re-routes through the agent-class router's normal scoring.
-2. The **quota / usage classifier** runs on the no-diff branch
-   (clean-exit-but-no-commit). Several CLIs (Antigravity / `agy` in
-   particular) swallow usage-cap errors as exit-0 with the cap signature
-   printed to stdout/stderr; without this check the failure would be
-   mis-attributed to "the agent declined to fix findings" instead of
-   infrastructure exhaustion. A quota match throws `TerminalQuotaError`,
-   which the agent-class fallback wrapper converts into a re-route to
-   a healthy class member.
+1. The **auth-required classifier** is consulted at the *top* of the
+   no-diff branch, before the empty result is treated as a verdict — a
+   Success exit with an auth-required signature throws
+   `AgentAuthRequiredException` from `RunAgentPhaseAsync`, which the
+   availability breaker turns into a per-agent exclusion. The work item
+   re-routes through the agent-class router's normal scoring. (This
+   classifier deliberately spans both the initial and rework phases.)
+2. The **quota / usage classifier** runs on the **rework** no-diff branch
+   only (`isInitial==false`, clean-exit-but-no-commit). Several CLIs
+   (Antigravity / `agy` in particular) swallow usage-cap errors as exit-0
+   with the cap signature printed to stdout/stderr; without this check the
+   failure would be mis-attributed to "the agent declined to fix findings"
+   instead of infrastructure exhaustion. A quota match throws
+   `TerminalQuotaError`, which the agent-class fallback wrapper converts
+   into a re-route to a healthy class member (or, on the single-agent
+   path, parks the item in `WaitingForQuotaReset`). The classifier is
+   gated behind `isInitial` so an empty *initial* commit is never
+   re-routed on a model-controlled quota-shaped string — initial work
+   stays fail-fast (see below).
 
-Neither infra path counts against convergence, parks the item, or
-terminal-fails it as "cannot resolve findings."
+Neither infra path counts against convergence, parks the item as
+operator-input, or terminal-fails it as "cannot resolve findings."
 
 ### Step 2: converge-aware handling
 
@@ -394,7 +400,9 @@ to commit")` on an empty commit. There is no audit/rework loop sitting
 behind it to converge a "declined to work" outcome — the failure must be
 visible to the operator immediately so they can re-prompt or re-route to
 a different agent rather than the orchestrator silently spending budget on
-escalation retries that have nowhere to land.
+escalation retries that have nowhere to land. The Step-1 quota classifier
+is gated to the rework phase for the same reason: the initial no-diff
+outcome always terminal-fails, never re-routes on a quota signature.
 
 ### Relation to the agent-level no-changes breaker
 

@@ -12,10 +12,17 @@ namespace CodeyBox.Tests;
 /// unconditional terminal failure. The audit/rework loop:
 /// </para>
 /// <list type="bullet">
-///   <item>Lets infra (auth / quota) signatures throw their own infra exception
-///         BEFORE reaching the no-diff branch, so the availability breaker
-///         excludes the agent and the item re-routes (covered by the existing
-///         auth/quota detection wired in earlier work items).</item>
+///   <item>STEP 1 — classifies infra (auth / quota) signatures on the
+///         clean-exit + no-diff REWORK branch: before the empty result is
+///         treated as "produced no changes", the quota classifier runs over the
+///         run's captured stdout/stderr; a match throws
+///         <c>TerminalQuotaError</c> so the availability breaker excludes the
+///         agent and the item re-routes / parks in
+///         <see cref="WorkItemState.WaitingForQuotaReset"/> (NOT terminal, NOT
+///         the operator-input park, NOT counted against convergence). This
+///         exit-0 no-diff detection is distinct from the earlier failure-path
+///         (non-zero exit) detector and is exercised by
+///         <see cref="EmptyRework_WithQuotaSignature_ClassifiedAsInfra_ReRoutes"/>.</item>
 ///   <item>When no infra signature applies, converge-aware handling kicks in:
 ///         escalation re-dispatch with an explicit "you committed nothing,
 ///         either modify files or justify each finding" instruction (gated on
@@ -93,6 +100,78 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         // The auditor ran exactly once (iteration 1 → rework → empty → park,
         // never reaches iteration 2 audit).
         Assert.Equal(1, auditor.Calls);
+    }
+
+    [Fact]
+    public async Task EmptyRework_WithQuotaSignature_ClassifiedAsInfra_ReRoutes()
+    {
+        // STEP 1 acceptance: an empty rework whose clean-exit output carries a
+        // usage/quota signature is classified as an INFRA failure — NOT the
+        // "produced no changes" verdict. The item must re-route (park in
+        // WaitingForQuotaReset so QuotaRetryScheduler re-dispatches on reset),
+        // NOT terminal-fail, NOT go through the operator-input park, and NOT be
+        // counted against convergence / reach a second audit iteration.
+        //
+        // Sequence:
+        //   work iter 1  → "v1\n" (initial diff; no-diff branch not hit, quota
+        //                  classifier not consulted for initial work)
+        //   audit iter 1 → 1 blocking finding → rework
+        //   rework iter 2 → writes "v1\n" again → NO diff → clean-exit no-diff
+        //                  branch. ResultStdout carries a Claude quota signature
+        //                  ("rate_limit_exceeded"), so the STEP 1 classifier
+        //                  matches → TerminalQuotaError → WaitingForQuotaReset.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new OnceFailingAuditor();
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 3,
+            AuditTypes = ["scripted"],
+        };
+        // Escalation retries are irrelevant: STEP 1 fires before STEP 2 ever
+        // runs. A generous value would let the genuine-empty escalation branch
+        // run if the quota classification were (wrongly) skipped, so leaving it
+        // >0 makes the test stricter — any escalation dispatch would appear in
+        // WorkPrompts and fail the assertions below.
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EmptyReworkEscalationRetries = 2,
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            pipelineTuning: tuning);
+        // Every work/rework result the ScriptedAgent produces from its WorkPlan
+        // carries this stdout. The Claude quota detector (wired into the test
+        // pipeline's CompositeQuotaFailureClassifier) matches the plain-text
+        // "rate_limit_exceeded" substring. It only influences the outcome on the
+        // no-diff branch (rework iter 2); the initial diff-producing work ignores
+        // it.
+        tp.Agent.ResultStdout = "rate_limit_exceeded";
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+
+        var item = NewItem("feature/empty-rework-quota-signature");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Infra classification re-routes via the quota path, NOT terminal /
+        // operator-park.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+        Assert.NotEqual(WorkItemState.NeedsOperatorInput, final.State);
+        // The empty-rework "produced no changes" verdict must NOT have been
+        // reached — the quota classifier short-circuited before it.
+        Assert.DoesNotContain("produced no changes", final.LastError ?? string.Empty,
+            StringComparison.OrdinalIgnoreCase);
+        // Not counted against convergence: the loop never re-entered audit
+        // iteration 2, and no escalation re-dispatch ran.
+        Assert.Equal(1, auditor.Calls);
+        Assert.DoesNotContain(tp.Agent.WorkPrompts, p =>
+            p.Contains("[empty-rework escalation attempt", StringComparison.Ordinal));
     }
 
     [Fact]
