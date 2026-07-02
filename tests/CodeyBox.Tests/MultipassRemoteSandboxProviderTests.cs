@@ -387,6 +387,40 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task DisposeAsync_serializes_parallel_remote_stop_and_delete_operations()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var firstSandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+        var secondSandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+
+        var activeHeavy = 0;
+        var maxHeavy = 0;
+        transport.OnRun = (argv, _) =>
+        {
+            if (IsRemoteHeavy(argv, opts.RemoteMultipassPath))
+            {
+                var current = Interlocked.Increment(ref activeHeavy);
+                UpdateMax(ref maxHeavy, current);
+                Thread.Sleep(25);
+                Interlocked.Decrement(ref activeHeavy);
+            }
+            return ProcessRunOk();
+        };
+
+        await Task.WhenAll(firstSandbox.DisposeAsync().AsTask(), secondSandbox.DisposeAsync().AsTask());
+
+        Assert.Equal(1, maxHeavy);
+    }
+
+    [Fact]
     public async Task ListAllManagedAsync_filters_to_provider_prefix_and_returns_empty_on_transport_drop()
     {
         var opts = DefaultOptions();

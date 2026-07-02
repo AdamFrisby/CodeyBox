@@ -1,5 +1,6 @@
 using CodeyBox.Api;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Options;
 using System.Net;
@@ -377,6 +378,46 @@ public sealed class CodeyBoxOptionsValidatorTests
 
         Assert.True(result.Failed);
         Assert.Contains("dedicated", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEnabledRemoteE2eWhenOpenSshConfigAliasResolvesLocal()
+    {
+        var runner = new RecordingProcessRunner(
+            new ProcessRunResult(0, "user e2e\nhostname 127.0.0.1\nport 2200\n", string.Empty));
+        var validator = new CodeyBoxOptionsValidator(new E2eRemotePoolConfigValidation(
+            new E2eRemoteHostValidation(new OpenSshConfigResolver(runner))));
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = null;
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig
+        {
+            SshBinary = "/usr/bin/ssh-custom",
+            SshTarget = "e2e-local-alias",
+            SshPort = 2200,
+            ExtraSshOptions = ["IdentityFile=/tmp/e2e_key", "UserKnownHostsFile=/tmp/e2e_known_hosts"],
+        };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = validator.Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("dedicated", result.FailureMessage);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(
+            [
+                "/usr/bin/ssh-custom",
+                "-G",
+                "-p",
+                "2200",
+                "-o",
+                "IdentityFile=/tmp/e2e_key",
+                "-o",
+                "UserKnownHostsFile=/tmp/e2e_known_hosts",
+                "e2e-local-alias",
+            ],
+            call.Argv);
     }
 
     [Fact]
@@ -999,4 +1040,37 @@ public sealed class CodeyBoxOptionsValidatorTests
                 throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
         }
     }
+
+    private sealed class RecordingProcessRunner : IProcessRunner
+    {
+        private readonly ProcessRunResult _result;
+
+        public RecordingProcessRunner(ProcessRunResult result)
+        {
+            _result = result;
+        }
+
+        public List<ProcessCall> Calls { get; } = [];
+
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
+        {
+            Calls.Add(new ProcessCall(argv.ToArray(), stdin, maxStdoutBytes, maxStderrBytes));
+            return Task.FromResult(_result);
+        }
+    }
+
+    private sealed record ProcessCall(
+        IReadOnlyList<string> Argv,
+        string? Stdin,
+        int? MaxStdoutBytes,
+        int? MaxStderrBytes);
 }

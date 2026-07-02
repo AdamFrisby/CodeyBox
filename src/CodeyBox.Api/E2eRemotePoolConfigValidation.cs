@@ -4,9 +4,18 @@ using CodeyBox.Sandbox.MultipassRemote;
 
 namespace CodeyBox.Api;
 
-internal static class E2eRemotePoolConfigValidation
+internal sealed class E2eRemotePoolConfigValidation
 {
-    public static IReadOnlyList<string> ValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxOptions options)
+    public static E2eRemotePoolConfigValidation Default { get; } = new(E2eRemoteHostValidation.Default);
+
+    private readonly E2eRemoteHostValidation _hostValidation;
+
+    public E2eRemotePoolConfigValidation(E2eRemoteHostValidation hostValidation)
+    {
+        _hostValidation = hostValidation;
+    }
+
+    public IReadOnlyList<string> ValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxOptions options)
     {
         var failures = new List<string>();
 
@@ -29,7 +38,7 @@ internal static class E2eRemotePoolConfigValidation
 
         foreach (var host in e2eHosts)
         {
-            if (E2eRemoteHostValidation.IsLocalSshTarget(host.RemoteSandbox, out var error))
+            if (_hostValidation.IsLocalSshTarget(host.RemoteSandbox, out var error))
             {
                 failures.Add(error is null
                     ? "CodeyBox:E2eMultipassRemoteSandbox must target a dedicated remote SSH host, not localhost, loopback, or the orchestrator host; E2E replay load must stay off the local coding fleet."
@@ -42,7 +51,7 @@ internal static class E2eRemotePoolConfigValidation
         return failures;
     }
 
-    public static IReadOnlyList<string> ValidateConfiguredRemoteLifecycleIsolation(CodeyBoxOptions options)
+    public IReadOnlyList<string> ValidateConfiguredRemoteLifecycleIsolation(CodeyBoxOptions options)
     {
         var failures = new List<string>();
         var e2eHosts = GetE2eRemoteHostConfigs(options)
@@ -55,7 +64,7 @@ internal static class E2eRemotePoolConfigValidation
         {
             foreach (var host in e2eHosts)
             {
-                if (E2eRemoteHostValidation.IsSameRemoteHost(coding, host.RemoteSandbox, out var error))
+                if (_hostValidation.IsSameRemoteHost(coding, host.RemoteSandbox, out var error))
                 {
                     failures.Add("CodeyBox:E2eMultipassRemoteSandbox must target a different SSH host than CodeyBox:MultipassRemoteSandbox; E2E replay load must stay off the coding fleet.");
                 }
@@ -73,7 +82,7 @@ internal static class E2eRemotePoolConfigValidation
                 if (!string.Equals(EffectiveVmNamePrefix(e2eHosts[i].RemoteSandbox), EffectiveVmNamePrefix(e2eHosts[j].RemoteSandbox), StringComparison.Ordinal))
                     continue;
 
-                if (E2eRemoteHostValidation.IsSameRemoteHost(e2eHosts[i].RemoteSandbox, e2eHosts[j].RemoteSandbox, out var error))
+                if (_hostValidation.IsSameRemoteHost(e2eHosts[i].RemoteSandbox, e2eHosts[j].RemoteSandbox, out var error))
                 {
                     failures.Add($"CodeyBox:E2eMultipassRemoteSandboxes:{i} and CodeyBox:E2eMultipassRemoteSandboxes:{j} target the same SSH host with the same VmNamePrefix; duplicate lifecycle views can purge each other's active VMs.");
                 }

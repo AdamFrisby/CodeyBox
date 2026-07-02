@@ -6,6 +6,18 @@ namespace CodeyBox.Api;
 
 public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
 {
+    private readonly E2eRemotePoolConfigValidation _e2eRemotePoolConfigValidation;
+
+    public CodeyBoxOptionsValidator()
+        : this(E2eRemotePoolConfigValidation.Default)
+    {
+    }
+
+    internal CodeyBoxOptionsValidator(E2eRemotePoolConfigValidation e2eRemotePoolConfigValidation)
+    {
+        _e2eRemotePoolConfigValidation = e2eRemotePoolConfigValidation;
+    }
+
     public ValidateOptionsResult Validate(string? name, CodeyBoxOptions options)
     {
         var failures = new List<string>();
@@ -54,11 +66,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             var remoteE2e = string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase);
             if (e2e.Enabled && remoteE2e)
             {
-                failures.AddRange(E2eRemotePoolConfigValidation.ValidateEnabledRemoteE2eConfig(e2e, options));
+                failures.AddRange(_e2eRemotePoolConfigValidation.ValidateEnabledRemoteE2eConfig(e2e, options));
             }
             else if (remoteE2e)
             {
-                failures.AddRange(E2eRemotePoolConfigValidation.ValidateConfiguredRemoteLifecycleIsolation(options));
+                failures.AddRange(_e2eRemotePoolConfigValidation.ValidateConfiguredRemoteLifecycleIsolation(options));
             }
             foreach (var (host, index) in GetE2eRemoteHostConfigs(options).Select((host, index) => (host, index)))
             {

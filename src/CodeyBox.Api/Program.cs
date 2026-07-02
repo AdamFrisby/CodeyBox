@@ -314,10 +314,15 @@ builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
     sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value,
         opts => AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns)));
+builder.Services.TryAddSingleton<IProcessRunner, DefaultProcessRunner>();
+builder.Services.TryAddSingleton<IOpenSshConfigResolver, OpenSshConfigResolver>();
+builder.Services.TryAddSingleton<E2eRemoteHostValidation>();
+builder.Services.TryAddSingleton<E2eRemotePoolConfigValidation>();
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new ImmutableCodeyBoxOptionsValidator(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
-builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptionsValidator>();
+builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
+    sp => new CodeyBoxOptionsValidator(sp.GetRequiredService<E2eRemotePoolConfigValidation>()));
 
 // Unbound-key startup check. Walks the CodeyBox:* configuration sub-tree
 // and surfaces any key that does not bind to a property on the typed
@@ -489,7 +494,10 @@ static IE2eExecutionPool BuildE2eExecutionPool(IServiceProvider sp)
 
     if (poolKind == "remote-ssh" && e2eOptions.CurrentValue.Enabled)
     {
-        ValidateEnabledRemoteE2eConfig(e2eOptions.CurrentValue, startupOptions);
+        ValidateEnabledRemoteE2eConfig(
+            e2eOptions.CurrentValue,
+            startupOptions,
+            sp.GetRequiredService<E2eRemotePoolConfigValidation>());
     }
 
     if (poolKind == "remote-ssh")
@@ -589,15 +597,22 @@ static bool IsValidE2eExecutionOptionsForConfig(E2eExecutionOptions opts, IConfi
     return TryValidateEnabledRemoteE2eConfig(opts, cb, out _);
 }
 
-static void ValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxOptions options)
+static void ValidateEnabledRemoteE2eConfig(
+    E2eExecutionOptions e2e,
+    CodeyBoxOptions options,
+    E2eRemotePoolConfigValidation? validator = null)
 {
-    if (!TryValidateEnabledRemoteE2eConfig(e2e, options, out var message))
+    if (!TryValidateEnabledRemoteE2eConfig(e2e, options, out var message, validator))
         throw new InvalidOperationException(message);
 }
 
-static bool TryValidateEnabledRemoteE2eConfig(E2eExecutionOptions e2e, CodeyBoxOptions options, out string message)
+static bool TryValidateEnabledRemoteE2eConfig(
+    E2eExecutionOptions e2e,
+    CodeyBoxOptions options,
+    out string message,
+    E2eRemotePoolConfigValidation? validator = null)
 {
-    var failures = E2eRemotePoolConfigValidation.ValidateEnabledRemoteE2eConfig(e2e, options);
+    var failures = (validator ?? E2eRemotePoolConfigValidation.Default).ValidateEnabledRemoteE2eConfig(e2e, options);
     if (failures.Count > 0)
     {
         message = string.Join("; ", failures);

@@ -87,9 +87,10 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.All(result.StepResults, step => Assert.True(step.Passed));
         Assert.Single(result.AssertionResults);
         Assert.True(result.AssertionResults[0].Passed);
-        var exec = Assert.Single(sandbox.ExecRequests, exec => exec.Argv[0] == "node");
-        Assert.Equal("node", exec.Argv[0]);
-        Assert.Equal("-e", exec.Argv[1]);
+        var exec = Assert.Single(sandbox.ExecRequests, exec => exec.Argv.Contains("node"));
+        var nodeIndex = exec.Argv.ToList().IndexOf("node");
+        Assert.True(nodeIndex >= 0);
+        Assert.Equal("-e", exec.Argv[nodeIndex + 1]);
         Assert.Equal(1024 * 1024, exec.MaxStdoutBytes);
         Assert.Equal(1024 * 1024, exec.MaxStderrBytes);
         var sent = JsonSerializer.Deserialize<E2eReplayArtifact>(exec.Stdin!, new JsonSerializerOptions(JsonSerializerDefaults.Web));
@@ -231,10 +232,37 @@ public sealed class E2eExecutionTests : IDisposable
         var result = await runtime.ExecuteAsync(artifact, sandbox);
 
         Assert.True(result.Passed, result.Summary);
-        Assert.Equal(["getent", "getent", "sh", "node", "sh"], sandbox.ExecLog.Select(static argv => argv[0]).ToArray());
+        Assert.Equal(["getent", "getent", "sh", "sudo", "sh"], sandbox.ExecLog.Select(static argv => argv[0]).ToArray());
         var install = sandbox.ExecRequests.Single(exec => exec.Argv.SequenceEqual(["sh", "-s"]) && exec.Stdin!.Contains("iptables -I OUTPUT", StringComparison.Ordinal));
         Assert.Contains("203.0.113.10 80", install.Stdin, StringComparison.Ordinal);
         Assert.Contains("203.0.113.10 443", install.Stdin, StringComparison.Ordinal);
+        Assert.Contains("-m owner --uid-owner", install.Stdin, StringComparison.Ordinal);
+        Assert.Contains("--ctstate ESTABLISHED,RELATED", install.Stdin, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Replay_fails_closed_when_vm_egress_firewall_install_fails()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "203.0.113.10 STREAM app.local\n", string.Empty);
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(1, 0));
+        var shCalls = 0;
+        sandbox.Programs["sh"] = _ => ++shCalls == 1
+            ? new SandboxExecResult(42, string.Empty, "iptables is required")
+            : new SandboxExecResult(0, string.Empty, string.Empty);
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/" }],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReplayEgressFirewallUnavailable", result.FailureKind);
+        Assert.Contains("iptables is required", result.Summary);
+        Assert.Equal(2, shCalls);
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv.Contains("node"));
     }
 
     [Fact]
@@ -332,7 +360,7 @@ public sealed class E2eExecutionTests : IDisposable
 
         Assert.True(result.Passed);
         Assert.Equal(2, curlAttempts);
-        Assert.Contains(sandbox.ExecLog, argv => argv[0] == "node");
+        Assert.Contains(sandbox.ExecLog, argv => argv.Contains("node"));
     }
 
     [Fact]
@@ -353,7 +381,7 @@ public sealed class E2eExecutionTests : IDisposable
 
         Assert.True(result.Passed);
         Assert.Contains(sandbox.ExecLog, argv => argv[0] == "curl");
-        Assert.Contains(sandbox.ExecLog, argv => argv[0] == "node");
+        Assert.Contains(sandbox.ExecLog, argv => argv.Contains("node"));
         var curl = sandbox.ExecRequests.Single(exec => exec.Argv[0] == "curl");
         Assert.Contains("app.local:80:127.0.0.1", curl.Argv);
     }
@@ -395,6 +423,30 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.False(result.Passed);
         Assert.Equal("ReadinessUrlRejected", result.FailureKind);
         Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "curl");
+    }
+
+    [Fact]
+    public async Task Replay_rejects_allowed_origin_that_resolves_metadata_address()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "169.254.169.254 STREAM metadata.local\n", string.Empty);
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(1, 0));
+        var options = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+        {
+            AllowedReadinessOrigins = ["http://metadata.local"],
+        });
+        var artifact = new E2eReplayArtifact
+        {
+            Steps = [new E2eReplayStep { Action = "wait", Value = "0" }],
+        };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance, options);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.Equal("ReplayEgressOriginRejected", result.FailureKind);
+        Assert.Contains("metadata", result.Summary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv.Contains("node"));
     }
 
     [Fact]
@@ -495,7 +547,7 @@ public sealed class E2eExecutionTests : IDisposable
 
         Assert.False(result.Passed);
         Assert.Equal("NavigationUrlRejected", result.FailureKind);
-        Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "node");
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv.Contains("node"));
     }
 
     [Fact]
@@ -535,7 +587,7 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.False(result.Passed);
         Assert.Equal("NavigationUrlRejected", result.FailureKind);
         Assert.Contains("userinfo", result.Summary);
-        Assert.DoesNotContain(sandbox.ExecLog, argv => argv[0] == "node");
+        Assert.DoesNotContain(sandbox.ExecLog, argv => argv.Contains("node"));
     }
 
     [Fact]
@@ -559,7 +611,7 @@ public sealed class E2eExecutionTests : IDisposable
 
         Assert.True(allowed.Passed);
         Assert.Contains(allowedSandbox.ExecLog, argv => argv[0] == "curl");
-        Assert.Contains(allowedSandbox.ExecLog, argv => argv[0] == "node");
+        Assert.Contains(allowedSandbox.ExecLog, argv => argv.Contains("node"));
 
         var rejectedSandbox = new FakeSandbox();
         rejectedSandbox.Programs["getent"] = _ => new SandboxExecResult(0, "10.42.0.6 STREAM other.local\n", string.Empty);
@@ -660,7 +712,7 @@ public sealed class E2eExecutionTests : IDisposable
         var result = await runtime.ExecuteAsync(artifact, sandbox);
 
         Assert.True(result.Passed);
-        var exec = Assert.Single(sandbox.ExecRequests, exec => exec.Argv[0] == "node");
+        var exec = Assert.Single(sandbox.ExecRequests, exec => exec.Argv.Contains("node"));
         Assert.Equal(1024 * 1024, exec.MaxStdoutBytes);
     }
 
@@ -2165,7 +2217,8 @@ public sealed class E2eExecutionTests : IDisposable
             ExecRequests.Add(exec);
             if (exec.Argv.Count == 0)
                 return Task.FromResult(new SandboxExecResult(127, string.Empty, "empty"));
-            if (Programs.TryGetValue(exec.Argv[0], out var handler))
+            var programName = DriverProgramName(exec.Argv);
+            if (Programs.TryGetValue(programName, out var handler))
                 return Task.FromResult(handler(ct));
             if (exec.Argv[0] == "getent" && exec.Argv.Count >= 3 && exec.Argv[1] == "ahosts" && exec.Argv[2] == "app.local")
                 return Task.FromResult(new SandboxExecResult(0, "127.0.0.1 STREAM app.local\n", string.Empty));
@@ -2175,6 +2228,18 @@ public sealed class E2eExecutionTests : IDisposable
         }
 
         public ValueTask DisposeAsync() => default;
+
+        private static string DriverProgramName(IReadOnlyList<string> argv)
+        {
+            if (argv.Count > 0 && argv[0] == "sudo")
+            {
+                var nodeIndex = argv.ToList().IndexOf("node");
+                if (nodeIndex >= 0)
+                    return argv[nodeIndex];
+            }
+
+            return argv[0];
+        }
     }
 
     private sealed class LocalNodeSandbox : ISandbox
@@ -2198,14 +2263,15 @@ public sealed class E2eExecutionTests : IDisposable
             if (exec.Argv.SequenceEqual(["sh", "-s"]))
                 return new SandboxExecResult(0, string.Empty, string.Empty);
 
-            var psi = new ProcessStartInfo(exec.Argv[0])
+            var argv = StripReplayDriverWrapper(exec.Argv);
+            var psi = new ProcessStartInfo(argv[0])
             {
                 WorkingDirectory = _root,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
             };
-            foreach (var arg in exec.Argv.Skip(1))
+            foreach (var arg in argv.Skip(1))
                 psi.ArgumentList.Add(arg);
             psi.Environment["NODE_PATH"] = Path.Combine(_root, "node_modules");
             psi.Environment["NODE_OPTIONS"] = $"--require {Path.Combine(_root, "dns-hook.js")}";
@@ -2239,6 +2305,15 @@ public sealed class E2eExecutionTests : IDisposable
         {
             try { Directory.Delete(_root, recursive: true); } catch { }
             return default;
+        }
+
+        private static IReadOnlyList<string> StripReplayDriverWrapper(IReadOnlyList<string> argv)
+        {
+            if (argv.Count == 0 || argv[0] != "sudo")
+                return argv;
+
+            var nodeIndex = argv.ToList().IndexOf("node");
+            return nodeIndex >= 0 ? argv.Skip(nodeIndex).ToArray() : argv;
         }
 
         private const string PlaywrightStub =

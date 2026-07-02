@@ -122,7 +122,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         {
             result = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = [ReplayDriverBinary, "-e", ReplayDriverScript],
+                Argv = BuildReplayDriverArgv(firewall.runUser!),
                 Stdin = JsonSerializer.Serialize(ToReplayDriverInput(artifact, egressPolicy), ArtifactJson),
                 WorkingDirectory = "/work",
                 MaxStdoutBytes = OutputCaptureBytes,
@@ -141,7 +141,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         finally
         {
             if (!string.IsNullOrEmpty(firewall.firewallId))
-                await RemoveReplayEgressFirewallAsync(sandbox, firewall.firewallId!, CancellationToken.None);
+                await RemoveReplayEgressFirewallAsync(sandbox, firewall.firewallId!, firewall.runUser!, CancellationToken.None);
         }
 
         if (result.OutputLimitExceeded)
@@ -392,13 +392,14 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             : (true, string.Empty, string.Empty, addresses);
     }
 
-    private async Task<(bool installed, string? firewallId, string detail)> InstallReplayEgressFirewallAsync(
+    private async Task<(bool installed, string? firewallId, string? runUser, string detail)> InstallReplayEgressFirewallAsync(
         ISandbox sandbox,
         IReadOnlyList<ReplayAllowedEndpoint> endpoints,
         CancellationToken ct)
     {
         var firewallId = "CB_E2E_" + Guid.NewGuid().ToString("N")[..12];
-        var script = BuildInstallFirewallScript(firewallId, endpoints);
+        var runUser = ReplayRunUserName(firewallId);
+        var script = BuildInstallFirewallScript(firewallId, runUser, endpoints);
         SandboxExecResult result;
         try
         {
@@ -416,25 +417,25 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         }
         catch (Exception ex)
         {
-            await RemoveReplayEgressFirewallAsync(sandbox, firewallId, CancellationToken.None);
-            return (false, null, $"replay VM egress firewall setup threw: {ex.Message}");
+            await RemoveReplayEgressFirewallAsync(sandbox, firewallId, runUser, CancellationToken.None);
+            return (false, null, null, $"replay VM egress firewall setup threw: {ex.Message}");
         }
 
         if (result.ExitCode == 0)
-            return (true, firewallId, string.Empty);
+            return (true, firewallId, runUser, string.Empty);
 
-        await RemoveReplayEgressFirewallAsync(sandbox, firewallId, CancellationToken.None);
-        return (false, null, $"replay VM egress firewall setup failed (exit {result.ExitCode}): {Tail(string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr)}");
+        await RemoveReplayEgressFirewallAsync(sandbox, firewallId, runUser, CancellationToken.None);
+        return (false, null, null, $"replay VM egress firewall setup failed (exit {result.ExitCode}): {Tail(string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr)}");
     }
 
-    private async Task RemoveReplayEgressFirewallAsync(ISandbox sandbox, string firewallId, CancellationToken ct)
+    private async Task RemoveReplayEgressFirewallAsync(ISandbox sandbox, string firewallId, string runUser, CancellationToken ct)
     {
         try
         {
             var result = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["sh", "-s"],
-                Stdin = BuildRemoveFirewallScript(firewallId),
+                Stdin = BuildRemoveFirewallScript(firewallId, runUser),
                 MaxStdoutBytes = OutputCaptureBytes,
                 MaxStderrBytes = OutputCaptureBytes,
             }, ct);
@@ -447,7 +448,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         }
     }
 
-    private static string BuildInstallFirewallScript(string firewallId, IReadOnlyList<ReplayAllowedEndpoint> endpoints)
+    private static string BuildInstallFirewallScript(string firewallId, string runUser, IReadOnlyList<ReplayAllowedEndpoint> endpoints)
     {
         var endpointLines = string.Join("\n", endpoints.Select(static e => $"{e.Family} {e.Address} {e.Port}"));
         return $$"""
@@ -455,13 +456,37 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         CHAIN='{{firewallId}}'
         CHAIN4="${CHAIN}_4"
         CHAIN6="${CHAIN}_6"
+        RUN_USER='{{runUser}}'
+        RUN_HOME="/tmp/$RUN_USER"
         run() {
           if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi
         }
         command -v iptables >/dev/null 2>&1 || { echo 'iptables is required for replay egress enforcement' >&2; exit 42; }
         command -v ip6tables >/dev/null 2>&1 || { echo 'ip6tables is required for replay egress enforcement' >&2; exit 42; }
+        command -v sudo >/dev/null 2>&1 || { echo 'sudo is required to isolate replay driver user' >&2; exit 42; }
+        ensure_run_user() {
+          if id -u "$RUN_USER" >/dev/null 2>&1; then return; fi
+          shell_path=/usr/sbin/nologin
+          [ -x "$shell_path" ] || shell_path=/bin/false
+          if command -v useradd >/dev/null 2>&1; then
+            run useradd --system --no-create-home --home-dir "$RUN_HOME" --shell "$shell_path" "$RUN_USER"
+          elif command -v adduser >/dev/null 2>&1; then
+            run adduser --system --no-create-home --home "$RUN_HOME" --shell "$shell_path" "$RUN_USER"
+          else
+            echo 'useradd or adduser is required to isolate replay driver user' >&2
+            exit 42
+          fi
+        }
+        ensure_run_user
+        RUN_UID="$(id -u "$RUN_USER")"
+        RUN_GID="$(id -g "$RUN_USER")"
+        run mkdir -p "$RUN_HOME"
+        run chown "$RUN_UID:$RUN_GID" "$RUN_HOME"
+        run chmod 0700 "$RUN_HOME"
         cleanup_chain() {
           table="$1"; chain="$2"
+          while run "$table" -D OUTPUT -m owner --uid-owner "$RUN_UID" -p tcp -j "$chain" 2>/dev/null; do :; done
+          while run "$table" -D OUTPUT -m owner --uid-owner "$RUN_UID" -p udp -j "$chain" 2>/dev/null; do :; done
           while run "$table" -D OUTPUT -p tcp -j "$chain" 2>/dev/null; do :; done
           while run "$table" -D OUTPUT -p udp -j "$chain" 2>/dev/null; do :; done
           run "$table" -F "$chain" 2>/dev/null || true
@@ -471,6 +496,8 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         cleanup_chain ip6tables "$CHAIN6"
         run iptables -N "$CHAIN4"
         run ip6tables -N "$CHAIN6"
+        run iptables -A "$CHAIN4" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+        run ip6tables -A "$CHAIN6" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
         ENDPOINTS="$(mktemp)"
         trap 'rm -f "$ENDPOINTS"' EXIT
         cat > "$ENDPOINTS" <<'CODEYBOX_E2E_ENDPOINTS'
@@ -488,24 +515,31 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         run iptables -A "$CHAIN4" -p udp -j REJECT
         run ip6tables -A "$CHAIN6" -p tcp -j REJECT
         run ip6tables -A "$CHAIN6" -p udp -j REJECT
-        run iptables -I OUTPUT 1 -p tcp -j "$CHAIN4"
-        run iptables -I OUTPUT 1 -p udp -j "$CHAIN4"
-        run ip6tables -I OUTPUT 1 -p tcp -j "$CHAIN6"
-        run ip6tables -I OUTPUT 1 -p udp -j "$CHAIN6"
+        run iptables -I OUTPUT 1 -m owner --uid-owner "$RUN_UID" -p tcp -j "$CHAIN4"
+        run iptables -I OUTPUT 1 -m owner --uid-owner "$RUN_UID" -p udp -j "$CHAIN4"
+        run ip6tables -I OUTPUT 1 -m owner --uid-owner "$RUN_UID" -p tcp -j "$CHAIN6"
+        run ip6tables -I OUTPUT 1 -m owner --uid-owner "$RUN_UID" -p udp -j "$CHAIN6"
         """;
     }
 
-    private static string BuildRemoveFirewallScript(string firewallId) =>
+    private static string BuildRemoveFirewallScript(string firewallId, string runUser) =>
         $$"""
         set -u
         CHAIN='{{firewallId}}'
         CHAIN4="${CHAIN}_4"
         CHAIN6="${CHAIN}_6"
+        RUN_USER='{{runUser}}'
+        RUN_HOME="/tmp/$RUN_USER"
         run() {
           if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi
         }
+        RUN_UID="$(id -u "$RUN_USER" 2>/dev/null || true)"
         cleanup_chain() {
           table="$1"; chain="$2"
+          if [ -n "$RUN_UID" ]; then
+            while run "$table" -D OUTPUT -m owner --uid-owner "$RUN_UID" -p tcp -j "$chain" 2>/dev/null; do :; done
+            while run "$table" -D OUTPUT -m owner --uid-owner "$RUN_UID" -p udp -j "$chain" 2>/dev/null; do :; done
+          fi
           while run "$table" -D OUTPUT -p tcp -j "$chain" 2>/dev/null; do :; done
           while run "$table" -D OUTPUT -p udp -j "$chain" 2>/dev/null; do :; done
           run "$table" -F "$chain" 2>/dev/null || true
@@ -513,7 +547,34 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         }
         cleanup_chain iptables "$CHAIN4"
         cleanup_chain ip6tables "$CHAIN6"
+        if [ -n "$RUN_UID" ]; then
+          run userdel "$RUN_USER" 2>/dev/null || true
+        fi
+        run rm -rf "$RUN_HOME" 2>/dev/null || true
         """;
+
+    private static IReadOnlyList<string> BuildReplayDriverArgv(string runUser) =>
+    [
+        "sudo",
+        "-n",
+        "-H",
+        "-u",
+        runUser,
+        "env",
+        $"HOME=/tmp/{runUser}",
+        ReplayDriverBinary,
+        "-e",
+        ReplayDriverScript,
+    ];
+
+    private static string ReplayRunUserName(string firewallId)
+    {
+        const string prefix = "CB_E2E_";
+        var suffix = firewallId.StartsWith(prefix, StringComparison.Ordinal)
+            ? firewallId[prefix.Length..]
+            : firewallId;
+        return "cb-e2e-" + suffix.ToLowerInvariant();
+    }
 
     private ReplayDriverInput ToReplayDriverInput(E2eReplayArtifact artifact, ReplayEgressPolicy egressPolicy)
     {

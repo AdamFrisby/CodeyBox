@@ -1,11 +1,105 @@
 using System.Net;
 using System.Net.NetworkInformation;
+using CodeyBox.HostProcess;
 
 namespace CodeyBox.Api;
 
-internal static class E2eRemoteHostValidation
+internal interface IOpenSshConfigResolver
 {
-    public static bool TryResolveSshTargetIdentity(
+    bool TryResolveHostName(MultipassRemoteSandboxConfig config, out string? hostName);
+}
+
+internal sealed class OpenSshConfigResolver : IOpenSshConfigResolver
+{
+    private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(5);
+    private const int OutputLimitBytes = 64 * 1024;
+    private readonly IProcessRunner _runner;
+    private readonly TimeSpan _timeout;
+
+    public OpenSshConfigResolver(IProcessRunner runner)
+        : this(runner, DefaultTimeout)
+    {
+    }
+
+    internal OpenSshConfigResolver(IProcessRunner runner, TimeSpan timeout)
+    {
+        _runner = runner;
+        _timeout = timeout;
+    }
+
+    public bool TryResolveHostName(MultipassRemoteSandboxConfig config, out string? hostName)
+    {
+        hostName = null;
+        if (string.IsNullOrWhiteSpace(config.SshTarget))
+            return false;
+
+        var argv = new List<string>
+        {
+            string.IsNullOrWhiteSpace(config.SshBinary) ? "ssh" : config.SshBinary!,
+            "-G",
+        };
+        if (config.SshPort is { } port)
+        {
+            argv.Add("-p");
+            argv.Add(port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+        foreach (var extra in config.ExtraSshOptions ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(extra))
+                continue;
+            argv.Add("-o");
+            argv.Add(extra);
+        }
+        argv.Add(config.SshTarget!);
+
+        try
+        {
+            using var cts = new CancellationTokenSource(_timeout);
+            var result = _runner.RunAsync(
+                    argv,
+                    stdin: null,
+                    cts.Token,
+                    maxStdoutBytes: OutputLimitBytes,
+                    maxStderrBytes: OutputLimitBytes)
+                .GetAwaiter()
+                .GetResult();
+            if (!result.Success || result.StdoutLimitExceeded)
+                return false;
+
+            foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var split = line.IndexOf(' ');
+                if (split <= 0 || split == line.Length - 1)
+                    continue;
+                if (string.Equals(line[..split], "hostname", StringComparison.OrdinalIgnoreCase))
+                {
+                    hostName = line[(split + 1)..].Trim();
+                    return !string.IsNullOrWhiteSpace(hostName);
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
+    }
+}
+
+internal sealed class E2eRemoteHostValidation
+{
+    public static E2eRemoteHostValidation Default { get; } =
+        new(new OpenSshConfigResolver(new DefaultProcessRunner()));
+
+    private readonly IOpenSshConfigResolver _openSshConfigResolver;
+
+    public E2eRemoteHostValidation(IOpenSshConfigResolver openSshConfigResolver)
+    {
+        _openSshConfigResolver = openSshConfigResolver;
+    }
+
+    public bool TryResolveSshTargetIdentity(
         MultipassRemoteSandboxConfig config,
         out SshTargetIdentity identity,
         out string error)
@@ -40,7 +134,7 @@ internal static class E2eRemoteHostValidation
         return true;
     }
 
-    public static bool IsLocalSshTarget(MultipassRemoteSandboxConfig config, out string? error)
+    public bool IsLocalSshTarget(MultipassRemoteSandboxConfig config, out string? error)
     {
         error = null;
         if (!TryResolveSshTargetIdentity(config, out var identity, out var resolveError))
@@ -53,7 +147,7 @@ internal static class E2eRemoteHostValidation
             || identity.Addresses.Any(IsLocalAddress);
     }
 
-    public static bool IsSameRemoteHost(MultipassRemoteSandboxConfig left, MultipassRemoteSandboxConfig right, out string? error)
+    public bool IsSameRemoteHost(MultipassRemoteSandboxConfig left, MultipassRemoteSandboxConfig right, out string? error)
     {
         error = null;
         var leftTextHost = SshHostIdentity(left.SshTarget ?? string.Empty);
@@ -98,13 +192,15 @@ internal static class E2eRemoteHostValidation
         return NormalizeHostIdentity(host);
     }
 
-    private static string? ResolveEffectiveHostName(MultipassRemoteSandboxConfig config)
+    private string? ResolveEffectiveHostName(MultipassRemoteSandboxConfig config)
     {
         var hostNameOption = LastSshOption(config.ExtraSshOptions, "HostName");
         if (!string.IsNullOrWhiteSpace(hostNameOption))
             return hostNameOption;
 
-        return TryResolveOpenSshConfigHost(config);
+        return _openSshConfigResolver.TryResolveHostName(config, out var hostName)
+            ? hostName
+            : null;
     }
 
     private static int? ResolveConfiguredPort(MultipassRemoteSandboxConfig config)
@@ -125,63 +221,6 @@ internal static class E2eRemoteHostValidation
                 value = option[(eq + 1)..];
         }
         return value;
-    }
-
-    private static string? TryResolveOpenSshConfigHost(MultipassRemoteSandboxConfig config)
-    {
-        try
-        {
-            using var process = new System.Diagnostics.Process();
-            process.StartInfo.FileName = string.IsNullOrWhiteSpace(config.SshBinary) ? "ssh" : config.SshBinary!;
-            process.StartInfo.RedirectStandardOutput = true;
-            process.StartInfo.RedirectStandardError = true;
-            process.StartInfo.UseShellExecute = false;
-            process.StartInfo.CreateNoWindow = true;
-            process.StartInfo.ArgumentList.Add("-G");
-            if (config.SshPort is { } port)
-            {
-                process.StartInfo.ArgumentList.Add("-p");
-                process.StartInfo.ArgumentList.Add(port.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            }
-            foreach (var extra in config.ExtraSshOptions ?? [])
-            {
-                if (string.IsNullOrWhiteSpace(extra))
-                    continue;
-                process.StartInfo.ArgumentList.Add("-o");
-                process.StartInfo.ArgumentList.Add(extra);
-            }
-            process.StartInfo.ArgumentList.Add(config.SshTarget!);
-
-            if (!process.Start())
-                return null;
-
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            _ = process.StandardError.ReadToEndAsync();
-            if (!process.WaitForExit(milliseconds: 5_000))
-            {
-                try { process.Kill(entireProcessTree: true); } catch { }
-                return null;
-            }
-
-            if (process.ExitCode != 0)
-                return null;
-
-            var output = outputTask.GetAwaiter().GetResult();
-            foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                var split = line.IndexOf(' ');
-                if (split <= 0 || split == line.Length - 1)
-                    continue;
-                if (string.Equals(line[..split], "hostname", StringComparison.OrdinalIgnoreCase))
-                    return line[(split + 1)..].Trim();
-            }
-        }
-        catch
-        {
-            return null;
-        }
-
-        return null;
     }
 
     private static bool IsLocalHostIdentity(string host)

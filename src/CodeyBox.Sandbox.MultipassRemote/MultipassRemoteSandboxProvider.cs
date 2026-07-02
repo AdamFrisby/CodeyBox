@@ -157,6 +157,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             stagedMounts,
             remoteSandboxRoot,
             _transport,
+            RunRemoteMaybeGatedAsync,
             _optsAccessor,
             _log,
             onDispose: name => _active.TryRemove(name, out _));
