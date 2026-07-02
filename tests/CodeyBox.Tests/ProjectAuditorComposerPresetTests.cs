@@ -65,6 +65,44 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void ComposeForTarget_SelectsAuditorsByTarget_RespectingActiveSet()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        Project Project(params string[] excluded) => new()
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                // architecture opts into {Plan, Code}; security is Code-only.
+                AuditTypes = ["architecture", "security"],
+                ExcludedAuditors = excluded,
+            },
+        };
+
+        var all = composer.Compose(Project(), new CapturingAgent()).Select(a => a.Name).ToArray();
+        var codeTargets = composer.ComposeForTarget(Project(), new CapturingAgent(), AuditTarget.Code)
+            .Select(a => a.Name).ToArray();
+        var planTargets = composer.ComposeForTarget(Project(), new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name).ToArray();
+
+        // Code audit sees every auditor (all built-ins are Code or Plan+Code).
+        Assert.Equal(all, codeTargets);
+        Assert.Contains("security:llm-review", codeTargets);
+        Assert.Contains("architecture:llm-review", codeTargets);
+
+        // Plan review sees ONLY the plan-targeted reviewer.
+        Assert.Equal(["architecture:llm-review"], planTargets);
+
+        // The config-driven active set (ExcludedAuditors) is honoured per target.
+        var planAfterExclusion = composer.ComposeForTarget(
+                Project("architecture:llm-review"), new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name).ToArray();
+        Assert.Empty(planAfterExclusion);
+    }
+
+    [Fact]
     public async Task Compose_AppliesProjectAuditTypeFocusAndFrame()
     {
         var runner = new CapturingAgent();

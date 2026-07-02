@@ -102,6 +102,17 @@ internal static class AuditTypePresets
             Severity = AuditSeverityParser.Parse(d.Severity),
         }).ToList();
 
+    // Subjective/architectural review is most valuable BEFORE any code exists.
+    // These built-in review categories opt into the plan-review phase in
+    // addition to the code-audit phase; every other LLM auditor stays code-only.
+    private static readonly IReadOnlySet<string> PlanReviewingAuditTypes =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "architecture",
+            "completeness",
+            "quality",
+        };
+
     private static IAuditor Llm(AuditTypePresetDefinition definition, string frameTemplate, PresetContext ctx)
         => new LlmReviewAuditor(new LlmReviewAuditorOptions
         {
@@ -109,6 +120,9 @@ internal static class AuditTypePresets
             Agent = ctx.Agent,
             ReviewFocus = definition.ReviewFocus,
             FrameTemplate = frameTemplate,
+            Targets = PlanReviewingAuditTypes.Contains(definition.Id)
+                ? AuditTargets.PlanAndCode
+                : AuditTargets.CodeOnly,
         });
 
     private static IAuditor Shell(

@@ -28,6 +28,21 @@ public interface IAuditor
     AuditCapabilities Required { get; }
 
     /// <summary>
+    /// Declares WHICH review targets this auditor runs on. Multi-valued: an
+    /// auditor may target several (e.g. <c>{ Plan, Code }</c>). The composer
+    /// selects auditors per phase by target — the plan-review phase composes
+    /// auditors whose <see cref="Targets"/> contains <see cref="AuditTarget.Plan"/>;
+    /// the code-audit phase composes those containing <see cref="AuditTarget.Code"/>.
+    ///
+    /// <para>The default is <see cref="AuditTargets.CodeOnly"/>, so every
+    /// existing and external auditor reviews code and is unaffected by the
+    /// introduction of plan review. Auditors that review plans opt in by
+    /// returning <see cref="AuditTargets.PlanOnly"/> or
+    /// <see cref="AuditTargets.PlanAndCode"/>.</para>
+    /// </summary>
+    IReadOnlySet<AuditTarget> Targets => AuditTargets.CodeOnly;
+
+    /// <summary>
     /// Declares that a blocking result from this auditor can skip the
     /// remaining auditors in the same audit iteration. Cheap mechanical gates
     /// can opt in so failures that already require rework avoid spending
@@ -204,7 +219,30 @@ public sealed record AuditContext(
     /// shape from before this field existed; auditors that consume it must
     /// fall back gracefully (typically to a base-branch-only key).
     /// </summary>
-    string? ProjectId = null);
+    string? ProjectId = null,
+    /// <summary>
+    /// The review target this invocation runs under. Null means the legacy
+    /// call shape from before plan review existed and is interpreted as
+    /// <see cref="AuditTarget.Code"/> (see <see cref="EffectiveTarget"/>). A
+    /// multi-target auditor reads this to adapt its review focus — reviewing a
+    /// PLAN artifact versus a code diff.
+    /// </summary>
+    AuditTarget? Target = null,
+    /// <summary>
+    /// The structured PLAN artifact under review when
+    /// <see cref="EffectiveTarget"/> is <see cref="AuditTarget.Plan"/>. Null
+    /// for code audits; a plan reviewer treats a null/blank value as "no plan
+    /// to review".
+    /// </summary>
+    string? PlanArtifact = null)
+{
+    /// <summary>
+    /// The effective review target: <see cref="Target"/> when set, otherwise
+    /// <see cref="AuditTarget.Code"/>. Auditors branch on this so a null Target
+    /// (legacy call sites) behaves exactly as a code audit.
+    /// </summary>
+    public AuditTarget EffectiveTarget => Target ?? AuditTarget.Code;
+}
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult

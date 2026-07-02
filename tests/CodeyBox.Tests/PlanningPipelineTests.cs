@@ -862,7 +862,7 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_PlanReviewRejection_FailsBeforeImplementation()
+    public async Task PlanOn_PlanReviewAlwaysRejects_FailsAfterMaxPlanIterations()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
@@ -870,7 +870,8 @@ public sealed class PlanningPipelineTests : IDisposable
             agent,
             _workspace,
             seed,
-            planReviewGate: new RejectingPlanReviewGate());
+            planReviewGate: new RejectingPlanReviewGate(),
+            maxPlanReviewIterations: 2);
         var item = NewItem("feature/rejected-plan") with
         {
             Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -885,9 +886,42 @@ public sealed class PlanningPipelineTests : IDisposable
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal(1, agent.PlanningCalls);
+        // Initial plan + one rework turn = 2 planning calls (== max iterations),
+        // then the still-blocked plan fails before any implementation.
+        Assert.Equal(2, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
-        Assert.Contains("Plan review rejected the planning artifact", final.LastError, StringComparison.Ordinal);
+        Assert.Contains("did not approve the planning artifact after 2 plan-review iteration", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanReviewRejectsThenApproves_ReworksPlanThenImplements()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var gate = new RejectThenApprovePlanReviewGate(rejectFirst: 1);
+        using var setup = BuildPipeline(agent, _workspace, seed, planReviewGate: gate);
+        var item = NewItem("feature/reworked-plan") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // First review rejected → one plan-rework turn → second review approved.
+        Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(2, gate.Calls);
+        Assert.Equal(1, agent.WorkCalls);
+        Assert.NotNull(final.PlanReviewedAt);
+        // The rework turn carried the prior review's blocking feedback.
+        Assert.Contains("was REJECTED by plan review", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1412,7 +1446,8 @@ public sealed class PlanningPipelineTests : IDisposable
         Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         bool omitKnobRegistry = false,
         bool wireTestCaseStore = false,
-        ILogger<PipelineRunner>? pipelineLogger = null)
+        ILogger<PipelineRunner>? pipelineLogger = null,
+        int maxPlanReviewIterations = 3)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1446,7 +1481,12 @@ public sealed class PlanningPipelineTests : IDisposable
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
             pipelineStore, webhooks,
-            pipelineOptions ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            pipelineOptions ?? new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                MaxPlanReviewIterations = maxPlanReviewIterations,
+            },
             pipelineLogger ?? NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
@@ -2044,6 +2084,26 @@ internal sealed class RejectingPlanReviewGate : IPlanReviewGate
             Approved: false,
             Summary: "Rejected by test gate.",
             RejectionReason: "test review rejection"));
+    }
+}
+
+internal sealed class RejectThenApprovePlanReviewGate(int rejectFirst) : IPlanReviewGate
+{
+    public int Calls { get; private set; }
+
+    public ValueTask<PlanReviewDecision> ReviewAsync(
+        PlanReviewRequest request,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        _ = PlanArtifactDocument.ParseCanonical(request.PlanArtifact);
+        Calls++;
+        return ValueTask.FromResult(Calls <= rejectFirst
+            ? new PlanReviewDecision(
+                Approved: false,
+                Summary: "Plan needs rework.",
+                RejectionReason: "The plan needs a different approach to the core data flow.")
+            : new PlanReviewDecision(true, "Plan approved after rework."));
     }
 }
 

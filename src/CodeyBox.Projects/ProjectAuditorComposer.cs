@@ -77,6 +77,24 @@ public sealed class ProjectAuditorComposer
     public ProjectAuditorComposer(IPresetCatalog catalog)
         : this(catalog, [], NullLogger<ProjectAuditorComposer>.Instance) { }
 
+    /// <summary>
+    /// Composes the project's effective auditor list filtered to a single
+    /// review <paramref name="target"/>. The plan-review phase passes
+    /// <see cref="AuditTarget.Plan"/> and the code-audit phase passes
+    /// <see cref="AuditTarget.Code"/>; both draw from the same registry,
+    /// preset selection, and config-driven active set (ExcludedAuditors etc.).
+    /// Only auditors whose <see cref="IAuditor.Targets"/> contains the target
+    /// survive — there is no bespoke per-phase wiring.
+    /// </summary>
+    public IReadOnlyList<IAuditor> ComposeForTarget(
+        Project project,
+        IAgentRunner agentForLlmAuditors,
+        AuditTarget target,
+        string? profile = null)
+        => Compose(project, agentForLlmAuditors, profile)
+            .Where(a => a.Targets.Contains(target))
+            .ToList();
+
     public IReadOnlyList<IAuditor> Compose(
         Project project,
         IAgentRunner agentForLlmAuditors,

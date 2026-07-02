@@ -1003,15 +1003,40 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (!string.IsNullOrWhiteSpace(current.PlanArtifact))
         {
             if (current.PlanReviewedAt is null || current.State != WorkItemState.PlanApproved)
-                return await RunPlanReviewPlaceholderAsync(current, project, ct);
+                return await RunPlanReviewLoopAsync(current, project, repoId, baseBranch, ct, hostShutdownToken);
 
             return current;
         }
 
-        using var planningScope = BeginPhaseScope(current, "planning");
         await Transition(current, WorkItemState.Planning, ct, project);
         current = PreserveEntryRouting(await _store.GetAsync(current.Id, ct) ?? current with { State = WorkItemState.Planning });
 
+        var reviewing = await InvokePlanningAgentAndEnterReviewAsync(
+            current, project, repoId, baseBranch, reviewFindings: null, ct, hostShutdownToken);
+        if (reviewing.State != WorkItemState.PlanReview)
+            return reviewing;
+
+        return await RunPlanReviewLoopAsync(reviewing, project, repoId, baseBranch, ct, hostShutdownToken);
+    }
+
+    /// <summary>
+    /// Runs one planning-agent turn (optionally carrying prior review findings
+    /// so the agent revises the plan) against a fresh disposable checkout, then
+    /// persists the artifact and transitions the item into
+    /// <see cref="WorkItemState.PlanReview"/>. The caller must have the item in
+    /// <see cref="WorkItemState.Planning"/> already. Returns the item in
+    /// PlanReview on success, or the raced/rewound item otherwise.
+    /// </summary>
+    private async Task<WorkItem> InvokePlanningAgentAndEnterReviewAsync(
+        WorkItem current,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string? reviewFindings,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        using var planningScope = BeginPhaseScope(current, "planning");
         string planArtifact;
         IPlanArtifactExtractor? producingExtractor = null;
         using (var planningPhase = new PhaseCancellation("planning", ct, _opts.TimeProvider))
@@ -1042,6 +1067,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     project,
                                     repoId,
                                     baseBranch,
+                                    reviewFindings,
                                     phaseCt,
                                     hostShutdownToken);
                             },
@@ -1060,15 +1086,63 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (planned is null)
             return await _store.GetAsync(current.Id, ct) ?? current;
 
-        var reviewing = await TryTransitionPlanningStateAsync(
-            planned,
-            WorkItemState.PlanReview,
-            project,
-            ct);
-        if (reviewing.State != WorkItemState.PlanReview)
-            return reviewing;
+        return await TryTransitionPlanningStateAsync(planned, WorkItemState.PlanReview, project, ct);
+    }
 
-        return await RunPlanReviewPlaceholderAsync(reviewing, project, ct);
+    /// <summary>
+    /// The PLAN REVIEW LOOP (analogous to the audit loop): review the plan
+    /// artifact; on blocking findings run a plan-rework turn that revises the
+    /// plan and re-review, up to <see cref="PipelineOptions.MaxPlanReviewIterations"/>.
+    /// The plan MUST pass before implementation starts — a plan still blocked
+    /// after the cap fails the work item.
+    /// </summary>
+    private async Task<WorkItem> RunPlanReviewLoopAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        var maxPlanIterations = Math.Max(1, _opts.MaxPlanReviewIterations);
+        var current = item;
+        for (var planIteration = 1; ; planIteration++)
+        {
+            var (reviewed, decision) = await ReviewCurrentPlanAsync(current, project, ct);
+            if (decision is null)
+                return reviewed;
+            if (decision.Approved)
+                return await ApproveReviewedPlanAsync(reviewed, decision, project, ct);
+
+            if (planIteration >= maxPlanIterations)
+            {
+                throw new InvalidOperationException(
+                    $"Plan review did not approve the planning artifact after {maxPlanIterations} plan-review iteration(s): "
+                    + (decision.RejectionReason ?? decision.Summary));
+            }
+
+            _log.LogInformation(
+                "Plan review iteration {Iteration}/{Max} for work item {WorkItemId} found blocking issues; running a plan-rework turn.",
+                planIteration,
+                maxPlanIterations,
+                reviewed.Id);
+
+            var reopening = await TryTransitionPlanningStateAsync(reviewed, WorkItemState.Planning, project, ct);
+            if (reopening.State != WorkItemState.Planning)
+                return reopening;
+
+            current = await InvokePlanningAgentAndEnterReviewAsync(
+                reopening,
+                project,
+                repoId,
+                baseBranch,
+                reviewFindings: decision.RejectionReason ?? decision.Summary,
+                ct,
+                hostShutdownToken);
+            if (current.State != WorkItemState.PlanReview
+                || string.IsNullOrWhiteSpace(current.PlanArtifact))
+                return current;
+        }
     }
 
     private async Task<WorkItem?> PersistPlanArtifactAsync(
@@ -1132,14 +1206,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
             $"Planning artifact persistence raced with state {current.State}; refusing to approve an ambiguous plan.");
     }
 
-    private async Task<WorkItem> RunPlanReviewPlaceholderAsync(
+    /// <summary>
+    /// Runs a single plan-review pass through the configured
+    /// <see cref="IPlanReviewGate"/> without transitioning to PlanApproved or
+    /// throwing on rejection — the loop in <see cref="RunPlanReviewLoopAsync"/>
+    /// decides whether to approve, rework, or fail. Returns a null decision for
+    /// the raced/rewound/already-approved cases the caller should just return.
+    /// </summary>
+    private async Task<(WorkItem Item, PlanReviewDecision? Decision)> ReviewCurrentPlanAsync(
         WorkItem item,
         Project project,
         CancellationToken ct)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
         if (current.State == WorkItemState.PlanApproved)
-            return current;
+            return (current, null);
         if (string.IsNullOrWhiteSpace(current.PlanArtifact))
             throw new InvalidOperationException("Plan review cannot run before the planning artifact exists.");
 
@@ -1147,12 +1228,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             current = await TryTransitionPlanningStateAsync(current, WorkItemState.PlanReview, project, ct);
             if (current.State != WorkItemState.PlanReview)
-                return current;
+                return (current, null);
         }
 
         current = await _store.GetAsync(item.Id, ct) ?? current with { State = WorkItemState.PlanReview };
         if (current.State == WorkItemState.PlanApproved)
-            return current;
+            return (current, null);
         if (current.State == WorkItemState.Queued
             && string.IsNullOrWhiteSpace(current.PlanArtifact))
         {
@@ -1160,7 +1241,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Plan review for work item {WorkItemId} observed a prompt edit or lifecycle rewind before review; leaving item queued at revision {PromptRevision}.",
                 item.Id,
                 current.PromptRevision);
-            return current;
+            return (current, null);
         }
         if (current.State != WorkItemState.PlanReview
             || string.IsNullOrWhiteSpace(current.PlanArtifact))
@@ -1170,7 +1251,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item.Id,
                 current.State,
                 !string.IsNullOrWhiteSpace(current.PlanArtifact));
-            return current;
+            return (current, null);
         }
 
         var decision = await _planReviewGate.ReviewAsync(
@@ -1186,12 +1267,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 current.ModelId,
                 current.ReasoningMode),
             ct);
-        if (!decision.Approved)
-        {
-            throw new InvalidOperationException(
-                $"Plan review rejected the planning artifact: {decision.RejectionReason ?? decision.Summary}");
-        }
+        return (current, decision);
+    }
 
+    private async Task<WorkItem> ApproveReviewedPlanAsync(
+        WorkItem current,
+        PlanReviewDecision decision,
+        Project project,
+        CancellationToken ct)
+    {
         var updatedAt = DateTimeOffset.UtcNow;
         var reviewed = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
             current.With(WorkItemState.PlanApproved),
@@ -1203,7 +1287,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             UpdatedAt = updatedAt,
         };
         var approved = false;
-        await RunBoundedPostAgentAsync(item.Id, "transition-to-PlanApproved", ct, async transitionCt =>
+        await RunBoundedPostAgentAsync(current.Id, "transition-to-PlanApproved", ct, async transitionCt =>
         {
             approved = await _store.TryUpdateIfStateAndUpdatedAtAsync(
                 reviewed,
@@ -1215,13 +1299,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
         });
         if (!approved)
         {
-            var latest = await _store.GetAsync(item.Id, ct) ?? current;
+            var latest = await _store.GetAsync(current.Id, ct) ?? current;
             if (latest.PromptRevision != current.PromptRevision
                 || latest.State == WorkItemState.Queued)
             {
                 _log.LogInformation(
                     "Plan review for work item {WorkItemId} lost a race with a prompt edit or lifecycle rewind; leaving current state {State} at revision {PromptRevision}.",
-                    item.Id,
+                    current.Id,
                     latest.State,
                     latest.PromptRevision);
                 return latest;
@@ -1233,7 +1317,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         await EmitPlanTestCasesAsync(reviewed, ct);
 
-        return await _store.GetAsync(item.Id, ct) ?? reviewed;
+        return await _store.GetAsync(current.Id, ct) ?? reviewed;
     }
 
     /// <summary>
@@ -1338,6 +1422,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         string repoId,
         string baseBranch,
+        string? reviewFindings,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -1399,7 +1484,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 1,
                 project,
                 sandbox,
-                BuildPlanningPrompt(item),
+                BuildPlanningPrompt(item, reviewFindings),
                 ct);
 
             AuditLog.AgentStarted(runner.Kind, sandbox.Id, "planning");
@@ -1605,7 +1690,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private static string BuildPlanningPrompt(WorkItem item) =>
+    private static string BuildPlanningPrompt(WorkItem item, string? reviewFindings = null) =>
         $$"""
         You are in CodeyBox's planning-only phase for this work item.
 
@@ -1632,7 +1717,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         Task:
         {{item.Prompt}}
+        {{BuildPlanReworkGuidance(reviewFindings)}}
         """;
+
+    private static string BuildPlanReworkGuidance(string? reviewFindings)
+        => string.IsNullOrWhiteSpace(reviewFindings)
+            ? string.Empty
+            : $"""
+
+
+              A prior version of this plan was REJECTED by plan review. Revise the plan
+              to resolve the following blocking feedback before resubmitting:
+
+              {reviewFindings}
+              """;
 
     private string NormalizePlanArtifact(IPlanArtifactExtractor? producingExtractor, string artifact)
     {
@@ -17059,6 +17157,14 @@ public sealed record PipelineOptions
     /// cases. No effect unless an <see cref="Core.ITestCaseStore"/> is wired.
     /// </summary>
     public bool EmitPlanTestCases { get; init; } = true;
+
+    /// <summary>
+    /// Maximum plan-review iterations before a still-blocked plan fails the
+    /// work item. Each iteration is: plan review → (if blocking findings) a
+    /// plan-rework agent turn that revises the plan → re-review. The plan must
+    /// pass before implementation starts. Clamped to at least 1.
+    /// </summary>
+    public int MaxPlanReviewIterations { get; init; } = 3;
 
     internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 

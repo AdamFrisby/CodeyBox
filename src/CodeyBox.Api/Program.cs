@@ -2802,7 +2802,23 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
-builder.Services.AddSingleton<IPlanReviewGate, AlwaysPassPlanReviewGate>();
+// Plan-review gate. Default is the always-pass placeholder; operators opt into
+// the auditor-driven gate (which composes AuditTarget.Plan reviewers and blocks
+// on their findings, driving the pipeline's plan-rework loop) with
+// CodeyBox:PlanReview:UseAuditors=true.
+if (builder.Configuration.GetValue("CodeyBox:PlanReview:UseAuditors", false))
+{
+    builder.Services.AddSingleton<IPlanReviewGate>(sp => new AuditorPlanReviewGate(
+        sp.GetRequiredService<ProjectAuditorComposer>(),
+        sp.GetRequiredService<IProjectRepository>(),
+        sp.GetRequiredService<IAgentRegistry>(),
+        sp.GetRequiredService<ICredentialProvider>(),
+        sp.GetRequiredService<ILogger<AuditorPlanReviewGate>>()));
+}
+else
+{
+    builder.Services.AddSingleton<IPlanReviewGate, AlwaysPassPlanReviewGate>();
+}
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
