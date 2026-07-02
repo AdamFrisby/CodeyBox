@@ -5533,7 +5533,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     private MultipassSandbox NewLoopbackHttpIngestSandbox(
         RecordingMultipassRunner runner,
         MultipassSandbox.AgentOutputHttpIngestSessionStarter? agentOutputIngestSessionStarter = null)
-        => new(
+    {
+        var sandbox = new MultipassSandbox(
             "codeybox-test",
             _workspace,
             new SandboxSpec
@@ -5551,6 +5552,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             NullLogger<MultipassSandboxProvider>.Instance,
             runner: runner,
             agentOutputIngestSessionStarter: agentOutputIngestSessionStarter);
+        // Keep the detached-completion poll loop off the wall clock so its
+        // 2s production cadence does not race a short test deadline under
+        // full-suite thread-pool contention.
+        sandbox.DetachedPollIntervalOverride = TimeSpan.FromMilliseconds(20);
+        return sandbox;
+    }
 
     private sealed class CapturingDetachedExitPoster
     {
