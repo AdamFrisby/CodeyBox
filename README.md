@@ -377,16 +377,22 @@ see [`AGENTS.md`](AGENTS.md).
 
 Pick with `CodeyBox.SandboxProvider`:
 
-| Provider     | Setup                    | Isolation                                       |
-|--------------|--------------------------|-------------------------------------------------|
-| `multipass`  | `snap install multipass` | **KVM kernel isolation — the recommended default** |
-| `graphical`  | Multipass + XFCE/Xvfb    | kernel isolation **with a desktop**, for GUI build/test |
-| `bubblewrap` | `apt install bubblewrap` | namespaces, shared kernel; integration-tested   |
-| `process`    | none                     | **none — testing only, never with untrusted prompts** |
+| Provider           | Setup                              | Isolation                                             |
+|--------------------|------------------------------------|-------------------------------------------------------|
+| `multipass`        | `snap install multipass`           | **KVM kernel isolation — the recommended default**    |
+| `multipass-remote` | Multipass on a remote host + SSH   | KVM isolation, VMs offloaded to another machine over SSH — orchestrator stays local |
+| `bubblewrap`       | `apt install bubblewrap`           | namespaces, shared kernel; integration-tested         |
+| `process`          | none                               | **none — testing only, never with untrusted prompts** |
 
 `multipass` is the isolation-providing configuration you want for anything real.
-The `graphical` flavor exposes screenshots and input synthesis through the
-sandbox API for projects that need a display.
+`multipass-remote` runs the same VMs on a separate host over SSH while the
+orchestrator — state, git, merge, auditors — stays local, so you can offload VM
+CPU without splitting the brain.
+
+A **graphical** flavor (a desktop + VNC/X display, plus a computer-use bridge
+exposing screenshots and input synthesis through the sandbox API) layers on top
+of Multipass for projects that need a display. It's enabled **per project** with
+`"GraphicalSandbox": true`, not selected via `SandboxProvider`.
 See [`docs/sandbox-providers.md`](docs/sandbox-providers.md).
 
 ## Going to production
