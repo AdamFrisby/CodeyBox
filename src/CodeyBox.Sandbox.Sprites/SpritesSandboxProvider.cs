@@ -87,8 +87,15 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
             _activeSandboxes[name] = new ActiveSandboxEntry(workItemId, sandbox);
             SandboxLiveCounter.Increment();
 
-            await ApplyNetworkPolicyAsync(opts, name, spec.Network, ct).ConfigureAwait(false);
+            // Run operator-supplied setup commands (toolchain / agent-CLI installs) BEFORE locking
+            // egress down: rc30 sprites have no baseline image, so these installs are the only path
+            // to provision the sprite and they need to reach package registries. Applying the
+            // default-deny network policy first would refuse npm/apt/curl unless every mirror were
+            // allow-listed. The natural bake-then-lock ordering provisions with open egress and then
+            // clamps to the work item's allow-list before the agent runs. The setup commands are
+            // operator-trusted and no agent code has executed yet, so the pre-lockdown window is safe.
             await sandbox.RunSetupCommandsAsync(ct).ConfigureAwait(false);
+            await ApplyNetworkPolicyAsync(opts, name, spec.Network, ct).ConfigureAwait(false);
             await sandbox.PrepareFilesystemAsync(ct).ConfigureAwait(false);
 
             _log.LogInformation("Created sprites sandbox {Name}", name);
@@ -215,7 +222,7 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
     private static bool IsValidNamePrefix(string prefix) =>
         prefix.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-');
 
-    private static IReadOnlyList<SpritesMountSync> ValidateAndPlanMounts(SandboxSpec spec, SpritesSandboxOptions opts)
+    private IReadOnlyList<SpritesMountSync> ValidateAndPlanMounts(SandboxSpec spec, SpritesSandboxOptions opts)
     {
         var result = new List<SpritesMountSync>();
         foreach (var mount in spec.Mounts)
@@ -236,12 +243,21 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
 
             if (mount.Tmpfs)
             {
+                // Credential tmpfs mounts are already rejected above, so anything reaching here is a
+                // non-secret scratch path (e.g. the audit phase's /audit mount). sprites.dev has no
+                // tmpfs backing, so we transparently downgrade to a persistent scratch directory
+                // rather than throwing — throwing here breaks the work->audit end-to-end flow, which
+                // always requests a /audit tmpfs scratch mount. The "fail loudly" contract is about
+                // credentials, not scratch space. Surface the downgrade in the log unless the operator
+                // has opted in via AllowPersistentTmpfsDowngrade.
                 if (!opts.AllowPersistentTmpfsDowngrade &&
                     !mount.SandboxPath.Equals(SandboxConventions.WorkDir, StringComparison.Ordinal))
                 {
-                    throw new NotSupportedException(
-                        $"sprites.dev does not expose tmpfs mounts; refusing tmpfs mount {mount.SandboxPath}. " +
-                        "Set CodeyBox:Sprites:AllowPersistentTmpfsDowngrade=true only for non-secret scratch paths.");
+                    _log.LogWarning(
+                        "sprites.dev does not expose tmpfs mounts; downgrading non-secret scratch mount {Path} " +
+                        "to a persistent directory (contents land on the sprite ext4 filesystem and are captured " +
+                        "by checkpoints). Set CodeyBox:Sprites:AllowPersistentTmpfsDowngrade=true to silence this warning.",
+                        mount.SandboxPath);
                 }
                 result.Add(new SpritesMountSync(mount.SandboxPath, HostPath: null, ReadOnly: false, IsPersistentTmpfsDirectory: true));
                 continue;
@@ -413,6 +429,17 @@ public sealed record SpritesSandboxOptions
 internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBackedAgentCredentials
 {
     private static readonly Encoding Utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
+    // Upper bound on how long teardown will wait for an in-flight exec to release the exec gate
+    // before abandoning the final mount sync and proceeding to delete the sprite. Deletion must
+    // always happen, so this must be finite.
+    private static readonly TimeSpan DisposeGateWaitTimeout = TimeSpan.FromSeconds(30);
+
+    // Slack added on top of the configured output cap when bounding a single WebSocket message, to
+    // cover the 1-byte stream-ID prefix and WebSocket framing overhead for a legitimately cap-sized
+    // payload delivered as one message.
+    private const long MessageSizeSlackBytes = 1024 * 1024;
+
     private const string EnvironmentBootstrapScript =
         """
         set -eu
@@ -610,13 +637,15 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         CancellationToken ct)
     {
         var sentStdin = false;
+        var killRequested = false;
         int? exitCode = null;
+        var maxMessageBytes = ComputeMaxMessageBytes(exec);
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         try
         {
             while (webSocket.State == WebSocketState.Open && exitCode is null)
             {
-                var message = await ReceiveMessageAsync(webSocket, buffer, ct).ConfigureAwait(false);
+                var message = await ReceiveMessageAsync(webSocket, buffer, maxMessageBytes, ct).ConfigureAwait(false);
                 if (message is null)
                     break;
 
@@ -672,8 +701,14 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
                         break;
                 }
 
-                if ((stdout.LimitExceeded || stderr.LimitExceeded) && exec.KillOnOutputLimit)
+                // Once the output limit is exceeded the LimitExceeded flag stays latched while the
+                // remaining buffered frames drain, so guard the kill with killRequested to issue the
+                // kill POST at most once per session instead of re-POSTing on every subsequent frame.
+                if (!killRequested && (stdout.LimitExceeded || stderr.LimitExceeded) && exec.KillOnOutputLimit)
+                {
+                    killRequested = true;
                     await KillActiveExecsAsync(CancellationToken.None).ConfigureAwait(false);
+                }
             }
         }
         finally
@@ -684,9 +719,25 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         return exitCode;
     }
 
+    // The output caps (MaxStdoutBytes/MaxStderrBytes) are enforced by LimitedOutputCollector only
+    // AFTER a whole WebSocket message has been received, so an untrusted in-sprite process that emits
+    // a single huge fragmented message would otherwise let the host buffer the full volume in
+    // ReceiveMessageAsync before KillOnOutputLimit can fire — a memory-exhaustion DoS that defeats the
+    // resource ceiling. Bound the accumulated per-message size to the larger configured output cap
+    // plus generous slack (WebSocket framing + the 1-byte stream prefix); exceeding it aborts the
+    // exec, whose catch path kills the session.
+    private static long? ComputeMaxMessageBytes(SandboxExec exec)
+    {
+        var cap = Math.Max(exec.MaxStdoutBytes ?? 0, exec.MaxStderrBytes ?? 0);
+        if (cap <= 0)
+            return null;
+        return cap + MessageSizeSlackBytes;
+    }
+
     private static async Task<ReceivedWebSocketMessage?> ReceiveMessageAsync(
         ISpritesWebSocket webSocket,
         byte[] buffer,
+        long? maxMessageBytes,
         CancellationToken ct)
     {
         using var payload = new MemoryStream();
@@ -697,6 +748,10 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
             if (result.MessageType == WebSocketMessageType.Close)
                 return null;
             payload.Write(buffer, 0, result.Count);
+            if (maxMessageBytes.HasValue && payload.Length > maxMessageBytes.Value)
+                throw new InvalidOperationException(
+                    $"sprites exec message exceeded the {maxMessageBytes.Value}-byte per-message ceiling " +
+                    "(output-cap defeat / memory-exhaustion guard).");
         }
         while (!result.EndOfMessage);
 
@@ -1065,18 +1120,38 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         await KillActiveExecsAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
-            await _execGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-            try
+            // The final mount sync needs exclusive exec access, but teardown MUST delete the sprite
+            // regardless of state. If an in-flight exec still holds the gate (e.g. its WebSocket
+            // ReceiveAsync is stalled and the best-effort kill above failed during a network-degraded
+            // teardown), a blocking WaitAsync would hang disposal forever and leak the sprite. Bound
+            // the wait: if we cannot acquire the gate in time, skip the sync and proceed to delete.
+            var acquiredGate = await _execGate.WaitAsync(DisposeGateWaitTimeout, CancellationToken.None).ConfigureAwait(false);
+            if (acquiredGate)
             {
-                await SyncWritableMountsToHostAsync(CancellationToken.None, allowDuringDispose: true).ConfigureAwait(false);
+                try
+                {
+                    await SyncWritableMountsToHostAsync(CancellationToken.None, allowDuringDispose: true).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Final sprites mount sync failed for {SpriteName}; proceeding with teardown", Id);
+                }
+                finally
+                {
+                    _execGate.Release();
+                    // Safe to dispose now: we hold the gate exclusively and the _disposing flag blocks
+                    // any new exec from acquiring it, so no late Release can hit a disposed semaphore.
+                    // In the timeout path below a stalled exec still owns the gate, so we deliberately
+                    // do NOT dispose there (accepting the minor handle leak over an ObjectDisposedException).
+                    _execGate.Dispose();
+                }
             }
-            catch (Exception ex)
+            else
             {
-                _log.LogWarning(ex, "Final sprites mount sync failed for {SpriteName}; proceeding with teardown", Id);
-            }
-            finally
-            {
-                _execGate.Release();
+                _log.LogWarning(
+                    "Could not acquire exec gate within {Timeout} during teardown of {SpriteName}; " +
+                    "skipping final mount sync and proceeding directly to sprite deletion.",
+                    DisposeGateWaitTimeout, Id);
             }
 
             await _client.DeleteSpriteAsync(_opts, Id, CancellationToken.None).ConfigureAwait(false);

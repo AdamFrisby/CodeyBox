@@ -817,6 +817,165 @@ public sealed class SpritesSandboxProviderTests
         Assert.Single(deleteHandler.Requests, r => r.Method == HttpMethod.Delete && r.PathAndQuery == "/v1/sprites/codeybox-missing");
     }
 
+    [Fact]
+    public async Task SyncBack_PathTraversalArchive_IsRejected_AndHostMountPreserved()
+    {
+        using var host = new TempDirectory();
+        File.WriteAllText(Path.Combine(host.Path, "keep.txt"), "keep");
+        var escapeTarget = Path.Combine(Path.GetDirectoryName(host.Path)!, "escape.txt");
+        var malicious = CreateRawTarGzipBase64(tar =>
+        {
+            var entry = new PaxTarEntry(TarEntryType.RegularFile, "../escape.txt")
+            {
+                DataStream = new MemoryStream(Encoding.UTF8.GetBytes("pwned")),
+            };
+            tar.WriteEntry(entry);
+        });
+
+        await RunMaliciousSyncBackAsync(host.Path, malicious, new SpritesSandboxOptions { Token = "sprite-token" });
+
+        Assert.True(Directory.Exists(host.Path));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(host.Path, "keep.txt")));
+        Assert.False(File.Exists(escapeTarget), "path-traversal entry escaped the mount root");
+    }
+
+    [Fact]
+    public async Task SyncBack_SymlinkArchive_IsRejected_AndHostMountPreserved()
+    {
+        using var host = new TempDirectory();
+        File.WriteAllText(Path.Combine(host.Path, "keep.txt"), "keep");
+        var malicious = CreateRawTarGzipBase64(tar =>
+            tar.WriteEntry(new PaxTarEntry(TarEntryType.SymbolicLink, "link") { LinkName = "/etc/passwd" }));
+
+        await RunMaliciousSyncBackAsync(host.Path, malicious, new SpritesSandboxOptions { Token = "sprite-token" });
+
+        Assert.True(Directory.Exists(host.Path));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(host.Path, "keep.txt")));
+        Assert.False(File.Exists(Path.Combine(host.Path, "link")), "symlink entry was extracted");
+    }
+
+    [Fact]
+    public async Task SyncBack_TooManyEntriesArchive_IsRejected_AndHostMountPreserved()
+    {
+        using var host = new TempDirectory();
+        File.WriteAllText(Path.Combine(host.Path, "keep.txt"), "keep");
+        var malicious = CreateRawTarGzipBase64(tar =>
+        {
+            for (var i = 0; i < 3; i++)
+            {
+                tar.WriteEntry(new PaxTarEntry(TarEntryType.RegularFile, $"file{i}.txt")
+                {
+                    DataStream = new MemoryStream(Encoding.UTF8.GetBytes("x")),
+                });
+            }
+        });
+
+        await RunMaliciousSyncBackAsync(
+            host.Path,
+            malicious,
+            new SpritesSandboxOptions { Token = "sprite-token", MaxSyncArchiveEntries = 1 });
+
+        Assert.True(Directory.Exists(host.Path));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(host.Path, "keep.txt")));
+        Assert.False(File.Exists(Path.Combine(host.Path, "file0.txt")), "over-count archive was extracted");
+    }
+
+    [Fact]
+    public async Task SyncBack_OverExpandedSizeArchive_IsRejected_AndHostMountPreserved()
+    {
+        using var host = new TempDirectory();
+        File.WriteAllText(Path.Combine(host.Path, "keep.txt"), "keep");
+        var malicious = CreateRawTarGzipBase64(tar =>
+            tar.WriteEntry(new PaxTarEntry(TarEntryType.RegularFile, "big.txt")
+            {
+                DataStream = new MemoryStream(new byte[64]),
+            }));
+
+        await RunMaliciousSyncBackAsync(
+            host.Path,
+            malicious,
+            new SpritesSandboxOptions { Token = "sprite-token", MaxSyncArchiveExpandedBytes = 16 });
+
+        Assert.True(Directory.Exists(host.Path));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(host.Path, "keep.txt")));
+        Assert.False(File.Exists(Path.Combine(host.Path, "big.txt")), "over-expanded archive was extracted");
+    }
+
+    [Fact]
+    public async Task ExecAsync_OutputLimitExceeded_TruncatesAndKillsExactlyOnce()
+    {
+        const string killPath = "/v1/sprites/codeybox-test/exec/7/kill";
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == killPath)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {"type":"signal"}
+                        {"type":"exited"}
+                        {"type":"complete","exit_code":143}
+                        """,
+                        Encoding.UTF8,
+                        "application/x-ndjson"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText("""{"type":"session_info","session_id":7,"command":"cat","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        // Three stdout frames arrive AFTER the 4-byte cap is already exceeded on the first one;
+        // the kill guard must fire exactly one kill POST despite the latched LimitExceeded flag.
+        socket.EnqueueBinary([1, .. Encoding.UTF8.GetBytes("aaaaaaaaaa")]);
+        socket.EnqueueBinary([1, .. Encoding.UTF8.GetBytes("bbbbbbbbbb")]);
+        socket.EnqueueBinary([1, .. Encoding.UTF8.GetBytes("cccccccccc")]);
+        socket.EnqueueText("""{"type":"exit","exit_code":0}""");
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" }, httpHandler: handler);
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["cat"], MaxStdoutBytes = 4 });
+
+        Assert.True(result.StdoutLimitExceeded);
+        Assert.Equal("aaaa", result.Stdout);
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == killPath);
+    }
+
+    private static async Task RunMaliciousSyncBackAsync(
+        string hostMountPath,
+        string maliciousArchiveBase64,
+        SpritesSandboxOptions options)
+    {
+        var sockets = new QueueSpritesWebSocketFactory(
+            SuccessfulSocket(sessionId: 1),
+            SuccessfulSocket(sessionId: 2),
+            SuccessfulSocket(sessionId: 3, stdout: maliciousArchiveBase64));
+        var provider = NewProvider(SuccessfulLifecycleHandler(), sockets, options);
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostMountPath, ReadOnly = false }],
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["true"] });
+        Assert.True(result.Success);
+
+        // The malicious archive is rejected during the dispose-time sync-back; the sync failure is
+        // swallowed so teardown still deletes the sprite, leaving the host mount untouched.
+        await sandbox.DisposeAsync();
+    }
+
+    private static string CreateRawTarGzipBase64(Action<TarWriter> populate)
+    {
+        using var output = new MemoryStream();
+        using (var gzip = new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true))
+        using (var tar = new TarWriter(gzip, TarEntryFormat.Pax, leaveOpen: true))
+        {
+            populate(tar);
+        }
+        return Convert.ToBase64String(output.ToArray());
+    }
+
     private static RecordingHttpHandler SuccessfulLifecycleHandler() =>
         new(request =>
         {
