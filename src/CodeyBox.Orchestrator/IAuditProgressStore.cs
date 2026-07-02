@@ -20,6 +20,20 @@ public interface IAuditProgressStore
         WorkItemId workItemId,
         DateTimeOffset? workAttemptStartedAt,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes every persisted audit-progress row for a work item's work-attempt
+    /// partition. Used when a resume discards a prior (passing / escaped) audit
+    /// verdict and forces a fresh audit that restarts iteration numbering at 1:
+    /// the fresh iteration-1 upsert only overwrites the stale iteration-1 row, so
+    /// stale higher-iteration rows from the prior run must be purged first or the
+    /// merge gate (which selects the highest-iteration record) would validate a
+    /// stale verdict instead of the fresh pass. Returns the number of rows deleted.
+    /// </summary>
+    Task<int> PurgeAuditProgressAsync(
+        WorkItemId workItemId,
+        DateTimeOffset? workAttemptStartedAt,
+        CancellationToken ct = default);
 }
 
 public sealed record AuditProgressRecord(

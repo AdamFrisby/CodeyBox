@@ -2025,6 +2025,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // findings (format, lint, build-WaE).
             var auditors = _auditorComposer.Compose(project, agentRunner);
             AuditLog.AuditProfileSelected(project.Audit.Profile, auditors.Select(a => a.Name).ToArray());
+            // currentRunAuditPass gates the merge on "an audit pass was produced
+            // in THIS pickup". Two resume paths seed it true without running a
+            // fresh audit here, and both are deliberate:
+            //   • skipMerge (entered from Merged): the merge commit is already
+            //     fixed; we are only resuming the upstream-push phase, so there
+            //     is nothing to re-audit.
+            //   • resumingConflictRework: conflict resolution re-touches the
+            //     tree, but the operator invariant this gate enforces targets
+            //     the WorkComplete/AuditPassed resume path (a whole prior-run
+            //     verdict carried straight to merge). A conflict-rework resume
+            //     still runs EnsureCurrentRealAuditPassBeforeMergeAsync, so the
+            //     realness half of the invariant (no infra / "review agent
+            //     failed to run" verdict) is enforced against the latest record;
+            //     only the currency half is relaxed, because conflict resolution
+            //     is a mechanical merge of already-audited changes rather than a
+            //     new semantic edit. Widening this to force a full re-audit on
+            //     every conflict rework is tracked separately and intentionally
+            //     out of scope for the merge-currency fix.
             var currentRunAuditPass = skipMerge || resumingConflictRework;
 
             // Snapshot the self-review-checklist gate once per pickup so the
@@ -2209,16 +2227,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 currentRunAuditPass = true;
             }
 
-            // -------- Phase 1.5b: AuditPassed-resume build gate --------
-            // skipAudit=true items entered from Merged (retry or
-            // resume past the audit phase). The audit loop is skipped, so the
-            // required-build gate above never runs for them. Re-verify the
-            // build here before any merge work: a branch that reached
-            // AuditPassed under an earlier degraded gate (or with a broken
-            // verifier) must not be promoted to merge if it does not actually
-            // compile. The check is skipped when there is no merge to do
-            // (skipMerge=true: the item already merged, we are resuming the
-            // upstream-push phase, and the merge commit is fixed).
+            // -------- Phase 1.5b: skip-audit-resume build gate --------
+            // skipAudit is now true only for items entered from Merged (which
+            // also set skipMerge=true and are excluded below) or for a
+            // resumingConflictRework resume. Since Merged is excluded by
+            // !skipMerge, the ONLY path that actually reaches this block is the
+            // conflict-rework resume (AuditPassed no longer skips audit — it
+            // re-runs the full audit loop above). The audit loop is skipped for
+            // conflict rework, so the required-build gate above never runs for
+            // it; re-verify the build here before any merge work so a
+            // conflict-resolved tree that does not compile cannot be promoted to
+            // merge. EnforceOnAuditPassedResumeAsync keeps its historical name
+            // for compatibility; treat it as the skip-audit-resume build gate.
             if (skipAudit && !skipMerge)
             {
                 await _requiredBuildGate.EnforceOnAuditPassedResumeAsync(
@@ -7199,6 +7219,35 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 latestPrior.Iteration,
                 item.Id);
             priorAuditHistory = [];
+
+            // Purge the stale prior-run rows before the fresh audit restarts at
+            // iteration 1. Without this, the fresh iteration-1 upsert only
+            // overwrites the stale iteration-1 row and stale iterations 2..N
+            // survive in the same work-attempt partition — so the merge gate,
+            // which validates the highest-iteration record, would read a stale
+            // (possibly "review agent failed to run") verdict instead of the
+            // fresh pass and either block the item forever or ship an unreviewed
+            // verdict. See EnsureCurrentRealAuditPassBeforeMergeAsync.
+            if (_auditProgress is not null)
+            {
+                try
+                {
+                    var purged = await _auditProgress.PurgeAuditProgressAsync(
+                        item.Id, currentWorkAttemptStartedAt, ct);
+                    if (purged > 0)
+                        _log.LogInformation(
+                            "Purged {Count} stale audit-progress row(s) for work item {Id} before fresh re-audit",
+                            purged,
+                            item.Id);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    throw new AuditHistoryPersistenceFailedException(
+                        $"failed to purge stale audit progress for work item {item.Id} before fresh re-audit; " +
+                        "cannot safely re-audit without removing the stale prior-run verdict",
+                        ex);
+                }
+            }
         }
         var configuredMaxIterations = ResolveConfiguredAuditMaxIterations(item, project);
         var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
@@ -8019,6 +8068,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex);
         }
 
+        // Select the record for the highest iteration in this work-attempt
+        // partition. On a resume that discards a passing/escaped prior verdict,
+        // RunAuditLoopAsync purges the stale prior-run rows before the fresh
+        // audit restarts at iteration 1, so the highest surviving iteration is
+        // always this pickup's audit — max-iteration and "most recent" agree.
+        // The store's UNIQUE(work_item_id, work_attempt_started_at, iteration)
+        // key means at most one row per iteration; the Index tiebreaker is a
+        // defensive no-op kept only to make the ordering total.
         var latest = records
             .Select((Record, Index) => (Record, Index))
             .Where(r => r.Record.Iteration > 0)
@@ -8051,7 +8108,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} did not complete auditor(s): {string.Join(", ", missingAuditors)}");
         }
 
-        if (HasLlmAgentExecutionFailureSentinel(latest.Findings, f => f.Title))
+        // Scan both the non-blocking Findings and the BlockingFindingsDetails:
+        // an infrastructure "review agent failed to run" result can surface in
+        // either collection depending on how it was classified, and the merge
+        // gate must reject it regardless.
+        if (HasLlmAgentExecutionFailureSentinel(latest.Findings, f => f.Title)
+            || HasLlmAgentExecutionFailureSentinel(latest.BlockingFindingsDetails, f => f.Title))
         {
             throw new AuditUnavailableException(
                 $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} contains review-agent infrastructure failure results");
