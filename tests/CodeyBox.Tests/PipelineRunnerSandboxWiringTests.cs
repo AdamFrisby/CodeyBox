@@ -422,6 +422,78 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         });
     }
 
+    // The sandbox-side env var that AuditReviewDotnetShim.Apply injects to arm
+    // the absolute-path hardening script. It is the ONLY defense on the
+    // production (multipass) provider against an auditor bypassing the PATH
+    // shim via an absolute dotnet path (e.g. /usr/bin/dotnet test). The branch
+    // that sets it is environment-independent, so it is unit-tested directly
+    // here rather than only through the ProcessSandboxProvider integration path
+    // (where hardening is always off) — a typo'd provider name or a dropped env
+    // var would otherwise silently disable hardening in production with no
+    // failing test.
+    private const string HardenAbsoluteEnvKey = "CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE";
+
+    [Theory]
+    [InlineData("multipass")]
+    [InlineData("multipass-remote")]
+    public void AuditDotnetShim_ArmsAbsolutePathHardening_OnMultipassProviders(string providerName)
+    {
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
+        var applied = shim.Apply(BaseAuditSpec());
+
+        Assert.True(
+            applied.Environment.TryGetValue(HardenAbsoluteEnvKey, out var value),
+            $"provider '{providerName}' must arm absolute-path hardening — it is the only bypass defense on that provider");
+        Assert.Equal("1", value);
+        AssertShimApplied(applied);
+    }
+
+    [Theory]
+    [InlineData("process")]
+    [InlineData("bubblewrap")]
+    [InlineData("multipass-local")] // near-miss: must NOT match the multipass prefix
+    [InlineData("Multipass")]       // case mismatch: comparison is Ordinal, not IgnoreCase
+    public void AuditDotnetShim_DoesNotArmAbsolutePathHardening_OnOtherProviders(string providerName)
+    {
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
+        var applied = shim.Apply(BaseAuditSpec());
+
+        Assert.DoesNotContain(HardenAbsoluteEnvKey, applied.Environment.Keys);
+        // The PATH shim + tmpfs mount still apply on every provider — only the
+        // privileged absolute-path hardening is multipass-scoped.
+        AssertShimApplied(applied);
+    }
+
+    [Fact]
+    public void AuditDotnetShim_Disabled_AppliesNothing_EvenOnMultipass()
+    {
+        var shim = AuditReviewDotnetShim.From(
+            new PipelineTuningOptions { BlockRedundantDotnetBuildTestInAuditSandbox = false },
+            "multipass");
+        var spec = BaseAuditSpec();
+        var applied = shim.Apply(spec);
+
+        Assert.Same(spec, applied);
+        Assert.DoesNotContain(HardenAbsoluteEnvKey, applied.Environment.Keys);
+        Assert.DoesNotContain(applied.Mounts, m => m.SandboxPath == AuditDotnetShimDir);
+    }
+
+    private static SandboxSpec BaseAuditSpec() => new()
+    {
+        ImageReference = "ignored",
+        Environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["PATH"] = "/usr/local/bin:/usr/bin:/bin",
+        },
+    };
+
+    private static void AssertShimApplied(SandboxSpec applied)
+    {
+        Assert.True(applied.Environment.TryGetValue("PATH", out var path));
+        Assert.StartsWith(AuditDotnetShimDir + ":", path);
+        Assert.Contains(applied.Mounts, m => m.Tmpfs && m.SandboxPath == AuditDotnetShimDir);
+    }
+
     private static void AssertCredentialAndOpenNetwork(SandboxSpec spec, string phaseName)
     {
         Assert.True(spec.Environment.TryGetValue(MarkerEnvKey, out var marker),
