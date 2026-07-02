@@ -111,6 +111,15 @@ public sealed class PresetCatalogTests
             ["dotnet", "test", "--no-build"],
             [.. runner.BuildInvocation(TestSelection.All, TestRunOptions.Default)]);
 
+        // The promotion from ShellCommandAuditor to DotnetTestAuditor must
+        // preserve the build-test-gate role/evidence declared in csharp.yaml
+        // (role: build-test-gate, gateEvidence: test) ON THE PROMOTED TYPE
+        // ITSELF — the merge/release verification path depends on this evidence
+        // surviving the promotion, and it flows through the new gated branch
+        // (Role==BuildTestGate ? evidence : None) on DotnetTestAuditor.
+        Assert.Equal(AuditorRole.BuildTestGate, runner.Role);
+        Assert.Equal(BuildTestGateEvidence.Test, runner.BuildTestGateEvidence);
+
         // A non-test csharp auditor must NOT masquerade as a test runner.
         var buildGate = catalog.ResolveLanguage("csharp", ctx)
             .Single(a => a.Name == "csharp:build-WaE");

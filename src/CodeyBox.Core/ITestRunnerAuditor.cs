@@ -7,7 +7,7 @@ namespace CodeyBox.Core;
 /// test selection filters, per-test hang-dump args and timeouts), exposes how to
 /// enumerate the test universe, and carries its own result classifier.
 ///
-/// The <see cref="ITestSelector"/> seam (a separate work item) consumes
+/// The <c>ITestSelector</c> seam (a separate work item) consumes
 /// <see cref="TestSuite"/> to enumerate candidate tests and then calls
 /// <see cref="BuildInvocation"/> with a narrowed <see cref="TestSelection"/>.
 /// With an all-tests selection and default options the emitted command is

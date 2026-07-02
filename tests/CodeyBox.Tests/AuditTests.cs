@@ -934,6 +934,42 @@ public sealed class AuditTests
         Assert.Equal<string[]>(["dotnet", "test", "--no-build"], [.. auditor.Argv]);
     }
 
+    [Fact]
+    public void DotnetTestAuditor_BuildTestGateRole_ExposesRoleAndGatedEvidence()
+    {
+        // The promoted type carries the build-test-gate role/evidence declared in
+        // csharp.yaml. This is the load-bearing branch the merge/release path
+        // depends on: Role==BuildTestGate passes the evidence through.
+        var auditor = new DotnetTestAuditor(new DotnetTestAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            BaseArgv = ["dotnet", "test", "--no-build"],
+            Role = AuditorRole.BuildTestGate,
+            BuildTestGateEvidence = BuildTestGateEvidence.Test,
+        });
+
+        Assert.Equal(AuditorRole.BuildTestGate, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.Test, auditor.BuildTestGateEvidence);
+    }
+
+    [Fact]
+    public void DotnetTestAuditor_NonGateRole_SuppressesBuildTestGateEvidence()
+    {
+        // Guards the other branch of the ternary: evidence is only surfaced when
+        // the role is actually BuildTestGate. An auditor with configured evidence
+        // but a non-gate role must NOT leak that evidence.
+        var auditor = new DotnetTestAuditor(new DotnetTestAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            BaseArgv = ["dotnet", "test", "--no-build"],
+            Role = AuditorRole.None,
+            BuildTestGateEvidence = BuildTestGateEvidence.Test,
+        });
+
+        Assert.Equal(AuditorRole.None, auditor.Role);
+        Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
+    }
+
     private static DotnetTestAuditor CSharpTestPassAuditor() =>
         new(new DotnetTestAuditorOptions
         {
