@@ -42,6 +42,8 @@ flowchart TD
     A["POST /workitems"] --> Q["Queue"]
     Q --> W["Worker pool — one fresh VM per phase"]
     subgraph atomic["Atomic — lands cleanly or not at all"]
+        W -->|"'plan' knob set"| P0["0 · Plan (optional) · draft + review a plan artifact first"]
+        P0 --> P1
         W --> P1["1 · Work · run the agent, commit, push a branch"]
         P1 --> P2["2 · Audit · tool + LLM review"]
         P2 -->|"findings"| RW["Rework"]
@@ -52,7 +54,9 @@ flowchart TD
     P4 --> DONE(["A reviewed, merged change"])
 ```
 
-Phases 1–3 are atomic — the change lands cleanly or not at all. Clean merges
+An optional **Plan** phase (0) runs first when a work item sets the `plan` knob:
+the agent drafts a plan artifact that's reviewed before any code is written —
+useful for larger or higher-risk changes. Phases 1–3 are atomic — the change lands cleanly or not at all. Clean merges
 are done host-side (no agent); only genuine conflicts are handed to an in-VM
 agent, then verified by a deterministic host-side scope fence. Push is a
 separate retryable tier, so a flaky remote never corrupts your local result.
@@ -189,16 +193,18 @@ practice — with real numbers from running it on its own codebase:
 - **Every round costs tokens.** Watch per-item cost early to build a feel for
   the economics before scaling up.
 
-Audit rounds to merge, across 113 merged changes to this codebase — most land
-in 2–4 rounds, but the tail is real:
+Audit rounds to merge, across 114 merged changes to this codebase — most land
+in 2–4 rounds, with a long tail beyond:
 
 ```mermaid
 xychart-beta
-    title "Audit rounds to merge (113 merged changes · median 5 · mean 7 · never 1)"
-    x-axis ["2", "3-4", "5-8", "9-15", "16+"]
-    y-axis "Merged changes" 0 --> 40
-    bar [20, 34, 32, 16, 11]
+    title "Audit rounds to merge (114 merged · median 5 · never 1)"
+    x-axis [2, 3, 4, 5, 6, 7, 8, 9, 10]
+    y-axis "Merged changes" 0 --> 22
+    bar [20, 18, 16, 7, 8, 7, 10, 4, 4]
 ```
+
+_Equal-width, one bar per round; a further **20** changes took **11–41** rounds — the long tail, off-chart._
 
 **Getting good results.**
 
