@@ -76,6 +76,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly IStartupRecoveryInputBarrier? _startupRecoveryBarrier;
     private readonly IStartupInitialRecoverySink? _startupRecoveryCompletion;
     private readonly ReleaseService? _releaseService;
+    // Consulted by AgentPauseRetryFromForPickup to decide whether a Queued
+    // item resumes into the planning phase or straight into work. Reads through
+    // IKnob.GetPipelineLifecycle so the check stays local to the knob descriptor
+    // and follows the same framework contract PipelineRunner.ShouldUsePlanningPhase
+    // consumes. Null in narrow test bootstraps that don't wire the registry;
+    // the fallback path references PlanKnob's public constants so a missing
+    // registry still routes plan=on Queued items to planning.
+    private readonly IKnobRegistry? _knobRegistry;
     // B1 baseline-pinning: stamps the work/headless baseline ref at pickup time
     // so matching work-profile sandboxes keep using that baseline even after an
     // operator edits config. Later phases with different profiles or graphical
@@ -246,6 +254,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IStartupRecoveryInputBarrier? startupRecoveryBarrier = null,
         IStartupInitialRecoverySink? startupRecoveryCompletion = null,
         IAgentDispatchAvailability? dispatchAvailability = null,
+        IKnobRegistry? knobRegistry = null,
         TimeProvider? timeProvider = null)
     {
         _queue = queue;
@@ -265,6 +274,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _startupRecoveryBarrier = startupRecoveryBarrier;
         _startupRecoveryCompletion = startupRecoveryCompletion;
         _releaseService = releaseService;
+        _knobRegistry = knobRegistry;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _progressClock = progressClock ?? new OrchestratorProgressClock();
         _reaper?.AttachWorkerPoolSlotReleaser(this);
@@ -2239,9 +2249,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // released in the outer finally.
             if (!agentSlotReserved && !isAgentControlItem)
             {
-                var gateDirectWorkAgent = ShouldGateDirectAgentAtPickup(item);
+                var checkDirectAgentPause = ShouldCheckDirectAgentPauseAtPickup(item);
+                var reserveDirectAgentSlot = ShouldReserveDirectAgentSlotAtPickup(item);
                 var effectiveDirectAgent = item.Agent ?? project?.DefaultAgent;
-                var directAvailability = gateDirectWorkAgent && effectiveDirectAgent is { } directAgent
+                var directAvailability = checkDirectAgentPause && effectiveDirectAgent is { } directAgent
                     ? _dispatchAvailability?.GetAvailability(new AgentMembership
                     {
                         Agent = directAgent,
@@ -2264,7 +2275,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     return;
                 }
 
-                if (gateDirectWorkAgent && item.Agent is { } routedAgent)
+                if (reserveDirectAgentSlot && item.Agent is { } routedAgent)
                 {
                     var routeKey = ResolveDirectRouteKey(routedAgent, item.AgentInstanceId);
                     var cap = GetAgentCapForRoute(routedAgent, routeKey);
@@ -2571,7 +2582,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             or WorkItemState.Reworking
             or WorkItemState.ReworkingForConflict;
 
-    private static bool ShouldGateDirectAgentAtPickup(WorkItem item)
+    // Paused-agent parking is only relevant for states that actually invoke the
+    // work agent at pickup (Queued/Reworking + planning-lifecycle). Continuation
+    // states (WorkComplete = audit continuation, AuditPassed = merge continuation)
+    // do NOT invoke the work agent and so must not park on an agent pause — the
+    // audit/merge phase can continue while the work agent is paused.
+    private static bool ShouldCheckDirectAgentPauseAtPickup(WorkItem item)
         => item.State is WorkItemState.Queued
             or WorkItemState.Planning
             or WorkItemState.PlanReview
@@ -2579,25 +2595,64 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             or WorkItemState.Reworking
             or WorkItemState.ReworkingForConflict;
 
-    private static string AgentPauseRetryFromForPickup(WorkItem item, Project? project)
-    {
-        if (item.State == WorkItemState.Queued)
-        {
-            if (item.Knobs.TryGetValue("plan", out var itemPlan))
-            {
-                return string.Equals(itemPlan, "on", StringComparison.OrdinalIgnoreCase)
-                    ? "planning"
-                    : "work";
-            }
+    // Per-agent concurrency-cap reservation must cover every state where the
+    // direct-agent item consumes a worker slot for real work (including the
+    // audit/merge continuation states). Mirrors ShouldResolveAgentClassAtPickup
+    // so the direct-agent path enforces the same cap coverage as class-routed
+    // items, which the pre-refactor code did unconditionally.
+    private static bool ShouldReserveDirectAgentSlotAtPickup(WorkItem item)
+        => item.State is WorkItemState.Queued
+            or WorkItemState.Planning
+            or WorkItemState.PlanReview
+            or WorkItemState.PlanApproved
+            or WorkItemState.WorkComplete
+            or WorkItemState.AuditPassed
+            or WorkItemState.Reworking
+            or WorkItemState.ReworkingForConflict;
 
-            if (project?.Knobs.TryGetValue("plan", out var projectPlan) == true
-                && string.Equals(projectPlan, "on", StringComparison.OrdinalIgnoreCase))
-            {
-                return "planning";
-            }
-        }
+    private string AgentPauseRetryFromForPickup(WorkItem item, Project? project)
+    {
+        if (item.State == WorkItemState.Queued && RequestsPlanningLifecycle(item, project))
+            return "planning";
 
         return AgentPauseResumeMapper.RetryFromForState(item.State);
+    }
+
+    /// <summary>
+    /// Returns true when any registered knob requests <see cref="KnobPipelineLifecycle.Planning"/>
+    /// for the effective knob map. Mirrors PipelineRunner.ShouldUsePlanningPhase so the pickup-time
+    /// pause-resume decision and the pipeline entry decision agree on which items enter planning.
+    /// Falls back to a direct read of <see cref="Knobs.PlanKnob.KeyName"/> / <see cref="Knobs.PlanKnob.ValueOn"/>
+    /// when the registry isn't wired (test bootstraps), so the plan knob still routes correctly.
+    /// </summary>
+    private bool RequestsPlanningLifecycle(WorkItem item, Project? project)
+    {
+        if (_knobRegistry is not null)
+        {
+            var effective = _knobRegistry.Resolve(item.Knobs, project?.Knobs);
+            foreach (var knob in _knobRegistry.All)
+            {
+                if (effective.TryGetValue(knob.Key, out var value)
+                    && knob.GetPipelineLifecycle(value).HasFlag(KnobPipelineLifecycle.Planning))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Registry-missing fallback: read the plan knob's canonical key/value directly
+        // from the descriptor constants so a rename of either can't silently desync
+        // this path from the descriptor. Item precedence: an item-level plan value
+        // (any value) shadows the project default, matching how IKnobRegistry.Resolve
+        // treats item entries as an override of the project defaults.
+        if (item.Knobs.TryGetValue(Knobs.PlanKnob.KeyName, out var itemPlan))
+        {
+            return string.Equals(itemPlan, Knobs.PlanKnob.ValueOn, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return project?.Knobs.TryGetValue(Knobs.PlanKnob.KeyName, out var projectPlan) == true
+            && string.Equals(projectPlan, Knobs.PlanKnob.ValueOn, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsOperatorPaused(AgentAvailability? availability) =>

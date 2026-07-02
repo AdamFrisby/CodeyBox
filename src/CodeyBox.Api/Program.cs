@@ -2676,7 +2676,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>(),
-    dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>()));
+    dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
+    knobRegistry: sp.GetRequiredService<IKnobRegistry>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(

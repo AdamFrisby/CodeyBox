@@ -843,9 +843,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private static bool LooksLikePlanRequested(IReadOnlyDictionary<string, string>? knobs)
         => knobs is not null
-            && knobs.TryGetValue("plan", out var value)
+            && knobs.TryGetValue(Knobs.PlanKnob.KeyName, out var value)
             && value is not null
-            && value.Equals("on", StringComparison.OrdinalIgnoreCase);
+            && value.Equals(Knobs.PlanKnob.ValueOn, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsPlanningLifecycleState(WorkItemState state) =>
         state is WorkItemState.Planning or WorkItemState.PlanReview or WorkItemState.PlanApproved;
