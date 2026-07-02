@@ -47,6 +47,12 @@ public sealed record StatisticsPluginOptions
     /// </summary>
     public int MaxQueryRows { get; init; } = 50_000;
 
+    /// <summary>
+    /// Knobs for the banked reset-credit expiry tracker. Bound from the nested
+    /// <c>ResetCreditExpiry</c> config sub-section.
+    /// </summary>
+    public ResetCreditExpiryOptions ResetCreditExpiry { get; init; } = new();
+
     public static StatisticsPluginOptions FromConfiguration(IConfigurationSection section)
     {
         if (section is null)
@@ -69,6 +75,8 @@ public sealed record StatisticsPluginOptions
                 unit: TimeUnit.Hours),
             DatabasePath = section["DatabasePath"]?.Trim() is { Length: > 0 } path ? path : null,
             MaxQueryRows = ReadInt(section, "MaxQueryRows", defaults.MaxQueryRows, minimum: 1),
+            ResetCreditExpiry = ResetCreditExpiryOptions.FromConfiguration(
+                section.GetSection("ResetCreditExpiry")),
         };
     }
 
@@ -108,4 +116,100 @@ public sealed record StatisticsPluginOptions
         };
         return span < minimum ? minimum : span;
     }
+}
+
+/// <summary>
+/// Operator knobs for the banked reset-credit expiry tracker. Bound from
+/// <c>CodeyBox:Plugins:codeybox.statistics:ResetCreditExpiry</c>. All values
+/// are read each request so hot-reload applies without a host restart.
+/// </summary>
+public sealed record ResetCreditExpiryOptions
+{
+    /// <summary>Agent whose reset-credit count series is tracked. Codex is the only provider that exposes reset credits today.</summary>
+    public string Agent { get; init; } = "codex";
+
+    /// <summary>Provider-published credit lifetime. Codex publishes 30 days.</summary>
+    public TimeSpan ExpiryPeriod { get; init; } = TimeSpan.FromDays(30);
+
+    /// <summary>Margin before the raw expiry at which the advisor should prompt. Default 24 hours.</summary>
+    public TimeSpan SafetyBuffer { get; init; } = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// How far back the count series is read when a query supplies no explicit
+    /// lower bound. Defaults to twice the expiry period so every live credit's
+    /// grant sample is in range (bounded in practice by the sampler's
+    /// retention window).
+    /// </summary>
+    public TimeSpan Lookback { get; init; } = TimeSpan.FromDays(60);
+
+    /// <summary>Operator-seeded pre-observation credits (estimated expiries).</summary>
+    public IReadOnlyList<SeededResetCreditOption> Seeds { get; init; } = Array.Empty<SeededResetCreditOption>();
+
+    public static ResetCreditExpiryOptions FromConfiguration(IConfigurationSection section)
+    {
+        if (section is null)
+            return new ResetCreditExpiryOptions();
+
+        var defaults = new ResetCreditExpiryOptions();
+        return new ResetCreditExpiryOptions
+        {
+            Agent = section["Agent"]?.Trim() is { Length: > 0 } agent ? agent : defaults.Agent,
+            ExpiryPeriod = ReadSpanDays(section, "ExpiryPeriodDays", defaults.ExpiryPeriod, TimeSpan.FromHours(1)),
+            SafetyBuffer = ReadSpanHours(section, "SafetyBufferHours", defaults.SafetyBuffer, TimeSpan.Zero),
+            Lookback = ReadSpanDays(section, "LookbackDays", defaults.Lookback, TimeSpan.FromDays(1)),
+            Seeds = ReadSeeds(section.GetSection("Seeds")),
+        };
+    }
+
+    private static IReadOnlyList<SeededResetCreditOption> ReadSeeds(IConfigurationSection seedsSection)
+    {
+        var seeds = new List<SeededResetCreditOption>();
+        foreach (var child in seedsSection.GetChildren())
+        {
+            var raw = child["EstimatedExpiresAt"];
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+            if (!DateTimeOffset.TryParse(
+                    raw,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out var expiresAt))
+                continue;
+
+            var label = child["Label"]?.Trim();
+            seeds.Add(new SeededResetCreditOption
+            {
+                EstimatedExpiresAt = expiresAt,
+                Label = string.IsNullOrEmpty(label) ? null : label,
+            });
+        }
+
+        return seeds;
+    }
+
+    private static TimeSpan ReadSpanDays(IConfigurationSection section, string key, TimeSpan fallback, TimeSpan minimum)
+        => ReadSpan(section, key, fallback, minimum, TimeSpan.FromDays(1));
+
+    private static TimeSpan ReadSpanHours(IConfigurationSection section, string key, TimeSpan fallback, TimeSpan minimum)
+        => ReadSpan(section, key, fallback, minimum, TimeSpan.FromHours(1));
+
+    private static TimeSpan ReadSpan(IConfigurationSection section, string key, TimeSpan fallback, TimeSpan minimum, TimeSpan unit)
+    {
+        var raw = section[key];
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) || parsed < 0)
+            return fallback;
+        var span = parsed * unit;
+        return span < minimum ? minimum : span;
+    }
+}
+
+/// <summary>Config shape for one operator-seeded pre-observation reset credit.</summary>
+public sealed record SeededResetCreditOption
+{
+    /// <summary>Estimated expiry of the pre-observation credit (ISO-8601).</summary>
+    public required DateTimeOffset EstimatedExpiresAt { get; init; }
+
+    /// <summary>Optional operator label describing the estimate's basis.</summary>
+    public string? Label { get; init; }
 }

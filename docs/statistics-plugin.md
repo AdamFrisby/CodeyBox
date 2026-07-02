@@ -24,8 +24,9 @@ quota-burned.
 3. [Configuration reference](#configuration-reference)
 4. [Storage layout](#storage-layout)
 5. [REST: `GET /quota/history`](#rest-get-quotahistory)
-6. [Adding further metric streams](#adding-further-metric-streams)
-7. [Migrating off the standalone poller](#migrating-off-the-standalone-poller)
+6. [REST: `GET /quota/reset-credits`](#rest-get-quotareset-credits)
+7. [Adding further metric streams](#adding-further-metric-streams)
+8. [Migrating off the standalone poller](#migrating-off-the-standalone-poller)
 
 ---
 
@@ -99,7 +100,17 @@ next prune cycle.
         "QuotaSamplerIntervalSeconds": 900,
         "RetentionHours": 720,
         "DatabasePath": "/var/lib/codeybox/codeybox-stats.db",
-        "MaxQueryRows": 50000
+        "MaxQueryRows": 50000,
+        "ResetCreditExpiry": {
+          "Agent": "codex",
+          "ExpiryPeriodDays": 30,
+          "SafetyBufferHours": 24,
+          "LookbackDays": 60,
+          "Seeds": [
+            { "EstimatedExpiresAt": "2026-07-16T00:00:00Z", "Label": "credit A — burn within 2 weeks" },
+            { "EstimatedExpiresAt": "2026-08-01T00:00:00Z", "Label": "credit B — just arrived (~30d)" }
+          ]
+        }
       }
     }
   }
@@ -113,6 +124,11 @@ next prune cycle.
 | `RetentionHours` | `int` | `720` (30 days) | Rows older than this are pruned hourly. Long enough to span two weekly resets. Floor 1h. Set to 0 to disable pruning. |
 | `DatabasePath` | `string` | unset → `codeybox-stats.db` next to `CodeyBox:StateDatabasePath` | Absolute path to the stats SQLite file. |
 | `MaxQueryRows` | `int` | `50000` | Hard ceiling on rows returned by a single `QueryAsync` call (clamps the REST `limit` parameter). |
+| `ResetCreditExpiry:Agent` | `string` | `codex` | Agent whose banked-reset-credit count series is tracked. Codex is the only provider that exposes reset credits today. |
+| `ResetCreditExpiry:ExpiryPeriodDays` | `double` | `30` | Provider-published credit lifetime (Codex publishes 30 days). Floor 1h. |
+| `ResetCreditExpiry:SafetyBufferHours` | `double` | `24` | Margin subtracted from a credit's raw expiry to produce its advised spend-by moment. |
+| `ResetCreditExpiry:LookbackDays` | `double` | `60` | How far back the count series is read when a query supplies no `from`. Bounded in practice by `RetentionHours`. |
+| `ResetCreditExpiry:Seeds` | array | `[]` | Operator estimates for pre-observation credits — see [Reset-credit expiry](#rest-get-quotareset-credits). Entries without a parseable `EstimatedExpiresAt` are dropped. |
 
 ---
 
@@ -287,6 +303,95 @@ curl 'http://orchestrator/stats/capacity?agent=claude&window=seven_day'
   own % remaining, but provider counters can lag actual ingestion by
   seconds-to-minutes. A short measurement window can show a misalignment
   that washes out over longer horizons.
+
+---
+
+## REST: `GET /quota/reset-credits`
+
+Derives, from the sampled `rate_limit_reset_credits.available_count`
+time-series, when each banked quota-**reset credit** was granted and when it
+expires — so an operator can spend a credit before the provider silently
+expires it. The endpoint resolves `IResetCreditExpiryEstimator` from DI; when
+the plugin is not loaded it returns `503 Service Unavailable`.
+
+No manual per-credit expiry is entered. The grant instant of each credit is
+inferred from *when the count stepped up*, and the provider's fixed expiry
+period (Codex publishes a 30-day credit lifetime) is added to it.
+
+### Derivation algorithm
+
+The tracker replays the ordered `available_count` series and maintains a FIFO
+queue of credit grant-times:
+
+- **On an increment** of `available_count` by *N*, it records *N* new grants,
+  each pinned to the timestamp of the **last sample at the previous (lower)
+  count** — the *earliest-possible* grant instant, not the first higher
+  reading. Taking the earlier bound yields the earliest-possible expiry (the
+  safe direction: warn to spend a credit sooner, never later) and is immune to
+  the orchestrator being **down** across the grant. A measurement gap can only
+  push the inferred grant earlier, so it can never under-estimate a credit's
+  age.
+- **On a decrement**, it retires the **oldest** grant first (FIFO —
+  closest-to-expiry first), mirroring how the provider spends the
+  soonest-expiring credit. A decrement below what is tracked is a safe no-op.
+- **`nextCreditExpiresAt`** = min over queued grants of
+  `grant_time + expiryPeriod − safetyBuffer`.
+
+A sample whose count is **absent** (older provider / probe failure) is treated
+as a *gap*, not a decrement to zero, so it never spuriously retires a credit.
+
+### Pre-observation credits
+
+Credits already banked before the count series began have no observed
+increment, so their age cannot be inferred. Seed them under
+`ResetCreditExpiry:Seeds` with an **estimated** expiry; the report flags each
+seeded credit `isEstimated: true` so it is never presented as precise. Seeds
+are treated as the oldest credits (retired before any observed grant on a
+decrement) and are sorted by estimated expiry so the soonest-expiring is
+retired first.
+
+### Query parameters
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `agent` | string | `codex` (from config) | Agent whose reset-credit series to derive. |
+| `from` | RFC 3339 | now − `LookbackDays` | Lower bound on the count series (inclusive). |
+| `to` | RFC 3339 | now | Upper bound on the count series (exclusive). |
+
+### Example
+
+```sh
+curl 'http://orchestrator/quota/reset-credits?agent=codex'
+```
+
+```json
+{
+  "credits": [
+    {
+      "grantedAt":       "2026-06-16T00:00:00+00:00",
+      "expiresAt":       "2026-07-16T00:00:00+00:00",
+      "advisedSpendByAt":"2026-07-15T00:00:00+00:00",
+      "isEstimated":     true,
+      "label":           "credit A — burn within 2 weeks"
+    },
+    {
+      "grantedAt":       "2026-06-20T12:00:00+00:00",
+      "expiresAt":       "2026-07-20T12:00:00+00:00",
+      "advisedSpendByAt":"2026-07-19T12:00:00+00:00",
+      "isEstimated":     false,
+      "label":           null
+    }
+  ],
+  "nextCreditExpiresAt": "2026-07-15T00:00:00+00:00",
+  "latestObservedCount": 2,
+  "expiryPeriod": "30.00:00:00",
+  "safetyBuffer": "1.00:00:00"
+}
+```
+
+`latestObservedCount` is the provider's own count; when it differs from
+`credits.length` the seed list does not exactly cover the pre-observation
+baseline — a signal to adjust `Seeds`.
 
 ---
 

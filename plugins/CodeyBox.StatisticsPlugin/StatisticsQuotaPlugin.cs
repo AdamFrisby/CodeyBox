@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using Microsoft.Extensions.Configuration;
@@ -37,7 +38,7 @@ namespace CodeyBox.StatisticsPlugin;
     displayName: "CodeyBox: Statistics",
     minHostApiVersion: "1.2")]
 public sealed class StatisticsQuotaPlugin
-    : IMetricSampler, IQuotaTimeSeriesStore, ICapacityCalculator, IPluginInitializer, IAsyncDisposable
+    : IMetricSampler, IQuotaTimeSeriesStore, ICapacityCalculator, IResetCreditExpiryEstimator, IPluginInitializer, IAsyncDisposable
 {
     public const string PluginId = "codeybox.statistics";
     public const string QuotaSamplerKind = "quota";
@@ -293,6 +294,85 @@ public sealed class StatisticsQuotaPlugin
             usage: _usageStore,
             clock: _timeProvider);
         return calc.ComputeAsync(filter, ct);
+    }
+
+    /// <inheritdoc/>
+    public async Task<ResetCreditExpiryReport> EstimateAsync(
+        ResetCreditExpiryQuery query,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        var store = _store
+            ?? throw new InvalidOperationException("Statistics plugin: store not initialised — InitializeAsync has not run yet");
+
+        ResetCreditExpiryOptions opts;
+        int maxRows;
+        lock (_stateLock)
+        {
+            opts = _options.ResetCreditExpiry;
+            maxRows = _options.MaxQueryRows;
+        }
+
+        var agent = string.IsNullOrWhiteSpace(query.Agent) ? opts.Agent : query.Agent.Trim();
+        var now = _timeProvider.GetUtcNow();
+        var toUtc = query.ToUtc?.ToUniversalTime() ?? now;
+        var fromUtc = query.FromUtc?.ToUniversalTime() ?? toUtc - opts.Lookback;
+
+        var filter = new QuotaTimeSeriesFilter
+        {
+            Agent = agent,
+            FromUtc = fromUtc,
+            // The store treats ToUtc as exclusive; add a second of slop so the
+            // most recent sample (written at ~now) is not silently excluded.
+            ToUtc = toUtc + TimeSpan.FromSeconds(1),
+            Limit = maxRows,
+        };
+
+        var rawRows = await store.QueryRawAsync(filter, ct);
+
+        var observations = new List<ResetCreditObservation>(rawRows.Count);
+        foreach (var row in rawRows)
+        {
+            var count = TryReadResetCreditsAvailable(row.RawJson);
+            if (count is { } value)
+                observations.Add(new ResetCreditObservation(row.SampledAt, value));
+        }
+
+        var config = new ResetCreditExpiryConfig
+        {
+            ExpiryPeriod = opts.ExpiryPeriod,
+            SafetyBuffer = opts.SafetyBuffer,
+            SeededCredits = opts.Seeds
+                .Select(s => new SeededResetCredit { EstimatedExpiresAt = s.EstimatedExpiresAt, Label = s.Label })
+                .ToList(),
+        };
+
+        return ResetCreditExpiryTracker.Track(observations, config);
+    }
+
+    /// <summary>
+    /// Reads <c>ResetCreditsAvailable</c> from a persisted raw snapshot without
+    /// deserialising the whole <see cref="AgentQuotaSnapshot"/>. Returns null
+    /// when the field is absent/null (a gap in the series) or the JSON is
+    /// malformed — a bad row must not abort the whole derivation.
+    /// </summary>
+    private int? TryReadResetCreditsAvailable(string rawJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(rawJson);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("ResetCreditsAvailable", out var prop)
+                && prop.ValueKind == JsonValueKind.Number
+                && prop.TryGetInt32(out var value)
+                ? value
+                : null;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogDebug(ex, "Statistics plugin: skipping malformed raw snapshot while deriving reset-credit expiry");
+            return null;
+        }
     }
 
     private QuotaTimeSeriesFilter ClampFilterLimit(QuotaTimeSeriesFilter filter)
