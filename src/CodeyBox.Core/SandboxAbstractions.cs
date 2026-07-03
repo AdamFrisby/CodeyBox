@@ -266,6 +266,20 @@ public interface IRejectsFileBackedAgentCredentials : ISandbox
 }
 
 /// <summary>
+/// Implemented by sandbox wrappers/decorators (e.g. the admission-control and
+/// reusable-sandbox families) that forward an inner <see cref="ISandbox"/>.
+/// Marker capabilities like <see cref="IRejectsFileBackedAgentCredentials"/>
+/// cannot be conditionally re-implemented by a decorator, so consumers that
+/// probe for a capability must walk <see cref="InnerSandbox"/> to the innermost
+/// sandbox rather than relying on <c>is</c> against the outermost wrapper.
+/// </summary>
+public interface ISandboxDecorator : ISandbox
+{
+    /// <summary>The sandbox this decorator wraps.</summary>
+    ISandbox InnerSandbox { get; }
+}
+
+/// <summary>
 /// Optional sandbox capability for providers that can freeze a running sandbox
 /// (including its RAM state) and resume it later via
 /// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/>. Currently

@@ -8,6 +8,7 @@ using System.Text.Json;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Sprites;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -361,6 +362,37 @@ public sealed class SpritesSandboxProviderTests
             credential,
             sandbox: sandbox,
             workingDirectory: "/work");
+
+        Assert.False(result.Success);
+        Assert.Contains("file-backed credentials are not supported", result.Summary, StringComparison.Ordinal);
+        Assert.Null(socket.ConnectedUri);
+    }
+
+    [Fact]
+    public async Task FileBackedCredentialRunner_FailsThroughProductionAdmissionWrapper()
+    {
+        // In production the sprite sandbox never reaches a runner raw: SandboxAdmissionControlledProvider
+        // wraps it (an AdmissionControlledShutdownSandbox, since SpritesSandbox is a shutdown sandbox).
+        // The IRejectsFileBackedAgentCredentials marker must survive that wrapping, or the credential-
+        // persistence guard is dead and OAuth/subscription files land on the sprite's ext4 disk.
+        var socket = new FakeSpritesWebSocket();
+        var inner = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            new SingleSandboxProvider(inner), maxConcurrentSandboxes: 1, NullLogger.Instance);
+
+        await using var wrapped = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+
+        // Sanity: we are exercising the decorator, not the raw sandbox the other guard tests use.
+        Assert.IsNotType<SpritesSandbox>(wrapped);
+        Assert.IsAssignableFrom<ISandboxDecorator>(wrapped);
+
+        var runner = new CodexAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = "{}" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunAsync(wrapped, "/work", "prompt", credential);
 
         Assert.False(result.Success);
         Assert.Contains("file-backed credentials are not supported", result.Summary, StringComparison.Ordinal);
@@ -940,6 +972,87 @@ public sealed class SpritesSandboxProviderTests
         Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == killPath);
     }
 
+    [Fact]
+    public async Task ExecAsync_SingleFragmentedMessageExceedingCeiling_AbortsAndKills()
+    {
+        const string killPath = "/v1/sprites/codeybox-test/exec/7/kill";
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == killPath)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {"type":"signal"}
+                        {"type":"exited"}
+                        {"type":"complete","exit_code":143}
+                        """,
+                        Encoding.UTF8,
+                        "application/x-ndjson"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText("""{"type":"session_info","session_id":7,"command":"cat","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        // One WebSocket message, delivered as many fragments, whose accumulated size exceeds the
+        // per-message ceiling (cap + 1 MiB slack). With MaxStdoutBytes=4 the ceiling is ~1 MiB, so the
+        // guard must abort the receive loop before the whole message is buffered — this is the
+        // memory-exhaustion / output-cap-defeat DoS the ceiling exists to stop.
+        socket.EnqueueFragmentedBinary(totalBytes: 3 * 1024 * 1024, chunkSize: 32 * 1024);
+        socket.EnqueueText("""{"type":"exit","exit_code":0}""");
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" }, httpHandler: handler);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sandbox.ExecAsync(new SandboxExec { Argv = ["cat"], MaxStdoutBytes = 4 }));
+
+        Assert.Contains("per-message ceiling", ex.Message, StringComparison.Ordinal);
+        // The catch path must kill the session so the sprite-side process cannot keep flooding output.
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == killPath);
+    }
+
+    [Fact]
+    public async Task ExecAsync_UncappedCaller_StillBoundedByDefaultCeiling()
+    {
+        const string killPath = "/v1/sprites/codeybox-test/exec/7/kill";
+        var handler = new RecordingHttpHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post && request.PathAndQuery == killPath)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        """
+                        {"type":"signal"}
+                        {"type":"exited"}
+                        {"type":"complete","exit_code":143}
+                        """,
+                        Encoding.UTF8,
+                        "application/x-ndjson"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText("""{"type":"session_info","session_id":7,"command":"cat","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        // The primary agent exec path supplies NO MaxStdoutBytes/MaxStderrBytes. The guard must still
+        // apply the hard DefaultMaxStreamBytes ceiling (64 MiB + 1 MiB slack), so a fragmented message
+        // just over that bound is aborted rather than buffered unbounded on the host.
+        socket.EnqueueFragmentedBinary(
+            totalBytes: SpritesSandbox.DefaultMaxStreamBytes + (2L * 1024 * 1024),
+            chunkSize: 32 * 1024);
+        socket.EnqueueText("""{"type":"exit","exit_code":0}""");
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" }, httpHandler: handler);
+
+        // Note: no MaxStdoutBytes set — this is the exact shape CliAgentRunnerBase builds.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sandbox.ExecAsync(new SandboxExec { Argv = ["cat"] }));
+
+        Assert.Contains("per-message ceiling", ex.Message, StringComparison.Ordinal);
+        Assert.Single(handler.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery == killPath);
+    }
+
     private static async Task RunMaliciousSyncBackAsync(
         string hostMountPath,
         string maliciousArchiveBase64,
@@ -1051,6 +1164,26 @@ public sealed class SpritesSandboxProviderTests
             [],
             () => { },
             NullLogger<SpritesSandboxProvider>.Instance);
+    }
+
+    // Returns a single pre-built sandbox once so a test can drive it through the real admission wrapper.
+    private sealed class SingleSandboxProvider(ISandbox sandbox) : ISandboxProvider
+    {
+        private ISandbox? _sandbox = sandbox;
+
+        public string Name => "sprites-test";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var next = Interlocked.Exchange(ref _sandbox, null)
+                ?? throw new InvalidOperationException("SingleSandboxProvider yields exactly one sandbox.");
+            return Task.FromResult(next);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class TempDirectory : IDisposable
@@ -1279,7 +1412,7 @@ public sealed class SpritesSandboxProviderTests
 
     private sealed class FakeSpritesWebSocket : ISpritesWebSocket
     {
-        private readonly Queue<(WebSocketMessageType Type, byte[] Payload)> _incoming = new();
+        private readonly Queue<(WebSocketMessageType Type, byte[] Payload, bool EndOfMessage)> _incoming = new();
 
         public Uri? ConnectedUri { get; private set; }
         public string? BearerToken { get; private set; }
@@ -1287,10 +1420,27 @@ public sealed class SpritesSandboxProviderTests
         public WebSocketState State { get; private set; } = WebSocketState.None;
 
         public void EnqueueText(string json) =>
-            _incoming.Enqueue((WebSocketMessageType.Text, Encoding.UTF8.GetBytes(json)));
+            _incoming.Enqueue((WebSocketMessageType.Text, Encoding.UTF8.GetBytes(json), true));
 
         public void EnqueueBinary(byte[] payload) =>
-            _incoming.Enqueue((WebSocketMessageType.Binary, payload));
+            _incoming.Enqueue((WebSocketMessageType.Binary, payload, true));
+
+        // Enqueue a SINGLE binary WebSocket message delivered as several fragments (all but the last
+        // carry endOfMessage=false), so tests can exercise the multi-frame accumulation path that the
+        // per-message memory-exhaustion ceiling defends. totalBytes is split into chunkSize pieces.
+        public void EnqueueFragmentedBinary(long totalBytes, int chunkSize)
+        {
+            var chunk = new byte[chunkSize];
+            Array.Fill(chunk, (byte)1);
+            long remaining = totalBytes;
+            while (remaining > 0)
+            {
+                var thisChunk = (int)Math.Min(chunkSize, remaining);
+                remaining -= thisChunk;
+                var payload = thisChunk == chunkSize ? chunk : chunk[..thisChunk];
+                _incoming.Enqueue((WebSocketMessageType.Binary, payload, remaining <= 0));
+            }
+        }
 
         public Task ConnectAsync(Uri uri, string bearerToken, CancellationToken ct)
         {
@@ -1318,7 +1468,7 @@ public sealed class SpritesSandboxProviderTests
 
             var message = _incoming.Dequeue();
             message.Payload.CopyTo(buffer);
-            return Task.FromResult(new WebSocketReceiveResult(message.Payload.Length, message.Type, endOfMessage: true));
+            return Task.FromResult(new WebSocketReceiveResult(message.Payload.Length, message.Type, message.EndOfMessage));
         }
 
         public ValueTask DisposeAsync()

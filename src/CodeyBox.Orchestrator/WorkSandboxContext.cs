@@ -200,7 +200,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         };
     }
 
-    private class ReusableSandbox : ISandbox
+    private class ReusableSandbox : ISandbox, ISandboxDecorator
     {
         protected readonly ISandbox _inner;
         protected readonly WorkSandboxContext _context;
@@ -212,6 +212,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         }
 
         public string Id => _inner.Id;
+        public ISandbox InnerSandbox => _inner;
         public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
         public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
         public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;

@@ -440,6 +440,15 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
     // payload delivered as one message.
     private const long MessageSizeSlackBytes = 1024 * 1024;
 
+    // Hard per-stream ceiling applied to the accumulated stdout/stderr buffer AND the per-message
+    // accumulation when the caller supplies no explicit MaxStdoutBytes/MaxStderrBytes. The primary
+    // agent exec path (CliAgentRunnerBase) builds SandboxExec without output caps, so without this
+    // floor an untrusted in-sprite process emitting unbounded output (e.g. `yes`) would let the host
+    // buffer the full volume in ReceiveMessageAsync / LimitedOutputCollector and exhaust host memory,
+    // defeating the resource ceiling the sandbox is meant to enforce. Chosen large enough not to
+    // truncate legitimate build/agent output; the guard is a DoS backstop, not a functional limit.
+    internal const int DefaultMaxStreamBytes = 64 * 1024 * 1024;
+
     private const string EnvironmentBootstrapScript =
         """
         set -eu
@@ -587,8 +596,8 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         try
         {
             await webSocket.ConnectAsync(BuildExecWebSocketUri(wireExec), _opts.Token!, ct).ConfigureAwait(false);
-            var stdout = new LimitedOutputCollector(exec.MaxStdoutBytes, exec.StdoutChunkCallback);
-            var stderr = new LimitedOutputCollector(exec.MaxStderrBytes, exec.StderrChunkCallback);
+            var stdout = new LimitedOutputCollector(exec.MaxStdoutBytes ?? DefaultMaxStreamBytes, exec.StdoutChunkCallback);
+            var stderr = new LimitedOutputCollector(exec.MaxStderrBytes ?? DefaultMaxStreamBytes, exec.StderrChunkCallback);
             var exitCode = await ReadExecUntilExitAsync(
                 webSocket,
                 exec,
@@ -724,20 +733,22 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
     // a single huge fragmented message would otherwise let the host buffer the full volume in
     // ReceiveMessageAsync before KillOnOutputLimit can fire — a memory-exhaustion DoS that defeats the
     // resource ceiling. Bound the accumulated per-message size to the larger configured output cap
-    // plus generous slack (WebSocket framing + the 1-byte stream prefix); exceeding it aborts the
-    // exec, whose catch path kills the session.
-    private static long? ComputeMaxMessageBytes(SandboxExec exec)
+    // (falling back to the hard DefaultMaxStreamBytes ceiling when the caller supplies no cap, so the
+    // primary agent exec path is protected too) plus generous slack (WebSocket framing + the 1-byte
+    // stream prefix); exceeding it aborts the exec, whose catch path kills the session. This never
+    // returns null — an uncapped caller must still not make the host buffer unbounded bytes.
+    private static long ComputeMaxMessageBytes(SandboxExec exec)
     {
         var cap = Math.Max(exec.MaxStdoutBytes ?? 0, exec.MaxStderrBytes ?? 0);
         if (cap <= 0)
-            return null;
+            cap = DefaultMaxStreamBytes;
         return cap + MessageSizeSlackBytes;
     }
 
     private static async Task<ReceivedWebSocketMessage?> ReceiveMessageAsync(
         ISpritesWebSocket webSocket,
         byte[] buffer,
-        long? maxMessageBytes,
+        long maxMessageBytes,
         CancellationToken ct)
     {
         using var payload = new MemoryStream();
@@ -748,9 +759,9 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
             if (result.MessageType == WebSocketMessageType.Close)
                 return null;
             payload.Write(buffer, 0, result.Count);
-            if (maxMessageBytes.HasValue && payload.Length > maxMessageBytes.Value)
+            if (payload.Length > maxMessageBytes)
                 throw new InvalidOperationException(
-                    $"sprites exec message exceeded the {maxMessageBytes.Value}-byte per-message ceiling " +
+                    $"sprites exec message exceeded the {maxMessageBytes}-byte per-message ceiling " +
                     "(output-cap defeat / memory-exhaustion guard).");
         }
         while (!result.EndOfMessage);

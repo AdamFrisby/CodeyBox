@@ -808,7 +808,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     private AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
     {
-        if (sandbox is not IRejectsFileBackedAgentCredentials policy)
+        // In production the sandbox is wrapped by admission-control / reusable decorators that cannot
+        // conditionally re-implement the IRejectsFileBackedAgentCredentials marker, so probe the whole
+        // decorator chain rather than only the outermost wrapper.
+        if (ResolveFileBackedCredentialPolicy(sandbox) is not { } policy)
             return null;
         if (credential?.EnvironmentVariables is not { Count: > 0 } env)
             return null;
@@ -828,6 +831,17 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 Summary: summary,
                 Stdout: null,
                 Stderr: summary);
+        }
+
+        return null;
+    }
+
+    private static IRejectsFileBackedAgentCredentials? ResolveFileBackedCredentialPolicy(ISandbox sandbox)
+    {
+        for (ISandbox? current = sandbox; current is not null; current = (current as ISandboxDecorator)?.InnerSandbox)
+        {
+            if (current is IRejectsFileBackedAgentCredentials policy)
+                return policy;
         }
 
         return null;
