@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Threading;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -21,6 +23,22 @@ namespace CodeyBox.Agents.Antigravity;
 /// </summary>
 public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
+    /// <summary>
+    /// Upper bound on how many bytes of agy's glog we read back for capture
+    /// (256 KiB). agy's glog is cumulative and can grow large on a long tool-heavy
+    /// run; the read is bounded so a runaway log can't be ingested unbounded into
+    /// the per-run stream and the audit log. The full tail is archived to the
+    /// observability stream; only the terminal error region (see
+    /// <see cref="AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion"/>) is
+    /// folded into the classifier-facing <c>result.Stderr</c>, and only on failure.
+    /// </summary>
+    private const int MaxLogTailBytes = 256 * 1024;
+
+    // Threads the per-invocation agy log path into BuildAgyInvocation (whose
+    // signature is fixed by the base class) without a new IAgentRunner
+    // parameter. Set for the duration of a single run and cleared in finally.
+    private readonly AsyncLocal<string?> _currentLogPath = new();
+
     public override AgentKind Kind => AgentKind.Antigravity;
 
     /// <summary>Default agy binary name on the sandbox PATH. The in-VM smoke
@@ -122,6 +140,305 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         return null;
     }
 
+    public override Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+        => RunWithLogCaptureAsync(
+            sandbox,
+            captureStructuredStream,
+            stdoutChunkCallback,
+            ct,
+            () => base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback, captureStructuredStream));
+
+    public override Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+        => RunWithLogCaptureAsync(
+            sandbox,
+            // Resume turns deliberately do not request the structured stream
+            // (see CliAgentRunnerBase.RunResumedAsync), so the folded glog uses
+            // the same plaintext line shape.
+            captureStructuredStream: false,
+            stdoutChunkCallback,
+            ct,
+            () => base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, stdoutChunkCallback));
+
+    /// <summary>
+    /// Shared lifecycle for both run overrides: pick the per-run agy glog path,
+    /// publish it for <see cref="BuildAgyInvocation"/> to emit as
+    /// <c>--log-file</c>, ensure the directory exists, run the base invocation,
+    /// then archive the glog to the observability stream and (on failure) fold its
+    /// terminal error region into the classifier-facing <c>Stderr</c>. The
+    /// setup/teardown lives here once so the log-path convention can't drift
+    /// between the two paths.
+    /// </summary>
+    private async Task<AgentResult> RunWithLogCaptureAsync(
+        ISandbox sandbox,
+        bool captureStructuredStream,
+        Action<string>? stdoutChunkCallback,
+        CancellationToken ct,
+        Func<Task<AgentResult>> runBase)
+    {
+        var logFile = ComputeAgyLogPath();
+        _currentLogPath.Value = logFile;
+        try
+        {
+            await EnsureLogDirectoryAsync(sandbox, logFile, ct).ConfigureAwait(false);
+            await ExcludeGlogFromWorkTreeGitAsync(sandbox, ct).ConfigureAwait(false);
+            var result = await runBase().ConfigureAwait(false);
+            return await ProcessResultAsync(sandbox, result, logFile, stdoutChunkCallback, captureStructuredStream, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _currentLogPath.Value = null;
+        }
+    }
+
+    /// <summary>
+    /// Deterministic per-run path agy is told to write its glog to. Co-located
+    /// with the orchestrator-assigned per-invocation log path
+    /// (<see cref="AgentInvocationLogContext.CurrentLogPath"/>) so it correlates
+    /// with the rest of the run's capture and lives under
+    /// <see cref="SandboxConventions.AgentLogDir"/> — which is on the <c>/work</c>
+    /// mount (survives a multipass suspend) and created by the exec wrapper. The
+    /// fallback (test / non-pipeline callers with no assigned path) still lands
+    /// under <c>AgentLogDir</c> rather than a provider-specific <c>$HOME</c> the
+    /// process/bubblewrap sandboxes do not necessarily share.
+    /// </summary>
+    private static string ComputeAgyLogPath()
+    {
+        var assigned = AgentInvocationLogContext.CurrentLogPath;
+        return string.IsNullOrEmpty(assigned)
+            ? $"{SandboxConventions.AgentLogDir}/agy-run-{Guid.NewGuid():N}.log"
+            : assigned + ".agy.log";
+    }
+
+    /// <summary>
+    /// agy's <c>--log-file</c> open fails if the parent directory is missing.
+    /// The exec wrapper only creates the log dir when <c>CODEYBOX_AGENT_LOG_FILE</c>
+    /// is set, and <see cref="PrepareSandboxAsync"/> only creates
+    /// <c>~/.gemini/…</c> on the OAuth-creds branch — so create the directory
+    /// unconditionally here, before agy runs, independent of the credential path.
+    /// </summary>
+    private async Task EnsureLogDirectoryAsync(ISandbox sandbox, string logFile, CancellationToken ct)
+    {
+        var dir = PosixDirName(logFile);
+        if (dir.Length == 0)
+            return;
+        var mkdir = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["mkdir", "-p", dir],
+        }, ct).ConfigureAwait(false);
+
+        // A failed mkdir means agy's `--log-file` open will fail and the whole
+        // capture silently yields nothing. Surface it via the same audit event the
+        // tail-failure path uses so the broken diagnostics path is observable
+        // rather than degrading invisibly to zero-capture. Non-fatal: the run still
+        // proceeds (agy may still write to a default location or fail loudly on its
+        // own), we just record that our capture directory could not be created.
+        if (!mkdir.Success)
+        {
+            AuditLog.AgentLogCaptureFailed(
+                Kind,
+                "mkdir",
+                $"could not create glog directory '{dir}' (exit {mkdir.ExitCode}): {mkdir.Stderr}");
+        }
+    }
+
+    private static string PosixDirName(string path)
+    {
+        var idx = path.LastIndexOf('/');
+        return idx <= 0 ? string.Empty : path[..idx];
+    }
+
+    /// <summary>
+    /// Adds the agent-log scratch dir to the work tree's
+    /// <c>.git/info/exclude</c> BEFORE agy runs, so that an agy self-commit's
+    /// <c>git add -A</c> can never stage the glog.
+    ///
+    /// Unlike the other agents, agy writes its diagnostics to a real file
+    /// (<c>--log-file</c>, see <see cref="ComputeAgyLogPath"/>) that lives under
+    /// <see cref="SandboxConventions.AgentLogDir"/> — inside the <c>/work</c> git
+    /// tree — and it is UNREDACTED on disk (agy logs applyAuthResult / auth
+    /// diagnostics and, per the credential contract, ships the OAuth
+    /// refresh_token verbatim). The orchestrator's post-run
+    /// <c>StripAgentLogScratchFromIndexAsync</c> unstages that dir before its OWN
+    /// commit, but cannot rewrite a commit an agent already made itself — and the
+    /// rework prompt explicitly asks agents to make new commits. A local
+    /// <c>.git/info/exclude</c> entry closes that gap: it is never committed, and
+    /// it makes <c>git add -A</c> skip the (never-tracked) scratch dir regardless
+    /// of who runs it.
+    ///
+    /// Best-effort and idempotent. A non-git working directory (unit tests, a
+    /// non-pipeline caller) is a no-op; a failed write leaves the orchestrator's
+    /// post-run strip as the remaining guard, so we do not fail the run over it.
+    /// </summary>
+    private async Task ExcludeGlogFromWorkTreeGitAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        // Anchor on AgentLogDir's leaf under the reserved .codeybox/ namespace so
+        // both ComputeAgyLogPath branches (the "<assigned>.agy.log" production
+        // shape and the Guid fallback) sit under the excluded dir. Relative to the
+        // work tree root; matches the pattern the orchestrator strip targets.
+        const string excludeEntry = ".codeybox/agent-logs/";
+        var script =
+            "[ -d .git ] || exit 0; mkdir -p .git/info; "
+            + $"grep -qxF '{excludeEntry}' .git/info/exclude 2>/dev/null || "
+            + $"printf '%s\\n' '{excludeEntry}' >> .git/info/exclude";
+        try
+        {
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", script],
+                WorkingDirectory = SandboxConventions.WorkDir,
+            }, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Defence-in-depth: the post-run --cached strip still protects the
+            // orchestrator's own commit. Surface the miss so a persistently broken
+            // exclude path is visible rather than silently narrowing the guard.
+            AuditLog.AgentLogCaptureFailed(Kind, ex.GetType().Name, $"git exclude write failed: {ex.Message}");
+        }
+    }
+
+    private async Task<AgentResult> ProcessResultAsync(
+        ISandbox sandbox,
+        AgentResult result,
+        string logFile,
+        Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream,
+        CancellationToken ct)
+    {
+        SandboxExecResult tailCmd;
+        try
+        {
+            tailCmd = await sandbox.ExecAsync(new SandboxExec
+            {
+                // tail keeps the last MaxLogTailBytes; for the motivating case
+                // (near-0-byte stdout, small glog) the whole file fits.
+                Argv = ["tail", "-c", MaxLogTailBytes.ToString(CultureInfo.InvariantCulture), logFile],
+            }, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // A requested cancellation must not be masked as a normal
+            // completion — let it propagate like the base class's own probes do.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // A broken capture path (sandbox/provider fault) must be observable
+            // rather than silently degrading back to zero diagnostics.
+            AuditLog.AgentLogCaptureFailed(Kind, ex.GetType().Name, ex.Message);
+            return result;
+        }
+
+        if (!tailCmd.Success || string.IsNullOrEmpty(tailCmd.Stdout))
+        {
+            return result;
+        }
+
+        // Redact with the same routine the normal stream-capture path uses
+        // (SensitiveDataRedactionEnricher.RedactText — see AgentStreamParser)
+        // so token/auth lines in agy's glog are scrubbed identically before they
+        // reach the stream or audit.
+        var redactedLog = SensitiveDataRedactionEnricher.RedactText(tailCmd.Stdout);
+
+        // (1) Archive the FULL glog to the per-run stream (observability / audit) on
+        // EVERY outcome — this is what surfaces agy's otherwise invisible
+        // diagnostics (model resolution, applyAuthResult, tool output) in the
+        // agent-stream files, which the pipeline records and audits.
+        if (stdoutChunkCallback is not null)
+        {
+            ForwardLogToStream(redactedLog, stdoutChunkCallback, captureStructuredStream);
+        }
+
+        // (2) On FAILURE only, fold agy's TERMINAL error region into the
+        // classifier-facing result.Stderr so the quota/auth/cost detectors — which
+        // substring-scan Stderr/Stdout — can finally see agy's terminal
+        // RESOURCE_EXHAUSTED / API Error: 401 (agy writes these ONLY to its glog;
+        // its process stderr is frequently ~0 bytes). This is the un-blinding the
+        // task requires: a terminal agy 429 now reaches quota detection and parks
+        // the item in WaitingForQuotaReset with the gateway's reset hint.
+        //
+        // We fold ONLY the terminal region, and ONLY on failure — never the whole
+        // cumulative log. agy's glog is cumulative within one --print process and
+        // records transient errors it later recovered from (a 429 a retry cleared,
+        // an auth blip a refresh fixed). Folding the whole log would let such a
+        // recovered-then-cleared "RESOURCE_EXHAUSTED"/"API Error: 401" falsely
+        // bench/park the member. ExtractTerminalErrorRegion returns only the slice
+        // from the last marker in the tail window to end — agy aborts right after
+        // its terminal error, so that slice is the real cause; an earlier recovered
+        // error sits outside the window and is excluded. A successful run folds
+        // nothing (there is no terminal failure to classify), and a non-quota/-auth
+        // failure (timeout, tool error, no-changes) folds nothing (no marker),
+        // leaving result.Stderr as agy's own process output.
+        if (!result.Success)
+        {
+            var terminalError = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(redactedLog);
+            if (!string.IsNullOrEmpty(terminalError))
+            {
+                result = result with { Stderr = AppendDiagnostic(result.Stderr, terminalError) };
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Appends <paramref name="addition"/> to an existing (possibly empty) stderr
+    /// buffer on its own line, preserving agy's original process stderr ahead of
+    /// the folded glog region.
+    /// </summary>
+    private static string AppendDiagnostic(string? existing, string addition)
+        => string.IsNullOrEmpty(existing) ? addition : existing + "\n" + addition;
+
+    private static void ForwardLogToStream(
+        string redactedLog,
+        Action<string> stdoutChunkCallback,
+        bool captureStructuredStream)
+    {
+        var lines = redactedLog.Replace("\r", "", StringComparison.Ordinal).Split('\n');
+        var count = lines.Length;
+        if (count > 0 && string.IsNullOrEmpty(lines[count - 1]))
+        {
+            count--;
+        }
+        for (int i = 0; i < count; i++)
+        {
+            var line = lines[i];
+            if (captureStructuredStream)
+            {
+                // Reuse the base class's serializer so the folded envelope stays
+                // byte-identical to StderrEnvelopeForwarder's and to what
+                // AgentStreamParser expects.
+                stdoutChunkCallback(SerializeStderrEnvelopeLine(line));
+            }
+            else
+            {
+                stdoutChunkCallback(line + "\n");
+            }
+        }
+    }
+
     protected override AgentInvocation BuildInvocation(
         string prompt,
         AgentCredential? credential,
@@ -165,6 +482,12 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // that auto-approves tool calls. The sandbox boundary is the real
         // permission boundary — same shape we use for Claude.
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+
+        if (_currentLogPath.Value is { } logPath)
+        {
+            argv.Add("--log-file");
+            argv.Add(logPath);
+        }
 
         // Override agy's 5m default --print-timeout (the per-response wait). On a
         // large work item a single gemini turn can exceed 5m; agy then aborts the

@@ -73,4 +73,48 @@ public sealed class AntigravityQuotaFailureDetectorTests
         Assert.Null(_detector.Detect(stderr: null, stdout: null));
         Assert.Null(_detector.Detect(stderr: "", stdout: ""));
     }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_TerminalMarkerAtEnd_ReturnsFromLastMarkerToEnd()
+    {
+        // The terminal 429 sits at the end of the cumulative glog; the region is the
+        // slice from the last marker to end — the leading non-marker noise is dropped
+        // so only the terminal cause reaches the classifiers.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "applyAuthResult: authMethod=consumer\n"
+            + "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)";
+
+        var region = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog);
+
+        Assert.NotNull(region);
+        Assert.Contains("RESOURCE_EXHAUSTED", region);
+        Assert.Contains("Resets in 8m14s", region); // reset hint preserved for Detect()
+        Assert.DoesNotContain("Model resolved", region!);
+        // And the sliced region still classifies as a rate-limit via Detect().
+        var detection = _detector.Detect(stderr: region, stdout: null);
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_MarkerOutsideTailWindow_ReturnsNull()
+    {
+        // A recovered-then-cleared 429 followed by lots of further work (the run then
+        // ends on a markerless failure) must NOT be surfaced: the marker scrolled out
+        // of the tail window, so the region is null and nothing reaches the classifiers.
+        var lines = new List<string> { "RESOURCE_EXHAUSTED (code 429): recovered after retry" };
+        for (var i = 0; i < 60; i++) lines.Add($"tool call {i}");
+        lines.Add("Error: timed out waiting for response");
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(string.Join("\n", lines)));
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_NoMarker_ReturnsNull()
+    {
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(
+            "Model resolved: gemini-3.5-flash\nwrote 3 files\ndone"));
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(null));
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(""));
+    }
 }

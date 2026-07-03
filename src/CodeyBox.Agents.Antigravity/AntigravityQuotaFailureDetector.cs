@@ -57,6 +57,55 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         @"(?:lockout\s+until|locked\s+until|reset(?:s)?\s+at|available\s+at)\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    /// <summary>
+    /// Extracts agy's <b>terminal</b> error region from its cumulative glog: the
+    /// slice from the LAST known quota/auth marker to the end of the log, but only
+    /// when that marker falls inside the tail window (the final
+    /// <paramref name="windowLines"/> content lines). Returns <c>null</c> when no
+    /// marker sits in the tail window.
+    ///
+    /// <para>agy aborts a run immediately after writing its terminal error, so the
+    /// error that actually ended the run sits at the very end of the glog. This is
+    /// what lets the caller surface ONLY the terminal failure to the classifier-
+    /// facing <c>result.Stderr</c> without folding the whole cumulative log: an
+    /// earlier <c>RESOURCE_EXHAUSTED</c> that agy retried past (and then logged many
+    /// more lines after) falls outside the tail window and is excluded, so it can't
+    /// falsely park/bench the member; a genuinely terminal 429/401 sits inside the
+    /// window and is surfaced. The reset hint (e.g. <c>Resets in 8m14s</c>) rides on
+    /// the same terminal line, so <see cref="Detect"/>'s reset parsing still works
+    /// off the folded region.</para>
+    /// </summary>
+    public static string? ExtractTerminalErrorRegion(string? glog, int windowLines = 25)
+    {
+        if (string.IsNullOrEmpty(glog)) return null;
+
+        var lines = glog.Replace("\r", string.Empty, StringComparison.Ordinal).Split('\n');
+        var end = lines.Length;
+        while (end > 0 && lines[end - 1].Length == 0) end--; // drop trailing blank lines
+        if (end == 0) return null;
+
+        var windowStart = Math.Max(0, end - windowLines);
+        var lastMarker = -1;
+        for (var i = windowStart; i < end; i++)
+        {
+            if (LineContainsQuotaOrAuthMarker(lines[i]))
+                lastMarker = i;
+        }
+        if (lastMarker < 0) return null;
+
+        return string.Join("\n", lines[lastMarker..end]);
+    }
+
+    private static bool LineContainsQuotaOrAuthMarker(string line)
+    {
+        foreach (var (pattern, _) in Patterns)
+        {
+            if (line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     public QuotaDetection? Detect(string? stderr, string? stdout)
     {
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))

@@ -18,6 +18,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     public abstract AgentKind Kind { get; }
 
     /// <summary>
+    /// Wire <c>type</c> of the JSON envelope used to fold agent stderr
+    /// diagnostics into a structured (NDJSON) capture stream without
+    /// interleaving non-JSON noise. Exposed so runners in sibling assemblies
+    /// that hand-build the same envelope (e.g. antigravity folding its glog
+    /// into the stream) reuse this literal instead of re-hardcoding it and
+    /// silently desynchronising from <see cref="AgentStreamParser"/>'s parser.
+    /// </summary>
+    public const string StderrEnvelopeType = "codeybox.stderr";
+
+    /// <summary>
+    /// Serialises a single stderr-diagnostic line as the codeybox-internal NDJSON
+    /// envelope (<c>{"type":"codeybox.stderr","text":...}</c>) that
+    /// <see cref="AgentStreamParser"/> recognises, terminated with the newline that
+    /// frames one envelope per line. Exposed so sibling-assembly runners that fold a
+    /// CLI log into a structured stream (e.g. antigravity's glog) emit a
+    /// byte-identical envelope via the SAME serializer <see cref="StderrEnvelopeForwarder"/>
+    /// uses, instead of re-implementing the shape and drifting from the parser.
+    /// </summary>
+    public static string SerializeStderrEnvelopeLine(string text)
+        => JsonSerializer.Serialize(new { type = StderrEnvelopeType, text }) + "\n";
+
+    /// <summary>
     /// Sandbox CLI invocation built by concrete agent runners. This stays
     /// protected so argv/environment/stdin details do not leak into Core's
     /// domain/plugin-facing API.
@@ -551,7 +573,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// </summary>
     internal sealed class StderrEnvelopeForwarder
     {
-        public const string EnvelopeType = "codeybox.stderr";
+        public const string EnvelopeType = StderrEnvelopeType;
 
         // A misbehaving CLI / tool can emit a single very long stderr line
         // without a newline (terminal control sequences, JSON dumps, stack
@@ -625,7 +647,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             string envelope;
             try
             {
-                envelope = JsonSerializer.Serialize(new { type = EnvelopeType, text }) + "\n";
+                envelope = SerializeStderrEnvelopeLine(text);
             }
             catch (NotSupportedException)
             {

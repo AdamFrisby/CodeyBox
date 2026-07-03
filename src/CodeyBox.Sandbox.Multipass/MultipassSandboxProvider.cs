@@ -5115,6 +5115,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedSupervisorSetupFailedExitCode = 88;
     private const int DetachedPollFailureLimit = 5;
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
+
+    // Test seam: override the WaitForDetachedCompletionAsync poll interval.
+    // Production polls every 2s; tests set a small value so the loop is not
+    // wall-clock-bound (a real 2s Task.Delay can drift well past a short test
+    // deadline under thread-pool starvation, making the test flaky).
+    internal TimeSpan? DetachedPollIntervalOverride { get; set; }
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -6260,10 +6266,11 @@ while True:
         // completion. VM-side sidecars are diagnostic only: the agent can sudo
         // inside the sandbox and must not be able to forge a successful exit.
         var pollFailures = 0;
+        var pollInterval = DetachedPollIntervalOverride ?? TimeSpan.FromSeconds(2);
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+            await Task.Delay(pollInterval, ct).ConfigureAwait(false);
 
             var state = await ProbeDetachedProcessGroupAsync(processGroupMarker, ct).ConfigureAwait(false);
             if (state.Status != DetachedProcessGroupStatus.PollFailed)
