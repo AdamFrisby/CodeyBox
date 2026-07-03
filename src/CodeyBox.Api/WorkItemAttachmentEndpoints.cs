@@ -155,44 +155,33 @@ internal static class WorkItemAttachmentEndpoints
         return Results.Ok(rows.Select(ToDto).ToList());
     }
 
-    private static IResult DownloadAsync(
+    private static async Task<IResult> DownloadAsync(
         string id,
         string attachmentId,
         IWorkItemAttachmentStore store,
         IWorkItemAttachmentBlobStore blobs,
-        HttpContext ctx,
         CancellationToken ct)
     {
         if (!TryParseWorkItemId(id, out var workItemId))
             return Results.BadRequest(new { error = "invalid work item id" });
-        // Read in the response body — we need to flow the file stream out
-        // directly with the right content type / filename.
-        return Results.Stream(
-            async writer =>
-            {
-                var record = await store.GetAsync(attachmentId, ct);
-                if (record is null || record.WorkItemId != workItemId)
-                {
-                    ctx.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                    return;
-                }
-                await using var blob = blobs.OpenRead(record.Sha256);
-                if (blob is null)
-                {
-                    ctx.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                    return;
-                }
-                ctx.Response.ContentType = string.IsNullOrWhiteSpace(record.ContentType)
-                    ? MediaTypeNames.Application.Octet
-                    : record.ContentType;
-                ctx.Response.ContentLength = record.SizeBytes;
-                ctx.Response.Headers.ContentDisposition =
-                    new ContentDispositionHeaderValue("attachment")
-                    {
-                        FileNameStar = record.FileName,
-                    }.ToString();
-                await blob.CopyToAsync(writer, ct);
-            });
+
+        var record = await store.GetAsync(attachmentId, ct);
+        if (record is null || record.WorkItemId != workItemId)
+            return Results.NotFound();
+
+        var blob = blobs.OpenRead(record.Sha256);
+        if (blob is null)
+            return Results.NotFound();
+
+        var contentType = string.IsNullOrWhiteSpace(record.ContentType)
+            ? MediaTypeNames.Application.Octet
+            : record.ContentType;
+
+        return Results.File(
+            blob,
+            contentType: contentType,
+            fileDownloadName: record.FileName,
+            enableRangeProcessing: true);
     }
 
     private static async Task<IResult> DeleteAsync(
