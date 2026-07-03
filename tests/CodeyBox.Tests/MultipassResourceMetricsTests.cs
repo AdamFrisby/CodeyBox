@@ -341,6 +341,71 @@ public sealed class MultipassResourceMetricsTests : IDisposable
     }
 
     [Fact]
+    public async Task PeakRamSamplerScript_RecordsRunningMaxAcrossTicks()
+    {
+        var root = Directory.CreateTempSubdirectory("codeybox-fake-meminfo-").FullName;
+        try
+        {
+            var outPath = Path.Combine(root, "peak");
+            var meminfoPath = Path.Combine(root, "meminfo");
+
+            // Tick 1: 100 MiB used (MemTotal - MemAvailable = 102400 KiB) -> peak written.
+            await WriteFakeMeminfoAsync(meminfoPath, memTotalKb: 204800, memAvailableKb: 102400);
+            await RunPeakRamSamplerAsync(meminfoPath, outPath);
+            Assert.Equal(102400L * 1024, ReadPeak(outPath));
+
+            // Tick 2: only 50 MiB used -> running max must be preserved, not lowered.
+            await WriteFakeMeminfoAsync(meminfoPath, memTotalKb: 204800, memAvailableKb: 153600);
+            await RunPeakRamSamplerAsync(meminfoPath, outPath);
+            Assert.Equal(102400L * 1024, ReadPeak(outPath));
+
+            // Tick 3: 150 MiB used -> new high-water mark recorded.
+            await WriteFakeMeminfoAsync(meminfoPath, memTotalKb: 204800, memAvailableKb: 51200);
+            await RunPeakRamSamplerAsync(meminfoPath, outPath);
+            Assert.Equal(153600L * 1024, ReadPeak(outPath));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    private static async Task WriteFakeMeminfoAsync(string path, long memTotalKb, long memAvailableKb) =>
+        // Trailing newline matters: real /proc/meminfo ends with one, and the
+        // sampler's `while read` loop drops a final line that has no newline.
+        await File.WriteAllTextAsync(path, FormattableString.Invariant(
+            $"MemTotal:       {memTotalKb} kB\nMemFree:        1024 kB\nMemAvailable:   {memAvailableKb} kB\n"));
+
+    private static long ReadPeak(string outPath) =>
+        long.Parse(File.ReadAllText(outPath).Trim(), System.Globalization.CultureInfo.InvariantCulture);
+
+    private static async Task RunPeakRamSamplerAsync(string meminfoPath, string outPath)
+    {
+        using var process = new Process();
+        process.StartInfo = new ProcessStartInfo("sh")
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        process.StartInfo.ArgumentList.Add("-s");
+        process.StartInfo.Environment["CODEYBOX_PEAK_RAM_MEMINFO"] = meminfoPath;
+        process.StartInfo.Environment["CODEYBOX_PEAK_RAM_OUT"] = outPath;
+        process.StartInfo.Environment["CODEYBOX_PEAK_RAM_INTERVAL"] = "0";
+        process.StartInfo.Environment["CODEYBOX_PEAK_RAM_MAX_TICKS"] = "1";
+        Assert.True(process.Start());
+        await process.StandardInput.WriteAsync(MultipassSandboxProvider.BuildPeakRamSamplerScript());
+        process.StandardInput.Close();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.StandardOutput.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var stderr = await stderrTask;
+        Assert.Equal(0, process.ExitCode);
+        Assert.True(string.IsNullOrEmpty(stderr), stderr);
+    }
+
+    [Fact]
     public void BuildCloudInit_DefaultOmitsPeakRamSamplerService()
     {
         var cloudInit = MultipassSandboxProvider.BuildCloudInit(

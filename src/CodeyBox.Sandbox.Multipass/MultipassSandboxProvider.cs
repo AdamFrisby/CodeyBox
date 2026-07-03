@@ -47,7 +47,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
+public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -3707,11 +3707,28 @@ test "$work" = present && test "$exec_wrapper" = present
     internal const string PeakRamSamplerPath = "/run/codeybox-peak-ram-bytes";
     internal const string ResourceDataInterface = "ens4";
 
-    private const string PeakRamSamplerScript = """
+    // The output path is derived from PeakRamSamplerPath so the host-side
+    // capture (which reads the same const via CODEYBOX_PEAK_RAM_SAMPLER_PATH)
+    // and the baked sampler cannot drift. The meminfo source, output path,
+    // tick interval and max-tick count are all env-overridable so the running-
+    // max logic can be exercised by a unit test against a fake /proc/meminfo;
+    // in the baked VM they default to the production values (an infinite loop
+    // over /proc/meminfo every 10s). The starting peak is seeded from any
+    // existing output file so a sampler restart (Restart=always) does not lose
+    // the high-water mark recorded before it crashed.
+    internal static string BuildPeakRamSamplerScript() => $$"""
         #!/bin/sh
-        out=/run/codeybox-peak-ram-bytes
+        out=${CODEYBOX_PEAK_RAM_OUT:-{{ShellSingleQuote(PeakRamSamplerPath)}}}
+        meminfo=${CODEYBOX_PEAK_RAM_MEMINFO:-/proc/meminfo}
+        interval=${CODEYBOX_PEAK_RAM_INTERVAL:-10}
+        max_ticks=${CODEYBOX_PEAK_RAM_MAX_TICKS:-0}
         peak=0
-        interval=10
+        existing=$(head -c 64 "$out" 2>/dev/null | awk 'NR == 1 { print; exit }' || true)
+        case "$existing" in
+            ''|*[!0-9]*) : ;;
+            *) peak=$existing ;;
+        esac
+        ticks=0
         while :; do
             mem_total_kb=0
             mem_available_kb=0
@@ -3720,7 +3737,7 @@ test "$work" = present && test "$exec_wrapper" = present
                     MemTotal:) mem_total_kb=$value ;;
                     MemAvailable:) mem_available_kb=$value ;;
                 esac
-            done < /proc/meminfo
+            done < "$meminfo"
             if [ "$mem_total_kb" -gt 0 ] && [ "$mem_available_kb" -gt 0 ]; then
                 used_bytes=$(( (mem_total_kb - mem_available_kb) * 1024 ))
                 if [ "$used_bytes" -gt "$peak" ]; then
@@ -3728,6 +3745,10 @@ test "$work" = present && test "$exec_wrapper" = present
                     tmp="${out}.$$"
                     printf '%s\n' "$peak" > "$tmp" && mv -f "$tmp" "$out"
                 fi
+            fi
+            ticks=$(( ticks + 1 ))
+            if [ "$max_ticks" -gt 0 ] && [ "$ticks" -ge "$max_ticks" ]; then
+                break
             fi
             sleep "$interval"
         done
@@ -3878,7 +3899,7 @@ test "$work" = present && test "$exec_wrapper" = present
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
         var peakRamSamplerIndented = includePeakRamSampler
-            ? string.Join("\n      ", PeakRamSamplerScript.Split('\n'))
+            ? string.Join("\n      ", BuildPeakRamSamplerScript().Split('\n'))
             : null;
         var peakRamSamplerServiceIndented = includePeakRamSampler
             ? string.Join("\n      ", PeakRamSamplerService.Split('\n'))
@@ -4129,6 +4150,12 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 
     private MultipassSandboxOptions ReadOptions() => _optsAccessor();
+
+    /// <summary>
+    /// <see cref="IResourceMetricsCapturingProvider"/>: read live so a hot-reload
+    /// of the capture toggle is observed on the next reuse decision.
+    /// </summary>
+    public bool CapturesResourceMetrics => ReadOptions().CaptureResourceMetrics;
 
     /// <summary>
     /// Classifies a multipass argv as a "heavy" daemon/filesystem operation

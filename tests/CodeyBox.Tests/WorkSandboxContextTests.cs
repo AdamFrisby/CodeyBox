@@ -39,9 +39,11 @@ public sealed class WorkSandboxContextTests
     }
 
     [Fact]
-    public async Task GetOrCreateSandboxAsync_DoesNotReuseAcrossTimingPhases()
+    public async Task GetOrCreateSandboxAsync_DoesNotReuseAcrossTimingPhases_WhenCapturingMetrics()
     {
-        var provider = new RecordingSandboxProvider();
+        // Capture on: each phase must get its own VM so the per-phase resource
+        // record is attributable to a single phase.
+        var provider = new RecordingSandboxProvider { CapturesResourceMetrics = true };
         await using var context = new WorkSandboxContext(
             provider,
             new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = true, MaxSandboxReuses = 10 }),
@@ -70,6 +72,72 @@ public sealed class WorkSandboxContextTests
         Assert.False(provider.Created[1].Disposed);
     }
 
+    [Fact]
+    public async Task GetOrCreateSandboxAsync_ReusesAcrossTimingPhases_WhenNotCapturingMetrics()
+    {
+        // Capture off (the default): the warm VM is reused across work<->rework,
+        // exactly as before the resource-capture feature — no per-phase churn.
+        var provider = new RecordingSandboxProvider { CapturesResourceMetrics = false };
+        await using var context = new WorkSandboxContext(
+            provider,
+            new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = true, MaxSandboxReuses = 10 }),
+            NullLogger.Instance);
+
+        await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            TimingPhase = "work",
+        }, CancellationToken.None))
+        {
+        }
+
+        await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            TimingPhase = "rework",
+        }, CancellationToken.None))
+        {
+        }
+
+        Assert.Single(provider.Created);
+        Assert.False(provider.Created[0].Disposed);
+    }
+
+    [Fact]
+    public async Task GetOrCreateSandboxAsync_ReusesSamePhase_EvenWhenCapturingMetrics()
+    {
+        // Same phase twice must still reuse one VM even with capture on — the
+        // phase-mismatch recreation must not degenerate into always-recreate.
+        var provider = new RecordingSandboxProvider { CapturesResourceMetrics = true };
+        await using var context = new WorkSandboxContext(
+            provider,
+            new PipelineTuningSnapshot(new PipelineTuningOptions { EnableSandboxReuse = true, MaxSandboxReuses = 10 }),
+            NullLogger.Instance);
+
+        await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            TimingPhase = "rework",
+        }, CancellationToken.None))
+        {
+        }
+
+        await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            TimingPhase = "rework",
+        }, CancellationToken.None))
+        {
+        }
+
+        Assert.Single(provider.Created);
+        Assert.False(provider.Created[0].Disposed);
+    }
+
     private sealed class SingleSandboxProvider(ISandbox sandbox) : ISandboxProvider
     {
         public string Name => "single";
@@ -81,10 +149,11 @@ public sealed class WorkSandboxContextTests
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class RecordingSandboxProvider : ISandboxProvider
+    private sealed class RecordingSandboxProvider : ISandboxProvider, IResourceMetricsCapturingProvider
     {
         public string Name => "recording";
         public List<RecordingSandbox> Created { get; } = [];
+        public bool CapturesResourceMetrics { get; set; }
 
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {

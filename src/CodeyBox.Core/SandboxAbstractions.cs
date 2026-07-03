@@ -64,6 +64,26 @@ public interface ISandboxProvider
 }
 
 /// <summary>
+/// Optional <see cref="ISandboxProvider"/> capability that reports whether the
+/// provider captures per-VM resource metrics at teardown (the multipass
+/// <c>CaptureResourceMetrics</c> toggle). When true, each work-item timing
+/// phase must be kept on its own VM so a persisted per-phase resource record is
+/// attributable to a single phase; when false (the default), a warm reusable VM
+/// is shared across phases as before, incurring no extra teardown/rebuild churn.
+/// <c>WorkSandboxContext</c> queries this so the phase-keyed VM isolation only
+/// fires when the capture feature is enabled. Providers that never capture
+/// metrics simply do not implement this interface.
+/// </summary>
+public interface IResourceMetricsCapturingProvider
+{
+    /// <summary>
+    /// True when the provider captures per-VM resource usage at teardown. Read
+    /// live so a hot-reload of the capture toggle is observed on the next call.
+    /// </summary>
+    bool CapturesResourceMetrics { get; }
+}
+
+/// <summary>
 /// Snapshot of a sandbox that exists on the host, returned by
 /// <see cref="ISandboxProvider.ListAllManagedAsync"/>.
 /// </summary>
