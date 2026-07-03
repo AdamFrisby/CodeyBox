@@ -38,7 +38,7 @@ namespace CodeyBox.StatisticsPlugin;
     displayName: "CodeyBox: Statistics",
     minHostApiVersion: "1.2")]
 public sealed class StatisticsQuotaPlugin
-    : IMetricSampler, IQuotaTimeSeriesStore, ICapacityCalculator, IResetCreditExpiryEstimator, IPluginInitializer, IAsyncDisposable
+    : IMetricSampler, IQuotaTimeSeriesStore, ICapacityCalculator, IResetCreditExpiryEstimator, IResetOptimalityAdvisor, IPluginInitializer, IAsyncDisposable
 {
     public const string PluginId = "codeybox.statistics";
     public const string QuotaSamplerKind = "quota";
@@ -382,6 +382,134 @@ public sealed class StatisticsQuotaPlugin
             _logger.LogDebug(ex, "Statistics plugin: skipping malformed raw snapshot while deriving reset-credit expiry");
             return null;
         }
+    }
+
+    /// <inheritdoc/>
+    public async Task<ResetSpendAdvice> AdviseAsync(
+        ResetAdviceRequest request,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var store = _store
+            ?? throw new InvalidOperationException("Statistics plugin: store not initialised — InitializeAsync has not run yet");
+
+        ResetOptimalityConfigOptions opts;
+        int maxRows;
+        TimeSpan lookback;
+        lock (_stateLock)
+        {
+            opts = _options.ResetOptimality;
+            maxRows = _options.MaxQueryRows;
+            lookback = _options.ResetCreditExpiry.Lookback;
+        }
+
+        var agent = string.IsNullOrWhiteSpace(request.Agent)
+            ? (opts.Agents.Count > 0 ? opts.Agents[0] : "codex")
+            : request.Agent.Trim();
+
+        var now = _timeProvider.GetUtcNow();
+        var toUtc = request.ToUtc?.ToUniversalTime() ?? now;
+        var fromUtc = request.FromUtc?.ToUniversalTime() ?? toUtc - lookback;
+
+        // Reuse the credit-expiry derivation (2/5) for the banked-credit reading.
+        var credits = await EstimateAsync(
+            new ResetCreditExpiryQuery { Agent = agent, FromUtc = fromUtc, ToUtc = toUtc },
+            ct);
+
+        // Latest quota snapshot (1/5): the most recent raw row for the agent.
+        var quota = await ReadLatestSnapshotAsync(store, agent, fromUtc, toUtc, maxRows, ct);
+
+        // Self-calibrate the cadence anchor from observed weekly resets in the
+        // logger, when enabled and an anchor is configured to refine.
+        var anchor = opts.CadenceAnchor;
+        if (anchor is { } configuredAnchor && opts.RefineAnchorFromLogger)
+        {
+            var observedResets = await DetectWeeklyResetsAsync(store, agent, fromUtc, toUtc, maxRows, ct);
+            anchor = NaturalResetCadence.RefineAnchor(
+                configuredAnchor, opts.CadencePeriod, observedResets, opts.TimeTolerance);
+        }
+
+        var config = new ResetOptimalityConfig
+        {
+            PlanEndsAt = opts.PlanEndsAt,
+            CadenceAnchor = anchor,
+            CadencePeriod = opts.CadencePeriod,
+            DustThresholdPct = opts.DustThresholdPct,
+            TimeTolerance = opts.TimeTolerance,
+            Agents = opts.Agents,
+        };
+
+        return ResetOptimalityEvaluator.Evaluate(agent, quota, credits, config, now);
+    }
+
+    /// <summary>
+    /// Returns the most recent persisted <see cref="AgentQuotaSnapshot"/> for
+    /// <paramref name="agent"/> in the window, or an unknown snapshot when the
+    /// series is empty / unparseable — so the advisor holds (burn-first cannot
+    /// be evaluated) rather than acting on a fabricated reading.
+    /// </summary>
+    private async Task<AgentQuotaSnapshot> ReadLatestSnapshotAsync(
+        QuotaTimeSeriesSqliteStore store,
+        string agent,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        int maxRows,
+        CancellationToken ct)
+    {
+        var filter = new QuotaTimeSeriesFilter
+        {
+            Agent = agent,
+            FromUtc = fromUtc,
+            ToUtc = toUtc + TimeSpan.FromSeconds(1),
+            Limit = maxRows,
+        };
+
+        var rawRows = await store.QueryRawAsync(filter, ct);
+        if (rawRows.Count == 0)
+            return AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Transient, "no quota snapshot logged for the requested window");
+
+        // QueryRawAsync orders ascending, so the last row is the most recent.
+        var rawJson = rawRows[^1].RawJson;
+        try
+        {
+            var snapshot = JsonSerializer.Deserialize<AgentQuotaSnapshot>(rawJson);
+            return snapshot ?? AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Permanent, "latest quota snapshot deserialised to null");
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogDebug(ex, "Statistics plugin: latest quota snapshot for {Agent} is unparseable", agent);
+            return AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Permanent, "latest quota snapshot is unparseable");
+        }
+    }
+
+    /// <summary>
+    /// Detects weekly natural-reset instants from the logged <c>weekly</c>-window
+    /// series: a sample whose usable % jumps up across the reset thresholds
+    /// (from a spent window to a fresh one) marks a reset. These feed the
+    /// cadence-anchor self-calibration.
+    /// </summary>
+    private async Task<IReadOnlyList<DateTimeOffset>> DetectWeeklyResetsAsync(
+        QuotaTimeSeriesSqliteStore store,
+        string agent,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        int maxRows,
+        CancellationToken ct)
+    {
+        var filter = new QuotaTimeSeriesFilter
+        {
+            Agent = agent,
+            WindowName = "weekly",
+            FromUtc = fromUtc,
+            ToUtc = toUtc + TimeSpan.FromSeconds(1),
+            Limit = maxRows,
+        };
+
+        var rows = await store.QueryAsync(filter, ct);
+        return WeeklyNaturalResetDetector.Detect(rows);
     }
 
     private QuotaTimeSeriesFilter ClampFilterLimit(QuotaTimeSeriesFilter filter)
