@@ -172,6 +172,39 @@ public sealed class ResetCreditExpiryEstimatorTests : IDisposable
         Assert.Empty(claudeReport.Credits);
     }
 
+    [Fact]
+    public async Task Estimate_SeedsApplyOnlyToConfiguredAgent_NotOtherAgents()
+    {
+        // Seeds are pre-observation credits for the single configured agent
+        // (codex). Querying an unrelated agent must NOT surface them, or the
+        // estimator fabricates banked credits for an agent that has none.
+        var codex = new MutableProbe(AgentKind.Codex) { ResetCreditsAvailable = 0 };
+        var claude = new MutableProbe(AgentKind.Claude) { ResetCreditsAvailable = null };
+        var clock = new FakeClock(DateTimeOffset.Parse("2026-06-01T00:00:00Z"));
+        await using var plugin = await BuildPluginAsync(
+            [codex, claude],
+            clock,
+            extraConfig: new Dictionary<string, string?>
+            {
+                ["ResetCreditExpiry:Seeds:0:EstimatedExpiresAt"] = "2026-06-16T00:00:00Z",
+                ["ResetCreditExpiry:Seeds:0:Label"] = "credit A",
+            });
+
+        await plugin.SampleOnceAsync(CancellationToken.None);
+
+        // Default query resolves to the configured agent (codex): seed present.
+        var codexReport = await plugin.EstimateAsync(new ResetCreditExpiryQuery());
+        var seed = Assert.Single(codexReport.Credits);
+        Assert.True(seed.IsEstimated);
+        Assert.True(codexReport.NextCreditIsEstimated);
+
+        // Explicitly querying claude must NOT inherit codex's seed.
+        var claudeReport = await plugin.EstimateAsync(new ResetCreditExpiryQuery { Agent = "claude" });
+        Assert.Empty(claudeReport.Credits);
+        Assert.Null(claudeReport.NextCreditExpiresAt);
+        Assert.False(claudeReport.NextCreditIsEstimated);
+    }
+
     private async Task<StatisticsQuotaPlugin> BuildPluginAsync(
         IEnumerable<IAgentQuotaProbe> probes,
         TimeProvider timeProvider,

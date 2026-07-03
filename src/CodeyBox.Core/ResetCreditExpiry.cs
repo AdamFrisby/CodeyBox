@@ -35,6 +35,15 @@ namespace CodeyBox.Core;
 public static class ResetCreditExpiryTracker
 {
     /// <summary>
+    /// Upper bound on a single-step count increase treated as a real grant
+    /// burst. Reset credits are single-digit in practice; a larger jump is a
+    /// corrupt/glitched reading and is skipped rather than enqueued unit-by-unit
+    /// (guards against a bogus ~2e9 reading exhausting memory).
+    /// </summary>
+    private const int MaxPlausibleGrantStep = 1000;
+
+
+    /// <summary>
     /// Replays an ordered reset-credit-count time-series and returns the
     /// derived set of banked credits with their inferred expiries.
     /// </summary>
@@ -85,6 +94,15 @@ public static class ResetCreditExpiryTracker
             }
 
             var delta = obs.AvailableCount - previousCount.Value;
+            if (delta > MaxPlausibleGrantStep)
+            {
+                // An implausibly large single-step jump is a corrupt/glitched
+                // reading, not a real grant burst (reset credits are single
+                // digits). Enqueuing one Grant per unit would let a bogus
+                // ~2e9 value exhaust memory. Skip the step as a bad row: keep
+                // the baseline where it is so a later valid reading re-syncs.
+                continue;
+            }
             if (delta > 0)
             {
                 // Grant(s): pin each to the last sample at the previous lower
@@ -129,14 +147,17 @@ public static class ResetCreditExpiryTracker
         // (grant_time + expiryPeriod - safetyBuffer). Because the safety buffer
         // is a constant, the minimum spend-by moment belongs to the credit with
         // the earliest raw expiry (the oldest grant when all share one period).
-        DateTimeOffset? next = credits.Count == 0
+        // Track whether that driving credit is a seeded estimate so a consumer
+        // reading only the headline never renders an operator guess as precise.
+        BankedResetCredit? nextCredit = credits.Count == 0
             ? null
-            : credits.Min(c => c.AdvisedSpendByAt);
+            : credits.Aggregate((a, b) => b.AdvisedSpendByAt < a.AdvisedSpendByAt ? b : a);
 
         return new ResetCreditExpiryReport
         {
             Credits = credits,
-            NextCreditExpiresAt = next,
+            NextCreditExpiresAt = nextCredit?.AdvisedSpendByAt,
+            NextCreditIsEstimated = nextCredit?.IsEstimated ?? false,
             LatestObservedCount = previousCount,
             ExpiryPeriod = config.ExpiryPeriod,
             SafetyBuffer = config.SafetyBuffer,
@@ -239,6 +260,15 @@ public sealed record ResetCreditExpiryReport
     /// credits are tracked. This is the value a reset advisor watches.
     /// </summary>
     public DateTimeOffset? NextCreditExpiresAt { get; init; }
+
+    /// <summary>
+    /// True when the credit driving <see cref="NextCreditExpiresAt"/> is a
+    /// seeded operator estimate rather than an observed grant. A consumer that
+    /// surfaces only the headline value must render it as an estimate (never as
+    /// a precise provider deadline) when this is set. False when no credits are
+    /// tracked or the soonest is observed.
+    /// </summary>
+    public bool NextCreditIsEstimated { get; init; }
 
     /// <summary>
     /// The most recent observed <c>available_count</c>, or null when the

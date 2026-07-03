@@ -52,7 +52,31 @@ public sealed class ResetCreditExpiryTrackerTests
         Assert.Equal(
             Base + TimeSpan.FromMinutes(30) + ThirtyDays - TwentyFourHours,
             report.NextCreditExpiresAt);
+        // An observed grant drives the headline → not an estimate.
+        Assert.False(report.NextCreditIsEstimated);
         Assert.Equal(1, report.LatestObservedCount);
+    }
+
+    [Fact]
+    public void CorruptGrantStep_IsSkippedRatherThanEnqueuedUnitByUnit()
+    {
+        // A single glitched reading of ~2e9 must NOT enqueue billions of Grants
+        // (memory-exhaustion guard). The implausible step is skipped as a bad
+        // row and the baseline stays put, so a later valid reading re-syncs.
+        var observations = new[]
+        {
+            Obs(0, 1),
+            Obs(15, int.MaxValue), // corrupt jump — skipped
+            Obs(30, 2),            // back to a real reading (1 → 2 grant)
+        };
+
+        var report = ResetCreditExpiryTracker.Track(observations, DefaultConfig());
+
+        // Only the genuine grant survives; the corrupt step added nothing.
+        var credit = Assert.Single(report.Credits);
+        Assert.False(credit.IsEstimated);
+        // Baseline held at 1 across the skipped step, so the grant pins to t+0.
+        Assert.Equal(Base, credit.GrantedAt);
     }
 
     [Fact]
@@ -145,8 +169,10 @@ public sealed class ResetCreditExpiryTrackerTests
         Assert.False(observed.IsEstimated);
         Assert.Null(observed.Label);
 
-        // The seed expires first, so it drives nextCreditExpiresAt.
+        // The seed expires first, so it drives nextCreditExpiresAt — and the
+        // headline must be flagged estimated so it is never rendered as precise.
         Assert.Equal(seedExpiry - TwentyFourHours, report.NextCreditExpiresAt);
+        Assert.True(report.NextCreditIsEstimated);
     }
 
     [Fact]

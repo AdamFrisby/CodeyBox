@@ -338,13 +338,22 @@ public sealed class StatisticsQuotaPlugin
                 observations.Add(new ResetCreditObservation(row.SampledAt, value));
         }
 
+        // Seeds are pre-observation credits for the single configured agent
+        // (opts.Agent). They must NOT be attributed to an unrelated agent
+        // queried via ?agent=... — doing so would fabricate banked credits for
+        // an agent that has none. Only inject seeds when the effective series
+        // agent matches the configured one.
+        var seedsApply = string.Equals(agent, opts.Agent, StringComparison.OrdinalIgnoreCase);
+
         var config = new ResetCreditExpiryConfig
         {
             ExpiryPeriod = opts.ExpiryPeriod,
             SafetyBuffer = opts.SafetyBuffer,
-            SeededCredits = opts.Seeds
-                .Select(s => new SeededResetCredit { EstimatedExpiresAt = s.EstimatedExpiresAt, Label = s.Label })
-                .ToList(),
+            SeededCredits = seedsApply
+                ? opts.Seeds
+                    .Select(s => new SeededResetCredit { EstimatedExpiresAt = s.EstimatedExpiresAt, Label = s.Label })
+                    .ToList()
+                : new List<SeededResetCredit>(),
         };
 
         return ResetCreditExpiryTracker.Track(observations, config);

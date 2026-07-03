@@ -335,7 +335,11 @@ queue of credit grant-times:
   closest-to-expiry first), mirroring how the provider spends the
   soonest-expiring credit. A decrement below what is tracked is a safe no-op.
 - **`nextCreditExpiresAt`** = min over queued grants of
-  `grant_time + expiryPeriod − safetyBuffer`.
+  `grant_time + expiryPeriod − safetyBuffer`. The companion
+  **`nextCreditIsEstimated`** is `true` when the credit driving that headline is
+  a seeded operator estimate (below) rather than an observed grant — a consumer
+  reading only the headline must then render it as an estimate, never as a
+  precise provider deadline.
 
 A sample whose count is **absent** (older provider / probe failure) is treated
 as a *gap*, not a decrement to zero, so it never spuriously retires a credit.
@@ -348,7 +352,9 @@ increment, so their age cannot be inferred. Seed them under
 seeded credit `isEstimated: true` so it is never presented as precise. Seeds
 are treated as the oldest credits (retired before any observed grant on a
 decrement) and are sorted by estimated expiry so the soonest-expiring is
-retired first.
+retired first. Seeds belong to the single configured agent
+(`ResetCreditExpiry:Agent`, default `codex`); a request for a different `agent`
+reads that agent's own series and never inherits the configured agent's seeds.
 
 ### Query parameters
 
@@ -383,6 +389,7 @@ curl 'http://orchestrator/quota/reset-credits?agent=codex'
     }
   ],
   "nextCreditExpiresAt": "2026-07-15T00:00:00+00:00",
+  "nextCreditIsEstimated": true,
   "latestObservedCount": 2,
   "expiryPeriod": "30.00:00:00",
   "safetyBuffer": "1.00:00:00"
