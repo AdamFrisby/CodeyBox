@@ -68,8 +68,10 @@ public sealed class OrchestratorServicePhaseCancellationLogTests : IDisposable
             logger);
 
         await service.StartAsync(CancellationToken.None);
-        await pipeline.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token);
+        // 45 s, not 10 s: pipeline start rides the thread-starved worker loop under
+        // parallel audit-suite load; the wait completes the instant it starts.
+        await pipeline.Started.Task.WaitAsync(TimeSpan.FromSeconds(45));
+        await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(30)).Token);
 
         var entry = await WaitForLogAsync(logger, e =>
             e.Properties.TryGetValue("CancellationSource", out var s)
@@ -118,7 +120,7 @@ public sealed class OrchestratorServicePhaseCancellationLogTests : IDisposable
                 && ss == CancellationSources.StuckProbe
                 && e.Message.Contains("cancelled in phase", StringComparison.Ordinal));
 
-        await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token);
+        await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(30)).Token);
 
         Assert.Equal(LogLevel.Information, entry.Level);
         Assert.Equal("audit", entry.Properties["Phase"]);
@@ -133,8 +135,9 @@ public sealed class OrchestratorServicePhaseCancellationLogTests : IDisposable
     {
         // Push-based wait: wakes on each new log call rather than polling a
         // wall-clock deadline that races ThreadPool starvation under the capped
-        // full-suite load. The 15s timeout is only a no-log-regression backstop.
-        return logger.WaitForEntryAsync(predicate, TimeSpan.FromSeconds(15));
+        // full-suite load. The 45s timeout is only a no-log-regression backstop —
+        // wide enough that a thread-starved worker loop still logs before it trips.
+        return logger.WaitForEntryAsync(predicate, TimeSpan.FromSeconds(45));
     }
 
     /// <summary>

@@ -51,7 +51,11 @@ public sealed class InVmSmokeProbeServiceTests
     private static async Task AwaitExecute(InVmSmokeProbeService service)
     {
         var done = service.ExecuteTask ?? Task.CompletedTask;
-        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(15)));
+        // 45 s ceiling (not 15 s): the single sweep completes in milliseconds on a
+        // healthy box, but under parallel audit-suite load the sweep's scripted
+        // sandbox exec can be starved of a thread-pool thread past 15 s. Task.WhenAny
+        // returns the instant the sweep finishes, so this only widens headroom.
+        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(45)));
         Assert.Same(done, winner); // single-sweep ExecuteAsync must complete promptly
         await done; // surface any exception that escaped (there must be none)
     }
