@@ -1303,42 +1303,41 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var launchScript = Path.Combine(_workspace, "detached-launch.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached.pgid");
         var doneFile = Path.Combine(_workspace, "detached.done");
+        var releaseFile = Path.Combine(_workspace, "detached.release");
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
-        // Sleep far longer than any plausible launch-script overhead. The
-        // "returns before the command completes" invariant is then verified by
-        // the command still being in-flight when the launch returns (doneFile
-        // absent), NOT by an absolute wall-clock deadline. The launch spawns
-        // several python3/sudo helpers before it backgrounds the command, so a
-        // tight deadline flakes under full-suite thread-pool contention even
-        // though the launch is genuinely non-blocking.
-        await File.WriteAllTextAsync(commandScript, "sleep 30\nprintf done > \"$1\"\n");
+        // The detached command blocks on a release gate the test controls
+        // rather than a fixed sleep. This lets us assert the launch returned
+        // WHILE the command was still running (a relative check that is
+        // immune to CI load) instead of an absolute wall-clock threshold,
+        // which flakes when the supervisor's sudo/http-probe spawns are slow
+        // under heavy parallel test load.
+        await File.WriteAllTextAsync(commandScript, "while [ ! -f \"$2\" ]; do sleep 0.05; done\nprintf done > \"$1\"\n");
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
-            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile, releaseFile]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        var sw = Stopwatch.StartNew();
+        // Cap the launch so a genuine "stayed attached" regression surfaces as
+        // a clean failure instead of an indefinite hang (the gated command
+        // never completes until this test releases it).
+        using var launchCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var (exit, _, stderr) = await RunLocalProcessAsync(
             "/bin/bash",
             ["-c", "exec 3>&1\nexec \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
+            ct: launchCts.Token,
             environmentOverrides: FakeSudoPathEnvironment());
-        sw.Stop();
 
         Assert.Equal(0, exit);
         Assert.Equal("", stderr);
+        // The command cannot finish until we create the release file below, so
+        // its absence here proves the launch detached the command rather than
+        // running it inline.
+        Assert.False(File.Exists(doneFile), "detached launch returned only after the command completed");
         Assert.True(File.Exists(processGroupMarker));
-        // The launch returned while the backgrounded command was still sleeping
-        // — it did not block until completion.
-        Assert.False(
-            File.Exists(doneFile),
-            $"detached launch stayed attached until the command completed (returned after {sw.Elapsed})");
-
-        // Tear the still-sleeping command's process group down rather than
-        // waiting out the full 30s sleep.
-        var pgid = (await File.ReadAllTextAsync(processGroupMarker)).Trim();
-        await KillProcessGroupAsync(pgid);
-        await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(6));
+        await File.WriteAllTextAsync(releaseFile, "go");
+        await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
     }
 
     [Fact]
