@@ -4723,10 +4723,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     var noChangeQuota = _quotaClassifier.Detect(
                         runner.Kind, agentResult.TerminalDiagnostic, agentResult.Stdout);
-                    if (noChangeQuota is not null)
+                    // Restrict the park to genuine quota kinds. A lifted terminal
+                    // "API Error: 401/403" classifies as Unauthorized; parking that
+                    // as WaitingForQuotaReset would retry it indefinitely (an expired
+                    // token never clears on a quota window) and would bypass the
+                    // deliberate auth-required machinery the !Success path runs first.
+                    // Unauthorized falls through to the generic no-changes terminal
+                    // failure below — the pre-change behaviour, and safe.
+                    if (IsParkableQuotaKind(noChangeQuota))
                     {
                         _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                             runner.Kind, agentResult.TerminalDiagnostic, agentResult.Stdout, agentPhase, sandbox.Id);
+                        // Feed the observed-failure store so the router proactively
+                        // gates this member during its quota window instead of every
+                        // other item re-discovering the 429 and parking individually.
+                        // The exit-0 give-up summary is "ok" (the run "succeeded"), so
+                        // the exit-1 summary guard would drop the record — bypass it
+                        // here since TerminalDiagnostic already positively confirmed a
+                        // quota block.
                         await _quotaClassifier.RecordIfQuotaFailureAsync(
                             _quotaFailures,
                             runner.Kind,
@@ -4737,9 +4751,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             _auditQuotaOptions.ObservedFailureRetention,
                             ct,
                             projectId: item.ProjectId,
-                            stdout: agentResult.Stdout);
-                        throw new TerminalQuotaError(noChangeQuota.Kind,
-                            $"Agent {runner.Kind} reported quota failure on clean exit with no changes: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                            stdout: agentResult.Stdout,
+                            bypassExitedSummaryGuard: true);
+                        throw new TerminalQuotaError(noChangeQuota!.Kind,
+                            $"Agent {runner.Kind} reported quota failure on clean exit with no changes: {RedactAndTruncateAgentDetail(agentResult.TerminalDiagnostic)}",
                             noChangeQuota.ResetAt);
                     }
                 }
@@ -9933,6 +9948,46 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
         }
 
+        // Exit-0 give-up on the audit path: some CLIs (notably agy) exit 0 and
+        // write no audit/result.json when a consumer-tier RESOURCE_EXHAUSTED (429)
+        // stops them, surfacing the 429 only in an internal log the runner lifts
+        // into TerminalDiagnostic (a side-channel distinct from AgentStderr, which
+        // the block above reads). Without this, an exit-0 audit 429 is treated as
+        // an audit that produced zero findings — the item could proceed/merge on an
+        // audit that never actually ran, violating the "auditor never rubber-stamps"
+        // invariant. Classify the terminal region and park a genuine quota block.
+        // Restricted to real quota kinds (a lifted "API Error: 401" classifies as
+        // Unauthorized and must NOT masquerade as a reset-and-retry park — an
+        // expired token never clears on a quota window, so it would pin the item in
+        // a retry loop; letting it fall through leaves the audit failing on its
+        // "agent did not write result.json" finding instead).
+        if (!string.IsNullOrEmpty(run.Result.AgentTerminalDiagnostic))
+        {
+            var terminalQuota = _quotaClassifier.Detect(
+                run.Runner.Kind, run.Result.AgentTerminalDiagnostic, run.Result.AgentStdout);
+            if (IsParkableQuotaKind(terminalQuota))
+            {
+                _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                    run.Runner.Kind, run.Result.AgentTerminalDiagnostic, run.Result.AgentStdout, "audit", sandboxName: null);
+                await _quotaClassifier.RecordIfQuotaFailureAsync(
+                    _quotaFailures,
+                    run.Runner.Kind,
+                    ResolveObservedModelId(run.Runner, modelId: null),
+                    run.Result.AgentSummary,
+                    run.Result.AgentTerminalDiagnostic,
+                    DateTimeOffset.UtcNow,
+                    _auditQuotaOptions.ObservedFailureRetention,
+                    ct,
+                    projectId: projectId,
+                    stdout: run.Result.AgentStdout,
+                    bypassExitedSummaryGuard: true);
+                throw new TerminalQuotaError(
+                    terminalQuota!.Kind,
+                    $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}",
+                    terminalQuota.ResetAt);
+            }
+        }
+
         if (IsLlmAgentExecutionFailure(run.Result))
         {
             ThrowIfTransientAgentFailure(
@@ -9941,6 +9996,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "audit");
         }
     }
+
+    /// <summary>
+    /// True when a quota detection is a genuine rate-limit / cap block that should
+    /// park the item as <see cref="WorkItemState.WaitingForQuotaReset"/> and retry
+    /// after the reset. An <see cref="QuotaFailureKind.Unauthorized"/> detection is
+    /// NOT parkable: a 401/403 never clears on a quota window, so parking it would
+    /// loop forever and skip the auth-required handling. Callers that classify a
+    /// terminal-diagnostic side-channel (where the auth path did not run first) use
+    /// this to keep an auth marker from masquerading as a reset-and-retry park.
+    /// </summary>
+    private static bool IsParkableQuotaKind(QuotaDetection? detection) =>
+        detection is { Kind: QuotaFailureKind.RateLimitExceeded or QuotaFailureKind.LimitReached };
 
     private static bool IsLlmAgentExecutionFailure(AuditResult result) =>
         !result.Passed

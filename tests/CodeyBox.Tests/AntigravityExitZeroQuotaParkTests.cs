@@ -92,6 +92,61 @@ public sealed class AntigravityExitZeroQuotaParkTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final.State);
     }
 
+    [Fact]
+    public async Task WorkPhase_ExitZeroNoChangesWithQuotaButNoResetHint_ParksWithDefaultBackoff()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Antigravity };
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, agentOverride: agent);
+
+        // Quota block WITHOUT a parseable reset duration. The relative-reset parser
+        // yields null; the routing must still park (falling back to the default
+        // backoff) rather than null-crash — acceptance item #1's "rather than
+        // null-crashing" clause.
+        agent.WorkResults.Enqueue(new AgentResult(true, "ok", null, null)
+        {
+            TerminalDiagnostic = "RESOURCE_EXHAUSTED (code 429): Individual quota reached",
+        });
+
+        var item = NewItem() with { Agent = AgentKind.Antigravity };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Parked, not Failed/dead-lettered, and with a non-null default retry time.
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.Equal("quota", final.FailureKind);
+        Assert.NotNull(final.NextQuotaRetryAt);
+    }
+
+    [Fact]
+    public async Task WorkPhase_ExitZeroNoChangesWithUnauthorizedTerminal_DoesNotParkAsQuota()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Antigravity };
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, agentOverride: agent);
+
+        // An auth block (401) lifted into TerminalDiagnostic classifies as
+        // Unauthorized. Parking that as WaitingForQuotaReset would retry it forever
+        // (an expired token never clears on a quota window), so the exit-0 routing
+        // must NOT park it as quota — it falls through to the generic no-changes
+        // terminal failure instead.
+        agent.WorkResults.Enqueue(new AgentResult(true, "ok", null, null)
+        {
+            TerminalDiagnostic = "API Error: 401 Unauthorized: invalid credentials",
+        });
+
+        var item = NewItem() with { Agent = AgentKind.Antigravity };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual("quota", final.FailureKind);
+    }
+
     private static WorkItem NewItem() => new()
     {
         Id = WorkItemId.New(),
