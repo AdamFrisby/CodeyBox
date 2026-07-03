@@ -334,17 +334,19 @@ public sealed class CursorQuotaProbeTests
     }
 
     [Fact]
-    public async Task PartiallyUsed_WithoutPerModelBuckets_ConfiguredModel_ReturnsUnknown()
+    public async Task PartiallyUsed_WithoutPerModelBuckets_ConfiguredModel_FallsBackToOverall()
     {
-        // Only totalPercentUsed -> overall is computed, but no autoPercentUsed
-        // means no perModel entries; the configured ModelId falls through to
-        // the unknown path so the router applies its unknown policy.
+        // Only totalPercentUsed -> overall 93% is computed, but no
+        // autoPercentUsed means no perModel entries; the configured ModelId
+        // resolves to the overall reading (a KNOWN snapshot) rather than
+        // Unknown so the floor is enforced normally — the model still rides
+        // the overall plan quota even when no auto bucket lists it.
         var handler = UsageHandler("""{"planUsage":{"totalPercentUsed":7}}""");
         var probe = BuildProbe(handler);
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        Assert.Equal(-1, snap.AvailablePct);
-        Assert.Contains("composer-2.5", snap.Notes ?? "");
-        Assert.Contains("not in quota response", snap.Notes ?? "");
+        Assert.Equal(93.0, snap.AvailablePct, precision: 5);
+        Assert.True(snap.PerModel.ContainsKey("composer-2.5"));
+        Assert.Equal(93.0, snap.PerModel["composer-2.5"].AvailablePct, precision: 5);
     }
 
     [Fact]
@@ -460,8 +462,12 @@ public sealed class CursorQuotaProbeTests
     }
 
     [Fact]
-    public async Task ConfiguredModelMissingFromBuckets_ReturnsUnknown()
+    public async Task ConfiguredModelMissingFromBuckets_FallsBackToOverall()
     {
+        // The configured model isn't in the auto bucket, but the overall plan
+        // quota is known (90% available). The probe resolves the model to the
+        // overall reading (a KNOWN snapshot) so the floor is enforced normally
+        // rather than degrading to Unknown.
         var handler = UsageHandler("""
         {
           "planUsage": { "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
@@ -471,8 +477,9 @@ public sealed class CursorQuotaProbeTests
         var probe = BuildProbe(handler);
         var member = AnyMember with { ModelId = "composer-99-unknown" };
         var snap = await probe.GetAvailabilityAsync(member, CancellationToken.None);
-        Assert.True(snap.AvailablePct < 0);
-        Assert.Contains("composer-99-unknown", snap.Notes);
+        Assert.Equal(90.0, snap.AvailablePct, precision: 5);
+        Assert.True(snap.PerModel.ContainsKey("composer-99-unknown"));
+        Assert.Equal(90.0, snap.PerModel["composer-99-unknown"].AvailablePct, precision: 5);
     }
 
     [Fact]

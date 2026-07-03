@@ -90,6 +90,18 @@ public sealed class QuotaGatePolicy
         if (availablePct >= 0)
             return new QuotaGateDecision(false, $"quota below floor ({availablePct:F1}% < {floor:F1}%)", floor);
 
+        // Safety: an operator-configured per-agent reserve floor (FloorByAgent)
+        // is explicit intent that must not be silently bypassed when the probe
+        // cannot produce a reading. Fail CLOSED to protect the reserve rather
+        // than letting the UnknownPolicy fail open and dispatch below the
+        // reserve. Agents WITHOUT an explicit reserve keep the existing
+        // UnknownPolicy behaviour.
+        if (HasExplicitReserveFloor(options, member.Agent))
+            return new QuotaGateDecision(
+                false,
+                "quota unknown; agent has an explicit reserve floor; fail-closed to protect the reserve",
+                floor);
+
         return options.UnknownPolicy switch
         {
             QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open", floor),
@@ -97,6 +109,16 @@ public sealed class QuotaGatePolicy
             _ => new QuotaGateDecision(true, "quota unknown; no recent observed failure", floor),
         };
     }
+
+    /// <summary>
+    /// True when the operator has configured an explicit per-agent reserve
+    /// floor (<see cref="QuotaRouterOptions.FloorByAgent"/>) for this agent.
+    /// The presence of the override entry is the explicit-intent signal — the
+    /// reserve exists to guarantee headroom and must not evaporate when the
+    /// probe is unreadable.
+    /// </summary>
+    private static bool HasExplicitReserveFloor(QuotaRouterOptions options, AgentKind agent) =>
+        TryGetFloorOverride(options, agent, out var perAgent) && perAgent is not null;
 
     public static double ComputeEffectiveFloorPct(
         QuotaRouterOptions options,

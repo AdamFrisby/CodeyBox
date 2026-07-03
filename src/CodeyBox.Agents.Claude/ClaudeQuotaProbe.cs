@@ -137,17 +137,48 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
 
     /// <summary>
     /// When the configured <see cref="AgentMembership.ModelId"/> is not present
-    /// in the parsed response's per-model buckets, return
-    /// <c>AvailablePct = -1</c> so the router falls onto its
-    /// <c>QuotaUnknownPolicy</c> rather than fail-opening on the global
-    /// availability. Logs once per (token, modelId) so operators can spot
-    /// typos in configured model ids without grepping for log lines.
+    /// in the parsed response's per-model buckets, attempt to resolve it to a
+    /// family/overall bucket before degrading to unknown. The Claude usage API
+    /// keys its per-model buckets by family names (e.g. "seven_day_opus"), not
+    /// by the full configured model id (e.g. "claude-opus-4-8"), so an exact
+    /// <see cref="AgentQuotaSnapshot.PerModel"/> key match is the exception
+    /// rather than the rule. When a family bucket or a usable overall/window
+    /// reading is available, return a KNOWN snapshot (with the resolved model
+    /// id added to <see cref="AgentQuotaSnapshot.PerModel"/> so
+    /// <see cref="QuotaGatePolicy.ResolveMemberQuota"/> finds it) rather than
+    /// Unknown — the floor is then enforced normally. Only degrade to Unknown
+    /// when neither a family bucket nor an overall reading is available. Logs
+    /// once per (token, modelId) when even the resolution falls through so
+    /// operators can spot typos in configured model ids.
     /// </summary>
     private AgentQuotaSnapshot ApplyMemberGate(AgentQuotaSnapshot snapshot, AgentMembership member, string token)
     {
         if (!snapshot.IsKnown) return snapshot;
         if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
         if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
+
+        if (TryResolveModelQuota(snapshot, member.ModelId) is { } resolved)
+        {
+            // Add the resolved reading under the configured model id so
+            // QuotaGatePolicy.ResolveMemberQuota finds it via TryGetValue and
+            // the floor is enforced on a KNOWN reading rather than degrading
+            // to Unknown.
+            var perModel = new Dictionary<string, ModelQuota>(snapshot.PerModel, StringComparer.OrdinalIgnoreCase)
+            {
+                [member.ModelId] = resolved.Quota,
+            };
+            _log.LogDebug(
+                "Claude quota probe: configured model {ModelId} resolved to {Resolution}",
+                member.ModelId, resolved.Note);
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = snapshot.AvailablePct,
+                ResetAt = snapshot.ResetAt,
+                Notes = snapshot.Notes,
+                PerModel = perModel,
+                Windows = snapshot.Windows,
+            };
+        }
 
         var modelList = snapshot.PerModel.Count == 0
             ? "(none)"
@@ -173,6 +204,65 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
             PerModel = snapshot.PerModel,
         };
     }
+
+    /// <summary>
+    /// Resolves a configured model id that is not an exact
+    /// <see cref="AgentQuotaSnapshot.PerModel"/> key to a family bucket (by
+    /// substring match against the opus/sonnet/haiku families) or, failing
+    /// that, to the overall/binding-window reading. Returns a
+    /// <see cref="ResolvedModelQuota"/> (with a KNOWN <see cref="ModelQuota"/>)
+    /// when a usable reading is available; null only when the snapshot carries
+    /// no usable reading at all.
+    /// </summary>
+    private static ResolvedModelQuota? TryResolveModelQuota(
+        AgentQuotaSnapshot snapshot,
+        string modelId)
+    {
+        // 1. Family bucket match by substring. The configured model id (e.g.
+        // "claude-opus-4-8") carries a family token ("opus"); the API's
+        // per-model buckets are keyed by family suffix (e.g.
+        // "seven_day_opus"). Match the family, then read the suffix bucket
+        // (already capped by overall in the parser).
+        foreach (var (suffix, modelMatch) in ModelSuffixes)
+        {
+            if (!modelId.Contains(modelMatch, StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (snapshot.PerModel.TryGetValue(suffix, out var familyQuota))
+            {
+                return new ResolvedModelQuota(familyQuota, $"family bucket '{suffix}'");
+            }
+
+            // Fall back to any per-model key carrying the same family token
+            // (covers legacy shapes and probes that surface configured-model
+            // keys alongside the family suffix).
+            foreach (var (key, quota) in snapshot.PerModel)
+            {
+                if (key.Contains(modelMatch, StringComparison.OrdinalIgnoreCase))
+                {
+                    return new ResolvedModelQuota(quota, $"family bucket '{key}'");
+                }
+            }
+        }
+
+        // 2. Fall back to the overall/binding-window reading. The snapshot is
+        // known (checked by the caller), so this is always available when we
+        // reach here.
+        if (snapshot.IsKnown)
+        {
+            return new ResolvedModelQuota(
+                new ModelQuota
+                {
+                    AvailablePct = snapshot.AvailablePct,
+                    ResetAt = snapshot.ResetAt,
+                    Window = "overall (model-specific bucket unavailable)",
+                },
+                "overall reading (no model-specific bucket)");
+        }
+
+        return null;
+    }
+
+    private sealed record ResolvedModelQuota(ModelQuota Quota, string Note);
 
     /// <summary>
     /// Drops the in-process snapshot so the next

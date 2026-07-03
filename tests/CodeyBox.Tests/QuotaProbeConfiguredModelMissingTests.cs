@@ -11,12 +11,15 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// When the configured <see cref="AgentMembership.ModelId"/> is not present in
-/// a quota probe response, the probe must report <c>AvailablePct = -1</c> with
-/// a diagnostic <c>Notes</c> string so the router falls onto its
-/// <c>QuotaUnknownPolicy</c>. Otherwise a typoed model id silently falls open
-/// to the global "most-constrained across visible models" answer — which is
-/// ~100% when the visible buckets happen to be full, giving zero gating signal
-/// for the model we'd actually invoke.
+/// a quota probe response, each probe applies its own resolution policy:
+/// Claude and Cursor fall back to the overall/binding-window reading (a KNOWN
+/// snapshot) so the floor is enforced normally rather than degrading to
+/// Unknown (which would fail open past an explicit reserve); Codex still
+/// reports <c>AvailablePct = -1</c> with a diagnostic <c>Notes</c> string so
+/// the router falls onto its <c>QuotaUnknownPolicy</c>. The per-probe split
+/// exists because Claude's usage API keys its per-model buckets by family
+/// names (not by the full configured model id), making Unknown the DEFAULT
+/// state — which would silently bypass an operator's FloorByAgent reserve.
 /// </summary>
 public sealed class QuotaProbeConfiguredModelMissingTests
 {
@@ -63,11 +66,15 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     // ── Claude ────────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Claude_ConfiguredModelMissingFromResponse_ReportsUnknownWithDiagnosticNotes()
+    public async Task Claude_ConfiguredModelMissingFromResponse_FallsBackToOverall()
     {
         // Claude's rollup shape with only top-level rate_limit (no per-model
-        // buckets). A configured ModelId that isn't surfaced should fall through
-        // to the unknown path rather than using the overall cap.
+        // buckets). A configured ModelId that isn't surfaced resolves to the
+        // overall reading (a KNOWN snapshot) so the floor is enforced normally
+        // rather than degrading to Unknown — the model still rides the overall
+        // account quota. "claude-some-typo" carries no opus/sonnet/haiku
+        // family token, so the family-bucket match is skipped and the overall
+        // fallback is used.
         var body = """{"rate_limit":{"primary_window":{"used_percent":10}}}""";
         var probe = BuildClaudeProbe(body);
 
@@ -80,9 +87,75 @@ public sealed class QuotaProbeConfiguredModelMissingTests
         };
         var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
-        Assert.Equal(-1, snapshot.AvailablePct);
-        Assert.Contains("claude-some-typo", snapshot.Notes ?? "");
-        Assert.Contains("not in quota response", snapshot.Notes ?? "");
+        Assert.Equal(90, snapshot.AvailablePct);
+        Assert.True(snapshot.PerModel.ContainsKey("claude-some-typo"));
+        Assert.Equal(90, snapshot.PerModel["claude-some-typo"].AvailablePct);
+    }
+
+    [Fact]
+    public async Task Claude_ConfiguredModelAbsentFromPerModel_ResolvesToFamilyBucket()
+    {
+        // The configured model id "claude-opus-4-8" is NOT in the parser's
+        // hardcoded configuredModels list, so it won't be an exact PerModel
+        // key. But it carries the "opus" family token, and the response
+        // includes a "seven_day_opus" family bucket at 0% — the probe must
+        // resolve the model to that family bucket (a KNOWN 0% reading) rather
+        // than degrading to Unknown. This is the root fix: claude reads
+        // normally instead of Unknown-by-default, so the floor is enforced.
+        var body = """
+        {
+          "five_hour": {"utilization":10,"resets_at":"2026-05-13T12:00:00Z"},
+          "seven_day": {"utilization":40,"resets_at":"2026-05-14T12:00:00Z"},
+          "seven_day_opus": {"utilization":100,"resets_at":"2026-05-14T12:00:00Z"}
+        }
+        """;
+        var probe = BuildClaudeProbe(body);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Claude,
+            Billing = AgentBilling.Subscription,
+            ModelId = "claude-opus-4-8",
+            QualityScore = 100,
+        };
+        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        // Overall = min(five_hour=90, seven_day=60) = 60. The headline stays
+        // the overall reading; the resolved per-model entry is the opus family
+        // bucket (0%), which is what the router gates on for this member.
+        Assert.Equal(60, snapshot.AvailablePct);
+        Assert.True(snapshot.PerModel.ContainsKey("claude-opus-4-8"));
+        Assert.Equal(0, snapshot.PerModel["claude-opus-4-8"].AvailablePct);
+    }
+
+    [Fact]
+    public async Task Claude_ConfiguredModelAbsentFromPerModel_NoFamilyBucket_ResolvesToOverall()
+    {
+        // "claude-opus-4-8" with no seven_day_opus bucket in the response —
+        // the opus family is constrained only by the overall cap. The probe
+        // resolves to the overall reading (a KNOWN snapshot) so the floor is
+        // enforced normally rather than degrading to Unknown.
+        var body = """
+        {
+          "five_hour": {"utilization":10,"resets_at":"2026-05-13T12:00:00Z"},
+          "seven_day": {"utilization":40,"resets_at":"2026-05-14T12:00:00Z"}
+        }
+        """;
+        var probe = BuildClaudeProbe(body);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Claude,
+            Billing = AgentBilling.Subscription,
+            ModelId = "claude-opus-4-8",
+            QualityScore = 100,
+        };
+        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        // Overall = min(90, 60) = 60. No opus bucket → overall fallback.
+        Assert.Equal(60, snapshot.AvailablePct);
+        Assert.True(snapshot.PerModel.ContainsKey("claude-opus-4-8"));
+        Assert.Equal(60, snapshot.PerModel["claude-opus-4-8"].AvailablePct);
     }
 
     [Fact]
@@ -187,13 +260,14 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     // ── Cursor ────────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Cursor_ConfiguredModelMissingFromResponse_ReportsUnknownWithDiagnosticNotes()
+    public async Task Cursor_ConfiguredModelMissingFromResponse_FallsBackToOverall()
     {
         // percent-used dimensions drive the headline (see CursorQuotaProbe
         // HEADLINE-METRIC): max(10,10,0)=10 -> 90% available. autoBucketModels
         // populates perModel with composer-2, so the configured ModelId
-        // "composer-99-unknown" doesn't match and ApplyMemberGate emits the
-        // diagnostic Notes string.
+        // "composer-99-unknown" doesn't match an auto-bucket key. The probe
+        // resolves it to the overall reading (a KNOWN snapshot) so the floor
+        // is enforced normally rather than degrading to Unknown.
         var body = """
         {
           "planUsage": { "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
@@ -211,9 +285,9 @@ public sealed class QuotaProbeConfiguredModelMissingTests
         };
         var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
-        Assert.Equal(-1, snapshot.AvailablePct);
-        Assert.Contains("composer-99-unknown", snapshot.Notes ?? "");
-        Assert.Contains("not in quota response", snapshot.Notes ?? "");
+        Assert.Equal(90, snapshot.AvailablePct);
+        Assert.True(snapshot.PerModel.ContainsKey("composer-99-unknown"));
+        Assert.Equal(90, snapshot.PerModel["composer-99-unknown"].AvailablePct);
     }
 
     [Fact]
