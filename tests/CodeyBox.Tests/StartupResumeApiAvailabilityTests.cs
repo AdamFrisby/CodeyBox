@@ -125,7 +125,13 @@ public sealed class StartupResumeApiAvailabilityTests
     [Fact]
     public async Task StartupResume_HotReloadedShutdownConfig_UsesProductionOptionsForModeTimeoutAndAdoption()
     {
-        var initialTimeout = TimeSpan.FromSeconds(20);
+        // The un-reloaded (initial) timeout is the value that would govern the
+        // hanging resume if the hot reload had NOT taken. Keep it far above the
+        // availability guard below so the guard cleanly discriminates
+        // "reload applied (250 ms)" from "reload ignored (initial)" even when
+        // parallel audit-suite load adds many seconds of HTTP-serving latency on
+        // top of the 250 ms resume.
+        var initialTimeout = TimeSpan.FromSeconds(90);
         var reloadedTimeout = TimeSpan.FromMilliseconds(250);
         var reloadedAdoptionSeconds = 7;
         using var factory = new StartupResumeFullHostFactory(
@@ -192,8 +198,15 @@ public sealed class StartupResumeApiAvailabilityTests
             sw.Stop();
 
             response.EnsureSuccessStatusCode();
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
-                $"GET /quota was blocked for {sw.Elapsed}; hot-reloaded startup resume timeout {reloadedTimeout} should keep API availability under 5s.");
+            // Availability guard: 30 s, chosen to sit well below the 90 s
+            // un-reloaded initial timeout (so it still fails loudly if the reload
+            // is ignored and the hanging resume blocks for the initial window) yet
+            // well above the ~18 s of HTTP-serving latency observed under parallel
+            // audit-suite thread-pool starvation. The reloaded 250 ms timeout being
+            // the value actually applied is proven independently by the >= reloaded
+            // assertion below plus the persisted work-item assertion.
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30),
+                $"GET /quota was blocked for {sw.Elapsed}; hot-reloaded startup resume timeout {reloadedTimeout} should keep API availability well under the {initialTimeout} un-reloaded window.");
             Assert.True(sw.Elapsed >= reloadedTimeout,
                 $"hot-reloaded Blocking mode was not observed; GET /quota was served before resume timeout {reloadedTimeout}; elapsed {sw.Elapsed}");
         }

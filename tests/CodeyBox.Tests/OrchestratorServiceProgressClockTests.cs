@@ -53,11 +53,15 @@ public sealed class OrchestratorServiceProgressClockTests : IDisposable
             NullLogger<OrchestratorService>.Instance,
             progressClock: clock);
 
-        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         await service.StartAsync(CancellationToken.None);
 
         var sw = Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 10_000 && clock.LastTransition == DateTimeOffset.MinValue)
+        // Generous ceiling: under parallel audit-suite load the background worker
+        // loop can be starved of a thread-pool thread well past 10 s. The loop
+        // exits the instant the clock is stamped, so a healthy run still finishes
+        // in milliseconds — this only widens the load-tolerance headroom.
+        while (sw.ElapsedMilliseconds < 45_000 && clock.LastTransition == DateTimeOffset.MinValue)
             await Task.Delay(50);
 
         Assert.True(clock.LastTransition > DateTimeOffset.MinValue,
@@ -91,13 +95,13 @@ public sealed class OrchestratorServiceProgressClockTests : IDisposable
             progressClock: clock,
             reaper: reaper);
 
-        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         await service.StartAsync(CancellationToken.None);
 
         // Reaper-init stamp happens synchronously inside ExecuteAsync before
         // the worker loop blocks on DequeueAsync. Wait briefly to let it through.
         var sw = Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 5_000 && clock.LastTransition == DateTimeOffset.MinValue)
+        while (sw.ElapsedMilliseconds < 45_000 && clock.LastTransition == DateTimeOffset.MinValue)
             await Task.Delay(20);
 
         Assert.True(clock.LastTransition > DateTimeOffset.MinValue,

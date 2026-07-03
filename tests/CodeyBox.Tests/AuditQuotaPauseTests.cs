@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Gemini;
@@ -141,6 +142,50 @@ public sealed class AuditQuotaPauseTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotNull(final.NextQuotaRetryAt);
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+    }
+
+    [Fact]
+    public async Task AuditExitZeroTerminalQuota_ParksWorkItemForQuotaReset()
+    {
+        // The audit-phase counterpart to the work-phase exit-0 give-up: an
+        // antigravity auditor exits 0 and writes no result.json when a
+        // consumer-tier RESOURCE_EXHAUSTED (429) stops it, surfacing the 429 only
+        // via the runner-lifted AgentTerminalDiagnostic side-channel (its exit code,
+        // stderr and stdout never reflect the block). ThrowIfAuditorRunQuotaAsync
+        // must classify that terminal region and PARK the item — otherwise the
+        // give-up reads as a zero-finding "clean" audit and the item could proceed
+        // on an audit that never actually ran (the "auditor never rubber-stamps"
+        // invariant).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(
+            false,
+            [new AuditFinding("cheating:llm-review", AuditSeverity.Error, "agent did not write audit/result.json", "")],
+            AgentSummary: "ok")
+        {
+            AgentTerminalDiagnostic =
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)",
+        });
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Antigravity],
+            auditAgent: AgentKind.Antigravity);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Parked (not Failed, not read as a clean zero-finding audit), and armed for
+        // retry. The precise relative-reset window is asserted on the work-path test;
+        // the audit path routes through the class-fallback exhaustion scheduler, so
+        // here we only assert the item parks for quota rather than proceeding.
         Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.NotNull(final.NextQuotaRetryAt);
         Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
@@ -895,6 +940,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
                 new ClaudeQuotaFailureDetector(),
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
+                new AntigravityQuotaFailureDetector(),
             ]),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: dispatchAvailability,

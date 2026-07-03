@@ -232,6 +232,18 @@ public sealed record AuditResult
     public string? AgentSummary { get; init; }
     public string? AgentStdout { get; init; }
 
+    /// <summary>
+    /// Mirrors <see cref="CodeyBox.Core.AgentResult.TerminalDiagnostic"/> for an
+    /// audit-agent run: some CLIs (notably <c>agy</c>) exit <b>0</b> and write no
+    /// <c>result.json</c> when a consumer-tier quota block (429) stops them,
+    /// surfacing the cause only in an internal log the runner lifts here. Threaded
+    /// through so the pipeline's audit-phase quota routing can park the item in
+    /// <c>WaitingForQuotaReset</c> instead of reading the give-up as a clean,
+    /// zero-finding audit (which would let the item merge on an audit that never
+    /// actually ran). Null on every ordinary audit outcome.
+    /// </summary>
+    public string? AgentTerminalDiagnostic { get; init; }
+
     public void Deconstruct(
         out bool Passed,
         out IReadOnlyList<AuditFinding> Findings,

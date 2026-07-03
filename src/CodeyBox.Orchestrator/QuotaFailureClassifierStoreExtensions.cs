@@ -15,14 +15,20 @@ public static class QuotaFailureClassifierStoreExtensions
         TimeSpan retention,
         CancellationToken ct,
         ProjectId? projectId = null,
-        string? stdout = null)
+        string? stdout = null,
+        bool bypassExitedSummaryGuard = false)
     {
         ArgumentNullException.ThrowIfNull(classifier);
 
         if (store is null)
             return;
 
-        if (!IsAgentExited1Summary(summary))
+        // The summary guard exists so an infrastructure exit-1 (e.g. failed auth
+        // materialisation) is never recorded as a provider quota signal. Callers
+        // that have already positively confirmed a quota block from a side-channel
+        // (the exit-0 give-up where the run "succeeded" with summary "ok", so the
+        // guard would otherwise drop a real 429) opt out via bypassExitedSummaryGuard.
+        if (!bypassExitedSummaryGuard && !IsAgentExited1Summary(summary))
             return;
 
         var detection = classifier.Detect(agent, stderr, stdout);

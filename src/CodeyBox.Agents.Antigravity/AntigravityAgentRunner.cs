@@ -371,33 +371,35 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             ForwardLogToStream(redactedLog, stdoutChunkCallback, captureStructuredStream);
         }
 
-        // (2) On FAILURE only, fold agy's TERMINAL error region into the
-        // classifier-facing result.Stderr so the quota/auth/cost detectors — which
-        // substring-scan Stderr/Stdout — can finally see agy's terminal
-        // RESOURCE_EXHAUSTED / API Error: 401 (agy writes these ONLY to its glog;
-        // its process stderr is frequently ~0 bytes). This is the un-blinding the
-        // task requires: a terminal agy 429 now reaches quota detection and parks
-        // the item in WaitingForQuotaReset with the gateway's reset hint.
-        //
-        // We fold ONLY the terminal region, and ONLY on failure — never the whole
-        // cumulative log. agy's glog is cumulative within one --print process and
-        // records transient errors it later recovered from (a 429 a retry cleared,
-        // an auth blip a refresh fixed). Folding the whole log would let such a
-        // recovered-then-cleared "RESOURCE_EXHAUSTED"/"API Error: 401" falsely
-        // bench/park the member. ExtractTerminalErrorRegion returns only the slice
-        // from the last marker in the tail window to end — agy aborts right after
-        // its terminal error, so that slice is the real cause; an earlier recovered
-        // error sits outside the window and is excluded. A successful run folds
-        // nothing (there is no terminal failure to classify), and a non-quota/-auth
-        // failure (timeout, tool error, no-changes) folds nothing (no marker),
-        // leaving result.Stderr as agy's own process output.
-        if (!result.Success)
+        // (2) Lift agy's TERMINAL error region out of the glog. We extract ONLY the
+        // terminal region (the slice from the last quota/auth marker in the tail
+        // window to end — agy aborts right after its terminal error, so an earlier
+        // transient it recovered past sits outside the window and is excluded),
+        // never the whole cumulative log, so a recovered-then-cleared 429/401 can't
+        // falsely bench/park the member.
+        var terminalError = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(redactedLog);
+        if (!string.IsNullOrEmpty(terminalError))
         {
-            var terminalError = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(redactedLog);
-            if (!string.IsNullOrEmpty(terminalError))
+            // (2a) On FAILURE (non-zero exit), fold the terminal region into the
+            // classifier-facing result.Stderr so the existing !Success quota/auth
+            // routing sees agy's terminal RESOURCE_EXHAUSTED / API Error: 401 (agy
+            // writes these ONLY to its glog; its process stderr is frequently
+            // ~0 bytes).
+            if (!result.Success)
             {
                 result = result with { Stderr = AppendDiagnostic(result.Stderr, terminalError) };
             }
+
+            // (2b) ALWAYS surface the terminal region on TerminalDiagnostic — the
+            // critical case is the EXIT-0 give-up: agy exits 0 and makes no changes
+            // when a consumer-tier quota block stops it, so the failure branch never
+            // fires and the pipeline would terminal-fail the run as "produced no
+            // changes" and eventually dead-letter it. TerminalDiagnostic is a
+            // side-channel distinct from Stderr (so the success-path auth classifier,
+            // which reads Stderr, is NOT re-triggered by a recovered transient), and
+            // the pipeline's no-changes branch classifies it to park a real 429 in
+            // WaitingForQuotaReset with the gateway's reset hint.
+            result = result with { TerminalDiagnostic = terminalError };
         }
 
         return result;
