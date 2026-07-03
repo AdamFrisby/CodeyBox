@@ -2178,6 +2178,33 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
     }
 
+    public async Task<int> PurgeAuditProgressAsync(
+        WorkItemId workItemId,
+        DateTimeOffset? workAttemptStartedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM work_item_audit_progress
+                WHERE work_item_id = $wi AND work_attempt_started_at = $attempt;
+                """;
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("PurgeAuditProgressAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

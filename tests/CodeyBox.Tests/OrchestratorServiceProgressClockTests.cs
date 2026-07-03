@@ -7,6 +7,13 @@ namespace CodeyBox.Tests;
 
 public sealed class OrchestratorServiceProgressClockTests : IDisposable
 {
+    // Positive event-driven poll-deadlines below use this as a backstop only:
+    // the awaited state (clock stamp) WILL be reached on a correct run, so the
+    // timeout just needs headroom for a correct-but-starved dispatch on the
+    // co-resident capped full-suite host. A real regression still fails because
+    // the clock never gets stamped. Same class as commits 0df5ee7 / 47661bd.
+    private static readonly TimeSpan StarvationBackstopTimeout = TimeSpan.FromSeconds(60);
+
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-orch-clock-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -53,15 +60,11 @@ public sealed class OrchestratorServiceProgressClockTests : IDisposable
             NullLogger<OrchestratorService>.Instance,
             progressClock: clock);
 
-        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var stopCts = new CancellationTokenSource(StarvationBackstopTimeout);
         await service.StartAsync(CancellationToken.None);
 
         var sw = Stopwatch.StartNew();
-        // Generous ceiling: under parallel audit-suite load the background worker
-        // loop can be starved of a thread-pool thread well past 10 s. The loop
-        // exits the instant the clock is stamped, so a healthy run still finishes
-        // in milliseconds — this only widens the load-tolerance headroom.
-        while (sw.ElapsedMilliseconds < 45_000 && clock.LastTransition == DateTimeOffset.MinValue)
+        while (sw.Elapsed < StarvationBackstopTimeout && clock.LastTransition == DateTimeOffset.MinValue)
             await Task.Delay(50);
 
         Assert.True(clock.LastTransition > DateTimeOffset.MinValue,
@@ -95,13 +98,13 @@ public sealed class OrchestratorServiceProgressClockTests : IDisposable
             progressClock: clock,
             reaper: reaper);
 
-        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var stopCts = new CancellationTokenSource(StarvationBackstopTimeout);
         await service.StartAsync(CancellationToken.None);
 
         // Reaper-init stamp happens synchronously inside ExecuteAsync before
         // the worker loop blocks on DequeueAsync. Wait briefly to let it through.
         var sw = Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 45_000 && clock.LastTransition == DateTimeOffset.MinValue)
+        while (sw.Elapsed < StarvationBackstopTimeout && clock.LastTransition == DateTimeOffset.MinValue)
             await Task.Delay(20);
 
         Assert.True(clock.LastTransition > DateTimeOffset.MinValue,

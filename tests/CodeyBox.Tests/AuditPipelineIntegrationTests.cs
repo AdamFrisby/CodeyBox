@@ -43,6 +43,327 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task ResumeFromWorkComplete_IgnoresPersistedPassingAuditAndRunsFreshAuditBeforeMerge()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])]);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.WorkComplete,
+            WorkBranch = "feature/resume-stale-pass",
+        };
+        await tp.Store.CreateAsync(item);
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "resume.txt",
+            "existing work\n",
+            "existing work");
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            StalePassingAuditProgress(
+                "Scripted",
+                new AuditProgressFinding(
+                    "Scripted",
+                    AuditSeverity.Warning,
+                    "review agent failed to run",
+                    "old escaped audit-agent infrastructure result")),
+            DateTimeOffset.UtcNow.AddMinutes(-10));
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
+
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttemptStartedAt: null);
+        var latest = Assert.Single(progress, p => p.Iteration == 1);
+        Assert.Equal(AuditProgressStatuses.Complete, latest.Status);
+        Assert.Empty(latest.Findings);
+        Assert.Equal(["Scripted"], latest.ScheduledAuditors);
+        Assert.Equal(["Scripted"], latest.CompletedAuditors);
+    }
+
+    // Regression for the confirmed incident: the stale escaped audit reached a
+    // HIGH iteration (25). On resume, the fresh audit restarts at iteration 1,
+    // whose upsert only overwrites the stale iteration-1 row — leaving stale
+    // iterations 2..25 in the same work-attempt partition. If the merge gate
+    // selects "latest" by max iteration, it validates the stale iteration-25
+    // "review agent failed to run" record and the item can NEVER merge despite
+    // a clean fresh pass. The fix purges the stale rows before re-auditing.
+    [Fact]
+    public async Task ResumeFromWorkComplete_PurgesStaleHighIterationEscapedAudit_ReachesMerge()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])]);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.WorkComplete,
+            WorkBranch = "feature/resume-stale-iter25",
+        };
+        await tp.Store.CreateAsync(item);
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "resume.txt",
+            "existing work\n",
+            "existing work");
+
+        // Seed a stale escaped verdict at iterations 1 AND 25 (as in the
+        // incident). Iteration 25 carries the "review agent failed to run"
+        // sentinel that must never back a merge.
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            StalePassingAuditProgress("Scripted", iteration: 1),
+            DateTimeOffset.UtcNow.AddMinutes(-20));
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            StalePassingAuditProgress(
+                "Scripted",
+                iteration: 25,
+                new AuditProgressFinding(
+                    "Scripted",
+                    AuditSeverity.Warning,
+                    "review agent failed to run",
+                    "old escaped audit-agent infrastructure result")),
+            DateTimeOffset.UtcNow.AddMinutes(-10));
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
+
+        // The stale rows are gone; only the fresh iteration-1 pass survives.
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttemptStartedAt: null);
+        var only = Assert.Single(progress);
+        Assert.Equal(1, only.Iteration);
+        Assert.Equal(AuditProgressStatuses.Complete, only.Status);
+        Assert.Empty(only.Findings);
+    }
+
+    // Branch 5 of the merge gate: a "latest" audit record whose ScheduledAuditors
+    // is a strict superset of CompletedAuditors means a required auditor never
+    // ran, so the item must not merge even though the durable findings are clean.
+    [Fact]
+    public async Task MergeGate_RejectsWhenLatestAuditHasMissingCompletedAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])]);
+        // The override returns a clean-but-incomplete record from the merge gate's
+        // GetAuditProgressAsync (scheduled {a,b}, completed {a}); RecordAuditProgress
+        // is ignored so the fresh audit-loop rows don't mask it.
+        var incompleteLatest = new AuditProgressRecord(
+            Iteration: 1,
+            MaxIterations: 1,
+            BlockingFindings: 0,
+            NonBlockingFindings: 0,
+            BlockingFindingIds: [],
+            BlockingFindingsDetails: [],
+            Findings: [],
+            WorkBranchTip: null,
+            Status: AuditProgressStatuses.Complete,
+            ScheduledAuditors: ["scripted-a", "scripted-b"],
+            CompletedAuditors: ["scripted-a"]);
+        var progressOverride = new FixedLatestAuditProgressStore(incompleteLatest);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed, auditors: [auditor], auditProgressOverride: progressOverride);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("did not complete auditor(s): scripted-b", final.LastError);
+    }
+
+    // Branch 7 of the merge gate: durable audit-progress findings are clean, but
+    // the diagnostic audit-report store carries a per-auditor "review agent
+    // failed to run" sentinel for the latest iteration (the exact incident shape,
+    // where a per-auditor infra failure did not propagate into the aggregate
+    // findings). The gate must still refuse to merge.
+    [Fact]
+    public async Task MergeGate_RejectsWhenAuditReportIterationHasReviewAgentFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])]);
+        var reportStore = new CapturingAuditReportStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed, auditors: [auditor], auditReportStore: reportStore);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        // A per-auditor infra failure recorded ONLY in the diagnostic report
+        // store, under a distinct auditor name so the fresh audit's clean
+        // "Scripted" report does not shadow it in the per-auditor grouping.
+        reportStore.Add(new AuditReport
+        {
+            Id = Guid.NewGuid().ToString(),
+            WorkItemId = item.Id.ToString(),
+            Iteration = 1,
+            AuditorName = "llm-review",
+            AuditorKind = "scripted",
+            WorstSeverity = "Warning",
+            StartedAt = DateTimeOffset.UtcNow,
+            EndedAt = DateTimeOffset.UtcNow,
+            DurationMs = 1,
+            Findings =
+            [
+                new AuditReportFinding(
+                    Id: "sentinel",
+                    Severity: "Warning",
+                    Title: "review agent failed to run",
+                    Message: "per-auditor infrastructure failure",
+                    Files: [],
+                    LineHints: []),
+            ],
+            RawOutput = null,
+        });
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("review-agent infrastructure failure", final.LastError);
+    }
+
+    [Fact]
+    public async Task ResumeFromAuditPassed_ReauditsBeforeMerge()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])]);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/resume-audit-passed",
+        };
+        await tp.Store.CreateAsync(item);
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "audit-passed.txt",
+            "existing work\n",
+            "existing work");
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            StalePassingAuditProgress("Scripted"),
+            DateTimeOffset.UtcNow.AddMinutes(-10));
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
+    }
+
+    // Mirror of ResumeFromWorkComplete_PurgesStaleHighIterationEscapedAudit_ReachesMerge
+    // for the AuditPassed entry state. A resume at State=AuditPassed skips work
+    // but must still re-audit; the stale-row purge must fire so the merge gate
+    // reads this pickup's fresh iteration-1 pass rather than the stale
+    // iteration-25 "review agent failed to run" verdict.
+    [Fact]
+    public async Task ResumeFromAuditPassed_PurgesStaleHighIterationEscapedAudit_ReachesMerge()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])]);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/resume-audit-passed-iter25",
+        };
+        await tp.Store.CreateAsync(item);
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "resume.txt",
+            "existing work\n",
+            "existing work");
+
+        // Seed a stale escaped verdict at iterations 1 AND 25 (the incident
+        // shape) under State=AuditPassed. Iteration 25 carries the "review agent
+        // failed to run" sentinel that must never back a merge.
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            StalePassingAuditProgress("Scripted", iteration: 1),
+            DateTimeOffset.UtcNow.AddMinutes(-20));
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            StalePassingAuditProgress(
+                "Scripted",
+                iteration: 25,
+                new AuditProgressFinding(
+                    "Scripted",
+                    AuditSeverity.Warning,
+                    "review agent failed to run",
+                    "old escaped audit-agent infrastructure result")),
+            DateTimeOffset.UtcNow.AddMinutes(-10));
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
+
+        // The stale rows are gone; only the fresh iteration-1 pass survives.
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttemptStartedAt: null);
+        var only = Assert.Single(progress);
+        Assert.Equal(1, only.Iteration);
+        Assert.Equal(AuditProgressStatuses.Complete, only.Status);
+        Assert.Empty(only.Findings);
+    }
+
+    [Fact]
+    public async Task CurrentAuditWithReviewAgentFailureSentinel_CannotReachMerge()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(true,
+            [
+                new AuditFinding(
+                    "Scripted",
+                    AuditSeverity.Warning,
+                    "review agent failed to run",
+                    "agent execution failed but was misreported as a passing warning"),
+            ]),
+        ]);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("review-agent infrastructure failure", final.LastError);
+        Assert.Equal([1], auditor.SeenIterations);
+    }
+
+    [Fact]
     public async Task AuditAgentTransientFailure_ParksWaitingForTransientRetry()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2916,6 +3237,20 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                         .ToList());
             }
         }
+
+        public Task<int> PurgeAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default)
+        {
+            _ = workAttemptStartedAt;
+            _ = ct;
+            lock (_gate)
+            {
+                var removed = _records.RemoveAll(r => r.WorkItemId == workItemId);
+                return Task.FromResult(removed);
+            }
+        }
     }
 
     private sealed class CapturingAuditReportStore : IAuditReportStore
@@ -2999,6 +3334,40 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             DateTimeOffset? workAttemptStartedAt,
             CancellationToken ct = default)
             => throw new InvalidOperationException("audit progress store unavailable");
+
+        public Task<int> PurgeAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default) => Task.FromResult(0);
+    }
+
+    // Returns a single caller-supplied record from GetAuditProgressAsync and
+    // ignores writes. Lets a test drive the merge gate with a crafted "latest"
+    // audit record (e.g. an incomplete-auditor record) without the fresh audit
+    // loop's own rows masking it. Purge is a no-op (nothing is stored).
+    private sealed class FixedLatestAuditProgressStore : IAuditProgressStore
+    {
+        private readonly AuditProgressRecord _latest;
+
+        public FixedLatestAuditProgressStore(AuditProgressRecord latest) => _latest = latest;
+
+        public Task RecordAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            AuditProgressRecord progress,
+            DateTimeOffset recordedAt,
+            CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<AuditProgressRecord>> GetAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<AuditProgressRecord>>([_latest]);
+
+        public Task<int> PurgeAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default) => Task.FromResult(0);
     }
 
     private sealed class ThrowingRecordAuditProgressStore : IAuditProgressStore
@@ -3016,6 +3385,11 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             DateTimeOffset? workAttemptStartedAt,
             CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<AuditProgressRecord>>([]);
+
+        public Task<int> PurgeAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default) => Task.FromResult(0);
     }
 
     private sealed class DrainingAuditor : IAuditor
@@ -3201,6 +3575,27 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         WorkBranch = "feature/x",
         PushUpstream = false,
     };
+
+    private static AuditProgressRecord StalePassingAuditProgress(
+        string auditorName,
+        params AuditProgressFinding[] findings)
+        => StalePassingAuditProgress(auditorName, iteration: 1, findings);
+
+    private static AuditProgressRecord StalePassingAuditProgress(
+        string auditorName,
+        int iteration,
+        params AuditProgressFinding[] findings) => new(
+            Iteration: iteration,
+            MaxIterations: iteration,
+            BlockingFindings: 0,
+            NonBlockingFindings: findings.Length,
+            BlockingFindingIds: [],
+            BlockingFindingsDetails: [],
+            Findings: findings,
+            WorkBranchTip: null,
+            Status: AuditProgressStatuses.Complete,
+            ScheduledAuditors: [auditorName],
+            CompletedAuditors: [auditorName]);
 
     private static IReadOnlyList<string> WithoutBuildTestGate(IEnumerable<string>? auditors)
         => (auditors ?? [])
