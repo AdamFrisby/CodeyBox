@@ -164,6 +164,62 @@ public sealed class AuditPresetsAndDeterministicAuditorsTests
         Assert.Equal(
             ["semgrep", "--config", "auto", "--error", "--quiet"],
             Assert.IsAssignableFrom<IShellAuditorArgvProvider>(auditors["security:semgrep"]).Argv);
+        Assert.Equal(AuditCapabilities.None, auditors["security:gitleaks"].Required);
+        Assert.Equal(AuditCapabilities.Network, auditors["security:semgrep"].Required);
+    }
+
+    [Fact]
+    public async Task SecurityPreset_ToolAuditorsExecuteWhenToolsArePresent()
+    {
+        var auditors = new PresetCatalog()
+            .ResolveAuditType("security", new PresetContext(new CapturingAgent()))
+            .Where(a => a.Name is "security:gitleaks" or "security:semgrep")
+            .ToArray();
+        var executedCommands = new List<IReadOnlyList<string>>();
+        var sandbox = new RecordingSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, $"/usr/local/bin/{exec.Argv[4]}\n", "");
+
+            executedCommands.Add(exec.Argv);
+            return new SandboxExecResult(0, "clean", "");
+        });
+
+        var results = new List<AuditResult>();
+        foreach (var auditor in auditors)
+            results.Add(await auditor.RunAsync(sandbox, "/repo", AuditingAndReportsHelpers.Context()));
+
+        Assert.All(results, result =>
+        {
+            Assert.True(result.Passed);
+            Assert.Empty(result.Findings);
+        });
+        Assert.Contains(executedCommands, argv => argv.SequenceEqual(
+            ["gitleaks", "detect", "--source", ".", "--no-banner", "--no-color"]));
+        Assert.Contains(executedCommands, argv => argv.SequenceEqual(
+            ["semgrep", "--config", "auto", "--error", "--quiet"]));
+    }
+
+    [Theory]
+    [InlineData("security:gitleaks", "gitleaks")]
+    [InlineData("security:semgrep", "semgrep")]
+    public async Task SecurityPreset_MissingToolSurfacesAsWarning(string auditorName, string toolName)
+    {
+        var auditor = new PresetCatalog()
+            .ResolveAuditType("security", new PresetContext(new CapturingAgent()))
+            .Single(a => a.Name == auditorName);
+        var sandbox = new RecordingSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(1, "", "")
+                : new SandboxExecResult(0, "unexpected command execution", ""));
+
+        var result = await auditor.RunAsync(sandbox, "/repo", AuditingAndReportsHelpers.Context());
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
+        Assert.Contains($"tool not installed in sandbox: {toolName}", finding.Title, StringComparison.Ordinal);
+        Assert.DoesNotContain(sandbox.Executions, exec => exec.Argv.Count > 0 && exec.Argv[0] == toolName);
     }
 
     [Theory]

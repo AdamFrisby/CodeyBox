@@ -120,7 +120,7 @@ jobs:
         pr: ${{ fromJSON(needs.enumerate.outputs.prs) }}
     steps:
       - name: check out main
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: main
           # The revalidate-build job executes PR-controlled scripts after the
@@ -131,7 +131,7 @@ jobs:
           fetch-depth: 0
 
       - name: set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: 10.0.x
 
@@ -227,7 +227,7 @@ jobs:
 
       - name: upload outcome artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           # PR number is the integrity anchor: post-status finds THIS PR's
           # outcome by THIS name; it never re-uses an artifact across PRs.
@@ -258,7 +258,7 @@ jobs:
       STATUS_CONTEXT: codeybox/pre-merge-revalidate
     steps:
       - name: download outcome artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: outcome-pr-${{ matrix.pr.number }}
           path: outcome/

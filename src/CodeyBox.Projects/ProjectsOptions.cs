@@ -236,6 +236,8 @@ public sealed class ProjectConfiguredAuditorConfig
     public string? Script { get; set; }
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
+    public string? MissingToolSeverity { get; set; }
+    public List<string>? RequiredCapabilities { get; set; }
     public bool CanShortCircuitOnBlockingFinding { get; set; }
     public string? Role { get; set; }
     public string? GateEvidence { get; set; }

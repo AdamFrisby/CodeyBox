@@ -4,9 +4,11 @@
 into the sandbox image before work starts. Install the tools your projects
 need; CodeyBox does not assume one privileged language stack.
 
-If a language auditor is enabled but its tool is missing, the auditor emits an
-Info finding and skips instead of blocking the work item. Install the missing
-tool and re-run audit to get enforcement.
+If a language auditor is enabled but its tool is missing, the auditor usually
+emits an Info finding and skips instead of blocking the work item. The built-in
+security tool auditors emit Warning on missing tools so lost secret/SAST
+coverage is visible without hard-blocking audits by default. Install the
+missing tool and re-run audit to get enforcement.
 
 ## Polyglot Sandbox
 
@@ -174,19 +176,21 @@ bake.
 
 ## Security Tooling
 
-The `security:gitleaks` and `security:semgrep` auditors skip with an Info
-finding when their tools are missing. Bake them into the audit sandbox so
-they enforce instead of skipping:
+The default `appsettings.json` bakes pinned `gitleaks` and `semgrep`
+versions into Multipass baselines. If you override `MultipassExtraRuncmd`,
+keep equivalent pinned install steps so `security:gitleaks` and
+`security:semgrep` execute instead of reporting a missing-tool Warning:
 
 ```json
 {
   "CodeyBox": {
     "MultipassExtraRuncmd": [
       "apt-get update",
-      "apt-get install -y curl ca-certificates python3 python3-pip",
-      "curl -fsSL -o /usr/local/bin/gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz",
-      "tar -xzf /usr/local/bin/gitleaks.tgz -C /usr/local/bin gitleaks && rm /usr/local/bin/gitleaks.tgz",
-      "python3 -m pip install --break-system-packages semgrep"
+      "apt-get install -y curl ca-certificates tar python3 python3-pip",
+      "set -eux\nGITLEAKS_VERSION=8.29.0\ncase \"$(uname -m)\" in\n  x86_64|amd64) GITLEAKS_ARCH=x64; GITLEAKS_SHA256=39e07ad810336fd0ae80d0bd61c60d0521f628173e7583583b5df4a38738522c ;;\n  aarch64|arm64) GITLEAKS_ARCH=arm64; GITLEAKS_SHA256=4c811a7c23296c7163ebab166ec67cd8a31eb9922caf06a7cac4d6dd872e4159 ;;\n  *) echo \"unsupported gitleaks architecture: $(uname -m)\" >&2; exit 1 ;;\nesac\nGITLEAKS_TGZ=/tmp/gitleaks_${GITLEAKS_VERSION}_linux_${GITLEAKS_ARCH}.tar.gz\ncurl -fsSL -o \"$GITLEAKS_TGZ\" \"https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${GITLEAKS_ARCH}.tar.gz\"\nprintf '%s  %s\\n' \"$GITLEAKS_SHA256\" \"$GITLEAKS_TGZ\" | sha256sum -c -\ntar -xzf \"$GITLEAKS_TGZ\" -C /usr/local/bin gitleaks\nchmod 0755 /usr/local/bin/gitleaks\nrm \"$GITLEAKS_TGZ\"",
+      "python3 -m pip install --break-system-packages --no-cache-dir --only-binary=:all: semgrep==1.168.0",
+      "gitleaks version | grep -Fx 8.29.0",
+      "semgrep --version | grep -Fx 1.168.0"
     ]
   }
 }

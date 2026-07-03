@@ -60,6 +60,26 @@
           "treatExit127AsMissingTool": {
             "type": "boolean"
           },
+          "missingToolSeverity": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warning",
+              "warn",
+              "error"
+            ]
+          },
+          "requiredCapabilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "network",
+                "agent-credentials",
+                "graphical"
+              ]
+            }
+          },
           "canShortCircuitOnBlockingFinding": {
             "type": "boolean"
           },

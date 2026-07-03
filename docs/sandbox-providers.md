@@ -206,7 +206,7 @@ Three ways to install what your project needs:
    ```json
    "CodeyBox": {
      "MultipassExtraRuncmd": [
-       "set -eux\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y nodejs npm\nnpm install -g @anthropic-ai/claude-code\ncurl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xzC /usr/local/bin gitleaks"
+       "set -eux\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y curl ca-certificates nodejs npm\nnpm install -g @anthropic-ai/claude-code\nGITLEAKS_TGZ=/tmp/gitleaks_8.29.0_linux_x64.tar.gz\ncurl -fsSL -o \"$GITLEAKS_TGZ\" https://github.com/gitleaks/gitleaks/releases/download/v8.29.0/gitleaks_8.29.0_linux_x64.tar.gz\nprintf '%s  %s\\n' 39e07ad810336fd0ae80d0bd61c60d0521f628173e7583583b5df4a38738522c \"$GITLEAKS_TGZ\" | sha256sum -c -\ntar -xzf \"$GITLEAKS_TGZ\" -C /usr/local/bin gitleaks\nrm \"$GITLEAKS_TGZ\""
      ]
    }
    ```

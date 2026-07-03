@@ -42,7 +42,7 @@ jobs:
       CODEYBOX_OPENCODE_AUTH_FILE: ${{ secrets.CODEYBOX_OPENCODE_AUTH_FILE }}
       CODEYBOX_ACP_BRIDGE_VERIFY_SOURCE_VM: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: multipass version
         run: multipass version
@@ -92,7 +92,7 @@ jobs:
 
       - name: upload trx
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: agent-suspend-resilience-trx
           path: "**/agent-suspend-resilience.trx"
